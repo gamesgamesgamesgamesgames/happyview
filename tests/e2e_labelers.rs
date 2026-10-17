@@ -470,7 +470,7 @@ async fn label_gc_removes_orphaned_record_labels_but_keeps_account_labels() {
             .unwrap();
     }
 
-    let orphaned = happyview::labeler::delete_orphaned_labels(db, common::db::test_backend())
+    let orphaned = happyview::labeler::delete_orphaned_labels(&app.state.records)
         .await
         .expect("the orphan sweep should run");
     assert_eq!(orphaned, 1);

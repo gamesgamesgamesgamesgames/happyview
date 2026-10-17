@@ -684,17 +684,18 @@ pub async fn delete_expired_labels(
 /// URI and so read as orphaned on its first pass — every account-level label an
 /// instance held was deleted within the hour. Account labels are retained until
 /// they expire or are negated.
+///
+/// A subject in a collection an external storage claims is asked of that
+/// storage (see `RecordStore::delete_orphaned_labels`).
 pub async fn delete_orphaned_labels(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    records: &crate::record_store::RecordStore,
 ) -> Result<u64, sqlx::Error> {
-    crate::record_store::RecordStore::new(db.clone(), backend)
-        .delete_orphaned_labels()
-        .await
+    records.delete_orphaned_labels().await
 }
 
 /// Hourly task to clean up expired and orphaned labels.
-pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
+pub async fn spawn_label_gc(records: crate::record_store::RecordStore) {
+    let (db, backend) = (records.db().clone(), records.backend());
     tracing::info!("starting label garbage collection task");
 
     let interval = tokio::time::Duration::from_secs(3600); // 1 hour
@@ -712,7 +713,7 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
             }
         };
 
-        let orphaned_count = match delete_orphaned_labels(&db, backend).await {
+        let orphaned_count = match delete_orphaned_labels(&records).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!("failed to clean up orphaned labels: {e}");

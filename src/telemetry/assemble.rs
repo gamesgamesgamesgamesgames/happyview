@@ -1,8 +1,6 @@
 //! Snapshot assembly.
 
-use sqlx::AnyPool;
-
-use crate::db::{DatabaseBackend, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::telemetry::collect::{database, features, health, host};
 use crate::telemetry::consent::Consent;
 use crate::telemetry::counters::Counters;
@@ -24,17 +22,17 @@ where
 }
 
 pub async fn assemble(
-    pool: &AnyPool,
-    backend: DatabaseBackend,
+    records: &crate::record_store::RecordStore,
     db_url: &str,
     consent: &Consent,
     counters: &Counters,
     lexicons: &crate::catalog::LexiconCatalog,
 ) -> Option<Snapshot> {
     let instance_id = consent.instance_id.clone()?;
+    let (pool, backend) = (records.db(), records.backend());
 
     let totals_fut = async {
-        budgeted("totals", database::totals(pool, backend))
+        budgeted("totals", database::totals(records))
             .await
             .unwrap_or_default()
     };
@@ -44,20 +42,13 @@ pub async fn assemble(
             .unwrap_or_default()
     };
     let shares_fut = async {
-        budgeted(
-            "collection_shares",
-            database::collection_shares(pool, backend),
-        )
-        .await
-        .unwrap_or_default()
+        budgeted("collection_shares", database::collection_shares(records))
+            .await
+            .unwrap_or_default()
     };
     let names_fut = async {
         if consent.lexicon_names {
-            budgeted(
-                "collection_names",
-                database::collection_names(pool, backend),
-            )
-            .await
+            budgeted("collection_names", database::collection_names(records)).await
         } else {
             None
         }
@@ -263,8 +254,7 @@ mod tests {
         c.instance_id = None;
 
         let out = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
@@ -278,8 +268,7 @@ mod tests {
     async fn builds_a_snapshot_with_shape_data_and_no_consented_extras() {
         let pool = pool_for_assembly().await;
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
@@ -305,8 +294,7 @@ mod tests {
     async fn report_mode_reflects_manual() {
         let pool = pool_for_assembly().await;
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Manual),
             &Counters::new(),
@@ -325,8 +313,7 @@ mod tests {
         c.contact = Some("tre@trezy.com".into());
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
@@ -344,8 +331,7 @@ mod tests {
         c.lexicon_names = true;
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
@@ -369,8 +355,7 @@ mod tests {
             .unwrap();
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
@@ -391,8 +376,7 @@ mod tests {
         let recorded = health::note_restart(&pool, DatabaseBackend::Sqlite).await;
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
@@ -419,8 +403,7 @@ mod tests {
         .expect("insert completed job");
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
@@ -465,8 +448,7 @@ mod tests {
 
         let pool = pool_for_assembly().await;
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),

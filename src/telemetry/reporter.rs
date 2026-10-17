@@ -89,8 +89,7 @@ pub async fn report_once(state: &AppState) -> Result<Option<Benchmarks>, String>
     }
 
     let snapshot = assemble::assemble(
-        &state.db,
-        state.db_backend,
+        &state.records,
         &state.config.database_url,
         &current,
         &state.telemetry_counters,

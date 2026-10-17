@@ -220,22 +220,6 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     happyview::maintenance::nsid_audit::run(&db_pool, db_backend).await;
     happyview::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
-    // Populate record_refs once, for records indexed before the table existed.
-    {
-        let db_bg = db_pool.clone();
-        tokio::spawn(async move {
-            match happyview::record_refs::rebuild_once(&db_bg, db_backend).await {
-                Ok(happyview::record_refs::RebuildOutcome::Rebuilt { records }) => {
-                    info!(records, "record_refs rebuild complete");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(error = %e, "record_refs rebuild failed; will resume on next startup")
-                }
-            }
-        });
-    }
-
     let project = happyview::project::shared_empty();
     let lexicons = LexiconCatalog::new(project.clone());
     let scripts =
@@ -973,6 +957,24 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         test: None,
     };
 
+    // Populate record_refs once, for records indexed before the table existed.
+    // Spawned before anything that writes records starts, as it was before
+    // it took the shared store.
+    {
+        let records = state.records.clone();
+        tokio::spawn(async move {
+            match happyview::record_refs::rebuild_once(&records).await {
+                Ok(happyview::record_refs::RebuildOutcome::Rebuilt { records }) => {
+                    info!(records, "record_refs rebuild complete");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "record_refs rebuild failed; will resume on next startup")
+                }
+            }
+        });
+    }
+
     // Before anything that runs a script starts: a worker that came first
     // would run against no project at all, and serving without the project
     // would answer its routes with nothing.
@@ -1035,7 +1037,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     jetstream::spawn(state.clone(), collections_rx);
 
     labeler::spawn(state.clone(), labeler_subscriptions_rx);
-    tokio::spawn(labeler::spawn_label_gc(state.db.clone(), state.db_backend));
+    tokio::spawn(labeler::spawn_label_gc(state.records.clone()));
 
     {
         let gc_db = state.db.clone();

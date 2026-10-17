@@ -367,6 +367,8 @@ pub async fn purge_did_records_before(
     purge(store, did, collections, Some(before_rev)).await
 }
 
+/// The local purge, then, with an external storage, its account purge for
+/// the claimed collections among `collections` (all of them when `None`).
 async fn purge(
     store: &crate::record_store::RecordStore,
     did: &str,
@@ -376,6 +378,29 @@ async fn purge(
     if collections.is_some_and(<[String]>::is_empty) {
         return Ok(0);
     }
+    let purged = purge_local(store, did, collections, before_rev).await?;
+    let Some(ext) = store.external() else {
+        return Ok(purged);
+    };
+    let claimed: Option<Vec<String>> = collections.map(|collections| {
+        collections
+            .iter()
+            .filter(|c| ext.claims(c))
+            .cloned()
+            .collect()
+    });
+    if claimed.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(purged);
+    }
+    Ok(purged + ext.forget_account(did, claimed.as_deref()).await?)
+}
+
+async fn purge_local(
+    store: &crate::record_store::RecordStore,
+    did: &str,
+    collections: Option<&[String]>,
+    before_rev: Option<&str>,
+) -> Result<u64, sqlx::Error> {
     let held = match before_rev {
         None => store.holds_network_records(did, collections).await?,
         Some(before) => {

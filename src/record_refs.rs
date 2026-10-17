@@ -183,10 +183,9 @@ where
 /// a resume cursor, and the done marker is written only after the last page,
 /// so an interrupted rebuild picks up where it stopped.
 pub async fn rebuild_once(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    records: &crate::record_store::RecordStore,
 ) -> Result<RebuildOutcome, sqlx::Error> {
-    Ok(rebuild_pages(db, backend, None)
+    Ok(rebuild_pages(records, None)
         .await?
         .unwrap_or(RebuildOutcome::AlreadyDone))
 }
@@ -194,10 +193,10 @@ pub async fn rebuild_once(
 /// `rebuild_once`, stopping without marking done after `max_pages` pages
 /// (`None` result) so tests can interrupt it.
 async fn rebuild_pages(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     max_pages: Option<usize>,
 ) -> Result<Option<RebuildOutcome>, sqlx::Error> {
+    let (db, backend) = (store.db(), store.backend());
     if get_setting(db, backend, REFS_REBUILT_SETTING)
         .await?
         .is_some()
@@ -205,7 +204,6 @@ async fn rebuild_pages(
         return Ok(Some(RebuildOutcome::AlreadyDone));
     }
 
-    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     let cursor = get_setting(db, backend, REFS_REBUILD_CURSOR_SETTING).await?;
     if cursor.is_none() && store.has_refs().await? {
         let mut conn = db.acquire().await?;
@@ -374,7 +372,12 @@ mod tests {
         seed_ref_bearing_records(&pool, 1500).await;
 
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("rebuild"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("rebuild"),
             RebuildOutcome::Rebuilt { records: 1500 }
         );
         assert_eq!(refs(&pool).await, 3);
@@ -386,7 +389,12 @@ mod tests {
             .await
             .expect("clear refs");
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("second boot"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("second boot"),
             RebuildOutcome::AlreadyDone
         );
         assert_eq!(refs(&pool).await, 0);
@@ -399,7 +407,15 @@ mod tests {
         seed_ref_bearing_records(&pool, 2500).await;
 
         // Stop after one page (records 0..1000: refs at 0 and 500).
-        assert_eq!(rebuild_pages(&pool, backend, Some(1)).await.unwrap(), None);
+        assert_eq!(
+            rebuild_pages(
+                &crate::record_store::RecordStore::new(pool.clone(), backend),
+                Some(1)
+            )
+            .await
+            .unwrap(),
+            None
+        );
         assert_eq!(refs(&pool).await, 2);
         assert!(
             get_setting(&pool, backend, REFS_REBUILT_SETTING)
@@ -411,7 +427,12 @@ mod tests {
 
         // The next run resumes from the cursor, not from the top, and finishes.
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("resume"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("resume"),
             RebuildOutcome::Rebuilt { records: 1500 }
         );
         assert_eq!(refs(&pool).await, 5);
@@ -423,7 +444,12 @@ mod tests {
         );
 
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("again"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("again"),
             RebuildOutcome::AlreadyDone
         );
     }
@@ -438,7 +464,12 @@ mod tests {
         seed_record(&pool, "b", &body).await;
 
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("rebuild"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("rebuild"),
             RebuildOutcome::NotNeeded
         );
         assert_eq!(
@@ -447,7 +478,12 @@ mod tests {
             "an install with refs is left as it is"
         );
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("again"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("again"),
             RebuildOutcome::AlreadyDone
         );
     }
@@ -459,7 +495,15 @@ mod tests {
         seed_ref_bearing_records(&pool, 1200).await;
 
         // Starts, then stops before committing a page.
-        assert_eq!(rebuild_pages(&pool, backend, Some(0)).await.unwrap(), None);
+        assert_eq!(
+            rebuild_pages(
+                &crate::record_store::RecordStore::new(pool.clone(), backend),
+                Some(0)
+            )
+            .await
+            .unwrap(),
+            None
+        );
         assert_eq!(refs(&pool).await, 0);
 
         // Live ingest writes a ref in the meantime.
@@ -468,7 +512,12 @@ mod tests {
         live_ref(&pool, "at://did:plc:r/app.test.post/live", &body).await;
 
         assert_eq!(
-            rebuild_once(&pool, backend).await.expect("resume"),
+            rebuild_once(&crate::record_store::RecordStore::new(
+                pool.clone(),
+                backend
+            ))
+            .await
+            .expect("resume"),
             RebuildOutcome::Rebuilt { records: 1201 }
         );
         assert_eq!(refs(&pool).await, 3 + 1);

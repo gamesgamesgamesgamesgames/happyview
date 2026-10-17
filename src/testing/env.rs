@@ -193,8 +193,12 @@ impl TestEnv {
         let mut state = self.base.clone();
         state.db = pool.clone();
         state.backfill_db = pool.clone();
+        // This file's own copy, routed as the base is.
         state.records =
             crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite);
+        if let Some(external) = self.base.records.external() {
+            state.records = state.records.clone().with_external(external.clone());
+        }
         state.scripts = crate::catalog::ScriptCatalog::new(
             pool.clone(),
             DatabaseBackend::Sqlite,

@@ -362,10 +362,11 @@ pub async fn records_get(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<Option<Value>, RecordsError> {
-    Ok(RecordStore::new(db.clone(), backend)
-        .get(uri)
-        .await?
-        .map(Value::from))
+    let route = happyview_provider::ReadRoute {
+        pool: db.clone(),
+        backend,
+    };
+    Ok(RecordStore::get_on(&route, uri).await?.map(Value::from))
 }
 
 pub async fn records_search(

@@ -176,6 +176,22 @@ pub enum AppError {
     },
 }
 
+/// A failed record read as the client sees it: `503 ServiceUnavailable` when
+/// the store that holds the record could not be reached (`storage_down`), so
+/// a client knows to retry, otherwise the `Internal` error a failed query
+/// has always been.
+pub fn record_read_error(e: sqlx::Error, storage_down: bool) -> AppError {
+    if storage_down {
+        AppError::XrpcError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "ServiceUnavailable",
+            message: "the record store is unavailable".to_string(),
+        }
+    } else {
+        AppError::Internal(format!("DB query failed: {e}"))
+    }
+}
+
 /// The file a failure happened in, when the chunk names one. A dashboard
 /// script's chunk is `script`, which no one can open.
 pub(crate) fn file_of(chunk: Option<String>) -> Option<String> {

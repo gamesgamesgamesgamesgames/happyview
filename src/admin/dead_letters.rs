@@ -916,7 +916,9 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
         body: record,
         time_us: None,
         origin: crate::ingest::Origin::Retry,
-        stored: false,
+        // A claimed collection's record lives in the external storage, and
+        // only its stored events reach a hook, so a retry applies a delta.
+        stored: state.records.external_route(&dl.collection).is_some(),
     };
 
     // The script runs once; what it returns is applied, as the original

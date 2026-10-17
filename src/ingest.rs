@@ -17,6 +17,7 @@ use serde_json::Value;
 pub use happyview_provider::{
     Action, BatchOutcome, IngestOutcome, Origin, RecordEvent, RecordKey, SourceEvent,
 };
+use happyview_provider::{Delta, RecordStorage};
 
 use crate::AppState;
 use crate::db::now_rfc3339;
@@ -71,6 +72,15 @@ impl Applied {
             error: Some(e.to_string()),
         }
     }
+}
+
+/// What the record hook decided for one create or update, before it
+/// becomes a body to store (local) or a delta (claimed collection).
+enum Decision {
+    Proceed,
+    Replace(Value),
+    Skip,
+    CidMismatch,
 }
 
 /// Where a record's hook outcome comes from.
@@ -164,9 +174,12 @@ pub(crate) async fn apply_batch_in(
     let mut tracked: HashMap<String, bool> = HashMap::new();
 
     for event in events {
+        // A claimed collection's events are written as deltas, one by one,
+        // through `apply_in`.
         if let SourceEvent::Record(ev) = &event
             && matches!(ev.action, Action::Create | Action::Update)
             && ev.key.collection != LEXICON_SCHEMA_COLLECTION
+            && state.records.external_route(&ev.key.collection).is_none()
             && let Some(body) = &ev.body
         {
             let is_tracked = match tracked.get(&ev.key.collection) {
@@ -328,6 +341,15 @@ async fn hook_body_with(
     body: &Value,
     hook: Hook,
 ) -> HookedBody {
+    match hook_decision(state, ev, body, hook).await {
+        Decision::Proceed => HookedBody::Store(body.clone()),
+        Decision::Replace(v) => HookedBody::Store(v),
+        Decision::Skip => HookedBody::Skip,
+        Decision::CidMismatch => HookedBody::CidMismatch,
+    }
+}
+
+async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: Hook) -> Decision {
     let uri = ev.key.uri();
     let cid = ev.cid.as_deref().unwrap_or_default();
 
@@ -364,7 +386,7 @@ async fn hook_body_with(
             state.db_backend,
         )
         .await;
-        return HookedBody::CidMismatch;
+        return Decision::CidMismatch;
     }
 
     // Run record-event script (if any) before storing. The script's
@@ -394,10 +416,10 @@ async fn hook_body_with(
     match outcome {
         RecordHookOutcome::Skip => {
             log_skipped(state, ev, &uri).await;
-            HookedBody::Skip
+            Decision::Skip
         }
-        RecordHookOutcome::Replace(v) => HookedBody::Store(v),
-        RecordHookOutcome::Proceed => HookedBody::Store(body.clone()),
+        RecordHookOutcome::Replace(v) => Decision::Replace(v),
+        RecordHookOutcome::Proceed => Decision::Proceed,
     }
 }
 
@@ -507,6 +529,10 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
         return IngestOutcome::Skipped;
     }
 
+    if let Some(ext) = state.records.external_route(&ev.key.collection) {
+        return apply_claimed(state, ext.as_ref(), ev, hook).await;
+    }
+
     let reason = matches!(ev.origin, Origin::Backfill { .. }).then(|| "backfill".to_string());
     match ev.action {
         Action::Create | Action::Update => {
@@ -563,23 +589,7 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
             // Run record-event script (if any) before deleting. Only a
             // script that actually ran and returned `nil` aborts the
             // delete — no script, or a dead-lettered one, proceeds.
-            let hook_result = match hook {
-                Hook::Run => {
-                    crate::lua::run_record_event_script(
-                        state,
-                        RecordEventPayload {
-                            nsid: &ev.key.collection,
-                            action: "delete",
-                            uri: &uri,
-                            did: &ev.key.did,
-                            rkey: &ev.key.rkey,
-                            record: ev.body.as_ref(),
-                        },
-                    )
-                    .await
-                }
-                Hook::Given(outcome) => outcome,
-            };
+            let hook_result = delete_hook(state, ev, &uri, hook).await;
             if hook_result == RecordHookOutcome::Skip {
                 // Gated for the same reason as the create path.
                 log_skipped(state, ev, &uri).await;
@@ -613,6 +623,128 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
                     log_record(state, "record.deleted", Severity::Error, ev, &uri, Some(&e)).await;
                     failed_write_outcome(&e)
                 }
+            }
+        }
+    }
+}
+
+/// The delete hook's outcome for `ev`.
+async fn delete_hook(
+    state: &AppState,
+    ev: &RecordEvent,
+    uri: &str,
+    hook: Hook,
+) -> RecordHookOutcome {
+    match hook {
+        Hook::Run => {
+            crate::lua::run_record_event_script(
+                state,
+                RecordEventPayload {
+                    nsid: &ev.key.collection,
+                    action: "delete",
+                    uri,
+                    did: &ev.key.did,
+                    rkey: &ev.key.rkey,
+                    record: ev.body.as_ref(),
+                },
+            )
+            .await
+        }
+        Hook::Given(outcome) => outcome,
+    }
+}
+
+/// A record event for a collection an external storage claims. Its body is
+/// already in that storage (`stored`); the hook runs as for a local record
+/// and only its result is written, as a delta on this instance's view:
+/// Proceed, Replace or Hide (a skip). A delete clears the delta; its hook
+/// runs, but cannot keep a record the storage no longer has. An event that is
+/// not `stored` came from somewhere other than the claiming store's feed and
+/// is refused, so nothing for a claimed collection is written locally.
+async fn apply_claimed(
+    state: &AppState,
+    ext: &dyn RecordStorage,
+    ev: &RecordEvent,
+    hook: Hook,
+) -> IngestOutcome {
+    let uri = ev.key.uri();
+    if !ev.stored {
+        tracing::warn!(
+            uri = %uri,
+            "a record of a collection stored outside this instance arrived from another source"
+        );
+        log_record(
+            state,
+            "record.unstored_claimed",
+            Severity::Warn,
+            ev,
+            &uri,
+            None,
+        )
+        .await;
+        return IngestOutcome::Invalid;
+    }
+    let (delta, outcome) = match ev.action {
+        Action::Create | Action::Update => {
+            let Some(body) = &ev.body else {
+                return IngestOutcome::Invalid;
+            };
+            match hook_decision(state, ev, body, hook).await {
+                Decision::Proceed => (Delta::Proceed, IngestOutcome::Matched),
+                Decision::Replace(replaced) => (
+                    Delta::Replace {
+                        cid: ev.cid.clone().unwrap_or_default(),
+                        rev: ev.rev.clone(),
+                        body: serde_json::to_string(&replaced).unwrap_or_default(),
+                    },
+                    IngestOutcome::Matched,
+                ),
+                Decision::Skip | Decision::CidMismatch => (Delta::Hide, IngestOutcome::Skipped),
+            }
+        }
+        Action::Delete => {
+            if delete_hook(state, ev, &uri, hook).await == RecordHookOutcome::Skip
+                && state.verbose_event_logging.load(Ordering::Relaxed)
+            {
+                log_event(
+                    &state.db,
+                    EventLog {
+                        event_type: "record.skip_ignored".to_string(),
+                        severity: Severity::Info,
+                        actor_did: None,
+                        subject: Some(uri.clone()),
+                        detail: serde_json::json!({
+                            "collection": ev.key.collection,
+                            "did": ev.key.did,
+                            "rkey": ev.key.rkey,
+                            "reason": "script returned nil for a record deleted from the store that holds it",
+                        }),
+                    },
+                    state.db_backend,
+                )
+                .await;
+            }
+            (Delta::Proceed, IngestOutcome::Matched)
+        }
+    };
+    let event_type = match ev.action {
+        Action::Delete => "record.deleted",
+        Action::Create | Action::Update => "record.created",
+    };
+    match ext.apply_delta(&ev.key, delta, ev.rev.as_deref()).await {
+        Ok(()) => {
+            if outcome == IngestOutcome::Matched && ev.action != Action::Delete {
+                fetch_labels(state, std::slice::from_ref(&uri)).await;
+            }
+            outcome
+        }
+        Err(e) => {
+            tracing::warn!(uri = %uri, "failed to apply a record's delta: {e}");
+            log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
+            if ext.unavailable(&e) {
+                IngestOutcome::Unavailable
+            } else {
+                failed_write_outcome(&e)
             }
         }
     }
