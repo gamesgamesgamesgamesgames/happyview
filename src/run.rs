@@ -266,6 +266,18 @@ async fn boot(
     let db_pool = db::connect(&config.database_url, db_backend).await;
     let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
 
+    // The source's own schema, after HappyView's own migrations and before
+    // the source starts.
+    if let Err(e) =
+        crate::provider_migrations::run(&db_pool, db_backend, providers.source.as_ref()).await
+    {
+        eprintln!(
+            "happyview: could not migrate the record source {}: {e}",
+            providers.source.id()
+        );
+        return Err(std::process::ExitCode::FAILURE);
+    }
+
     if dev_mode && let Err(e) = crate::dev::instance::seed(&db_pool, db_backend).await {
         eprintln!("happyview dev: could not prepare the instance: {e}");
         return Err(std::process::ExitCode::FAILURE);

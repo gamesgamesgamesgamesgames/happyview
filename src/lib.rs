@@ -40,6 +40,7 @@ pub mod plc;
 pub mod plugin;
 pub mod profile;
 pub mod project;
+pub mod provider_migrations;
 pub mod proxy_config;
 pub mod rate_limit;
 pub mod raw_sql_guard;
