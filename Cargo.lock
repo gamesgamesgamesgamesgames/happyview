@@ -1947,6 +1947,7 @@ dependencies = [
  "happyview-nsid",
  "happyview-plc",
  "happyview-plugin-sdk",
+ "happyview-provider",
  "happyview-scopes",
  "hex",
  "hickory-resolver",
@@ -2035,6 +2036,22 @@ dependencies = [
  "serde",
  "serde_json",
  "wasmparser 0.236.1",
+]
+
+[[package]]
+name = "happyview-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

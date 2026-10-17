@@ -29,24 +29,7 @@ pub struct RecordEvent {
 /// The outcome of processing one record event, returned so a caller can
 /// account for it in telemetry rather than this function reaching into
 /// `state.telemetry_counters` itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub enum RecordOutcome {
-    Matched,
-    Skipped,
-    SchemaEvent,
-    Errored,
-    /// The write failed because the database could not be reached (see
-    /// `db::is_unavailable`); the same event should apply once it is back.
-    /// A caller that does not retry treats it like `Errored`.
-    Unavailable,
-    /// The event can never be applied as it stands: a write with no record
-    /// body, an unknown operation, a lexicon schema that does not parse, or
-    /// data the database refuses (see `db::is_invalid_data`). Retrying it
-    /// cannot help. A caller that does not distinguish it treats it like
-    /// `Errored`.
-    Invalid,
-}
+pub use happyview_provider::IngestOutcome as RecordOutcome;
 
 /// Process a record event: upsert/delete the record in the database, run index
 /// hooks, and handle lexicon schema events. Returns the outcome so the caller

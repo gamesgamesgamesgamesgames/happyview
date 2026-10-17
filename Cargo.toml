@@ -21,6 +21,7 @@ exclude = [
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
 happyview-plc = { path = "crates/happyview-plc" }
+happyview-provider = { path = "crates/happyview-provider" }
 happyview-plugin-sdk = { path = "crates/happyview-plugin-sdk" }
 happyview-scopes = { path = "crates/happyview-scopes" }
 
@@ -63,6 +64,7 @@ data-encoding = "2"
 dotenvy = "0.15"
 happyview-nsid = { workspace = true }
 happyview-plc = { workspace = true }
+happyview-provider = { workspace = true }
 happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
