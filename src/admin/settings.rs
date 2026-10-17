@@ -52,6 +52,33 @@ pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) ->
     try_get_setting(pool, key, backend).await.ok().flatten()
 }
 
+/// Store a setting in `happyview_instance_settings`, replacing any value.
+pub async fn put_setting(
+    pool: &AnyPool,
+    key: &str,
+    value: &str,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        r#"
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
+        "#,
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind(&now)
+        .bind(value)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// [`get_setting`] for a caller that must tell a missing row from a database
 /// it could not ask: the script budgets keep their cached values on the
 /// second, where the first means the env var or the default.
@@ -147,23 +174,7 @@ pub(super) async fn upsert(
     auth.require(Permission::SettingsManage).await?;
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
 
-    let backend = state.db_backend;
-    let now = now_rfc3339();
-    let sql = adapt_sql(
-        r#"
-        INSERT INTO happyview_instance_settings (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
-        "#,
-        backend,
-    );
-    crate::db::query(&sql)
-        .bind(&key)
-        .bind(&body.value)
-        .bind(&now)
-        .bind(&body.value)
-        .bind(&now)
-        .execute(&state.db)
+    put_setting(&state.db, &key, &body.value, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
     refresh_script_limits(&state, &key).await;

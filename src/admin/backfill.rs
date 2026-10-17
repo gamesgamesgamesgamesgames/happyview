@@ -22,6 +22,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::http_retry::parse_retry_after;
 use crate::jetstream::archive::SourceChoice;
 use crate::profile;
+#[cfg(test)]
 use crate::record_store::PreparedRecord;
 
 use super::auth::UserAuth;
@@ -2559,6 +2560,7 @@ async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
 /// again, so the settle could wait on it forever.
 async fn fetch_unit(
     state: Arc<AppState>,
+    job_id: Arc<String>,
     pds_endpoint: String,
     collections: Vec<String>,
     unit: WorkUnit,
@@ -2580,6 +2582,7 @@ async fn fetch_unit(
             .expect("request semaphore is never closed");
         match fetch_records_page_loop(
             &state,
+            &job_id,
             &pds_endpoint,
             &unit.did,
             collection,
@@ -2683,6 +2686,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                         // `fetch_unit`.
                         fetches.push(tokio::spawn(fetch_unit(
                             Arc::clone(&state),
+                            Arc::clone(&queue.job_id),
                             pds_endpoint.clone(),
                             unit.collections(&collections),
                             unit,
@@ -2740,6 +2744,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                     .expect("request semaphore is never closed");
                 let outcome = fetch_records_page_loop(
                     &state,
+                    &queue.job_id,
                     &pds_endpoint,
                     &did,
                     &collection,
@@ -2903,6 +2908,7 @@ async fn run_fetching_phase(
                         let collections = Arc::clone(&collections);
                         let cancelled = Arc::clone(&cancelled);
                         let pds_endpoint = pds_endpoint.clone();
+                        let job_id = Arc::clone(&job_id);
 
                         // A task of its own for the reason `fetch_unit` gives:
                         // `for_each` below awaits writes while polling nothing
@@ -2922,6 +2928,7 @@ async fn run_fetching_phase(
                                 }
                                 match fetch_records_page_loop(
                                     &state,
+                                    job_id.as_str(),
                                     &pds_endpoint,
                                     &did,
                                     collection,
@@ -3110,6 +3117,7 @@ async fn run_fetching_phase(
                             let attempts = item.attempts + 1;
                             match fetch_records_page_loop(
                                 &state,
+                                job_id.as_str(),
                                 &pds_endpoint,
                                 &did,
                                 &collection,
@@ -3189,6 +3197,7 @@ async fn run_fetching_phase(
 /// one transaction, tombstoned rows skipped, a repeated URI written once with
 /// its last copy, refs for exactly the rows inserted or changed. Returns the
 /// URIs written. Callers run it inside `db::retry_on_busy`.
+#[cfg(test)]
 async fn write_records_page(
     state: &AppState,
     batch: &[PreparedRecord],
@@ -3200,17 +3209,6 @@ async fn write_records_page(
         .into_iter()
         .map(|changed| changed.uri)
         .collect())
-}
-
-/// Fetch labels for freshly written records, when any labeler is subscribed.
-async fn queue_label_backfill(state: &AppState, uris: &[String]) {
-    if uris.is_empty() || !crate::labeler::has_active_subscriptions(state).await {
-        return;
-    }
-    let shared = Arc::new(state.clone());
-    for uri in uris {
-        crate::labeler::backfill_labels_for_uri(Arc::clone(&shared), uri.clone());
-    }
 }
 
 /// The outcome of a records-page-loop attempt.
@@ -3238,6 +3236,7 @@ pub(super) enum FetchOutcome {
 /// `Failed` with the cursor reached so far so the caller can defer and resume.
 async fn fetch_records_page_loop(
     state: &AppState,
+    job_id: &str,
     pds_endpoint: &str,
     did: &str,
     collection: &str,
@@ -3305,63 +3304,45 @@ async fn fetch_records_page_loop(
 
         let page_count = body.records.len();
 
-        let mut batch: Vec<PreparedRecord> = Vec::with_capacity(page_count);
-        for entry in &body.records {
-            let rkey = entry.uri.rsplit('/').next().unwrap_or_default().to_string();
-            let uri = format!("at://{did}/{collection}/{rkey}");
+        // Every record goes through the ingest pipeline: the CID check
+        // (security review L9: the source PDS is attacker-controllable via
+        // the DID document), the record hook, one write for the page on the
+        // backfill pool, and label fetches for the rows it changed.
+        let events: Vec<crate::ingest::SourceEvent> = body
+            .records
+            .iter()
+            .map(|entry| {
+                let rkey = entry.uri.rsplit('/').next().unwrap_or_default().to_string();
+                crate::ingest::SourceEvent::Record(crate::ingest::RecordEvent {
+                    key: crate::ingest::RecordKey {
+                        did: did.to_string(),
+                        collection: collection.to_string(),
+                        rkey,
+                    },
+                    action: crate::ingest::Action::Create,
+                    cid: Some(entry.cid.clone()),
+                    rev: None,
+                    body: Some(entry.value.clone()),
+                    time_us: None,
+                    origin: crate::ingest::Origin::Backfill {
+                        job_id: job_id.to_string(),
+                    },
+                    stored: false,
+                })
+            })
+            .collect();
 
-            // Reject records whose claimed CID doesn't match their content
-            // (security review L9). The backfill source PDS is attacker-
-            // controllable via the DID document, so a hostile PDS could serve a
-            // record under a mismatched CID. Skip on mismatch; `Skipped`
-            // (unencodable value) proceeds unchanged.
-            if crate::cid_verify::verify_record_cid(&entry.cid, &entry.value)
-                == crate::cid_verify::CidCheck::Mismatch
-            {
-                tracing::warn!(
-                    collection,
-                    did,
-                    rkey,
-                    claimed_cid = %entry.cid,
-                    "record content does not match claimed CID, skipping"
-                );
-                continue;
+        match crate::ingest::apply_batch_in(state, events).await {
+            (batch, None) => {
+                // Records written, as before: every record the hook kept,
+                // changed or not.
+                count += batch
+                    .outcomes
+                    .iter()
+                    .filter(|o| **o == crate::ingest::IngestOutcome::Matched)
+                    .count() as u32;
             }
-
-            let rec_to_store = match crate::lua::run_record_event_script(
-                state,
-                crate::lua::RecordEventPayload {
-                    nsid: collection,
-                    action: "create",
-                    uri: &uri,
-                    did,
-                    rkey: &rkey,
-                    record: Some(&entry.value),
-                },
-            )
-            .await
-            {
-                crate::lua::RecordHookOutcome::Skip => continue,
-                crate::lua::RecordHookOutcome::Replace(v) => v,
-                crate::lua::RecordHookOutcome::Proceed => entry.value.clone(),
-            };
-
-            batch.push(PreparedRecord {
-                did: did.to_string(),
-                collection: collection.to_string(),
-                rkey,
-                record_json: serde_json::to_string(&rec_to_store).unwrap_or_default(),
-                cid: entry.cid.clone(),
-                rev: None,
-            });
-        }
-
-        match crate::db::retry_on_busy(|| write_records_page(state, &batch)).await {
-            Ok(written) => {
-                count += batch.len() as u32;
-                queue_label_backfill(state, &written).await;
-            }
-            Err(e) => {
+            (_, Some(e)) => {
                 tracing::error!(did, collection, error = %e, "failed to write a page of backfilled records");
                 // The page rolled back, so it is not counted, and a retry
                 // resumes from the cursor that fetched it.
@@ -9053,6 +9034,8 @@ mod tests {
     async fn a_page_that_cannot_be_written_is_a_fetch_failure() {
         let mock = MockServer::start().await;
         let state = migrated_state().await;
+        // The ingest pipeline stores records for tracked collections only.
+        state.lexicons.upsert(record_lexicon(POST).1).await;
         crate::db::query("DROP TABLE happyview_record_refs_v2")
             .execute(&state.db)
             .await
@@ -9071,6 +9054,7 @@ mod tests {
 
         let outcome = fetch_records_page_loop(
             &state,
+            "job",
             &mock.uri(),
             "did:plc:f",
             POST,

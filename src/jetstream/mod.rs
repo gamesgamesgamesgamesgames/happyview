@@ -757,7 +757,7 @@ async fn run_session(
                         }
                         state
                             .telemetry_counters
-                            .jetstream_received
+                            .ingest.received
                             .fetch_add(1, Ordering::Relaxed);
                         delivered = true;
                         let ticket = watermark.begin(event.cursor);

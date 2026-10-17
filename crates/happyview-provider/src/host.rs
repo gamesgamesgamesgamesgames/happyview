@@ -29,7 +29,7 @@ pub struct IngestCounters {
 pub trait Host: Send + Sync + 'static {
     async fn ingest(&self, event: SourceEvent) -> IngestOutcome;
     /// In order, in one write transaction where the storage allows.
-    async fn ingest_batch(&self, events: Vec<SourceEvent>) -> Vec<IngestOutcome>;
+    async fn ingest_batch(&self, events: Vec<SourceEvent>) -> BatchOutcome;
     fn tracked_collections(&self) -> watch::Receiver<Vec<String>>;
     async fn has_record_hook(&self, collection: &str, action: Action) -> bool;
     /// DIDs holding records in `collections`, after `after_did`, ascending.

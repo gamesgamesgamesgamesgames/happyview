@@ -87,13 +87,40 @@ pub fn escape_like(value: &str) -> String {
 ///
 /// Run the whole transaction inside `retry_on_busy`, so a write lock held
 /// past the busy timeout retries the transaction rather than failing it.
+///
+/// Inside [`with_change_reason`] on Postgres, the transaction starts by
+/// setting `happyview.change_reason` (transaction-local) for triggers to read.
 pub async fn begin_write(
     pool: &AnyPool,
     backend: DatabaseBackend,
 ) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
     match backend {
         DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
-        DatabaseBackend::Postgres => pool.begin().await,
+        DatabaseBackend::Postgres => {
+            let mut tx = pool.begin().await?;
+            if let Ok(reason) = CHANGE_REASON.try_with(Clone::clone) {
+                query("SELECT set_config('happyview.change_reason', $1, true)")
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Ok(tx)
+        }
+    }
+}
+
+tokio::task_local! {
+    static CHANGE_REASON: String;
+}
+
+/// Run `f` with every [`begin_write`] transaction it opens on Postgres tagged
+/// with `reason` in the transaction-local setting `happyview.change_reason`
+/// (`purge:<status>`, `backfill`). HappyView never reads it; a trigger on the
+/// records table can, to label its change feed. `None` runs `f` untagged.
+pub async fn with_change_reason<F: std::future::Future>(reason: Option<String>, f: F) -> F::Output {
+    match reason {
+        Some(reason) => CHANGE_REASON.scope(reason, f).await,
+        None => f.await,
     }
 }
 

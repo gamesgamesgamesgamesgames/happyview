@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use futures_util::FutureExt;
 use tokio::sync::watch;
@@ -21,15 +20,9 @@ use tokio::sync::watch;
 use super::event::{Commit, CursorPoint, Event, EventKind};
 use super::workers::{ApplyFn, ApplyOutcome, GiveUpFn};
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::ingest::{Origin, SourceEvent};
 use crate::record_handler::{self, LEXICON_SCHEMA_COLLECTION, RecordEvent, RecordOutcome};
-
-/// How long asking an account's PDS for its status may take before a purge
-/// goes ahead on the relay's word.
-const ACCOUNT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-/// The largest `getRepoStatus` answer read; a real one is under 200 bytes.
-const REPO_STATUS_MAX_BYTES: usize = 64 << 10;
 
 /// The worker's `ApplyFn`. `collections` is the registered record
 /// collections; only a `#sync` reads them, so only a `#sync` clones them.
@@ -78,43 +71,14 @@ pub fn give_up_fn(state: AppState) -> GiveUpFn {
 }
 
 /// Apply one event. `tracked` is the registered record collections, which
-/// bound what a `#sync` purges; other events ignore it.
+/// bound what a `#sync` purges; other events ignore it. Commits go through
+/// the ingest pipeline as live events; account, sync and identity events go
+/// through it acting now (`as_of_us: None`).
 pub async fn apply_event(state: &AppState, tracked: &[String], event: Event) -> ApplyOutcome {
     let Event { did, cursor, kind } = event;
     match kind {
         EventKind::Commit(commit) => apply_commit(state, did, cursor, commit).await,
-        EventKind::Account {
-            active: false,
-            status,
-        } if status.as_deref() == Some("deleted") => {
-            account_purged(state, &did, cursor, "jetstream.account_deleted", None, None).await
-        }
-        EventKind::Account {
-            active: false,
-            status,
-        } if matches!(status.as_deref(), Some("takendown" | "suspended")) => {
-            account_purged(
-                state,
-                &did,
-                cursor,
-                "jetstream.account_takendown",
-                status.as_deref(),
-                None,
-            )
-            .await
-        }
-        EventKind::Account {
-            active: false,
-            status,
-        } => account_inactive(state, &did, status.as_deref()).await,
-        EventKind::Account { active: true, .. } => account_active(state, &did, None).await,
-        EventKind::Sync { rev } => repo_resynced(state, &did, rev.as_deref(), tracked, None).await,
-        EventKind::Identity { handle } => {
-            // HappyView caches no DID documents or handles, so there is
-            // nothing to refresh.
-            tracing::debug!(did, ?handle, "jetstream identity event");
-            ApplyOutcome::Applied
-        }
+        kind => apply_marker(state, tracked, did, cursor, kind, None).await,
     }
 }
 
@@ -129,45 +93,7 @@ pub async fn apply_replayed_marker(
     event: Event,
 ) -> ApplyOutcome {
     let Event { did, cursor, kind } = event;
-    let marker_rev = crate::tid::tid_from_unix_microseconds(cursor.time_us());
     match kind {
-        EventKind::Account {
-            active: false,
-            status,
-        } if status.as_deref() == Some("deleted") => {
-            account_purged(
-                state,
-                &did,
-                cursor,
-                "jetstream.account_deleted",
-                None,
-                Some(&marker_rev),
-            )
-            .await
-        }
-        EventKind::Account {
-            active: false,
-            status,
-        } if matches!(status.as_deref(), Some("takendown" | "suspended")) => {
-            account_purged(
-                state,
-                &did,
-                cursor,
-                "jetstream.account_takendown",
-                status.as_deref(),
-                Some(&marker_rev),
-            )
-            .await
-        }
-        // Historical deactivations aren't news.
-        EventKind::Account { active: false, .. } => ApplyOutcome::Applied,
-        EventKind::Account { active: true, .. } => {
-            account_active(state, &did, Some(&marker_rev)).await
-        }
-        EventKind::Sync { rev } => {
-            let before = rev.clone().unwrap_or(marker_rev);
-            repo_resynced(state, &did, rev.as_deref(), tracked, Some(&before)).await
-        }
         EventKind::Commit(_) | EventKind::Identity { .. } => {
             debug_assert!(
                 false,
@@ -175,15 +101,65 @@ pub async fn apply_replayed_marker(
             );
             ApplyOutcome::Applied
         }
+        kind => {
+            let as_of_us = Some(cursor.time_us());
+            apply_marker(state, tracked, did, cursor, kind, as_of_us).await
+        }
     }
 }
 
-/// The outcome of an event whose database work failed with `e`.
-fn failed(e: &sqlx::Error) -> ApplyOutcome {
-    if crate::db::is_unavailable(e) {
-        ApplyOutcome::Unavailable(e.to_string())
-    } else {
-        ApplyOutcome::Failed(e.to_string())
+/// The ingest event for an account, sync or identity event seen at `cursor`.
+pub(crate) fn marker_event(
+    did: String,
+    cursor: CursorPoint,
+    kind: EventKind,
+    as_of_us: Option<i64>,
+) -> SourceEvent {
+    let (seq, time_us) = (cursor.seq(), Some(cursor.time_us()));
+    match kind {
+        EventKind::Account { active, status } => SourceEvent::Account {
+            did,
+            active,
+            status,
+            as_of_us,
+            seq,
+            time_us,
+        },
+        EventKind::Sync { rev } => SourceEvent::Sync {
+            did,
+            rev,
+            as_of_us,
+            seq,
+            time_us,
+        },
+        EventKind::Identity { handle } => SourceEvent::Identity { did, handle },
+        EventKind::Commit(_) => unreachable!("a commit is not a marker"),
+    }
+}
+
+async fn apply_marker(
+    state: &AppState,
+    tracked: &[String],
+    did: String,
+    cursor: CursorPoint,
+    kind: EventKind,
+    as_of_us: Option<i64>,
+) -> ApplyOutcome {
+    let event = marker_event(did, cursor, kind, as_of_us);
+    worker_outcome(crate::ingest::apply_in(state, event, Some(tracked)).await)
+}
+
+/// What the worker makes of an account, sync or identity event's outcome:
+/// `Unavailable` is held until it applies, any other failure is retried a
+/// few times.
+fn worker_outcome(applied: crate::ingest::Applied) -> ApplyOutcome {
+    let error = || applied.error.clone().unwrap_or_default();
+    match applied.outcome {
+        RecordOutcome::Unavailable => ApplyOutcome::Unavailable(error()),
+        RecordOutcome::Errored | RecordOutcome::Invalid => ApplyOutcome::Failed(error()),
+        RecordOutcome::Matched | RecordOutcome::Skipped | RecordOutcome::SchemaEvent => {
+            ApplyOutcome::Applied
+        }
     }
 }
 
@@ -203,18 +179,28 @@ async fn apply_commit(
         rev: commit.rev,
     };
     let uri = || format!("at://{}/{}/{}", event.did, event.collection, event.rkey);
-    match record_handler::handle_record_event(state, &event).await {
+    let outcome = match event.to_source_event(Origin::Live) {
+        Some(SourceEvent::Record(mut record)) => {
+            record.time_us = Some(cursor.time_us());
+            crate::ingest::apply(state, SourceEvent::Record(record)).await
+        }
+        // An operation the pipeline does not know, judged as before.
+        _ => record_handler::handle_record_event(state, &event).await,
+    };
+    match outcome {
         RecordOutcome::Matched => {
             state
                 .telemetry_counters
-                .jetstream_matched
+                .ingest
+                .matched
                 .fetch_add(1, Ordering::Relaxed);
             ApplyOutcome::Applied
         }
         RecordOutcome::Skipped => {
             state
                 .telemetry_counters
-                .jetstream_skipped
+                .ingest
+                .skipped
                 .fetch_add(1, Ordering::Relaxed);
             ApplyOutcome::Applied
         }
@@ -235,7 +221,8 @@ async fn apply_commit(
         RecordOutcome::Invalid => {
             state
                 .telemetry_counters
-                .jetstream_skipped
+                .ingest
+                .skipped
                 .fetch_add(1, Ordering::Relaxed);
             let uri = uri();
             let error = invalid_reason(&event);
@@ -288,290 +275,13 @@ async fn log(
     .await;
 }
 
-/// `active=false` with `status=deleted`, `takendown` or `suspended` (Decision
-/// A1: a takedown is treated like a deletion; a reinstated account's records
-/// come back only through a new backfill). Write a DID tombstone first, so a
-/// backfill write racing the purge is refused, then purge the DID's network
-/// records; local writes awaiting their echo stay. Account events carry no
-/// repo rev, so the tombstone's rev is a TID of when Jetstream witnessed the
-/// event.
-///
-/// A deletion is what the emitting host says, and a relay can still be
-/// relaying a host the account has migrated away from. So for a deletion
-/// (`status` `None`) of an account this instance holds records for, its
-/// current PDS is asked first (rulings FR2 and E1): if that says the account
-/// is active, nothing is purged or tombstoned, and
-/// `jetstream.account_status_mismatch` is logged. If the PDS cannot be asked,
-/// the relay is trusted. A takedown or suspension is purged on the relay's
-/// word: the relay may have imposed it, and the account's PDS cannot see it.
-///
-/// The tombstone's transaction holds the DID's lock, and `purge_did_records`
-/// takes it again per batch, so that transaction commits before the purge
-/// starts.
-async fn account_purged(
-    state: &AppState,
-    did: &str,
-    cursor: CursorPoint,
-    event_type: &str,
-    status: Option<&str>,
-    before: Option<&str>,
-) -> ApplyOutcome {
-    let backend = state.db_backend;
-    let deleted = status.is_none();
-    let held = deleted
-        && match holds_records(state, did).await {
-            Ok(held) => held,
-            Err(e) => {
-                tracing::warn!(did, error = %e, "failed to check an account's records");
-                return failed(&e);
-            }
-        };
-    if held && let Some(pds) = active_at_pds(state, did).await {
-        let status = "deleted";
-        tracing::warn!(
-            did,
-            status,
-            pds,
-            "the account's PDS says it is active; not purging"
-        );
-        log(
-            state,
-            "jetstream.account_status_mismatch",
-            Severity::Warn,
-            did,
-            serde_json::json!({ "status": status, "pds": pds, "seq": cursor.seq() }),
-        )
-        .await;
-        return ApplyOutcome::Applied;
-    }
-    let rev = crate::tid::tid_from_unix_microseconds(cursor.time_us());
-    let now = now_rfc3339();
-    let (rev, now) = (rev.as_str(), now.as_str());
-    let tombstoned = crate::db::retry_on_busy(|| async move {
-        let mut tx = crate::db::begin_write(&state.db, backend).await?;
-        crate::tombstones::write_did_tombstone(&mut tx, backend, did, rev, cursor.seq(), now)
-            .await?;
-        tx.commit().await
-    })
-    .await;
-    let purged = match tombstoned {
-        Ok(()) => match before {
-            None => crate::tombstones::purge_did_records(&state.records, did, None).await,
-            Some(before) => {
-                crate::tombstones::purge_did_records_before(&state.records, did, None, before).await
-            }
-        },
-        Err(e) => Err(e),
-    };
-    match purged {
-        Ok(0) => ApplyOutcome::Applied,
-        Ok(purged) => {
-            let mut detail = serde_json::json!({ "purged": purged, "seq": cursor.seq() });
-            if let Some(status) = status {
-                detail["status"] = status.into();
-            }
-            if before.is_some() {
-                detail["replayed"] = true.into();
-            }
-            log(state, event_type, Severity::Info, did, detail).await;
-            ApplyOutcome::Applied
-        }
-        // The worker retries the event; `give_up_fn` logs it if it never
-        // applies.
-        Err(e) => {
-            tracing::warn!(did, error = %e, "failed to purge an account's records");
-            failed(&e)
-        }
-    }
-}
-
-/// Whether this instance holds any network records for `did`.
-async fn holds_records(state: &AppState, did: &str) -> Result<bool, sqlx::Error> {
-    state.records.holds_network_records(did, None).await
-}
-
-#[derive(serde::Deserialize)]
-struct RepoStatus {
-    active: bool,
-}
-
-/// The endpoint of `did`'s current PDS when `com.atproto.sync.getRepoStatus`
-/// there says the account is active. `None` when it says otherwise, or when
-/// it cannot be asked within `ACCOUNT_STATUS_TIMEOUT`.
-async fn active_at_pds(state: &AppState, did: &str) -> Option<String> {
-    let check = async {
-        let pds =
-            crate::profile::resolve_pds_endpoint_once(&state.http, &state.config.plc_url, did)
-                .await
-                .map_err(|e| e.message)?;
-        let url = format!(
-            "{}/xrpc/com.atproto.sync.getRepoStatus",
-            pds.trim_end_matches('/')
-        );
-        let response = state
-            .http
-            .get(&url)
-            .query(&[("did", did)])
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("getRepoStatus answered {}", response.status()));
-        }
-        let body = super::compression::read_capped(response, REPO_STATUS_MAX_BYTES).await?;
-        let status: RepoStatus = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-        Ok((pds, status.active))
-    };
-    match tokio::time::timeout(ACCOUNT_STATUS_TIMEOUT, check).await {
-        Ok(Ok((pds, active))) => active.then_some(pds),
-        Ok(Err(error)) => {
-            tracing::debug!(
-                did,
-                error,
-                "could not ask the account's PDS; trusting the relay"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::debug!(
-                did,
-                "the account's PDS did not answer in time; trusting the relay"
-            );
-            None
-        }
-    }
-}
-
-/// Decision A1: a deactivated, desynchronized or throttled account keeps its
-/// records (takedowns and suspensions are purged above). Logged when this
-/// instance holds any.
-async fn account_inactive(state: &AppState, did: &str, status: Option<&str>) -> ApplyOutcome {
-    let held = match holds_records(state, did).await {
-        Ok(held) => held,
-        Err(e) => {
-            tracing::warn!(did, error = %e, "failed to check an inactive account's records");
-            return failed(&e);
-        }
-    };
-    if held {
-        log(
-            state,
-            "jetstream.account_inactive",
-            Severity::Info,
-            did,
-            serde_json::json!({ "status": status }),
-        )
-        .await;
-    }
-    ApplyOutcome::Applied
-}
-
-/// `active=true`. Ruling F6: lift the DID's tombstone, whatever event left
-/// it, so a reinstated account can be backfilled again. Nearly every account
-/// on the network has none, so look before taking the lock.
-async fn account_active(state: &AppState, did: &str, before: Option<&str>) -> ApplyOutcome {
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "SELECT rev FROM happyview_did_tombstones WHERE did = ?",
-        backend,
-    );
-    let found: Result<Option<(String,)>, sqlx::Error> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await;
-    let lifted = match found {
-        Ok(None) => return ApplyOutcome::Applied,
-        // A replayed reactivation older than the tombstone lifts nothing.
-        // TIDs are fixed-width and base32-sortable, so this is the order
-        // `rev_compare` gives.
-        Ok(Some((stored,))) if before.is_some_and(|before| stored.as_str() >= before) => {
-            return ApplyOutcome::Applied;
-        }
-        Ok(Some(_)) => {
-            // The rev check repeats in the DELETE, so a newer tombstone
-            // written since the look above survives too.
-            let delete = adapt_sql(
-                &match before {
-                    None => "DELETE FROM happyview_did_tombstones WHERE did = ?".to_string(),
-                    Some(_) => format!(
-                        "DELETE FROM happyview_did_tombstones WHERE did = ? AND {}",
-                        crate::db::rev_compare(backend, "rev", "<", "?")
-                    ),
-                },
-                backend,
-            );
-            let delete = delete.as_str();
-            crate::db::retry_on_busy(|| async move {
-                let mut tx = crate::db::begin_write(&state.db, backend).await?;
-                crate::tombstones::lock_did(&mut tx, backend, did).await?;
-                let mut query = crate::db::query(delete).bind(did);
-                if let Some(before) = before {
-                    query = query.bind(before);
-                }
-                query.execute(&mut *tx).await?;
-                tx.commit().await
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
-    match lifted {
-        Ok(()) => {
-            tracing::info!(did, "lifted the DID tombstone of a reactivated account");
-            ApplyOutcome::Applied
-        }
-        Err(e) => {
-            tracing::warn!(did, error = %e, "failed to lift a reactivated account's tombstone");
-            failed(&e)
-        }
-    }
-}
-
-/// `#sync`: the repo diverged, and its authoritative records follow as
-/// creates on this same worker. Drop what is held for the DID in tracked
-/// collections so records missing from the replacement set do not linger.
-async fn repo_resynced(
-    state: &AppState,
-    did: &str,
-    rev: Option<&str>,
-    tracked: &[String],
-    before: Option<&str>,
-) -> ApplyOutcome {
-    let collections: Vec<String> = tracked
-        .iter()
-        .filter(|c| c.as_str() != LEXICON_SCHEMA_COLLECTION)
-        .cloned()
-        .collect();
-    let collections = Some(collections.as_slice());
-    let purged = match before {
-        None => crate::tombstones::purge_did_records(&state.records, did, collections).await,
-        Some(before) => {
-            crate::tombstones::purge_did_records_before(&state.records, did, collections, before)
-                .await
-        }
-    };
-    match purged {
-        Ok(0) => ApplyOutcome::Applied,
-        Ok(purged) => {
-            let mut detail = serde_json::json!({ "purged": purged, "rev": rev });
-            if before.is_some() {
-                detail["replayed"] = true.into();
-            }
-            log(state, "jetstream.sync_purged", Severity::Info, did, detail).await;
-            ApplyOutcome::Applied
-        }
-        // As for an account purge, `give_up_fn` logs it if it never applies.
-        Err(e) => {
-            tracing::warn!(did, error = %e, "failed to purge a resynced repo");
-            failed(&e)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{adapt_sql, now_rfc3339};
+    use crate::ingest::REPO_STATUS_MAX_BYTES;
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
+    use std::time::Duration;
 
     const NSID: &str = "app.test.applied";
     const BASE_US: i64 = 1_779_719_000_000_000;
@@ -1252,7 +962,6 @@ mod tests {
     async fn a_purge_that_keeps_failing_logs_one_error_when_given_up() {
         use super::super::watermark::WatermarkHandle;
         use super::super::workers::{Job, RetryPolicy, WorkerPool};
-        use std::time::Duration;
 
         for state in states().await {
             let did = unique_did();

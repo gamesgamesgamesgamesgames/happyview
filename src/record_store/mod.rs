@@ -877,6 +877,43 @@ impl RecordStore {
         Ok(ids.len() as u64)
     }
 
+    /// Up to `limit` DIDs after `after_did`, in ascending order, that hold
+    /// network records in `collections`, read on `pool`. The query of the
+    /// replay job's held-DID sweep, keyed by DID rather than by row id.
+    pub async fn held_dids_page(
+        &self,
+        pool: &AnyPool,
+        collections: &[String],
+        after_did: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if collections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; collections.len()].join(", ");
+        let sql = crate::db::adapt_sql(
+            &format!(
+                "SELECT d.did FROM happyview_dids d WHERE d.did > ? AND EXISTS ( \
+                   SELECT 1 FROM happyview_records_v2 r \
+                   WHERE r.did_id = d.id AND r.indexed_at IS NOT NULL AND r.collection_id IN ( \
+                     SELECT id FROM happyview_collections WHERE nsid IN ({placeholders}))) \
+                 ORDER BY d.did LIMIT ?"
+            ),
+            self.backend,
+        );
+        let mut query = crate::db::query_as::<(String,)>(&sql).bind(after_did.unwrap_or(""));
+        for collection in collections {
+            query = query.bind(collection.as_str());
+        }
+        Ok(query
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(did,)| did)
+            .collect())
+    }
+
     /// [`Self::holds_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(

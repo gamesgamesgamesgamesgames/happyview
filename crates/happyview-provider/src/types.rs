@@ -85,6 +85,12 @@ pub enum SourceEvent {
         active: bool,
         status: Option<String>,
         as_of_us: Option<i64>,
+        /// The source's sequence number for the event, when it has one.
+        /// Logged and kept on a DID tombstone.
+        seq: Option<i64>,
+        /// When the source saw the event. Orders a DID tombstone against
+        /// commit revs; `None` means now.
+        time_us: Option<i64>,
     },
     Identity {
         did: String,
@@ -94,6 +100,10 @@ pub enum SourceEvent {
         did: String,
         rev: Option<String>,
         as_of_us: Option<i64>,
+        /// As for `Account`.
+        seq: Option<i64>,
+        /// As for `Account`.
+        time_us: Option<i64>,
     },
 }
 
@@ -112,12 +122,23 @@ pub enum IngestOutcome {
     Invalid,
 }
 
+/// What the host did with a batch: one outcome per event, in order, and
+/// whether each event changed stored state (`false` for an identical
+/// repeat, a refused write or anything not stored).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchOutcome {
+    pub outcomes: Vec<IngestOutcome>,
+    pub changed: Vec<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackfillKind {
     Manual,
     Automatic,
     /// Jetstream reported `CursorTooOld`; replay from `after_seq`.
-    Gap { after_seq: i64 },
+    Gap {
+        after_seq: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

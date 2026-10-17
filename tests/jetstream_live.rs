@@ -647,7 +647,8 @@ impl Drop for SeqWatch {
 fn received(app: &TestApp) -> u64 {
     app.state
         .telemetry_counters
-        .jetstream_received
+        .ingest
+        .received
         .load(Ordering::Relaxed)
 }
 

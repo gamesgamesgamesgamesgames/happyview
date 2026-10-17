@@ -22,8 +22,10 @@ pub mod feature_flags;
 pub mod feature_middleware;
 #[cfg(unix)]
 pub(crate) mod fs_private;
+pub mod host;
 pub mod http_retry;
 pub mod identity;
+pub mod ingest;
 pub mod jetstream;
 pub mod jobs;
 pub mod labeler;

@@ -1,19 +1,16 @@
-//! Fold archive events into the record store in seq order (spec B.6).
-//! Creates and updates are batched into `write_network`, which applies the
-//! rev guard and tombstones; deletes go through the live record pipeline;
-//! account and sync markers apply as of their own time (P2). A delete of a
-//! buffered record, or a marker for a buffered DID, flushes first, so
-//! per-record and per-DID order holds.
+//! Fold archive events into the record store in seq order (spec B.6),
+//! through the ingest pipeline. Creates and updates are buffered and handed
+//! to `ingest::apply_batch` (CID check, hook, one `write_network`
+//! transaction with the rev guard and tombstones); deletes go through
+//! `ingest::apply`; account and sync markers apply as of their own time (P2).
+//! A delete of a buffered record, or a marker for a buffered DID, flushes
+//! first, so per-record and per-DID order holds.
 
 use std::collections::HashSet;
 
 use crate::AppState;
-use crate::jetstream::apply::apply_replayed_marker;
+use crate::ingest::{Action, IngestOutcome, Origin, RecordEvent, RecordKey, SourceEvent};
 use crate::jetstream::event::{Event, EventKind};
-use crate::jetstream::workers::ApplyOutcome;
-use crate::lua::{RecordEventPayload, RecordHookOutcome, run_record_event_script};
-use crate::record_handler::{RecordEvent, RecordOutcome, handle_record_event};
-use crate::record_store::PreparedRecord;
 
 pub(super) const FOLD_BATCH: usize = 200;
 
@@ -28,8 +25,9 @@ impl std::fmt::Display for FoldError {
 
 pub(super) struct ReplayFold {
     state: AppState,
+    job_id: String,
     tracked: Vec<String>,
-    pending: Vec<PreparedRecord>,
+    pending: Vec<SourceEvent>,
     pending_uris: HashSet<String>,
     pending_dids: HashSet<String>,
     written: u64,
@@ -42,9 +40,10 @@ pub(super) struct ReplayFold {
 
 impl ReplayFold {
     /// `tracked`: the job's collections, which scope a `#sync` purge.
-    pub(super) fn new(state: AppState, tracked: Vec<String>) -> Self {
+    pub(super) fn new(state: AppState, job_id: &str, tracked: Vec<String>) -> Self {
         Self {
             state,
+            job_id: job_id.to_string(),
             tracked,
             pending: Vec::with_capacity(FOLD_BATCH),
             pending_uris: HashSet::new(),
@@ -76,6 +75,12 @@ impl ReplayFold {
         self.pending_dids.contains(did)
     }
 
+    fn origin(&self) -> Origin {
+        Origin::Backfill {
+            job_id: self.job_id.clone(),
+        }
+    }
+
     pub(super) async fn apply(&mut self, event: Event) -> Result<(), FoldError> {
         let Event { did, cursor, kind } = event;
         match kind {
@@ -84,17 +89,22 @@ impl ReplayFold {
                 if self.pending_uris.contains(&uri) {
                     self.flush().await?;
                 }
-                let event = RecordEvent {
-                    did,
-                    collection: commit.collection,
-                    rkey: commit.rkey,
-                    action: "delete".to_string(),
-                    record: None,
+                let event = SourceEvent::Record(RecordEvent {
+                    key: RecordKey {
+                        did,
+                        collection: commit.collection,
+                        rkey: commit.rkey,
+                    },
+                    action: Action::Delete,
                     cid: None,
                     rev: commit.rev,
-                };
-                match handle_record_event(&self.state, &event).await {
-                    RecordOutcome::Errored | RecordOutcome::Unavailable => Err(FoldError(format!(
+                    body: None,
+                    time_us: Some(cursor.time_us()),
+                    origin: self.origin(),
+                    stored: false,
+                });
+                match crate::ingest::apply(&self.state, event).await {
+                    IngestOutcome::Errored | IngestOutcome::Unavailable => Err(FoldError(format!(
                         "deleting {uri} failed; see its record event log"
                     ))),
                     _ => Ok(()),
@@ -104,59 +114,49 @@ impl ReplayFold {
                 let Some(record) = commit.record else {
                     return Ok(());
                 };
-                let uri = format!("at://{did}/{}/{}", commit.collection, commit.rkey);
-                // Spec B.6: verify each record's CID, as the crawl does. The
-                // CID is the payload's own, so a mismatch means the JSON form
-                // of the payload does not re-encode to it; skip the record.
-                if let Some(cid) = &commit.cid
-                    && crate::cid_verify::verify_record_cid(cid, &record)
-                        == crate::cid_verify::CidCheck::Mismatch
-                {
-                    tracing::warn!(uri, claimed_cid = %cid, "replayed record does not match its CID, skipping");
-                    return Ok(());
-                }
-                let body = match run_record_event_script(
-                    &self.state,
-                    RecordEventPayload {
-                        nsid: &commit.collection,
-                        action: &commit.operation,
-                        uri: &uri,
-                        did: &did,
-                        rkey: &commit.rkey,
-                        record: Some(&record),
-                    },
-                )
-                .await
-                {
-                    RecordHookOutcome::Skip => return Ok(()),
-                    RecordHookOutcome::Replace(replaced) => replaced,
-                    RecordHookOutcome::Proceed => record,
+                let action = match commit.operation.as_str() {
+                    "update" => Action::Update,
+                    _ => Action::Create,
                 };
-                self.pending.push(PreparedRecord {
+                let key = RecordKey {
                     did: did.clone(),
                     collection: commit.collection,
                     rkey: commit.rkey,
-                    record_json: serde_json::to_string(&body)
-                        .map_err(|e| FoldError(format!("{uri} does not serialize: {e}")))?,
-                    cid: commit.cid.unwrap_or_default(),
-                    rev: commit.rev,
-                });
-                self.pending_uris.insert(uri);
+                };
+                self.pending_uris.insert(key.uri());
                 self.pending_dids.insert(did);
+                self.pending.push(SourceEvent::Record(RecordEvent {
+                    key,
+                    action,
+                    // Spec B.6: the pipeline verifies each record's CID, as
+                    // the crawl does. The CID is the payload's own, so a
+                    // mismatch means the JSON form of the payload does not
+                    // re-encode to it; the record is skipped.
+                    cid: commit.cid,
+                    rev: commit.rev,
+                    body: Some(record),
+                    time_us: Some(cursor.time_us()),
+                    origin: self.origin(),
+                    stored: false,
+                }));
                 if self.pending.len() >= FOLD_BATCH {
                     self.flush().await?;
                 }
                 Ok(())
             }
-            EventKind::Account { .. } | EventKind::Sync { .. } => {
+            kind @ (EventKind::Account { .. } | EventKind::Sync { .. }) => {
                 if self.pending_dids.contains(&did) {
                     self.flush().await?;
                 }
-                match apply_replayed_marker(&self.state, &self.tracked, Event { did, cursor, kind })
-                    .await
-                {
-                    ApplyOutcome::Applied => Ok(()),
-                    ApplyOutcome::Unavailable(e) | ApplyOutcome::Failed(e) => Err(FoldError(e)),
+                let as_of_us = Some(cursor.time_us());
+                let event = crate::jetstream::apply::marker_event(did, cursor, kind, as_of_us);
+                let applied =
+                    crate::ingest::apply_in(&self.state, event, Some(&self.tracked)).await;
+                match applied.outcome {
+                    IngestOutcome::Unavailable
+                    | IngestOutcome::Errored
+                    | IngestOutcome::Invalid => Err(FoldError(applied.error.unwrap_or_default())),
+                    _ => Ok(()),
                 }
             }
             EventKind::Identity { .. } => Ok(()),
@@ -170,26 +170,37 @@ impl ReplayFold {
         let batch = std::mem::take(&mut self.pending);
         self.pending_uris.clear();
         self.pending_dids.clear();
-        let state = &self.state;
-        let changed =
-            crate::db::retry_on_busy(|| state.records.write_network(&state.backfill_db, &batch))
-                .await
-                .map_err(|e| {
-                    FoldError(format!(
-                        "writing {} replayed records failed: {e}",
-                        batch.len()
-                    ))
-                })?;
-        self.written += changed.len() as u64;
-        let uris: Vec<String> = changed.into_iter().map(|c| c.uri).collect();
-        if self.collect_dids {
-            self.written_dids.extend(uris.iter().filter_map(|uri| {
-                uri.strip_prefix("at://")
-                    .and_then(|rest| rest.split('/').next())
-                    .map(str::to_string)
-            }));
+        let count = batch.len();
+        let dids: Vec<String> = batch
+            .iter()
+            .map(|event| match event {
+                SourceEvent::Record(ev) => ev.key.did.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        let (outcome, error) = crate::ingest::apply_batch_in(&self.state, batch).await;
+        if let Some(e) = error {
+            return Err(FoldError(format!(
+                "writing {count} replayed records failed: {e}"
+            )));
         }
-        super::queue_label_backfill(state, &uris).await;
+        if outcome
+            .outcomes
+            .iter()
+            .any(|o| matches!(o, IngestOutcome::Errored | IngestOutcome::Unavailable))
+        {
+            return Err(FoldError(format!(
+                "writing {count} replayed records failed; see the record event log"
+            )));
+        }
+        for (changed, did) in outcome.changed.iter().zip(dids) {
+            if *changed {
+                self.written += 1;
+                if self.collect_dids {
+                    self.written_dids.insert(did);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -263,7 +274,7 @@ mod tests {
     }
 
     fn fresh(state: &AppState) -> ReplayFold {
-        ReplayFold::new(state.clone(), vec![NSID.to_string()])
+        ReplayFold::new(state.clone(), "job", vec![NSID.to_string()])
     }
 
     async fn text(state: &AppState, did: &str, rkey: &str) -> Option<String> {

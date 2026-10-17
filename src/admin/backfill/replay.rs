@@ -80,7 +80,7 @@ pub(super) async fn run(
         state,
         job_id,
         client: ArchiveClient::new(&endpoint, &state.archive),
-        fold: ReplayFold::new(state.clone(), collections.to_vec()),
+        fold: ReplayFold::new(state.clone(), job_id, collections.to_vec()),
         errors: ErrorRecorder::new(state, job_id).await,
         counted: 0,
         records_counted: 0,

@@ -50,6 +50,7 @@ lto = "thin"
 aes-gcm = "0.11"
 anyhow = "1"
 arc-swap = "1"
+async-trait = "0.1"
 wasmparser = "0.258"
 atrium-oauth = { version = "0.1", default-features = false }
 atrium-identity = "0.1"
