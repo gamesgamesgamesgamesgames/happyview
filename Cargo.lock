@@ -2098,14 +2098,19 @@ dependencies = [
 name = "happyview-source-jetstream"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "chrono",
+ "futures-util",
  "happyview-provider",
  "reqwest",
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
  "serial_test",
+ "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "wiremock",

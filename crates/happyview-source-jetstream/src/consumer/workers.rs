@@ -327,7 +327,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use crate::jetstream::event::{CursorPoint, EventKind};
+    use crate::consumer::event::{CursorPoint, EventKind};
 
     fn event(did: &str, seq: i64) -> Event {
         Event {

@@ -10,9 +10,12 @@ use std::time::Duration;
 
 use happyview::db::DatabaseBackend;
 use happyview::db::adapt_sql;
-use happyview::jetstream::config::{DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint};
-use happyview::jetstream::workers::RetryPolicy;
+use happyview::host::AppHost;
 use happyview::lexicon::ProcedureAction;
+use happyview_source_jetstream::consumer::config::{
+    DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
+};
+use happyview_source_jetstream::consumer::workers::RetryPolicy;
 use serde_json::{Value, json};
 use serial_test::serial;
 use tokio::sync::watch;
@@ -96,11 +99,17 @@ fn fast_retries() -> RetryPolicy {
 }
 
 fn start(app: &TestApp, settings: Settings) -> Consumer {
-    let (tx, rx) = watch::channel(vec![GAME.to_string()]);
+    let (tx, _) = watch::channel(vec![GAME.to_string()]);
     let mut state = app.state.clone();
     state.config.jetstream_url = settings.endpoint.ws_base.clone();
+    // The consumer reads the tracked collections from its host.
+    state.collections_tx = tx.clone();
     Consumer {
-        handle: happyview::jetstream::spawn_with(state, rx, settings, Some(fast_retries())),
+        handle: happyview_source_jetstream::consumer::spawn_with(
+            AppHost::new(state),
+            settings,
+            Some(fast_retries()),
+        ),
         _collections: tx,
     }
 }

@@ -192,6 +192,8 @@ pub struct InstanceInfo {
     pub plc_url: String,
     pub relay_url: String,
     pub public_url: String,
+    /// The `User-Agent` HappyView sends, for a provider's own HTTP clients.
+    pub user_agent: String,
 }
 
 #[derive(Debug, thiserror::Error)]

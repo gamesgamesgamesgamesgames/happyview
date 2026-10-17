@@ -1,8 +1,9 @@
-//! `BuiltinSource`: the in-tree Jetstream consumer and backfill behind the
-//! `RecordSource` contract (plan ruling C1: route HappyView through the
-//! contract first, move the code into its crate after).
+//! `BuiltinSource`: the Jetstream consumer (from `happyview_source_jetstream`)
+//! and the in-tree backfill behind the `RecordSource` contract (plan ruling
+//! C1: route HappyView through the contract first, move the code into its
+//! crate after).
 //!
-//! The code it wraps still takes an `AppState`, so the source holds one,
+//! The backfill code it wraps still takes an `AppState`, so the source holds one,
 //! attached by whoever built the state: `run` before it calls `start`, and the
 //! test state builders. The state it holds reaches back to the source through
 //! a weak handle, so an instance and its source do not keep each other (and
@@ -11,7 +12,7 @@
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
-use tokio::sync::watch;
+use futures_util::FutureExt;
 
 use happyview_provider::{
     BackfillError, BackfillKind, BackfillRequest, Host, ProviderError, RecordSource,
@@ -19,6 +20,8 @@ use happyview_provider::{
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::jetstream::GapReplay;
+use crate::jetstream::archive::SourceChoice;
 
 /// Tables counted into telemetry `totals`, as (payload key, table name).
 const COUNTED_TABLES: &[(&str, &str)] = &[
@@ -37,9 +40,6 @@ pub struct BuiltinSource {
     /// `false` for a test state's source: `start` spawns nothing.
     live: bool,
     state: RwLock<Option<AppState>>,
-    /// The receiver made with the instance's collections channel, which the
-    /// consumer has always been given, taken by `start`.
-    collections_rx: Mutex<Option<watch::Receiver<Vec<String>>>>,
 }
 
 impl BuiltinSource {
@@ -62,7 +62,7 @@ impl BuiltinSource {
     /// state after building it and needs the source to see the change.
     pub fn attached(state: &AppState) -> Arc<Self> {
         let source = Arc::new(Self::detached());
-        source.attach(state, None);
+        source.attach(state);
         source
     }
 
@@ -70,26 +70,15 @@ impl BuiltinSource {
         Self {
             live,
             state: RwLock::new(None),
-            collections_rx: Mutex::new(None),
         }
     }
 
     /// Hold `state` (its own handle to this source made weak) for the
     /// in-tree code this source calls.
-    pub fn attach(
-        self: &Arc<Self>,
-        state: &AppState,
-        collections_rx: Option<watch::Receiver<Vec<String>>>,
-    ) {
+    pub fn attach(self: &Arc<Self>, state: &AppState) {
         let mut held = state.clone();
         held.source = Arc::new(SourceRef(Arc::downgrade(self)));
         *self.state.write().unwrap_or_else(|e| e.into_inner()) = Some(held);
-        if let Some(rx) = collections_rx {
-            *self
-                .collections_rx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(rx);
-        }
     }
 
     fn state(&self) -> Option<AppState> {
@@ -99,11 +88,7 @@ impl BuiltinSource {
 
 /// Attach `state` to `source` when it is a [`BuiltinSource`] made by
 /// [`BuiltinSource::new`]. Any other source is left alone.
-pub(crate) fn attach_if_builtin(
-    source: &Arc<dyn RecordSource>,
-    state: &AppState,
-    collections_rx: watch::Receiver<Vec<String>>,
-) -> bool {
+pub(crate) fn attach_if_builtin(source: &Arc<dyn RecordSource>, state: &AppState) -> bool {
     let address = Arc::as_ptr(source) as *const ();
     let found = ATTACHABLE
         .lock()
@@ -113,11 +98,25 @@ pub(crate) fn attach_if_builtin(
         .and_then(Weak::upgrade);
     match found {
         Some(builtin) => {
-            builtin.attach(state, Some(collections_rx));
+            builtin.attach(state);
             true
         }
         None => false,
     }
+}
+
+/// The consumer's gap replay for `state`: the in-tree archive replay, or
+/// `None` when backfill only crawls, which never asks the archive (P8).
+pub fn gap_replay(state: &AppState) -> Option<GapReplay> {
+    if state.archive.default_source == SourceChoice::Crawl {
+        return None;
+    }
+    let state = state.clone();
+    Some(Arc::new(move |after_seq| {
+        let state = state.clone();
+        async move { crate::admin::backfill::replay::start_gap_replay(&state, after_seq).await }
+            .boxed()
+    }))
 }
 
 fn backfill_error(e: AppError) -> BackfillError {
@@ -155,14 +154,12 @@ impl RecordSource for BuiltinSource {
                 "the builtin record source was started with no instance attached".into(),
             ));
         };
-        let collections_rx = self
-            .collections_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .unwrap_or_else(|| host.tracked_collections());
-
-        crate::jetstream::spawn(state.clone(), collections_rx);
+        crate::jetstream::spawn_with_gap_replay(
+            host,
+            crate::jetstream::config::Settings::from_env(&state.config.jetstream_url),
+            None,
+            gap_replay(&state),
+        );
 
         crate::admin::backfill::resume_backfill_jobs(&state).await;
 

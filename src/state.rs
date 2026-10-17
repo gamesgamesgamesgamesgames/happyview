@@ -129,6 +129,6 @@ pub fn state_with_pool_on(
         test: None,
     };
     // Backfills and their admin routes work on this state; nothing is started.
-    source.attach(&state, None);
+    source.attach(&state);
     state
 }

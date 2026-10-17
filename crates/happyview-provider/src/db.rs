@@ -4,6 +4,58 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Deserialize;
+use sqlx::any::{AnyArguments, AnyRow};
+use sqlx::query::{Query, QueryAs, QueryScalar};
+use sqlx::{Any, AssertSqlSafe, FromRow};
+use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_query_scalar};
+
+// ---------------------------------------------------------------------------
+// SQL query helpers (sqlx 0.9 `SqlSafeStr`)
+// ---------------------------------------------------------------------------
+//
+// sqlx 0.9 requires the SQL passed to `query*` to implement `SqlSafeStr`, which
+// only `&'static str` satisfies directly — runtime strings must be wrapped in
+// `AssertSqlSafe`. Almost every query here is a static SQLite template run
+// through `adapt_sql`, where no user-supplied *value* is concatenated, since
+// values vary only as bound `?` placeholders. Two kinds of exception make the
+// assertion a claim about validation rather than about the absence of
+// interpolation:
+//
+//   * Identifiers and JSON field paths are interpolated, because `adapt_sql`
+//     rewrites SQL text and cannot reach a bound path. Each passes a
+//     validating helper first — `plugin::host::records::is_valid_identifier`
+//     and this module's `is_valid_json_field_path`, which admit only letters,
+//     digits, underscore, dot and a bracketed numeric index — and
+//     `records.rs` is the only module that interpolates caller-controlled
+//     text at all.
+//   * `plugin::host::db`'s `run_query` and `run_execute` pass a plugin's
+//     entire statement through untranslated. There is no template there: what
+//     stands in for one is `raw_sql_guard::check_raw_sql_tables` plus the
+//     `database:read`/`database:write` capability.
+//
+// Routing all dynamic queries through these three helpers keeps that assertion
+// in one audited place instead of at ~460 call sites. Backend is always `Any`.
+
+/// `sqlx::query` for a runtime-built (adapted) SQL string.
+pub fn query<'q>(sql: &str) -> Query<'q, Any, AnyArguments> {
+    sqlx_query(AssertSqlSafe(sql.to_owned()))
+}
+
+/// `sqlx::query_as` for a runtime-built (adapted) SQL string.
+pub fn query_as<'q, O>(sql: &str) -> QueryAs<'q, Any, O, AnyArguments>
+where
+    O: for<'r> FromRow<'r, AnyRow>,
+{
+    sqlx_query_as(AssertSqlSafe(sql.to_owned()))
+}
+
+/// `sqlx::query_scalar` for a runtime-built (adapted) SQL string.
+pub fn query_scalar<'q, O>(sql: &str) -> QueryScalar<'q, Any, O, AnyArguments>
+where
+    (O,): for<'r> FromRow<'r, AnyRow>,
+{
+    sqlx_query_scalar(AssertSqlSafe(sql.to_owned()))
+}
 
 /// Attempts `retry_on_busy` makes before giving the error back.
 pub const BUSY_RETRY_ATTEMPTS: u32 = 3;

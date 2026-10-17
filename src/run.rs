@@ -1103,7 +1103,7 @@ async fn boot(
         script_limits,
         test: None,
     };
-    crate::builtin_source::attach_if_builtin(&state.source, &state, collections_rx.clone());
+    crate::builtin_source::attach_if_builtin(&state.source, &state);
 
     // Populate record_refs once, for records indexed before the table existed.
     // Spawned before anything that writes records starts, as it was before

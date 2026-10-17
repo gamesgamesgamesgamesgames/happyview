@@ -29,6 +29,11 @@ impl Host for AppHost {
         crate::ingest::apply(&self.state, event).await
     }
 
+    async fn ingest_with_error(&self, event: SourceEvent) -> (IngestOutcome, Option<String>) {
+        let applied = crate::ingest::apply_in(&self.state, event).await;
+        (applied.outcome, applied.error)
+    }
+
     async fn ingest_batch(&self, events: Vec<SourceEvent>) -> BatchOutcome {
         crate::ingest::apply_batch(&self.state, events).await
     }
@@ -101,6 +106,7 @@ impl Host for AppHost {
             plc_url: self.state.config.plc_url.clone(),
             relay_url: self.state.config.relay_url.clone(),
             public_url: self.state.config.public_url.clone(),
+            user_agent: crate::version::user_agent(),
         }
     }
 

@@ -6,6 +6,7 @@ mod common;
 use common::app::TestApp;
 use common::jetstream::{self as js, MockJetstream};
 use common::segment_writer::write_segment;
+use happyview::host::AppHost;
 use happyview::jetstream::archive::SourceChoice;
 use happyview::jetstream::archive::client::{ArchiveClient, PlanMode, PlanRequest};
 use happyview::jetstream::archive::{ArchiveConfig, rows, segment};
@@ -289,7 +290,12 @@ async fn replay_matches_applying_the_same_events_live() {
             payload: event.payload,
         };
         if let Some(event) = rows::row_to_event(row).unwrap() {
-            happyview::jetstream::apply::apply_event(&app.state, &[GAME.to_string()], event).await;
+            happyview::jetstream::apply::apply_event(
+                &*AppHost::new(app.state.clone()),
+                &[GAME.to_string()],
+                event,
+            )
+            .await;
         }
     }
     assert_eq!(dump(&app).await, replayed);
@@ -568,7 +574,12 @@ async fn replay_never_resurrects_a_record_deleted_live() {
         else {
             panic!("an event")
         };
-        happyview::jetstream::apply::apply_event(&app.state, &[GAME.to_string()], event).await;
+        happyview::jetstream::apply::apply_event(
+            &*AppHost::new(app.state.clone()),
+            &[GAME.to_string()],
+            event,
+        )
+        .await;
     }
     let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
     assert_eq!(finished(&app, &id).await["status"], "completed");
@@ -896,8 +907,15 @@ async fn the_live_stream_never_sees_the_api_key() {
     mock.seal(games(1..=4, "did:plc:key"), 4);
     let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
     assert_eq!(finished(&app, &id).await["status"], "completed");
-    let (tx, rx) = tokio::sync::watch::channel(vec![GAME.to_string()]);
-    let consumer = happyview::jetstream::spawn(app.state.clone(), rx);
+    let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
+    let mut state = app.state.clone();
+    state.collections_tx = tx.clone();
+    let consumer = happyview::jetstream::spawn_with_gap_replay(
+        AppHost::new(state.clone()),
+        happyview::jetstream::config::Settings::from_env(&state.config.jetstream_url),
+        None,
+        happyview::builtin_source::gap_replay(&state),
+    );
     wait_until!("a live connection", !mock.connections().is_empty());
     consumer.abort();
     drop(tx);
@@ -1692,12 +1710,14 @@ fn consume(
     tokio::task::JoinHandle<()>,
     tokio::sync::watch::Sender<Vec<String>>,
 ) {
-    let (tx, rx) = tokio::sync::watch::channel(vec![GAME.to_string()]);
-    let handle = happyview::jetstream::spawn_with(
-        app.state.clone(),
-        rx,
+    let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
+    let mut state = app.state.clone();
+    state.collections_tx = tx.clone();
+    let handle = happyview::jetstream::spawn_with_gap_replay(
+        AppHost::new(state.clone()),
         settings(mock),
         Some(fast_retries()),
+        happyview::builtin_source::gap_replay(&state),
     );
     (handle, tx)
 }

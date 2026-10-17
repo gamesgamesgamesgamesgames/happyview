@@ -1140,8 +1140,7 @@ async fn active_at_pds(state: &AppState, did: &str) -> Option<String> {
         if !response.status().is_success() {
             return Err(format!("getRepoStatus answered {}", response.status()));
         }
-        let body =
-            crate::jetstream::compression::read_capped(response, REPO_STATUS_MAX_BYTES).await?;
+        let body = happyview_provider::http::read_capped(response, REPO_STATUS_MAX_BYTES).await?;
         let status: RepoStatus = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
         Ok((pds, status.active))
     };

@@ -28,6 +28,11 @@ pub struct IngestCounters {
 #[async_trait]
 pub trait Host: Send + Sync + 'static {
     async fn ingest(&self, event: SourceEvent) -> IngestOutcome;
+    /// [`Host::ingest`], with the error text behind a failed account or sync
+    /// event, for a source that reports it once it gives the event up.
+    async fn ingest_with_error(&self, event: SourceEvent) -> (IngestOutcome, Option<String>) {
+        (self.ingest(event).await, None)
+    }
     /// In order, in one write transaction where the storage allows.
     async fn ingest_batch(&self, events: Vec<SourceEvent>) -> BatchOutcome;
     fn tracked_collections(&self) -> watch::Receiver<Vec<String>>;
