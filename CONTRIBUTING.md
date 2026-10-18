@@ -117,7 +117,7 @@ docker compose -f docker-compose.test.yml down
 ```
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
-file. CI covers only Postgres, so run it this way once when you change SQL,
+file. Leaving the variable unset does not test SQLite: the database-backed tests skip silently, so point it at a file URL as below. Run it this way once when you change SQL,
 migrations or anything that touches the write path:
 
 ```bash
@@ -189,6 +189,10 @@ run — so without the build above every save is refused and the suite stops in
 only when the volume is new: on a reused one the PDS and PLC containers
 crash-loop over missing databases, and the specs that cover first-run setup
 need a database where setup has not happened.
+
+## The provider contract
+
+The `happyview-provider` crate is the contract that record sources and stores implement, and it is licensed MIT OR Apache-2.0 so providers can be built under any terms. A change to it is a contract change. If the change breaks existing providers, bump `CONTRACT_VERSION` in `crates/happyview-provider/src/types.rs`. See [Record providers](packages/docs/content/docs/guides/record-providers.md).
 
 ## Code of conduct
 
