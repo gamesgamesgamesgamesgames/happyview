@@ -16,7 +16,7 @@ use happyview::Providers;
 use happyview::record_store::PreparedRecord;
 use happyview::testkit::conformance::{self, COLLECTION, Feeder};
 use happyview_provider::testkit::ScriptedSource;
-use happyview_provider::{RecordEvent, SourceEvent};
+use happyview_provider::{Delta, RecordEvent, SourceEvent};
 
 use common::fake_storage::FakeStorage;
 
@@ -92,6 +92,37 @@ async fn a_claiming_external_store_conforms() {
                 RecordEvent {
                     stored: true,
                     ..event
+                }
+            })
+        });
+        // What the served view cannot show: nothing of the claimed
+        // collection was written locally, and core spoke to the store.
+        let seen = storage.clone();
+        let feeder = feeder.after_each(move |case, app| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                assert_eq!(
+                    app.local_rows(COLLECTION).await,
+                    0,
+                    "a claimed collection has no local rows"
+                );
+                let deltas = seen.deltas();
+                assert!(!deltas.is_empty(), "core wrote no delta to the store");
+                if case == "delete_removes_the_record" {
+                    // The store removed the record itself; what core owes it
+                    // is clearing this instance's delta, at the delete's rev.
+                    let deleted: Vec<_> = deltas
+                        .iter()
+                        .filter(|(key, _, _)| key.rkey == "a1")
+                        .collect();
+                    let (_, first, created_at) = deleted.first().expect("a1 had a delta");
+                    let (_, last, deleted_at) = deleted.last().unwrap();
+                    assert_eq!(*first, Delta::Proceed, "a1's create proceeded");
+                    assert_eq!(*last, Delta::Proceed, "the delete cleared a1's delta");
+                    assert!(
+                        deleted_at.is_some() && deleted_at > created_at,
+                        "the delete's delta is at the delete's rev: {deleted:?}"
+                    );
                 }
             })
         });

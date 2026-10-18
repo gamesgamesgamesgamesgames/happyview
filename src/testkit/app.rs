@@ -91,8 +91,43 @@ pub async fn acquire_test_lock() -> Option<TestLock> {
     Some(TestLock::Postgres(lock_pool))
 }
 
+/// Panics unless `pool` is connected to the `TEST_DATABASE_URL` database
+/// (same backend, host, port and database or file), so a helper that wipes
+/// data never runs against any other.
+pub fn assert_test_pool(pool: &AnyPool) {
+    let url = test_database_url();
+    let expected: sqlx::any::AnyConnectOptions = url
+        .parse()
+        .unwrap_or_else(|e| panic!("TEST_DATABASE_URL does not parse: {e}"));
+    let expected = &expected.database_url;
+    let options = pool.connect_options();
+    let actual = &options.database_url;
+    let backend_of = |scheme: &str| DatabaseBackend::from_url(&format!("{scheme}:"));
+    assert!(
+        backend_of(actual.scheme()) == test_backend(),
+        "refusing to wipe a {} pool: TEST_DATABASE_URL is a {:?} database",
+        actual.scheme(),
+        test_backend()
+    );
+    let same = actual.scheme() == expected.scheme()
+        && actual.host_str() == expected.host_str()
+        && actual.port_or_known_default() == expected.port_or_known_default()
+        && actual.path() == expected.path();
+    assert!(
+        same,
+        "refusing to wipe a pool that is not on the TEST_DATABASE_URL database \
+         (the pool is on {}://{}{})",
+        actual.scheme(),
+        actual.host_str().unwrap_or(""),
+        actual.path()
+    );
+}
+
 /// Empty every table a test writes, so the next test starts from nothing.
+/// Test-only and destructive: refuses (panics) unless `pool` is on the
+/// `TEST_DATABASE_URL` database.
 pub async fn truncate_all(pool: &AnyPool) {
+    assert_test_pool(pool);
     match test_backend() {
         DatabaseBackend::Postgres => {
             // The catalog's tables by their constants: only `catalog` spells them.
@@ -400,6 +435,21 @@ mod provider_app {
             body["backfill_job_id"].as_str().map(str::to_string)
         }
 
+        /// Rows of `collection` in the instance's own record table, whatever
+        /// the routing: 0 for a collection an external storage claims.
+        pub async fn local_rows(&self, collection: &str) -> i64 {
+            let sql = db::adapt_sql(
+                "SELECT COUNT(*) FROM happyview_records_v2 WHERE collection_id = \
+                 (SELECT id FROM happyview_collections WHERE nsid = ?)",
+                self.state.db_backend,
+            );
+            db::query_scalar::<i64>(&sql)
+                .bind(collection)
+                .fetch_one(&self.state.db)
+                .await
+                .expect("counting local rows")
+        }
+
         /// The `script.log` events hooks wrote, oldest first: each one's
         /// message and fields.
         pub async fn script_logs(&self) -> Vec<(String, Value)> {
@@ -475,5 +525,28 @@ mod provider_app {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wiping helpers accept a pool on the test database and refuse
+    /// any other, whichever backend the test database is.
+    #[tokio::test]
+    async fn the_wipe_guard_refuses_a_pool_off_the_test_database() {
+        if std::env::var("TEST_DATABASE_URL").is_err() {
+            return;
+        }
+        let on = test_pool().await;
+        assert_test_pool(&on);
+        let off = crate::test_support::memory_pool().await;
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_test_pool(&off)));
+        assert!(
+            refused.is_err(),
+            "a pool off the test database was let through"
+        );
     }
 }

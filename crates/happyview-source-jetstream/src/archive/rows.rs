@@ -13,7 +13,7 @@ pub(crate) const KIND_UPDATE: u8 = 2;
 pub(crate) const KIND_DELETE: u8 = 3;
 // The archive's identity rows are dropped unread; the kind is named for
 // the tests that check so.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) const KIND_IDENTITY: u8 = 4;
 pub(crate) const KIND_ACCOUNT: u8 = 5;
 pub(crate) const KIND_SYNC: u8 = 6;

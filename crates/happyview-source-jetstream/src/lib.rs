@@ -3,7 +3,8 @@
 
 //!
 //! The stable API is what this page lists: [`JetstreamSource`] and its
-//! builder, the types the builder takes, and the composition types a
+//! builder, the types the builder takes ([`Settings`], [`ArchiveConfig`])
+//! with the types their public fields hold, and the composition types a
 //! provider built on this source implements or is handed
 //! ([`BackfillExecutor`], [`JobHandle`], [`JobTotals`]). The modules are
 //! public only so HappyView's own tests can reach the source's internals;
@@ -23,7 +24,8 @@ pub mod consumer;
 #[doc(hidden)]
 pub mod source;
 
-pub use archive::ArchiveConfig;
+pub use archive::pacer::{BytePacer, Quota};
+pub use archive::{ArchiveConfig, SourceChoice};
 pub use compose::{BackfillExecutor, JobHandle, JobTotals};
-pub use consumer::config::Settings;
+pub use consumer::config::{Endpoint, ProtocolChoice, Settings};
 pub use source::{JetstreamSource, JetstreamSourceBuilder};

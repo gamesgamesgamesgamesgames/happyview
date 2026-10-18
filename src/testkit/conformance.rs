@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use happyview_provider::{Action, Origin, RecordEvent, RecordKey, SourceEvent};
@@ -25,18 +26,29 @@ use crate::Providers;
 /// The collection every case writes.
 pub const COLLECTION: &str = "com.example.conformance.note";
 
+/// How long one case, boot included, may take before it fails.
+const CASE_TIMEOUT: Duration = Duration::from_secs(60);
+
 const ALICE: &str = "did:plc:conformancealice";
 const BOB: &str = "did:plc:conformancebob";
 
-/// Appends ` (hooked)` to the record's text.
-const MARK: &str = r#"function handle(input)
+/// Logs that it ran, then appends ` (hooked)` to the record's text.
+const MARK: &str = r#"local log = require("internal.logging")
+
+function handle(input)
+  log.info("mark hook", { uri = input.uri, action = input.action })
   local record = input.record
   record.text = record.text .. " (hooked)"
   return record
 end"#;
 
-/// Skips every record.
-const SKIP: &str = "function handle(input) return nil end";
+/// Logs that it ran, then skips the record.
+const SKIP: &str = r#"local log = require("internal.logging")
+
+function handle(input)
+  log.info("skip hook", { uri = input.uri })
+  return nil
+end"#;
 
 /// Logs the text of the body a delete carried, and lets the delete proceed.
 const LOG_DELETE: &str = r#"local log = require("internal.logging")
@@ -49,6 +61,11 @@ function handle(input)
 end"#;
 
 type Feed = Box<dyn Fn(RecordEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// What [`Feeder::after_each`] returns: a check of the instance a case left.
+pub type CheckFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+
+type Check = Box<dyn for<'a> Fn(&'static str, &'a ProviderApp) -> CheckFuture<'a> + Send + Sync>;
 
 /// How a case puts records into the provider's world.
 ///
@@ -66,6 +83,7 @@ pub struct Feeder {
     put: Feed,
     delete: Feed,
     delete_bodies: bool,
+    check: Option<Check>,
 }
 
 impl Feeder {
@@ -80,7 +98,20 @@ impl Feeder {
             put: Box::new(move |event| Box::pin(put(event))),
             delete: Box::new(move |event| Box::pin(delete(event))),
             delete_bodies: true,
+            check: None,
         }
+    }
+
+    /// A provider's own check, run after each case passes, with the case's
+    /// name and the instance it left: what the provider can see that the
+    /// served view cannot, such as where the records were written. A
+    /// failure fails the case.
+    pub fn after_each<C>(mut self, check: C) -> Self
+    where
+        C: for<'a> Fn(&'static str, &'a ProviderApp) -> CheckFuture<'a> + Send + Sync + 'static,
+    {
+        self.check = Some(Box::new(check));
+        self
     }
 
     /// The deletes this feeder delivers carry no body, so no case expects
@@ -118,21 +149,33 @@ where
     );
 
     let mut failures: Vec<String> = Vec::new();
+    // Each case in a block of its own: its providers, feeder and source's
+    // stream are dropped, and the test database's lock released, before the
+    // next case boots.
     macro_rules! cases {
-        ($($case:ident),* $(,)?) => {$(
-            let (providers, feeder) = make().await;
-            let app = ProviderApp::new(providers).await;
-            let outcome = AssertUnwindSafe($case(&app, &feeder)).catch_unwind().await;
-            drop(app);
-            match outcome {
-                Ok(()) => eprintln!("conformance: {} ok", stringify!($case)),
-                Err(panic) => {
-                    let failure = format!("{}: {}", stringify!($case), panic_message(&panic));
+        ($($case:ident),* $(,)?) => {$({
+            let name = stringify!($case);
+            let case = AssertUnwindSafe(async {
+                let (providers, feeder) = make().await;
+                let app = ProviderApp::new(providers).await;
+                $case(&app, &feeder).await;
+                if let Some(check) = &feeder.check {
+                    check(name, &app).await;
+                }
+            });
+            let failure = match tokio::time::timeout(CASE_TIMEOUT, case.catch_unwind()).await {
+                Ok(Ok(())) => None,
+                Ok(Err(panic)) => Some(format!("{name}: {}", panic_message(&panic))),
+                Err(_) => Some(format!("{name}: timed out after {CASE_TIMEOUT:?}")),
+            };
+            match failure {
+                None => eprintln!("conformance: {name} ok"),
+                Some(failure) => {
                     eprintln!("conformance: {failure}");
                     failures.push(failure);
                 }
             }
-        )*};
+        })*};
     }
     cases!(
         create_without_hook_is_served,
@@ -157,6 +200,15 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "the case panicked".to_string()
     }
+}
+
+/// How many times the hook that logs `message` ran for `uri`.
+async fn hook_runs(app: &ProviderApp, message: &str, uri: &str) -> usize {
+    app.script_logs()
+        .await
+        .iter()
+        .filter(|(logged, fields)| logged == message && fields["uri"] == uri)
+        .count()
 }
 
 fn key(did: &str, rkey: &str) -> RecordKey {
@@ -251,6 +303,11 @@ async fn skip_hook_hides_the_record(app: &ProviderApp, feeder: &Feeder) {
         "a record the hook skipped is not served"
     );
     assert_eq!(app.list(COLLECTION).await, Vec::<String>::new());
+    assert_eq!(
+        hook_runs(app, "skip hook", &uri(ALICE, "a1")).await,
+        1,
+        "the skip hook ran, once"
+    );
 }
 
 async fn update_reruns_the_hook(app: &ProviderApp, feeder: &Feeder) {
@@ -378,28 +435,46 @@ async fn account_deletion_removes_the_accounts_records(app: &ProviderApp, feeder
     );
 }
 
+/// Today the hook runs on every delivery, an identical redelivery and a
+/// stale one included; what is idempotent is what gets served. Each
+/// delivery is counted, so a hook run twice for one delivery fails here.
 async fn redelivery_is_idempotent(app: &ProviderApp, feeder: &Feeder) {
     app.track(COLLECTION, false).await;
     app.set_hook(COLLECTION, Action::Create, MARK).await;
     app.set_hook(COLLECTION, Action::Update, MARK).await;
+    let a1 = uri(ALICE, "a1");
+    let mut deliveries = 0;
     let event = created(ALICE, "a1", "once", 1);
-    feeder.put(event.clone()).await;
-    feeder.put(event.clone()).await;
+    for _ in 0..2 {
+        feeder.put(event.clone()).await;
+        deliveries += 1;
+        assert_eq!(
+            hook_runs(app, "mark hook", &a1).await,
+            deliveries,
+            "the hook ran once for each delivery of the create"
+        );
+    }
     assert_eq!(
-        app.get_record(&uri(ALICE, "a1")).await,
+        app.get_record(&a1).await,
         Some(body("once (hooked)")),
         "a redelivered create is served as the first delivery was"
     );
 
     let update = written(ALICE, "a1", Action::Update, "twice", 2);
-    feeder.put(update.clone()).await;
-    feeder.put(update).await;
-    // An older commit arriving late changes nothing either.
-    feeder.put(event).await;
+    // An older commit arriving late, last, changes nothing either.
+    for event in [update.clone(), update, event] {
+        feeder.put(event).await;
+        deliveries += 1;
+        assert_eq!(
+            hook_runs(app, "mark hook", &a1).await,
+            deliveries,
+            "the hook ran once for each delivery"
+        );
+    }
     assert_eq!(
-        app.get_record(&uri(ALICE, "a1")).await,
+        app.get_record(&a1).await,
         Some(body("twice (hooked)")),
         "a redelivered update is served as the first delivery was"
     );
-    assert_eq!(app.list(COLLECTION).await, vec![uri(ALICE, "a1")]);
+    assert_eq!(app.list(COLLECTION).await, vec![a1]);
 }
