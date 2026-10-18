@@ -8,10 +8,6 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    if command == happyview::cli::Command::Help {
-        println!("{}", happyview::cli::USAGE);
-        return std::process::ExitCode::SUCCESS;
-    }
     // In a project, `.env` holds script variables. Loaded into the
     // environment it would become server configuration and beat
     // happyview.toml, so only a plain serve reads it.

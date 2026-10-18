@@ -42,6 +42,18 @@ impl Default for Providers {
     }
 }
 
+/// Refuses a source built for another contract version.
+fn check_contract_version(providers: &Providers) -> Result<(), happyview_provider::ProviderError> {
+    let found = providers.source.contract_version();
+    if found == happyview_provider::CONTRACT_VERSION {
+        return Ok(());
+    }
+    Err(happyview_provider::ProviderError::Version {
+        found,
+        expected: happyview_provider::CONTRACT_VERSION,
+    })
+}
+
 /// Serve HappyView, or run one of its other commands, with `providers` as the
 /// record source and storage.
 pub async fn run(command: crate::cli::Command, providers: Providers) -> std::process::ExitCode {
@@ -78,7 +90,10 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             let code = crate::testing::runner::run(&args, &mut std::io::stdout()).await;
             return std::process::ExitCode::from(code);
         }
-        crate::cli::Command::Help => unreachable!("main answers --help itself"),
+        crate::cli::Command::Help => {
+            println!("{}", crate::cli::USAGE);
+            return std::process::ExitCode::SUCCESS;
+        }
         crate::cli::Command::Serve | crate::cli::Command::Dev { .. } => {}
     }
 
@@ -95,6 +110,13 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             }),
         )
         .init();
+
+    if let Err(e) = check_contract_version(&providers) {
+        let id = providers.source.id();
+        tracing::error!("refusing to start: record source `{id}`: {e}");
+        eprintln!("refusing to start: record source `{id}`: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     let (dev, config) = match &dev_root {
         Some(root) => match crate::dev::prepare(root) {
@@ -1274,5 +1296,86 @@ async fn seed_and_load_rate_limit_defaults(
             SEED_DEFAULT_PROXY_COST,
         )
         .await,
+    }
+}
+
+#[cfg(test)]
+mod contract_version_tests {
+    use super::*;
+    use happyview_provider::{
+        BackfillError, BackfillRequest, CONTRACT_VERSION, Host, ProviderError,
+    };
+
+    /// A source that reports the contract version it was built for.
+    struct Versioned(u32);
+
+    #[async_trait::async_trait]
+    impl RecordSource for Versioned {
+        fn id(&self) -> &'static str {
+            "versioned"
+        }
+        fn contract_version(&self) -> u32 {
+            self.0
+        }
+        fn migrations(
+            &self,
+            _: happyview_provider::db::DatabaseBackend,
+        ) -> Option<&'static sqlx::migrate::Migrator> {
+            None
+        }
+        async fn start(self: Arc<Self>, _: Arc<dyn Host>) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn admin_routes(&self) -> axum::Router {
+            axum::Router::new()
+        }
+        async fn start_backfill(
+            &self,
+            _: BackfillRequest,
+        ) -> Result<Option<String>, BackfillError> {
+            Ok(None)
+        }
+        async fn has_backfill(&self, _: &str) -> bool {
+            false
+        }
+        async fn backfill_running(&self, _: &str) -> bool {
+            false
+        }
+        async fn status(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        async fn metrics(&self) -> Vec<(String, i64)> {
+            Vec::new()
+        }
+    }
+
+    fn providers(version: u32) -> Providers {
+        Providers {
+            source: Arc::new(Versioned(version)),
+            storage: None,
+        }
+    }
+
+    #[test]
+    fn a_source_built_for_this_contract_version_is_accepted() {
+        assert!(check_contract_version(&providers(CONTRACT_VERSION)).is_ok());
+    }
+
+    #[test]
+    fn a_source_built_for_another_contract_version_is_refused() {
+        let err = check_contract_version(&providers(CONTRACT_VERSION + 1)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "contract version {} is not {CONTRACT_VERSION}",
+                CONTRACT_VERSION + 1
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn run_exits_non_zero_for_a_source_of_another_version() {
+        let code = run(crate::cli::Command::Serve, providers(CONTRACT_VERSION + 1)).await;
+        assert_eq!(code, std::process::ExitCode::FAILURE);
     }
 }
