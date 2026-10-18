@@ -11,6 +11,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use happyview::Providers;
 use happyview::record_store::PreparedRecord;
@@ -94,6 +95,12 @@ async fn a_claiming_external_store_conforms() {
                     ..event
                 }
             })
+        });
+        // The store's outage: its reads fail as a closed pool's do.
+        let outage = storage.clone();
+        let feeder = feeder.make_unavailable(move || {
+            let outage = outage.clone();
+            async move { outage.down.store(true, Ordering::SeqCst) }
         });
         // What the served view cannot show: nothing of the claimed
         // collection was written locally, and core spoke to the store.

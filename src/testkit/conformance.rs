@@ -9,6 +9,10 @@
 //! The cases use one collection, [`COLLECTION`]; a provider whose storage
 //! claims collections claims that one. Hooks are Lua, so the run needs
 //! `HAPPYVIEW_LUA_PLUGIN` as well as `TEST_DATABASE_URL`.
+//!
+//! A provider whose storage claims [`COLLECTION`] must also say how to make
+//! that storage unavailable ([`Feeder::make_unavailable`]), for the case
+//! that checks a claimed read answers 503 while it is down.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -25,6 +29,10 @@ use crate::Providers;
 
 /// The collection every case writes.
 pub const COLLECTION: &str = "com.example.conformance.note";
+
+/// A default XRPC query over [`COLLECTION`]: a get with `uri`, a list
+/// without.
+pub const QUERY: &str = "com.example.conformance.listNotes";
 
 /// How long one case, boot included, may take before it fails.
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -62,6 +70,8 @@ end"#;
 
 type Feed = Box<dyn Fn(RecordEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+type Outage = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// What [`Feeder::after_each`] returns: a check of the instance a case left.
 pub type CheckFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
@@ -84,6 +94,7 @@ pub struct Feeder {
     delete: Feed,
     delete_bodies: bool,
     check: Option<Check>,
+    outage: Option<Outage>,
 }
 
 impl Feeder {
@@ -99,7 +110,21 @@ impl Feeder {
             delete: Box::new(move |event| Box::pin(delete(event))),
             delete_bodies: true,
             check: None,
+            outage: None,
         }
+    }
+
+    /// How to make the provider's storage unavailable: afterwards a read of
+    /// [`COLLECTION`] through its `read_route` fails with an error its
+    /// `unavailable` recognises. Required of a provider whose storage claims
+    /// [`COLLECTION`]: the case checking the 503 rule fails without it.
+    pub fn make_unavailable<U, UF>(mut self, outage: U) -> Self
+    where
+        U: Fn() -> UF + Send + Sync + 'static,
+        UF: Future<Output = ()> + Send + 'static,
+    {
+        self.outage = Some(Box::new(move || Box::pin(outage())));
+        self
     }
 
     /// A provider's own check, run after each case passes, with the case's
@@ -181,11 +206,13 @@ where
         create_without_hook_is_served,
         replace_hook_changes_what_is_served,
         skip_hook_hides_the_record,
+        skip_hook_on_update_hides_the_update,
         update_reruns_the_hook,
         delete_removes_the_record,
         history_runs_hooks,
         account_deletion_removes_the_accounts_records,
         redelivery_is_idempotent,
+        an_unavailable_store_answers_503,
     );
     if !failures.is_empty() {
         panic!("{}", failures.join("\n"));
@@ -303,6 +330,46 @@ async fn skip_hook_hides_the_record(app: &ProviderApp, feeder: &Feeder) {
         "a record the hook skipped is not served"
     );
     assert_eq!(app.list(COLLECTION).await, Vec::<String>::new());
+    assert_eq!(
+        hook_runs(app, "skip hook", &uri(ALICE, "a1")).await,
+        1,
+        "the skip hook ran, once"
+    );
+}
+
+/// A skip on an update keeps the update from being served. What is served
+/// instead depends on where the record lives: the instance database still
+/// holds the version before it, while a claiming store already holds only
+/// the update, so its record is hidden. Either way the skipped body is not
+/// served, and what a get answers, a list agrees with.
+async fn skip_hook_on_update_hides_the_update(app: &ProviderApp, feeder: &Feeder) {
+    app.track(COLLECTION, false).await;
+    feeder.put(created(ALICE, "a1", "first", 1)).await;
+    assert_eq!(
+        app.get_record(&uri(ALICE, "a1")).await,
+        Some(body("first")),
+        "the create, with no hook, is served as it arrived"
+    );
+
+    app.set_hook(COLLECTION, Action::Update, SKIP).await;
+    feeder
+        .put(written(ALICE, "a1", Action::Update, "second", 2))
+        .await;
+    let served = app.get_record(&uri(ALICE, "a1")).await;
+    assert!(
+        served.is_none() || served == Some(body("first")),
+        "an update the hook skipped is not served: {served:?}"
+    );
+    let listed = if served.is_some() {
+        vec![uri(ALICE, "a1")]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        app.list(COLLECTION).await,
+        listed,
+        "the list agrees with the get"
+    );
     assert_eq!(
         hook_runs(app, "skip hook", &uri(ALICE, "a1")).await,
         1,
@@ -477,4 +544,47 @@ async fn redelivery_is_idempotent(app: &ProviderApp, feeder: &Feeder) {
         "a redelivered update is served as the first delivery was"
     );
     assert_eq!(app.list(COLLECTION).await, vec![a1]);
+}
+
+/// The 503 rule: while the storage that claims a collection is down, a
+/// default XRPC get and list of it answer `503 ServiceUnavailable`, so a
+/// client knows to retry. A provider whose storage claims nothing keeps
+/// records in the instance database, where the rule does not apply; for it
+/// the case checks only that the query serves.
+async fn an_unavailable_store_answers_503(app: &ProviderApp, feeder: &Feeder) {
+    app.track(COLLECTION, false).await;
+    app.track_query(QUERY, COLLECTION).await;
+    feeder.put(created(ALICE, "a1", "kept", 1)).await;
+    let get = format!("/xrpc/{QUERY}?uri={}", uri(ALICE, "a1"));
+    let list = format!("/xrpc/{QUERY}");
+
+    let (status, answer) = app.xrpc_get(&get).await;
+    assert_eq!(status, 200, "{get} before the outage: {answer}");
+    assert_eq!(answer["record"]["text"], "kept", "{get}: {answer}");
+    let (status, answer) = app.xrpc_get(&list).await;
+    assert_eq!(status, 200, "{list} before the outage: {answer}");
+
+    if !app.claims(COLLECTION) {
+        eprintln!(
+            "conformance: an_unavailable_store_answers_503: nothing claims {COLLECTION}, \
+             so only the served query was checked"
+        );
+        return;
+    }
+    let outage = feeder.outage.as_ref().unwrap_or_else(|| {
+        panic!(
+            "this provider's storage claims {COLLECTION}, so it must say how to make that \
+             storage unavailable: give the feeder Feeder::make_unavailable"
+        )
+    });
+    outage().await;
+
+    for path in [&get, &list] {
+        let (status, answer) = app.xrpc_get(path).await;
+        assert_eq!(status, 503, "{path} while the storage is down: {answer}");
+        assert_eq!(
+            answer["error"], "ServiceUnavailable",
+            "{path} while the storage is down: {answer}"
+        );
+    }
 }

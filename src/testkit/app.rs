@@ -435,6 +435,59 @@ mod provider_app {
             body["backfill_job_id"].as_str().map(str::to_string)
         }
 
+        /// Stores a query lexicon `nsid` over `collection`, which HappyView
+        /// then serves as a default XRPC query: a get with `uri`, a list
+        /// without.
+        pub async fn track_query(&self, nsid: &str, collection: &str) {
+            let lexicon = json!({
+                "lexicon": 1,
+                "id": nsid,
+                "defs": {"main": {"type": "query",
+                    "parameters": {"type": "params",
+                        "properties": {"uri": {"type": "string"}, "limit": {"type": "integer"}}},
+                    "output": {"encoding": "application/json"}}}
+            });
+            self.state
+                .lexicons
+                .put_manual(
+                    &self.state.db,
+                    self.state.db_backend,
+                    crate::catalog::LexiconWrite {
+                        lexicon_json: lexicon,
+                        backfill: false,
+                        target_collection: Some(collection.to_string()),
+                        action: crate::lexicon::ProcedureAction::Upsert,
+                        token_cost: None,
+                        authority_did: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("storing the {nsid} query: {e}"));
+        }
+
+        /// GETs `path` (such as `/xrpc/<nsid>?uri=...`) from the router,
+        /// unauthenticated: its status and JSON body (`null` when it is not
+        /// JSON).
+        pub async fn xrpc_get(&self, path: &str) -> (StatusCode, Value) {
+            let response = self
+                .router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .expect("the router answers");
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+
+        /// Whether an external storage claims `collection`.
+        pub fn claims(&self, collection: &str) -> bool {
+            self.state.records.external_route(collection).is_some()
+        }
+
         /// Rows of `collection` in the instance's own record table, whatever
         /// the routing: 0 for a collection an external storage claims.
         pub async fn local_rows(&self, collection: &str) -> i64 {
