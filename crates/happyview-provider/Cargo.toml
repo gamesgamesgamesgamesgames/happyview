@@ -7,7 +7,8 @@ description = "The contract between HappyView and its record sources and stores"
 license = "MIT OR Apache-2.0"
 
 [features]
-testkit = []
+# `testkit::ScriptedSource`, a channel-fed source for provider tests.
+testkit = ["tokio/rt", "tokio/macros"]
 
 [dependencies]
 async-trait = "0.1"

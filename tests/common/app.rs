@@ -243,15 +243,7 @@ impl TestApp {
     }
 
     fn build_router(state: &AppState) -> axum::Router {
-        server::router(state.clone()).layer(axum::middleware::from_fn(
-            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
-                if !req.headers().contains_key("host") {
-                    req.headers_mut()
-                        .insert("host", axum::http::HeaderValue::from_static("127.0.0.1"));
-                }
-                next.run(req).await
-            },
-        ))
+        happyview::testkit::app::router(state)
     }
 
     pub fn rebuild_router(&mut self) {

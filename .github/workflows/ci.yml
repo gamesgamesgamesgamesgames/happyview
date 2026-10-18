@@ -306,6 +306,21 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --tests
 
+      # The record-provider conformance cases. They are built only with the
+      # kit's feature, so the run above leaves them out; they run here on
+      # both backends, SQLite on a file of its own.
+      - name: Provider conformance (Postgres)
+        env:
+          TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo test --features testkit --test conformance
+
+      - name: Provider conformance (SQLite)
+        env:
+          TEST_DATABASE_URL: sqlite://${{ runner.temp }}/conformance.db?mode=rwc
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo test --features testkit --test conformance
+
       # The only thing comparing the interpreter against the native runner
       # case for case, which is what lets the native one retire with evidence.
       # It needs the native runtime behind `lua-reference` and it is

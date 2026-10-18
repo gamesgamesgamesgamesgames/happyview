@@ -141,6 +141,9 @@ lua-reference = ["dep:mlua"]
 # which is why it is off by default: the release build turns it on after
 # building the frontend, and nothing else has to.
 embedded-dashboard = ["dep:rust-embed"]
+# `happyview::testkit`'s `ProviderApp` and the provider conformance cases,
+# with the contract crate's `ScriptedSource`, for a record provider's tests.
+testkit = ["happyview-provider/testkit"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -164,6 +167,12 @@ path = "src/bin/codemod.rs"
 name = "lua_differential"
 path = "tests/lua_differential.rs"
 required-features = ["lua-reference"]
+
+# The provider conformance run, which needs the kit.
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["testkit"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

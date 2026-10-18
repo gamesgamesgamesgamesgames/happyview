@@ -2,8 +2,13 @@
 //! database migrated with HappyView's own migrations, so its `read_route`
 //! satisfies the relation contract and core's reads run on it unchanged.
 //! It claims a fixed set of collections and records every call core makes.
+//!
+//! Built with [`FakeStorage::applying`], it also acts on those calls as a
+//! real store would: it keeps the records its own feed stored
+//! ([`FakeStorage::store`]) apart from the view it serves, and each delta,
+//! account purge and collection delete changes that view.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,6 +27,10 @@ pub struct FakeStorage {
     pub forgotten: Mutex<Vec<(String, Option<Vec<String>>)>>,
     pub collection_deletes: Mutex<Vec<(String, i64)>>,
     pub asked_live: Mutex<Vec<String>>,
+    /// Whether calls change what is served (see [`FakeStorage::applying`]).
+    applying: bool,
+    /// The records the store's feed stored, by URI, before any delta.
+    stored: Mutex<HashMap<String, PreparedRecord>>,
 }
 
 impl FakeStorage {
@@ -37,7 +46,61 @@ impl FakeStorage {
             forgotten: Mutex::new(Vec::new()),
             collection_deletes: Mutex::new(Vec::new()),
             asked_live: Mutex::new(Vec::new()),
+            applying: false,
+            stored: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A fake whose served view follows the calls core makes: what a
+    /// claimed collection's provider is shown to behave like by the
+    /// conformance cases.
+    pub async fn applying(collections: &[&str]) -> Self {
+        Self {
+            applying: true,
+            ..Self::claiming(collections).await
+        }
+    }
+
+    /// The store's own feed storing `record`: kept, and served as it is
+    /// until a delta says otherwise. An older rev than the one held is
+    /// refused, as a store ordering commits by rev refuses it.
+    pub async fn store(&self, record: PreparedRecord) {
+        let uri = record.uri();
+        {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(held) = stored.get(&uri)
+                && held.rev > record.rev
+            {
+                return;
+            }
+            stored.insert(uri, record.clone());
+        }
+        self.serve(&record).await;
+    }
+
+    /// The store's own feed removing the record at `uri`.
+    pub async fn unstore(&self, uri: &str) {
+        self.stored.lock().unwrap().remove(uri);
+        self.unserve(uri).await;
+    }
+
+    fn records(&self) -> RecordStore {
+        RecordStore::new(self.pool.clone(), DatabaseBackend::Sqlite)
+    }
+
+    async fn serve(&self, record: &PreparedRecord) {
+        self.unserve(&record.uri()).await;
+        self.records()
+            .write_network(&self.pool, std::slice::from_ref(record))
+            .await
+            .expect("serve a record from the fake storage");
+    }
+
+    async fn unserve(&self, uri: &str) {
+        self.records()
+            .delete(uri)
+            .await
+            .expect("hide a record in the fake storage");
     }
 
     /// The fake's own database, where its records live.
@@ -89,7 +152,36 @@ impl RecordStorage for FakeStorage {
         self.deltas
             .lock()
             .unwrap()
-            .push((key.clone(), delta, for_rev.map(str::to_string)));
+            .push((key.clone(), delta.clone(), for_rev.map(str::to_string)));
+        if !self.applying {
+            return Ok(());
+        }
+        let uri = key.uri();
+        let held = self.stored.lock().unwrap().get(&uri).cloned();
+        // A delta computed from a version the store no longer holds.
+        if let Some(for_rev) = for_rev
+            && held.as_ref().and_then(|held| held.rev.as_deref()) != Some(for_rev)
+        {
+            return Ok(());
+        }
+        match delta {
+            Delta::Proceed => match held {
+                Some(held) => self.serve(&held).await,
+                None => self.unserve(&uri).await,
+            },
+            Delta::Replace { cid, rev, body } | Delta::Pending { cid, rev, body, .. } => {
+                self.serve(&PreparedRecord {
+                    did: key.did.clone(),
+                    collection: key.collection.clone(),
+                    rkey: key.rkey.clone(),
+                    record_json: body,
+                    cid,
+                    rev,
+                })
+                .await
+            }
+            Delta::Hide => self.unserve(&uri).await,
+        }
         Ok(())
     }
 
@@ -102,7 +194,22 @@ impl RecordStorage for FakeStorage {
             .lock()
             .unwrap()
             .push((did.to_string(), collections.map(<[String]>::to_vec)));
-        Ok(0)
+        if !self.applying {
+            return Ok(0);
+        }
+        let gone: Vec<String> = self
+            .stored
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|record| record.did == did)
+            .filter(|record| collections.is_none_or(|c| c.contains(&record.collection)))
+            .map(PreparedRecord::uri)
+            .collect();
+        for uri in &gone {
+            self.unstore(uri).await;
+        }
+        Ok(gone.len() as u64)
     }
 
     async fn delete_collection_batch(

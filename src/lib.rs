@@ -61,6 +61,7 @@ pub mod telemetry;
 pub mod telemetry_middleware;
 pub mod test_support;
 pub mod testing;
+pub mod testkit;
 pub mod tid;
 pub mod tombstones;
 pub mod verification_methods;

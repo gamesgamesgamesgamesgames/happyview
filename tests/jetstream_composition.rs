@@ -941,5 +941,6 @@ async fn a_panicking_executor_fails_its_job() {
         row.error.as_deref(),
         Some("backfill executor 'store-pass' panicked")
     );
-    assert!(!source.backfill_running(B).await);
+    // The job's guard drops after `fail_job` writes the status.
+    wait_until!("the guard to drop", !source.backfill_running(B).await);
 }

@@ -9,6 +9,8 @@ pub mod http;
 pub mod source;
 pub mod storage;
 pub mod telemetry;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod types;
 pub mod vars;
 
