@@ -144,6 +144,11 @@ impl JetstreamSource {
     /// Give this source `host` without starting anything: its backfill jobs,
     /// admin routes and answers work over `host` from now on. `start` does
     /// this itself.
+    ///
+    /// Each call (re)binds the source: it builds a new [`JobState`] over
+    /// `host`, with its own backfill events channel, and replaces the one
+    /// held before. A caller must not keep a `JobState` (from [`Self::jobs`])
+    /// across an `attach` or a `start`; ask again afterwards.
     pub fn attach(&self, host: Arc<dyn Host>) {
         let settings = self.settings.clone().unwrap_or_else(|| {
             Settings::from_env(
@@ -252,6 +257,11 @@ impl RecordSource for JetstreamSource {
 
     /// Resume the jobs the last run left running, then spawn the consumer
     /// and the retention sweep. Once: a second call does nothing.
+    ///
+    /// The first call (re)binds the source to `host`, as [`Self::attach`]
+    /// does, even when it was attached before: it replaces the source's
+    /// [`JobState`] and its backfill events channel. A caller must not hold
+    /// a `JobState` from an earlier `attach` across `start`.
     async fn start(self: Arc<Self>, host: Arc<dyn Host>) -> Result<(), ProviderError> {
         // Once only: a second start would resume, and so run twice, the
         // jobs the first one is running.
@@ -330,8 +340,9 @@ impl RecordSource for JetstreamSource {
     /// the collection's. When it cannot tell, it says yes, so no caller starts
     /// one on a guess.
     async fn has_backfill(&self, collection: &str) -> bool {
+        // Unbound, it cannot tell either.
         let Some(jobs) = self.jobs() else {
-            return false;
+            return true;
         };
         let sql = adapt_sql(
             "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ? AND scope = 'network'",
@@ -402,5 +413,19 @@ impl RecordSource for JetstreamSource {
         out.push(("feature.backfill.ever".to_string(), i64::from(ever)));
         out.push(("feature.backfill.active".to_string(), i64::from(active)));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no host it cannot tell whether a collection was backfilled, so
+    /// it says yes, as it does when its query fails.
+    #[tokio::test]
+    async fn an_unbound_source_reports_a_backfill() {
+        let source = JetstreamSource::detached();
+        assert!(source.jobs().is_none(), "a detached source has no host yet");
+        assert!(source.has_backfill("com.example.anything").await);
     }
 }
