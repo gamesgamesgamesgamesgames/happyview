@@ -49,8 +49,13 @@ impl Action {
     }
 }
 
-/// Where an event came from. Only logging and telemetry read it; the
-/// pipeline treats every origin the same.
+/// Where an event came from. The pipeline acts on it: a `Backfill` event's
+/// write is tagged with the change reason `backfill` (and a batch of them is
+/// written through the backfill pool, `backfill_db`), a CID mismatch in one
+/// is also traced as a warning, and a `Retry`
+/// is a dead-letter retry, whose skip removes the version its fail-open
+/// delivery stored and whose claimed delta applies only to the version the
+/// dead letter was made from. Logging and telemetry read it too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
     Live,

@@ -101,9 +101,10 @@ pub async fn apply(state: &AppState, event: SourceEvent) -> IngestOutcome {
     apply_in(state, event).await.outcome
 }
 
-/// Apply events in order. Runs of consecutive creates and updates are hooked
-/// one by one and written in one transaction; any other event ends the run
-/// and goes through [`apply`]. One outcome per event, in order.
+/// Apply events in order. Runs of consecutive creates and updates of one
+/// origin are hooked one by one and written in one transaction; any other
+/// event, or a change of origin, ends the run (another event goes through
+/// [`apply`]). One outcome per event, in order.
 pub async fn apply_batch(state: &AppState, events: Vec<SourceEvent>) -> BatchOutcome {
     apply_batch_in(state, events).await.0
 }
@@ -208,6 +209,17 @@ pub(crate) async fn apply_batch_in(
                 };
                 match hooked {
                     HookedBody::Store(body) => {
+                        // A run is written under one origin's pool and
+                        // change reason: a change of origin ends it.
+                        if run
+                            .last()
+                            .is_some_and(|(_, last, _)| last.origin != ev.origin)
+                            && let Err((outcome, error)) =
+                                write_run(state, &mut run, &mut out).await
+                        {
+                            fill_failed(&mut out, total, outcome);
+                            return (out, Some(error));
+                        }
                         let prepared = prepare(&ev, &body);
                         run.push((out.outcomes.len(), ev, prepared));
                         // `changed` is settled when the run is written.
@@ -256,6 +268,8 @@ async fn write_run(
         return Ok(());
     }
     let run = std::mem::take(run);
+    // Every event of a run has one origin (`apply_batch_in` splits runs
+    // where it changes).
     let backfill = matches!(run[0].1.origin, Origin::Backfill { .. });
     let pool = if backfill {
         &state.backfill_db

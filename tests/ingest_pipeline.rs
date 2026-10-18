@@ -410,6 +410,97 @@ async fn the_change_reason_is_set_inside_purge_transactions() {
     assert_eq!(reasons, vec![(Some("purge:deleted".to_string()),)]);
 }
 
+/// Postgres only: a batch mixing live and backfill creates writes each
+/// under its own origin's change reason, not the first event's.
+#[tokio::test]
+#[serial]
+async fn a_mixed_origin_batch_tags_each_write_with_its_own_origin() {
+    common::require_db!();
+    let app = app().await;
+    if app.state.db_backend != happyview::db::DatabaseBackend::Postgres {
+        return;
+    }
+    let did = format!("did:plc:mixed{}", uuid::Uuid::new_v4().simple());
+    let create = |rkey: &str, origin: Origin| {
+        SourceEvent::Record(RecordEvent {
+            key: RecordKey {
+                did: did.clone(),
+                collection: GAME.to_string(),
+                rkey: rkey.to_string(),
+            },
+            action: Action::Create,
+            cid: None,
+            rev: None,
+            body: Some(json!({"$type": GAME, "name": rkey})),
+            time_us: None,
+            origin,
+            stored: false,
+        })
+    };
+    let backfill = || Origin::Backfill {
+        job_id: "job-1".to_string(),
+    };
+
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS test_batch_reasons (rkey TEXT, reason TEXT)",
+        "DELETE FROM test_batch_reasons",
+        "CREATE OR REPLACE FUNCTION test_batch_reason() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO test_batch_reasons VALUES (NEW.rkey, current_setting('happyview.change_reason', true)); \
+         RETURN NEW; END $$",
+        "DROP TRIGGER IF EXISTS test_batch_reason ON happyview_records_v2",
+        "CREATE TRIGGER test_batch_reason AFTER INSERT OR UPDATE ON happyview_records_v2 \
+         FOR EACH ROW EXECUTE FUNCTION test_batch_reason()",
+    ] {
+        happyview::db::query(sql)
+            .execute(&app.state.db)
+            .await
+            .expect(sql);
+    }
+
+    let batch = happyview::ingest::apply_batch(
+        &app.state,
+        vec![
+            create("live1", Origin::Live),
+            create("back1", backfill()),
+            create("back2", backfill()),
+            create("live2", Origin::Live),
+        ],
+    )
+    .await;
+    let reasons: Vec<(String, Option<String>)> =
+        happyview::db::query_as("SELECT rkey, reason FROM test_batch_reasons ORDER BY rkey")
+            .fetch_all(&app.state.db)
+            .await
+            .expect("read reasons");
+    for sql in [
+        "DROP TRIGGER test_batch_reason ON happyview_records_v2",
+        "DROP FUNCTION test_batch_reason()",
+        "DROP TABLE test_batch_reasons",
+    ] {
+        happyview::db::query(sql)
+            .execute(&app.state.db)
+            .await
+            .expect(sql);
+    }
+
+    assert_eq!(batch.outcomes, vec![IngestOutcome::Matched; 4]);
+    assert_eq!(batch.changed, vec![true; 4]);
+    // An empty setting reads back as '' once set earlier in the session.
+    let reasons: Vec<(String, Option<String>)> = reasons
+        .into_iter()
+        .map(|(rkey, reason)| (rkey, reason.filter(|r| !r.is_empty())))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("back1".to_string(), Some("backfill".to_string())),
+            ("back2".to_string(), Some("backfill".to_string())),
+            ("live1".to_string(), None),
+            ("live2".to_string(), None),
+        ]
+    );
+}
+
 /// The id of the one open dead letter.
 async fn only_dead_letter(app: &TestApp) -> String {
     let list = app.get_json("/admin/dead-letters").await;
