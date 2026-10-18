@@ -10,7 +10,7 @@ use super::config::Protocol;
 use super::event::CursorPoint;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub struct JetstreamStatus {
+pub(crate) struct JetstreamStatus {
     /// `"v2"` or `"v1"`; `None` before the first connection.
     pub protocol: Option<&'static str>,
     pub host: Option<String>,
@@ -46,7 +46,7 @@ fn live() -> MutexGuard<'static, Live> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn connected(protocol: Protocol, host: &str, dictionary_id: Option<u32>) {
+pub(crate) fn connected(protocol: Protocol, host: &str, dictionary_id: Option<u32>) {
     let mut live = live();
     live.status.protocol = Some(protocol.as_str());
     live.status.host = Some(host.to_string());
@@ -55,30 +55,30 @@ pub fn connected(protocol: Protocol, host: &str, dictionary_id: Option<u32>) {
     live.status.dictionary_id = dictionary_id;
 }
 
-pub fn disconnected() {
+pub(crate) fn disconnected() {
     live().status.connected = false;
 }
 
-pub fn applied(point: &CursorPoint) {
+pub(crate) fn applied(point: &CursorPoint) {
     let mut live = live();
     live.status.applied_seq = point.seq();
     live.status.applied_time_us = Some(point.time_us());
 }
 
-pub fn set_workers(depths: Arc<Vec<AtomicUsize>>, busy_since: Arc<Vec<AtomicI64>>) {
+pub(crate) fn set_workers(depths: Arc<Vec<AtomicUsize>>, busy_since: Arc<Vec<AtomicI64>>) {
     let mut live = live();
     live.depths = Some(depths);
     live.busy_since = Some(busy_since);
 }
 
 /// Forget the worker counters, once the pool they belong to is gone.
-pub fn clear_workers() {
+pub(crate) fn clear_workers() {
     let mut live = live();
     live.depths = None;
     live.busy_since = None;
 }
 
-pub fn snapshot() -> JetstreamStatus {
+pub(crate) fn snapshot() -> JetstreamStatus {
     snapshot_at(chrono::Utc::now().timestamp_micros())
 }
 

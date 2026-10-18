@@ -154,7 +154,7 @@ where
 }
 
 /// POST /admin/backfill/{id}/cancel — cancel a running backfill job.
-pub async fn cancel_backfill(
+pub(crate) async fn cancel_backfill(
     State(state): State<JobState>,
     AdminUser(admin): AdminUser,
     Path(job_id): Path<String>,
@@ -215,7 +215,7 @@ pub async fn cancel_backfill(
 }
 
 /// POST /admin/backfill/{id}/pause — pause a running backfill job.
-pub async fn pause_backfill(
+pub(crate) async fn pause_backfill(
     State(state): State<JobState>,
     AdminUser(admin): AdminUser,
     Path(job_id): Path<String>,
@@ -262,12 +262,13 @@ pub async fn pause_backfill(
 /// Why an account job's replay can't go on: its queue rows, which list its
 /// accounts, went with a detail flush or the retention sweep. Without them a
 /// replay would plan the whole network.
-pub const DIDS_GONE: &str = "the job's DID list is no longer available; start a new backfill";
+pub(crate) const DIDS_GONE: &str =
+    "the job's DID list is no longer available; start a new backfill";
 
 /// POST /admin/backfill/{id}/resume — resume a paused backfill job, or a
 /// failed replay job: its sweeps, cursors and retry rows say exactly where it
 /// stopped, so a transient failure doesn't throw away a long replay.
-pub async fn resume_backfill(
+pub(crate) async fn resume_backfill(
     State(state): State<JobState>,
     AdminUser(admin): AdminUser,
     Path(job_id): Path<String>,
@@ -471,7 +472,7 @@ pub async fn backfill_status(
 // SSE events endpoint
 // ---------------------------------------------------------------------------
 
-pub async fn backfill_events(
+pub(crate) async fn backfill_events(
     State(state): State<JobState>,
     Path(job_id): Path<String>,
     AdminUser(auth): AdminUser,
@@ -547,7 +548,7 @@ pub struct ReposQuery {
 }
 
 /// A job's queue version, or `None` for an unknown job.
-pub async fn job_queue_version(
+pub(crate) async fn job_queue_version(
     state: &JobState,
     job_id: &str,
 ) -> Result<Option<QueueVersion>, AdminError> {
@@ -596,7 +597,7 @@ pub async fn backfill_repos(
 }
 
 /// A legacy job's repo rows, keyset-paged by DID.
-pub async fn legacy_repos_page(
+pub(crate) async fn legacy_repos_page(
     state: &JobState,
     job_id: &str,
     phase: Option<&str>,
@@ -648,7 +649,7 @@ pub async fn legacy_repos_page(
 }
 
 /// A bounded job's recent completions, newest first, paged by log id.
-pub async fn recent_completions_page(
+pub(crate) async fn recent_completions_page(
     state: &JobState,
     job_id: &str,
     cursor: Option<&str>,
@@ -701,7 +702,7 @@ pub async fn recent_completions_page(
 
 /// A bounded job's queued units in `(collection, did)` order, paged by a
 /// `collection|did` cursor. Neither an NSID nor a DID contains `|`.
-pub async fn queued_units_page(
+pub(crate) async fn queued_units_page(
     state: &JobState,
     job_id: &str,
     resolved_only: bool,
@@ -934,7 +935,7 @@ pub async fn backfill_errors_list(
 /// `ERROR_DETAIL_CAP`. Above the cap rows stop being written and the JSON is the
 /// only source left, so take whichever is larger per kind rather than either
 /// one alone.
-pub async fn load_live_error_counts(state: &JobState, job_id: &str) -> ErrorCounts {
+pub(crate) async fn load_live_error_counts(state: &JobState, job_id: &str) -> ErrorCounts {
     let mut counts = load_error_counts(state, job_id).await;
 
     let sql = adapt_sql(
@@ -958,7 +959,7 @@ pub async fn load_live_error_counts(state: &JobState, job_id: &str) -> ErrorCoun
     counts
 }
 
-pub async fn load_error_counts(state: &JobState, job_id: &str) -> ErrorCounts {
+pub(crate) async fn load_error_counts(state: &JobState, job_id: &str) -> ErrorCounts {
     let sql = adapt_sql(
         "SELECT error_counts FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
@@ -1234,12 +1235,12 @@ pub async fn flush_all_backfill_details(
 // ---------------------------------------------------------------------------
 
 /// `/backfill*` and `/jetstream/status`, over `jobs`.
-pub fn routes(jobs: JobState) -> axum::Router {
+pub(crate) fn routes(jobs: JobState) -> axum::Router {
     router().with_state(jobs)
 }
 
 /// [`routes`] before it is given its jobs.
-pub fn router() -> axum::Router<JobState> {
+pub(crate) fn router() -> axum::Router<JobState> {
     axum::Router::new()
         .route("/backfill", post(create_backfill))
         .route("/backfill/status", get(backfill_status))
@@ -1258,7 +1259,7 @@ pub fn router() -> axum::Router<JobState> {
 
 /// `GET /admin/jetstream/status`: what the live consumer is doing. The
 /// platform principal may read it.
-pub async fn jetstream_status(
+pub(crate) async fn jetstream_status(
     caller: AdminCaller,
 ) -> Result<Json<crate::consumer::status::JetstreamStatus>, AdminError> {
     caller.require("stats:read")?;

@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use super::event::CursorPoint;
 
 #[derive(Debug, Default)]
-pub struct Watermark {
+pub(crate) struct Watermark {
     /// The ticket of `pending[0]`.
     front: u64,
     /// Every ticket from `front` on, in read order, and whether it finished.

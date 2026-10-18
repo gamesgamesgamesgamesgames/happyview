@@ -7,17 +7,17 @@ const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// Ceiling on any single cooldown. Matches the cap `parse_retry_after` applies
 /// to `RateLimit-Reset`, so neither a hostile header nor a long failure streak
 /// can park a job for an unbounded time.
-pub const MAX_BACKOFF: Duration = Duration::from_secs(120);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(120);
 
 /// Consecutive failures against one host after which it is treated as down and
 /// its queued work is given up on rather than retried one cooldown at a time.
 /// See `HostCooldowns::is_saturated`.
-pub const SATURATED_CONSECUTIVE_FAILURES: u32 = 5;
+pub(crate) const SATURATED_CONSECUTIVE_FAILURES: u32 = 5;
 
 /// Exponential backoff for the Nth consecutive failure against a host.
 /// No jitter: cooldowns are keyed by host, so every DID behind one host already
 /// shares a single timestamp and there is no herd to disperse.
-pub fn backoff_delay(consecutive_failures: u32) -> Duration {
+pub(crate) fn backoff_delay(consecutive_failures: u32) -> Duration {
     if consecutive_failures == 0 {
         return Duration::ZERO;
     }
@@ -194,7 +194,7 @@ impl<T> DeferredQueue<T> {
 }
 
 #[derive(Debug)]
-pub enum DrainStep<T> {
+pub(crate) enum DrainStep<T> {
     /// This item is ready; the caller retries it.
     Retry(DeferredItem<T>),
     /// Nothing was ready, so we waited a slice. The caller should check for
@@ -210,7 +210,7 @@ pub enum DrainStep<T> {
 /// caller regains control often enough to notice a cancel or pause. Both the
 /// resolve and fetch phases drain this way; only the retry operation differs,
 /// which is why that stays with the caller.
-pub async fn next_drain_step<T>(
+pub(crate) async fn next_drain_step<T>(
     queue: &mut DeferredQueue<T>,
     cooldowns: &HostCooldowns,
     max_slice: Duration,

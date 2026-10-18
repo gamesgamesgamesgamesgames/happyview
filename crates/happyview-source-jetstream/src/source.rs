@@ -166,11 +166,15 @@ impl JetstreamSource {
     }
 
     /// The jobs this source runs, as `backfill_running` answers from them.
+    /// Not part of the stable API: for HappyView's own tests.
+    #[doc(hidden)]
     pub fn running(&self) -> RunningJobs {
         self.running.clone()
     }
 
     /// The backfill job system this source runs, once it has a host.
+    /// Not part of the stable API: for HappyView's own tests.
+    #[doc(hidden)]
     pub fn jobs(&self) -> Option<JobState> {
         self.bound().map(|bound| bound.jobs)
     }
@@ -180,6 +184,8 @@ impl JetstreamSource {
     /// from the archive as one of this source's jobs, unless backfill only
     /// crawls (P8), which never asks the archive. Gives the source `host`
     /// first if it has none.
+    /// Not part of the stable API: for HappyView's own tests.
+    #[doc(hidden)]
     pub fn spawn_consumer(
         &self,
         host: Arc<dyn Host>,

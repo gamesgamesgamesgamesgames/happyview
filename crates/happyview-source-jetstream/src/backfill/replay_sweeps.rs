@@ -7,8 +7,8 @@ use happyview_provider::db::adapt_sql;
 
 use super::JobState;
 
-pub const MAX_PLAN_COLLECTIONS: usize = 100;
-pub const MAX_PLAN_DIDS: usize = 10_000;
+pub(crate) const MAX_PLAN_COLLECTIONS: usize = 100;
+pub(crate) const MAX_PLAN_DIDS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SweepKind {
@@ -218,7 +218,11 @@ pub async fn save(state: &JobState, job_id: &str, sweep: &Sweep) -> Result<(), s
 
 /// Replace the DIDs of a marker sweep that has not planned yet (a retry
 /// job adds the DIDs each refetched block wrote).
-pub async fn set_dids(state: &JobState, job_id: &str, sweep: &Sweep) -> Result<(), sqlx::Error> {
+pub(crate) async fn set_dids(
+    state: &JobState,
+    job_id: &str,
+    sweep: &Sweep,
+) -> Result<(), sqlx::Error> {
     let dids = sweep
         .dids
         .as_ref()
@@ -238,7 +242,7 @@ pub async fn set_dids(state: &JobState, job_id: &str, sweep: &Sweep) -> Result<(
 }
 
 /// Forget a job's sweeps (an `auto` job that fell back to crawling).
-pub async fn clear(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn clear(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
     happyview_provider::db::retry_on_busy(|| {
         happyview_provider::db::query(&adapt_sql(
             "DELETE FROM happyview_backfill_replay_sweeps WHERE job_id = ?",
@@ -251,7 +255,11 @@ pub async fn clear(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-pub async fn set_source(state: &JobState, job_id: &str, source: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn set_source(
+    state: &JobState,
+    job_id: &str,
+    source: &str,
+) -> Result<(), sqlx::Error> {
     happyview_provider::db::retry_on_busy(|| {
         happyview_provider::db::query(&adapt_sql(
             "UPDATE happyview_backfill_jobs SET source = ? WHERE id = ?",
@@ -341,7 +349,7 @@ pub async fn counters(state: &JobState, job_id: &str) -> Result<(i64, i32), sqlx
 }
 
 /// `replay_after_seq`: where a gap replay starts; 0 for a whole-archive job.
-pub async fn after_seq(state: &JobState, job_id: &str) -> Result<i64, sqlx::Error> {
+pub(crate) async fn after_seq(state: &JobState, job_id: &str) -> Result<i64, sqlx::Error> {
     let row: Option<(Option<i64>,)> = happyview_provider::db::query_as(&adapt_sql(
         "SELECT replay_after_seq FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
@@ -353,7 +361,7 @@ pub async fn after_seq(state: &JobState, job_id: &str) -> Result<i64, sqlx::Erro
 }
 
 /// The DIDs an account job targets (its queue rows).
-pub async fn job_dids(state: &JobState, job_id: &str) -> Result<Vec<String>, sqlx::Error> {
+pub(crate) async fn job_dids(state: &JobState, job_id: &str) -> Result<Vec<String>, sqlx::Error> {
     Ok(happyview_provider::db::query_as::<(String,)>(&adapt_sql(
         "SELECT DISTINCT did FROM happyview_backfill_queue WHERE job_id = ? ORDER BY did",
         state.db_backend,
@@ -366,7 +374,10 @@ pub async fn job_dids(state: &JobState, job_id: &str) -> Result<Vec<String>, sql
     .collect())
 }
 
-pub async fn retries(state: &JobState, job_id: &str) -> Result<Vec<(String, i32)>, sqlx::Error> {
+pub(crate) async fn retries(
+    state: &JobState,
+    job_id: &str,
+) -> Result<Vec<(String, i32)>, sqlx::Error> {
     happyview_provider::db::query_as::<(String, i32)>(&adapt_sql(
         "SELECT segment, block_index FROM happyview_backfill_replay_retries \
          WHERE job_id = ? AND done = 0 ORDER BY segment, block_index",
@@ -379,7 +390,7 @@ pub async fn retries(state: &JobState, job_id: &str) -> Result<Vec<(String, i32)
 
 /// Record the blocks a retry job refetches (`block_index` -1: a whole
 /// segment), before the job is spawned.
-pub async fn insert_retries(
+pub(crate) async fn insert_retries(
     state: &JobState,
     job_id: &str,
     blocks: &[(String, i32)],
@@ -401,7 +412,7 @@ pub async fn insert_retries(
     Ok(())
 }
 
-pub async fn has_retries(state: &JobState, job_id: &str) -> Result<bool, sqlx::Error> {
+pub(crate) async fn has_retries(state: &JobState, job_id: &str) -> Result<bool, sqlx::Error> {
     let n: i64 = happyview_provider::db::query_scalar(&adapt_sql(
         "SELECT COUNT(*) FROM happyview_backfill_replay_retries WHERE job_id = ?",
         state.db_backend,
@@ -412,7 +423,7 @@ pub async fn has_retries(state: &JobState, job_id: &str) -> Result<bool, sqlx::E
     Ok(n > 0)
 }
 
-pub async fn retry_done(
+pub(crate) async fn retry_done(
     state: &JobState,
     job_id: &str,
     segment: &str,

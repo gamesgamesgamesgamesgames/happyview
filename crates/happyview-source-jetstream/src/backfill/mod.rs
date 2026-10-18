@@ -187,7 +187,7 @@ mod running_tests {
 }
 
 /// How a replay job's run ended.
-pub enum ReplayOutcome {
+pub(crate) enum ReplayOutcome {
     Completed {
         records: u64,
         bytes: u64,
@@ -203,7 +203,7 @@ pub enum ReplayOutcome {
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub async fn set_stage(state: &JobState, job_id: &str, stage: &str) {
+pub(crate) async fn set_stage(state: &JobState, job_id: &str, stage: &str) {
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET stage = ? WHERE id = ?",
         state.db_backend,
@@ -224,7 +224,7 @@ pub async fn set_stage(state: &JobState, job_id: &str, stage: &str) {
     );
 }
 
-pub async fn update_job_counter(state: &JobState, job_id: &str, column: &str, value: i32) {
+pub(crate) async fn update_job_counter(state: &JobState, job_id: &str, column: &str, value: i32) {
     let query = match column {
         "total_repos" => "UPDATE happyview_backfill_jobs SET total_repos = ? WHERE id = ?",
         "resolved_repos" => "UPDATE happyview_backfill_jobs SET resolved_repos = ? WHERE id = ?",
@@ -252,7 +252,7 @@ pub async fn update_job_counter(state: &JobState, job_id: &str, column: &str, va
 /// columns are `INT`, which Postgres refuses to overflow and which every
 /// reader decodes as `i32`. Postgres widens the sum first so that it cannot
 /// overflow before it is clamped.
-pub fn saturating_counter(
+pub(crate) fn saturating_counter(
     column: &str,
     increment: &str,
     backend: happyview_provider::db::DatabaseBackend,
@@ -278,7 +278,7 @@ pub fn saturating_fetch_add(counter: &AtomicI32, n: i32) -> i32 {
     previous.saturating_add(n)
 }
 
-pub fn publish_event(state: &JobState, event: types::BackfillEvent) {
+pub(crate) fn publish_event(state: &JobState, event: types::BackfillEvent) {
     let _ = state.backfill_events_tx.send(event);
 }
 
@@ -372,18 +372,18 @@ pub async fn build_job_snapshot(state: &JobState, job_id: &str) -> Option<types:
     })
 }
 
-pub fn random_batch_threshold(base: i32) -> i32 {
+pub(crate) fn random_batch_threshold(base: i32) -> i32 {
     let low = base - base / 10;
     rand::rng().random_range(low..=base)
 }
 
-pub struct BackfillConcurrency {
+pub(crate) struct BackfillConcurrency {
     resolution: usize,
     pds: usize,
     dids_per_pds: usize,
 }
 
-pub async fn load_concurrency(state: &JobState) -> BackfillConcurrency {
+pub(crate) async fn load_concurrency(state: &JobState) -> BackfillConcurrency {
     let resolution = state
         .host
         .setting("backfill_concurrent_resolution")
@@ -412,7 +412,7 @@ pub async fn load_concurrency(state: &JobState) -> BackfillConcurrency {
     }
 }
 
-pub async fn load_max_attempts(state: &JobState) -> u32 {
+pub(crate) async fn load_max_attempts(state: &JobState) -> u32 {
     state
         .host
         .setting("backfill_max_attempts")
@@ -422,7 +422,7 @@ pub async fn load_max_attempts(state: &JobState) -> u32 {
         .clamp(1, 10)
 }
 
-pub async fn fail_job(state: &JobState, job_id: &str, error: &str) {
+pub(crate) async fn fail_job(state: &JobState, job_id: &str, error: &str) {
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
@@ -446,7 +446,7 @@ pub async fn fail_job(state: &JobState, job_id: &str, error: &str) {
     );
 }
 
-pub async fn should_stop(state: &JobState, job_id: &str) -> Option<&'static str> {
+pub(crate) async fn should_stop(state: &JobState, job_id: &str) -> Option<&'static str> {
     let sql = adapt_sql(
         "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
@@ -465,11 +465,11 @@ pub async fn should_stop(state: &JobState, job_id: &str) -> Option<&'static str>
     }
 }
 
-pub async fn should_stop_worker(state: &JobState, job_id: &str) -> bool {
+pub(crate) async fn should_stop_worker(state: &JobState, job_id: &str) -> bool {
     should_stop(state, job_id).await.is_some()
 }
 
-pub async fn request_cancel(state: &JobState, job_id: &str) {
+pub(crate) async fn request_cancel(state: &JobState, job_id: &str) {
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'cancelling' WHERE id = ? AND status IN ('running', 'paused')",
         state.db_backend,
@@ -482,7 +482,7 @@ pub async fn request_cancel(state: &JobState, job_id: &str) {
     .await;
 }
 
-pub async fn finalise_cancel(state: &JobState, job_id: &str) {
+pub(crate) async fn finalise_cancel(state: &JobState, job_id: &str) {
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
@@ -518,7 +518,7 @@ pub async fn request_pause(state: &JobState, job_id: &str) {
     .await;
 }
 
-pub async fn finalise_pause(state: &JobState, job_id: &str) {
+pub(crate) async fn finalise_pause(state: &JobState, job_id: &str) {
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'paused' WHERE id = ?",
         state.db_backend,
@@ -539,7 +539,7 @@ pub async fn finalise_pause(state: &JobState, job_id: &str) {
     );
 }
 
-pub async fn complete_job(
+pub(crate) async fn complete_job(
     state: &JobState,
     job_id: &str,
     processed_repos: i32,
@@ -575,7 +575,7 @@ pub async fn complete_job(
 // Background backfill worker
 // ---------------------------------------------------------------------------
 
-pub async fn run_backfill_job(state: JobState, job_id: String) {
+pub(crate) async fn run_backfill_job(state: JobState, job_id: String) {
     let window = parse_discovery_window(
         happyview_provider::vars::var("BACKFILL_DISCOVERY_WINDOW").as_deref(),
     );
@@ -839,7 +839,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
 ///
 /// The reason goes in the job's `error`, so the dashboard can tell this from
 /// a pause an operator asked for. Resuming clears it.
-pub async fn pause_with_units_left(
+pub(crate) async fn pause_with_units_left(
     state: &JobState,
     job_id: &str,
     collection: Option<&str>,
@@ -894,7 +894,7 @@ pub async fn pause_with_units_left(
 ///
 /// `discovery_complete = 1` makes `run_backfill_job` skip discovery, both on
 /// first run and on resume.
-pub async fn insert_targeted_job(
+pub(crate) async fn insert_targeted_job(
     state: &JobState,
     job_id: &str,
     collection: Option<&str>,
@@ -966,7 +966,7 @@ pub async fn create_backfill_job(
 
 /// Insert a backfill job without starting it. With no `dids` the job
 /// discovers repos through the relay; otherwise it targets exactly those.
-pub async fn create_backfill_job_with(
+pub(crate) async fn create_backfill_job_with(
     state: &JobState,
     collection: Option<&str>,
     dids: &[String],
@@ -1000,7 +1000,7 @@ pub async fn create_gap_replay_job(state: &JobState, after_seq: i64) -> Result<S
     Ok(job_id)
 }
 
-pub async fn insert_network_job(
+pub(crate) async fn insert_network_job(
     state: &JobState,
     pool: &sqlx::AnyPool,
     job_id: &str,
@@ -1030,7 +1030,7 @@ pub async fn insert_network_job(
     Ok(())
 }
 
-pub async fn start_backfill(
+pub(crate) async fn start_backfill(
     state: &JobState,
     collection: Option<String>,
     dids: Vec<String>,
@@ -1040,7 +1040,7 @@ pub async fn start_backfill(
 }
 
 /// `start_backfill` with the source asked for; `None`: `BACKFILL_SOURCE`.
-pub async fn start_backfill_with(
+pub(crate) async fn start_backfill_with(
     state: &JobState,
     collection: Option<String>,
     dids: Vec<String>,
@@ -1130,7 +1130,7 @@ pub async fn start_backfill_with(
 
 /// Create and spawn a job of `executor` backfilling `collection`. Its
 /// `source` is the executor's name.
-pub async fn start_executor_job(
+pub(crate) async fn start_executor_job(
     state: &JobState,
     collection: &str,
     executor: Arc<dyn BackfillExecutor>,
@@ -1281,7 +1281,7 @@ async fn run_executor_job(state: &JobState, job_id: &str, collection: Option<&st
 
 /// Per-job detail a flush or the retention sweep clears: a legacy job's repo
 /// rows, and a bounded job's recent completions and PDS summary.
-pub const BACKFILL_DETAIL_TABLES: [&str; 3] = [
+pub(crate) const BACKFILL_DETAIL_TABLES: [&str; 3] = [
     "happyview_backfill_repos",
     "happyview_backfill_completions",
     "happyview_backfill_pds_stats",
@@ -1290,24 +1290,24 @@ pub const BACKFILL_DETAIL_TABLES: [&str; 3] = [
 /// A bounded job's live work. A running or paused job still needs it, so it
 /// is cleared only once the job has finished. A cancelled or failed job can
 /// leave up to a window of units behind.
-pub const BACKFILL_WORK_TABLES: [&str; 2] =
+pub(crate) const BACKFILL_WORK_TABLES: [&str; 2] =
     ["happyview_backfill_queue", "happyview_backfill_cursors"];
 
 /// Statuses a job never leaves.
 pub const FINISHED_STATUSES: [&str; 3] = ["completed", "cancelled", "failed"];
 
-pub const FINISHED_JOBS: &str =
+pub(crate) const FINISHED_JOBS: &str =
     "SELECT id FROM happyview_backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed')";
 
 /// Rows each flush or retention DELETE removes at a time. A legacy network
 /// job can hold millions of repo rows, and one statement over all of them
 /// would hold the write lock (and on SQLite grow the WAL) for its whole run.
-pub const BACKFILL_DELETE_BATCH: i64 = 10_000;
+pub(crate) const BACKFILL_DELETE_BATCH: i64 = 10_000;
 
 /// Delete the rows of `table` matching `filter`, `batch` at a time, each
 /// batch its own statement retried while the database is busy. Returns the
 /// rows deleted.
-pub async fn delete_detail_rows(
+pub(crate) async fn delete_detail_rows(
     state: &JobState,
     table: &str,
     filter: &str,
@@ -1394,7 +1394,7 @@ pub async fn sweep_backfill_details_in_batches(
     Ok(deleted)
 }
 
-pub async fn run_backfill_retention_cleanup(state: &JobState) {
+pub(crate) async fn run_backfill_retention_cleanup(state: &JobState) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
 
     loop {

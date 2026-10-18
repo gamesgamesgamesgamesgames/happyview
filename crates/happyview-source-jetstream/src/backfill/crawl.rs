@@ -23,24 +23,24 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub struct ListReposResponse {
+pub(crate) struct ListReposResponse {
     pub repos: Vec<RepoEntry>,
     pub cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct RepoEntry {
+pub(crate) struct RepoEntry {
     pub did: String,
 }
 
 #[derive(Deserialize)]
-pub struct ListRecordsResponse {
+pub(crate) struct ListRecordsResponse {
     pub records: Vec<RecordEntry>,
     pub cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct RecordEntry {
+pub(crate) struct RecordEntry {
     pub uri: String,
     pub cid: String,
     pub value: serde_json::Value,
@@ -63,16 +63,16 @@ pub const RECENT_COMPLETIONS_PER_JOB: i64 = 1000;
 pub const ALL_COLLECTIONS: &str = "";
 
 /// The largest relay page discovery asks for.
-pub const RELAY_PAGE_LIMIT: i64 = 1000;
+pub(crate) const RELAY_PAGE_LIMIT: i64 = 1000;
 
 /// Discovered DIDs per INSERT: three bound parameters each, 900 a statement.
 /// That is well within the bundled SQLite's limit of 32766, and within the
 /// 999 of SQLite builds before 3.32 too.
-pub const DISCOVERY_INSERT_CHUNK: usize = 300;
+pub(crate) const DISCOVERY_INSERT_CHUNK: usize = 300;
 
 /// Rows per DELETE when a pre-upgrade job's partial repo list is discarded,
 /// so millions of rows never go through one transaction.
-pub const LEGACY_DELETE_BATCH: i64 = 5000;
+pub(crate) const LEGACY_DELETE_BATCH: i64 = 5000;
 
 /// Completed units between trims of a job's recent-completions log. Trimming
 /// inside every unit's transaction would add a ranged DELETE to each one, so
@@ -243,7 +243,7 @@ impl JobQueue {
 
 /// Sets `discovery_done` however discovery ends, panics included, so the
 /// resolver is never left waiting on a discovery that is gone.
-pub struct MarkDiscoveryDone(Arc<AtomicBool>);
+pub(crate) struct MarkDiscoveryDone(Arc<AtomicBool>);
 
 impl Drop for MarkDiscoveryDone {
     fn drop(&mut self) {
@@ -510,7 +510,7 @@ pub async fn complete_unit(
 
 /// Trim a job's recent-completions log to its newest
 /// `RECENT_COMPLETIONS_PER_JOB` rows.
-pub async fn trim_completions(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn trim_completions(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
     let sql = adapt_sql(
         "DELETE FROM happyview_backfill_completions WHERE job_id = ? AND id <= \
          (SELECT id FROM happyview_backfill_completions WHERE job_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)",
@@ -541,7 +541,7 @@ pub async fn trim_completions_on_schedule(state: &JobState, queue: &JobQueue, pr
 /// `happyview_backfill_errors`, which retry-failed reads. A legacy row stays,
 /// as it always did, so a resumed job tries it again. Returns whether a row
 /// left the queue.
-pub async fn drop_unresolvable(
+pub(crate) async fn drop_unresolvable(
     state: &JobState,
     queue: &JobQueue,
     unit: &WorkUnit,
@@ -574,14 +574,14 @@ pub async fn drop_unresolvable(
 /// Completions that keep failing fail the run instead, after
 /// `MAX_CONSECUTIVE_COMPLETION_FAILURES` in a row, so freed slots cannot let
 /// discovery grow the queue without bound.
-pub fn release_slot(queue: &JobQueue, removed: Option<bool>) {
+pub(crate) fn release_slot(queue: &JobQueue, removed: Option<bool>) {
     if removed != Some(false) {
         queue.window.release(1);
     }
 }
 
 /// Count a fetch give-up against its PDS.
-pub async fn count_pds_error(
+pub(crate) async fn count_pds_error(
     state: &JobState,
     queue: &JobQueue,
     pds: &str,
@@ -643,7 +643,7 @@ pub async fn add_late_records(
 /// `(resolved, processed, records)` for a pipeline run to start from. A
 /// bounded job's row holds exact counters; a legacy job's are recounted from
 /// its repo rows, as before.
-pub async fn seed_counters(
+pub(crate) async fn seed_counters(
     state: &JobState,
     queue: &JobQueue,
 ) -> Result<(i32, i32, i32), sqlx::Error> {
@@ -686,7 +686,7 @@ pub async fn seed_counters(
     Ok((resolved, completed, records))
 }
 
-pub async fn queued_units(state: &JobState, job_id: &str) -> Result<i64, sqlx::Error> {
+pub(crate) async fn queued_units(state: &JobState, job_id: &str) -> Result<i64, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT COUNT(*) FROM happyview_backfill_queue WHERE job_id = ?",
         state.db_backend,
@@ -702,7 +702,7 @@ pub async fn queued_units(state: &JobState, job_id: &str) -> Result<i64, sqlx::E
 /// queue. Its partial repo list is discarded in batches and discovery starts
 /// over; a single-account job gets its one unit back. Nothing had been
 /// fetched, so nothing is lost.
-pub async fn convert_to_bounded(
+pub(crate) async fn convert_to_bounded(
     state: &JobState,
     job_id: &str,
     single_did: Option<&str>,
@@ -743,7 +743,7 @@ pub async fn convert_to_bounded(
 
 /// The job-row half of `convert_to_bounded`, with the single account's unit,
 /// in one transaction.
-pub async fn switch_to_bounded(
+pub(crate) async fn switch_to_bounded(
     state: &JobState,
     job_id: &str,
     single_did: Option<&str>,
@@ -782,13 +782,13 @@ pub async fn switch_to_bounded(
 
 /// How far one collection's relay listing got.
 #[derive(Clone, Debug)]
-pub struct DiscoveryCursor {
+pub(crate) struct DiscoveryCursor {
     pub cursor: Option<String>,
     pub done: bool,
 }
 
 /// Why one collection's discovery stopped short.
-pub enum DiscoveryError {
+pub(crate) enum DiscoveryError {
     /// The relay would not list the collection. As before, it is skipped.
     Relay(String),
     /// The queue could not be written. The job fails rather than finishing
@@ -796,7 +796,7 @@ pub enum DiscoveryError {
     Database(String),
 }
 
-pub async fn load_discovery_cursors(
+pub(crate) async fn load_discovery_cursors(
     state: &JobState,
     job_id: &str,
 ) -> Result<HashMap<String, DiscoveryCursor>, sqlx::Error> {
@@ -822,7 +822,7 @@ pub async fn load_discovery_cursors(
         .collect())
 }
 
-pub async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i32, sqlx::Error> {
+pub(crate) async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i32, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT total_repos FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
@@ -836,7 +836,7 @@ pub async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i32, sqlx
 
 /// One `listReposByCollection` page, sleeping through rate limits. `Ok(None)`
 /// means the job stopped while it waited out a rate limit.
-pub async fn fetch_relay_page(
+pub(crate) async fn fetch_relay_page(
     state: &JobState,
     url: &str,
     collection: &str,
@@ -934,7 +934,7 @@ pub async fn enqueue_discovered_page(
 
 /// Wait until the window has room for `n` units and reserve it. Returns false
 /// if the job is stopping.
-pub async fn wait_for_window(
+pub(crate) async fn wait_for_window(
     state: &JobState,
     queue: &JobQueue,
     n: i64,
@@ -959,7 +959,7 @@ pub async fn wait_for_window(
 /// Page one collection's repos into the queue, starting at `cursor`.
 /// `Ok(true)` means the relay has no more pages; `Ok(false)` means the job is
 /// stopping.
-pub async fn discover_collection(
+pub(crate) async fn discover_collection(
     state: &JobState,
     queue: &JobQueue,
     collection: &str,
@@ -1047,7 +1047,7 @@ pub async fn discover_collection(
 /// An `Err` means discovery could not read or write the queue, and the job
 /// must fail: it sets `cancelled` so the resolver and fetchers stop too,
 /// rather than draining what was queued and leaving the job looking complete.
-pub async fn run_discovery(
+pub(crate) async fn run_discovery(
     state: JobState,
     queue: JobQueue,
     collections: Vec<String>,
@@ -1061,7 +1061,7 @@ pub async fn run_discovery(
     result
 }
 
-pub async fn discover_all(
+pub(crate) async fn discover_all(
     state: &JobState,
     queue: &JobQueue,
     collections: Vec<String>,
@@ -1208,7 +1208,7 @@ pub struct ResolvedDids {
 /// DIDs the resolver remembers. A DID's units are queued close together (one
 /// per collection, each page of each collection's relay listing at a time),
 /// so a small cache catches nearly every repeat.
-pub const RESOLVED_DID_CACHE: usize = 10_000;
+pub(crate) const RESOLVED_DID_CACHE: usize = 10_000;
 
 impl ResolvedDids {
     pub fn get(&self, did: &str) -> Option<String> {
@@ -1233,7 +1233,7 @@ impl ResolvedDids {
 /// page at a time. This finishes before this run resolves anything, so every
 /// resolved unit it reads came from an earlier run and none is sent twice.
 /// Returns false if the job is stopping or the fetcher has gone away.
-pub async fn send_resolved_backlog(ctx: &ResolverContext) -> Result<bool, sqlx::Error> {
+pub(crate) async fn send_resolved_backlog(ctx: &ResolverContext) -> Result<bool, sqlx::Error> {
     let mut after: Option<WorkUnit> = None;
     loop {
         let page = resolved_page(&ctx.state, &ctx.queue, after.as_ref()).await?;
@@ -1260,7 +1260,7 @@ pub async fn send_resolved_backlog(ctx: &ResolverContext) -> Result<bool, sqlx::
 ///
 /// An `Err` means the queue could not be read; `cancelled` is set so the
 /// fetchers stop, and the job fails.
-pub async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
+pub(crate) async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
     match send_resolved_backlog(&ctx).await {
         Ok(true) => {}
         Ok(false) => return Ok(()),
@@ -1403,7 +1403,7 @@ pub async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
     Ok(())
 }
 
-pub fn warn_fetcher_gone(ctx: &ResolverContext, run: &ResolverRun) {
+pub(crate) fn warn_fetcher_gone(ctx: &ResolverContext, run: &ResolverRun) {
     tracing::warn!(
         job_id = %ctx.queue.job_id,
         deferred_queued = run.deferred.len(),
@@ -1415,7 +1415,7 @@ pub fn warn_fetcher_gone(ctx: &ResolverContext, run: &ResolverRun) {
 /// Between passes, while discovery is still enqueueing, retry the deferred
 /// resolutions that are due and then wait briefly. Returns false if the job
 /// is stopping or the fetcher has gone away.
-pub async fn idle_drain(ctx: &ResolverContext, run: &mut ResolverRun) -> bool {
+pub(crate) async fn idle_drain(ctx: &ResolverContext, run: &mut ResolverRun) -> bool {
     loop {
         if ctx.cancelled.load(Ordering::Relaxed) {
             return false;
@@ -1557,7 +1557,7 @@ pub async fn on_cached(
 
 /// Record a resolve give-up (once per DID) and take the unit out of the queue,
 /// freeing its window slot.
-pub async fn give_up_resolution(
+pub(crate) async fn give_up_resolution(
     ctx: &ResolverContext,
     run: &mut ResolverRun,
     unit: WorkUnit,
@@ -1596,7 +1596,7 @@ pub async fn give_up_resolution(
 /// A unit whose PDS could not be stored is not fetched: it stays unresolved
 /// in the queue, so a later pass (or the resumed job) resolves it again
 /// instead of fetching a unit the queue does not know is in flight.
-pub async fn on_resolved(ctx: &ResolverContext, unit: WorkUnit, pds: String) -> bool {
+pub(crate) async fn on_resolved(ctx: &ResolverContext, unit: WorkUnit, pds: String) -> bool {
     let stored = job_write(&ctx.state, &ctx.queue.job_id, "mark_resolved", || {
         mark_resolved(&ctx.state, &ctx.queue, &unit, &pds)
     })
@@ -1631,7 +1631,7 @@ pub async fn on_resolved(ctx: &ResolverContext, unit: WorkUnit, pds: String) -> 
 /// read and the job must fail.
 ///
 /// `cancelled` is shared with discovery, which sets it when it fails.
-pub async fn run_pipelined_resolve_and_fetch(
+pub(crate) async fn run_pipelined_resolve_and_fetch(
     state: &JobState,
     collections: &[String],
     concurrency: &BackfillConcurrency,
@@ -1795,7 +1795,7 @@ pub async fn run_pipelined_resolve_and_fetch(
 /// Never blocks: every worker starts consuming the moment it exists (see
 /// `FetchContext::requests`), and a full channel just leaves the rest waiting
 /// for the next call.
-pub fn dispatch_waiting(
+pub(crate) fn dispatch_waiting(
     template: &FetchContext,
     workers: &mut HashMap<String, mpsc::Sender<WorkUnit>>,
     handles: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
@@ -1825,7 +1825,7 @@ pub fn dispatch_waiting(
 }
 
 /// Start a PDS worker with `first` already queued, and register its sender.
-pub fn spawn_pds_worker(
+pub(crate) fn spawn_pds_worker(
     template: &FetchContext,
     workers: &mut HashMap<String, mpsc::Sender<WorkUnit>>,
     handles: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
@@ -1844,7 +1844,7 @@ pub fn spawn_pds_worker(
 }
 
 #[derive(Clone)]
-pub struct FetchContext {
+pub(crate) struct FetchContext {
     pub state: Arc<JobState>,
     pub queue: JobQueue,
     pub collections: Arc<Vec<String>>,
@@ -1878,7 +1878,7 @@ pub struct FetchContext {
 ///
 /// One set per worker is one set per job for any given DID, since a DID is
 /// routed to exactly one PDS worker.
-pub type RecordedDids = std::collections::HashSet<String>;
+pub(crate) type RecordedDids = std::collections::HashSet<String>;
 
 /// Order a DID's failed collections so a retryable failure is handled first.
 ///
@@ -1899,7 +1899,7 @@ pub fn retryable_give_ups_first(failures: &mut [(String, FetchOutcome)]) {
 /// per-DID results arm, the post-cancellation drain, and the deferred-retry
 /// loop — so the retry/give-up policy can't drift between them.
 #[allow(clippy::too_many_arguments)]
-pub async fn defer_or_give_up_fetch(
+pub(crate) async fn defer_or_give_up_fetch(
     state: &JobState,
     queue: &JobQueue,
     pds_endpoint: &str,
@@ -1955,7 +1955,7 @@ pub async fn defer_or_give_up_fetch(
 /// reading logs wants to know which collection failed. Only the *row* and the
 /// *count*, which are per-DID by the detail table's key, are collapsed.
 #[allow(clippy::too_many_arguments)]
-pub async fn record_fetch_give_up(
+pub(crate) async fn record_fetch_give_up(
     state: &JobState,
     queue: &JobQueue,
     pds_endpoint: &str,
@@ -1997,7 +1997,7 @@ pub async fn record_fetch_give_up(
 /// the host, so the error taxonomy the dashboard reads is unchanged; only the
 /// time taken to reach it stops scaling with the queue length.
 #[allow(clippy::too_many_arguments)]
-pub async fn abandon_saturated_pds(
+pub(crate) async fn abandon_saturated_pds(
     state: &JobState,
     queue: &JobQueue,
     pds_endpoint: &str,
@@ -2051,10 +2051,10 @@ pub async fn abandon_saturated_pds(
 /// The result of one unit's first attempt: records fetched, whether any
 /// collection succeeded (clears the host's cooldown), and the per-collection
 /// failures still needing a defer-or-give-up decision.
-pub type UnitFetchResult = (WorkUnit, i32, bool, Vec<(String, FetchOutcome)>);
+pub(crate) type UnitFetchResult = (WorkUnit, i32, bool, Vec<(String, FetchOutcome)>);
 
 /// What settling a unit needs from its worker.
-pub struct WorkerScope<'a> {
+pub(crate) struct WorkerScope<'a> {
     pub state: &'a JobState,
     pub queue: &'a JobQueue,
     pub pds_endpoint: &'a str,
@@ -2068,7 +2068,7 @@ pub struct WorkerScope<'a> {
 
 /// A worker's retry bookkeeping. It is local to the worker and keyed to the
 /// one host that worker talks to.
-pub struct WorkerRetries {
+pub(crate) struct WorkerRetries {
     pub cooldowns: HostCooldowns,
     pub deferred: DeferredQueue<(String, String, Option<String>)>,
     pub recorded: RecordedDids,
@@ -2079,7 +2079,7 @@ pub struct WorkerRetries {
 /// pause or cancel stays queued so the resumed job fetches it again. Returns
 /// the job's processed and record counts, or `None` if the unit was left
 /// queued.
-pub async fn finish_unit(
+pub(crate) async fn finish_unit(
     scope: &WorkerScope<'_>,
     retries: &mut WorkerRetries,
     result: UnitFetchResult,
@@ -2143,7 +2143,7 @@ pub async fn finish_unit(
 }
 
 /// Count records a deferred retry fetched after its unit completed.
-pub async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
+pub(crate) async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
     if records == 0 {
         return;
     }
@@ -2162,7 +2162,7 @@ pub async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
 /// worker polls nothing else. A fetch suspended inside a page's transaction
 /// would hold its connection (and on SQLite the write lock) until polled
 /// again, so the settle could wait on it forever.
-pub async fn fetch_unit(
+pub(crate) async fn fetch_unit(
     state: Arc<JobState>,
     job_id: Arc<String>,
     pds_endpoint: String,
@@ -2211,7 +2211,7 @@ pub async fn fetch_unit(
 /// A `fetch_unit` task's result. A task that panicked took its unit with it:
 /// the unit stays queued for the next run, and its window slot is freed so
 /// this run's discovery is not held up by it.
-pub fn fetched_unit(
+pub(crate) fn fetched_unit(
     queue: &JobQueue,
     joined: Result<UnitFetchResult, tokio::task::JoinError>,
 ) -> Option<UnitFetchResult> {
@@ -2225,7 +2225,7 @@ pub fn fetched_unit(
     }
 }
 
-pub async fn run_pds_worker(
+pub(crate) async fn run_pds_worker(
     ctx: FetchContext,
     pds_endpoint: String,
     mut rx: mpsc::Receiver<WorkUnit>,
@@ -2413,7 +2413,7 @@ pub async fn run_pds_worker(
 // Phase 3: Fetch records from PDS instances (legacy, for resumed jobs)
 // ---------------------------------------------------------------------------
 
-pub async fn run_fetching_phase(
+pub(crate) async fn run_fetching_phase(
     state: &JobState,
     job_id: &str,
     collections: &[String],
@@ -2961,7 +2961,7 @@ pub async fn fetch_records_page_loop(
 /// unfinished. Returns the job's `(processed_repos, total_records)`, or the
 /// error the job fails with: a queue that could not be read or written, by
 /// discovery or by the pipeline, never lets the job finish as completed.
-pub async fn run_queue(
+pub(crate) async fn run_queue(
     state: &JobState,
     job_id: &str,
     collections: &[String],

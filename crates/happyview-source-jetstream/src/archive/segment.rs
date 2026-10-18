@@ -6,12 +6,12 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-pub const HEADER_LEN: u64 = 256;
-pub const INDEX_ENTRY_LEN: u64 = 52;
+pub(crate) const HEADER_LEN: u64 = 256;
+pub(crate) const INDEX_ENTRY_LEN: u64 = 52;
 /// Decoded block cap. The protocol allows 1 GiB; real blocks are a few MiB
 /// (4,096 events), and a bigger one is recorded as a failed block (P5).
-pub const MAX_DECODED_BLOCK: usize = 64 << 20;
-pub const MAX_BLOCK_EVENTS: usize = 262_144;
+pub(crate) const MAX_DECODED_BLOCK: usize = 64 << 20;
+pub(crate) const MAX_BLOCK_EVENTS: usize = 262_144;
 const MAGIC: &[u8; 4] = b"jss0";
 const VERSION: u16 = 1;
 

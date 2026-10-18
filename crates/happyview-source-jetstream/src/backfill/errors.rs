@@ -16,7 +16,7 @@ use super::{JobState, now_rfc3339};
 pub const ERROR_DETAIL_CAP: i64 = 10_000;
 
 #[derive(Debug, Default, Clone)]
-pub struct ErrorCounts {
+pub(crate) struct ErrorCounts {
     counts: HashMap<BackfillErrorKind, i64>,
 }
 
@@ -78,7 +78,7 @@ impl ErrorCounts {
 /// so that the reservation and the insert cannot interleave with another
 /// worker's across the `.await` below. See `ErrorRecorder::record`.
 #[allow(clippy::too_many_arguments)]
-pub async fn persist_failure(
+pub(crate) async fn persist_failure(
     state: &JobState,
     job_id: &str,
     did: &str,
@@ -119,7 +119,7 @@ pub async fn persist_failure(
     result.is_ok()
 }
 
-pub async fn flush_error_counts(state: &JobState, job_id: &str, counts: &ErrorCounts) {
+pub(crate) async fn flush_error_counts(state: &JobState, job_id: &str, counts: &ErrorCounts) {
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET error_counts = ? WHERE id = ?",
         state.db_backend,

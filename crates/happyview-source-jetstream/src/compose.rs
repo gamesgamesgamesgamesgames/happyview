@@ -181,7 +181,7 @@ impl JobHandle {
 }
 
 /// The phase an executor's failures are logged under.
-pub const EXECUTOR_PHASE: &str = "executor";
+pub(crate) const EXECUTOR_PHASE: &str = "executor";
 
 /// The job counters are `INT` columns.
 fn clamp(n: i64) -> i32 {
@@ -208,9 +208,9 @@ async fn counters_so_far(jobs: &JobState, id: &str) -> (i64, i64) {
 }
 
 /// Which tracked collections are streamed live.
-pub type LiveFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub(crate) type LiveFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// Who runs a collection's backfill; `None`: crawl or replay.
-pub type ExecutorFor = Arc<dyn Fn(&str) -> Option<Arc<dyn BackfillExecutor>> + Send + Sync>;
+pub(crate) type ExecutorFor = Arc<dyn Fn(&str) -> Option<Arc<dyn BackfillExecutor>> + Send + Sync>;
 
 /// How a composing provider shapes the source. The default streams every
 /// tracked collection and crawls or replays every backfill.

@@ -15,7 +15,7 @@ use happyview_provider::{
 
 use crate::consumer::event::{Event, EventKind};
 
-pub const FOLD_BATCH: usize = 200;
+pub(crate) const FOLD_BATCH: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldError(pub String);

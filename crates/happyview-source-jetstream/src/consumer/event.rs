@@ -148,7 +148,7 @@ struct V2Info {
 }
 
 /// RFC 3339 (Jetstream sends six fractional digits) to unix microseconds.
-pub fn parse_time_us(s: &str) -> Result<i64, String> {
+pub(crate) fn parse_time_us(s: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| t.timestamp_micros())
         .map_err(|e| format!("bad timestamp {s:?}: {e}"))
@@ -240,7 +240,7 @@ struct V1Frame {
 /// One v1 frame. v1 has no seq HappyView can rely on (an original v1 server
 /// sends none, and `time_us` is neither unique nor monotonic), so the cursor
 /// is the `time_us` and nothing is deduplicated by it.
-pub fn parse_v1(text: &str) -> Result<Frame, String> {
+pub(crate) fn parse_v1(text: &str) -> Result<Frame, String> {
     let frame: V1Frame = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let kind = match (
         frame.kind.as_str(),

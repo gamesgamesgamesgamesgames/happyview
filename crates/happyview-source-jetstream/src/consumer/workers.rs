@@ -40,15 +40,15 @@ pub enum ApplyOutcome {
 }
 
 /// What a worker does with each event.
-pub type ApplyFn = Arc<dyn Fn(Event) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
+pub(crate) type ApplyFn = Arc<dyn Fn(Event) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
 
 /// Called once for an event that still failed after every retry, with the
 /// last error. It runs inline before the event's ticket completes, so it
 /// must not hang: a hang stops that worker and the watermark for good.
-pub type GiveUpFn = Arc<dyn Fn(Event, String) -> BoxFuture<'static, ()> + Send + Sync>;
+pub(crate) type GiveUpFn = Arc<dyn Fn(Event, String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The longest wait between retries of an `Unavailable` event.
-pub const MAX_UNAVAILABLE_DELAY: Duration = Duration::from_secs(30);
+pub(crate) const MAX_UNAVAILABLE_DELAY: Duration = Duration::from_secs(30);
 
 /// How a worker retries an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,7 +114,7 @@ impl Drop for WorkerPool {
 }
 
 /// The worker that owns `did`'s events.
-pub fn worker_for(did: &str, workers: usize) -> usize {
+pub(crate) fn worker_for(did: &str, workers: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     did.hash(&mut hasher);
     (hasher.finish() % workers.max(1) as u64) as usize
@@ -204,7 +204,7 @@ impl WorkerPool {
 const IDLE: i64 = i64::MIN;
 
 /// Reads a `busy_since` set as `None` for idle workers.
-pub fn busy_since_values(busy_since: &[AtomicI64]) -> Vec<Option<i64>> {
+pub(crate) fn busy_since_values(busy_since: &[AtomicI64]) -> Vec<Option<i64>> {
     busy_since
         .iter()
         .map(|since| match since.load(Ordering::Relaxed) {

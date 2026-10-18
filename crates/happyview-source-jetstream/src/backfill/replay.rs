@@ -61,7 +61,7 @@ struct Run<'a> {
 /// Run replay job `job_id` over `collections` (and, for an account job,
 /// `scope_dids`) from the archive of `jobs.endpoint`. `source` is the job's:
 /// `auto` falls back to a crawl when there is no archive.
-pub async fn run(
+pub(crate) async fn run(
     jobs: &JobState,
     job_id: &str,
     collections: &[String],
@@ -951,7 +951,10 @@ async fn decode(frame: Vec<u8>) -> Result<Vec<Row>, String> {
 /// Close a gap in the live stream from the archive (plan ruling P7): start a
 /// network replay job for everything after `after_seq`, and return its id and
 /// the archive's sealed tip, where the live stream can resume at once.
-pub async fn start_gap_replay(jobs: &JobState, after_seq: i64) -> Result<(String, i64), String> {
+pub(crate) async fn start_gap_replay(
+    jobs: &JobState,
+    after_seq: i64,
+) -> Result<(String, i64), String> {
     // The gap is in the live stream, which carries only these.
     let collections = jobs.compose.live(&jobs.host.tracked_collections().borrow());
     if collections.is_empty() {

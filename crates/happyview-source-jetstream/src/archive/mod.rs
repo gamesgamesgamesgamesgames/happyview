@@ -11,26 +11,27 @@ pub mod pacer;
 pub mod rows;
 pub mod segment;
 
-pub const DEFAULT_CONCURRENCY: usize = 8;
-pub const MAX_CONCURRENCY: usize = 64;
+pub(crate) const DEFAULT_CONCURRENCY: usize = 8;
+pub(crate) const MAX_CONCURRENCY: usize = 64;
 /// The archive client's read timeout: as long as a whole `planSnapshot` or
 /// `getBlock` may take, and as long as a segment body may go silent.
-pub const ARCHIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const ARCHIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long one archive request may keep being answered 429 before it
 /// fails. The archive's quota refills steadily, so a 429 is a reason to wait,
 /// not to give up; only one that lasts this long is treated as an outage.
-pub const MAX_THROTTLED_FOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub(crate) const MAX_THROTTLED_FOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How long the live consumer waits for the archive to plan a gap replay
 /// before resuming without it.
-pub const GAP_PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const GAP_PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How far back from the archive's tip a network replay sweeps account and
 /// sync markers: three of Jetstream's default 4-hour compaction intervals.
 /// Below that, compaction has already removed what a deleted account or a
 /// `#sync` supersedes.
-pub const DEFAULT_MARKER_TAIL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+pub(crate) const DEFAULT_MARKER_TAIL: std::time::Duration =
+    std::time::Duration::from_secs(12 * 60 * 60);
 
 /// Where a backfill job's records come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +53,7 @@ impl SourceChoice {
 }
 
 /// `auto`, `replay` or `crawl`, any case. `None` for anything else.
-pub fn parse_source(raw: &str) -> Option<SourceChoice> {
+pub(crate) fn parse_source(raw: &str) -> Option<SourceChoice> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => Some(SourceChoice::Auto),
         "replay" => Some(SourceChoice::Replay),
@@ -63,11 +64,11 @@ pub fn parse_source(raw: &str) -> Option<SourceChoice> {
 
 /// Whether a job's `source` is one of the source's own backfills (`auto`,
 /// `replay` or `crawl`, as stored); anything else names an executor.
-pub fn is_builtin_source(source: &str) -> bool {
+pub(crate) fn is_builtin_source(source: &str) -> bool {
     matches!(source, "auto" | "replay" | "crawl")
 }
 
-pub fn parse_concurrency(raw: Option<&str>) -> usize {
+pub(crate) fn parse_concurrency(raw: Option<&str>) -> usize {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_CONCURRENCY;
     };
@@ -87,7 +88,7 @@ pub fn parse_concurrency(raw: Option<&str>) -> usize {
 /// `BACKFILL_REPLAY_MARKER_TAIL_HOURS`: whole hours, `0` for the whole
 /// range. Unset, blank or anything else (logged) means
 /// `DEFAULT_MARKER_TAIL`.
-pub fn parse_marker_tail(raw: Option<&str>) -> std::time::Duration {
+pub(crate) fn parse_marker_tail(raw: Option<&str>) -> std::time::Duration {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_MARKER_TAIL;
     };
@@ -108,7 +109,7 @@ pub fn parse_marker_tail(raw: Option<&str>) -> std::time::Duration {
 /// logs a warning and means `crawl`. Replay is an opt-in: the archive holds
 /// only what it holds, and some repos' history in it starts after their
 /// first record.
-pub fn parse_default_source(raw: Option<&str>) -> SourceChoice {
+pub(crate) fn parse_default_source(raw: Option<&str>) -> SourceChoice {
     match raw {
         None => SourceChoice::Crawl,
         Some(raw) if raw.trim().is_empty() => SourceChoice::Crawl,
@@ -123,7 +124,7 @@ pub fn parse_default_source(raw: Option<&str>) -> SourceChoice {
 }
 
 /// The key, trimmed; blank means none.
-pub fn parse_api_key(raw: Option<&str>) -> Option<String> {
+pub(crate) fn parse_api_key(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)

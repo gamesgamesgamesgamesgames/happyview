@@ -44,11 +44,6 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Events each worker may have queued before reading the socket waits.
 const WORKER_QUEUE_CAPACITY: usize = 512;
 
-/// Start the consumer with `settings`.
-pub fn spawn(host: Arc<dyn Host>, settings: Settings) -> JoinHandle<()> {
-    spawn_with(host, settings, None)
-}
-
 /// Start the consumer with `settings`, retrying failed events by `retry`
 /// (`RetryPolicy::default()` when `None`).
 pub fn spawn_with(

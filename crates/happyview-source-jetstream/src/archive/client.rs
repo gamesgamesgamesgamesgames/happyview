@@ -19,16 +19,16 @@ use super::ArchiveConfig;
 use super::pacer::BytePacer;
 use crate::consumer::config::Endpoint;
 
-pub const PLAN_PATH: &str = "/xrpc/network.bsky.jetstream.planSnapshot";
-pub const SEGMENT_PATH: &str = "/xrpc/network.bsky.jetstream.getSegment";
-pub const BLOCK_PATH: &str = "/xrpc/network.bsky.jetstream.getBlock";
-pub const LIST_SEGMENTS_PATH: &str = "/xrpc/network.bsky.jetstream.listSegments";
+pub(crate) const PLAN_PATH: &str = "/xrpc/network.bsky.jetstream.planSnapshot";
+pub(crate) const SEGMENT_PATH: &str = "/xrpc/network.bsky.jetstream.getSegment";
+pub(crate) const BLOCK_PATH: &str = "/xrpc/network.bsky.jetstream.getBlock";
+pub(crate) const LIST_SEGMENTS_PATH: &str = "/xrpc/network.bsky.jetstream.listSegments";
 /// Segments per `listSegments` page.
 const LIST_SEGMENTS_LIMIT: &str = "1000";
-pub const SEGMENT_PART: u64 = 16 << 20;
-pub const MAX_SEGMENT_BYTES: u64 = 1 << 30;
-pub const MAX_BLOCK_BYTES: usize = 64 << 20;
-pub const MAX_GENERATION_RESTARTS: u32 = 2;
+pub(crate) const SEGMENT_PART: u64 = 16 << 20;
+pub(crate) const MAX_SEGMENT_BYTES: u64 = 1 << 30;
+pub(crate) const MAX_BLOCK_BYTES: usize = 64 << 20;
+pub(crate) const MAX_GENERATION_RESTARTS: u32 = 2;
 const MAX_PLAN_BYTES: usize = 64 << 20;
 /// Attempts at a request the archive answers 503.
 const UNAVAILABLE_ATTEMPTS: u32 = 5;

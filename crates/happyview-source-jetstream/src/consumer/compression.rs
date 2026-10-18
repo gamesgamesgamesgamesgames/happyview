@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// Largest decoded frame accepted (the Go client's read limit), so a hostile
 /// or broken frame cannot decompress into unbounded memory.
-pub const MAX_DECODED_FRAME: usize = 32 << 20;
+pub(crate) const MAX_DECODED_FRAME: usize = 32 << 20;
 /// A real dictionary is tens of KiB; refuse anything absurd.
 const MAX_DICTIONARY_BYTES: usize = 1 << 20;
 /// log2 of the largest window a frame may declare (32 MiB), so a hostile frame
@@ -17,7 +17,7 @@ const DICTIONARY_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 /// A structured zstd dictionary's ID: little-endian u32 after the magic.
 /// `None` for anything else, and for ID 0, which is invalid.
-pub fn dictionary_id(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn dictionary_id(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < 8 || bytes[..4] != DICTIONARY_MAGIC {
         return None;
     }
@@ -25,7 +25,7 @@ pub fn dictionary_id(bytes: &[u8]) -> Option<u32> {
     (id != 0).then_some(id)
 }
 
-pub struct Dictionary {
+pub(crate) struct Dictionary {
     pub id: u32,
     decoder: zstd::dict::DecoderDictionary<'static>,
 }
@@ -67,7 +67,10 @@ impl Dictionary {
 }
 
 /// `GET getZstdDictionary`: the server's current dictionary.
-pub async fn fetch_dictionary(http: &reqwest::Client, url: &str) -> Result<Dictionary, String> {
+pub(crate) async fn fetch_dictionary(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<Dictionary, String> {
     let response = http
         .get(url)
         .timeout(Duration::from_secs(15))

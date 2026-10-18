@@ -112,7 +112,7 @@ pub async fn apply_replayed_marker(
 /// `sync_scope` is the collections a `#sync` purges (the registered record
 /// collections live, a job's collections in replay). An account purge is not
 /// scoped: it removes everything held for the account, live or replayed.
-pub fn marker_event(
+pub(crate) fn marker_event(
     did: String,
     cursor: CursorPoint,
     kind: EventKind,

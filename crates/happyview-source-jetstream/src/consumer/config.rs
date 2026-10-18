@@ -8,19 +8,19 @@ use happyview_provider::LEXICON_SCHEMA_COLLECTION;
 /// Most collections either protocol takes in one subscription. Past it, v2
 /// refuses the subscription with `InvalidRequest`, so the filter is dropped
 /// and unregistered collections are discarded on arrival instead.
-pub const MAX_COLLECTION_FILTERS: usize = 100;
-pub const DEFAULT_WORKERS: usize = 8;
-pub const MAX_WORKERS: usize = 64;
+pub(crate) const MAX_COLLECTION_FILTERS: usize = 100;
+pub(crate) const DEFAULT_WORKERS: usize = 8;
+pub(crate) const MAX_WORKERS: usize = 64;
 /// How long to wait after the server rejects the subscription as invalid,
 /// which retrying sooner will not fix.
-pub const INVALID_REQUEST_RETRY: Duration = Duration::from_secs(3600);
+pub(crate) const INVALID_REQUEST_RETRY: Duration = Duration::from_secs(3600);
 /// How long a session waits for its in-flight events before reconnecting
 /// anyway. The saved cursor then stops before them.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const V2_SUBSCRIBE_PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
-pub const V1_SUBSCRIBE_PATH: &str = "/subscribe";
-pub const DICTIONARY_PATH: &str = "/xrpc/network.bsky.jetstream.getZstdDictionary";
+pub(crate) const V2_SUBSCRIBE_PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
+pub(crate) const V1_SUBSCRIBE_PATH: &str = "/subscribe";
+pub(crate) const DICTIONARY_PATH: &str = "/xrpc/network.bsky.jetstream.getZstdDictionary";
 
 /// `JETSTREAM_PROTOCOL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl Protocol {
     }
 }
 
-pub fn parse_protocol(raw: Option<&str>) -> ProtocolChoice {
+pub(crate) fn parse_protocol(raw: Option<&str>) -> ProtocolChoice {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         None | Some("") | Some("auto") => ProtocolChoice::Auto,
         Some("v2") => ProtocolChoice::V2,
@@ -62,7 +62,7 @@ pub fn parse_protocol(raw: Option<&str>) -> ProtocolChoice {
     }
 }
 
-pub fn parse_compression(raw: Option<&str>) -> bool {
+pub(crate) fn parse_compression(raw: Option<&str>) -> bool {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         None | Some("") | Some("true" | "1" | "yes" | "on") => true,
         Some("false" | "0" | "no" | "off") => false,
@@ -76,7 +76,7 @@ pub fn parse_compression(raw: Option<&str>) -> bool {
     }
 }
 
-pub fn parse_workers(raw: Option<&str>) -> usize {
+pub(crate) fn parse_workers(raw: Option<&str>) -> usize {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_WORKERS;
     };
@@ -160,7 +160,7 @@ fn collection_filters(collections: &[String]) -> Option<Vec<&str>> {
 
 /// The v2 `subscribeEvents` URL. No `kinds` filter: `collections` only
 /// constrains commits, so account, identity and sync events still arrive.
-pub fn v2_url(
+pub(crate) fn v2_url(
     endpoint: &Endpoint,
     collections: &[String],
     cursor: Option<i64>,
@@ -185,7 +185,7 @@ pub fn v2_url(
 }
 
 /// The v1 `/subscribe` URL, uncompressed as HappyView has always used it.
-pub fn v1_url(endpoint: &Endpoint, collections: &[String], cursor: Option<i64>) -> String {
+pub(crate) fn v1_url(endpoint: &Endpoint, collections: &[String], cursor: Option<i64>) -> String {
     let mut params = vec!["compress=false".to_string()];
     if let Some(wanted) = collection_filters(collections) {
         params.extend(wanted.iter().map(|c| format!("wantedCollections={c}")));
@@ -200,7 +200,7 @@ pub fn v1_url(endpoint: &Endpoint, collections: &[String], cursor: Option<i64>) 
     )
 }
 
-pub fn dictionary_url(endpoint: &Endpoint) -> String {
+pub(crate) fn dictionary_url(endpoint: &Endpoint) -> String {
     format!("{}{DICTIONARY_PATH}", endpoint.http_base)
 }
 

@@ -8,27 +8,30 @@ use serde::Deserialize;
 use super::segment::Row;
 use crate::consumer::event::{Commit, CursorPoint, Event, EventKind};
 
-pub const KIND_CREATE: u8 = 1;
-pub const KIND_UPDATE: u8 = 2;
-pub const KIND_DELETE: u8 = 3;
-pub const KIND_IDENTITY: u8 = 4;
-pub const KIND_ACCOUNT: u8 = 5;
-pub const KIND_SYNC: u8 = 6;
-pub const KIND_RESYNC_CREATE: u8 = 7;
+pub(crate) const KIND_CREATE: u8 = 1;
+pub(crate) const KIND_UPDATE: u8 = 2;
+pub(crate) const KIND_DELETE: u8 = 3;
+// The archive's identity rows are dropped unread; the kind is named for
+// the tests that check so.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const KIND_IDENTITY: u8 = 4;
+pub(crate) const KIND_ACCOUNT: u8 = 5;
+pub(crate) const KIND_SYNC: u8 = 6;
+pub(crate) const KIND_RESYNC_CREATE: u8 = 7;
 
-pub fn is_commit(kind: u8) -> bool {
+pub(crate) fn is_commit(kind: u8) -> bool {
     matches!(
         kind,
         KIND_CREATE | KIND_UPDATE | KIND_DELETE | KIND_RESYNC_CREATE
     )
 }
 
-pub fn is_marker(kind: u8) -> bool {
+pub(crate) fn is_marker(kind: u8) -> bool {
     matches!(kind, KIND_ACCOUNT | KIND_SYNC)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowKinds {
+pub(crate) enum RowKinds {
     Commits,
     Markers,
     Both,
@@ -36,7 +39,7 @@ pub enum RowKinds {
 
 /// What a sweep keeps of a decoded block.
 #[derive(Clone, Debug)]
-pub struct RowFilter {
+pub(crate) struct RowFilter {
     pub kinds: RowKinds,
     /// Collections a commit must be in. Markers have none.
     pub collections: HashSet<String>,

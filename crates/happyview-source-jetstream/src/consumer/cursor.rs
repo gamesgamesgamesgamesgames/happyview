@@ -28,9 +28,9 @@ pub const TIME_KEY: &str = "jetstream_cursor";
 pub const HOST_KEY: &str = "jetstream_host";
 /// How far before the saved time a resume on a different host starts, to
 /// cover clock skew between instances. Re-applied events are idempotent.
-pub const HOST_CHANGE_REWIND_US: i64 = 5_000_000;
+pub(crate) const HOST_CHANGE_REWIND_US: i64 = 5_000_000;
 /// Cursors at or above this are unix microseconds; below, seqs.
-pub const TIMESTAMP_CURSOR_MIN: i64 = 1_000_000_000_000_000;
+pub(crate) const TIMESTAMP_CURSOR_MIN: i64 = 1_000_000_000_000_000;
 
 /// What `load` found. `time_us` is also the fallback when a seq resume is
 /// refused as too old.
