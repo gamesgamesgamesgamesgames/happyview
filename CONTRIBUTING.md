@@ -164,6 +164,10 @@ names the two variables, `HAPPYVIEW_LUA_PLUGIN` and `HAPPYVIEW_LUA_SRC`, that
 make those targets run. CI runs it in reporting mode, so absent is not a
 failure there.
 
+The provider conformance kit (`cargo test --features testkit --test
+conformance`) is the exception: it does not skip. It panics when
+`TEST_DATABASE_URL` or `HAPPYVIEW_LUA_PLUGIN` is unset.
+
 The job also runs the SDK crate's tests and the `migration_upgrade` target
 ahead of the full run, for a separately named signal. Both are already
 included in the commands above.

@@ -43,7 +43,7 @@ This is what HappyView gives a provider.
 | `log_event(ProviderEvent)` | A row in the admin event log. |
 | `http() -> reqwest::Client` | The shared HTTP client. |
 | `instance() -> InstanceInfo` | The PLC, relay and public URLs, and the `User-Agent` HappyView sends. |
-| `resolve_pds(did)`, `resolve_handle(handle)` | One attempt at a lookup through HappyView's identity cache. The `ResolveError` says whether a retry could help and after how long. |
+| `resolve_pds(did)`, `resolve_handle(handle)` | One attempt at a lookup, with no cache in front of it. `resolve_pds` fetches the DID document from the PLC directory (or the `did:web` host) and reads its PDS endpoint. `resolve_handle` resolves a handle to its DID, and returns a DID it is given after checking it. The `ResolveError` says whether a retry could help and after how long. |
 | `counters() -> Arc<IngestCounters>` | The `received`, `matched` and `skipped` counters telemetry reports. A source increments them. `ingest` does not. |
 
 ## The `RecordSource` trait
@@ -78,7 +78,7 @@ HappyView keeps its own record tables for every collection a storage does not cl
 | `claims(collection) -> bool` | Whether the storage keeps this collection. It must not change for the life of a request. |
 | `claimed() -> Vec<String>` | The collections it claims right now, for stats and label cleanup. |
 | `read_route(collection) -> ReadRoute` | A pool on which `happyview_records_v2`, `happyview_dids`, `happyview_collections` and `happyview_record_refs_v2` resolve to relations with the compact-record columns. HappyView runs its reads and the plugin query DSL against it. |
-| `apply_delta(key, Delta, for_rev)` | Record the outcome of a hook, a local write or an admin delete. `Delta` is `Proceed` (clear any delta), `Replace`, `Hide` or `Pending` (a local write awaiting its echo). With `for_rev: Some(rev)` it applies only while the stored record is still at that rev, so a delta computed from an old version never lands on a newer one. `None` applies always. |
+| `apply_delta(key, Delta, for_rev)` | Record the outcome of a hook, a local write, a delete or an admin delete. `Delta` is `Proceed` (clear any delta), `Replace`, `Hide` or `Pending` (a local write awaiting its echo). With `for_rev: Some(rev)` it applies only while the stored record is still at that rev, so a delta computed from an old version never lands on a newer one. `None` applies always. A record delete is a `Proceed` with `for_rev: None`. |
 | `forget_account(did, collections)` | Account purges. It forgets this instance's deltas, not the records. |
 | `delete_collection_batch(collection, limit)` | One batch of the delete-collection job. |
 | `is_live(uri) -> bool` | Whether a record exists, for label cleanup. |
@@ -90,10 +90,10 @@ For a collection a storage claims:
 
 - **Reads** go to the storage's `read_route`. The list, get and query endpoints and the plugin query DSL behave as they do for any collection.
 - **Writes** from HappyView go through the storage too. A local write is a `Pending` delta until the record comes back from the source.
-- **Deletes**, whether from an event or from an admin, clear the delta at the delete's rev. The storage owns removing the record itself.
+- **Deletes** from an event clear the delta unconditionally: a `Proceed` with `for_rev: None`, so no `Replace` or `Hide` outlives the record and covers a later re-create of the same key. The storage owns removing the record itself. An admin delete does not clear anything. It hides the record with a `Hide` delta, also with `for_rev: None`.
 - **Events** carry `stored: true` when the body is already in the storage. HappyView then runs the hook and writes only the hook's delta. HappyView refuses an event for a claimed collection that is not marked stored, with a `record.unstored_claimed` warning in the event log, so nothing is ever written to the local tables.
 - **Raw SQL** reads and writes the local tables as before for unclaimed collections. A claimed collection's records are queryable in the storage's own database. A `db.raw` write that names one of its records is refused with an error that says to use `records.indexPut`, so a hook cannot create a local row that reads never see. While a storage is configured, a raw write to `happyview_records` that names no collection or record URI is refused too, because HappyView cannot tell whether it touches a claimed record.
-- **Outages.** When the storage is down (`unavailable` says so), HappyView answers 503. An outage of the instance database stays a 500.
+- **Outages.** When the storage is down (`unavailable` says so), the default XRPC get and list of a claimed collection answer 503. An outage of the instance database stays a 500.
 
 ## Composing with Jetstream
 
@@ -150,7 +150,7 @@ The binary accepts the same commands as `happyview`, and `run` prints the usage 
 
 ## Testing a provider
 
-The conformance kit runs a fixed set of cases against your providers. Each case boots a fresh instance, feeds it records, and checks what HappyView then serves: hooks that replace, skip or leave a record, updates, deletes, history from a backfill, account removal, and redelivery. A provider passes by behaving as the built-in one does.
+The conformance kit runs a fixed set of cases against your providers. Each case boots a fresh instance, feeds it records, and checks what HappyView then serves: hooks that replace, skip or leave a record on create, a skip on update, updates, deletes, history from a backfill, account removal, redelivery, and the 503 a claimed read answers while the storage is down. A provider passes by behaving as the built-in one does.
 
 You supply two things: a function that builds your `Providers`, and a `Feeder` that puts records into your provider's world. The kit calls the function once per case so cases do not share state.
 
@@ -168,16 +168,16 @@ async fn my_provider_conforms() {
 }
 ```
 
-`Feeder::new(put, delete)` takes two functions, each given a `RecordEvent`. For a source, they deliver the event the way your source would. For a claiming storage, `put` writes the stored row first and then delivers the event with `stored: true`, and `delete` removes the row and then delivers the delete. `Feeder::after_each` adds a check of your own after each case, and `without_delete_bodies` says your deletes carry no body. The cases use the collection `conformance::COLLECTION`. A storage claims that one.
+`Feeder::new(put, delete)` takes two functions, each given a `RecordEvent`. For a source, they deliver the event the way your source would. For a claiming storage, `put` writes the stored row first and then delivers the event with `stored: true`, and `delete` removes the row and then delivers the delete. `Feeder::after_each` adds a check of your own after each case, and `without_delete_bodies` says your deletes carry no body. The cases use the collection `conformance::COLLECTION`. A storage claims that one, and must also give `Feeder::make_unavailable`, a function that takes the storage down so its reads fail as `unavailable` recognises. The 503 case fails, saying so, when a claiming storage leaves it out. For providers that claim nothing, that case checks only that the query serves.
 
 `tests/conformance.rs` in the repository has two complete runs: the default providers with a scripted source, and an external store.
 
-In your own crate, depend on HappyView with its `testkit` feature in `[dev-dependencies]`, and on the contract crate's `testkit` feature if you use `ScriptedSource`:
+In your own crate, depend on HappyView with its `testkit` feature in `[dev-dependencies]`, and on the contract crate's `testkit` feature if you use `ScriptedSource`. The contract crate lives in the same repository as HappyView, so take both from the same git source:
 
 ```toml
 [dev-dependencies]
 happyview = { git = "https://github.com/gamesgamesgamesgamesgames/happyview", features = ["testkit"] }
-happyview-provider = { version = "0.1", features = ["testkit"] }
+happyview-provider = { git = "https://github.com/gamesgamesgamesgamesgames/happyview", features = ["testkit"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -195,4 +195,4 @@ TEST_DATABASE_URL=postgres://... HAPPYVIEW_LUA_PLUGIN=/path/to/lua-plugin \
 
 Two telemetry log lines moved with the code into the contract crate. They now log under the target `happyview_provider::telemetry` (they were under the `happyview::telemetry::collect` modules). If you filter logs by target, for example with `RUST_LOG`, update the filter. Nothing else about log output, tables, endpoints, settings or JSON shapes changed.
 
-The contract carries a version, `CONTRACT_VERSION` in `happyview-provider`. A change that breaks providers bumps it, and a source built for another version is refused at boot.
+The contract carries a version, `CONTRACT_VERSION` in `happyview-provider`. A change that breaks providers bumps it. At boot HappyView checks the record source's `contract_version()` and refuses a source built for another version. The check covers the record source only. `RecordStorage` carries no version, so a storage is not checked.
