@@ -110,7 +110,8 @@ async fn a_claiming_external_store_conforms() {
                 assert!(!deltas.is_empty(), "core wrote no delta to the store");
                 if case == "delete_removes_the_record" {
                     // The store removed the record itself; what core owes it
-                    // is clearing this instance's delta, at the delete's rev.
+                    // is clearing this instance's delta, whatever rev it
+                    // was made at.
                     let deleted: Vec<_> = deltas
                         .iter()
                         .filter(|(key, _, _)| key.rkey == "a1")
@@ -118,10 +119,16 @@ async fn a_claiming_external_store_conforms() {
                     let (_, first, created_at) = deleted.first().expect("a1 had a delta");
                     let (_, last, deleted_at) = deleted.last().unwrap();
                     assert_eq!(*first, Delta::Proceed, "a1's create proceeded");
+                    assert!(created_at.is_some(), "a1's create is at its rev");
                     assert_eq!(*last, Delta::Proceed, "the delete cleared a1's delta");
-                    assert!(
-                        deleted_at.is_some() && deleted_at > created_at,
-                        "the delete's delta is at the delete's rev: {deleted:?}"
+                    assert_eq!(
+                        *deleted_at, None,
+                        "the delete's clear is unconditional: {deleted:?}"
+                    );
+                    assert_eq!(
+                        seen.overlay(&deleted[0].0.uri()),
+                        None,
+                        "no delta on a1 outlived it"
                     );
                 }
             })

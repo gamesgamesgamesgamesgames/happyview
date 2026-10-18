@@ -685,8 +685,9 @@ async fn delete_hook(
 /// A record event for a collection an external storage claims. Its body is
 /// already in that storage (`stored`); the hook runs as for a local record
 /// and only its result is written, as a delta on this instance's view:
-/// Proceed, Replace or Hide (a skip). A delete clears the delta; its hook
-/// runs, but cannot keep a record the storage no longer has. An event that is
+/// Proceed, Replace or Hide (a skip). A delete clears the delta
+/// unconditionally (`for_rev: None`); its hook runs, but cannot keep a
+/// record the storage no longer has. An event that is
 /// not `stored` came from somewhere other than the claiming store's feed and
 /// is refused, so nothing for a claimed collection is written locally.
 ///
@@ -768,12 +769,19 @@ async fn apply_claimed(
         Action::Delete => "record.deleted",
         Action::Create | Action::Update => "record.created",
     };
+    // A delete's clear is unconditional: the store no longer holds the
+    // record, so no rev of it is left to guard by, and a Replace or Hide
+    // left behind would cover a later re-create of the same key.
+    //
     // A dead-letter retry carries no rev. Its delta applies only to the
     // version the dead letter was made from: while the claiming store still
     // holds that body, and at that version's rev, so the store's own rev
     // check guards it too. A version that changed or went since is left
     // alone, as the local path's `delete_network_if_body` leaves it.
-    let mut for_rev = ev.rev.clone();
+    let mut for_rev = match ev.action {
+        Action::Delete => None,
+        Action::Create | Action::Update => ev.rev.clone(),
+    };
     if ev.origin == Origin::Retry && ev.action != Action::Delete {
         let route = ext.read_route(&ev.key.collection);
         match crate::record_store::RecordStore::stored_version_on(&route, &uri).await {

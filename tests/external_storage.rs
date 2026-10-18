@@ -17,7 +17,7 @@ use happyview::plugin::library::LibraryCallContext;
 use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
 use happyview::record_store::{PreparedRecord, RecordStore};
 use happyview_provider::{
-    Action, Delta, IngestOutcome, Origin, RecordEvent, RecordKey, SourceEvent,
+    Action, Delta, IngestOutcome, Origin, RecordEvent, RecordKey, RecordStorage, SourceEvent,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -318,6 +318,81 @@ async fn an_admin_delete_of_a_claimed_record_is_a_hide_delta() {
     );
 }
 
+/// A claimed delete clears this instance's delta unconditionally: a
+/// Replace left on the deleted record does not outlive it, so a re-create
+/// of the same key is served as the store holds it, not as the old hook
+/// rewrote it.
+#[tokio::test]
+async fn a_claimed_delete_clears_the_delta_so_a_recreate_is_served_fresh() {
+    let storage = Arc::new(FakeStorage::applying(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let at = uri(CLAIMED, "r1");
+    let served = |state: AppState| {
+        let at = at.clone();
+        async move {
+            state
+                .records
+                .get(&at)
+                .await
+                .expect("read the record")
+                .map(|record| {
+                    serde_json::from_str::<Value>(&record.record).unwrap()["text"].clone()
+                })
+        }
+    };
+
+    storage
+        .store(PreparedRecord {
+            rev: Some(tid(1)),
+            ..prepared(CLAIMED, "r1", json!({"text": "old"}))
+        })
+        .await;
+    // A hook replaced the stored body.
+    storage
+        .apply_delta(
+            &key(CLAIMED, "r1"),
+            Delta::Replace {
+                cid: "cid-hooked".to_string(),
+                rev: Some(tid(1)),
+                body: json!({"text": "hooked"}).to_string(),
+            },
+            Some(&tid(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served(state.clone()).await, Some(json!("hooked")));
+
+    // The store's feed removes the record, then delivers the delete.
+    storage.unstore(&at).await;
+    let outcome = happyview::ingest::apply(
+        &state,
+        record_event(CLAIMED, "r1", Action::Delete, None, Some(tid(2)), true),
+    )
+    .await;
+    assert_eq!(outcome, IngestOutcome::Matched);
+    assert_eq!(
+        storage.deltas().last(),
+        Some(&(key(CLAIMED, "r1"), Delta::Proceed, None)),
+        "the delete's clear is unconditional"
+    );
+    assert_eq!(
+        storage.overlay(&at),
+        None,
+        "the Replace went with the record"
+    );
+    assert_eq!(served(state.clone()).await, None);
+
+    // Re-created under the same key: the store serves the new body.
+    storage
+        .store(PreparedRecord {
+            rev: Some(tid(3)),
+            ..prepared(CLAIMED, "r1", json!({"text": "new"}))
+        })
+        .await;
+    assert_eq!(served(state.clone()).await, Some(json!("new")));
+    assert_eq!(local_rows(&state).await, 0);
+}
+
 #[tokio::test]
 async fn a_stored_event_writes_only_the_hook_delta() {
     if !echo_interpreter::is_built() {
@@ -400,7 +475,7 @@ async fn a_stored_event_writes_only_the_hook_delta() {
     .await;
     assert_eq!(batch.outcomes, vec![IngestOutcome::Matched]);
 
-    // A delete clears this instance's delta.
+    // A delete clears this instance's delta, unconditionally.
     let outcome = happyview::ingest::apply(
         &state,
         record_event(CLAIMED, "s1", Action::Delete, None, Some(tid(5)), true),
@@ -438,7 +513,8 @@ async fn a_stored_event_writes_only_the_hook_delta() {
             ),
             (key(CLAIMED, "s3"), Delta::Proceed, Some(tid(3))),
             (key(CLAIMED, "s4"), Delta::Proceed, Some(tid(4))),
-            (key(CLAIMED, "s1"), Delta::Proceed, Some(tid(5))),
+            // Unconditionally: whatever rev the delta was made at.
+            (key(CLAIMED, "s1"), Delta::Proceed, None),
         ]
     );
     assert_eq!(local_rows(&state).await, 0);
@@ -966,7 +1042,8 @@ async fn a_batch_reports_a_claimed_delta_that_applied_as_a_change() {
         vec![
             (key(CLAIMED, "c1"), Delta::Proceed, Some(tid(1))),
             (key(CLAIMED, "c2"), Delta::Proceed, Some(tid(2))),
-            (key(CLAIMED, "c1"), Delta::Proceed, Some(tid(4))),
+            // A delete clears the delta whatever rev it was made at.
+            (key(CLAIMED, "c1"), Delta::Proceed, None),
         ]
     );
     assert_eq!(local_rows(&state).await, 0);

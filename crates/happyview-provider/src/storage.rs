@@ -36,7 +36,14 @@ pub trait RecordStorage: Send + Sync + 'static {
     fn read_route(&self, collection: &str) -> ReadRoute;
     /// `for_rev: Some(r)`: apply only while the stored record's rev is
     /// still `r` (the delta was computed from that version; a newer one is
-    /// on its way). `None`: apply unconditionally (local writes, admin deletes).
+    /// on its way). `None`: apply unconditionally (local writes, admin
+    /// deletes, and record deletes).
+    ///
+    /// A record delete from the store's feed arrives as `Delta::Proceed`
+    /// with `for_rev: None`: clear this instance's delta for the key
+    /// whatever rev it was made at, so no Replace or Hide outlives the
+    /// record and covers a later re-create of the same key. An admin delete
+    /// is a `Delta::Hide` with `for_rev: None` instead.
     async fn apply_delta(
         &self,
         key: &RecordKey,

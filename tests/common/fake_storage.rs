@@ -5,8 +5,10 @@
 //!
 //! Built with [`FakeStorage::applying`], it also acts on those calls as a
 //! real store would: it keeps the records its own feed stored
-//! ([`FakeStorage::store`]) apart from the view it serves, and each delta,
-//! account purge and collection delete changes that view.
+//! ([`FakeStorage::store`]) apart from this instance's deltas, which it holds
+//! as overlays on them, and serves the two together; each delta, account
+//! purge and collection delete changes that view. An overlay outlives a
+//! change to the stored record until a delta replaces or clears it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -31,6 +33,9 @@ pub struct FakeStorage {
     applying: bool,
     /// The records the store's feed stored, by URI, before any delta.
     stored: Mutex<HashMap<String, PreparedRecord>>,
+    /// This instance's deltas by URI: a Replace, Hide or Pending laid over
+    /// the stored record. Proceed clears one.
+    overlays: Mutex<HashMap<String, Delta>>,
 }
 
 impl FakeStorage {
@@ -48,6 +53,7 @@ impl FakeStorage {
             asked_live: Mutex::new(Vec::new()),
             applying: false,
             stored: Mutex::new(HashMap::new()),
+            overlays: Mutex::new(HashMap::new()),
         }
     }
 
@@ -61,9 +67,9 @@ impl FakeStorage {
         }
     }
 
-    /// The store's own feed storing `record`: kept, and served as it is
-    /// until a delta says otherwise. An older rev than the one held is
-    /// refused, as a store ordering commits by rev refuses it.
+    /// The store's own feed storing `record`: kept, and served under any
+    /// overlay this instance's deltas left on its key. An older rev than the
+    /// one held is refused, as a store ordering commits by rev refuses it.
     pub async fn store(&self, record: PreparedRecord) {
         let uri = record.uri();
         {
@@ -73,15 +79,56 @@ impl FakeStorage {
             {
                 return;
             }
-            stored.insert(uri, record.clone());
+            stored.insert(uri.clone(), record);
         }
-        self.serve(&record).await;
+        self.refresh(&uri).await;
     }
 
-    /// The store's own feed removing the record at `uri`.
+    /// The store's own feed removing the record at `uri`. Its overlay is
+    /// left for core's delete delta to clear.
     pub async fn unstore(&self, uri: &str) {
         self.stored.lock().unwrap().remove(uri);
-        self.unserve(uri).await;
+        self.refresh(uri).await;
+    }
+
+    /// This instance's delta on the record at `uri`, if one is held.
+    pub fn overlay(&self, uri: &str) -> Option<Delta> {
+        self.overlays.lock().unwrap().get(uri).cloned()
+    }
+
+    /// Serve what the stored record and its overlay say for `uri`: a
+    /// Pending body; a Replace body over a stored record; nothing for a
+    /// Hide or when nothing is stored; otherwise the stored record.
+    async fn refresh(&self, uri: &str) {
+        let held = self.stored.lock().unwrap().get(uri).cloned();
+        let overlay = self.overlay(uri);
+        let replaced = |cid: String, rev: Option<String>, body: String| {
+            let rest = uri.strip_prefix("at://").expect("an at:// URI");
+            let mut parts = rest.splitn(3, '/');
+            let (did, collection, rkey) = (
+                parts.next().expect("a DID").to_string(),
+                parts.next().expect("a collection").to_string(),
+                parts.next().expect("an rkey").to_string(),
+            );
+            PreparedRecord {
+                did,
+                collection,
+                rkey,
+                record_json: body,
+                cid,
+                rev,
+            }
+        };
+        let served = match (overlay, held) {
+            (Some(Delta::Pending { cid, rev, body, .. }), _) => Some(replaced(cid, rev, body)),
+            (Some(Delta::Replace { cid, rev, body }), Some(_)) => Some(replaced(cid, rev, body)),
+            (Some(Delta::Hide), _) | (_, None) => None,
+            (_, Some(held)) => Some(held),
+        };
+        match served {
+            Some(record) => self.serve(&record).await,
+            None => self.unserve(uri).await,
+        }
     }
 
     fn records(&self) -> RecordStore {
@@ -164,24 +211,18 @@ impl RecordStorage for FakeStorage {
         {
             return Ok(());
         }
-        match delta {
-            Delta::Proceed => match held {
-                Some(held) => self.serve(&held).await,
-                None => self.unserve(&uri).await,
-            },
-            Delta::Replace { cid, rev, body } | Delta::Pending { cid, rev, body, .. } => {
-                self.serve(&PreparedRecord {
-                    did: key.did.clone(),
-                    collection: key.collection.clone(),
-                    rkey: key.rkey.clone(),
-                    record_json: body,
-                    cid,
-                    rev,
-                })
-                .await
+        {
+            let mut overlays = self.overlays.lock().unwrap();
+            match delta {
+                Delta::Proceed => {
+                    overlays.remove(&uri);
+                }
+                delta => {
+                    overlays.insert(uri.clone(), delta);
+                }
             }
-            Delta::Hide => self.unserve(&uri).await,
         }
+        self.refresh(&uri).await;
         Ok(())
     }
 
@@ -207,6 +248,7 @@ impl RecordStorage for FakeStorage {
             .map(PreparedRecord::uri)
             .collect();
         for uri in &gone {
+            self.overlays.lock().unwrap().remove(uri);
             self.unstore(uri).await;
         }
         Ok(gone.len() as u64)
