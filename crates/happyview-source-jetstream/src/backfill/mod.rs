@@ -113,7 +113,10 @@ impl JobState {
 /// `running`, `pausing` and `cancelling` statuses: a pausing or cancelling
 /// job still writes the pages it has in flight.
 #[derive(Clone, Default)]
-pub struct RunningJobs(Arc<Mutex<HashMap<String, (Option<String>, usize)>>>);
+pub struct RunningJobs(Arc<Mutex<RunningMap>>);
+
+/// Each running job's collection and how many guards hold it.
+type RunningMap = HashMap<String, (Option<String>, usize)>;
 
 impl RunningJobs {
     /// Note `job_id` as running until the guard is dropped. Guards nest: the
@@ -136,7 +139,7 @@ impl RunningJobs {
             .any(|(covered, _)| covered.as_deref().is_none_or(|c| c == collection))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Option<String>, usize)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RunningMap> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -156,33 +159,6 @@ impl Drop for RunningGuard {
                 jobs.remove(&self.job_id);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod running_tests {
-    use super::RunningJobs;
-
-    #[test]
-    fn a_job_runs_until_its_last_guard_goes() {
-        let running = RunningJobs::default();
-        assert!(!running.covers("app.a"));
-        let outer = running.enter("j1", Some("app.a".into()));
-        let inner = running.enter("j1", Some("app.a".into()));
-        assert!(running.covers("app.a"));
-        assert!(!running.covers("app.b"));
-        drop(inner);
-        assert!(running.covers("app.a"));
-        drop(outer);
-        assert!(!running.covers("app.a"));
-    }
-
-    #[test]
-    fn a_job_without_a_collection_covers_every_one() {
-        let running = RunningJobs::default();
-        let _all = running.enter("j2", None);
-        assert!(running.covers("app.a"));
-        assert!(running.covers("app.b"));
     }
 }
 
@@ -1466,5 +1442,32 @@ pub async fn resume_backfill_jobs(state: &JobState) {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod running_tests {
+    use super::RunningJobs;
+
+    #[test]
+    fn a_job_runs_until_its_last_guard_goes() {
+        let running = RunningJobs::default();
+        assert!(!running.covers("app.a"));
+        let outer = running.enter("j1", Some("app.a".into()));
+        let inner = running.enter("j1", Some("app.a".into()));
+        assert!(running.covers("app.a"));
+        assert!(!running.covers("app.b"));
+        drop(inner);
+        assert!(running.covers("app.a"));
+        drop(outer);
+        assert!(!running.covers("app.a"));
+    }
+
+    #[test]
+    fn a_job_without_a_collection_covers_every_one() {
+        let running = RunningJobs::default();
+        let _all = running.enter("j2", None);
+        assert!(running.covers("app.a"));
+        assert!(running.covers("app.b"));
     }
 }

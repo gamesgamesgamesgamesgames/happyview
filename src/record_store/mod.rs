@@ -786,6 +786,7 @@ impl RecordStore {
     /// retry) deletes the row whatever its rev and tombstones it at the rev it
     /// was stored at, if any, so a replay of that create cannot bring it back.
     /// The record's refs go with it; a surviving newer row keeps its own.
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_network(
         &self,
         pool: &AnyPool,

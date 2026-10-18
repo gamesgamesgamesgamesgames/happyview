@@ -429,6 +429,11 @@ fn adapt_placeholders_to_postgres(sql: &str) -> String {
     result
 }
 
+/// The current UTC time as RFC 3339, as HappyView binds it.
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,9 +891,4 @@ mod tests {
             "SELECT COUNT(*) FROM records WHERE collection = $1"
         );
     }
-}
-
-/// The current UTC time as RFC 3339, as HappyView binds it.
-pub fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
