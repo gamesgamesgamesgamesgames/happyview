@@ -92,7 +92,7 @@ For a collection a storage claims:
 - **Writes** from HappyView go through the storage too. A local write is a `Pending` delta until the record comes back from the source.
 - **Deletes**, whether from an event or from an admin, clear the delta at the delete's rev. The storage owns removing the record itself.
 - **Events** carry `stored: true` when the body is already in the storage. HappyView then runs the hook and writes only the hook's delta. HappyView refuses an event for a claimed collection that is not marked stored, with a `record.unstored_claimed` warning in the event log, so nothing is ever written to the local tables.
-- **Raw SQL** reads and writes the local tables as before for unclaimed collections. A claimed collection's records are queryable in the storage's own database. A `db.raw` write that names one of its records is refused with an error that says to use `records.indexPut`, so a hook cannot create a local row that reads never see.
+- **Raw SQL** reads and writes the local tables as before for unclaimed collections. A claimed collection's records are queryable in the storage's own database. A `db.raw` write that names one of its records is refused with an error that says to use `records.indexPut`, so a hook cannot create a local row that reads never see. While a storage is configured, a raw write to `happyview_records` that names no collection or record URI is refused too, because HappyView cannot tell whether it touches a claimed record.
 - **Outages.** When the storage is down (`unavailable` says so), HappyView answers 503. An outage of the instance database stays a 500.
 
 ## Composing with Jetstream
@@ -109,7 +109,7 @@ let source = JetstreamSource::builder()
 - `live_filter` says which tracked collections to stream live. Leave claimed ones out. It is asked again only when the tracked list changes, so keep its answers stable.
 - `executor_for` says who runs a backfill for a collection. A `BackfillExecutor` has a `name()` and an async `run(JobHandle, collection) -> Result<JobTotals, String>`.
 
-An executor's job is an ordinary row in the job system. It is listed, paused, cancelled, resumed and swept like a crawl, and its `source` column holds the executor's `name()`. Through its `JobHandle` an executor reports `progress` and `stage`, calls `record_error`, polls `should_stop`, and keeps a resume point with `checkpoint`, which it reads back with `resume_from`. The checkpoint is stored per job and collection. `JobTotals.records` is added across resumes. An executor that panics fails its job. `record_error(None, ..)` is a single job-level slot; `Some(did)` keeps one row per DID.
+An executor's job is an ordinary row in the job system. It is listed, paused, cancelled, resumed and swept like a crawl, and its `source` column holds the executor's `name()`. Through its `JobHandle` an executor reads the job's `id()` and the `host()`, reports `progress` and `stage`, calls `record_error`, polls `should_stop`, and keeps a resume point with `checkpoint`, which it reads back with `resume_from`. The checkpoint is stored per job and collection. `JobTotals.records` is added across resumes. An executor that panics fails its job. `record_error(None, ..)` is a single job-level slot; `Some(did)` keeps one row per DID.
 
 How the pieces fit:
 
@@ -146,7 +146,7 @@ fn main() -> ExitCode {
 }
 ```
 
-The binary accepts the same commands as `happyview`. Swap in your own `Arc<dyn RecordSource>` or set `storage` to `Some(Arc<dyn RecordStorage>)` the same way.
+The binary accepts the same commands as `happyview`, and `run` prints the usage for `--help` itself. The `happyview` binary also loads a `.env` file before a plain serve; the example leaves that out, so add `dotenvy::dotenv().ok()` before `run` when the command is `Command::Serve` if you want it. Swap in your own `Arc<dyn RecordSource>` or set `storage` to `Some(Arc<dyn RecordStorage>)` the same way.
 
 ## Testing a provider
 
@@ -160,8 +160,9 @@ use happyview::testkit::conformance::{self, Feeder};
 #[tokio::test]
 async fn my_provider_conforms() {
     conformance::run(|| async {
-        let (providers, feeder) = build_my_providers().await;
-        (providers, feeder)
+        // `build_my_providers` is your own function: it makes fresh
+        // providers and the feeder that puts records into their world.
+        build_my_providers().await
     })
     .await;
 }
@@ -171,7 +172,16 @@ async fn my_provider_conforms() {
 
 `tests/conformance.rs` in the repository has two complete runs: the default providers with a scripted source, and an external store.
 
-Run it with the `testkit` feature:
+In your own crate, depend on HappyView with its `testkit` feature in `[dev-dependencies]`, and on the contract crate's `testkit` feature if you use `ScriptedSource`:
+
+```toml
+[dev-dependencies]
+happyview = { git = "https://github.com/gamesgamesgamesgamesgames/happyview", features = ["testkit"] }
+happyview-provider = { version = "0.1", features = ["testkit"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Put the test above in `tests/conformance.rs` and run it with the `testkit` feature:
 
 ```bash
 TEST_DATABASE_URL=postgres://... HAPPYVIEW_LUA_PLUGIN=/path/to/lua-plugin \
@@ -179,7 +189,7 @@ TEST_DATABASE_URL=postgres://... HAPPYVIEW_LUA_PLUGIN=/path/to/lua-plugin \
 ```
 
 - `HAPPYVIEW_LUA_PLUGIN` is required because the hooks are real Lua. Point it at the Lua interpreter plugin. CI fetches it with `scripts/fetch-lua-plugin.sh`.
-- `TEST_DATABASE_URL` is a Postgres URL or a file SQLite URL such as `sqlite:///path/t.db?mode=rwc`. Without it the database-backed tests skip instead of failing.
+- `TEST_DATABASE_URL` is a Postgres URL or a file SQLite URL such as `sqlite:///path/t.db?mode=rwc`. The conformance run panics if either variable is unset. It does not skip.
 
 ## Upgrading
 

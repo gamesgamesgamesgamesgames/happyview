@@ -117,7 +117,9 @@ docker compose -f docker-compose.test.yml down
 ```
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
-file. Leaving the variable unset does not test SQLite: the database-backed tests skip silently, so point it at a file URL as below. Run it this way once when you change SQL,
+file. Leaving the variable unset does not test SQLite: the end-to-end suite
+skips its database-backed tests silently, so point it at a file URL as
+below. Run it this way once when you change SQL,
 migrations or anything that touches the write path:
 
 ```bash
