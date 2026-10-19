@@ -36,6 +36,8 @@ pub const QUERY: &str = "com.example.conformance.listNotes";
 
 /// How long one case, boot included, may take before it fails.
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a finished case's pool may take to hand back its connections.
+const POOL_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ALICE: &str = "did:plc:conformancealice";
 const BOB: &str = "did:plc:conformancebob";
@@ -176,13 +178,17 @@ where
     let mut failures: Vec<String> = Vec::new();
     // Each case in a block of its own: its providers, feeder and source's
     // stream are dropped, and the test database's lock released, before the
-    // next case boots.
+    // next case boots. The app's background tasks outlive it, so its pool is
+    // closed here; left open, every case's idle connections pile up until
+    // the database refuses more.
     macro_rules! cases {
         ($($case:ident),* $(,)?) => {$({
             let name = stringify!($case);
+            let mut pool = None;
             let case = AssertUnwindSafe(async {
                 let (providers, feeder) = make().await;
                 let app = ProviderApp::new(providers).await;
+                pool = Some(app.state.db.clone());
                 $case(&app, &feeder).await;
                 if let Some(check) = &feeder.check {
                     check(name, &app).await;
@@ -193,6 +199,9 @@ where
                 Ok(Err(panic)) => Some(format!("{name}: {}", panic_message(&panic))),
                 Err(_) => Some(format!("{name}: timed out after {CASE_TIMEOUT:?}")),
             };
+            if let Some(pool) = pool {
+                let _ = tokio::time::timeout(POOL_CLOSE_TIMEOUT, pool.close()).await;
+            }
             match failure {
                 None => eprintln!("conformance: {name} ok"),
                 Some(failure) => {
