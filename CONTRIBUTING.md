@@ -60,7 +60,11 @@ Point git at the tracked hooks once per clone:
 git config core.hooksPath .githooks
 ```
 
-- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins.
+- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins,
+  then formats the dashboard's staged files with prettier and restages them. A file
+  that is staged *and* modified in the working tree is left alone, so the hook never
+  commits work you did not stage. Needs `npm ci` in `web/`; without it the formatting
+  half is skipped.
 - **pre-push** runs `cargo clippy --all-targets`, which also covers test code.
 
 ## What CI checks
@@ -73,7 +77,7 @@ These checks must pass before merging:
 | `unit-tests`            | See [Unit tests](#unit-tests)                                                                                                                                                                  |
 | `e2e-tests`             | See [End-to-end tests](#end-to-end-tests)                                                                                                                                                      |
 | `playwright`            | See [Browser tests](#browser-tests)                                                                                                                                                            |
-| `frontend`              | `npm ci && npm run build` in `web/`                                                                                                                                                            |
+| `frontend`              | `npm ci`, `npm run format:check`, `npm run build` in `web/`                                                                                                                                    |
 | `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
 | `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 

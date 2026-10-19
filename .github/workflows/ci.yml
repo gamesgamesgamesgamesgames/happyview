@@ -415,11 +415,22 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      # Ahead of the build, so a formatting failure costs seconds. The
+      # pre-commit hook rewrites these files, but a hook can be skipped and
+      # is not installed in a fresh clone.
+      - name: Check formatting
+        working-directory: web
+        run: npm run format:check
+
       - name: Build frontend
         working-directory: web
         env:
           NEXT_PUBLIC_BASE_PATH: /__HAPPYVIEW_BP__
-        run: npm ci && npm run build
+        run: npm run build
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
