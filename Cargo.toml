@@ -21,6 +21,8 @@ exclude = [
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
 happyview-plc = { path = "crates/happyview-plc" }
+happyview-provider = { path = "crates/happyview-provider" }
+happyview-source-jetstream = { path = "crates/happyview-source-jetstream" }
 happyview-plugin-sdk = { path = "crates/happyview-plugin-sdk" }
 happyview-scopes = { path = "crates/happyview-scopes" }
 
@@ -49,6 +51,7 @@ lto = "thin"
 aes-gcm = "0.11"
 anyhow = "1"
 arc-swap = "1"
+async-trait = "0.1"
 wasmparser = "0.258"
 atrium-oauth = { version = "0.1", default-features = false }
 atrium-identity = "0.1"
@@ -63,6 +66,8 @@ data-encoding = "2"
 dotenvy = "0.15"
 happyview-nsid = { workspace = true }
 happyview-plc = { workspace = true }
+happyview-provider = { workspace = true }
+happyview-source-jetstream = { workspace = true }
 happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
@@ -136,6 +141,9 @@ lua-reference = ["dep:mlua"]
 # which is why it is off by default: the release build turns it on after
 # building the frontend, and nothing else has to.
 embedded-dashboard = ["dep:rust-embed"]
+# `happyview::testkit`'s `ProviderApp` and the provider conformance cases,
+# with the contract crate's `ScriptedSource`, for a record provider's tests.
+testkit = ["happyview-provider/testkit"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -159,6 +167,12 @@ path = "src/bin/codemod.rs"
 name = "lua_differential"
 path = "tests/lua_differential.rs"
 required-features = ["lua-reference"]
+
+# The provider conformance run, which needs the kit.
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["testkit"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -8,6 +8,8 @@ pub mod burn;
 pub mod db;
 #[allow(dead_code, unused_imports)]
 pub mod echo_interpreter;
+#[allow(dead_code, unused_imports)]
+pub mod fake_storage;
 #[allow(unused_imports)]
 pub use db::insert_oauth_session;
 #[allow(dead_code, unused_imports)]

@@ -151,12 +151,12 @@ pub(super) async fn preview(
     }
 
     let snapshot = assemble::assemble(
-        &state.db,
-        state.db_backend,
+        &state.records,
         &state.config.database_url,
         &c,
         &state.telemetry_counters,
         &state.lexicons,
+        state.source.as_ref(),
     )
     .await
     .ok_or_else(|| AppError::Internal("failed to assemble telemetry preview".to_string()))?;

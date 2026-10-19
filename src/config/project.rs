@@ -83,7 +83,7 @@ pub struct LabelsSection {
 }
 
 /// Typed rather than passed through as text so a bad value is refused with
-/// its line here; `jetstream::config::parse_protocol` would only warn and
+/// its line here; `happyview_source_jetstream::consumer::config::parse_protocol` would only warn and
 /// fall back to `auto` at connect time.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

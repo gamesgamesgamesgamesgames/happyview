@@ -6,6 +6,7 @@
     "lexicons",
     "backfill",
     "background-jobs",
+    "record-providers",
     "record-scripts",
     "lua-scripting",
     "testing",

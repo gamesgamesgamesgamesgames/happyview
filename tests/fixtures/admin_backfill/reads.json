@@ -1,0 +1,152 @@
+[
+  {
+    "body": "[{\"id\":\"job-replay-failed\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"dids\",\"status\":\"failed\",\"stage\":\"replaying\",\"total_repos\":2,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":0,\"error\":\"archive unavailable\",\"started_at\":\"2026-01-06T00:00:00+00:00\",\"completed_at\":\"2026-01-06T00:10:00+00:00\",\"created_at\":\"2026-01-06T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":0,\"through_seq\":100,\"tip_seq\":200,\"bytes\":64,\"blocks_failed\":1}},{\"id\":\"job-paused\",\"collection\":\"app.pinned.missing\",\"did\":null,\"scope\":\"network\",\"status\":\"paused\",\"stage\":\"fetching_records\",\"total_repos\":1,\"resolved_repos\":0,\"processed_repos\":0,\"total_records\":0,\"error\":null,\"started_at\":\"2026-01-05T00:00:00+00:00\",\"completed_at\":null,\"created_at\":\"2026-01-05T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"crawl\",\"replay\":null},{\"id\":\"job-failed\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"dids\",\"status\":\"failed\",\"stage\":\"fetching_records\",\"total_repos\":5,\"resolved_repos\":4,\"processed_repos\":2,\"total_records\":9,\"error\":\"boom\",\"started_at\":\"2026-01-04T00:00:00+00:00\",\"completed_at\":\"2026-01-04T00:30:00+00:00\",\"created_at\":\"2026-01-04T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":null,\"source\":\"crawl\",\"replay\":null},{\"id\":\"job-gap\",\"collection\":null,\"did\":null,\"scope\":\"network\",\"status\":\"running\",\"stage\":\"replaying\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":7,\"error\":null,\"started_at\":\"2026-01-03T00:00:00+00:00\",\"completed_at\":null,\"created_at\":\"2026-01-03T00:00:00+00:00\",\"discovery_complete\":false,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":777,\"through_seq\":800,\"tip_seq\":900,\"bytes\":2048,\"blocks_failed\":1}},{\"id\":\"job-replay\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"network\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":40,\"error\":null,\"started_at\":\"2026-01-02T00:00:00+00:00\",\"completed_at\":\"2026-01-02T02:00:00+00:00\",\"created_at\":\"2026-01-02T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":0,\"through_seq\":5000,\"tip_seq\":5000,\"bytes\":123456,\"blocks_failed\":0}},{\"id\":\"job-crawl\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"network\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":3,\"resolved_repos\":3,\"processed_repos\":3,\"total_records\":12,\"error\":null,\"started_at\":\"2026-01-01T00:00:00+00:00\",\"completed_at\":\"2026-01-01T01:00:00+00:00\",\"created_at\":\"2026-01-01T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"crawl\",\"replay\":null}]",
+    "call": "GET /admin/backfill/status",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:queuedb\",\"pds_endpoint\":null,\"status\":\"pending\",\"records_fetched\":0},{\"did\":\"did:plc:queueda\",\"pds_endpoint\":null,\"status\":\"pending\",\"records_fetched\":0},{\"did\":\"did:plc:queuedc\",\"pds_endpoint\":\"https://pds-two.example\",\"status\":\"pending\",\"records_fetched\":0}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:queuedc\",\"pds_endpoint\":\"https://pds-two.example\",\"status\":\"pending\",\"records_fetched\":0}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=resolved",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:queuedb\",\"pds_endpoint\":null,\"status\":\"pending\",\"records_fetched\":0},{\"did\":\"did:plc:queueda\",\"pds_endpoint\":null,\"status\":\"pending\",\"records_fetched\":0}],\"cursor\":\"app.pinned.post|did:plc:queueda\"}",
+    "call": "GET /admin/backfill/job-crawl/repos?limit=2",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos?limit=2&cursor=app.pinned.post%7Cdid:plc:queuedc",
+    "status": 200
+  },
+  {
+    "body": "{\"error\":\"invalid cursor: nopipe\"}",
+    "call": "GET /admin/backfill/job-crawl/repos?cursor=nopipe",
+    "status": 400
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:crawlc\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3},{\"did\":\"did:plc:crawlb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":5},{\"did\":\"did:plc:crawla\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":4}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=fetched",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:crawlc\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3},{\"did\":\"did:plc:crawlb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":5}],\"cursor\":\"102\"}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=fetched&limit=2",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:crawla\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":4}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=fetched&limit=2&cursor=102",
+    "status": 200
+  },
+  {
+    "body": "{\"error\":\"invalid cursor: abc\"}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=fetched&cursor=abc",
+    "status": 400
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:faileda\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3},{\"did\":\"did:plc:failedb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":6},{\"did\":\"did:plc:failedc\",\"pds_endpoint\":\"https://pds-two.example\",\"status\":\"failed\",\"records_fetched\":0},{\"did\":\"did:plc:failedd\",\"pds_endpoint\":null,\"status\":\"pending\",\"records_fetched\":0}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-failed/repos",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:faileda\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3},{\"did\":\"did:plc:failedb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":6},{\"did\":\"did:plc:failedc\",\"pds_endpoint\":\"https://pds-two.example\",\"status\":\"failed\",\"records_fetched\":0}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-failed/repos?phase=resolved",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:faileda\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3},{\"did\":\"did:plc:failedb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":6}],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-failed/repos?phase=fetched",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:faileda\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":3}],\"cursor\":\"did:plc:faileda\"}",
+    "call": "GET /admin/backfill/job-failed/repos?limit=1",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[{\"did\":\"did:plc:failedb\",\"pds_endpoint\":\"https://pds-one.example\",\"status\":\"completed\",\"records_fetched\":6}],\"cursor\":\"did:plc:failedb\"}",
+    "call": "GET /admin/backfill/job-failed/repos?limit=1&cursor=did:plc:faileda",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[],\"cursor\":null}",
+    "call": "GET /admin/backfill/no-such-job/repos",
+    "status": 200
+  },
+  {
+    "body": "{\"pds_endpoints\":[{\"pds_endpoint\":\"https://pds-one.example\",\"total_repos\":2,\"completed_repos\":2,\"total_records\":9},{\"pds_endpoint\":\"https://pds-two.example\",\"total_repos\":1,\"completed_repos\":1,\"total_records\":3}]}",
+    "call": "GET /admin/backfill/job-crawl/pds-summary",
+    "status": 200
+  },
+  {
+    "body": "{\"pds_endpoints\":[{\"pds_endpoint\":\"https://pds-one.example\",\"total_repos\":2,\"completed_repos\":2,\"total_records\":9},{\"pds_endpoint\":\"https://pds-two.example\",\"total_repos\":1,\"completed_repos\":0,\"total_records\":0}]}",
+    "call": "GET /admin/backfill/job-failed/pds-summary",
+    "status": 200
+  },
+  {
+    "body": "{\"pds_endpoints\":[]}",
+    "call": "GET /admin/backfill/no-such-job/pds-summary",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[{\"did\":\"did:plc:errora\",\"collection\":null,\"phase\":\"resolve\",\"kind\":\"timeout\",\"message\":\"DID document request timed out\",\"attempts\":2,\"last_at\":\"2026-01-04T00:20:00+00:00\"},{\"did\":\"did:plc:errorb\",\"collection\":\"app.pinned.post\",\"phase\":\"fetch\",\"kind\":\"timeout\",\"message\":\"operation timed out\",\"attempts\":3,\"last_at\":\"2026-01-04T00:20:00+00:00\"},{\"did\":\"did:plc:errorc\",\"collection\":\"app.pinned.post\",\"phase\":\"fetch\",\"kind\":\"repo_not_found\",\"message\":\"PDS returned 400 Bad Request: Could not find repo\",\"attempts\":1,\"last_at\":\"2026-01-04T00:20:00+00:00\"}],\"cursor\":null,\"counts\":[{\"kind\":\"timeout\",\"count\":2,\"retryable\":true},{\"kind\":\"repo_not_found\",\"count\":1,\"retryable\":false}],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-failed/errors",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[{\"did\":\"did:plc:errora\",\"collection\":null,\"phase\":\"resolve\",\"kind\":\"timeout\",\"message\":\"DID document request timed out\",\"attempts\":2,\"last_at\":\"2026-01-04T00:20:00+00:00\"},{\"did\":\"did:plc:errorb\",\"collection\":\"app.pinned.post\",\"phase\":\"fetch\",\"kind\":\"timeout\",\"message\":\"operation timed out\",\"attempts\":3,\"last_at\":\"2026-01-04T00:20:00+00:00\"}],\"cursor\":null,\"counts\":[{\"kind\":\"timeout\",\"count\":2,\"retryable\":true},{\"kind\":\"repo_not_found\",\"count\":1,\"retryable\":false}],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-failed/errors?kind=timeout",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[{\"did\":\"did:plc:errora\",\"collection\":null,\"phase\":\"resolve\",\"kind\":\"timeout\",\"message\":\"DID document request timed out\",\"attempts\":2,\"last_at\":\"2026-01-04T00:20:00+00:00\"}],\"cursor\":\"did:plc:errora\",\"counts\":[{\"kind\":\"timeout\",\"count\":2,\"retryable\":true},{\"kind\":\"repo_not_found\",\"count\":1,\"retryable\":false}],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-failed/errors?limit=1",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[{\"did\":\"did:plc:errorb\",\"collection\":\"app.pinned.post\",\"phase\":\"fetch\",\"kind\":\"timeout\",\"message\":\"operation timed out\",\"attempts\":3,\"last_at\":\"2026-01-04T00:20:00+00:00\"}],\"cursor\":\"did:plc:errorb\",\"counts\":[{\"kind\":\"timeout\",\"count\":2,\"retryable\":true},{\"kind\":\"repo_not_found\",\"count\":1,\"retryable\":false}],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-failed/errors?limit=1&cursor=did:plc:errora",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[{\"did\":\"segment-0001\",\"collection\":null,\"phase\":\"replay_block:3\",\"kind\":\"replay_block\",\"message\":\"block 3 failed to decode\",\"attempts\":1,\"last_at\":\"2026-01-06T00:05:00+00:00\"}],\"cursor\":null,\"counts\":[{\"kind\":\"replay_block\",\"count\":1,\"retryable\":true}],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-replay-failed/errors",
+    "status": 200
+  },
+  {
+    "body": "{\"errors\":[],\"cursor\":null,\"counts\":[],\"capped\":false,\"cap\":10000}",
+    "call": "GET /admin/backfill/job-gap/errors",
+    "status": 200
+  },
+  {
+    "body": "event: event\ndata: {\"type\":\"job_snapshot\",\"job_id\":\"job-crawl\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":3,\"resolved_repos\":3,\"processed_repos\":3,\"total_records\":12,\"error_counts\":{},\"discovery_complete\":true}\n\n",
+    "call": "GET /admin/backfill/job-crawl/events (first event)",
+    "status": 200
+  },
+  {
+    "body": "event: event\ndata: {\"type\":\"job_snapshot\",\"job_id\":\"job-replay\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":40,\"error_counts\":{},\"discovery_complete\":true}\n\n",
+    "call": "GET /admin/backfill/job-replay/events (first event)",
+    "status": 200
+  },
+  {
+    "body": "event: event\ndata: {\"type\":\"job_snapshot\",\"job_id\":\"job-gap\",\"status\":\"running\",\"stage\":\"replaying\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":7,\"error_counts\":{},\"discovery_complete\":false}\n\n",
+    "call": "GET /admin/backfill/job-gap/events (first event)",
+    "status": 200
+  },
+  {
+    "body": "event: event\ndata: {\"type\":\"job_snapshot\",\"job_id\":\"job-failed\",\"status\":\"failed\",\"stage\":\"fetching_records\",\"total_repos\":5,\"resolved_repos\":4,\"processed_repos\":2,\"total_records\":9,\"error_counts\":{\"repo_not_found\":1,\"timeout\":2},\"discovery_complete\":true}\n\n",
+    "call": "GET /admin/backfill/job-failed/events (first event)",
+    "status": 200
+  },
+  {
+    "body": "{\"protocol\":null,\"host\":null,\"connected\":false,\"compression\":false,\"dictionary_id\":null,\"applied_seq\":null,\"applied_time_us\":null,\"lag_ms\":null,\"worker_queue_depths\":[],\"worker_busy_since_ms\":[],\"now_ms\":\"<now_ms>\"}",
+    "call": "GET /admin/jetstream/status",
+    "status": 200
+  }
+]

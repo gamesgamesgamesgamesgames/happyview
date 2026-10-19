@@ -1179,10 +1179,7 @@ pub(crate) async fn accept_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::LexiconCatalog;
-    use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use tokio::sync::watch;
 
     macro_rules! require_test_db {
         () => {
@@ -1199,147 +1196,10 @@ mod tests {
         let backend = DatabaseBackend::from_url(&url);
         let pool = crate::db::connect(&url, backend).await;
 
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            database_url: String::new(),
-            database_backend: backend,
-            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
-            public_url: String::new(),
-            user_agent: String::new(),
-            session_secret: "test-secret".into(),
-            jetstream_url: String::new(),
-            relay_url: String::new(),
-            plc_url: String::new(),
-            static_dir: None,
-            base_path: None,
-            event_log_retention_days: 30,
-            app_name: None,
-            logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
-            // Space writes need this to decrypt the `#atproto_space` signing key.
-            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
-            default_rate_limit_capacity: 100,
-            default_rate_limit_refill_rate: 2.0,
-            telemetry_collector_url: String::new(),
-            plugin_cache_dir: None,
-            platform_api_key_hash: None,
-            job_worker_concurrency: 1,
-            superadmin_did: None,
-            project_root: None,
-            project: None,
-            plugin_dir: std::path::PathBuf::from("./plugins"),
-            auto_backfill: true,
-            script_env_file: None,
-        };
-        let (collections_tx, _) = watch::channel(vec![]);
-        let (labeler_subscriptions_tx, _) = watch::channel(());
-
-        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
-        let did_resolver = atrium_identity::did::CommonDidResolver::new(
-            atrium_identity::did::CommonDidResolverConfig {
-                plc_directory_url: "https://plc.directory".into(),
-                http_client: std::sync::Arc::clone(&atrium_http),
-            },
-        );
-        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
-            atrium_identity::handle::AtprotoHandleResolverConfig {
-                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
-                http_client: atrium_http,
-            },
-        );
-        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
-            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![atrium_oauth::Scope::Known(
-                    atrium_oauth::KnownScope::Atproto,
-                )]),
-            },
-            keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend),
-            resolver: atrium_oauth::OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-            http_client: crate::http_retry::HappyViewHttpClient::default(),
-        })
-        .expect("Failed to create test OAuth client");
-
-        let project = crate::project::shared_empty();
-
-        let state = AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: pool.clone(),
-            backfill_db: pool.clone(),
-            db_backend: backend,
-            records: crate::record_store::RecordStore::new(pool.clone(), backend),
-            archive: Default::default(),
-            domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconCatalog::new(project.clone()),
-            scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
-            project,
-            collections_tx,
-            labeler_subscriptions_tx,
-            labeler_subscription_cache: std::sync::Arc::new(
-                crate::labeler::SubscriptionCache::default(),
-            ),
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            linked_repos_client: std::sync::Arc::new(
-                crate::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    vec![atrium_oauth::Scope::Known(
-                        atrium_oauth::KnownScope::Atproto,
-                    )],
-                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-                    pool.clone(),
-                    backend,
-                    None,
-                )
-                .expect("Failed to create test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-for-tests-only-not-production",
-            ),
-            plugin_registry: std::sync::Arc::new(crate::plugin::PluginRegistry::new()),
-            wasm_runtime: std::sync::Arc::new(
-                crate::plugin::WasmRuntime::new().expect("wasm runtime"),
-            ),
-            attestation_signer: None,
-            official_registry: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
-            ),
-            proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
-                crate::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-            script_limits: std::sync::Arc::new(crate::lua::limits::ScriptLimits::default()),
-            test: None,
-        };
+        // Port 0: the one field the shared fixture's configuration sets
+        // differently.
+        let mut state = crate::test_support::test_state_with_pool_on(pool, backend);
+        state.config.port = 0;
 
         crate::test_support::provision_space_signing_key(&state).await;
 

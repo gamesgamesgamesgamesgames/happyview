@@ -47,6 +47,9 @@ pub struct HostContext {
     pub scope: String, // user DID or OAuth state
     pub secrets: HashMap<String, String>,
     pub config: serde_json::Value,
+    /// The instance's record store (its routing included); a local store over
+    /// `db` for an instance built without the app state.
+    pub records: crate::record_store::RecordStore,
     pub db: sqlx::AnyPool,
     pub db_backend: crate::db::DatabaseBackend,
     pub http_client: reqwest::Client,

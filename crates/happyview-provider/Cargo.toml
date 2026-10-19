@@ -1,0 +1,34 @@
+[package]
+name = "happyview-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "The contract between HappyView and its record sources and stores"
+license = "MIT OR Apache-2.0"
+
+[features]
+# `testkit::ScriptedSource`, a channel-fed source for provider tests.
+testkit = ["tokio/rt", "tokio/macros"]
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = "0.4"
+cid = "0.11"
+ipld-core = { version = "0.4", features = ["serde"] }
+regex = "1.12.3"
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_ipld_dagcbor = "0.6"
+serde_json = "1"
+sha2 = "0.11"
+sqlx = { version = "0.9", default-features = false, features = ["any", "migrate", "runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+serial_test = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+zstd = "0.13"

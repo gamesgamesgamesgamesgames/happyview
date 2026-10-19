@@ -136,7 +136,7 @@ mod tests {
             root.join("tests/test_runner_identity.rs"),
         ];
         let run = vec![
-            root.join("src/main.rs"),
+            root.join("src/run.rs"),
             root.join("src/testing/runner.rs"),
             root.join("tests/test_runner.rs"),
         ];

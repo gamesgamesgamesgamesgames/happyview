@@ -85,6 +85,85 @@ pub fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a raw write to a claimed collection's records is refused.
+pub const CLAIMED_WRITE_REFUSED: &str = "writes to records of a collection stored outside this instance must go through records.indexPut";
+
+/// The compat view raw SQL writes records through.
+const RECORDS_VIEW: &str = "happyview_records";
+
+/// With collections stored outside this instance (`claims` says which), refuse
+/// a raw write to `happyview_records` that could create or change a local row
+/// for one of them: reads of a claimed collection go to the external storage,
+/// so the row would never be seen.
+///
+/// A write is checked by the collections it names: every string literal in
+/// the statement and every string parameter, read as a collection NSID or a
+/// record URI. One that is claimed refuses the write; a write naming no
+/// collection at all cannot be checked, and is refused too. Read-only
+/// statements, and statements that do not mention `happyview_records`, pass.
+/// SQL that cannot be tokenized fails closed.
+pub fn check_claimed_record_writes(
+    sql: &str,
+    params: &[serde_json::Value],
+    claims: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    if is_read_only(sql) == Ok(true) {
+        return Ok(());
+    }
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize()
+        .map_err(|e| format!("could not parse SQL: {e}"))?;
+    let writes_records = tokens.iter().any(
+        |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(RECORDS_VIEW)),
+    );
+    if !writes_records {
+        return Ok(());
+    }
+    let literals = tokens.iter().filter_map(|token| match token {
+        Token::SingleQuotedString(s)
+        | Token::EscapedStringLiteral(s)
+        | Token::NationalStringLiteral(s) => Some(s.as_str()),
+        Token::DollarQuotedString(s) => Some(s.value.as_str()),
+        _ => None,
+    });
+    let params = params.iter().filter_map(serde_json::Value::as_str);
+    let mut named = false;
+    for collection in literals.chain(params).filter_map(named_collection) {
+        if claims(collection) {
+            return Err(format!("{CLAIMED_WRITE_REFUSED}: {collection}"));
+        }
+        named = true;
+    }
+    if named {
+        Ok(())
+    } else {
+        Err(format!(
+            "a write to {RECORDS_VIEW} must name its collection or record URI as a literal \
+             or parameter while collections are stored outside this instance"
+        ))
+    }
+}
+
+/// The collection `text` names: the collection of a record URI, or `text`
+/// itself when it has an NSID's shape.
+fn named_collection(text: &str) -> Option<&str> {
+    if text.starts_with("at://") {
+        return crate::record_store::codec::parse_record_uri(text).map(|(_, c, _)| c);
+    }
+    let segments: Vec<&str> = text.split('.').collect();
+    (segments.len() >= 3
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }))
+    .then_some(text)
+}
+
 /// True when a `Query`'s body — and every CTE feeding it — is read-only.
 ///
 /// sqlparser 0.62 parses `WITH x AS (...) DELETE/INSERT/UPDATE/MERGE ...` as a
@@ -273,6 +352,63 @@ mod tests {
             Ok(true)
         );
         assert_eq!(is_read_only("SELECT 1 UNION ALL SELECT 2"), Ok(true));
+    }
+
+    #[test]
+    fn claimed_record_writes_are_refused_and_others_pass() {
+        let claims = |c: &str| c == "app.claimed.thing";
+        let check = |sql: &str, params: &[serde_json::Value]| {
+            check_claimed_record_writes(sql, params, &claims)
+        };
+        // Reads, and writes elsewhere, pass whatever they name.
+        assert!(
+            check(
+                "SELECT * FROM happyview_records WHERE collection = 'app.claimed.thing'",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(check("DELETE FROM my_table", &[]).is_ok());
+        // A claimed collection, as a literal, a URI or a parameter.
+        for (sql, params) in [
+            (
+                "INSERT INTO happyview_records (collection) VALUES ('app.claimed.thing')",
+                vec![],
+            ),
+            (
+                "DELETE FROM happyview_records WHERE uri = 'at://did:plc:a/app.claimed.thing/1'",
+                vec![],
+            ),
+            (
+                "UPDATE happyview_records SET record = ? WHERE collection = 'app.local.thing' OR collection = ?",
+                vec![
+                    serde_json::json!("{}"),
+                    serde_json::json!("app.claimed.thing"),
+                ],
+            ),
+        ] {
+            let err = check(sql, &params).unwrap_err();
+            assert!(err.starts_with(CLAIMED_WRITE_REFUSED), "{err}");
+            assert!(err.ends_with("app.claimed.thing"), "{err}");
+        }
+        // A local collection, by literal or parameter.
+        assert!(
+            check(
+                "DELETE FROM happyview_records WHERE collection = 'app.local.thing'",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "DELETE FROM HAPPYVIEW_RECORDS WHERE uri = ?",
+                &[serde_json::json!("at://did:plc:a/app.local.thing/1")]
+            )
+            .is_ok()
+        );
+        // Nothing to check against: refused.
+        assert!(check("DELETE FROM happyview_records WHERE did = 'did:plc:a'", &[]).is_err());
+        assert!(check("DELETE FROM happyview_records", &[]).is_err());
     }
 
     #[test]

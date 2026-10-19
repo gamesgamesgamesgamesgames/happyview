@@ -286,6 +286,54 @@ pub async fn write_did_tombstone(
     Ok(())
 }
 
+/// The rev of `did`'s DID tombstone, if it has one. An unlocked look, so a
+/// caller can skip the write transaction for the accounts (nearly all) that
+/// have none.
+pub async fn did_tombstone_rev(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT rev FROM happyview_did_tombstones WHERE did = ?",
+        backend,
+    );
+    let found: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(did)
+        .fetch_optional(db)
+        .await?;
+    Ok(found.map(|(rev,)| rev))
+}
+
+/// Lift `did`'s DID tombstone (an account reactivated). With `before`, only a
+/// tombstone older than it goes, so a replayed reactivation never lifts a
+/// newer one. Takes the DID's lock, so call it inside a `begin_write`
+/// transaction.
+pub async fn lift_did_tombstone(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+    did: &str,
+    before: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    lock_did(conn, backend, did).await?;
+    let delete = adapt_sql(
+        &match before {
+            None => "DELETE FROM happyview_did_tombstones WHERE did = ?".to_string(),
+            Some(_) => format!(
+                "DELETE FROM happyview_did_tombstones WHERE did = ? AND {}",
+                rev_compare(backend, "rev", "<", "?")
+            ),
+        },
+        backend,
+    );
+    let mut query = crate::db::query(&delete).bind(did);
+    if let Some(before) = before {
+        query = query.bind(before);
+    }
+    query.execute(&mut *conn).await?;
+    Ok(())
+}
+
 /// Delete `did`'s network records (`indexed_at` set) and their refs, in
 /// batches, optionally only in `collections`. Local writes still awaiting
 /// their echo are left alone. Each batch is its own `begin_write`
@@ -319,6 +367,8 @@ pub async fn purge_did_records_before(
     purge(store, did, collections, Some(before_rev)).await
 }
 
+/// The local purge, then, with an external storage, its account purge for
+/// the claimed collections among `collections` (all of them when `None`).
 async fn purge(
     store: &crate::record_store::RecordStore,
     did: &str,
@@ -328,6 +378,29 @@ async fn purge(
     if collections.is_some_and(<[String]>::is_empty) {
         return Ok(0);
     }
+    let purged = purge_local(store, did, collections, before_rev).await?;
+    let Some(ext) = store.external() else {
+        return Ok(purged);
+    };
+    let claimed: Option<Vec<String>> = collections.map(|collections| {
+        collections
+            .iter()
+            .filter(|c| ext.claims(c))
+            .cloned()
+            .collect()
+    });
+    if claimed.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(purged);
+    }
+    Ok(purged + ext.forget_account(did, claimed.as_deref()).await?)
+}
+
+async fn purge_local(
+    store: &crate::record_store::RecordStore,
+    did: &str,
+    collections: Option<&[String]>,
+    before_rev: Option<&str>,
+) -> Result<u64, sqlx::Error> {
     let held = match before_rev {
         None => store.holds_network_records(did, collections).await?,
         Some(before) => {

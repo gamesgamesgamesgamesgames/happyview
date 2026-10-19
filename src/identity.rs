@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 
-use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
 use crate::dns::NativeDnsResolver;
 use crate::error::AppError;
+use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
 /// The shared handle resolver, wired to HappyView's own DNS resolver and
 /// retrying HTTP client.
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn did_document_failures_name_the_did_but_not_the_failure_detail() {
-        use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+        use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
         for kind in BackfillErrorKind::all() {
             let failure = BackfillFailure {

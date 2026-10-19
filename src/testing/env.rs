@@ -109,7 +109,8 @@ impl TestEnv {
 
         // The fixture's fixed keys are fine here: the state is a throwaway
         // whose keys protect nothing.
-        let base = crate::test_support::test_state_with_pool_on(template, DatabaseBackend::Sqlite);
+        let mut base =
+            crate::test_support::test_state_with_pool_on(template, DatabaseBackend::Sqlite);
         base.domain_cache
             .insert(crate::domain::Domain {
                 id: "test".into(),
@@ -125,22 +126,19 @@ impl TestEnv {
         let script_limits = Arc::new(
             crate::lua::limits::ScriptLimits::load(&base.db, DatabaseBackend::Sqlite).await,
         );
-        let base = AppState {
-            config,
-            script_limits,
-            http: crate::http_retry::shared_client().clone(),
-            plugin_registry: registry,
-            wasm_runtime: runtime,
-            // A forged caller's unknown method has to reach the in-process
-            // PDS, which only service-proxy routing asks.
-            proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                crate::proxy_config::ProxyConfig {
-                    routing: crate::proxy_config::ProxyRouting::ServiceProxy,
-                    ..Default::default()
-                },
-            ))),
-            ..base
-        };
+        base.config = config;
+        base.script_limits = script_limits;
+        base.http = crate::http_retry::shared_client().clone();
+        base.plugin_registry = registry;
+        base.wasm_runtime = runtime;
+        // A forged caller's unknown method has to reach the in-process
+        // PDS, which only service-proxy routing asks.
+        base.proxy_config = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            crate::proxy_config::ProxyConfig {
+                routing: crate::proxy_config::ProxyRouting::ServiceProxy,
+                ..Default::default()
+            },
+        )));
         Ok(TestEnv {
             base,
             dir,
@@ -192,33 +190,36 @@ impl TestEnv {
             .await
             .map_err(std::io::Error::other)?;
         let harness = Arc::new(TestHarness::new(file));
-        let state = AppState {
-            db: pool.clone(),
-            backfill_db: pool.clone(),
-            records: crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
-            scripts: crate::catalog::ScriptCatalog::new(
-                pool.clone(),
-                DatabaseBackend::Sqlite,
-                self.base.project.clone(),
-            ),
-            lexicons,
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
-                pool,
-                DatabaseBackend::Sqlite,
-            ),
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            // Caches the active labeler subscriptions read from `db`, so it is
-            // per database: the base's would hand one file's rows to the next.
-            labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),
-            test: Some(harness.clone()),
-            ..self.base.clone()
-        };
+        let mut state = self.base.clone();
+        state.db = pool.clone();
+        state.backfill_db = pool.clone();
+        // This file's own copy, routed as the base is.
+        state.records =
+            crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite);
+        if let Some(external) = self.base.records.external() {
+            state.records = state.records.clone().with_external(external.clone());
+        }
+        state.scripts = crate::catalog::ScriptCatalog::new(
+            pool.clone(),
+            DatabaseBackend::Sqlite,
+            self.base.project.clone(),
+        );
+        state.lexicons = lexicons;
+        state.oauth_state_store =
+            crate::auth::oauth_store::DbStateStore::new(pool, DatabaseBackend::Sqlite);
+        state.rate_limiter =
+            crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
+                query_cost: 1,
+                procedure_cost: 1,
+                proxy_cost: 1,
+            });
+        // Caches the active labeler subscriptions read from `db`, so it is
+        // per database: the base's would hand one file's rows to the next.
+        state.labeler_subscription_cache = Arc::new(crate::labeler::SubscriptionCache::default());
+        state.test = Some(harness.clone());
+        // The base's source works on the base's pools: give this state one
+        // of its own.
+        crate::host::attach_jetstream(&mut state, Default::default());
         Ok(FileState {
             state,
             harness,

@@ -216,14 +216,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_test_runs_blob_upload_is_answered_by_the_in_process_pds() {
-        let state = AppState {
-            test: Some(std::sync::Arc::new(crate::testing::TestHarness::new(
-                "a.test.lua",
-            ))),
-            ..crate::test_support::test_state_with_pool(
-                crate::test_support::migrated_memory_pool().await,
-            )
-        };
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "a.test.lua",
+        )));
         let auth = crate::repo::test_pds_auth(&state).unwrap();
         let blob = upload_blob_to_pds(&state, "did:plc:a", &auth, "image/png", Bytes::from("png"))
             .await

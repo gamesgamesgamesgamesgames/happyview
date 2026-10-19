@@ -13,10 +13,11 @@ use super::permissions::Permission;
 use super::types::{LexiconSummary, UploadLexiconBody};
 
 /// Broadcast the current record collection list so the Jetstream
-/// subscription syncs its filter.
+/// subscription syncs its filter. Stored even when nothing listens yet: the
+/// backfill job system reads it to know what it may backfill.
 async fn notify_collections(state: &AppState) {
     let collections = state.lexicons.get_record_collections().await;
-    let _ = state.collections_tx.send(collections);
+    let _ = state.collections_tx.send_replace(collections);
 }
 
 /// POST /admin/lexicons — upload (upsert) a lexicon.
@@ -70,9 +71,7 @@ pub(super) async fn upload_lexicon(
 
     let backfill_job_id: Option<String> =
         if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
-            match crate::admin::backfill::start_automatic_backfill(&state, id.clone(), &auth.did)
-                .await
-            {
+            match state.start_automatic_backfill(id.clone(), &auth.did).await {
                 Ok(job_id) => job_id,
                 Err(e) => {
                     tracing::warn!(

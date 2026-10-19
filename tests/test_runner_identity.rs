@@ -86,12 +86,10 @@ async fn resolution_answers_from_the_rule_and_never_the_network() {
         "{blob}"
     );
 
-    let state = happyview::AppState {
-        http: http.clone(),
-        ..happyview::test_support::test_state_with_pool(
-            happyview::test_support::migrated_memory_pool().await,
-        )
-    };
+    let mut state = happyview::test_support::test_state_with_pool(
+        happyview::test_support::migrated_memory_pool().await,
+    );
+    state.http = http.clone();
     let space_blob =
         happyview::spaces::service::fetch_space_blob(&state, "did:plc:alice", "bafkreiblob")
             .await
