@@ -106,6 +106,8 @@ The handler a `query`, `procedure`, record or `label` trigger runs has the limit
 
 A job is bounded in a test run, though a served job is not. Its own code gets the same 60 seconds as a test file, and its `ctx.job.wait` calls share another 60 seconds between them, after which a wait returns at once. A job that never finishes fails its trigger with a `500` rather than holding up the run.
 
+Each library call that is not mocked may take 60 seconds, including any time it spends waiting on the network, and fails with a timeout after that. A served instance sets no such limit. Mock a library whose calls reach a service that might not answer.
+
 ## Watching
 
 `--watch` runs the tests, then waits for changes to the project and reruns:

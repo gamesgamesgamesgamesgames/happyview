@@ -681,7 +681,8 @@ impl PluginExecutor {
         // A test run sees every library call, and answers a mocked namespace
         // from data without instantiating the library at all. This is the one
         // dispatch path for a library call, so a mock cannot be bypassed.
-        if let Some(test) = self.app_state.as_ref().and_then(|state| state.test.clone())
+        let test = self.app_state.as_ref().and_then(|state| state.test.clone());
+        if let Some(test) = &test
             && let Some(namespace) = self
                 .registry
                 .get(lib_id)
@@ -704,10 +705,18 @@ impl PluginExecutor {
                 });
             }
         }
-        let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
-        let value = inst.call_library_function(function, args, ctx).await?;
-        inst.settle_pending_calls(self.script_wall_clock()).await;
-        Ok(value)
+        let call = async {
+            let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
+            let value = inst.call_library_function(function, args, ctx).await?;
+            inst.settle_pending_calls(self.script_wall_clock()).await;
+            Ok(value)
+        };
+        match test {
+            Some(test) => tokio::time::timeout(test.library_call_limit(), call)
+                .await
+                .unwrap_or(Err(ExecutionError::Timeout)),
+            None => call.await,
+        }
     }
 
     /// Run a script through interpreter `plugin_id`.
