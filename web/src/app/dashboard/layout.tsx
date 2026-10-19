@@ -1,53 +1,53 @@
-"use client"
+"use client";
 
-import { useEffect, useState } from "react"
-import { useRouter } from "next/navigation"
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
-import { getSetupStatus } from "@/lib/api"
-import { useAuth } from "@/lib/auth-context"
-import { useConfig } from "@/lib/config-context"
-import { AppSidebar } from "@/components/app-sidebar"
-import { PluginUpdateProvider } from "@/components/plugin-update-provider"
-import { TelemetryPrompt } from "@/components/telemetry-prompt"
-import { VacuumPromptProvider } from "@/components/vacuum-prompt-provider"
-import { RestartProvider } from "@/lib/restart-context"
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
-import { Toaster } from "@/components/ui/sonner"
+import { getSetupStatus } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
+import { useConfig } from "@/lib/config-context";
+import { AppSidebar } from "@/components/app-sidebar";
+import { PluginUpdateProvider } from "@/components/plugin-update-provider";
+import { TelemetryPrompt } from "@/components/telemetry-prompt";
+import { VacuumPromptProvider } from "@/components/vacuum-prompt-provider";
+import { RestartProvider } from "@/lib/restart-context";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { Toaster } from "@/components/ui/sonner";
 
 export default function DashboardLayout({
   children,
 }: {
-  children: React.ReactNode
+  children: React.ReactNode;
 }) {
-  const { did } = useAuth()
-  const { app_name } = useConfig()
-  const router = useRouter()
-  const [setupChecked, setSetupChecked] = useState(false)
+  const { did } = useAuth();
+  const { app_name } = useConfig();
+  const router = useRouter();
+  const [setupChecked, setSetupChecked] = useState(false);
 
   useEffect(() => {
     if (!did) {
-      router.replace("/login")
-      return
+      router.replace("/login");
+      return;
     }
 
     getSetupStatus()
       .then((status) => {
         if (!status.setup_complete) {
-          router.replace("/setup")
+          router.replace("/setup");
         } else {
-          setSetupChecked(true)
+          setSetupChecked(true);
         }
       })
       .catch(() => {
-        setSetupChecked(true)
-      })
-  }, [did, router])
+        setSetupChecked(true);
+      });
+  }, [did, router]);
 
   useEffect(() => {
-    document.title = app_name ? `${app_name} Admin` : "HappyView Admin"
-  }, [app_name])
+    document.title = app_name ? `${app_name} Admin` : "HappyView Admin";
+  }, [app_name]);
 
-  if (!did || !setupChecked) return null
+  if (!did || !setupChecked) return null;
 
   return (
     <PluginUpdateProvider>
@@ -75,5 +75,5 @@ export default function DashboardLayout({
         <Toaster />
       </RestartProvider>
     </PluginUpdateProvider>
-  )
+  );
 }

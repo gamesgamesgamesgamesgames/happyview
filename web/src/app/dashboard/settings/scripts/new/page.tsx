@@ -1,6 +1,13 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Wand2 } from "lucide-react";
 
@@ -178,7 +185,12 @@ function NewScriptInner() {
               )}
             </div>
           )}
-          <ScriptForm state={state} onChange={setState} lexicons={lexicons} lexiconsLoading={lexiconsLoading} />
+          <ScriptForm
+            state={state}
+            onChange={setState}
+            lexicons={lexicons}
+            lexiconsLoading={lexiconsLoading}
+          />
         </div>
         <footer className="bg-sidebar-accent flex justify-between gap-2 px-4 py-2 md:px-6 md:py-4 rounded-b-md">
           {isDirty ? (
@@ -205,17 +217,11 @@ function NewScriptInner() {
               </AlertDialogContent>
             </AlertDialog>
           ) : (
-            <Button
-              variant="outline"
-              onClick={() => router.push(returnHref)}
-            >
+            <Button variant="outline" onClick={() => router.push(returnHref)}>
               Cancel
             </Button>
           )}
-          <Button
-            onClick={handleSave}
-            disabled={!canSave}
-          >
+          <Button onClick={handleSave} disabled={!canSave}>
             {saving ? "Creating..." : "Create script"}
             <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
               ⌘↵
@@ -258,7 +264,8 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
   }
   // Fallbacks to a sensible default. Suffix starts empty so the form
   // surfaces the "Pick a source to compose the trigger id" hint.
-  const kind = (searchParams.get("kind") as TriggerKind | null) ?? "record.index";
+  const kind =
+    (searchParams.get("kind") as TriggerKind | null) ?? "record.index";
   const source = searchParams.get("source") ?? searchParams.get("suffix") ?? "";
   const isJob = kind === "job.run" || source === JOB_SOURCE;
   const resolvedKind: TriggerKind = isJob ? "job.run" : kind;

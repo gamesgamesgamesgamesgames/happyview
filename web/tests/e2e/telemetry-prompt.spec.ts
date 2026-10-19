@@ -80,7 +80,9 @@ test.describe("telemetry prompt", () => {
         res.url().includes("/admin/settings/telemetry/dismiss") &&
         res.request().method() === "POST",
     );
-    await telemetryToast(page).getByRole("button", { name: /^review$/i }).click();
+    await telemetryToast(page)
+      .getByRole("button", { name: /^review$/i })
+      .click();
 
     await dismissed;
     await expect(page).toHaveURL(/\/dashboard\/settings\/telemetry\/?$/);
@@ -98,7 +100,9 @@ test.describe("telemetry prompt", () => {
         res.url().includes("/admin/settings/telemetry/dismiss") &&
         res.request().method() === "POST",
     );
-    await telemetryToast(page).getByLabel(/close toast/i).click();
+    await telemetryToast(page)
+      .getByLabel(/close toast/i)
+      .click();
 
     // The write is what makes it stick across browsers and admins; a toast
     // that merely disappears would be back on the next page load.

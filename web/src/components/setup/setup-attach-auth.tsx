@@ -97,9 +97,12 @@ export function SetupAttachAuth({
         localStorage.setItem(ATTACH_AUTH_STORAGE_KEY, JSON.stringify(payload));
 
         const handle = attachedHandle ?? attachedDid;
-        return fetch(`/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/setup")}`, {
-          credentials: "same-origin",
-        });
+        return fetch(
+          `/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/setup")}`,
+          {
+            credentials: "same-origin",
+          },
+        );
       })
       .then((resp) => {
         if (!resp.ok) throw new Error("Login request failed");

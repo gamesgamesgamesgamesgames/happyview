@@ -300,7 +300,7 @@ export default function AddLexiconPage() {
                     items={suggestions}
                     filter={null}
                     inputValue={nsid}
-                    onInputValueChange={setNsid}                  
+                    onInputValueChange={setNsid}
                     onValueChange={(suggestion: LexiconSuggestion | null) => {
                       if (suggestion) setNsid(suggestion.nsid);
                     }}

@@ -1,24 +1,25 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react";
 
-import { useCurrentUser } from "@/hooks/use-current-user"
+import { useCurrentUser } from "@/hooks/use-current-user";
 import {
   getProxyConfig,
   updateProxyConfig,
   type ProxyConfig,
   type ProxyRouting,
-} from "@/lib/api"
-import { SiteHeader } from "@/components/site-header"
-import { Button } from "@/components/ui/button"
-import { MultiInput } from "@/components/ui/multi-input"
-import { Label } from "@/components/ui/label"
+} from "@/lib/api";
+import { SiteHeader } from "@/components/site-header";
+import { Button } from "@/components/ui/button";
+import { MultiInput } from "@/components/ui/multi-input";
+import { Label } from "@/components/ui/label";
 
 const MODES = [
   {
     value: "disabled" as const,
     label: "Disabled",
-    description: "Block all proxy requests. Only locally registered lexicons are served.",
+    description:
+      "Block all proxy requests. Only locally registered lexicons are served.",
   },
   {
     value: "open" as const,
@@ -35,10 +36,9 @@ const MODES = [
   {
     value: "blocklist" as const,
     label: "Blocklist",
-    description:
-      "Proxy all NSIDs except those that match a pattern below.",
+    description: "Proxy all NSIDs except those that match a pattern below.",
   },
-]
+];
 
 const ROUTINGS = [
   {
@@ -57,49 +57,49 @@ const ROUTINGS = [
     caveat:
       "Requires authentication: an unrecognized request from an anonymous caller returns 401, because the destination depends on who is asking. Requests carrying an atproto-proxy header are passed through for the PDS to relay onwards.",
   },
-]
+];
 
 export default function XrpcProxySettingsPage() {
-  const { hasPermission } = useCurrentUser()
-  const canManage = hasPermission("settings:manage")
+  const { hasPermission } = useCurrentUser();
+  const canManage = hasPermission("settings:manage");
 
-  const [mode, setMode] = useState<ProxyConfig["mode"]>("open")
-  const [routing, setRouting] = useState<ProxyRouting>("authority")
-  const [nsids, setNsids] = useState<string[]>([""])
-  const [error, setError] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
-  const [notice, setNotice] = useState<string | null>(null)
+  const [mode, setMode] = useState<ProxyConfig["mode"]>("open");
+  const [routing, setRouting] = useState<ProxyRouting>("authority");
+  const [nsids, setNsids] = useState<string[]>([""]);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const config = await getProxyConfig()
-      setMode(config.mode)
-      setRouting(config.routing ?? "authority")
-      setNsids(config.nsids.length > 0 ? [...config.nsids, ""] : [""])
+      const config = await getProxyConfig();
+      setMode(config.mode);
+      setRouting(config.routing ?? "authority");
+      setNsids(config.nsids.length > 0 ? [...config.nsids, ""] : [""]);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    load()
-  }, [load])
+    load();
+  }, [load]);
 
-  const showNsids = mode === "allowlist" || mode === "blocklist"
+  const showNsids = mode === "allowlist" || mode === "blocklist";
 
   async function handleSave() {
-    setError(null)
-    setNotice(null)
-    setSaving(true)
+    setError(null);
+    setNotice(null);
+    setSaving(true);
     try {
-      const filteredNsids = nsids.map((s) => s.trim()).filter(Boolean)
-      await updateProxyConfig({ mode, nsids: filteredNsids, routing })
-      setNotice("Proxy settings saved.")
-      await load()
+      const filteredNsids = nsids.map((s) => s.trim()).filter(Boolean);
+      await updateProxyConfig({ mode, nsids: filteredNsids, routing });
+      setNotice("Proxy settings saved.");
+      await load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false)
+      setSaving(false);
     }
   }
 
@@ -109,9 +109,7 @@ export default function XrpcProxySettingsPage() {
       <div className="flex flex-1 flex-col gap-6 p-4 md:p-6 max-w-3xl">
         {error && <p className="text-destructive text-sm">{error}</p>}
         {notice && (
-          <p className="text-sm text-green-600 dark:text-green-400">
-            {notice}
-          </p>
+          <p className="text-sm text-green-600 dark:text-green-400">{notice}</p>
         )}
 
         <div>
@@ -180,12 +178,13 @@ export default function XrpcProxySettingsPage() {
 
         {showNsids && (
           <div className="flex flex-col gap-2">
-            <Label>
-              NSID Patterns
-            </Label>
+            <Label>NSID Patterns</Label>
             <p className="text-muted-foreground text-xs">
-              Enter NSID patterns. Use <code className="text-[11px] bg-muted px-1 py-0.5 rounded">com.example.*</code> to
-              match all NSIDs under a namespace.
+              Enter NSID patterns. Use{" "}
+              <code className="text-[11px] bg-muted px-1 py-0.5 rounded">
+                com.example.*
+              </code>{" "}
+              to match all NSIDs under a namespace.
             </p>
             <MultiInput
               values={nsids}
@@ -203,5 +202,5 @@ export default function XrpcProxySettingsPage() {
         </div>
       </div>
     </>
-  )
+  );
 }

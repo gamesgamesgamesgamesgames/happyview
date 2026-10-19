@@ -1,50 +1,50 @@
-"use client"
+"use client";
 
-import { useEffect, useState } from "react"
+import { useEffect, useState } from "react";
 
-import { SiteHeader } from "@/components/site-header"
+import { SiteHeader } from "@/components/site-header";
 import {
   Card,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
-} from "@/components/ui/card"
-import { ApiError, getJetstreamStatus, type JetstreamStatus } from "@/lib/api"
+} from "@/components/ui/card";
+import { ApiError, getJetstreamStatus, type JetstreamStatus } from "@/lib/api";
 
 interface ConfigInfo {
-  version: string
-  public_url: string
-  database_backend: string
-  jetstream_url: string
-  relay_url: string
-  plc_url: string
+  version: string;
+  public_url: string;
+  database_backend: string;
+  jetstream_url: string;
+  relay_url: string;
+  plc_url: string;
 }
 
-type Row = { label: string; value: string | undefined }
+type Row = { label: string; value: string | undefined };
 
 /** A worker whose job has run this long is probably retrying it. */
-const RETRYING_AFTER_MS = 30_000
-const POLL_MS = 5_000
+const RETRYING_AFTER_MS = 30_000;
+const POLL_MS = 5_000;
 
 function formatLag(ms: number | null): string | undefined {
-  if (ms === null) return undefined
-  if (ms < 1000) return `${ms} ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} min`
-  return `${(ms / 3_600_000).toFixed(1)} h`
+  if (ms === null) return undefined;
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} min`;
+  return `${(ms / 3_600_000).toFixed(1)} h`;
 }
 
 function formatWorkers(status: JetstreamStatus): string | undefined {
-  if (status.worker_queue_depths.length === 0) return undefined
+  if (status.worker_queue_depths.length === 0) return undefined;
   return status.worker_queue_depths
     .map((depth, i) => {
-      const since = status.worker_busy_since_ms[i] ?? null
+      const since = status.worker_busy_since_ms[i] ?? null;
       return since !== null && status.now_ms - since > RETRYING_AFTER_MS
         ? `${depth} (retrying)`
-        : String(depth)
+        : String(depth);
     })
-    .join(" · ")
+    .join(" · ");
 }
 
 function Rows({ rows }: { rows: Row[] }) {
@@ -57,34 +57,36 @@ function Rows({ rows }: { rows: Row[] }) {
         </div>
       ))}
     </dl>
-  )
+  );
 }
 
 export default function AboutPage() {
-  const [config, setConfig] = useState<ConfigInfo | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [jetstream, setJetstream] = useState<JetstreamStatus | null>(null)
+  const [config, setConfig] = useState<ConfigInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [jetstream, setJetstream] = useState<JetstreamStatus | null>(null);
 
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`, { credentials: "same-origin" })
+    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`, {
+      credentials: "same-origin",
+    })
       .then((r) => {
-        if (!r.ok) throw new Error("Failed to load config")
-        return r.json()
+        if (!r.ok) throw new Error("Failed to load config");
+        return r.json();
       })
       .then(setConfig)
-      .catch((e) => setError(e.message))
-  }, [])
+      .catch((e) => setError(e.message));
+  }, []);
 
   // Needs stats:read; without it the card is simply not shown. Polls while
   // the page is visible.
   useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | undefined
-    let cancelled = false
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let cancelled = false;
 
     const poll = () => {
       getJetstreamStatus()
         .then((status) => {
-          if (!cancelled) setJetstream(status)
+          if (!cancelled) setJetstream(status);
         })
         .catch((e) => {
           // Keep the last good status through a transient failure; hide the
@@ -94,30 +96,30 @@ export default function AboutPage() {
             e instanceof ApiError &&
             (e.status === 403 || e.status === 404)
           ) {
-            setJetstream(null)
+            setJetstream(null);
           }
-        })
-    }
+        });
+    };
     const start = () => {
-      if (timer !== undefined) return
-      poll()
-      timer = setInterval(poll, POLL_MS)
-    }
+      if (timer !== undefined) return;
+      poll();
+      timer = setInterval(poll, POLL_MS);
+    };
     const stop = () => {
-      if (timer === undefined) return
-      clearInterval(timer)
-      timer = undefined
-    }
-    const onVisibility = () => (document.hidden ? stop() : start())
+      if (timer === undefined) return;
+      clearInterval(timer);
+      timer = undefined;
+    };
+    const onVisibility = () => (document.hidden ? stop() : start());
 
-    if (!document.hidden) start()
-    document.addEventListener("visibilitychange", onVisibility)
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      cancelled = true
-      stop()
-      document.removeEventListener("visibilitychange", onVisibility)
-    }
-  }, [])
+      cancelled = true;
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
 
   const rows: Row[] = config
     ? [
@@ -128,7 +130,7 @@ export default function AboutPage() {
         { label: "Relay", value: config.relay_url },
         { label: "PLC Directory", value: config.plc_url },
       ]
-    : []
+    : [];
 
   const jetstreamRows: Row[] = jetstream
     ? [
@@ -154,7 +156,7 @@ export default function AboutPage() {
           value: formatWorkers(jetstream),
         },
       ]
-    : []
+    : [];
 
   return (
     <>
@@ -195,5 +197,5 @@ export default function AboutPage() {
         )}
       </div>
     </>
-  )
+  );
 }

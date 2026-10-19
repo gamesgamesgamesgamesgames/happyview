@@ -92,9 +92,7 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
         </div>
         <div>
           <span className="text-muted-foreground">Actor</span>
-          <p className="font-mono text-xs">
-            {event.actor_did ?? "System"}
-          </p>
+          <p className="font-mono text-xs">{event.actor_did ?? "System"}</p>
         </div>
         <div>
           <span className="text-muted-foreground">Time</span>
@@ -265,8 +263,12 @@ export default function EventsPage() {
           ?.value as string | undefined;
 
         const data = await getEvents({
-          category: categoryFilter?.length ? categoryFilter.join(",") : undefined,
-          severity: severityFilter?.length ? severityFilter.join(",") : undefined,
+          category: categoryFilter?.length
+            ? categoryFilter.join(",")
+            : undefined,
+          severity: severityFilter?.length
+            ? severityFilter.join(",")
+            : undefined,
           subject: subjectFilter || undefined,
           cursor,
           limit: 50,

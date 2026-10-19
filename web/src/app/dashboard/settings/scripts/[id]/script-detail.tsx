@@ -13,11 +13,7 @@ import {
   patchScript,
 } from "@/lib/api";
 import type { Script, TriggerFamily } from "@/types/scripts";
-import {
-  TRIGGER_KIND_LABELS,
-  familyOf,
-  parseTriggerId,
-} from "@/types/scripts";
+import { TRIGGER_KIND_LABELS, familyOf, parseTriggerId } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -84,8 +80,7 @@ export default function ScriptDetail() {
   const isDirty = useMemo(() => {
     if (!state || !original) return false;
     return (
-      state.body !== original.body ||
-      state.description !== original.description
+      state.body !== original.body || state.description !== original.description
     );
   }, [state, original]);
 
@@ -186,7 +181,9 @@ export default function ScriptDetail() {
         <div className="flex flex-col gap-6 p-4 md:p-6">
           {parsed && (
             <div className="flex gap-2 items-baseline">
-              <Badge variant="outline">{TRIGGER_KIND_LABELS[parsed.kind]}</Badge>
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[parsed.kind]}
+              </Badge>
             </div>
           )}
           <ScriptModulePanel module={script.module} />
@@ -229,10 +226,10 @@ export default function ScriptDetail() {
               <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
               <p className="text-xs text-amber-500">
                 No interpreter is installed for{" "}
-                <span className="font-mono">{script.script_type}</span>{" "}
-                scripts, so this one does not run — every trigger it is bound
-                to fails until one is. It is otherwise intact and still
-                editable. Install an interpreter from the{" "}
+                <span className="font-mono">{script.script_type}</span> scripts,
+                so this one does not run — every trigger it is bound to fails
+                until one is. It is otherwise intact and still editable. Install
+                an interpreter from the{" "}
                 <Link
                   href="/dashboard/settings/plugins"
                   className="underline font-medium"
@@ -246,7 +243,9 @@ export default function ScriptDetail() {
 
           {parsed && (
             <div className="flex gap-2 items-baseline">
-              <Badge variant="outline">{TRIGGER_KIND_LABELS[parsed.kind]}</Badge>
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[parsed.kind]}
+              </Badge>
               <span className="text-muted-foreground text-xs">
                 ({familyLabel[familyOf(parsed.kind)]})
               </span>

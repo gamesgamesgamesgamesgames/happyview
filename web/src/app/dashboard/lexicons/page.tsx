@@ -22,11 +22,7 @@ import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
-import {
-  deleteLexicon,
-  deleteNetworkLexicon,
-  getLexicons,
-} from "@/lib/api";
+import { deleteLexicon, deleteNetworkLexicon, getLexicons } from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
 import {
   AlertDialog,
@@ -226,34 +222,40 @@ export default function LexiconsPage() {
             {hasPermission("lexicons:delete") &&
               row.original.layer !== "project" &&
               !row.original.declared && (
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="destructive"
-                    size="icon"
-                    className="size-8 text-muted-foreground hover:text-destructive"
-                    title="Delete lexicon"
-                    aria-label="Delete lexicon"
-                    onClick={(e) => e.stopPropagation()}
-                    onPointerDown={(e) => e.stopPropagation()}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This will permanently remove the lexicon and its associated routes. This action cannot be undone.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original)}>Delete</AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            )}
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="destructive"
+                      size="icon"
+                      className="size-8 text-muted-foreground hover:text-destructive"
+                      title="Delete lexicon"
+                      aria-label="Delete lexicon"
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => e.stopPropagation()}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This will permanently remove the lexicon and its
+                        associated routes. This action cannot be undone.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction
+                        variant="destructive"
+                        onClick={() => handleDelete(row.original)}
+                      >
+                        Delete
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
           </div>
         ),
         enableSorting: false,

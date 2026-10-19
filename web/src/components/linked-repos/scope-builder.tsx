@@ -585,7 +585,6 @@ export function ScopeBuilder({
             </p>
           </div>
         )}
-
       </div>
 
       <div className="flex flex-col gap-2">
@@ -595,8 +594,9 @@ export function ScopeBuilder({
         </p>
         {grantsNoAccess(scopeString) && (
           <p className="text-muted-foreground text-xs">
-            Nothing selected yet. <code className="font-mono">{BASE_SCOPE}</code>{" "}
-            on its own authorizes no reads or writes.
+            Nothing selected yet.{" "}
+            <code className="font-mono">{BASE_SCOPE}</code> on its own
+            authorizes no reads or writes.
           </p>
         )}
       </div>

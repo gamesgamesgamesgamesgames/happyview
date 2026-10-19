@@ -1,15 +1,15 @@
-"use client"
+"use client";
 
-import { useState } from "react"
-import { Check, Copy } from "lucide-react"
+import { useState } from "react";
+import { Check, Copy } from "lucide-react";
 
-import { CODE_CLASS, useHighlighted } from "@/lib/highlight"
-import { SCRIPT_LANGUAGES, bindingFor } from "@/lib/script-usage"
-import { Button } from "@/components/ui/button"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { CODE_CLASS, useHighlighted } from "@/lib/highlight";
+import { SCRIPT_LANGUAGES, bindingFor } from "@/lib/script-usage";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 function CopyButton({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false)
+  const [copied, setCopied] = useState(false);
   return (
     <Button
       variant="ghost"
@@ -18,19 +18,19 @@ function CopyButton({ value, label }: { value: string; label: string }) {
       aria-label={label}
       onClick={() => {
         void navigator.clipboard.writeText(value).then(() => {
-          setCopied(true)
-          setTimeout(() => setCopied(false), 1500)
-        })
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
       }}
     >
       {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
       {copied ? "Copied" : "Copy"}
     </Button>
-  )
+  );
 }
 
 function UsageLine({ code, grammar }: { code: string; grammar: string }) {
-  const nodes = useHighlighted(code, grammar)
+  const nodes = useHighlighted(code, grammar);
   return (
     <div className="shiki-on-surface overflow-x-auto px-4 py-3">
       {nodes ?? (
@@ -39,7 +39,7 @@ function UsageLine({ code, grammar }: { code: string; grammar: string }) {
         </pre>
       )}
     </div>
-  )
+  );
 }
 
 /**
@@ -51,11 +51,11 @@ function UsageLine({ code, grammar }: { code: string; grammar: string }) {
  * whichever line is showing.
  */
 export function UsageBlock({ namespace }: { namespace: string }) {
-  const binding = bindingFor(namespace)
-  const [active, setActive] = useState(SCRIPT_LANGUAGES[0].id)
+  const binding = bindingFor(namespace);
+  const [active, setActive] = useState(SCRIPT_LANGUAGES[0].id);
   const current =
     SCRIPT_LANGUAGES.find((language) => language.id === active) ??
-    SCRIPT_LANGUAGES[0]
+    SCRIPT_LANGUAGES[0];
 
   return (
     <div className="flex flex-col gap-2">
@@ -86,5 +86,5 @@ export function UsageBlock({ namespace }: { namespace: string }) {
         </div>
       </Tabs>
     </div>
-  )
+  );
 }

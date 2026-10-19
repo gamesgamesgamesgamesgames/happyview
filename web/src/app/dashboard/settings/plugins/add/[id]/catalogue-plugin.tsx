@@ -1,72 +1,72 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react"
-import Link from "next/link"
-import { usePathname, useRouter, useSearchParams } from "next/navigation"
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
-import { useOfficialPlugins } from "@/hooks/use-official-plugins"
+import { useOfficialPlugins } from "@/hooks/use-official-plugins";
 import {
   addPlugin,
   getPlugins,
   previewPlugin,
   type PluginPreview,
-} from "@/lib/api"
-import { URL_PLUGIN_ID, installedPluginHref } from "@/lib/plugin-routes"
-import { visibleCapabilities } from "@/components/plugin-capabilities"
+} from "@/lib/api";
+import { URL_PLUGIN_ID, installedPluginHref } from "@/lib/plugin-routes";
+import { visibleCapabilities } from "@/components/plugin-capabilities";
 import {
   InstallAction,
   PluginDetail,
   type PluginView,
-} from "@/components/plugin-detail"
-import { PageBreadcrumbs } from "@/components/page-breadcrumbs"
-import { SiteHeader } from "@/components/site-header"
-import { Button } from "@/components/ui/button"
-import { Skeleton } from "@/components/ui/skeleton"
+} from "@/components/plugin-detail";
+import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
+import { SiteHeader } from "@/components/site-header";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 
 export default function CataloguePlugin() {
   // The `[id]` segment carries the URL-encoded plugin id, which contains dots.
   const id = decodeURIComponent(
     usePathname().split("/").filter(Boolean).pop() ?? "",
-  )
-  const search = useSearchParams()
-  const router = useRouter()
-  const { byId, loading: catalogueLoading } = useOfficialPlugins()
+  );
+  const search = useSearchParams();
+  const router = useRouter();
+  const { byId, loading: catalogueLoading } = useOfficialPlugins();
 
-  const [preview, setPreview] = useState<PluginPreview | null>(null)
-  const [installing, setInstalling] = useState(false)
-  const [installed, setInstalled] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [preview, setPreview] = useState<PluginPreview | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installed, setInstalled] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const entry = id === URL_PLUGIN_ID ? undefined : byId.get(id)
-  const manifestUrl = search.get("manifest") ?? entry?.manifest_url ?? null
+  const entry = id === URL_PLUGIN_ID ? undefined : byId.get(id);
+  const manifestUrl = search.get("manifest") ?? entry?.manifest_url ?? null;
 
   useEffect(() => {
-    if (!manifestUrl) return
-    const controller = new AbortController()
+    if (!manifestUrl) return;
+    const controller = new AbortController();
     void previewPlugin(manifestUrl, controller.signal)
       .then(setPreview)
       .catch((e: unknown) => {
-        if (controller.signal.aborted) return
-        setError(e instanceof Error ? e.message : String(e))
-      })
-    return () => controller.abort()
-  }, [manifestUrl])
+        if (controller.signal.aborted) return;
+        setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => controller.abort();
+  }, [manifestUrl]);
 
   // Derived rather than held: a `loading` flag the effect sets would render
   // once with the wrong value before correcting itself.
-  const reading = manifestUrl !== null && preview === null && error === null
+  const reading = manifestUrl !== null && preview === null && error === null;
 
   useEffect(() => {
-    if (!preview) return
+    if (!preview) return;
     void getPlugins()
       .then((r) => setInstalled(r.plugins.some((p) => p.id === preview.id)))
       // Not knowing costs an Install button that answers "already installed"
       // on click, which the server refuses safely.
-      .catch(() => setInstalled(false))
-  }, [preview])
+      .catch(() => setInstalled(false));
+  }, [preview]);
 
   const view: PluginView | null = useMemo(() => {
-    if (!preview) return null
+    if (!preview) return null;
     return {
       id: preview.id,
       name: preview.name,
@@ -89,13 +89,13 @@ export default function CataloguePlugin() {
       latestVersion: null,
       releases: entry?.releases ?? [],
       sections: entry?.sections ?? {},
-    }
-  }, [preview, entry, installed])
+    };
+  }, [preview, entry, installed]);
 
   const install = useCallback(async () => {
-    if (!preview) return
-    setInstalling(true)
-    setError(null)
+    if (!preview) return;
+    setInstalling(true);
+    setError(null);
     try {
       await addPlugin({
         url: preview.manifest_url,
@@ -103,13 +103,13 @@ export default function CataloguePlugin() {
         accepted_capabilities: visibleCapabilities(preview.capabilities).map(
           (c) => c.name,
         ),
-      })
-      router.push(installedPluginHref(preview.id))
+      });
+      router.push(installedPluginHref(preview.id));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-      setInstalling(false)
+      setError(e instanceof Error ? e.message : String(e));
+      setInstalling(false);
     }
-  }, [preview, router])
+  }, [preview, router]);
 
   return (
     <>
@@ -161,5 +161,5 @@ export default function CataloguePlugin() {
         )}
       </div>
     </>
-  )
+  );
 }
