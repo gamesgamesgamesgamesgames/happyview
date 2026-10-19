@@ -57,47 +57,55 @@ impl CallerError {
     }
 }
 
-/// `{repo, collection, rkey?, record, validate}`, the body
-/// `com.atproto.repo.createRecord` takes.
+/// `{repo, collection, rkey?, record, validate?}`, the body
+/// `com.atproto.repo.createRecord` takes. `validate` is sent only when the
+/// caller chose one: without it the PDS validates a record whose lexicon it
+/// knows or can resolve and accepts one whose lexicon it cannot, where
+/// `true` would refuse that second record.
 pub fn create_body(
     repo: &str,
     collection: &str,
     rkey: Option<&str>,
     record: &Value,
-    validate: bool,
+    validate: Option<bool>,
 ) -> Value {
     let mut body = json!({
         "repo": repo,
         "collection": collection,
         "record": record,
-        "validate": validate,
     });
     if let Some(rkey) = rkey {
         body["rkey"] = json!(rkey);
     }
+    if let Some(validate) = validate {
+        body["validate"] = json!(validate);
+    }
     body
 }
 
-/// `{repo, collection, rkey, record, validate, swapRecord?}`, the body
+/// `{repo, collection, rkey, record, validate?, swapRecord?}`, the body
 /// `com.atproto.repo.putRecord` takes. `swapRecord` is the caller's
-/// no-create guarantee and is sent only when they supplied one.
+/// no-create guarantee and is sent only when they supplied one; `validate`
+/// as for [`create_body`].
 fn put_body(
     repo: &str,
     collection: &str,
     rkey: &str,
     record: &Value,
     swap_cid: Option<&str>,
-    validate: bool,
+    validate: Option<bool>,
 ) -> Value {
     let mut body = json!({
         "repo": repo,
         "collection": collection,
         "rkey": rkey,
         "record": record,
-        "validate": validate,
     });
     if let Some(cid) = swap_cid {
         body["swapRecord"] = json!(cid);
+    }
+    if let Some(validate) = validate {
+        body["validate"] = json!(validate);
     }
     body
 }
@@ -181,7 +189,8 @@ pub async fn create_record(
         .unwrap_or_else(|| caller.default_repo().to_string());
     check_writable_repo(&repo, &caller.did, caller.delegate_did.as_deref())
         .map_err(CallerError::WritableRepo)?;
-    if spec.validate {
+    // Checked here unless the caller asked for no validation at all.
+    if spec.validate != Some(false) {
         check_against_lexicon(caller, &spec.collection, &spec.record).await?;
     }
     let record = with_type(spec.record, &spec.collection);
@@ -205,7 +214,8 @@ pub async fn put_record(
     let (repo, collection, rkey) = parse_at_uri(&spec.uri)?;
     check_writable_repo(&repo, &caller.did, caller.delegate_did.as_deref())
         .map_err(CallerError::WritableRepo)?;
-    if spec.validate {
+    // Checked here unless the caller asked for no validation at all.
+    if spec.validate != Some(false) {
         check_against_lexicon(caller, &collection, &spec.record).await?;
     }
     let record = with_type(spec.record, &collection);
@@ -441,7 +451,7 @@ mod tests {
             "app.bsky.feed.post",
             None,
             &json!({"a": 1}),
-            true,
+            Some(true),
         );
         assert_eq!(
             body,
@@ -461,10 +471,28 @@ mod tests {
             "app.bsky.feed.post",
             Some("abc"),
             &json!({"a": 1}),
-            false,
+            Some(false),
         );
         assert_eq!(body["rkey"], "abc");
         assert_eq!(body["validate"], false);
+    }
+
+    /// No flag is the PDS's own default: it validates a record whose lexicon
+    /// it knows or can resolve, and accepts one whose lexicon it cannot. An
+    /// explicit `true` refuses that second record outright.
+    #[test]
+    fn a_write_that_leaves_validation_to_the_pds_sends_no_flag() {
+        let create = create_body("did:plc:me", "app.test.rec", None, &json!({"a": 1}), None);
+        assert!(create.get("validate").is_none(), "{create}");
+        let put = put_body(
+            "did:plc:me",
+            "app.test.rec",
+            "abc",
+            &json!({"a": 1}),
+            None,
+            None,
+        );
+        assert!(put.get("validate").is_none(), "{put}");
     }
 
     #[test]
@@ -475,7 +503,7 @@ mod tests {
             "abc",
             &json!({"a": 1}),
             None,
-            true,
+            Some(true),
         );
         assert!(body.get("swapRecord").is_none());
         assert_eq!(body["rkey"], "abc");
@@ -486,7 +514,7 @@ mod tests {
             "abc",
             &json!({"a": 1}),
             Some("bafy"),
-            true,
+            Some(true),
         );
         assert_eq!(guarded["swapRecord"], "bafy");
     }
@@ -495,7 +523,7 @@ mod tests {
     fn a_record_without_a_type_gets_its_collection_as_one() {
         let typed = with_type(json!({"a": 1}), "app.bsky.feed.post");
         assert_eq!(typed, json!({"$type": "app.bsky.feed.post", "a": 1}));
-        let body = create_body("did:plc:me", "app.bsky.feed.post", None, &typed, true);
+        let body = create_body("did:plc:me", "app.bsky.feed.post", None, &typed, Some(true));
         assert_eq!(body["record"]["$type"], "app.bsky.feed.post");
     }
 

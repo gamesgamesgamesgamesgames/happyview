@@ -682,10 +682,6 @@ pub struct StrongRef {
 // Caller-acting writes, index writes, and lexicon lookup
 // ---------------------------------------------------------------------------
 
-fn default_true() -> bool {
-    true
-}
-
 /// What a successful create or put on the caller's own repo returns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordRef {
@@ -704,10 +700,13 @@ pub struct CallerRecordCreate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     pub record: Value,
-    /// Whether the PDS should validate the record against its lexicon.
-    /// Defaults to `true`, matching `com.atproto.repo.createRecord`.
-    #[serde(default = "default_true")]
-    pub validate: bool,
+    /// How the record is checked against its lexicon. `Some(true)`: here and
+    /// by the PDS, which refuses a record whose lexicon it cannot resolve.
+    /// `Some(false)`: neither. `None`, the default and what
+    /// `com.atproto.repo.createRecord` itself defaults to: here, and by the PDS
+    /// when it knows or can resolve the lexicon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
 }
 
 /// A record put (upsert) issued as the calling script's user. Needs
@@ -720,8 +719,9 @@ pub struct CallerRecordPut {
     /// record's current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_cid: Option<String>,
-    #[serde(default = "default_true")]
-    pub validate: bool,
+    /// As [`CallerRecordCreate`]'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
 }
 
 /// A record delete issued as the calling script's user. Needs `caller:write`.
@@ -3116,7 +3116,7 @@ mod caller_tests {
     }
 
     #[test]
-    fn caller_record_create_defaults_validate_true_and_omits_optionals() {
+    fn caller_record_create_leaves_validate_to_the_pds_and_omits_optionals() {
         let create: CallerRecordCreate = serde_json::from_value(json!({
             "collection": "app.bsky.feed.post",
             "record": {"text": "hi"},
@@ -3126,12 +3126,12 @@ mod caller_tests {
         assert_eq!(create.rkey, None);
         assert_eq!(create.repo, None);
         assert_eq!(create.record, json!({"text": "hi"}));
-        assert!(create.validate);
+        assert_eq!(create.validate, None);
 
         let value = serde_json::to_value(&create).unwrap();
         assert!(value.get("rkey").is_none());
         assert!(value.get("repo").is_none());
-        assert_eq!(value["validate"], true);
+        assert!(value.get("validate").is_none());
     }
 
     #[test]
@@ -3141,7 +3141,7 @@ mod caller_tests {
             rkey: Some("abc123".to_string()),
             repo: Some("did:plc:abc".to_string()),
             record: json!({"text": "hi"}),
-            validate: false,
+            validate: Some(false),
         };
         let value = serde_json::to_value(&create).unwrap();
         assert_eq!(value["rkey"], "abc123");
@@ -3154,18 +3154,18 @@ mod caller_tests {
     }
 
     #[test]
-    fn caller_record_put_defaults_validate_true_and_omits_swap_cid() {
+    fn caller_record_put_leaves_validate_to_the_pds_and_omits_swap_cid() {
         let put: CallerRecordPut = serde_json::from_value(json!({
             "uri": "at://did:plc:abc/app.bsky.feed.post/1",
             "record": {"text": "hi"},
         }))
         .unwrap();
         assert_eq!(put.swap_cid, None);
-        assert!(put.validate);
+        assert_eq!(put.validate, None);
 
         let value = serde_json::to_value(&put).unwrap();
         assert!(value.get("swap_cid").is_none());
-        assert_eq!(value["validate"], true);
+        assert!(value.get("validate").is_none());
     }
 
     #[test]
@@ -3174,7 +3174,7 @@ mod caller_tests {
             uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
             record: json!({"text": "hi"}),
             swap_cid: Some("bafy123".to_string()),
-            validate: false,
+            validate: Some(false),
         };
         let value = serde_json::to_value(&put).unwrap();
         assert_eq!(value["swap_cid"], "bafy123");

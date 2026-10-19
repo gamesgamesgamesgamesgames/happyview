@@ -514,14 +514,16 @@ A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:wri
 | Import | Capability | Spec → result |
 | --------------------------- | ------------ | ------------------------------------------------------------------------------- |
 | `host_caller_xrpc_query`    | `caller:read`  | `{method, params?}` → the response body |
-| `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate}` → `{uri, cid}`; mirrored into the index |
-| `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate}` → `{uri, cid}`; mirrored into the index |
+| `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate?}` → `{uri, cid}`; mirrored into the index |
+| `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate?}` → `{uri, cid}`; mirrored into the index |
 | `host_caller_delete_record` | `caller:write` | `{uri}` → nothing; removed from the index |
 | `host_caller_upload_blob`   | `caller:write` | `{bytes, mime_type}` → the PDS's blob reference |
 | `host_caller_xrpc_procedure`| `caller:call`  | `{method, input, params?}` → the response body |
 | `host_records_index_put`    | `records:write`| `{collection, rkey, did?, record, cid?}` → `{uri, cid}` |
 | `host_records_index_delete` | `records:write`| `{uri}` → whether a row was removed |
 | `host_lexicon_get`          | none           | `{nsid}` → the lexicon's stored JSON, or null if none is uploaded |
+
+`validate` decides how a write is checked against its lexicon. Left out, HappyView checks the record and the PDS validates it when it knows or can resolve the lexicon — `com.atproto.repo.createRecord`'s own default. `true` asks the PDS to validate strictly, which refuses a record whose lexicon it can't resolve; `false` skips both checks.
 
 `host_records_index_put`'s `did` is optional on the wire but required to succeed — the host has no default author for a row and rejects a spec without one.
 
