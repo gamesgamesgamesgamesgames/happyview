@@ -1,72 +1,12 @@
 "use client"
 
-import {
-  Fragment,
-  type ComponentProps,
-  type ReactNode,
-  useEffect,
-  useState,
-} from "react"
-import { jsx, jsxs } from "react/jsx-runtime"
-import { toJsxRuntime } from "hast-util-to-jsx-runtime"
-// The full bundle rather than `shiki/bundle/web`, which carries no Lua
-// grammar — the one language that most needs highlighting here. Grammars load
-// on demand, so the tab a reader opens is the only one fetched.
-import { codeToHast, type BundledLanguage } from "shiki"
+import { useState } from "react"
 import { Check, Copy } from "lucide-react"
 
+import { CODE_CLASS, useHighlighted } from "@/lib/highlight"
 import { SCRIPT_LANGUAGES, bindingFor } from "@/lib/script-usage"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-
-async function highlight(code: string, lang: string): Promise<ReactNode> {
-  const hast = await codeToHast(code, {
-    lang: lang as BundledLanguage,
-    themes: { light: "github-light", dark: "github-dark" },
-    // The `.shiki` rules in globals.css read the per-theme custom properties
-    // this emits, so the block follows the dashboard's own theme switch.
-    defaultColor: false,
-  })
-
-  return toJsxRuntime(hast, {
-    Fragment,
-    jsx,
-    jsxs,
-    components: {
-      pre: (props: ComponentProps<"pre">) => <pre {...props} />,
-      code: (props: ComponentProps<"code">) => (
-        <code className="font-mono text-sm whitespace-pre" {...props} />
-      ),
-    },
-  }) as ReactNode
-}
-
-/** The highlighted line, or null until the grammar has loaded. */
-function useHighlighted(code: string, grammar: string): ReactNode | null {
-  const key = `${grammar}:${code}`
-  // The result carries the input it was produced from, so a result that
-  // arrives after the input changed is ignored rather than cleared on the way
-  // in — clearing would be a setState in the effect body.
-  const [done, setDone] = useState<{ key: string; nodes: ReactNode } | null>(
-    null,
-  )
-
-  useEffect(() => {
-    let cancelled = false
-    void highlight(code, grammar)
-      .then((nodes) => {
-        if (!cancelled) setDone({ key, nodes })
-      })
-      // An unavailable grammar costs colour, not the line: the plain fallback
-      // is the same text.
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [code, grammar, key])
-
-  return done?.key === key ? done.nodes : null
-}
 
 function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false)
@@ -95,7 +35,7 @@ function UsageLine({ code, grammar }: { code: string; grammar: string }) {
     <div className="shiki-on-surface overflow-x-auto px-4 py-3">
       {nodes ?? (
         <pre>
-          <code className="font-mono text-sm whitespace-pre">{code}</code>
+          <code className={CODE_CLASS}>{code}</code>
         </pre>
       )}
     </div>

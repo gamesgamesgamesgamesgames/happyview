@@ -57,6 +57,7 @@ export default defineConfig({
         "script-module-row.spec.ts",
         "plugin-catalogue.spec.ts",
         "plugin-update-approved-url.spec.ts",
+        "plugin-readme-highlighting.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
