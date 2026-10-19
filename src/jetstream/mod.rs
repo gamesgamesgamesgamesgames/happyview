@@ -8,6 +8,7 @@
 //! dictionary (`compression`).
 
 pub mod apply;
+pub mod archive;
 pub mod compression;
 pub mod config;
 pub mod cursor;
@@ -84,6 +85,10 @@ struct Session {
     /// A resume from the tip that lost events, reported once the first event
     /// shows where the stream picked up again.
     pending_gap: Option<Gap>,
+    /// The archive's sealed tip a gap replay resumed the stream at. If the
+    /// server refuses that cursor too, the next `CursorTooOld` resumes
+    /// without a seq instead of planning the same gap again.
+    gap_resumed_at: Option<i64>,
     /// 400s in a row with no error name to go by (`handle_rejection`).
     unexplained_400s: u32,
     /// After `FutureCursor`, the first ticket of the new seq numbering:
@@ -131,6 +136,7 @@ impl Session {
             stale_seq: None,
             from_tip: false,
             pending_gap: None,
+            gap_resumed_at: None,
             unexplained_400s: 0,
             save_barrier: None,
             logged_gaps: HashSet::new(),
@@ -221,6 +227,53 @@ async fn handle_rejection(
             Some(Duration::ZERO)
         }
         Rejection::CursorTooOld(message) => {
+            // P8: under BACKFILL_SOURCE=crawl the archive is never asked.
+            // A refusal of the tip a gap replay already resumed at would only
+            // plan the same gap and send the same cursor again, forever.
+            if session.protocol == Protocol::V2
+                && state.archive.default_source != crate::jetstream::archive::SourceChoice::Crawl
+                && (session.gap_resumed_at.is_none()
+                    || session.sent_cursor != session.gap_resumed_at)
+                && let Some(after_seq) = gap_floor(state, settings).await
+            {
+                match crate::admin::backfill::replay::start_gap_replay(state, after_seq).await {
+                    Ok((job_id, tip)) => {
+                        tracing::warn!(
+                            %message,
+                            after_seq,
+                            tip,
+                            job_id,
+                            "jetstream refused the cursor; replaying the gap from its archive and resuming live at the sealed tip"
+                        );
+                        session.stale_seq = Some(after_seq);
+                        session.from_tip = false;
+                        session.pending_gap = None;
+                        session.gap_resumed_at = Some(tip);
+                        *last_dispatched = Some(tip);
+                        let sent = session.sent_cursor;
+                        log_gap(
+                            state,
+                            session,
+                            GAP_CURSOR_TOO_OLD,
+                            sent,
+                            serde_json::json!({
+                                "message": message,
+                                "after_seq": after_seq,
+                                "resumed_at_seq": tip,
+                                "replay_job_id": job_id,
+                            }),
+                        )
+                        .await;
+                        return Some(Duration::ZERO);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error,
+                            "could not replay the jetstream gap from its archive"
+                        );
+                    }
+                }
+            }
             resume_without_seq(state, session, last_dispatched, message, true).await;
             Some(Duration::ZERO)
         }
@@ -297,6 +350,16 @@ async fn handle_rejection(
             None
         }
     }
+}
+
+/// The saved applied seq, when it was saved for this host: where a gap
+/// replay starts. Seqs are local to one Jetstream instance.
+async fn gap_floor(state: &AppState, settings: &Settings) -> Option<i64> {
+    let stored = cursor::load(&state.db, state.db_backend).await.ok()?;
+    if stored.host.as_deref() != Some(settings.endpoint.host.as_str()) {
+        return None;
+    }
+    stored.seq
 }
 
 /// Stop resuming by seq: the refused one, the saved one and the last one

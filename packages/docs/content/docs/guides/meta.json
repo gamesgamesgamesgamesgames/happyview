@@ -9,6 +9,7 @@
     "background-jobs",
     "record-scripts",
     "lua-scripting",
+    "testing",
     "migrating-scripts",
     "api-clients",
     "linked-repos",

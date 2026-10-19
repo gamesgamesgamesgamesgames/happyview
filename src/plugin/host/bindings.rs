@@ -32,7 +32,7 @@ pub struct PluginState {
     /// `host_caller_xrpc_query`, which a session-less query, record-event or
     /// label script can also reach.
     pub caller: Option<Arc<crate::plugin::caller::CallerSession>>,
-    /// The script run this instance is executing, for the four imports that
+    /// The script run this instance is executing, for the five imports that
     /// act on it. `None` for a library or auth instance, which is what makes
     /// those imports refuse rather than act on a run they are not inside.
     pub script_run: Option<super::script::ScriptRun>,
@@ -53,6 +53,12 @@ pub struct PluginState {
     /// Library calls started through `host_call_library_start` and not yet
     /// waited on. Dropped with the store, which aborts whatever is left.
     pub pending_calls: super::PendingCalls,
+    /// The panic a guest reported before trapping, which the script runner
+    /// answers the run with instead of the trap.
+    pub panic: Option<happyview_plugin_sdk::wire::PanicReport>,
+    /// The fuel each call into this instance starts with. The plugin type's
+    /// default, except a compiled module's, which is its run's budget.
+    pub call_fuel: u64,
 }
 
 /// Check that a memory access is within bounds
@@ -100,13 +106,14 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
 
 /// Registers every async import through [`HostImports::define`], so none
 /// can be added without the guest-deadline accounting, and returns the
-/// names that went through it. `host_log` is synchronous and copies a few
-/// bytes; it is registered bare.
+/// names that went through it. `host_log` and `host_script_panic` are
+/// synchronous and copy a few bytes; they are registered bare.
 pub(crate) fn define_host_functions(
     linker: &mut Linker<PluginState>,
 ) -> Result<Vec<&'static str>, wasmtime::Error> {
     // Sync functions
     linker.func_wrap("env", "host_log", host_log)?;
+    linker.func_wrap("env", "host_script_panic", host_script_panic)?;
     let mut imports = HostImports::new(linker);
 
     // host_get_secret must be async because it calls alloc on an async store
@@ -1104,6 +1111,117 @@ pub(crate) fn define_host_functions(
         })
     })?;
 
+    imports.define(
+        "host_module_resolve",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_script_impl(
+                    caller,
+                    "host_module_resolve",
+                    req_ptr,
+                    req_len,
+                    |_state, run, spec: happyview_plugin_sdk::wire::ModuleResolve| async move {
+                        super::script::module_resolve(&run, spec)
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // The test runner's imports. Each answers only inside a test file's run
+    // on a state the test command built.
+    imports.define(
+        "host_test_report",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_report",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, report: crate::plugin::TestReport| async move {
+                        harness.report(report);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_trigger",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_trigger",
+                    req_ptr,
+                    req_len,
+                    |state, harness, spec: crate::plugin::TestTrigger| async move {
+                        crate::testing::triggers::fire(&state, &harness, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_mock",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_mock",
+                    req_ptr,
+                    req_len,
+                    |state, harness, spec: crate::plugin::TestMock| async move {
+                        crate::testing::mocks::mock(&state, &harness, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_calls",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_calls",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, spec: crate::plugin::TestCalls| async move {
+                        Ok(harness.calls(&spec.namespace))
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_pds_writes",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_pds_writes",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, _spec: crate::plugin::TestPdsWritesRequest| async move {
+                        Ok(harness.pds().writes())
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     Ok(imports.wrapped)
 }
 
@@ -1168,7 +1286,7 @@ fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     caller.as_context_mut().set_epoch_deadline(remaining);
 }
 
-/// One entry point for the four imports that act on the script run in
+/// One entry point for the five imports that act on the script run in
 /// progress. The capability is checked before the run, so a plugin that never
 /// asked for `script:host` hears about the grant rather than about a run it
 /// could not have reached anyway.
@@ -1221,6 +1339,58 @@ where
     write_guest_response(caller, &response).await
 }
 
+/// One entry point for the test runner's imports. Both the run and the state
+/// have to say "test": a test-kind input reaching a serving instance's state,
+/// or a handler's run on a test state, is refused alike.
+async fn host_test_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(crate::AppState, Arc<crate::testing::TestHarness>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, crate::testing::TestHostError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let in_test_file = caller
+        .data()
+        .script_run
+        .as_ref()
+        .is_some_and(|run| run.test);
+    let app_state = caller.data().app_state.clone();
+    let harness = app_state.as_ref().and_then(|state| state.test.clone());
+    let (true, Some(app_state), Some(harness)) = (in_test_file, app_state, harness) else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "UNSUPPORTED",
+                format!("{import} is available only to a test file run by `happyview test`"),
+            ),
+        )
+        .await;
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let response = match run(app_state, harness, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), e),
+    };
+    write_guest_response(caller, &response).await
+}
+
 /// Read a string from guest memory
 fn read_guest_string(
     caller: &wasmtime::Caller<'_, PluginState>,
@@ -1261,6 +1431,7 @@ async fn write_guest_response(caller: &mut wasmtime::Caller<'_, PluginState>, da
     // The allocator is guest code: the clock has to be running again, and
     // armed from what remains, before it is entered.
     resume_guest_deadline(caller);
+    crate::plugin::runtime::grant_fuel_for_bytes(caller, data.len());
     let len = data.len() as u32;
     let ptr = match alloc.call_async(&mut *caller, len).await {
         Ok(p) if p != 0 => p,
@@ -1311,6 +1482,30 @@ fn host_log(
     let db_backend = caller.data().db_backend;
     let log_level: super::LogLevel = level.parse().unwrap_or_default();
     super::log(&plugin_id, log_level, msg, db, db_backend);
+}
+
+/// The longest panic report the host reads. The message reaches an API
+/// caller's error body and the logs, so its size is not the guest's to choose.
+pub(crate) const MAX_PANIC_REPORT_BYTES: usize = 64 * 1024;
+
+/// Host function: record the panic a guest is about to trap on. A report
+/// that cannot be read, or is longer than [`MAX_PANIC_REPORT_BYTES`], is
+/// dropped unparsed, and the run then ends as the plain trap it would have
+/// been anyway.
+fn host_script_panic(mut caller: wasmtime::Caller<'_, PluginState>, ptr: i32, len: i32) {
+    if len as u32 as usize > MAX_PANIC_REPORT_BYTES {
+        return;
+    }
+    let Some(memory) = caller.data().memory else {
+        return;
+    };
+    let data = memory.data(&caller);
+    let Ok((start, end)) = check_bounds(ptr as usize, len as usize, data.len()) else {
+        return;
+    };
+    if let Ok(report) = serde_json::from_slice(&data[start..end]) {
+        caller.data_mut().panic = Some(report);
+    }
 }
 
 /// Host function: get a secret value by name
@@ -2756,6 +2951,8 @@ mod tests {
                 crate::plugin::runtime::LIBRARY_MEMORY_CEILING,
             ),
             pending_calls: Default::default(),
+            panic: None,
+            call_fuel: u64::MAX,
         }
     }
 

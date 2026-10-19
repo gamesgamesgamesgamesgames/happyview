@@ -72,15 +72,10 @@ pub(super) async fn upload_lexicon(
 
     let backfill_job_id: Option<String> =
         if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
-            match crate::admin::backfill::start_backfill(
-                &state,
-                Some(id.clone()),
-                Vec::new(),
-                &auth.did,
-            )
-            .await
+            match crate::admin::backfill::start_automatic_backfill(&state, id.clone(), &auth.did)
+                .await
             {
-                Ok(job_id) => Some(job_id),
+                Ok(job_id) => job_id,
                 Err(e) => {
                     tracing::warn!(
                         lexicon = id.as_str(),
@@ -130,6 +125,14 @@ pub(super) async fn upload_lexicon(
     ))
 }
 
+/// The refusal `delete_lexicon` answers is the one `declared` reports, so the
+/// dashboard can leave out a Delete that could only fail.
+fn summarize(state: &AppState, listing: crate::catalog::LexiconListing) -> LexiconSummary {
+    let mut summary = LexiconSummary::from(listing);
+    summary.declared = state.config.declares_network_lexicon(&summary.id);
+    summary
+}
+
 /// GET /admin/lexicons — list all lexicons.
 pub(super) async fn list_lexicons(
     State(state): State<AppState>,
@@ -138,7 +141,7 @@ pub(super) async fn list_lexicons(
     auth.require(Permission::LexiconsRead).await?;
     let listings = state.lexicons.list(&state.db, state.db_backend).await?;
     Ok(Json(
-        listings.into_iter().map(LexiconSummary::from).collect(),
+        listings.into_iter().map(|l| summarize(&state, l)).collect(),
     ))
 }
 
@@ -155,7 +158,7 @@ pub(super) async fn get_lexicon(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("lexicon '{id}' not found")))?;
     let lexicon_json = listing.lexicon_json.clone();
-    let summary = LexiconSummary::from(listing);
+    let summary = summarize(&state, listing);
     let mut out = serde_json::to_value(&summary)
         .map_err(|e| AppError::Internal(format!("failed to encode lexicon: {e}")))?;
     out["lexicon_json"] = lexicon_json;

@@ -1,8 +1,21 @@
+export type BackfillSource = "auto" | "replay" | "crawl"
+
+export interface ReplayProgress {
+  after_seq: number
+  through_seq: number | null
+  tip_seq: number | null
+  bytes: number
+  blocks_failed: number
+}
+
 export interface BackfillJob {
   id: string
   collection: string | null
   did: string | null
   scope: "network" | "dids"
+  source: BackfillSource
+  // Set for jobs that read the Jetstream archive; null for crawl jobs.
+  replay: ReplayProgress | null
   status: string
   stage: string
   total_repos: number | null
@@ -60,6 +73,11 @@ export interface BackfillEvent {
   error?: string | null
   error_counts?: Record<string, number>
   discovery_complete?: boolean
+  // `replay_progress` events
+  through_seq?: number | null
+  tip_seq?: number | null
+  bytes?: number
+  blocks_failed?: number
 }
 
 export interface BlueskyProfile {

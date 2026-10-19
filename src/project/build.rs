@@ -10,12 +10,14 @@ use crate::catalog::{Layer, LexiconCatalog};
 use crate::config::project::{PROJECT_FILE, ProjectConfigError, load_project_config};
 use crate::lua::ParsedTrigger;
 use crate::plugin::{PluginExecutor, PluginRegistry};
-use crate::script::checks::{self, InterpreterCheck};
+use crate::script::checks;
 
 use super::describe;
 use super::diagnostic;
 use super::layout::{self, Claim, ExtensionClaims, LexiconIndex, Role};
 use super::lexicons;
+use super::prepare;
+use super::script_module;
 use super::snapshot::{ProjectLexicon, ProjectModule, ProjectScript, ProjectSnapshot, ScriptBody};
 use super::walk::{self, SrcFile};
 
@@ -180,6 +182,44 @@ pub async fn build_snapshot_with(
         }
     }
 
+    // Compiled modules claim triggers as files do, so they join the same
+    // map: a clash with a file is caught by `load_modules`, and a
+    // `[scripts.*]` key naming a module trigger is not stale.
+    // Compiling a module takes from a tenth of a second to several, which
+    // would stall a worker thread serving requests during a dev rebuild.
+    let loading = {
+        let runtime = Arc::clone(env.executor.runtime());
+        let root = root.to_path_buf();
+        let decls = config.modules.clone();
+        let lexicons = project_lexicons.clone();
+        let files = handled_by.clone();
+        tokio::task::spawn_blocking(move || {
+            script_module::load_modules(&runtime, &root, &decls, &lexicons, &files)
+        })
+    };
+    let loaded = match loading.await {
+        Ok(loaded) => loaded,
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(e) => Err(vec![Diagnostic::error(
+                PROJECT_FILE,
+                format!("loading the project's modules did not finish: {e}"),
+            )]),
+        },
+    };
+    let loaded_modules = match loaded {
+        Ok(loaded) => {
+            for (trigger_id, script) in &loaded.scripts {
+                handled_by.insert(trigger_id.clone(), script.path.clone());
+            }
+            Some(loaded)
+        }
+        Err(mut errors) => {
+            diagnostics.append(&mut errors);
+            None
+        }
+    };
+
     let mut scripts = BTreeMap::new();
     let mut modules = BTreeMap::new();
     let mut tests = BTreeMap::new();
@@ -196,7 +236,7 @@ pub async fn build_snapshot_with(
             Unit::Handler(trigger) => trigger.id(),
             Unit::Module | Unit::Test => String::new(),
         };
-        if !passes_checks(env, &item, &trigger_id, &source, &mut diagnostics).await {
+        if !passes_checks(&item, &trigger_id, &source, &mut diagnostics) {
             continue;
         }
         let language_id = item.claim.language_id;
@@ -246,22 +286,56 @@ pub async fn build_snapshot_with(
         }
     }
 
+    let mut script_modules = BTreeMap::new();
+    if let Some(loaded) = loaded_modules {
+        for (trigger_id, mut script) in loaded.scripts {
+            // A module has no leading comment to read, so its description
+            // comes from `happyview.toml` alone.
+            match describe::script_meta(
+                &trigger_id,
+                &script.path,
+                "",
+                config.scripts.get(&trigger_id),
+            ) {
+                Ok(meta) => {
+                    script.description = meta.description;
+                    script.outbound_xrpcs = meta.outbound_xrpcs;
+                }
+                Err(d) => diagnostics.push(d),
+            }
+            scripts.insert(trigger_id, script);
+        }
+        script_modules = loaded.modules;
+    }
+
     diagnostics.extend(lexicons::stale_overrides(&config.lexicons, &lexicon_files));
     let handled: BTreeSet<String> = handled_by.into_keys().collect();
     diagnostics.extend(describe::stale_overrides(&config.scripts, &handled));
 
-    diagnostic::sort(&mut diagnostics);
-    if diagnostic::has_errors(&diagnostics) {
-        return Err(diagnostics);
-    }
-    let snapshot = ProjectSnapshot {
+    let mut snapshot = ProjectSnapshot {
         root: Some(root.to_path_buf()),
         generation: 0,
         lexicons: project_lexicons,
         scripts,
         modules,
         tests,
+        script_modules,
     };
+    // The interpreters see the files only now that every module exists, so
+    // an import can be checked in the same pass that prepares it. Every file
+    // is prepared whatever else failed, so one run reports every error; the
+    // imports wait for a clean build, because a module dropped for its own
+    // error would read as missing.
+    let (prepared, imports) = prepare::prepare_files(env, &mut snapshot).await;
+    diagnostics.extend(prepared);
+    if !diagnostic::has_errors(&diagnostics) {
+        diagnostics.extend(prepare::check_imports(env, &snapshot, &imports).await);
+    }
+
+    diagnostic::sort(&mut diagnostics);
+    if diagnostic::has_errors(&diagnostics) {
+        return Err(diagnostics);
+    }
     let changes = changes(&env.current, &snapshot);
     Ok(BuildReport {
         snapshot,
@@ -305,58 +379,25 @@ fn config_diagnostic(e: ProjectConfigError) -> Diagnostic {
     }
 }
 
-/// The admin API's checks, in its order: removed globals, then the
-/// interpreter. Only a handler reaches the interpreter: `validate` checks for
-/// `handle`, which a module or a test never defines, and it has no way yet
-/// to be told which kind of chunk it is reading. Until it does, modules and
-/// tests are stored after the removed-globals scan alone.
-async fn passes_checks(
-    env: &BuildEnv,
+/// The admin API's checks that read the text alone: removed globals. The
+/// interpreter's check runs once the snapshot is assembled, in
+/// `prepare::prepare_files` and then `prepare::check_imports`, where every
+/// module exists for imports to resolve against.
+fn passes_checks(
     item: &Pending<'_>,
     trigger_id: &str,
     source: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
-    let path = item.file.rel_path();
     let globals = checks::unmigrated_globals(trigger_id, &item.claim.language_id, source);
     if !globals.is_empty() {
         diagnostics.push(Diagnostic::error(
-            path,
+            item.file.rel_path(),
             checks::unmigrated_message(&globals),
         ));
         return false;
     }
-    if !matches!(item.unit, Unit::Handler(_)) {
-        return true;
-    }
-    // The build's one call into an interpreter.
-    match checks::check_with_interpreter(
-        &env.plugins,
-        &env.executor,
-        &item.claim.language_id,
-        source,
-    )
-    .await
-    {
-        Ok(InterpreterCheck::Valid) => true,
-        Ok(InterpreterCheck::Refused(errors)) => {
-            if errors.is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    path,
-                    "the interpreter refused the script without saying why",
-                ));
-                return false;
-            }
-            for error in errors {
-                diagnostics.push(Diagnostic::error(&path, error.message).at_line(error.line));
-            }
-            false
-        }
-        Err(e) => {
-            diagnostics.push(Diagnostic::error(path, e.to_string()));
-            false
-        }
-    }
+    true
 }
 
 /// A test file whose name, without its extension, is a lexicon the instance
@@ -397,6 +438,7 @@ async fn test_names_a_lexicon(
 fn source_body(source: String) -> ScriptBody {
     ScriptBody::Source {
         source: source.into(),
+        artifact: None,
     }
 }
 
@@ -407,12 +449,15 @@ fn project_module(id: String, path: PathBuf, language_id: String, source: String
         path,
         language_id,
         source: source.into(),
+        artifact: None,
     }
 }
 
 fn body_text(body: &ScriptBody) -> &str {
     match body {
         ScriptBody::Source { source, .. } => source.as_ref(),
+        // A rebuilt module is a changed script.
+        ScriptBody::Module { hash, .. } => hash.as_str(),
     }
 }
 
@@ -494,7 +539,7 @@ mod tests {
     /// The echo fixture twice: as `echo` for `.echo` files, and as `lua` for
     /// `.lua` files, which is the language the removed-globals check reads.
     /// The fixture's `validate` accepts any source except one starting
-    /// `invalid` (a syntax error at line 1) or `no-handle`.
+    /// `invalid` (a syntax error at line 1), or `no-handle` in a handler.
     async fn env() -> Option<crate::AppState> {
         let dir = built_fixture("interpreter_echo", "wasm32-unknown-unknown")?;
         let state = test_state_with_pool(memory_pool().await);
@@ -658,8 +703,9 @@ mod tests {
         );
     }
 
-    /// Modules aren't sent to `validate` until it can be told they are
-    /// modules, so one the interpreter would call invalid still builds.
+    /// A module needs no `handle`, but it must still parse: both files are
+    /// reported, the handler for its missing `handle` and the module for its
+    /// syntax.
     #[tokio::test]
     async fn a_handler_needs_handle_and_a_module_does_not() {
         let Some(state) = env().await else { return };
@@ -676,8 +722,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(errors.len(), 1, "{:?}", shown(&errors));
+        assert_eq!(errors.len(), 2, "{:?}", shown(&errors));
         assert!(errors[0].path.ends_with("getThing.echo"));
+        assert_eq!(errors[1].path, PathBuf::from("src/lib/broken.echo"));
+        assert_eq!(errors[1].line, Some(1));
     }
 
     #[tokio::test]
@@ -1203,5 +1251,258 @@ mod tests {
         install(&state, again.snapshot).await;
         assert_eq!(state.project.load().generation, before + 2);
         assert!(!rx.has_changed().unwrap());
+    }
+
+    /// A module with one query handler, `xrpc.query:app.test.echo`, that
+    /// answers `{"from": <answer>}`.
+    fn echo_module_wasm(answer: &str) -> Vec<u8> {
+        let body = format!(
+            r#"{{"ok":{{"status":"returned","value":{{"from":"{answer}"}},"value_kind":"object"}}}}"#
+        );
+        module_wasm(
+            &body,
+            &format!(
+                "i64.const 32768 i64.const 32 i64.shl i64.const {} i64.or",
+                body.len()
+            ),
+        )
+    }
+
+    /// The same handler, counting to two million before it answers `null`:
+    /// roughly ten million fuel, far past a thousand-instruction budget.
+    fn counting_module_wasm() -> Vec<u8> {
+        let body = r#"{"ok":{"status":"returned","value":null,"value_kind":"other"}}"#;
+        module_wasm(
+            body,
+            &format!(
+                "(local i32)
+                (loop
+                    local.get 2 i32.const 1 i32.add local.tee 2
+                    i32.const 2000000 i32.lt_u br_if 0)
+                i64.const 32768 i64.const 32 i64.shl i64.const {} i64.or",
+                body.len()
+            ),
+        )
+    }
+
+    fn module_wasm(answer: &str, execute: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 32768) "{escaped}")
+                (func (export "alloc") (param i32) (result i32) i32.const 1024)
+                (func (export "dealloc") (param i32 i32))
+                (func (export "execute") (param i32 i32) (result i64) {execute})
+                (@custom "happyview.handlers" "xrpc.query:app.test.echo\techo\n")
+                (@custom "happyview.interface" "1"))"#,
+            escaped = answer.replace('"', "\\\""),
+        ))
+        .unwrap()
+    }
+
+    const MODULE_TOML: &str =
+        "[modules.registry]\nlanguage = \"rust\"\npath = \"modules/registry\"\n";
+
+    fn module_project(wasm: &[u8]) -> tempfile::TempDir {
+        let root = project(&[
+            ("happyview.toml", MODULE_TOML),
+            (
+                "src/lexicons/app/test/echo.json",
+                &lexicon("app.test.echo", "query"),
+            ),
+        ]);
+        write_module(&root, wasm);
+        root
+    }
+
+    fn write_module(root: &tempfile::TempDir, wasm: &[u8]) {
+        let path = root.path().join(".happyview/build/registry.wasm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, wasm).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_module_handler_is_a_snapshot_script_and_its_module_is_held_by_hash() {
+        use sha2::Digest;
+        let state = test_state_with_pool(memory_pool().await);
+        let wasm = echo_module_wasm("module");
+        let root = module_project(&wasm);
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap_or_else(|d| panic!("{:?}", shown(&d)));
+
+        let hash = hex::encode(sha2::Sha256::digest(&wasm));
+        let script = &report.snapshot.scripts["xrpc.query:app.test.echo"];
+        assert!(matches!(&script.body, ScriptBody::Module { hash: h, .. } if *h == hash));
+        assert_eq!(script.path, PathBuf::from("modules/registry"));
+        assert_eq!(report.snapshot.script_modules[&hash].name, "registry");
+    }
+
+    /// Preparing sends each script to the interpreter its language names, and
+    /// a module's language names none: a module handler reaching it would
+    /// fail every project that has one.
+    #[tokio::test]
+    async fn a_module_builds_where_no_interpreter_claims_its_language() {
+        let Some(state) = env().await else { return };
+        assert!(
+            state
+                .plugin_registry
+                .get_interpreter_by_language("rust")
+                .await
+                .is_none()
+        );
+        let root = module_project(&echo_module_wasm("module"));
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap_or_else(|d| panic!("{:?}", shown(&d)));
+        assert!(report.warnings.is_empty(), "{:?}", shown(&report.warnings));
+        assert_eq!(
+            report.snapshot.scripts["xrpc.query:app.test.echo"].language_id,
+            "rust"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_handler_takes_its_description_from_happyview_toml() {
+        let state = test_state_with_pool(memory_pool().await);
+        let root = project(&[
+            (
+                "happyview.toml",
+                &format!(
+                    "{MODULE_TOML}\n[scripts.\"xrpc.query:app.test.echo\"]\ndescription = \"Echoes.\"\n"
+                ),
+            ),
+            (
+                "src/lexicons/app/test/echo.json",
+                &lexicon("app.test.echo", "query"),
+            ),
+        ]);
+        write_module(&root, &echo_module_wasm("module"));
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap_or_else(|d| panic!("{:?}", shown(&d)));
+        // Not reported as a stale override, and applied.
+        assert_eq!(
+            report.snapshot.scripts["xrpc.query:app.test.echo"]
+                .description
+                .as_deref(),
+            Some("Echoes.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_and_a_file_for_one_trigger_fail_the_build() {
+        let Some(state) = env().await else { return };
+        let root = project(&[
+            ("happyview.toml", MODULE_TOML),
+            (
+                "src/lexicons/app/test/echo.json",
+                &lexicon("app.test.echo", "query"),
+            ),
+            ("src/lexicons/app/test/echo.echo", "echo"),
+        ]);
+        write_module(&root, &echo_module_wasm("module"));
+        let errors = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .err()
+            .expect("two handlers for one trigger");
+        let shown = shown(&errors).join("\n");
+        assert!(shown.contains("module 'registry'"), "{shown}");
+        assert!(shown.contains("src/lexicons/app/test/echo.echo"), "{shown}");
+    }
+
+    async fn run(
+        state: &crate::AppState,
+        resolved: &crate::lua::scripts::ResolvedScript,
+    ) -> Result<crate::plugin::ScriptExecuteOutput, crate::script::DispatchError> {
+        use crate::script::{Invocation, ScriptOrigin, Trigger, dispatch};
+        let input = serde_json::json!({});
+        dispatch(
+            state,
+            &Invocation {
+                trigger_id: &resolved.id,
+                trigger: Trigger::XrpcQuery,
+                language: &resolved.script_type,
+                source: &resolved.body,
+                input: &input,
+                caller_did: None,
+                has_pds_auth: false,
+                method: Some("app.test.echo"),
+                collection: None,
+                params: None,
+                delegate_did: None,
+                space: None,
+                origin: ScriptOrigin::of(resolved),
+            },
+            None,
+        )
+        .await
+    }
+
+    async fn installed(
+        state: &crate::AppState,
+        root: &Path,
+    ) -> crate::lua::scripts::ResolvedScript {
+        let report = build_snapshot(state, root, BuildOptions::default())
+            .await
+            .unwrap_or_else(|d| panic!("{:?}", shown(&d)));
+        install(state, report.snapshot).await;
+        let trigger = ParsedTrigger::parse("xrpc.query:app.test.echo").unwrap();
+        state
+            .scripts
+            .resolve_in(&state.project.load_full(), &trigger)
+            .await
+            .unwrap()
+    }
+
+    fn answered(word: &str) -> crate::plugin::ScriptExecuteOutput {
+        crate::plugin::ScriptExecuteOutput::Returned {
+            value: serde_json::json!({ "from": word }),
+            value_kind: crate::plugin::ScriptValueKind::Object,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_script_dispatches_to_its_module_and_a_pinned_run_keeps_it() {
+        let state = test_state_with_pool(memory_pool().await);
+        let root = module_project(&echo_module_wasm("module"));
+        let old = installed(&state, root.path()).await;
+
+        // Different bytes under the same module name: the runtime's cache
+        // entry for `module:registry` is replaced.
+        write_module(&root, &echo_module_wasm("rebuilt"));
+        let new = installed(&state, root.path()).await;
+
+        assert_eq!(run(&state, &new).await.unwrap(), answered("rebuilt"));
+        assert_eq!(
+            run(&state, &old).await.unwrap(),
+            answered("module"),
+            "a pinned run keeps its module"
+        );
+    }
+
+    /// A module has no interpreter counting its instructions, so a dispatch
+    /// that reached it without fuel would run unbounded until the wall clock.
+    #[tokio::test]
+    async fn a_dispatched_module_runs_on_a_finite_fuel_budget() {
+        let state = test_state_with_pool(memory_pool().await);
+        state.script_limits.set_instruction_limit(1_000);
+        state.script_limits.set_wall_clock_seconds(300);
+        let root = module_project(&counting_module_wasm());
+        let resolved = installed(&state, root.path()).await;
+
+        let started = std::time::Instant::now();
+        let err = run(&state, &resolved)
+            .await
+            .expect_err("100,000 fuel cannot count to two million");
+        assert!(
+            matches!(
+                err,
+                crate::script::DispatchError::Execution(crate::plugin::ExecutionError::Timeout)
+            ),
+            "{err}"
+        );
+        // Fuel, not the wall clock, ended it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
     }
 }

@@ -16,7 +16,7 @@
 
 use serde::Deserialize;
 
-use super::official_registry::{OfficialPlugin, ReleaseEntry};
+use super::official_registry::{OfficialPlugin, PluginSections, ReleaseEntry};
 
 /// How many of a package's releases one refresh reads. The registry clamps a
 /// page to 100, so asking for its ceiling costs the same as asking for less.
@@ -86,6 +86,10 @@ struct ProfileRecord {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// The publisher's long-form prose. Absent for a profile written before
+    /// the field existed, which is why every field inside it is optional too.
+    #[serde(default)]
+    sections: PluginSections,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,12 +133,68 @@ struct Artifacts {
     package: Option<Artifact>,
     #[serde(default)]
     icon: Option<Artifact>,
+    #[serde(default)]
+    banner: Option<Artifact>,
+    /// The module's own `manifest.json`, where the publisher uploaded one.
+    /// A release whose module is a blob has no sibling file to derive a
+    /// manifest from, so this is the only way such a release is installable.
+    #[serde(default)]
+    manifest: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Artifact {
     #[serde(default)]
     url: Option<String>,
+    /// Set when the publisher uploaded the bytes rather than linking them,
+    /// which is what the HappyProto registry's own publisher does. The blob
+    /// itself is never read here: `getArtifact` serves it, so only its
+    /// presence matters.
+    #[serde(default)]
+    blob: Option<serde_json::Value>,
+}
+
+/// Where an artifact's bytes are served from: the URL the publisher gave, or
+/// the registry's own copy when they uploaded a blob instead.
+///
+/// `getArtifact` answers any kind the copy job holds, and it holds every
+/// artifact the release declared, so a blob needs no special case beyond
+/// naming its kind.
+fn artifact_url(
+    base: &str,
+    did: &str,
+    slug: &str,
+    version: &str,
+    kind: &str,
+    artifact: &Artifact,
+) -> Option<String> {
+    if let Some(url) = &artifact.url {
+        return Some(url.clone());
+    }
+    artifact.blob.as_ref()?;
+    Some(format!(
+        "{base}/xrpc/at.happyproto.registry.getArtifact?did={}&slug={}&version={}&type={kind}",
+        urlencoding::encode(did),
+        urlencoding::encode(slug),
+        urlencoding::encode(version),
+    ))
+}
+
+/// The highest version among `releases`, by semver precedence, or `None`
+/// when none of them carries a version that parses.
+///
+/// A prerelease sorts below the same core version without one, so an
+/// `alpha` line never shadows the stable release it leads to — the rule the
+/// registry's own ordering follows.
+fn highest_version(releases: &[ReleaseView]) -> Option<String> {
+    releases
+        .iter()
+        .filter_map(|r| {
+            let raw = r.record.version.as_deref()?;
+            Some((semver::Version::parse(raw).ok()?, raw.to_owned()))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, raw)| raw)
 }
 
 /// The slug a package's profile URI ends with, which is the plugin's id.
@@ -276,10 +336,6 @@ async fn entry_for(
         tracing::warn!(uri = %package.uri, "registry_source: package uri has no slug");
         return None;
     };
-    // No active release means nothing to install. A package can be indexed
-    // before its first release is, and a withdrawn one keeps its profile.
-    let version = package.latest_version.clone()?;
-
     // Every release rather than just the latest: the update preview lists
     // each version between what is installed and what is current, so a
     // catalogue carrying only the newest would show one entry where the
@@ -304,42 +360,72 @@ async fn entry_for(
     };
     listing.releases.retain(ReleaseView::is_active);
 
-    // The module comes from the release the package calls current; the
-    // others are listed for the preview but are not what gets installed.
-    let Some(release) = listing
-        .releases
-        .iter()
-        .find(|r| r.record.version.as_deref() == Some(version.as_str()))
+    // Which release is current is worked out here rather than taken from the
+    // package view: `searchPackages` answers no `latestVersion` at all — it
+    // skips the per-package lookup that would cost, the same way it skips
+    // `handle` — so trusting the field skipped every package the registry
+    // served. The releases are already in hand for the update preview, so
+    // the highest active one costs nothing extra. A registry that does
+    // supply the field is still honoured, as long as it names a release this
+    // listing calls active.
+    let Some(version) = package
+        .latest_version
+        .clone()
+        .filter(|named| {
+            listing
+                .releases
+                .iter()
+                .any(|r| r.record.version.as_deref() == Some(named.as_str()))
+        })
+        .or_else(|| highest_version(&listing.releases))
     else {
-        tracing::warn!(
-            plugin = %slug,
-            version = %version,
-            "registry_source: the package names a current version its active releases do not list"
-        );
+        // No active release means nothing to install. A package can be
+        // indexed before its first release is, and a withdrawn one keeps its
+        // profile.
         return None;
     };
 
-    let Some(wasm_url) = release
-        .record
-        .artifacts
-        .package
-        .as_ref()
-        .and_then(|a| a.url.clone())
-    else {
+    // The module comes from the release named current; the others are listed
+    // for the preview but are not what gets installed.
+    let release = listing
+        .releases
+        .iter()
+        .find(|r| r.record.version.as_deref() == Some(version.as_str()))?;
+
+    let Some(module) = release.record.artifacts.package.as_ref() else {
         tracing::info!(
             plugin = %slug,
             version = %version,
-            "registry_source: skipping a release whose module has no url, \
-             so no manifest can be derived for it"
+            "registry_source: skipping a release that declares no module"
         );
         return None;
     };
+    let wasm_url = artifact_url(base, &package.did, &slug, &version, "package", module)?;
 
-    // The loader derives this from the module's own directory; naming it
-    // here keeps the entry self-describing and matches what the GitHub
-    // source puts in the same field.
-    let (dir, _) = wasm_url.rsplit_once('/')?;
-    let manifest_url = format!("{dir}/manifest.json");
+    // A published manifest is the authority. Where the release declares
+    // none, the module's own directory answers — but only when the publisher
+    // linked the module, because that fallback means "the file beside it".
+    // A module served from the registry's copy has no directory of its own:
+    // every blob's URL shares one `/xrpc/` path, so the sibling of any of
+    // them is the same meaningless `/xrpc/manifest.json`. Such a release is
+    // skipped rather than offered with a URL that cannot resolve.
+    let manifest_url = match (release.record.artifacts.manifest.as_ref(), &module.url) {
+        (Some(a), _) => artifact_url(base, &package.did, &slug, &version, "manifest", a),
+        (None, Some(linked)) => linked
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/manifest.json")),
+        (None, None) => None,
+    };
+    let Some(manifest_url) = manifest_url else {
+        tracing::info!(
+            plugin = %slug,
+            version = %version,
+            "registry_source: skipping a release whose module is uploaded rather \
+             than linked and which publishes no manifest artifact, so nothing \
+             names how to load it"
+        );
+        return None;
+    };
 
     Some(OfficialPlugin {
         id: slug.clone(),
@@ -352,10 +438,17 @@ async fn entry_for(
             .artifacts
             .icon
             .as_ref()
-            .and_then(|a| a.url.clone()),
+            .and_then(|a| artifact_url(base, &package.did, &slug, &version, "icon", a)),
+        banner_url: release
+            .record
+            .artifacts
+            .banner
+            .as_ref()
+            .and_then(|a| artifact_url(base, &package.did, &slug, &version, "banner", a)),
         latest_version: version,
         manifest_url,
         wasm_url,
+        sections: package.record.sections.clone(),
         releases: listing
             .releases
             .iter()
@@ -672,6 +765,170 @@ mod tests {
                 .and_then(|a| a.url)
                 .is_none(),
             "a blob-only module has no url to install from"
+        );
+    }
+
+    /// `searchPackages` answers no `latestVersion` — it skips the per-package
+    /// lookup that would cost, exactly as it skips `handle` — so a source
+    /// that trusted the field skipped every package the registry served.
+    #[test]
+    fn the_current_version_is_the_highest_active_release() {
+        let releases: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
+            { "record": { "version": "1.0.0" } },
+            { "record": { "version": "1.2.0" } },
+            { "record": { "version": "1.10.0" } },
+            { "record": { "version": "1.3.0" } },
+        ]))
+        .expect("the releases should parse");
+
+        assert_eq!(
+            highest_version(&releases).as_deref(),
+            Some("1.10.0"),
+            "versions order numerically, not as strings"
+        );
+        assert_eq!(highest_version(&[]), None, "no releases, no version");
+    }
+
+    /// A prerelease never shadows the stable release it leads to, which is
+    /// the ordering the registry itself applies.
+    #[test]
+    fn a_prerelease_sorts_below_the_release_it_leads_to() {
+        let mixed: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
+            { "record": { "version": "1.0.0-alpha.2" } },
+            { "record": { "version": "1.0.0" } },
+            { "record": { "version": "1.0.0-alpha.10" } },
+        ]))
+        .expect("the releases should parse");
+        assert_eq!(highest_version(&mixed).as_deref(), Some("1.0.0"));
+
+        let only_pre: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
+            { "record": { "version": "1.0.0-alpha.2" } },
+            { "record": { "version": "1.0.0-alpha.10" } },
+        ]))
+        .expect("the releases should parse");
+        assert_eq!(
+            highest_version(&only_pre).as_deref(),
+            Some("1.0.0-alpha.10"),
+            "alpha.10 is after alpha.2: prerelease identifiers compare numerically"
+        );
+    }
+
+    /// A blob has no URL of its own, so the registry's own copy is where its
+    /// bytes come from. A linked artifact keeps the URL the publisher gave.
+    #[test]
+    fn an_artifact_resolves_to_its_url_or_to_the_registrys_copy() {
+        let linked = Artifact {
+            url: Some("https://example.com/d/m.wasm".into()),
+            blob: None,
+        };
+        assert_eq!(
+            artifact_url(
+                "https://reg.example",
+                "did:plc:abc",
+                "demo",
+                "1.0.0",
+                "package",
+                &linked
+            )
+            .as_deref(),
+            Some("https://example.com/d/m.wasm"),
+        );
+
+        let uploaded = Artifact {
+            url: None,
+            blob: Some(serde_json::json!({ "$type": "blob" })),
+        };
+        let url = artifact_url(
+            "https://reg.example",
+            "did:plc:abc",
+            "demo",
+            "1.0.0-alpha.1",
+            "manifest",
+            &uploaded,
+        )
+        .expect("an uploaded artifact resolves to getArtifact");
+        assert!(url.starts_with("https://reg.example/xrpc/at.happyproto.registry.getArtifact?"));
+        assert!(url.contains("type=manifest"));
+        assert!(
+            url.contains("version=1.0.0-alpha.1"),
+            "the version is carried as given: {url}"
+        );
+
+        let neither = Artifact {
+            url: None,
+            blob: None,
+        };
+        assert_eq!(
+            artifact_url(
+                "https://reg.example",
+                "did:plc:abc",
+                "demo",
+                "1.0.0",
+                "package",
+                &neither
+            ),
+            None,
+            "an artifact naming no bytes resolves to nothing"
+        );
+    }
+
+    /// The sibling-manifest fallback means "the file beside the module", so
+    /// it only answers for a module the publisher linked. Every uploaded
+    /// module is served from the one `/xrpc/` path, where the sibling of any
+    /// of them is the same meaningless `/xrpc/manifest.json`.
+    #[test]
+    fn an_uploaded_module_has_no_sibling_manifest_to_fall_back_on() {
+        let uploaded = artifact_url(
+            "https://reg.example",
+            "did:plc:abc",
+            "demo",
+            "1.0.0",
+            "package",
+            &Artifact {
+                url: None,
+                blob: Some(serde_json::json!({ "$type": "blob" })),
+            },
+        )
+        .expect("an uploaded module resolves to getArtifact");
+        let sibling = uploaded
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/manifest.json"));
+        assert_eq!(
+            sibling.as_deref(),
+            Some("https://reg.example/xrpc/manifest.json"),
+            "which names no plugin at all, and is why the fallback is not taken"
+        );
+    }
+
+    /// The prose a detail page shows. Every field is optional, and a profile
+    /// written before `sections` existed parses to an empty set rather than
+    /// failing the whole catalogue.
+    #[test]
+    fn a_profiles_sections_survive_the_parse_and_are_each_optional() {
+        let listing: SearchPackages = serde_json::from_value(serde_json::json!({
+            "packages": [{
+                "uri": "at://did:plc:abc/at.happyproto.plugin.profile/demo",
+                "did": "did:plc:abc",
+                "record": {
+                    "name": "Demo",
+                    "sections": { "description": "# What it does", "security": "Report privately." }
+                }
+            }, {
+                "uri": "at://did:plc:abc/at.happyproto.plugin.profile/bare",
+                "did": "did:plc:abc",
+                "record": { "name": "Bare" }
+            }]
+        }))
+        .expect("the listing should parse");
+
+        let sections = &listing.packages[0].record.sections;
+        assert_eq!(sections.description.as_deref(), Some("# What it does"));
+        assert_eq!(sections.security.as_deref(), Some("Report privately."));
+        assert_eq!(sections.installation, None);
+        assert_eq!(sections.changelog, None);
+        assert_eq!(
+            listing.packages[1].record.sections,
+            PluginSections::default()
         );
     }
 }

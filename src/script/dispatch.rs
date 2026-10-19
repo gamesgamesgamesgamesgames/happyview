@@ -5,8 +5,9 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::plugin::caller::CallerSession;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput};
+use crate::project::snapshot::ScriptBody;
 
-use super::input::{Invocation, build_input};
+use super::input::{Invocation, ScriptOrigin, build_input};
 
 /// Why a dispatch produced no result at all. A script that ran and failed is
 /// not here: that arrives as [`ScriptExecuteOutput::Error`], which each runner
@@ -58,14 +59,43 @@ impl From<ExecutionError> for DispatchError {
 /// Run one invocation through the interpreter that claims its language,
 /// lending it `caller`'s credentials where the runner has them.
 ///
+/// The artifact attached here is a candidate: `execute_script_in` decides
+/// against the build it actually instantiates whether the run loads it or the
+/// source.
+///
 /// The wall clock is not set here. `execute_script_as` arms it per run and
 /// lifts it for a job, so a budget cannot be set once and then outlive the run
 /// it was meant for.
+///
+/// A compiled module is its own interpreter, so it runs as itself rather than
+/// through the interpreter its language would name. It is read from the
+/// snapshot the run pinned, so a rebuild mid-run cannot swap its bytes.
 pub async fn dispatch(
     state: &AppState,
     inv: &Invocation<'_>,
     caller: Option<Arc<CallerSession>>,
 ) -> Result<ScriptExecuteOutput, DispatchError> {
+    if let ScriptOrigin::Project { snapshot, script } = inv.origin
+        && let ScriptBody::Module { module, hash } = &script.body
+    {
+        // The build only emits a module script beside its module, so a miss
+        // is a snapshot that broke its own invariant.
+        let compiled = snapshot.script_modules.get(hash).ok_or_else(|| {
+            DispatchError::Execution(ExecutionError::PluginNotFound(
+                crate::project::script_module::module_plugin_id(module),
+            ))
+        })?;
+        let input = build_input(state, inv).await;
+        return Ok(state
+            .plugin_executor()
+            .execute_compiled_as(
+                compiled.plugin.clone(),
+                &compiled.source_path,
+                &input,
+                caller,
+            )
+            .await?);
+    }
     let interpreter = state
         .plugin_registry
         .get_interpreter_by_language(inv.language)
@@ -73,9 +103,11 @@ pub async fn dispatch(
         .ok_or_else(|| DispatchError::NoInterpreter {
             language: inv.language.to_string(),
         })?;
-    let input = build_input(state, inv).await;
+    let mut input = build_input(state, inv).await;
+    let modules =
+        super::prepared::attach_prepared(state, &interpreter.info.id, inv, &mut input).await;
     Ok(state
         .plugin_executor()
-        .execute_script_as(&interpreter.info.id, &input, caller)
+        .execute_script_in(&interpreter.info.id, &input, caller, modules)
         .await?)
 }

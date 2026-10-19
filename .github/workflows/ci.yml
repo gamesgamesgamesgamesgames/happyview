@@ -107,7 +107,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -189,6 +189,9 @@ jobs:
       # one against. What that guard protects a developer from — a hand-staged
       # artefact going quietly out of date — the pinned hash answers here.
       HAPPYVIEW_LUA_PLUGIN: ${{ github.workspace }}/lua-plugin
+      # The same, for the two QuickJS interpreters.
+      HAPPYVIEW_JAVASCRIPT_PLUGIN: ${{ github.workspace }}/quickjs-plugins/javascript-plugin
+      HAPPYVIEW_TYPESCRIPT_PLUGIN: ${{ github.workspace }}/quickjs-plugins/typescript-plugin
     services:
       postgres:
         image: postgres:16-alpine
@@ -248,6 +251,20 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The JavaScript and TypeScript interpreters, pinned and fetched for the
+      # same reasons as the Lua one above.
+      - name: Fetch the JavaScript and TypeScript interpreter plugins
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-quickjs-plugins.sh quickjs-plugins
+          {
+            echo '## JavaScript and TypeScript interpreter plugins'
+            echo '```'
+            ls -l quickjs-plugins/*-plugin
+            sha256sum quickjs-plugins/*-plugin/*.wasm
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
 
@@ -264,6 +281,9 @@ jobs:
       # operator reads when a script will not save.
       - name: Verify the Lua interpreter is present
         run: bash scripts/check-lua-plugin.sh --require
+
+      - name: Verify the JavaScript and TypeScript interpreters are present
+        run: bash scripts/check-quickjs-plugins.sh --require
 
       - name: Run plugin SDK tests
         run: cargo test -p happyview-plugin-sdk

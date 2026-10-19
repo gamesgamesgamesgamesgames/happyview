@@ -22,6 +22,9 @@ pub(super) struct LexiconSummary {
     /// A stored row sits under this project file and answers again when the
     /// file goes.
     pub(super) shadows_stored: bool,
+    /// Listed in `happyview.toml`'s `[network_lexicons] include`, so a delete
+    /// is refused: the file would restore it at the next boot.
+    pub(super) declared: bool,
     pub(super) authority_did: Option<String>,
     pub(super) last_fetched_at: Option<String>,
     /// `None` for a project lexicon, which has no row.
@@ -62,6 +65,7 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             layer: l.layer,
             path: l.path.as_deref().map(crate::catalog::path_string),
             shadows_stored: l.shadows_stored,
+            declared: false,
             authority_did: l.authority_did,
             last_fetched_at: l.last_fetched_at,
             created_at: l.created_at,
@@ -111,6 +115,8 @@ pub(super) struct CreateBackfillBody {
     pub(super) collection: Option<String>,
     pub(super) did: Option<String>,
     pub(super) dids: Option<Vec<String>>,
+    /// `auto`, `replay` or `crawl`; `BACKFILL_SOURCE` when absent.
+    pub(super) source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -136,6 +142,24 @@ pub(crate) struct BackfillJob {
     /// `repos?phase=fetched` lists. `None` for older jobs, which list every
     /// completed repo.
     pub(crate) recent_completions_limit: Option<i64>,
+    /// `auto` until an `auto` job has probed the archive, then `replay` or
+    /// `crawl`.
+    pub(crate) source: String,
+    /// Replay progress; `None` for a crawl.
+    pub(crate) replay: Option<ReplayProgress>,
+}
+
+/// Where a replay job's running sweep is, and what it has cost.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ReplayProgress {
+    /// Where the job started: 0, or the applied seq of a gap replay.
+    pub(crate) after_seq: i64,
+    /// The running sweep's cursor.
+    pub(crate) through_seq: Option<i64>,
+    /// The running sweep's pinned tip.
+    pub(crate) tip_seq: Option<i64>,
+    pub(crate) bytes: i64,
+    pub(crate) blocks_failed: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +199,13 @@ pub enum BackfillEvent {
         job_id: String,
         status: String,
         error: Option<String>,
+    },
+    ReplayProgress {
+        job_id: String,
+        through_seq: i64,
+        tip_seq: i64,
+        bytes: i64,
+        blocks_failed: i32,
     },
     /// Current job state, straight from the database.
     ///
@@ -424,6 +455,12 @@ pub(super) struct PluginSummary {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) version: String,
+    /// What a surface shows about a plugin before it shows what it does.
+    /// Each is independently optional: a plugin may carry an icon, a banner,
+    /// both, or neither.
+    pub(super) description: Option<String>,
+    pub(super) icon_url: Option<String>,
+    pub(super) banner_url: Option<String>,
     pub(super) source: String,
     pub(super) url: Option<String>,
     pub(super) sha256: Option<String>,
@@ -476,6 +513,14 @@ pub(super) struct OfficialPluginSummary {
     pub(super) latest_version: String,
     pub(super) manifest_url: String,
     pub(super) official: bool,
+    pub(super) banner_url: Option<String>,
+    /// Every release the catalogue knows, newest first. A detail page lists
+    /// them; `PluginSummary::pending_releases` carries only the newer ones,
+    /// which cannot answer "what versions exist".
+    pub(super) releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
+    /// The publisher's long-form prose, as published. Empty for a
+    /// GitHub-sourced entry, which has no profile record behind it.
+    pub(super) sections: crate::plugin::official_registry::PluginSections,
 }
 
 #[derive(Serialize)]
@@ -520,6 +565,7 @@ pub(super) struct PluginPreviewResponse {
     pub(super) version: String,
     pub(super) description: Option<String>,
     pub(super) icon_url: Option<String>,
+    pub(super) banner_url: Option<String>,
     pub(super) auth_type: String,
     pub(super) required_secrets: Vec<SecretDefinition>,
     pub(super) manifest_url: String,

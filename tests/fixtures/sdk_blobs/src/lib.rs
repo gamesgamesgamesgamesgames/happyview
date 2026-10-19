@@ -6,11 +6,9 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use happyview_plugin_sdk::host;
 use happyview_plugin_sdk::{
-    library_plugin, ApiExport, ApiSurface, CallContext, PluginError, PluginInfo, Value,
+    library_plugin, ApiExport, ApiSurface, Bytes, CallContext, PluginError, PluginInfo, Value,
 };
 
 library_plugin! {
@@ -35,15 +33,14 @@ fn cid_arg(args: &[Value]) -> Result<&str, PluginError> {
 
 fn dispatch(function: &str, args: &[Value], _ctx: &CallContext) -> Result<Value, PluginError> {
     match function {
-        // Bytes come in as an array of integers so a test can send content
-        // that is not valid UTF-8, which is the case worth pinning: a string
-        // argument could only ever exercise the other branch of the wire's
-        // body encoding.
+        // Bytes come in as `Bytes` so a test can send content that is not
+        // valid UTF-8, which is the case worth pinning: a string argument
+        // could only ever exercise the other branch of the wire's encoding.
         "put" => {
             let [bytes, mime] = args else {
                 return Err(PluginError::bad_input("expected bytes and a mime type"));
             };
-            let bytes: Vec<u8> = serde_json::from_value(bytes.clone())?;
+            let Bytes(bytes) = serde_json::from_value(bytes.clone())?;
             let mime = mime
                 .as_str()
                 .ok_or_else(|| PluginError::bad_input("mime must be a string"))?;

@@ -144,7 +144,11 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
-pub(crate) async fn fetch_space_blob(
+///
+/// Public only so `tests/test_runner_identity.rs` can show it refuses a
+/// forged PDS before any request; the routes are its real callers.
+#[doc(hidden)]
+pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
     cid: &str,
@@ -159,6 +163,13 @@ pub(crate) async fn fetch_space_blob(
     let pds_endpoint =
         crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
             .await?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "fetching a space blob").map_err(
+        |message| AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message,
+        },
+    )?;
 
     let url = format!(
         "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
@@ -276,6 +287,30 @@ pub(crate) async fn service_signing_key(
         )
     })?;
     load_signing_key(&state.db, state.db_backend, encryption_key).await
+}
+
+/// Begin a write to one space, holding the space for the whole transaction.
+///
+/// Every write reads its author's repo state and folds into it, so writes to
+/// a space have to land one at a time. SQLite's `BEGIN IMMEDIATE` already
+/// does that. Postgres runs them in parallel, so the space row is locked
+/// first: taken any later, after an insert's foreign key has share-locked the
+/// same row, two writers each wait on the other's share lock and deadlock.
+pub(crate) async fn begin_space_write(
+    state: &AppState,
+    space_id: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if state.db_backend == DatabaseBackend::Postgres {
+        crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR UPDATE")
+            .bind(space_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock space: {e}")))?;
+    }
+    Ok(tx)
 }
 
 pub(crate) async fn commit_write(
@@ -430,6 +465,19 @@ async fn forward_write_if_native(
         return Ok(None);
     }
 
+    // The in-process PDS answers repo writes only, so re-authenticating, which
+    // is the advice below, could never help here.
+    if state.test.is_some() {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message: format!(
+                "this space lives on {author_did}'s PDS, and a test run serves no \
+                 PDS-backed spaces; {method} reaches only spaces HappyView hosts"
+            ),
+        });
+    }
+
     tracing::warn!(
         space_id = %space.id,
         author_did,
@@ -549,11 +597,7 @@ pub(crate) async fn create_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
     let committed = commit_write(
         &mut tx,
@@ -643,11 +687,7 @@ pub(crate) async fn put_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = match swap_cid.as_deref() {
         Some(swap) => Some(swap.to_string()),
@@ -737,11 +777,7 @@ pub(crate) async fn delete_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = if let Some(swap) = swap_cid {
         db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
@@ -1193,6 +1229,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
@@ -1239,6 +1278,7 @@ mod tests {
             backfill_db: pool.clone(),
             db_backend: backend,
             records: crate::record_store::RecordStore::new(pool.clone(), backend),
+            archive: Default::default(),
             domain_cache: crate::domain::DomainCache::new(),
             lexicons: LexiconCatalog::new(project.clone()),
             scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
@@ -1298,6 +1338,7 @@ mod tests {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(crate::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         crate::test_support::provision_space_signing_key(&state).await;
@@ -2265,6 +2306,33 @@ mod native_write_bridge_tests {
             format!("{err}").contains("re-authenticate"),
             "the error should tell the user what to do: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_native_write_in_a_test_run_says_the_run_serves_no_pds_spaces() {
+        let (mut state, space) = state_with_space(HostMode::Native).await;
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "src/a.test.lua",
+        )));
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a test run cannot forward a write to a PDS");
+
+        let AppError::XrpcError {
+            status, message, ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(message.contains("test run"), "{message}");
+        assert!(!message.contains("re-authenticate"), "{message}");
     }
 }
 

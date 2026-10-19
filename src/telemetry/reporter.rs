@@ -94,6 +94,7 @@ pub async fn report_once(state: &AppState) -> Result<Option<Benchmarks>, String>
         &state.config.database_url,
         &current,
         &state.telemetry_counters,
+        &state.lexicons,
     )
     .await
     .ok_or_else(|| "no instance id".to_string())?;

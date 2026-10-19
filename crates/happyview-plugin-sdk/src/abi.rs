@@ -15,36 +15,6 @@ use crate::types::{
 };
 use serde_json::Value;
 
-/// Default guest heap, overridable with `export_abi!(heap = <bytes>)`.
-pub const DEFAULT_HEAP_SIZE: usize = 524_288;
-
-/// Bump-allocate `layout` out of a caller-owned heap, returning null when the
-/// heap is exhausted. The heap and its cursor live in the plugin crate because
-/// `export_abi!` places them there; this is only the arithmetic.
-///
-/// # Safety
-/// `heap` must point at `heap_size` writable bytes that outlive every returned
-/// pointer, and `pos` must point at a `usize` used for no other heap.
-pub unsafe fn bump_alloc(
-    heap: *mut u8,
-    heap_size: usize,
-    pos: *mut usize,
-    layout: core::alloc::Layout,
-) -> *mut u8 {
-    let align = layout.align();
-    let Some(start) = pos.read().checked_add(align - 1).map(|v| v & !(align - 1)) else {
-        return core::ptr::null_mut();
-    };
-    let Some(end) = start.checked_add(layout.size()) else {
-        return core::ptr::null_mut();
-    };
-    if end > heap_size {
-        return core::ptr::null_mut();
-    }
-    pos.write(end);
-    heap.add(start)
-}
-
 /// `size` bytes from the crate's global allocator, or null. The layout is
 /// always byte-aligned, so `free_raw` can reconstruct it from the length the
 /// host hands back.
@@ -88,13 +58,8 @@ pub fn alloc_bytes(size: u32) -> u32 {
     }
 }
 
-/// Body of the `dealloc` export. The bump allocator never reuses memory, so
-/// this is a no-op — the export exists because the host calls it.
-pub fn dealloc_bytes(_ptr: u32, _size: u32) {}
-
-/// Body of the `dealloc` export under `export_abi!(alloc = system)`, where the
-/// memory really is returned: an interpreter allocates and frees for the whole
-/// run, so a heap that only ever grows would end the run rather than the call.
+/// Body of the `dealloc` export: the memory really is returned, so a call or
+/// a run may churn through far more than it ever holds at once.
 pub fn free_bytes(ptr: u32, size: u32) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -304,12 +269,12 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-    /// The `alloc = system` pair returns what it takes, so a run may churn
-    /// far more than the bump heap holds. Sixteen times over: the bump
-    /// allocator would hand back null a sixteenth of the way in.
+    /// The `alloc`/`dealloc` pair returns what it takes, so a call may churn
+    /// through far more than it holds at once: eight MiB here, in eight KiB
+    /// pieces that are each freed before the next.
     #[test]
-    fn the_system_allocator_pair_frees_what_it_allocates() {
-        let rounds = 16 * DEFAULT_HEAP_SIZE / PROBE_SIZE;
+    fn the_allocator_pair_frees_what_it_allocates() {
+        let rounds = 8 * 1024 * 1024 / PROBE_SIZE;
         let before = PROBE_FREES.load(Ordering::Relaxed);
         for _ in 0..rounds {
             let ptr = alloc_raw(PROBE_SIZE);
@@ -340,6 +305,8 @@ mod tests {
                 memory_bytes: 1024,
             },
             removed_globals: alloc::vec::Vec::new(),
+            chunk_name: crate::wire::DEFAULT_CHUNK_NAME.into(),
+            artifact: None,
         }
     }
 
@@ -423,32 +390,9 @@ mod tests {
     }
 
     #[test]
-    fn bump_alloc_respects_alignment_and_capacity() {
-        let mut heap = [0u8; 64];
-        let mut pos = 0usize;
-        let base = heap.as_mut_ptr();
-        // SAFETY: `base`/`pos` describe the local heap above.
-        unsafe {
-            let a = bump_alloc(base, 64, &raw mut pos, layout(3, 1));
-            assert_eq!(a, base);
-            let b = bump_alloc(base, 64, &raw mut pos, layout(4, 4));
-            assert_eq!(
-                b as usize - base as usize,
-                4,
-                "second alloc must be aligned"
-            );
-            assert!(bump_alloc(base, 64, &raw mut pos, layout(1024, 1)).is_null());
-        }
-    }
-
-    fn layout(size: usize, align: usize) -> core::alloc::Layout {
-        core::alloc::Layout::from_size_align(size, align).unwrap()
-    }
-
-    #[test]
     fn alloc_is_unavailable_off_wasm_so_returns_are_zero() {
         assert_eq!(alloc_bytes(8), 0);
         assert_eq!(return_ok(&Value::Null), 0);
-        dealloc_bytes(0, 0);
+        free_bytes(0, 0);
     }
 }

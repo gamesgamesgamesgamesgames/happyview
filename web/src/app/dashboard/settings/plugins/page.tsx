@@ -1,835 +1,346 @@
-"use client";
+"use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
-import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle, CheckCircle2, AlertCircle, ArrowUpCircle, Search, ChevronDown } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react"
+import Link from "next/link"
+import {
+  AlertTriangle,
+  ArrowUpCircle,
+  Blocks,
+  Plus,
+  Search,
+} from "lucide-react"
 
-import { useCurrentUser } from "@/hooks/use-current-user";
-import { useOfficialPlugins } from "@/hooks/use-official-plugins";
-import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, getPluginAllowedHosts, updatePluginAllowedHosts, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
-import type { PluginSummary } from "@/types/plugins";
-import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
-import { PluginCapabilities, visibleCapabilities } from "@/components/plugin-capabilities";
-import { SiteHeader } from "@/components/site-header";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
+import { useCurrentUser } from "@/hooks/use-current-user"
+import { getPlugins } from "@/lib/api"
+import { installedPluginHref } from "@/lib/plugin-routes"
+import type { PluginSummary, PluginType } from "@/types/plugins"
+import { PluginMark, TYPE_LABEL, TYPE_NOTE } from "@/components/plugin-identity"
+import { SiteHeader } from "@/components/site-header"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import {
-  Command,
-  CommandGroup,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import {
-  Popover,
-  PopoverAnchor,
-  PopoverContent,
-} from "@/components/ui/popover";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { MultiInput } from "@/components/ui/multi-input";
-import {
-  ResponsiveDialog,
-  ResponsiveDialogClose,
-  ResponsiveDialogContent,
-  ResponsiveDialogDescription,
-  ResponsiveDialogFooter,
-  ResponsiveDialogHeader,
-  ResponsiveDialogTitle,
-  ResponsiveDialogTrigger,
-} from "@/components/ui/responsive-dialog";
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 
-function isValidHttpUrl(value: string): boolean {
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
+type TypeFilter = PluginType | "all"
+type SortKey = "attention" | "name" | "version"
+
+const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"]
+
+/**
+ * What the row says at a glance. A plugin that needs something is the only
+ * state worth colour, so a healthy instance reads calm rather than as a wall
+ * of green ticks.
+ */
+function attention(plugin: PluginSummary): {
+  needs: boolean
+  label: string | null
+  kind: "config" | "update" | null
+} {
+  if (!plugin.secrets_configured) {
+    return { needs: true, label: "Needs configuration", kind: "config" }
   }
-}
-
-function formatAuthType(authType: string): string {
-  const formats: Record<string, string> = {
-    oauth2: "OAuth 2.0",
-    openid: "OpenID",
-    api_key: "API Key",
-  };
-  return formats[authType] || authType;
-}
-
-function hasDefinedHostsCapability(plugin: PluginSummary): boolean {
-  return visibleCapabilities(plugin.capabilities).some(
-    (c) => c.name === "network:request:defined",
-  );
+  if (plugin.update_available) {
+    return { needs: true, label: "Update available", kind: "update" }
+  }
+  return { needs: false, label: null, kind: null }
 }
 
 export default function PluginsPage() {
-  const { hasPermission } = useCurrentUser();
-  const [plugins, setPlugins] = useState<PluginSummary[]>([]);
-  const [encryptionConfigured, setEncryptionConfigured] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reloading, setReloading] = useState<string | null>(null);
-  const [removing, setRemoving] = useState<string | null>(null);
-  const [updateDialogPlugin, setUpdateDialogPlugin] = useState<PluginSummary | null>(null);
-  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
-  const [checkingUpdate, setCheckingUpdate] = useState<string | null>(null);
+  const { hasPermission } = useCurrentUser()
+  const [plugins, setPlugins] = useState<PluginSummary[]>([])
+  const [encryptionConfigured, setEncryptionConfigured] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
-  const searchParams = useSearchParams();
+  const [query, setQuery] = useState("")
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all")
+  const [sort, setSort] = useState<SortKey>("attention")
+  const [grouped, setGrouped] = useState(true)
 
-  // Add plugin dialog state
-  const [addOpen, setAddOpen] = useState(false);
-  const [newUrl, setNewUrl] = useState("");
-  const [adding, setAdding] = useState(false);
-  const [pluginPreview, setPluginPreview] = useState<PluginPreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [comboboxOpen, setComboboxOpen] = useState<boolean>(false);
-  const [selectedManifestUrl, setSelectedManifestUrl] = useState<string | null>(
-    null,
-  );
-
-  const { plugins: officialPlugins, loading: officialLoading } = useOfficialPlugins();
-
-  const filteredOfficialPlugins = useMemo(() => {
-    const q = newUrl.trim().toLowerCase();
-    if (!q) return officialPlugins;
-    return officialPlugins.filter(
-      (p) =>
-        p.id.toLowerCase().includes(q) ||
-        p.name.toLowerCase().includes(q),
-    );
-  }, [officialPlugins, newUrl]);
-
-  const showCombobox = officialLoading || officialPlugins.length > 0;
-  const hasComboboxResults =
-    officialLoading || filteredOfficialPlugins.length > 0;
-
-  // Configure secrets dialog state
-  const [configOpen, setConfigOpen] = useState(false);
-  const [configPlugin, setConfigPlugin] = useState<PluginSummary | null>(null);
-  const [secretValues, setSecretValues] = useState<Record<string, string>>({});
-  const [savingSecrets, setSavingSecrets] = useState(false);
-  const [allowedHosts, setAllowedHosts] = useState<string[]>([""]);
-  const [configuredHosts, setConfiguredHosts] = useState<Record<string, string[]>>({});
-
-  const canCreate = hasPermission("plugins:create");
-  const canDelete = hasPermission("plugins:delete");
+  const canManage = hasPermission("plugins:manage")
 
   const load = useCallback(async () => {
     try {
-      const response = await getPlugins();
-      setPlugins(response.plugins ?? []);
-      setEncryptionConfigured(response.encryption_configured ?? false);
-      setError(null);
+      const response = await getPlugins()
+      setPlugins(response.plugins)
+      setEncryptionConfigured(response.encryption_configured)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
     }
-  }, []);
+  }, [])
 
   useEffect(() => {
-    load();
-  }, [load]);
+    void load()
+  }, [load])
 
-  function openUpdateDialog(plugin: PluginSummary) {
-    setUpdateDialogPlugin(plugin);
-    setUpdateDialogOpen(true);
-  }
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const matches = plugins.filter((plugin) => {
+      if (typeFilter !== "all" && plugin.plugin_type !== typeFilter) return false
+      if (!q) return true
+      // What an operator would actually type: the name they see, the id they
+      // installed, the namespace a script requires, or words from the blurb.
+      return (
+        plugin.name.toLowerCase().includes(q) ||
+        plugin.id.toLowerCase().includes(q) ||
+        (plugin.namespace?.toLowerCase().includes(q) ?? false) ||
+        (plugin.description?.toLowerCase().includes(q) ?? false)
+      )
+    })
 
-  async function handleCheckUpdate(plugin: PluginSummary) {
-    setCheckingUpdate(plugin.id);
-    setError(null);
-    try {
-      await checkPluginUpdate(plugin.id);
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setCheckingUpdate(null);
-    }
-  }
+    const byName = (a: PluginSummary, b: PluginSummary) =>
+      a.name.localeCompare(b.name)
 
-  useEffect(() => {
-    const updateId = searchParams.get("update");
-    if (!updateId || plugins.length === 0) return;
-    const target = plugins.find((p) => p.id === updateId);
-    if (target && target.update_available) {
-      openUpdateDialog(target);
-    }
-  }, [searchParams, plugins]);
+    return [...matches].sort((a, b) => {
+      if (sort === "name") return byName(a, b)
+      if (sort === "version") return a.version.localeCompare(b.version)
+      const needs = Number(attention(b).needs) - Number(attention(a).needs)
+      return needs !== 0 ? needs : byName(a, b)
+    })
+  }, [plugins, query, typeFilter, sort])
 
-  const newUrlIsUrl = isValidHttpUrl(newUrl.trim());
-  const effectivePreviewUrl = selectedManifestUrl
-    ? selectedManifestUrl
-    : newUrlIsUrl
-      ? newUrl.trim()
-      : null;
+  const sections = useMemo(() => {
+    if (!grouped) return [{ type: null as PluginType | null, rows: visible }]
+    return TYPE_ORDER.map((type) => ({
+      type,
+      rows: visible.filter((p) => p.plugin_type === type),
+    })).filter((section) => section.rows.length > 0)
+  }, [visible, grouped])
 
-  useEffect(() => {
-    if (!addOpen) return;
-    if (!effectivePreviewUrl) {
-      setPluginPreview(null);
-      setPreviewError(null);
-      return;
-    }
-    const controller = new AbortController();
-    setPreviewError(null);
-    const timer = setTimeout(async () => {
-      try {
-        const preview = await previewPlugin(
-          effectivePreviewUrl,
-          controller.signal,
-        );
-        if (!controller.signal.aborted) {
-          setPluginPreview(preview);
-          setPreviewError(null);
-        }
-      } catch (e) {
-        if (!controller.signal.aborted) {
-          setPluginPreview(null);
-          setPreviewError(e instanceof Error ? e.message : String(e));
-        }
-      }
-    }, 500);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [addOpen, effectivePreviewUrl]);
-
-  async function handleAdd() {
-    if (!pluginPreview) return;
-
-    setAdding(true);
-    setError(null);
-    try {
-      const capabilities = visibleCapabilities(pluginPreview.capabilities);
-      await addPlugin({
-        url: pluginPreview.wasm_url,
-        sha256: pluginPreview.sha256,
-        accepted_capabilities: capabilities.map((c) => c.name),
-      });
-      setAddOpen(false);
-      setNewUrl("");
-      setPluginPreview(null);
-      setPreviewError(null);
-      setSelectedManifestUrl(null);
-      load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAdding(false);
-    }
-  }
-
-  function handleCancelAdd() {
-    setAddOpen(false);
-    setNewUrl("");
-    setPluginPreview(null);
-    setPreviewError(null);
-    setSelectedManifestUrl(null);
-    setComboboxOpen(false);
-    setError(null);
-  }
-
-  async function handleReload(id: string) {
-    setReloading(id);
-    setError(null);
-    try {
-      await reloadPlugin(id);
-      load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setReloading(null);
-    }
-  }
-
-  async function handleRemove(id: string) {
-    setRemoving(id);
-    setError(null);
-    try {
-      await removePlugin(id);
-      load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRemoving(null);
-    }
-  }
-
-  async function handleOpenConfig(plugin: PluginSummary) {
-    setConfigPlugin(plugin);
-    setError(null);
-    try {
-      const response = await getPluginSecrets(plugin.id);
-      // Initialize with existing secrets (masked) and empty strings for missing ones
-      const initial: Record<string, string> = {};
-      for (const secret of plugin.required_secrets) {
-        initial[secret.key] = response.secrets[secret.key] || "";
-      }
-      setSecretValues(initial);
-      if (hasDefinedHostsCapability(plugin)) {
-        const hostsResponse = await getPluginAllowedHosts(plugin.id);
-        setAllowedHosts([...hostsResponse.hosts, ""]);
-        setConfiguredHosts((prev) => ({ ...prev, [plugin.id]: hostsResponse.hosts }));
-      } else {
-        setAllowedHosts([""]);
-      }
-      setConfigOpen(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  async function handleSaveSecrets() {
-    if (!configPlugin) return;
-    setSavingSecrets(true);
-    setError(null);
-    try {
-      await updatePluginSecrets(configPlugin.id, secretValues);
-      if (hasDefinedHostsCapability(configPlugin)) {
-        const hosts = allowedHosts.map((host) => host.trim()).filter(Boolean);
-        const hostsResponse = await updatePluginAllowedHosts(configPlugin.id, hosts);
-        setConfiguredHosts((prev) => ({ ...prev, [configPlugin.id]: hostsResponse.hosts }));
-      }
-      setConfigOpen(false);
-      setConfigPlugin(null);
-      setSecretValues({});
-      setAllowedHosts([""]);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSavingSecrets(false);
-    }
-  }
+  const needing = plugins.filter((p) => attention(p).needs).length
 
   return (
     <>
       <SiteHeader title="Plugins" />
-      <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
+      <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        {error ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        ) : null}
 
-        {!encryptionConfigured && (
-          <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-4">
-            <AlertTriangle className="size-5 text-amber-500 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-medium text-amber-500">Encryption not configured</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Plugin secrets cannot be stored without an encryption key. Set the{" "}
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">TOKEN_ENCRYPTION_KEY</code>{" "}
-                environment variable to a base64-encoded 32-byte key.
+        {!encryptionConfigured ? (
+          <div className="flex items-start gap-3 rounded-lg border bg-muted/40 p-4">
+            <AlertTriangle className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium">
+                Plugin secrets cannot be stored
               </p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Generate one with: <code className="text-xs bg-muted px-1 py-0.5 rounded">openssl rand -base64 32</code>
+              <p className="text-sm text-muted-foreground">
+                Set{" "}
+                <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                  TOKEN_ENCRYPTION_KEY
+                </code>{" "}
+                to a base64-encoded 32-byte key and restart. Generate one with{" "}
+                <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                  openssl rand -base64 32
+                </code>
+                .
               </p>
             </div>
           </div>
-        )}
+        ) : null}
 
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-lg font-semibold">External Auth Plugins</h2>
-            <p className="text-muted-foreground text-sm">
-              Manage WASM plugins that provide authentication with external platforms.
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex flex-col gap-1">
+            <h2 className="text-lg font-semibold">Installed plugins</h2>
+            <p className="text-sm text-muted-foreground">
+              {loading
+                ? "Loading"
+                : plugins.length === 0
+                  ? "Nothing installed yet."
+                  : needing > 0
+                    ? `${plugins.length} installed · ${needing} need attention`
+                    : `${plugins.length} installed · all configured`}
             </p>
           </div>
-          {canCreate && (
-            <ResponsiveDialog open={addOpen} onOpenChange={(open) => {
-              if (!open) handleCancelAdd();
-              else setAddOpen(true);
-            }}>
-              <ResponsiveDialogTrigger asChild>
-                <Button size="sm">
-                  <Plus className="mr-1 size-4" />
-                  Add Plugin
-                </Button>
-              </ResponsiveDialogTrigger>
-              <ResponsiveDialogContent>
-                <ResponsiveDialogHeader>
-                  <ResponsiveDialogTitle>Add Plugin</ResponsiveDialogTitle>
-                  <ResponsiveDialogDescription>
-                    Select a plugin from the registry or enter a plugin URL.
-                  </ResponsiveDialogDescription>
-                </ResponsiveDialogHeader>
-
-                <div className="grid gap-4 py-4">
-                  <div className="grid gap-2">
-                    <Label htmlFor="url">Plugin</Label>
-                      {showCombobox ? (
-                        <Popover
-                          open={
-                            comboboxOpen && hasComboboxResults && !newUrlIsUrl
-                          }
-                          onOpenChange={setComboboxOpen}
-                        >
-                          <PopoverAnchor asChild>
-                            <Input
-                              id="url"
-                              placeholder="https://github.com/org/repo/releases/download/v1.0.0/steam.wasm"
-                              value={newUrl}
-                              onChange={(e) => {
-                                setNewUrl(e.target.value);
-                                setSelectedManifestUrl(null);
-                                setComboboxOpen(true);
-                              }}
-                              onFocus={() => setComboboxOpen(true)}
-                              autoComplete="off"
-                            />
-                          </PopoverAnchor>
-                          <PopoverContent
-                            className="p-0 w-(--radix-popover-trigger-width)"
-                            align="start"
-                            onOpenAutoFocus={(e) => e.preventDefault()}
-                            onInteractOutside={(e) => {
-                              // Don't close when clicking the input itself
-                              const target = e.target as Node;
-                              if (
-                                target instanceof Element &&
-                                target.id === "url"
-                              ) {
-                                e.preventDefault();
-                              }
-                            }}
-                          >
-                            <Command shouldFilter={false}>
-                              <CommandList>
-                                {officialLoading ? (
-                                  <CommandGroup>
-                                    <CommandItem
-                                      disabled
-                                      value="__loading__"
-                                    >
-                                      <Loader2 className="mr-2 size-4 animate-spin" />
-                                      Loading plugins…
-                                    </CommandItem>
-                                  </CommandGroup>
-                                ) : (
-                                  <CommandGroup>
-                                      {filteredOfficialPlugins.map((p) => (
-                                        <CommandItem
-                                          key={p.id}
-                                          value={`${p.id} ${p.name}`}
-                                          onSelect={() => {
-                                            setNewUrl(p.name);
-                                            setSelectedManifestUrl(
-                                              p.manifest_url,
-                                            );
-                                            setComboboxOpen(false);
-                                          }}
-                                        >
-                                          {p.icon_url ? (
-                                            // eslint-disable-next-line @next/next/no-img-element
-                                            <img
-                                              src={p.icon_url}
-                                              alt=""
-                                              className="size-6 rounded shrink-0"
-                                            />
-                                          ) : (
-                                            <div className="size-6 rounded bg-muted shrink-0" />
-                                          )}
-                                          <div className="flex flex-col min-w-0 flex-1">
-                                            <div className="flex items-center gap-2">
-                                              <span className="font-medium truncate">
-                                                {p.name}
-                                              </span>
-                                              <Badge
-                                                variant="secondary"
-                                                className="shrink-0"
-                                              >
-                                                v{p.latest_version}
-                                              </Badge>
-                                              {p.official && (
-                                                <Badge
-                                                  variant="outline"
-                                                  className="shrink-0"
-                                                >
-                                                  Official
-                                                </Badge>
-                                              )}
-                                            </div>
-                                            {p.description && (
-                                              <span className="text-muted-foreground text-xs truncate">
-                                                {p.description}
-                                              </span>
-                                            )}
-                                          </div>
-                                        </CommandItem>
-                                      ))}
-                                    </CommandGroup>
-                                )}
-                              </CommandList>
-                            </Command>
-                          </PopoverContent>
-                        </Popover>
-                      ) : (
-                        <Input
-                          id="url"
-                          placeholder="https://github.com/org/repo/releases/download/v1.0.0/steam.wasm"
-                          value={newUrl}
-                          onChange={(e) => {
-                            setNewUrl(e.target.value);
-                            setSelectedManifestUrl(null);
-                          }}
-                        />
-                      )}
-                    <p className="text-muted-foreground text-xs">
-                      Link to the .wasm file or manifest.json (GitHub Releases URL)
-                    </p>
-                  </div>
-
-                  {previewError && (
-                    <p className="text-sm text-destructive">{previewError}</p>
-                  )}
-
-                  {pluginPreview && (
-                    <div className="grid gap-4 rounded-lg border p-4">
-                      <div className="flex items-start gap-4">
-                        {pluginPreview.icon_url && (
-                          <img
-                            src={pluginPreview.icon_url}
-                            alt=""
-                            className="size-12 rounded"
-                          />
-                        )}
-                        <div className="flex-1">
-                          <h3 className="font-semibold">{pluginPreview.name}</h3>
-                          <p className="text-muted-foreground text-sm">
-                            {pluginPreview.description || `Version ${pluginPreview.version}`}
-                          </p>
-                        </div>
-                        <Badge variant="secondary">{pluginPreview.version}</Badge>
-                      </div>
-
-                      <div className="grid gap-2 text-sm">
-                        <div className="flex justify-between">
-                          <span className="text-muted-foreground">Auth Type</span>
-                          <Badge variant="outline">
-                            {formatAuthType(pluginPreview.auth_type)}
-                          </Badge>
-                        </div>
-                        {pluginPreview.required_secrets.length > 0 && (
-                          <div className="grid gap-2">
-                            <span className="text-muted-foreground">Required Configuration</span>
-                            <div className="flex flex-col gap-2">
-                              {pluginPreview.required_secrets.map((secret) => (
-                                <div key={secret.key} className="bg-muted rounded p-2">
-                                  <div className="flex items-center justify-between">
-                                    <span className="font-medium text-sm">{secret.name}</span>
-                                    <code className="text-xs text-muted-foreground">{secret.key}</code>
-                                  </div>
-                                  {secret.description && (
-                                    <p className="text-muted-foreground text-xs mt-1">{secret.description}</p>
-                                  )}
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="space-y-2">
-                        <h4 className="text-sm font-medium">This plugin can</h4>
-                        <PluginCapabilities
-                          entries={visibleCapabilities(pluginPreview.capabilities)}
-                          allowedHosts={pluginPreview.allowed_hosts}
-                        />
-                        {visibleCapabilities(pluginPreview.capabilities).some(
-                          (c) => c.risk === "critical" || c.risk === "high",
-                        ) && (
-                          <p className="text-sm text-destructive">
-                            This plugin asks for dangerous permissions. Only install it if you trust its publisher.
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <ResponsiveDialogFooter>
-                  <ResponsiveDialogClose asChild>
-                    <Button variant="outline" disabled={adding}>
-                      Cancel
-                    </Button>
-                  </ResponsiveDialogClose>
-                  <Button onClick={handleAdd} disabled={adding || !pluginPreview}>
-                    {adding ? (
-                      <>
-                        <Loader2 className="mr-2 size-4 animate-spin" />
-                        Installing...
-                      </>
-                    ) : (
-                      "Install Plugin"
-                    )}
-                  </Button>
-                </ResponsiveDialogFooter>
-              </ResponsiveDialogContent>
-            </ResponsiveDialog>
-          )}
+          {canManage ? (
+            <Button asChild>
+              <Link href="/dashboard/settings/plugins/add">
+                <Plus />
+                Add plugin
+              </Link>
+            </Button>
+          ) : null}
         </div>
 
-        {plugins.length === 0 ? (
-          <div className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-muted-foreground">No plugins loaded.</p>
-            {canCreate && (
-              <p className="text-muted-foreground mt-2 text-sm">
-                Add a plugin to enable external account authentication.
+        {plugins.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative min-w-56 flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search by name, id or namespace"
+                aria-label="Search installed plugins"
+                className="pl-9"
+              />
+            </div>
+            <Select
+              value={typeFilter}
+              onValueChange={(v) => setTypeFilter(v as TypeFilter)}
+            >
+              <SelectTrigger className="w-40" aria-label="Filter by kind">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All kinds</SelectItem>
+                {TYPE_ORDER.map((type) => (
+                  <SelectItem key={type} value={type}>
+                    {TYPE_LABEL[type]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={sort} onValueChange={(v) => setSort(v as SortKey)}>
+              <SelectTrigger className="w-48" aria-label="Sort plugins">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="attention">Needs attention first</SelectItem>
+                <SelectItem value="name">Name</SelectItem>
+                <SelectItem value="version">Version</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button
+              variant={grouped ? "secondary" : "outline"}
+              onClick={() => setGrouped((g) => !g)}
+              aria-pressed={grouped}
+            >
+              Group by kind
+            </Button>
+          </div>
+        ) : null}
+
+        {loading ? (
+          <div className="flex flex-col gap-2">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-[66px] w-full rounded-lg" />
+            ))}
+          </div>
+        ) : plugins.length === 0 ? (
+          <div className="flex flex-col items-start gap-3 rounded-lg border border-dashed p-8">
+            <Blocks className="size-5 text-muted-foreground" />
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium">No plugins installed</p>
+              <p className="max-w-prose text-sm text-muted-foreground">
+                Libraries your scripts can call, interpreters that run them, and
+                sign-in providers.
               </p>
-            )}
+            </div>
+            {canManage ? (
+              <Button asChild size="sm">
+                <Link href="/dashboard/settings/plugins/add">
+                  <Plus />
+                  Add plugin
+                </Link>
+              </Button>
+            ) : null}
+          </div>
+        ) : visible.length === 0 ? (
+          <div className="flex flex-col items-start gap-3 rounded-lg border border-dashed p-8">
+            <p className="text-sm text-muted-foreground">
+              No plugin matches this search.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setQuery("")
+                setTypeFilter("all")
+              }}
+            >
+              Clear filters
+            </Button>
           </div>
         ) : (
-          <div className="overflow-clip rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Plugin</TableHead>
-                  <TableHead>Version</TableHead>
-                  <TableHead>Auth Type</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="w-32" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {plugins.map((plugin) => {
-                  const capabilities = visibleCapabilities(plugin.capabilities);
-                  return (
-                  <TableRow key={plugin.id}>
-                    <TableCell>
-                      <div className="flex flex-col gap-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium">{plugin.name}</span>
-                          <Badge variant="outline">{plugin.plugin_type}</Badge>
-                        </div>
-                        <code className="text-muted-foreground text-xs">
-                          {plugin.id}
-                        </code>
-                        {capabilities.length > 0 && (
-                          <Collapsible>
-                            <CollapsibleTrigger asChild>
-                              <button
-                                type="button"
-                                className="flex w-fit items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                              >
-                                <ChevronDown className="size-3" />
-                                <span>Permissions</span>
-                              </button>
-                            </CollapsibleTrigger>
-                            <CollapsibleContent className="mt-1 max-w-sm">
-                              <PluginCapabilities
-                                entries={capabilities}
-                                allowedHosts={
-                                  hasDefinedHostsCapability(plugin)
-                                    ? configuredHosts[plugin.id]
-                                    : plugin.allowed_hosts
-                                }
-                              />
-                            </CollapsibleContent>
-                          </Collapsible>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="secondary">{plugin.version}</Badge>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="outline">{formatAuthType(plugin.auth_type)}</Badge>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1">
-                        <Badge variant={plugin.source === "url" ? "default" : "secondary"}>
-                          {plugin.source}
-                        </Badge>
-                        {plugin.url && plugin.source === "url" && (
-                          <a
-                            href={plugin.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-muted-foreground hover:text-foreground"
-                          >
-                            <ExternalLink className="size-3" />
-                          </a>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {plugin.required_secrets?.length === 0 ? (
-                        <span className="text-muted-foreground text-sm">No config needed</span>
-                      ) : plugin.secrets_configured ? (
-                        <div className="flex items-center gap-1.5 text-green-600">
-                          <CheckCircle2 className="size-4" />
-                          <span className="text-sm">Configured</span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1.5 text-amber-500">
-                          <AlertCircle className="size-4" />
-                          <span className="text-sm">Needs config</span>
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex gap-1">
-                        {canCreate && plugin.update_available && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8 text-primary"
-                            title={`Update to v${plugin.latest_version}`}
-                            onClick={() => openUpdateDialog(plugin)}
-                          >
-                            <ArrowUpCircle className="size-4" />
-                          </Button>
-                        )}
-                        {canCreate && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            title="Check for updates"
-                            onClick={() => handleCheckUpdate(plugin)}
-                            disabled={checkingUpdate === plugin.id}
-                          >
-                            <Search
-                              className={`size-4 ${checkingUpdate === plugin.id ? "animate-spin" : ""}`}
-                            />
-                          </Button>
-                        )}
-                        {canCreate &&
-                          (plugin.required_secrets?.length > 0 ||
-                            hasDefinedHostsCapability(plugin)) && (
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="size-8"
-                              title={
-                                plugin.required_secrets?.length > 0 && !encryptionConfigured
-                                  ? "Encryption not configured"
-                                  : "Configure plugin"
-                              }
-                              onClick={() => handleOpenConfig(plugin)}
-                              disabled={plugin.required_secrets?.length > 0 && !encryptionConfigured}
+          <div className="flex flex-col gap-6">
+            {sections.map((section) => (
+              <div key={section.type ?? "all"} className="flex flex-col gap-2">
+                {section.type ? (
+                  <div className="flex items-baseline gap-2">
+                    <h3 className="text-sm font-medium">
+                      {TYPE_LABEL[section.type]}
+                    </h3>
+                    <span className="text-xs text-muted-foreground">
+                      {TYPE_NOTE[section.type]}
+                    </span>
+                  </div>
+                ) : null}
+                <ul className="flex flex-col gap-2">
+                  {section.rows.map((plugin) => {
+                    const state = attention(plugin)
+                    return (
+                      <li key={plugin.id}>
+                        <Link
+                          href={installedPluginHref(plugin.id)}
+                          aria-label={`${plugin.name}, ${TYPE_LABEL[plugin.plugin_type]}${
+                            state.label ? `, ${state.label}` : ""
+                          }`}
+                          className="flex w-full items-center gap-4 rounded-lg border bg-card p-3 text-left shadow-xs transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
+                        >
+                          <PluginMark
+                            name={plugin.name}
+                            type={plugin.plugin_type}
+                            iconUrl={plugin.icon_url}
+                          />
+                          <div className="flex min-w-0 shrink-0 basis-56 flex-col gap-0.5">
+                            <span className="truncate text-sm font-medium">
+                              {plugin.name}
+                            </span>
+                            <span className="truncate font-mono text-xs text-muted-foreground">
+                              {plugin.namespace ?? plugin.id}
+                            </span>
+                          </div>
+                          {/* The middle earns its width only when there is
+                              something to put there; an absent description
+                              leaves the row short rather than padded out. */}
+                          <span className="hidden min-w-0 flex-1 truncate text-sm text-muted-foreground lg:block">
+                            {plugin.description ?? ""}
+                          </span>
+                          <span className="flex-1 lg:hidden" />
+                          {!grouped ? (
+                            <Badge
+                              variant="outline"
+                              className="hidden shrink-0 sm:inline-flex"
                             >
-                              <Settings className="size-4" />
-                            </Button>
-                          )}
-                        {canCreate && plugin.source === "url" && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            title="Reload plugin"
-                            onClick={() => handleReload(plugin.id)}
-                            disabled={reloading === plugin.id}
-                          >
-                            <RefreshCw
-                              className={`size-4 ${reloading === plugin.id ? "animate-spin" : ""}`}
-                            />
-                          </Button>
-                        )}
-                        {canDelete && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8 text-destructive hover:text-destructive"
-                            title="Remove plugin"
-                            onClick={() => handleRemove(plugin.id)}
-                            disabled={removing === plugin.id}
-                          >
-                            <Trash2 className="size-4" />
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
+                              {TYPE_LABEL[plugin.plugin_type]}
+                            </Badge>
+                          ) : null}
+                          {state.needs ? (
+                            <Badge variant="destructive" className="shrink-0">
+                              {state.kind === "update" ? (
+                                <ArrowUpCircle />
+                              ) : (
+                                <AlertTriangle />
+                              )}
+                              <span className="hidden sm:inline">
+                                {state.label}
+                              </span>
+                            </Badge>
+                          ) : null}
+                          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                            {plugin.version}
+                          </span>
+                        </Link>
+                      </li>
+                    )
+                  })}
+                </ul>
+              </div>
+            ))}
           </div>
         )}
-
-        {/* Configure Secrets Dialog */}
-        <ResponsiveDialog open={configOpen} onOpenChange={setConfigOpen}>
-          <ResponsiveDialogContent>
-            <ResponsiveDialogHeader>
-              <ResponsiveDialogTitle>
-                Configure {configPlugin?.name}
-              </ResponsiveDialogTitle>
-              <ResponsiveDialogDescription>
-                {configPlugin && configPlugin.required_secrets.length > 0
-                  ? "Enter the required secrets for this plugin. Leave empty to use environment variables."
-                  : "Configure this plugin's settings."}
-              </ResponsiveDialogDescription>
-            </ResponsiveDialogHeader>
-            <div className="grid gap-4 py-4">
-              {configPlugin?.required_secrets.map((secret) => (
-                <div key={secret.key} className="grid gap-2">
-                  <Label htmlFor={`secret-${secret.key}`}>
-                    {secret.name}
-                    <code className="text-xs font-normal text-muted-foreground ml-2">{secret.key}</code>
-                  </Label>
-                  {secret.description && (
-                    <p className="text-xs text-muted-foreground">{secret.description}</p>
-                  )}
-                  <Input
-                    id={`secret-${secret.key}`}
-                    type="password"
-                    placeholder="Enter value..."
-                    value={secretValues[secret.key] || ""}
-                    onChange={(e) =>
-                      setSecretValues((prev) => ({ ...prev, [secret.key]: e.target.value }))
-                    }
-                  />
-                </div>
-              ))}
-              {configPlugin && hasDefinedHostsCapability(configPlugin) && (
-                <div className="grid gap-2">
-                  <Label htmlFor="allowed-hosts">Allowed hosts</Label>
-                  <p className="text-xs text-muted-foreground">
-                    This plugin can only make requests to hosts listed here.
-                  </p>
-                  <MultiInput
-                    id="allowed-hosts"
-                    values={allowedHosts}
-                    onChange={setAllowedHosts}
-                    placeholder="api.example.com"
-                  />
-                </div>
-              )}
-            </div>
-            <ResponsiveDialogFooter>
-              <ResponsiveDialogClose asChild>
-                <Button variant="outline" disabled={savingSecrets}>
-                  Cancel
-                </Button>
-              </ResponsiveDialogClose>
-              <Button onClick={handleSaveSecrets} disabled={savingSecrets}>
-                {savingSecrets ? "Saving..." : "Save"}
-              </Button>
-            </ResponsiveDialogFooter>
-          </ResponsiveDialogContent>
-        </ResponsiveDialog>
-
-        <PluginUpdateDialog
-          plugin={updateDialogPlugin}
-          open={updateDialogOpen}
-          onOpenChange={(open) => {
-            setUpdateDialogOpen(open);
-            if (!open) setUpdateDialogPlugin(null);
-          }}
-          onUpdated={() => load()}
-        />
       </div>
     </>
-  );
+  )
 }

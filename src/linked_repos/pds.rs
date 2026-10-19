@@ -85,10 +85,17 @@ fn require_blob_scope(grant: &LinkedRepo, mime: &str) -> Result<(), AppError> {
     )))
 }
 
-pub async fn session_for(
-    state: &AppState,
-    grant: &LinkedRepo,
-) -> Result<HappyViewOAuthSession, AppError> {
+/// What a linked-repo call acts with. A test run answers every call from the
+/// in-process PDS, so no grant needs a live OAuth session.
+pub enum LinkedSession {
+    OAuth(Box<HappyViewOAuthSession>),
+    Test {
+        pds: std::sync::Arc<crate::testing::FakePds>,
+        did: String,
+    },
+}
+
+pub async fn session_for(state: &AppState, grant: &LinkedRepo) -> Result<LinkedSession, AppError> {
     let did_str = require_did(grant)?;
 
     if grant.status == STATUS_NEEDS_REAUTH {
@@ -97,13 +104,20 @@ pub async fn session_for(
         )));
     }
 
+    if let Some(test) = &state.test {
+        return Ok(LinkedSession::Test {
+            pds: test.pds().clone(),
+            did: did_str.to_string(),
+        });
+    }
+
     let did = Did::new(did_str.to_string())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
     let client = flow::client_for_grant(state, grant).await?;
 
     match client.restore(&did).await {
-        Ok(session) => Ok(session),
+        Ok(session) => Ok(LinkedSession::OAuth(Box::new(session))),
         Err(e) => {
             let message = format!("{e}");
             super::db::mark_needs_reauth(state, &grant.id, &message).await?;
@@ -114,7 +128,16 @@ pub async fn session_for(
     }
 }
 
-pub(crate) async fn post_json(
+async fn post_json(session: &LinkedSession, nsid: &str, body: &Value) -> Result<Value, AppError> {
+    match session {
+        LinkedSession::OAuth(session) => post_json_oauth(session, nsid, body).await,
+        LinkedSession::Test { pds, did } => pds
+            .post(did, nsid, body)
+            .map_err(|e| AppError::Internal(format!("{nsid} failed: {e}"))),
+    }
+}
+
+pub(crate) async fn post_json_oauth(
     session: &HappyViewOAuthSession,
     nsid: &str,
     body: &Value,
@@ -299,7 +322,14 @@ pub async fn upload_blob(
     bytes: Vec<u8>,
 ) -> Result<Value, AppError> {
     require_blob_scope(grant, mime)?;
-    let session = session_for(state, grant).await?;
+    let session = match session_for(state, grant).await? {
+        LinkedSession::OAuth(session) => session,
+        LinkedSession::Test { pds, .. } => {
+            return pds
+                .upload_blob(mime, &bytes)
+                .map_err(|e| AppError::Internal(format!("uploadBlob failed: {e}")));
+        }
+    };
 
     let request = XrpcRequest {
         method: Method::POST,
@@ -332,6 +362,15 @@ pub async fn call(
     if let Some(input) = input {
         return post_json(&session, nsid, &input).await;
     }
+    let session = match session {
+        LinkedSession::OAuth(session) => session,
+        LinkedSession::Test { .. } => {
+            return Err(AppError::Internal(format!(
+                "{nsid} failed: {}",
+                crate::testing::FakePdsError::not_served(nsid)
+            )));
+        }
+    };
 
     let request = XrpcRequest {
         method: Method::GET,
@@ -349,5 +388,66 @@ pub async fn call(
         Ok(OutputDataOrBytes::Bytes(b)) => serde_json::from_slice(&b)
             .map_err(|e| AppError::Internal(format!("{nsid} returned non-JSON: {e}"))),
         Err(e) => Err(AppError::Internal(format!("{nsid} failed: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn bound_grant(state: &AppState) -> LinkedRepo {
+        let grant = super::super::db::create(
+            state,
+            None,
+            None,
+            None,
+            "atproto repo:app.test.rec",
+            "did:plc:admin",
+        )
+        .await
+        .unwrap();
+        super::super::db::bind_did(state, &grant.id, "did:plc:linked", None)
+            .await
+            .unwrap();
+        super::super::db::get(state, &grant.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_test_runs_linked_repo_write_reaches_the_fake() {
+        let harness = std::sync::Arc::new(crate::testing::TestHarness::new("a.test.lua"));
+        let state = crate::AppState {
+            test: Some(harness.clone()),
+            ..crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            )
+        };
+        let grant = bound_grant(&state).await;
+        let (uri, _cid) = create_record(&state, &grant, "app.test.rec", Some("1"), json!({"a": 1}))
+            .await
+            .unwrap();
+        assert_eq!(uri, "at://did:plc:linked/app.test.rec/1");
+        assert_eq!(harness.pds().writes()[0].repo, "did:plc:linked");
+    }
+
+    /// Outside a test run a grant acts through its stored OAuth session, and
+    /// one that has none is marked for reauthorization.
+    #[tokio::test]
+    async fn a_served_linked_repo_call_restores_the_grants_session() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let grant = bound_grant(&state).await;
+        let Err(err) = session_for(&state, &grant).await else {
+            panic!("a grant with no stored session restored one");
+        };
+        assert!(err.to_string().contains("needs reauthorization"), "{err}");
+        let grant = super::super::db::get(&state, &grant.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.status, STATUS_NEEDS_REAUTH);
     }
 }

@@ -252,7 +252,7 @@ async fn instance_call(
             AppError::Auth(_) => AppError::Auth(SIGN_IN_AGAIN.to_string()),
             other => other,
         })?;
-    crate::linked_repos::pds::post_json(&session, method, body)
+    crate::linked_repos::pds::post_json_oauth(&session, method, body)
         .await
         .map_err(|e| {
             if crate::setup::is_pds_session_expired(&e) {

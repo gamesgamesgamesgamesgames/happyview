@@ -26,7 +26,7 @@ pub struct TestApp {
     pub mock_server: MockServer,
     pub admin_did: String,
     pub admin_token: String,
-    _db_lock: Option<sqlx::AnyPool>,
+    _db_lock: Option<db::TestLock>,
 }
 
 impl TestApp {
@@ -112,6 +112,9 @@ impl TestApp {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
 
         let sql = adapt_sql(
@@ -193,6 +196,7 @@ impl TestApp {
             records: happyview::record_store::RecordStore::shared(pool.clone(), backend)
                 .await
                 .expect("load record dictionaries"),
+            archive: happyview::jetstream::archive::ArchiveConfig::default(),
             domain_cache,
             lexicons,
             scripts: happyview::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
@@ -253,6 +257,7 @@ impl TestApp {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {

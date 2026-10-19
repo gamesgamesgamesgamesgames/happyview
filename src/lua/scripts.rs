@@ -44,10 +44,20 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::plugin::{ScriptExecuteOutput, ScriptValueKind};
 use crate::project::ProjectSnapshot;
-use crate::script::{Invocation, Trigger, dispatch};
+use crate::script::{Invocation, ScriptOrigin, Trigger, dispatch};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
 const MAX_ATTEMPTS: u32 = 4;
+
+/// A test run reports a script's failure rather than waiting out seven
+/// seconds of backoff for a failure retrying cannot change.
+fn attempts(state: &AppState) -> u32 {
+    if state.test.is_some() {
+        1
+    } else {
+        MAX_ATTEMPTS
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Trigger grammar
@@ -288,7 +298,7 @@ pub async fn run_record_event_script(
     }
 
     let mut last_error = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..attempts(state) {
         if attempt > 0 {
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
@@ -336,7 +346,7 @@ pub async fn run_record_event_script(
             host_id: &host_id,
             payload: &event_payload,
             error: &last_error,
-            attempts: MAX_ATTEMPTS,
+            attempts: attempts(state),
             collection: Some(payload.nsid),
         },
         payload.uri,
@@ -386,6 +396,7 @@ pub async fn run_record_event_once(
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(script),
         },
         None,
     )
@@ -397,7 +408,13 @@ pub async fn run_record_event_once(
             ScriptValueKind::Object => RecordHookOutcome::Replace(value),
             ScriptValueKind::Other => RecordHookOutcome::Proceed,
         }),
-        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
 }
 
@@ -483,13 +500,20 @@ pub async fn run_label_applied_script(
     }
 
     let mut last_error = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..attempts(state) {
         if attempt > 0 {
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
         }
         match run_label_once(state, &resolved, &event).await {
             Ok(outcome) => {
+                if matches!(outcome, LabelHookOutcome::Skip) {
+                    tracing::debug!(
+                        target: "happyview::labeler",
+                        src = %event.src, uri = %event.uri, val = %event.val,
+                        "label.applied script skipped persistence"
+                    );
+                }
                 if state.verbose_event_logging.load(Ordering::Relaxed) {
                     log_event(
                         &state.db,
@@ -530,7 +554,7 @@ pub async fn run_label_applied_script(
             host_id: &host_id,
             payload: &payload,
             error: &last_error,
-            attempts: MAX_ATTEMPTS,
+            attempts: attempts(state),
             collection,
         },
         &event.uri,
@@ -563,6 +587,7 @@ async fn run_label_once(
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(script),
         },
         None,
     )
@@ -584,7 +609,13 @@ async fn run_label_once(
             }),
             ScriptValueKind::Other => LabelHookOutcome::Continue(event.clone()),
         }),
-        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
 }
 
@@ -597,8 +628,15 @@ async fn run_label_once(
 /// other. The text carries the line that points at the script and no category;
 /// a spent budget and an exhausted heap describe themselves in no text at all,
 /// so without the category they read as any other runtime failure.
-pub(crate) fn failure_text(kind: crate::plugin::ScriptErrorKind, raw: &str) -> String {
-    format!("{}: {raw}", kind.as_str())
+pub(crate) fn failure_text(
+    kind: crate::plugin::ScriptErrorKind,
+    file: Option<&str>,
+    raw: &str,
+) -> String {
+    match file {
+        Some(file) => format!("{} in {file}: {raw}", kind.as_str()),
+        None => format!("{}: {raw}", kind.as_str()),
+    }
 }
 
 fn extract_string(v: &Value, key: &str) -> Option<String> {
@@ -620,7 +658,7 @@ struct DeadLetterEntry<'a> {
     payload: &'a Value,
     error: &'a str,
     /// How many runs it took to get here. A retry budget that was spent
-    /// reports [`MAX_ATTEMPTS`]; a failure no retry could have changed
+    /// reports the whole budget; a failure no retry could have changed
     /// reports the one attempt it was worth.
     attempts: u32,
     collection: Option<&'a str>,
@@ -659,6 +697,9 @@ async fn no_interpreter_for(state: &AppState, script: &ResolvedScript) -> bool {
 /// and the event their feed shows. One call because they describe one failure
 /// and a run that wrote only one of them would be a half-told story.
 async fn dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>, subject: &str) {
+    if let Some(test) = &state.test {
+        test.note_script_failure(entry.error);
+    }
     write_dead_letter(state, entry).await;
     log_event(
         &state.db,
@@ -714,6 +755,22 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failure_text_leads_with_its_file() {
+        assert_eq!(
+            failure_text(
+                crate::plugin::ScriptErrorKind::Runtime,
+                Some("src/jobs/tick.lua"),
+                "src/jobs/tick.lua:4: boom"
+            ),
+            "runtime in src/jobs/tick.lua: src/jobs/tick.lua:4: boom"
+        );
+        assert_eq!(
+            failure_text(crate::plugin::ScriptErrorKind::Runtime, None, "x"),
+            "runtime: x"
+        );
+    }
+
     use super::*;
 
     #[test]

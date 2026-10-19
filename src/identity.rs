@@ -78,6 +78,13 @@ pub async fn resolve_handle(handle: &str) -> Result<String, AppError> {
 
     let parsed = atrium_api::types::string::Handle::new(handle.to_string())
         .map_err(|_| AppError::BadRequest(format!("invalid handle: {handle}")))?;
+    if crate::testing::identity::forging() {
+        return crate::testing::identity::did_for(handle).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "could not resolve handle {handle}: a test run resolves only handles of the form <name>.test, such as alice.test"
+            ))
+        });
+    }
     // The resolver's error text can include the `.well-known` URL and HTTP
     // client detail, so the caller gets a fixed reason and the detail is
     // logged.
@@ -228,7 +235,8 @@ fn did_document_failure(did: &str, failure: &BackfillFailure) -> AppError {
         BackfillErrorKind::RepoNotFound
         | BackfillErrorKind::RepoDeactivated
         | BackfillErrorKind::RepoTakendown
-        | BackfillErrorKind::Other => format!("could not fetch DID document for {did}"),
+        | BackfillErrorKind::Other
+        | BackfillErrorKind::ReplayBlock => format!("could not fetch DID document for {did}"),
     };
     AppError::BadRequest(reason)
 }

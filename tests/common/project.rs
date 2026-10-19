@@ -37,6 +37,7 @@ pub fn add_script(snap: &mut ProjectSnapshot, trigger: &str, body: &str, path: &
             language_id: "lua".to_string(),
             body: ScriptBody::Source {
                 source: Arc::from(body),
+                artifact: None,
             },
             description: None,
             outbound_xrpcs: Vec::new(),

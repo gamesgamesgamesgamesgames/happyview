@@ -27,6 +27,7 @@ import type {
 } from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
+import type { BackfillSource } from "@/types/backfill";
 import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
@@ -336,7 +337,11 @@ export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
 }
 
-export function createBackfillJob(body: { collection?: string; dids?: string[] }) {
+export function createBackfillJob(body: {
+  collection?: string;
+  dids?: string[];
+  source?: BackfillSource;
+}) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1323,6 +1328,7 @@ export interface PluginPreview {
   version: string;
   description: string | null;
   icon_url: string | null;
+  banner_url: string | null;
   auth_type: string;
   required_secrets: SecretDefinition[];
   manifest_url: string;

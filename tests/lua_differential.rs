@@ -127,6 +127,15 @@ const ZONE_DEPENDENT: [&str; 2] = [
     "bridge/query.timezone_format.lua",
 ];
 
+/// The case that differs **only when the plugin has `internal.async`**.
+///
+/// It prints the "built-in modules are: …" sentence, and the plugin's list
+/// names `internal.async` from 1.1.0 on, which the native runner does not
+/// implement and never will. The harness asks the plugin under test whether it
+/// has the module, as it asks the native runner for its zone, so an older
+/// module that agrees here is not reported as a closed difference.
+const ASYNC_DEPENDENT: [&str; 1] = ["bridge/query.require_rules.lua"];
+
 /// A case that has not finished by now is not going to tell us anything: mlua
 /// cannot be interrupted from outside, and a job run has no deadline on
 /// either path, so the harness needs its own or one script ends the run
@@ -264,6 +273,20 @@ async fn native_local_time_is_utc(app: &TestApp) -> bool {
     )
 }
 
+/// Whether the plugin under test has `internal.async`, asked of the plugin
+/// itself because it is the side whose built-ins vary by release.
+async fn plugin_has_internal_async(executor: &happyview::plugin::PluginExecutor, id: &str) -> bool {
+    let probe = input(
+        "query.async_probe",
+        r#"function handle() return (pcall(require, "internal.async")) end"#,
+        None,
+    );
+    matches!(
+        executor.execute_script(id, &probe).await,
+        Ok(ScriptExecuteOutput::Returned { value, .. }) if value == json!(true)
+    )
+}
+
 /// The interpreter and the ten library registrations both paths share.
 async fn registered(app: &TestApp) -> (String, happyview::plugin::PluginExecutor) {
     let dir = plugin_dir().expect("the caller checks the variable first");
@@ -385,6 +408,8 @@ fn input(name: &str, source: &str, job_id: Option<&str>) -> ScriptExecuteInput {
             .collect(),
         limits,
         removed_globals: Vec::new(),
+        chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 
@@ -608,6 +633,7 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     cases.retain(|(name, _)| !EXCLUDED.contains(&name.as_str()));
 
     let on_utc = native_local_time_is_utc(&app).await;
+    let has_async = plugin_has_internal_async(&executor, &id).await;
     let mut agreed = 0usize;
     let mut calls_compared = 0usize;
     let mut logs_compared = 0usize;
@@ -670,7 +696,12 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
         if native_progress != Value::Null && native_progress != json!({}) {
             progress_compared += 1;
         }
-        calls_compared += native_calls
+        // The plugin's side, because its count does not depend on the
+        // backend: a native library call that ends its run is a dropped
+        // future, and SQLite's driver runs a statement it was already handed
+        // where Postgres's sends nothing, so `bridge/query.coroutines.lua`
+        // records its one call natively on SQLite only.
+        calls_compared += plugin_calls
             .as_object()
             .map(|by_library| {
                 by_library
@@ -703,7 +734,8 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     println!(
         "module: {}\ncases: {} ({excluded} excluded) | identical in every respect: {agreed} \
          | library calls compared: {calls_compared} | log lines compared: {logs_compared} \
-         | job progress compared: {progress_compared} | native process on UTC: {on_utc}",
+         | job progress compared: {progress_compared} | native process on UTC: {on_utc} \
+         | plugin has internal.async: {has_async}",
         identify(&dir),
         cases.len()
     );
@@ -719,7 +751,7 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     // deliberately.
     assert_eq!(
         (calls_compared, logs_compared, progress_compared),
-        (82, 18, 2),
+        (83, 18, 2),
         "the transcript, the log rows or the job progress are not being recorded; \
          a deliberate change to the case list has to be recorded here. Two of the \
          three job cases call `ctx.job.progress`, which is why that one is 2"
@@ -732,6 +764,11 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
             [].iter().copied()
         } else {
             ZONE_DEPENDENT.iter().copied()
+        })
+        .chain(if has_async {
+            ASYNC_DEPENDENT.iter().copied()
+        } else {
+            [].iter().copied()
         })
         .collect();
     let unexpected: Vec<&String> = differences

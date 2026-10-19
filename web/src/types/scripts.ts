@@ -67,6 +67,24 @@ export interface Script {
    * the interpreter is installed.
    */
   runnable: boolean
+  /**
+   * Set when a compiled module's handler answers this trigger. Such a row
+   * comes from the project build and is read-only: it has no body, and it
+   * changes only when the module is rebuilt.
+   */
+  module?: ScriptModuleRow | null
+}
+
+/** A compiled module's handler, which has no body to show or edit. */
+export interface ScriptModuleRow {
+  /** The `[modules.<name>]` key in happyview.toml. */
+  module: string
+  /** The module's crate, relative to the project root. */
+  path: string
+  /** The Rust function that handles this trigger; empty when the build did not record it. */
+  handler: string
+  /** sha256 of the build HappyView is running. */
+  hash: string
 }
 
 /** One construct the codemod could not rewrite mechanically. */

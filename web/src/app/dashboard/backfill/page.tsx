@@ -5,7 +5,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { toastError } from "@/lib/format";
+import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
@@ -27,6 +27,8 @@ import type {
   BackfillRepoEntry,
   PdsSummaryEntry,
   BackfillEvent,
+  BackfillSource,
+  ReplayProgress,
   BackfillErrorCount,
   BackfillErrorEntry,
   BlueskyProfile,
@@ -72,6 +74,13 @@ import {
 } from "@/components/ui/responsive-dialog";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Sheet,
   SheetContent,
   SheetFooter,
@@ -93,6 +102,20 @@ const PROGRESS_PHASES = [
   "fetching_records",
 ] as const;
 
+// A replay job reads the Jetstream archive instead of crawling PDSes, so it
+// has its own stages and no PDS or repo lists.
+const REPLAY_STAGES = ["replaying", "replaying_accounts", "retrying_blocks"];
+
+function isReplayStage(stage: string): boolean {
+  return REPLAY_STAGES.includes(stage);
+}
+
+const SOURCE_LABELS: Record<BackfillSource, string> = {
+  auto: "Auto",
+  replay: "Replay",
+  crawl: "Crawl",
+};
+
 // Operators read these, not enum names.
 const ERROR_KIND_LABELS: Record<string, string> = {
   dns_failure: "Domain not resolving",
@@ -106,6 +129,7 @@ const ERROR_KIND_LABELS: Record<string, string> = {
   repo_not_found: "Repo deleted or moved",
   repo_deactivated: "Account deactivated",
   repo_takendown: "Account taken down",
+  replay_block: "Archive block failed",
   other: "Other",
 };
 
@@ -168,6 +192,7 @@ function statusBadge(job: BackfillJob) {
 }
 
 function phaseIndex(stage: string): number {
+  if (isReplayStage(stage)) return REPLAY_STAGES.indexOf(stage);
   if (stage === "resolving_and_fetching") return 1;
   const idx = PROGRESS_PHASES.indexOf(
     stage as (typeof PROGRESS_PHASES)[number],
@@ -421,6 +446,62 @@ function ProfileRow({ did, profile, suffix }: {
       {suffix && (
         <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{suffix}</span>
       )}
+    </div>
+  );
+}
+
+function ReplayProgressBar({
+  stage,
+  replay,
+  active,
+}: {
+  stage: string;
+  replay: ReplayProgress;
+  active: boolean;
+}) {
+  const { after_seq, through_seq, tip_seq, bytes, blocks_failed } = replay;
+  const known = tip_seq != null && through_seq != null && tip_seq > after_seq;
+  const fraction = known
+    ? Math.min(1, Math.max(0, (through_seq - after_seq) / (tip_seq - after_seq)))
+    : null;
+  const label =
+    stage === "replaying_accounts" ? "Replaying account events" : "Replaying records";
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span>{label}</span>
+        <span className="text-xs text-muted-foreground tabular-nums">
+          {through_seq != null && tip_seq != null
+            ? `seq ${through_seq.toLocaleString()} of ${tip_seq.toLocaleString()}`
+            : "waiting for the archive plan"}
+        </span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={fraction == null ? undefined : Math.round(fraction * 100)}
+        className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+      >
+        <div
+          className={`h-full rounded-full bg-blue-500 ${
+            fraction == null
+              ? `w-1/3 ${active ? "animate-pulse" : ""}`
+              : "transition-[width]"
+          }`}
+          style={fraction == null ? undefined : { width: `${fraction * 100}%` }}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground tabular-nums">
+        <span>{formatBytes(bytes)} downloaded</span>
+        {blocks_failed > 0 && (
+          <span className="text-destructive">
+            {blocks_failed.toLocaleString()} failed {blocks_failed === 1 ? "block" : "blocks"}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -731,6 +812,10 @@ function JobDetail({
   const allDone = job.status === "completed";
   const isActive = job.status === "running" || job.status === "cancelling" || job.status === "pausing";
   const isPaused = job.status === "paused" || job.status === "pausing";
+  // A failed replay resumes from its saved sweeps.
+  const resumable =
+    job.status === "paused" ||
+    (job.status === "failed" && job.source === "replay");
   // Discovery runs alongside resolving and fetching on the bounded queue.
   const discovering = job.discovery_complete === false;
   const bounded = job.recent_completions_limit != null;
@@ -866,6 +951,9 @@ function JobDetail({
     }
   }
 
+  // A replay job has no repos or PDSes to list; its progress is a seq range.
+  const replayView = job.source === "replay" || isReplayStage(job.stage);
+
   const discoveredReached = hasReached("discovering_repos");
   const pdsReached = hasReached("resolving_pds");
   const fetchedReached = hasReached("fetching_records") || job.stage === "resolving_and_fetching";
@@ -953,6 +1041,17 @@ function JobDetail({
           ...(e.processed_repos != null && { processed_repos: e.processed_repos }),
           ...(e.total_records != null && { total_records: e.total_records }),
         }));
+      } else if (e.type === "replay_progress") {
+        update((j) => ({
+          ...j,
+          replay: {
+            after_seq: j.replay?.after_seq ?? 0,
+            through_seq: e.through_seq ?? j.replay?.through_seq ?? null,
+            tip_seq: e.tip_seq ?? j.replay?.tip_seq ?? null,
+            bytes: e.bytes ?? j.replay?.bytes ?? 0,
+            blocks_failed: e.blocks_failed ?? j.replay?.blocks_failed ?? 0,
+          },
+        }));
       } else if (e.type === "job_stage_changed" && e.stage) {
         update((j) => ({ ...j, stage: e.stage! }));
       } else if (e.type === "job_completed" && e.status) {
@@ -1013,6 +1112,12 @@ function JobDetail({
             </p>
           </div>
           <div>
+            <span className="text-muted-foreground">Source</span>
+            <p className="text-xs">
+              <Badge variant="secondary">{SOURCE_LABELS[job.source] ?? job.source}</Badge>
+            </p>
+          </div>
+          <div>
             <span className="text-muted-foreground">Created</span>
             <p className="text-xs">
               {new Date(job.created_at).toLocaleString()}
@@ -1055,6 +1160,15 @@ function JobDetail({
         <div>
           <span className="text-muted-foreground text-sm">Progress</span>
           <div className="mt-1 rounded-md border divide-y">
+            {replayView && job.replay && (
+              <ReplayProgressBar
+                stage={job.stage}
+                replay={job.replay}
+                active={isActive && !isPaused}
+              />
+            )}
+            {!replayView && (
+            <>
             <ProgressRow
               label="Discovering repos"
               active={isActive && (job.stage === "discovering_repos" || discovering)}
@@ -1182,6 +1296,8 @@ function JobDetail({
                 <p className="py-3 text-center text-xs text-muted-foreground">No repos fetched yet.</p>
               ) : null}
             </ProgressRow>
+            </>
+            )}
             {errorsTotal > 0 && (
               <ProgressRow
                 label="Errors"
@@ -1286,7 +1402,7 @@ function JobDetail({
             {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
           </Button>
         )}
-        {canCancel && job.status === "paused" && (
+        {canCancel && resumable && (
           <Button
             variant="default"
             size="sm"
@@ -1477,8 +1593,13 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [collection, setCollection] = useState<string | null>(null);
   const [dids, setDids] = useState<string[]>([]);
   const [accountsBlocked, setAccountsBlocked] = useState(false);
+  // "default" sends no source, so the server's BACKFILL_SOURCE decides.
+  const [source, setSource] = useState<BackfillSource | "default">("default");
   const [open, setOpen] = useState(false);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
+  // Account backfills always crawl; the server refuses replay for them.
+  const accountJob = dids.length > 0;
+  const chosenSource = accountJob && source === "replay" ? "default" : source;
 
   useEffect(() => {
     if (open) {
@@ -1500,10 +1621,12 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       await createBackfillJob({
         collection: collection || undefined,
         dids: dids.length > 0 ? dids : undefined,
+        source: chosenSource === "default" ? undefined : chosenSource,
       });
       toast.success("Backfill job created");
       setCollection(null);
       setDids([]);
+      setSource("default");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
@@ -1571,6 +1694,33 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
             <p className="text-muted-foreground text-xs">
               Search by handle, or paste handles and DIDs separated by commas
               or spaces.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="bf-source">Source</Label>
+            <Select
+              value={chosenSource}
+              onValueChange={(v) => setSource(v as BackfillSource | "default")}
+            >
+              <SelectTrigger id="bf-source" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">Default</SelectItem>
+                <SelectItem value="replay" disabled={accountJob}>
+                  Replay from Jetstream
+                </SelectItem>
+                <SelectItem value="crawl">Crawl PDSes</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-xs">
+              {accountJob
+                ? "Account backfills always crawl each account's PDS."
+                : chosenSource === "replay"
+                  ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
+                  : chosenSource === "crawl"
+                    ? "Lists repos from the relay and fetches each PDS."
+                    : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
             </p>
           </div>
         </ResponsiveDialogBody>

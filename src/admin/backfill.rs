@@ -20,6 +20,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::http_retry::parse_retry_after;
+use crate::jetstream::archive::SourceChoice;
 use crate::profile;
 use crate::record_store::PreparedRecord;
 
@@ -30,8 +31,13 @@ use super::backfill_retry::{
 };
 use super::permissions::Permission;
 use super::types::{
-    BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob, CreateBackfillBody,
+    BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob,
+    CreateBackfillBody, ReplayProgress,
 };
+
+pub(crate) mod replay;
+mod replay_fold;
+mod replay_sweeps;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -3395,18 +3401,27 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
 
     // Load job metadata
     let sql = adapt_sql(
-        "SELECT collection, did, stage, queue_version, discovery_complete FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT collection, did, stage, queue_version, discovery_complete, scope, source FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]
-    let job: Option<(Option<String>, Option<String>, String, i32, i32)> = crate::db::query_as(&sql)
+    let job: Option<(
+        Option<String>,
+        Option<String>,
+        String,
+        i32,
+        i32,
+        String,
+        String,
+    )> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.backfill_db)
         .await
         .ok()
         .flatten();
 
-    let Some((collection, did, stage, queue_version, discovery_complete)) = job else {
+    let Some((collection, did, stage, queue_version, discovery_complete, scope, source)) = job
+    else {
         tracing::error!(job_id, "backfill job not found");
         return;
     };
@@ -3438,6 +3453,67 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         )
         .await;
         return;
+    }
+
+    if source != "crawl" {
+        let scope_dids = if scope == "dids" {
+            match replay_sweeps::job_dids(&state, &job_id).await {
+                // Never plan an account job without its accounts.
+                Ok(dids) if dids.is_empty() => {
+                    fail_job(&state, &job_id, DIDS_GONE).await;
+                    return;
+                }
+                Ok(dids) => Some(dids),
+                Err(e) => {
+                    fail_job(
+                        &state,
+                        &job_id,
+                        &format!("failed to read the job's accounts: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        match replay::run(&state, &job_id, &collections, scope_dids, &source).await {
+            replay::ReplayOutcome::FellBack => {}
+            replay::ReplayOutcome::Completed { records, bytes } => {
+                let records = i32::try_from(records).unwrap_or(i32::MAX);
+                complete_job(&state, &job_id, 0, records, None).await;
+                log_event(
+                    &state.db,
+                    EventLog {
+                        event_type: "backfill.completed".to_string(),
+                        severity: Severity::Info,
+                        actor_did: None,
+                        subject: collection,
+                        detail: serde_json::json!({
+                            "job_id": job_id,
+                            "source": "replay",
+                            "total_records": records,
+                            "bytes_downloaded": bytes,
+                        }),
+                    },
+                    backend,
+                )
+                .await;
+                return;
+            }
+            replay::ReplayOutcome::Stopped => {
+                match should_stop(&state, &job_id).await {
+                    Some("cancelling") => finalise_cancel(&state, &job_id).await,
+                    _ => finalise_pause(&state, &job_id).await,
+                }
+                return;
+            }
+            replay::ReplayOutcome::Failed(error) => {
+                tracing::error!(job_id, error, "replay backfill failed");
+                fail_job(&state, &job_id, &error).await;
+                return;
+            }
+        }
     }
 
     let mut version = QueueVersion::from_column(queue_version);
@@ -3651,8 +3727,25 @@ pub(super) async fn create_backfill(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     admin.require(Permission::BackfillCreate).await?;
 
+    let source = match body.source.as_deref() {
+        None => state.archive.default_source,
+        Some(raw) => crate::jetstream::archive::parse_source(raw).ok_or_else(|| {
+            AppError::BadRequest("source must be one of auto, replay, crawl".into())
+        })?,
+    };
+
     let mut inputs = body.dids.unwrap_or_default();
     inputs.extend(body.did);
+    // An account backfill crawls: block-granular planning downloads far more
+    // than a crawl of a few repos, and the archive may not hold a repo's
+    // oldest records.
+    // An explicit `replay` is refused; a default of `replay` crawls them.
+    if body.source.is_some() && source == SourceChoice::Replay && !inputs.is_empty() {
+        return Err(AppError::BadRequest(
+            "replay is only available for collection backfills; account backfills always crawl"
+                .into(),
+        ));
+    }
     let dids = resolve_backfill_accounts(inputs, |input| async move {
         crate::identity::resolve_identifier(&input)
             .await
@@ -3660,7 +3753,7 @@ pub(super) async fn create_backfill(
     })
     .await?;
 
-    let job_id = start_backfill(&state, body.collection, dids, &admin.did).await?;
+    let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, source).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -3762,6 +3855,7 @@ async fn insert_targeted_job(
     job_id: &str,
     collection: Option<&str>,
     dids: &[String],
+    source: SourceChoice,
 ) -> Result<(), AppError> {
     let backend = state.db_backend;
     let now = now_rfc3339();
@@ -3779,8 +3873,8 @@ async fn insert_targeted_job(
 
     let sql = adapt_sql(
         "INSERT INTO happyview_backfill_jobs \
-         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at) \
-         VALUES (?, ?, ?, 'dids', 'running', 'resolving_pds', ?, 2, 1, ?, ?)",
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source) \
+         VALUES (?, ?, ?, 'dids', 'running', 'resolving_pds', ?, 2, 1, ?, ?, ?)",
         backend,
     );
     crate::db::query(&sql)
@@ -3790,6 +3884,7 @@ async fn insert_targeted_job(
         .bind(total)
         .bind(&now)
         .bind(&now)
+        .bind(source.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
@@ -3815,37 +3910,84 @@ async fn insert_targeted_job(
         .map_err(|e| AppError::Internal(format!("failed to commit backfill job: {e}")))
 }
 
-/// Insert a backfill job without starting it. With no `dids` the job
-/// discovers repos through the relay; otherwise it targets exactly those.
+/// `create_backfill_job_with` at `BACKFILL_SOURCE`. Only tests create a job
+/// without starting it at the default source.
+#[cfg(test)]
 pub(crate) async fn create_backfill_job(
     state: &AppState,
     collection: Option<&str>,
     dids: &[String],
 ) -> Result<String, AppError> {
+    create_backfill_job_with(state, collection, dids, state.archive.default_source).await
+}
+
+/// Insert a backfill job without starting it. With no `dids` the job
+/// discovers repos through the relay; otherwise it targets exactly those.
+pub(crate) async fn create_backfill_job_with(
+    state: &AppState,
+    collection: Option<&str>,
+    dids: &[String],
+    source: SourceChoice,
+) -> Result<String, AppError> {
     let job_id = Uuid::new_v4().to_string();
 
     if !dids.is_empty() {
-        insert_targeted_job(state, &job_id, collection, dids).await?;
+        insert_targeted_job(state, &job_id, collection, dids, source).await?;
         return Ok(job_id);
     }
 
+    insert_network_job(state, &state.db, &job_id, collection, source, None).await?;
+    Ok(job_id)
+}
+
+/// Create a network replay job for everything after `after_seq` (a gap in
+/// the live stream). `replay_after_seq` goes in with the row, so no reader,
+/// including a restart's resume, ever sees the job without it.
+pub(crate) async fn create_gap_replay_job(
+    state: &AppState,
+    after_seq: i64,
+) -> Result<String, AppError> {
+    let job_id = Uuid::new_v4().to_string();
+    insert_network_job(
+        state,
+        &state.backfill_db,
+        &job_id,
+        None,
+        SourceChoice::Replay,
+        Some(after_seq),
+    )
+    .await?;
+    Ok(job_id)
+}
+
+async fn insert_network_job(
+    state: &AppState,
+    pool: &sqlx::AnyPool,
+    job_id: &str,
+    collection: Option<&str>,
+    source: SourceChoice,
+    replay_after_seq: Option<i64>,
+) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
         "INSERT INTO happyview_backfill_jobs \
-         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at) \
-         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 0, ?, ?)",
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source, replay_after_seq) \
+         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 0, ?, ?, ?, ?)",
         state.db_backend,
     );
-    crate::db::query(&sql)
-        .bind(&job_id)
-        .bind(collection)
-        .bind(&now)
-        .bind(&now)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
-
-    Ok(job_id)
+    crate::db::retry_on_busy(|| {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .bind(collection)
+            .bind(&now)
+            .bind(&now)
+            .bind(source.as_str())
+            .bind(replay_after_seq)
+            .execute(pool)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
+    Ok(())
 }
 
 pub(crate) async fn start_backfill(
@@ -3854,7 +3996,32 @@ pub(crate) async fn start_backfill(
     dids: Vec<String>,
     actor_did: &str,
 ) -> Result<String, AppError> {
-    let job_id = create_backfill_job(state, collection.as_deref(), &dids).await?;
+    start_backfill_with(
+        state,
+        collection,
+        dids,
+        actor_did,
+        state.archive.default_source,
+    )
+    .await
+}
+
+/// `start_backfill` with an explicit source.
+pub(crate) async fn start_backfill_with(
+    state: &AppState,
+    collection: Option<String>,
+    dids: Vec<String>,
+    actor_did: &str,
+    source: SourceChoice,
+) -> Result<String, AppError> {
+    // Account backfills always crawl, whatever the default (see
+    // `create_backfill`).
+    let source = if dids.is_empty() {
+        source
+    } else {
+        SourceChoice::Crawl
+    };
+    let job_id = create_backfill_job_with(state, collection.as_deref(), &dids, source).await?;
     let scope = if dids.is_empty() { "network" } else { "dids" };
 
     log_event(
@@ -3868,6 +4035,7 @@ pub(crate) async fn start_backfill(
                 "job_id": job_id.clone(),
                 "scope": scope,
                 "account_count": dids.len(),
+                "source": source.as_str(),
             }),
         },
         state.db_backend,
@@ -3891,6 +4059,13 @@ pub(crate) async fn start_automatic_backfill(
     collection: String,
     actor_did: &str,
 ) -> Result<Option<String>, AppError> {
+    if !state.config.auto_backfill {
+        tracing::info!(
+            collection = collection.as_str(),
+            "automatic backfill is off; not backfilling"
+        );
+        return Ok(None);
+    }
     start_backfill(state, Some(collection), Vec::new(), actor_did)
         .await
         .map(Some)
@@ -4008,7 +4183,14 @@ pub(super) async fn pause_backfill(
     }
 }
 
-/// POST /admin/backfill/{id}/resume — resume a paused backfill job.
+/// Why an account job's replay can't go on: its queue rows, which list its
+/// accounts, went with a detail flush or the retention sweep. Without them a
+/// replay would plan the whole network.
+const DIDS_GONE: &str = "the job's DID list is no longer available; start a new backfill";
+
+/// POST /admin/backfill/{id}/resume — resume a paused backfill job, or a
+/// failed replay job: its sweeps, cursors and retry rows say exactly where it
+/// stopped, so a transient failure doesn't throw away a long replay.
 pub(super) async fn resume_backfill(
     State(state): State<AppState>,
     admin: UserAuth,
@@ -4017,10 +4199,10 @@ pub(super) async fn resume_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT status, source, scope FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
+    let row: Option<(String, String, String)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.backfill_db)
         .await
@@ -4028,21 +4210,46 @@ pub(super) async fn resume_backfill(
 
     match row {
         None => Err(AppError::NotFound("backfill job not found".into())),
-        Some((status,)) if status != "paused" => Err(AppError::BadRequest(format!(
-            "job is not paused (status: {status})"
-        ))),
+        Some((status, source, _))
+            if status != "paused" && !(status == "failed" && source == "replay") =>
+        {
+            Err(AppError::BadRequest(format!(
+                "job is not paused (status: {status})"
+            )))
+        }
+        Some((status, _, scope))
+            if status == "failed"
+                && scope == "dids"
+                && replay_sweeps::job_dids(&state, &job_id)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("failed to read the job's accounts: {e}"))
+                    })?
+                    .is_empty() =>
+        {
+            Err(AppError::BadRequest(DIDS_GONE.into()))
+        }
         Some(_) => {
+            // A failed job has a `completed_at`; a paused one has none.
+            // Conditional, so of two resumes at once only one runs the job.
             let sql = adapt_sql(
-                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL WHERE id = ?",
+                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL, completed_at = NULL \
+                 WHERE id = ? AND (status = 'paused' OR (status = 'failed' AND source = 'replay'))",
                 state.db_backend,
             );
-            crate::db::retry_on_busy(|| {
+            let resumed = crate::db::retry_on_busy(|| {
                 crate::db::query(&sql)
                     .bind(&job_id)
                     .execute(&state.backfill_db)
             })
             .await
-            .map_err(|e| AppError::Internal(format!("failed to resume backfill job: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("failed to resume backfill job: {e}")))?
+            .rows_affected();
+            if resumed == 0 {
+                return Err(AppError::BadRequest(
+                    "job is not paused (it was resumed or changed meanwhile)".into(),
+                ));
+            }
 
             let spawn_state = state.clone();
             let spawn_job_id = job_id.clone();
@@ -4104,6 +4311,25 @@ pub(super) async fn backfill_status(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list backfill jobs: {e}")))?;
 
+    // The row above is at sqlx's tuple limit; the replay columns come apart.
+    #[allow(clippy::type_complexity)]
+    let replay_rows: Vec<(String, String, Option<i64>, Option<i64>, Option<i64>, i64, i32)> =
+        crate::db::query_as(&adapt_sql(
+            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs",
+            backend,
+        ))
+        .fetch_all(&state.backfill_db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list backfill jobs: {e}")))?;
+    #[allow(clippy::type_complexity)]
+    let mut replay: HashMap<String, (String, Option<i64>, Option<i64>, Option<i64>, i64, i32)> =
+        replay_rows
+            .into_iter()
+            .map(|(id, source, after, through, tip, bytes, failed)| {
+                (id, (source, after, through, tip, bytes, failed))
+            })
+            .collect();
+
     let jobs: Vec<BackfillJob> = rows
         .into_iter()
         .map(
@@ -4125,6 +4351,16 @@ pub(super) async fn backfill_status(
                 queue_version,
                 discovery_complete,
             )| {
+                let (source, after, through, tip, bytes, failed) = replay
+                    .remove(&id)
+                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0));
+                let replay = (source != "crawl").then_some(ReplayProgress {
+                    after_seq: after.unwrap_or(0),
+                    through_seq: through,
+                    tip_seq: tip,
+                    bytes,
+                    blocks_failed: failed,
+                });
                 BackfillJob {
                     id,
                     collection,
@@ -4144,6 +4380,8 @@ pub(super) async fn backfill_status(
                     recent_completions_limit: (QueueVersion::from_column(queue_version)
                         == QueueVersion::Bounded)
                         .then_some(RECENT_COMPLETIONS_PER_JOB),
+                    source,
+                    replay,
                 }
             },
         )
@@ -4190,6 +4428,7 @@ pub(super) async fn backfill_events(
                         | super::types::BackfillEvent::JobCounters { job_id, .. }
                         | super::types::BackfillEvent::JobStageChanged { job_id, .. }
                         | super::types::BackfillEvent::JobCompleted { job_id, .. }
+                        | super::types::BackfillEvent::ReplayProgress { job_id, .. }
                         | super::types::BackfillEvent::JobSnapshot { job_id, .. } => job_id,
                     };
                     if *event_job_id != job_id {
@@ -4667,18 +4906,109 @@ pub(super) async fn retry_failed_backfill(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT collection FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT collection, source, scope FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
-    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+    let row: Option<(Option<String>, String, String)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))?;
 
-    let Some((collection,)) = row else {
+    let Some((collection, source, scope)) = row else {
         return Err(AppError::NotFound("backfill job not found".into()));
     };
+
+    if source == "replay" {
+        if let Some(requested) = &body.kinds
+            && !requested.is_empty()
+            && !requested.iter().any(|k| k == "replay_block")
+        {
+            return Err(AppError::BadRequest(
+                "no retryable failures for this job".into(),
+            ));
+        }
+        let rows: Vec<(String, String)> = crate::db::query_as(&adapt_sql(
+            "SELECT did, phase FROM happyview_backfill_errors WHERE job_id = ? AND kind = 'replay_block'",
+            backend,
+        ))
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read block failures: {e}")))?;
+        let blocks: Vec<(String, i32)> = rows
+            .into_iter()
+            .filter_map(|(segment, phase)| match phase.as_str() {
+                "replay_segment" => Some((segment, -1)),
+                other => other
+                    .strip_prefix("replay_block:")
+                    .and_then(|i| i.parse().ok())
+                    .map(|i| (segment, i)),
+            })
+            .collect();
+        if blocks.is_empty() {
+            return Err(AppError::BadRequest(
+                "no retryable failures for this job".into(),
+            ));
+        }
+        let dids = if scope == "dids" {
+            let dids = replay_sweeps::job_dids(&state, &job_id)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to read the job's accounts: {e}"))
+                })?;
+            // A finished job's queue rows go with a detail flush or the
+            // retention sweep. Never widen an account job to the network.
+            if dids.is_empty() {
+                return Err(AppError::BadRequest(DIDS_GONE.into()));
+            }
+            dids
+        } else {
+            Vec::new()
+        };
+        let new_job_id = create_backfill_job_with(
+            &state,
+            collection.as_deref(),
+            &dids,
+            crate::jetstream::archive::SourceChoice::Replay,
+        )
+        .await?;
+        replay_sweeps::insert_retries(&state, &new_job_id, &blocks)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to record the blocks to retry: {e}"))
+            })?;
+
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "backfill.retry_started".to_string(),
+                severity: Severity::Info,
+                actor_did: Some(admin.did.clone()),
+                subject: collection.clone(),
+                detail: serde_json::json!({
+                    "job_id": new_job_id,
+                    "source_job_id": job_id,
+                    "source": "replay",
+                    "blocks": blocks.len(),
+                }),
+            },
+            backend,
+        )
+        .await;
+
+        // Spawned only now, so the driver finds the retries.
+        let spawn_state = state.clone();
+        let spawn_job_id = new_job_id.clone();
+        tokio::spawn(async move {
+            run_backfill_job(spawn_state, spawn_job_id).await;
+        });
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": new_job_id })),
+        ));
+    }
 
     let kinds: Vec<&'static str> = match &body.kinds {
         Some(requested) if !requested.is_empty() => requested
@@ -4721,7 +5051,14 @@ pub(super) async fn retry_failed_backfill(
 
     let dids: Vec<String> = dids.into_iter().map(|(did,)| did).collect();
     let new_job_id = Uuid::new_v4().to_string();
-    insert_targeted_job(&state, &new_job_id, collection.as_deref(), &dids).await?;
+    insert_targeted_job(
+        &state,
+        &new_job_id,
+        collection.as_deref(),
+        &dids,
+        SourceChoice::Crawl,
+    )
+    .await?;
 
     log_event(
         &state.db,
@@ -5001,6 +5338,24 @@ mod tests {
 
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
 
+    /// With automatic backfill off, nothing is queued: no job row, no task.
+    #[tokio::test]
+    async fn automatic_backfill_is_refused_when_off() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.config.auto_backfill = false;
+        let started = start_automatic_backfill(&state, "com.example.thing".into(), "did:plc:dev")
+            .await
+            .unwrap();
+        assert!(started.is_none());
+        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_backfill_jobs")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     const POST: &str = "app.test.post";
     const LIKE: &str = "app.test.like";
 
@@ -5010,6 +5365,98 @@ mod tests {
 
     async fn migrated_state() -> AppState {
         test_state_with_pool(crate::test_support::migrated_memory_pool().await)
+    }
+
+    #[tokio::test]
+    async fn a_gap_replay_job_row_is_created_with_its_floor() {
+        // A restart's resume must never see the job without its floor, or
+        // it would replay the whole archive from seq 0.
+        let mut states = vec![migrated_state().await];
+        if let Some(state) = crate::test_support::test_state_from_env().await {
+            states.push(state);
+        }
+        for state in states {
+            let job_id = create_gap_replay_job(&state, 20).await.expect("gap job");
+            let row: (Option<i64>, String, String, Option<String>) = crate::db::query_as(&adapt_sql(
+                "SELECT replay_after_seq, source, scope, collection FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind(&job_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("the job row");
+            assert_eq!(
+                row,
+                (Some(20), "replay".to_string(), "network".to_string(), None)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_columns_and_tables_exist_on_both_backends() {
+        let mut states = vec![migrated_state().await];
+        if let Some(state) = crate::test_support::test_state_from_env().await {
+            states.push(state);
+        }
+        for state in states {
+            seed_job(
+                &state,
+                "replay-schema",
+                None,
+                "network",
+                "pending",
+                2,
+                false,
+            )
+            .await;
+            let (source, bytes, failed): (String, i64, i32) = crate::db::query_as(&adapt_sql(
+                "SELECT source, replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .fetch_one(&state.db)
+            .await
+            .expect("replay columns");
+            assert_eq!((source.as_str(), bytes, failed), ("crawl", 0, 0));
+
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_backfill_replay_sweeps \
+                 (job_id, sweep, kind, collections, dids, after_seq, cursor_seq) \
+                 VALUES (?, 0, 'commits', '[]', NULL, ?, ?)",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .bind(40_000_000_000_i64)
+            .bind(40_000_000_000_i64)
+            .execute(&state.db)
+            .await
+            .expect("a seq past 2^31 fits");
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_backfill_replay_retries (job_id, segment, block_index) VALUES (?, 'seg_0000000001.jss', -1)",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .execute(&state.db)
+            .await
+            .expect("retries table");
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .execute(&state.db)
+            .await
+            .expect("delete job");
+            let left: i64 = crate::db::query_scalar(&adapt_sql(
+                "SELECT COUNT(*) FROM happyview_backfill_replay_sweeps WHERE job_id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .fetch_one(&state.db)
+            .await
+            .expect("count");
+            assert_eq!(left, 0, "sweeps cascade with their job");
+        }
     }
 
     async fn seed_legacy_repo(
@@ -6784,6 +7231,7 @@ mod tests {
                 collection: None,
                 did: Some("did:plc:legacy".into()),
                 dids: Some(vec!["did:plc:other".into()]),
+                source: None,
             }),
         )
         .await

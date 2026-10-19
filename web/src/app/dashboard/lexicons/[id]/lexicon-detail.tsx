@@ -291,6 +291,11 @@ export default function LexiconDetailPage() {
               Defined by <span className="font-mono">{projectPath}</span>. Edit
               that file to change this lexicon.
             </p>
+          ) : lexicon.declared ? (
+            <p className="text-muted-foreground text-sm self-center">
+              Declared in <span className="font-mono">happyview.toml</span>.
+              Remove it from the file to stop tracking it.
+            </p>
           ) : (
             hasPermission("lexicons:delete") && (
               <Button

@@ -40,6 +40,7 @@ import {
   stateFromScript,
 } from "../script-form";
 import { MigrateScriptDialog } from "../migrate-dialog";
+import { ScriptModulePanel } from "./script-module-panel";
 
 export default function ScriptDetail() {
   const pathname = usePathname();
@@ -177,6 +178,22 @@ export default function ScriptDetail() {
     labeler: "Label arrival",
     job: "Job runner",
   };
+
+  if (script?.module) {
+    return (
+      <>
+        <SiteHeader title={`Script: ${id}`} backHref={returnHref} />
+        <div className="flex flex-col gap-6 p-4 md:p-6">
+          {parsed && (
+            <div className="flex gap-2 items-baseline">
+              <Badge variant="outline">{TRIGGER_KIND_LABELS[parsed.kind]}</Badge>
+            </div>
+          )}
+          <ScriptModulePanel module={script.module} />
+        </div>
+      </>
+    );
+  }
 
   return (
     <>

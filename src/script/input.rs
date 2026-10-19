@@ -1,16 +1,20 @@
 //! What a runner knows about one invocation, and the input it becomes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::AppState;
+use crate::catalog::Layer;
 use crate::db::adapt_sql;
 use crate::lua::TriggerKind;
+use crate::lua::scripts::ResolvedScript;
 use crate::plugin::{
-    DEFAULT_SCRIPT_MEMORY_BYTES, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
-    ScriptJob, ScriptKind, ScriptLibraryRef, ScriptSpace,
+    DEFAULT_CHUNK_NAME, DEFAULT_SCRIPT_MEMORY_BYTES, ScriptExecuteContext, ScriptExecuteInput,
+    ScriptExecuteLimits, ScriptJob, ScriptKind, ScriptLibraryRef, ScriptSpace,
 };
+use crate::project::snapshot::{ProjectScript, ProjectSnapshot};
 
 /// Which runner is dispatching. A job run carries the job it reports to,
 /// because [`ScriptKind::Job`] and `context.job` are independent fields on the
@@ -21,7 +25,11 @@ pub enum Trigger<'a> {
     Label,
     XrpcQuery,
     XrpcProcedure,
-    Job { id: &'a str },
+    Job {
+        id: &'a str,
+    },
+    /// A test file, which reports to the test runner rather than to a trigger.
+    Test,
 }
 
 impl<'a> Trigger<'a> {
@@ -33,6 +41,7 @@ impl<'a> Trigger<'a> {
             Self::XrpcQuery => ScriptKind::XrpcQuery,
             Self::XrpcProcedure => ScriptKind::XrpcProcedure,
             Self::Job { .. } => ScriptKind::Job,
+            Self::Test => ScriptKind::Test,
         }
     }
 
@@ -62,6 +71,46 @@ impl<'a> Trigger<'a> {
     }
 }
 
+/// Where the script being run came from, which decides its chunk name, the
+/// artifact it may load, and what a relative import resolves against.
+#[derive(Clone, Copy)]
+pub enum ScriptOrigin<'a> {
+    /// A dashboard row: chunk `script`, no local modules.
+    Dashboard,
+    /// A project file, read from the snapshot its run pinned.
+    Project {
+        snapshot: &'a Arc<ProjectSnapshot>,
+        script: &'a ProjectScript,
+    },
+}
+
+impl<'a> ScriptOrigin<'a> {
+    /// The origin of a resolved script. A project-layer script is looked up
+    /// in the snapshot it was resolved in rather than the live one, so the
+    /// handler and every import come from one build.
+    pub fn of(script: &'a ResolvedScript) -> Self {
+        if !matches!(script.layer, Layer::Project) {
+            return Self::Dashboard;
+        }
+        match script.snapshot.scripts.get(&script.id) {
+            Some(project) => Self::Project {
+                snapshot: &script.snapshot,
+                script: project,
+            },
+            None => Self::Dashboard,
+        }
+    }
+}
+
+impl std::fmt::Debug for ScriptOrigin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dashboard => f.write_str("Dashboard"),
+            Self::Project { script, .. } => write!(f, "Project({})", script.path.display()),
+        }
+    }
+}
+
 /// One invocation, as the runner that fired it sees it. The three fields a
 /// script row supplies are its id (the trigger string), its `script_type` and
 /// its body; the rest is the event.
@@ -81,6 +130,7 @@ pub struct Invocation<'a> {
     pub params: Option<&'a HashMap<String, Value>>,
     pub delegate_did: Option<&'a str>,
     pub space: Option<&'a ScriptSpace>,
+    pub origin: ScriptOrigin<'a>,
 }
 
 /// Build the input for one invocation: the kind from the trigger, the context
@@ -126,32 +176,102 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
         },
         libraries,
         limits: ScriptExecuteLimits {
-            // A job has no instruction budget: running long is what a job is
-            // for, and `should_stop` is its stop.
+            // A job and a test file have no instruction budget: a job's stop
+            // is `should_stop`, and a test file is bounded by its guest
+            // deadline.
             instructions: match kind {
-                ScriptKind::Job => None,
-                _ => Some(state.script_limits.instruction_limit()),
+                ScriptKind::Job | ScriptKind::Test => None,
+                ScriptKind::XrpcQuery
+                | ScriptKind::XrpcProcedure
+                | ScriptKind::RecordEvent
+                | ScriptKind::Label => Some(state.script_limits.instruction_limit()),
             },
             memory_bytes: DEFAULT_SCRIPT_MEMORY_BYTES as u64,
         },
         // `execute_script_as` overrides the guard list with the host's own,
         // so sending one here would only mislead a reader.
         removed_globals: Vec::new(),
+        // `dispatch` attaches the artifact and the project chunk name once
+        // it knows which interpreter runs this.
+        chunk_name: DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 
-/// Script variables, which every kind of run reads as `ctx.env`.
+/// Script variables, which every kind of run reads as `ctx.env`: the
+/// database's, then the env file's over them.
 async fn load_env(state: &AppState) -> BTreeMap<String, String> {
     let sql = adapt_sql(
         "SELECT key, value FROM happyview_script_variables",
         state.db_backend,
     );
-    crate::db::query_as::<(String, String)>(&sql)
+    let mut env: BTreeMap<String, String> = crate::db::query_as::<(String, String)>(&sql)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default()
         .into_iter()
-        .collect()
+        .collect();
+    if let Some(path) = &state.config.script_env_file {
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => {
+                // A Windows editor's byte-order mark would otherwise become
+                // part of the first key, which a script then reads as nil.
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                let mut searched = 0;
+                for entry in dotenvy::from_read_iter(text.as_bytes()) {
+                    match entry {
+                        Ok((key, value)) => {
+                            env.insert(key, value);
+                        }
+                        // The error's text quotes the line, which is usually
+                        // a secret, so only its position is logged.
+                        Err(dotenvy::Error::LineParse(line, _)) => tracing::warn!(
+                            path = %path.display(),
+                            line = line_number(text, &line, &mut searched),
+                            "skipping an unparsable line in the script env file"
+                        ),
+                        Err(dotenvy::Error::Io(e)) => tracing::warn!(
+                            path = %path.display(),
+                            kind = %e.kind(),
+                            "could not read the script env file"
+                        ),
+                        Err(_) => tracing::warn!(
+                            path = %path.display(),
+                            "skipping an unreadable line in the script env file"
+                        ),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read the script env file"
+            ),
+        }
+    }
+    env
+}
+
+/// The 1-based line on which `logical` starts, searching line starts from
+/// `searched` onwards so a repeated bad line is not reported twice at the
+/// first one's position. dotenvy's parse error carries the line's text but
+/// not its number, and a quoted value can span several lines, so the text is
+/// matched rather than the entries counted. `None` when nothing matches.
+fn line_number(text: &str, logical: &str, searched: &mut usize) -> Option<usize> {
+    let mut start = *searched;
+    while start <= text.len() {
+        let at_line_start = start == 0 || text.as_bytes()[start - 1] == b'\n';
+        if at_line_start && text[start..].starts_with(logical) {
+            *searched = start + 1;
+            return Some(text[..start].matches('\n').count() + 1);
+        }
+        match text[start..].find('\n') {
+            Some(offset) => start += offset + 1,
+            None => break,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -169,6 +289,110 @@ mod tests {
         .await
         .expect("seed a script variable");
         state
+    }
+
+    /// The env file overlays the database's variables: its keys win, the
+    /// rest come through, and an edit is seen on the next run.
+    #[tokio::test]
+    async fn the_script_env_file_overlays_the_database() {
+        let mut state = state_with_one_variable().await;
+        crate::db::query(
+            "INSERT INTO happyview_script_variables (key, value) VALUES ('ONLY_DB', 'db')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(&file, "API_KEY=from-file\nONLY_FILE=file\n").unwrap();
+        state.config.script_env_file = Some(file.clone());
+
+        let env = load_env(&state).await;
+        assert_eq!(env["API_KEY"], "from-file");
+        assert_eq!(env["ONLY_DB"], "db");
+        assert_eq!(env["ONLY_FILE"], "file");
+
+        std::fs::write(&file, "API_KEY=edited\n").unwrap();
+        assert_eq!(load_env(&state).await["API_KEY"], "edited");
+    }
+
+    /// A configured file that does not exist yet is not an error: a project
+    /// starts without one.
+    #[tokio::test]
+    async fn a_missing_script_env_file_is_empty() {
+        let mut state = state_with_one_variable().await;
+        state.config.script_env_file = Some(std::path::PathBuf::from("/nonexistent/.env"));
+        assert_eq!(load_env(&state).await["API_KEY"], "k");
+    }
+
+    /// A Windows editor's byte-order mark is not part of the first key.
+    #[tokio::test]
+    async fn a_byte_order_mark_does_not_rename_the_first_key() {
+        let mut state = state_with_one_variable().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(&file, "\u{feff}FIRST=one\nSECOND=two\n").unwrap();
+        state.config.script_env_file = Some(file);
+
+        let env = load_env(&state).await;
+        assert_eq!(env.get("FIRST").map(String::as_str), Some("one"));
+        assert_eq!(env["SECOND"], "two");
+        assert!(!env.keys().any(|k| k.contains('\u{feff}')));
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A malformed line is usually a secret with a typo in it, so the
+    /// warning names its file and line and never its text.
+    #[tokio::test]
+    async fn a_malformed_line_is_logged_by_number_not_by_text() {
+        let mut state = state_with_one_variable().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(
+            &file,
+            "# comment\nGOOD=1\nBAD KEY=sk-live-spaced\nLATER=2\nSECRET=\"sk-live-unterminated\n",
+        )
+        .unwrap();
+        state.config.script_env_file = Some(file);
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let env = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            load_env(&state).await
+        };
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+        assert_eq!(env["GOOD"], "1");
+        assert_eq!(env["LATER"], "2");
+        assert!(!log.contains("sk-live"), "a value reached the log: {log}");
+        assert!(log.contains("line=3"), "got: {log}");
+        assert!(log.contains("line=5"), "got: {log}");
+    }
+
+    #[test]
+    fn a_repeated_bad_line_is_numbered_where_it_occurs() {
+        let text = "A B=1\nOK=1\nA B=1\n";
+        let mut searched = 0;
+        assert_eq!(line_number(text, "A B=1", &mut searched), Some(1));
+        assert_eq!(line_number(text, "A B=1", &mut searched), Some(3));
+        assert_eq!(line_number(text, "A B=1", &mut searched), None);
     }
 
     /// Install a library under `id` and `namespace`. Its surface is seeded into
@@ -235,6 +459,7 @@ mod tests {
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::Dashboard,
         }
     }
 
@@ -454,5 +679,20 @@ mod tests {
             assert_eq!(other.context.job, None, "{trigger:?}");
             assert!(other.limits.instructions.is_some(), "{trigger:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_test_file_run_has_no_instruction_budget_and_no_job() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        let input = json!(null);
+        let built = build_input(
+            &state,
+            &invocation("test:src/lib/a.test.lua", Trigger::Test, &input),
+        )
+        .await;
+        assert_eq!(built.kind, ScriptKind::Test);
+        assert_eq!(built.limits.instructions, None);
+        assert!(built.context.job.is_none());
+        assert_eq!(built.context.trigger, "test:src/lib/a.test.lua");
     }
 }

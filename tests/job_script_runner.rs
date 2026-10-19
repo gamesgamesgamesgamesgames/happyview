@@ -232,7 +232,7 @@ async fn a_job_hands_the_interpreter_its_input_its_job_and_no_instruction_budget
     let sent = result_of(&row);
 
     assert_eq!(sent["kind"], "job");
-    assert_eq!(sent["source"], "probe");
+    assert_eq!(echo_interpreter::script_text(&sent), "probe");
     assert_eq!(sent["input"], input);
     assert_eq!(sent["context"]["trigger"], format!("job.run:{TYPE}"));
     assert_eq!(sent["context"]["caller_did"], app.admin_did);
@@ -249,6 +249,74 @@ async fn a_job_hands_the_interpreter_its_input_its_job_and_no_instruction_budget
             "a job run has no {absent}: {sent}"
         );
     }
+}
+
+/// A job whose script is a project file runs as that file: its chunk is the
+/// path, and its imports resolve in the snapshot the run pinned.
+#[tokio::test]
+#[serial]
+async fn a_project_job_runs_as_its_file() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    let mut snap = happyview::project::snapshot::ProjectSnapshot::empty();
+    snap.scripts.insert(
+        format!("job.run:{TYPE}"),
+        happyview::project::snapshot::ProjectScript {
+            trigger: format!("job.run:{TYPE}"),
+            path: format!("src/jobs/{TYPE}.lua").into(),
+            language_id: "lua".into(),
+            body: happyview::project::snapshot::ScriptBody::Source {
+                source: std::sync::Arc::from("probe"),
+                artifact: None,
+            },
+            description: None,
+            outbound_xrpcs: Vec::new(),
+        },
+    );
+    happyview::project::build::install(&app.state, snap).await;
+    let id = seed_job(&app, TYPE, &json!({})).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    let sent = result_of(&row);
+    assert_eq!(sent["chunk_name"], format!("src/jobs/{TYPE}.lua"), "{sent}");
+    assert_eq!(sent["source"], "probe");
+}
+
+/// The `error` column is where an operator reads why a job failed, so a
+/// project job's failure names the file that raised it.
+#[tokio::test]
+#[serial]
+async fn a_failed_project_job_names_its_file() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    let mut snap = happyview::project::snapshot::ProjectSnapshot::empty();
+    snap.scripts.insert(
+        format!("job.run:{TYPE}"),
+        happyview::project::snapshot::ProjectScript {
+            trigger: format!("job.run:{TYPE}"),
+            path: format!("src/jobs/{TYPE}.lua").into(),
+            language_id: "lua".into(),
+            body: happyview::project::snapshot::ScriptBody::Source {
+                source: std::sync::Arc::from("error:runtime"),
+                artifact: None,
+            },
+            description: None,
+            outbound_xrpcs: Vec::new(),
+        },
+    );
+    happyview::project::build::install(&app.state, snap).await;
+    let id = seed_job(&app, TYPE, &json!({})).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error.expect("no error persisted");
+    assert!(
+        error.starts_with(&format!("runtime in src/jobs/{TYPE}.lua: ")),
+        "{error}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +601,48 @@ async fn a_job_with_inherited_auth_acts_as_its_creator() {
         "the run carried no session at all: {error}"
     );
     assert!(error.contains("DPoP session"), "{error}");
+}
+
+/// In a test run an inheriting job carries no DPoP ids and acts through the
+/// in-process PDS.
+#[tokio::test]
+#[serial]
+async fn a_test_runs_inheriting_job_writes_through_the_in_process_pds() {
+    common::require_db!();
+    require_echo!();
+    let mut app = app().await;
+    if !install_caller_library(&app).await {
+        return;
+    }
+    let harness = std::sync::Arc::new(happyview::testing::TestHarness::new("a.test.lua"));
+    app.state.test = Some(harness.clone());
+    seed_script(&app, TYPE, "host:require").await;
+    let id = seed_job_as(&app, TYPE, &create_record_call(), true, None, None).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    let writes = harness.pds().writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].repo, app.admin_did);
+}
+
+/// Outside a test run the same job looks for its creator's OAuth session.
+#[tokio::test]
+#[serial]
+async fn an_inheriting_job_without_dpop_ids_looks_up_an_oauth_session() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    if !install_caller_library(&app).await {
+        return;
+    }
+    seed_script(&app, TYPE, "host:require").await;
+    let id = seed_job_as(&app, TYPE, &create_record_call(), true, None, None).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error.expect("no error persisted");
+    assert!(error.contains("failed to obtain PDS auth"), "{error}");
 }
 
 #[tokio::test]

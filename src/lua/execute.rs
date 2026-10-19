@@ -7,12 +7,12 @@ use std::time::Instant;
 
 use crate::AppState;
 use crate::auth::Claims;
-use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType};
+use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, file_of};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
-use crate::script::{DispatchError, Invocation, dispatch};
+use crate::script::{DispatchError, Invocation, ScriptOrigin, dispatch};
 use crate::telemetry::counters::Counters;
 
 use super::context;
@@ -87,6 +87,7 @@ fn script_error(
     error_type: ScriptErrorType,
     message: String,
     line: Option<u32>,
+    file: Option<String>,
 ) -> AppError {
     AppError::ScriptError {
         error_type,
@@ -96,6 +97,7 @@ fn script_error(
         },
         method: method.to_string(),
         line,
+        file,
     }
 }
 
@@ -116,10 +118,13 @@ fn returned_value(
             message,
             line,
             raw,
+            chunk,
         }) => {
             let error = auth_error(&[&message, &raw])
                 .or_else(|| invalid_cursor_error(&[&message, &raw]))
-                .unwrap_or_else(|| script_error(method, kind.into(), message, line));
+                .unwrap_or_else(|| {
+                    script_error(method, kind.into(), message, line, file_of(chunk))
+                });
             Err((raw, error))
         }
         // An endpoint whose interpreter is absent cannot answer until an
@@ -142,10 +147,10 @@ fn returned_value(
             let raw = e.to_string();
             let error = auth_error(&[&raw]).unwrap_or_else(|| match &e {
                 DispatchError::Execution(ExecutionError::Timeout) => {
-                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None)
+                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None, None)
                 }
                 DispatchError::Execution(ExecutionError::MemoryLimit { .. }) => {
-                    script_error(method, ScriptErrorType::Memory, raw.clone(), None)
+                    script_error(method, ScriptErrorType::Memory, raw.clone(), None, None)
                 }
                 _ => AppError::Internal(raw.clone()),
             });
@@ -186,7 +191,9 @@ pub async fn execute_procedure_script(
     let script_source = script.body.clone();
     let input_json = input.clone();
 
-    let pds_auth: Option<repo::PdsAuth> = if let Some(client_key) = claims.client_key() {
+    let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
+        Some(auth)
+    } else if let Some(client_key) = claims.client_key() {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -262,6 +269,7 @@ pub async fn execute_procedure_script(
             params: Some(params),
             delegate_did,
             space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
         },
         caller_session,
     )
@@ -383,6 +391,7 @@ pub async fn execute_query_script(
             params: None,
             delegate_did: None,
             space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
         },
         None,
     )
@@ -505,6 +514,7 @@ mod tests {
             message: message.to_string(),
             line: Some(7),
             raw: format!("[string \"script\"]:7: {message}"),
+            chunk: None,
         })
     }
 
@@ -576,6 +586,7 @@ mod tests {
                     message,
                     method,
                     line,
+                    ..
                 } => {
                     assert_eq!(error_type, expected, "{kind:?}");
                     assert_eq!(message, "attempt to index a nil value (local 't')");
@@ -661,6 +672,7 @@ mod tests {
                 raw: format!(
                     "[string \"script\"]:4: {LUA_AUTH_ERROR_PREFIX}DPoP session not found"
                 ),
+                chunk: None,
             }),
         )
         .expect_err("a failed run has no value");
@@ -874,5 +886,80 @@ mod tests {
             1,
             "script.executed must still be logged when verbose event logging is on"
         );
+    }
+
+    #[test]
+    fn a_failure_in_a_project_file_names_the_file() {
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(12),
+            raw: "src/lib/format.lua:12: boom".into(),
+            chunk: Some("src/lib/format.lua".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        match error {
+            AppError::ScriptError { file, line, .. } => {
+                assert_eq!(file.as_deref(), Some("src/lib/format.lua"));
+                assert_eq!(line, Some(12));
+            }
+            other => panic!("expected a script error, got {other:?}"),
+        }
+    }
+
+    /// A panic's location travels as `chunk` and `line`, so the caller reads
+    /// the file once: in the sentence, and once more in the body's own field.
+    #[tokio::test]
+    async fn a_panic_names_its_file_once() {
+        const PLACED: &str = "modules/registry/src/lib.rs";
+        let report = happyview_plugin_sdk::wire::PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 3,
+            column: 1,
+        };
+        let outcome = Ok(crate::plugin::executor::panic_output(
+            report,
+            Some(std::path::Path::new("modules/registry")),
+        ));
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        let sentence = error.to_string();
+        assert_eq!(
+            sentence,
+            format!("script runtime error in com.example.probe at {PLACED}:3: boom")
+        );
+
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(body["message"], "boom");
+        assert_eq!(body["file"], PLACED);
+        assert_eq!(body["line"], 3);
+        assert_eq!(body.to_string().matches(PLACED).count(), 1, "{body}");
+    }
+
+    /// A dashboard script is chunk `script`, which names no file anyone can
+    /// open; its error must read exactly as it did before chunks had paths.
+    #[test]
+    fn a_dashboard_failure_names_no_file() {
+        assert_eq!(file_of(Some("script".into())), None);
+        assert_eq!(file_of(None), None);
+        assert_eq!(file_of(Some("src/a.lua".into())), Some("src/a.lua".into()));
+
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(7),
+            raw: "[string \"script\"]:7: boom".into(),
+            chunk: Some("script".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "script runtime error in com.example.probe at line 7: boom"
+        );
+        assert!(matches!(error, AppError::ScriptError { file: None, .. }));
     }
 }

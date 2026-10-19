@@ -156,6 +156,7 @@ pub(super) async fn preview(
         &state.config.database_url,
         &c,
         &state.telemetry_counters,
+        &state.lexicons,
     )
     .await
     .ok_or_else(|| AppError::Internal("failed to assemble telemetry preview".to_string()))?;

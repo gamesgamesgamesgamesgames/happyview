@@ -926,6 +926,8 @@ fn catalogue_entry(
                 body: String::new(),
             })
             .collect(),
+        sections: Default::default(),
+        banner_url: None,
     }
 }
 

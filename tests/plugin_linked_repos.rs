@@ -543,15 +543,19 @@ const CREATE_GAME: &str = "games.gamesgamesgamesgames.createGame";
 /// rather than through it — the same thing `src/plugin/host/jobs.rs`'s own
 /// unit tests do, since those run inside the crate and could reach it.
 async fn job_dpop_fields(app: &TestApp, id: &str) -> (bool, Option<String>, Option<String>) {
+    // Cast as `jobs::db` does: the Any driver cannot decode SQLite's boolean.
     let sql = happyview::db::adapt_sql(
-        "SELECT inherit_auth, api_client_id, dpop_key_id FROM happyview_jobs WHERE id = ?",
+        "SELECT CAST(inherit_auth AS INTEGER), api_client_id, dpop_key_id \
+         FROM happyview_jobs WHERE id = ?",
         app.state.db_backend,
     );
-    happyview::db::query_as(&sql)
-        .bind(id)
-        .fetch_one(&app.state.db)
-        .await
-        .expect("job row should exist")
+    let (inherit_auth, api_client_id, dpop_key_id): (i64, Option<String>, Option<String>) =
+        happyview::db::query_as(&sql)
+            .bind(id)
+            .fetch_one(&app.state.db)
+            .await
+            .expect("job row should exist");
+    (inherit_auth != 0, api_client_id, dpop_key_id)
 }
 
 #[tokio::test]

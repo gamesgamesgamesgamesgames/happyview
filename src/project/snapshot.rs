@@ -26,6 +26,10 @@ pub struct ProjectSnapshot {
     /// By project-relative path (`src/...`). Filled only by a build that
     /// includes tests.
     pub tests: BTreeMap<String, ProjectScript>,
+    /// Compiled modules by hex sha256. A `ScriptBody::Module` names its
+    /// module by this hash, so a run that pinned this snapshot keeps running
+    /// the bytes it resolved after a rebuild replaces them.
+    pub script_modules: BTreeMap<String, Arc<crate::project::script_module::ScriptModule>>,
 }
 
 impl ProjectSnapshot {
@@ -55,7 +59,20 @@ pub struct ProjectScript {
 
 #[derive(Debug, Clone)]
 pub enum ScriptBody {
-    Source { source: Arc<str> },
+    Source {
+        source: Arc<str>,
+        /// What the file's interpreter prepared from `source`, stamped with
+        /// that interpreter's build. `None` until the build prepares it, and
+        /// for an interpreter that cannot.
+        artifact: Option<crate::plugin::PreparedArtifact>,
+    },
+    /// A handler of a compiled module, which has no source to prepare.
+    Module {
+        /// The `[modules.<name>]` key.
+        module: String,
+        /// Hex sha256 of the build that was loaded.
+        hash: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +81,7 @@ pub struct ProjectModule {
     pub path: PathBuf,
     pub language_id: String,
     pub source: Arc<str>,
+    pub artifact: Option<crate::plugin::PreparedArtifact>,
 }
 
 /// How `AppState` and the catalogs hold the current snapshot. A reader that
@@ -87,6 +105,7 @@ mod tests {
         assert!(snap.scripts.is_empty());
         assert!(snap.modules.is_empty());
         assert!(snap.tests.is_empty());
+        assert!(snap.script_modules.is_empty());
     }
 
     /// What lets a run pin a build: an `Arc` taken before a swap keeps

@@ -227,7 +227,7 @@ async fn a_query_hands_the_interpreter_its_params_and_its_context() {
     assert_eq!(resp.status(), StatusCode::OK);
     let sent = json_body(resp).await;
 
-    assert_eq!(sent["source"], "echo");
+    assert_eq!(echo_interpreter::script_text(&sent), "echo");
     assert_eq!(sent["kind"], "xrpc_query");
     assert_eq!(sent["input"]["limit"], 5);
     assert_eq!(sent["context"]["trigger"], format!("xrpc.query:{QUERY}"));
@@ -845,7 +845,7 @@ async fn a_project_script_answers_a_query_ahead_of_its_row() {
         happyview::project::ProjectSnapshot::empty(),
     ));
     let sent = json_body(call_query(&app, "").await).await;
-    assert_eq!(sent["source"], "row");
+    assert_eq!(echo_interpreter::script_text(&sent), "row");
 }
 
 #[tokio::test]
