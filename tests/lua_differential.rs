@@ -81,7 +81,7 @@ const NAMESPACES: [&str; 10] = [
 /// plugin's own `src/ctx.rs`.
 const EXCLUDED: [&str; 1] = ["bridge/job.controls.lua"];
 
-/// The two cases the paths answer differently, and why.
+/// The cases the paths answer differently, and why.
 ///
 /// `bridge/query.builtins.lua` lists the members of the `os` table, and
 /// `os.clock` is in the native sandbox's and absent from the plugin's:
@@ -130,8 +130,8 @@ const ZONE_DEPENDENT: [&str; 2] = [
 /// The case that differs **only when the plugin has `internal.async`**.
 ///
 /// It prints the "built-in modules are: …" sentence, and the plugin's list
-/// names `internal.async` from 1.1.0 on, which the native runner does not
-/// implement and never will. The harness asks the plugin under test whether it
+/// names `internal.async` once the plugin has it, which the native runner
+/// does not implement and never will. The harness asks the plugin under test whether it
 /// has the module, as it asks the native runner for its zone, so an older
 /// module that agrees here is not reported as a closed difference.
 const ASYNC_DEPENDENT: [&str; 1] = ["bridge/query.require_rules.lua"];
