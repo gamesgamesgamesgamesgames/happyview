@@ -173,7 +173,7 @@ pub async fn insert_rule(
             if e.as_database_error()
                 .is_some_and(|d| d.is_unique_violation())
             {
-                AppError::Conflict(format!("a default for {stored} already exists"))
+                AppError::Conflict(format!("a rule for {stored} already exists"))
             } else {
                 rule_write_error("failed to create lexicon publish rule", e)
             }

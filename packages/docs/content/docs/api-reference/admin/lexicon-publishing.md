@@ -2,9 +2,9 @@
 title: "Lexicon Publishing"
 ---
 
-Admin API endpoints for publishing lexicons as `com.atproto.lexicon.schema` records and managing the defaults that decide where they go. For the concepts, DNS requirements and dashboard, see [Publishing Lexicons](../../guides/publishing-lexicons.md).
+Admin API endpoints for publishing lexicons as `com.atproto.lexicon.schema` records and managing the rules that decide where they go. For the concepts, DNS requirements and dashboard, see [Publishing Lexicons](../../guides/publishing-lexicons.md).
 
-All endpoints are under `/admin/lexicon-publishing`. Reads need `lexicons:read` and writes need `lexicons:publish`. Choosing a linked repo as a default's target also needs `linked-repos:read`; for a caller without it, every linked-repo target in a response keeps `kind`, `available` and `can_unpublish` and has `linked_repo_id`, `did`, `handle` and `unavailable_reason` set to `null`, as does a linked-repo rule's own `linked_repo_id`. Errors use the usual body, `{"error": "<message>"}`.
+All endpoints are under `/admin/lexicon-publishing`. Reads need `lexicons:read` and writes need `lexicons:publish`. Choosing a linked repo as a rule's target also needs `linked-repos:read`; for a caller without it, every linked-repo target in a response keeps `kind`, `available` and `can_unpublish` and has `linked_repo_id`, `did`, `handle` and `unavailable_reason` set to `null`, as does a linked-repo rule's own `linked_repo_id`. Errors use the usual body, `{"error": "<message>"}`.
 
 ```sh
 # All examples assume $TOKEN is an API key (hv_...)
@@ -29,7 +29,7 @@ A **target** is a place a lexicon can be published:
 
 `kind` is `instance` or `linked_repo`. `available` is false when nothing can be written there now, and `unavailable_reason` says why. `can_unpublish` is true when the target can also delete records.
 
-A **rule** (a publishing default):
+A **rule**:
 
 | Field            | Type        | Description                                                                 |
 | ---------------- | ----------- | --------------------------------------------------------------------------- |
@@ -84,10 +84,10 @@ GET /admin/lexicon-publishing
 }
 ```
 
-- `usable`: whether any target can publish, or can remove a record HappyView put there. The dashboard keeps the publishing page closed while it's `false`.
+- `usable`: whether any target can publish, or can remove a record HappyView put there. While it's `false`, the dashboard's publishing page shows what to set up instead of its rules.
 - `targets`: the instance first, then one per linked repo.
 - `rules`: most specific first.
-- `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no default matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `withdrawn`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed. `withdrawn_at` is set when the lexicon was unpublished and has not been published since; such a lexicon reports `withdrawn` (unless no default matches or its target is unavailable) and auto-publish skips it.
+- `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no rule matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `withdrawn`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed. `withdrawn_at` is set when the lexicon was unpublished and has not been published since; such a lexicon reports `withdrawn` (unless no rule matches or its target is unavailable) and auto-publish skips it.
 
 - `orphans`: publication rows, in the same shape as `publication`, for records still in a repo whose lexicon is no longer publishable, such as one deleted after it was published. [Unpublish](#unpublish) works on them as on any other.
 
@@ -116,20 +116,6 @@ Looks up `_lexicon.<authority>` for every distinct authority among the publishab
 
 `did` is `null` when there's no TXT record. `error` is set when the lookup itself failed, such as a timeout. Compare `did` with each lexicon's target DID to see what needs adding.
 
-## Check availability
-
-```http
-GET /admin/lexicon-publishing/availability
-```
-
-**Permission:** `lexicons:read`
-
-The overview's `usable` without building every lexicon's status, which the dashboard asks for on each navigation.
-
-```json
-{ "usable": true }
-```
-
 ## Check one lexicon's DNS
 
 ```http
@@ -151,9 +137,9 @@ Looks up the `_lexicon` record for one lexicon's authority, with the same five-s
 }
 ```
 
-`expected_did` is the DID of the account the lexicon's default publishes to, or failing that the account already holding its record. It's `null` for a lexicon HappyView doesn't publish, or when neither is known. Without `linked-repos:read`, a default's linked repo isn't named, so `expected_did` then comes only from a publication. An invalid NSID is a `400`.
+`expected_did` is the DID of the account the lexicon's rule publishes to, or failing that the account already holding its record. It's `null` for a lexicon HappyView doesn't publish, or when neither is known. Without `linked-repos:read`, a rule's linked repo isn't named, so `expected_did` then comes only from a publication. An invalid NSID is a `400`.
 
-## Create a default
+## Create a rule
 
 ```http
 POST /admin/lexicon-publishing/rules
@@ -185,11 +171,11 @@ Returns `201` with the rule and its target.
 | ------ | ----------------------------------------------------------------------------------------- |
 | `400`  | A malformed pattern, an unknown `target_kind`, a missing or unknown `linked_repo_id`, or a target that is unavailable (the body gives its reason) |
 | `403`  | The target is a linked repo and the caller lacks `linked-repos:read` |
-| `409`  | A default for this pattern already exists. Patterns are compared after normalisation, so `COM.EXAMPLE.*` collides with `com.example.*` |
+| `409`  | A rule for this pattern already exists. Patterns are compared after normalisation, so `COM.EXAMPLE.*` collides with `com.example.*` |
 
 After a successful create, HappyView starts an auto-publish run in the background.
 
-## Update a default
+## Update a rule
 
 ```http
 PATCH /admin/lexicon-publishing/rules/{id}
@@ -197,11 +183,11 @@ PATCH /admin/lexicon-publishing/rules/{id}
 
 **Permission:** `lexicons:publish`
 
-Any of `target_kind`, `linked_repo_id` and `auto_publish`. The pattern can't change; delete the default and add another. The target is re-validated only when it changes, so you can still turn off auto-publish on a default whose linked repo has gone away. Switching to `instance` clears `linked_repo_id`.
+Any of `target_kind`, `linked_repo_id` and `auto_publish`. The pattern can't change; delete the rule and add another. The target is re-validated only when it changes, so you can still turn off auto-publish on a rule whose linked repo has gone away. Switching to `instance` clears `linked_repo_id`.
 
 Returns `200` with the rule and its target, `403` when it changes the target to a linked repo without `linked-repos:read`, or `404` for an unknown ID.
 
-## Delete a default
+## Delete a rule
 
 ```http
 DELETE /admin/lexicon-publishing/rules/{id}
@@ -209,7 +195,7 @@ DELETE /admin/lexicon-publishing/rules/{id}
 
 **Permission:** `lexicons:publish`
 
-Returns `204`, or `404` for an unknown ID. Records already published are left alone, and an auto-publish run starts in the background, since a broader default may now cover the lexicons this one did.
+Returns `204`, or `404` for an unknown ID. Records already published are left alone, and an auto-publish run starts in the background, since a broader rule may now cover the lexicons this one did.
 
 ## Publish
 

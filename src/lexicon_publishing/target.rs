@@ -8,13 +8,13 @@ use crate::linked_repos::scope::{self, RepoAction};
 use crate::linked_repos::types::{LinkedRepo, STATUS_ACTIVE, STATUS_NEEDS_REAUTH};
 use crate::service_identity::{self, IdentityMode};
 
+use super::SCHEMA_COLLECTION;
 use super::store::Rule;
-use super::{SCHEMA_COLLECTION, SCHEMA_WRITE_SCOPE};
 
 pub const KIND_INSTANCE: &str = "instance";
 pub const KIND_LINKED_REPO: &str = "linked_repo";
 
-pub const REMOVED_LINKED_REPO: &str = "the linked repo this default used was removed";
+pub const REMOVED_LINKED_REPO: &str = "the linked repo this rule used was removed";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetInfo {
@@ -119,7 +119,7 @@ pub fn attached_account_target(did: String, session: Option<Option<String>>) -> 
         None => {
             return TargetInfo::unavailable(
                 KIND_INSTANCE,
-                "the attached account has no session; sign it in again from Service Identity",
+                "the attached account needs to sign in again from Service Identity",
             );
         }
         Some(granted) => granted,
@@ -133,11 +133,8 @@ pub fn attached_account_target(did: String, session: Option<Option<String>>) -> 
     if !(allows(RepoAction::Create) && allows(RepoAction::Update)) {
         return TargetInfo::unavailable(
             KIND_INSTANCE,
-            format!(
-                "the attached account's session cannot write {SCHEMA_COLLECTION} records ({}); \
-                 re-authenticate it from Service Identity to grant {SCHEMA_WRITE_SCOPE}",
-                granted_phrase(granted.as_deref().unwrap_or_default())
-            ),
+            "the attached account hasn't granted permission to write lexicon records. \
+             Re-authenticate it from Service Identity",
         );
     }
     TargetInfo {
@@ -148,14 +145,6 @@ pub fn attached_account_target(did: String, session: Option<Option<String>>) -> 
         available: true,
         unavailable_reason: None,
         can_unpublish: allows(RepoAction::Delete),
-    }
-}
-
-fn granted_phrase(granted: &str) -> String {
-    if granted.trim().is_empty() {
-        "it granted no scopes".to_string()
-    } else {
-        format!("it granted: {}", granted.trim())
     }
 }
 
@@ -213,17 +202,16 @@ pub fn linked_repo_target(grant: &LinkedRepo, granted_scope: Option<&str>) -> Ta
     } else if grant.status != STATUS_ACTIVE {
         Some(format!("this linked repo is {}", grant.status))
     } else if !writes(&requested) {
-        Some(format!(
-            "this linked repo's grant cannot write {SCHEMA_COLLECTION} records; add it again \
-             with repo:{SCHEMA_COLLECTION}?action=create&action=update"
-        ))
+        Some(
+            "this linked repo doesn't have permission to write lexicon records. Remove it and \
+             link it again with the Lexicon publishing preset"
+                .to_string(),
+        )
     } else if !writes(effective) {
-        Some(format!(
-            "the PDS granted fewer scopes than this linked repo asked for ({}). It may have \
-             cached HappyView's client details before this grant existed; link the repo again \
-             later",
-            granted_phrase(granted_scope.unwrap_or_default())
-        ))
+        Some(
+            "this linked repo's PDS granted less access than requested. Try linking it again later"
+                .to_string(),
+        )
     } else {
         None
     };

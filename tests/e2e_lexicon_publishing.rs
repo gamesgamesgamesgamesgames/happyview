@@ -75,7 +75,7 @@ async fn duplicate_pattern_is_a_conflict() {
         .await
         .unwrap_err();
     match err {
-        AppError::Conflict(msg) => assert_eq!(msg, "a default for * already exists"),
+        AppError::Conflict(msg) => assert_eq!(msg, "a rule for * already exists"),
         other => panic!("expected conflict, got {other:?}"),
     }
 }
@@ -357,7 +357,7 @@ fn linked_repo_target_reads_the_grant_status_and_scopes() {
         create_only
             .unavailable_reason
             .unwrap()
-            .contains("repo:com.atproto.lexicon.schema?action=create&action=update")
+            .contains("doesn't have permission to write lexicon records")
     );
 
     let no_delete = linked_repo_target(
@@ -403,12 +403,16 @@ fn a_granted_scope_narrower_than_the_request_decides() {
         Some(FULL_SCOPE),
     );
     assert!(!unasked.available);
-    assert!(unasked.unavailable_reason.unwrap().contains("add it again"));
+    assert!(
+        unasked
+            .unavailable_reason
+            .unwrap()
+            .contains("link it again")
+    );
 }
 
-const GRANTED_FEWER_ATPROTO: &str = "the PDS granted fewer scopes than this linked repo asked \
-     for (it granted: atproto). It may have cached HappyView's client details before this grant \
-     existed; link the repo again later";
+const GRANTED_FEWER_ATPROTO: &str =
+    "this linked repo's PDS granted less access than requested. Try linking it again later";
 
 async fn seed_linked_session(s: &happyview::AppState, did: &str, scope: Option<&str>) {
     let session = serde_json::json!({
@@ -482,7 +486,7 @@ async fn linked_repo_targets_judge_by_the_scope_in_the_stored_session() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body.to_string().contains("granted fewer scopes"), "{body}");
+    assert!(body.to_string().contains("granted less access"), "{body}");
 }
 
 #[tokio::test]
@@ -516,7 +520,7 @@ async fn publish_without_a_rule_records_the_failure() {
     assert!(!outcome.ok);
     assert_eq!(
         outcome.error.as_deref(),
-        Some("no publishing default covers com.example.norule")
+        Some("no publishing rule covers com.example.norule")
     );
     let row = store::get_publication(s, "com.example.norule")
         .await
@@ -524,7 +528,7 @@ async fn publish_without_a_rule_records_the_failure() {
         .unwrap();
     assert_eq!(
         row.last_error.as_deref(),
-        Some("no publishing default covers com.example.norule")
+        Some("no publishing rule covers com.example.norule")
     );
     assert_eq!(row.did, None);
     assert_eq!(
@@ -656,13 +660,13 @@ async fn a_rule_whose_linked_repo_was_removed_never_falls_back_to_a_broader_rule
     assert_eq!(target.did, None);
     assert_eq!(
         target.unavailable_reason.as_deref(),
-        Some("the linked repo this default used was removed")
+        Some("the linked repo this rule used was removed")
     );
 
     let outcome = publish(s, nsid, None).await;
     assert_eq!(
         outcome.error.as_deref(),
-        Some("the linked repo this default used was removed")
+        Some("the linked repo this rule used was removed")
     );
 
     // The fallback grant would have been marked needs_reauth had anything
@@ -1166,7 +1170,7 @@ async fn publish_validates_the_batch_and_reports_each_failure() {
             "ok": false,
             "uri": null,
             "cid": null,
-            "error": "no publishing default covers com.example.batch",
+            "error": "no publishing rule covers com.example.batch",
         }]})
     );
 
@@ -1311,18 +1315,14 @@ async fn publishing_is_usable_only_once_some_account_can_take_a_publish() {
     let app = TestApp::new().await;
     let s = &app.state;
 
-    let (status, body) = call(&app, "GET", &format!("{BASE}/availability"), None).await;
+    let (status, body) = call(&app, "GET", BASE, None).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, json!({"usable": false}));
-    let (_, body) = call(&app, "GET", BASE, None).await;
     assert_eq!(body["usable"], false, "{body}");
 
     let did = "did:plc:usablerepo";
     active_grant(s, did, FULL_SCOPE).await;
     seed_linked_session(s, did, Some(FULL_SCOPE)).await;
 
-    let (_, body) = call(&app, "GET", &format!("{BASE}/availability"), None).await;
-    assert_eq!(body, json!({"usable": true}));
     let (_, body) = call(&app, "GET", BASE, None).await;
     assert_eq!(body["usable"], true, "{body}");
 }
@@ -1443,7 +1443,7 @@ async fn the_instance_target_is_judged_by_the_scope_the_attached_session_granted
     assert!(!none.available && !none.can_unpublish);
     assert_eq!(
         none.unavailable_reason.as_deref(),
-        Some("the attached account has no session; sign it in again from Service Identity")
+        Some("the attached account needs to sign in again from Service Identity")
     );
 
     seed_attached_session(s, "atproto identity:*").await;
@@ -1452,9 +1452,8 @@ async fn the_instance_target_is_judged_by_the_scope_the_attached_session_granted
     assert_eq!(
         identity_only.unavailable_reason.as_deref(),
         Some(
-            "the attached account's session cannot write com.atproto.lexicon.schema records \
-             (it granted: atproto identity:*); re-authenticate it from Service Identity to grant \
-             repo:com.atproto.lexicon.schema?action=create&action=update&action=delete"
+            "the attached account hasn't granted permission to write lexicon records. \
+             Re-authenticate it from Service Identity"
         )
     );
 
@@ -1464,7 +1463,7 @@ async fn the_instance_target_is_judged_by_the_scope_the_attached_session_granted
         empty
             .unavailable_reason
             .unwrap()
-            .contains("(it granted no scopes)")
+            .contains("hasn't granted permission to write lexicon records")
     );
 
     seed_attached_session(
@@ -1506,7 +1505,7 @@ async fn an_instance_rule_needs_the_schema_scope_on_the_attached_session() {
     assert_eq!(status, 400, "{body}");
     assert!(
         body.to_string()
-            .contains("re-authenticate it from Service Identity"),
+            .contains("Re-authenticate it from Service Identity"),
         "{body}"
     );
 

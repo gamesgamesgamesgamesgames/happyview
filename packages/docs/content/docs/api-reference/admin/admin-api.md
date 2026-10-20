@@ -45,7 +45,7 @@ AUTH="Authorization: Bearer $TOKEN"
 | Group | Description |
 | ----- | ----------- |
 | [Lexicons](lexicons.md) | Upload, list, get, and delete lexicons and network lexicons |
-| [Lexicon Publishing](lexicon-publishing.md) | Publish lexicons to the network and manage publishing defaults |
+| [Lexicon Publishing](lexicon-publishing.md) | Publish lexicons to the network and manage publishing rules |
 | [Stats](stats.md) | Record counts by collection |
 | [Backfill](backfill.md) | Create and monitor historical backfill jobs |
 | [Event Logs](events.md) | Query the audit trail of system events |

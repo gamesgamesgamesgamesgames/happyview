@@ -214,7 +214,7 @@ impl Permission {
             Self::LexiconsPublish => PermissionInfo {
                 key: "lexicons:publish",
                 name: "Publish Lexicons",
-                description: "Publish lexicons to the network and manage publishing defaults",
+                description: "Publish lexicons to the network and manage publishing rules",
                 category: "Lexicons",
             },
             Self::RecordsRead => PermissionInfo {

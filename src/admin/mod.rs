@@ -56,10 +56,6 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
         )
         .route("/lexicon-publishing", get(lexicon_publishing::overview))
-        .route(
-            "/lexicon-publishing/availability",
-            get(lexicon_publishing::availability),
-        )
         .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
         .route(
             "/lexicon-publishing/dns/{nsid}",

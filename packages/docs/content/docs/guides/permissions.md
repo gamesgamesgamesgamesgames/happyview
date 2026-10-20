@@ -15,7 +15,7 @@ HappyView defines 51 permissions organized by category:
 | `lexicons:create` | Upload and register new lexicon schemas |
 | `lexicons:read`   | View registered lexicon schemas      |
 | `lexicons:delete` | Remove lexicon schemas               |
-| `lexicons:publish` | Publish lexicons to the network and manage publishing defaults |
+| `lexicons:publish` | Publish lexicons to the network and manage publishing rules |
 
 ### Records
 

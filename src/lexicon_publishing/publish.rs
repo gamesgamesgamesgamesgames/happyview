@@ -17,9 +17,9 @@ use super::target::{self, KIND_INSTANCE, TargetInfo};
 use super::{PublishStatus, SCHEMA_COLLECTION, best_match, record_cid, schema_record};
 
 const SIGN_IN_AGAIN: &str = "the attached account needs to sign in again";
-const SCOPE_REFUSED: &str = "the attached account's PDS refused the write for lack of scope; \
-     re-authenticate the attached account from Service Identity to grant it";
-const WITHDRAWN: &str = "unpublished by hand, so auto-publish leaves it alone";
+const SCOPE_REFUSED: &str = "the attached account's PDS refused the write for lack of permission. \
+     Re-authenticate it from Service Identity";
+const WITHDRAWN: &str = "auto-publish skips a lexicon that was unpublished manually";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishOutcome {
@@ -186,7 +186,7 @@ async fn write(state: &AppState, nsid: &str) -> Result<(String, String, String),
 
     let rules = parsed_rules(store::list_rules(state).await?);
     let rule = rule_for(nsid, &rules)
-        .ok_or_else(|| Refusal::Failed(format!("no publishing default covers {nsid}")))?;
+        .ok_or_else(|| Refusal::Failed(format!("no publishing rule covers {nsid}")))?;
 
     let linked = target::LinkedRepoTargets::load(state).await?;
     let instance = target::instance_target(state).await?;

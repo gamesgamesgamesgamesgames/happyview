@@ -125,26 +125,6 @@ pub(super) async fn dns_for_lexicon(
     }))
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct Availability {
-    usable: bool,
-}
-
-/// GET /admin/lexicon-publishing/availability
-///
-/// The overview's `usable` without building every lexicon's status, for the
-/// navigation to ask on each page.
-pub(super) async fn availability(
-    State(state): State<AppState>,
-    auth: UserAuth,
-) -> Result<Json<Availability>, AppError> {
-    auth.require(Permission::LexiconsRead).await?;
-    let targets = publishing::list_targets(&state).await?;
-    Ok(Json(Availability {
-        usable: publishing::usable(&targets),
-    }))
-}
-
 #[derive(Deserialize)]
 pub(super) struct CreateRuleBody {
     pattern: String,
@@ -224,9 +204,9 @@ async fn rule_view(
     Ok(view)
 }
 
-/// Pointing a default at a linked repo publishes into that account, so it
+/// Pointing a rule at a linked repo publishes into that account, so it
 /// takes the permission that lets a caller see linked repos at all. A caller
-/// without it can still change auto-publish on a default that already points
+/// without it can still change auto-publish on a rule that already points
 /// at one, since that chooses no account.
 async fn require_linked_repo_access(auth: &UserAuth, target_kind: &str) -> Result<(), AppError> {
     if target_kind == KIND_LINKED_REPO {
@@ -295,7 +275,7 @@ pub(super) async fn update_rule(
 ) -> Result<Json<RuleView>, AppError> {
     auth.require(Permission::LexiconsPublish).await?;
 
-    let not_found = || AppError::NotFound("publishing default not found".into());
+    let not_found = || AppError::NotFound("publishing rule not found".into());
     let current = store::get_rule(&state, &id).await?.ok_or_else(not_found)?;
 
     let target_kind = body
@@ -310,7 +290,7 @@ pub(super) async fn update_rule(
         || (target_kind == KIND_LINKED_REPO && linked_repo_id != current.linked_repo_id);
 
     // An unchanged target is left alone even when it is unavailable, so a
-    // default whose repo went away can still have auto-publish switched off.
+    // rule whose repo went away can still have auto-publish switched off.
     let linked_repo_update = if target_changed {
         require_linked_repo_access(&auth, &target_kind).await?;
         let (_, stored) = validate_target(&state, &target_kind, linked_repo_id.as_deref()).await?;
@@ -342,14 +322,14 @@ pub(super) async fn delete_rule(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LexiconsPublish).await?;
 
-    let not_found = || AppError::NotFound("publishing default not found".into());
+    let not_found = || AppError::NotFound("publishing rule not found".into());
     let rule = store::get_rule(&state, &id).await?.ok_or_else(not_found)?;
     if !store::delete_rule(&state, &id).await? {
         return Err(not_found());
     }
 
     log_rule_event(&state, "lexicon_publishing.rule_deleted", &auth.did, &rule).await;
-    // A broader auto-publish default may cover what this one did.
+    // A broader auto-publish rule may cover what this one did.
     publishing::spawn_reconcile(&state);
     Ok(StatusCode::NO_CONTENT)
 }

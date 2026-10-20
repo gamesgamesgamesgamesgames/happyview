@@ -67,14 +67,14 @@ impl Overview {
 }
 
 /// Whether any account can take a publish, or give up a record HappyView put
-/// there. With neither, defaults and a publish button have nothing to act on,
-/// so the dashboard keeps the publishing page closed.
+/// there. With neither, rules and a publish button have nothing to act on,
+/// so the dashboard says what to set up instead of offering them.
 pub fn usable(targets: &[TargetInfo]) -> bool {
     targets.iter().any(|t| t.available || t.can_unpublish)
 }
 
 /// The DID `_lexicon.<authority>` should name for `nsid`: the account its
-/// default publishes to, or failing that the account already holding its
+/// rule publishes to, or failing that the account already holding its
 /// record. `None` for a lexicon HappyView does not publish, or when neither
 /// is known. A caller who may not see linked repos learns a linked repo's DID
 /// only from a publication, where the record's `uri` names it anyway.
