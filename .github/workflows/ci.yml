@@ -174,14 +174,12 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    # Headroom for the differential step, which rebuilds the library under a
-    # different feature set and compiles PUC Lua from C to do it. A timeout
-    # costs a whole run; splitting that step into a job of its own is the
-    # answer if it ever earns one.
-    timeout-minutes: 40
+    # Both e2e jobs have run within five minutes of 40, and a timeout costs a
+    # whole run.
+    timeout-minutes: 50
     env:
       # Read by every target that loads the interpreter, so it sits on the job
-      # rather than on each of the three steps that reach one.
+      # rather than on each step that reaches one.
       #
       # `HAPPYVIEW_LUA_SRC`, which would turn a stale artefact into a failure,
       # is deliberately unset: it compares the module's modification time
@@ -315,26 +313,13 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --features testkit --test conformance
 
-      # The only thing comparing the interpreter against the native runner
-      # case for case, which is what lets the native one retire with evidence.
-      # It needs the native runtime behind `lua-reference` and it is
-      # `#[ignore]`d for being slow, so neither the feature nor the flag can
-      # ride the run above. `--nocapture` because libtest swallows a passing
-      # test's output, and the module's identity and the case figures are that
-      # output.
-      - name: Lua interpreter against the native runner
-        env:
-          TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --features lua-reference --test lua_differential -- --ignored --nocapture
-
   # The e2e suite again on SQLite: every database-backed test the job above
   # runs on Postgres, on a SQLite file, since self-hosting supports both.
   e2e-tests-sqlite:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     env:
       # Read by every target that loads the interpreter, so it sits on the job
       # rather than on each of the three steps that reach one.
@@ -438,6 +423,65 @@ jobs:
           TEST_DATABASE_URL: sqlite://${{ runner.temp }}/conformance.db?mode=rwc
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --features testkit --test conformance
+
+  # The only thing comparing the interpreter against the native runner case
+  # for case, which is what lets the native one retire with evidence. A job of
+  # its own because it rebuilds the library under `lua-reference`, compiling
+  # PUC Lua from C to do it, and that build sat at the end of an e2e job
+  # already near its timeout.
+  lua-differential:
+    needs: changes
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # `HAPPYVIEW_LUA_SRC` stays unset for the reason given on `e2e-tests`.
+      HAPPYVIEW_LUA_PLUGIN: ${{ github.workspace }}/lua-plugin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Its own key: the feature set differs from every other test build, so
+      # sharing `test` would trade one cache's contents for the other's.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lua-differential
+
+      # Pinned and fetched as in `e2e-tests`, with the module's identity in
+      # the summary beside the figures the run reports.
+      - name: Fetch the Lua interpreter plugin
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-lua-plugin.sh lua-plugin
+          {
+            echo '## Lua interpreter plugin'
+            echo '```'
+            ls -l lua-plugin
+            sha256sum lua-plugin/*.wasm
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the library fixture
+        run: bash scripts/build-plugin-fixtures.sh differential_library
+
+      # The target skips when either module is absent, and a skip here would
+      # read as the two runners agreeing.
+      - name: Verify the fixture and the interpreter are present
+        run: |
+          bash scripts/check-plugin-fixtures.sh --require differential_library
+          bash scripts/check-lua-plugin.sh --require
+
+      # It needs the native runtime behind `lua-reference` and it is
+      # `#[ignore]`d for being slow, so neither the feature nor the flag can
+      # ride an e2e run. `--nocapture` because libtest swallows a passing
+      # test's output, and the module's identity and the case figures are that
+      # output.
+      - name: Lua interpreter against the native runner
+        env:
+          TEST_DATABASE_URL: sqlite://${{ runner.temp }}/differential.db?mode=rwc
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo test --features lua-reference --test lua_differential -- --ignored --nocapture
 
   # Runs the unit, crate, and e2e suites once under LLVM source-based
   # instrumentation. Informational for now: no threshold gates the PR.
@@ -883,11 +927,12 @@ jobs:
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
       && needs.e2e-tests-sqlite.result == 'success'
+      && needs.lua-differential.result == 'success'
       && needs.frontend.result == 'success'
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
       && needs.portability.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, frontend, playwright, lint, portability]
+    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
