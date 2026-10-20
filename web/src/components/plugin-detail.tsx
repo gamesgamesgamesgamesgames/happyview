@@ -1,8 +1,8 @@
-"use client"
+"use client";
 
-import { Check, ExternalLink, Loader2 } from "lucide-react"
+import { Check, ExternalLink, Loader2 } from "lucide-react";
 
-import { cn } from "@/lib/utils"
+import { cn } from "@/lib/utils";
 import type {
   CapabilityReport,
   PluginDependency,
@@ -10,23 +10,23 @@ import type {
   PluginSections,
   ReleaseEntry,
   SecretDefinition,
-} from "@/types/plugins"
+} from "@/types/plugins";
 import {
   PluginCapabilities,
   visibleCapabilities,
-} from "@/components/plugin-capabilities"
-import { PublishedMarkdown } from "@/components/published-markdown"
-import { UsageBlock } from "@/components/usage-block"
+} from "@/components/plugin-capabilities";
+import { PublishedMarkdown } from "@/components/published-markdown";
+import { UsageBlock } from "@/components/usage-block";
 import {
   PluginBanner,
   PluginMark,
   TYPE_LABEL,
   TYPE_NOTE,
-} from "@/components/plugin-identity"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Separator } from "@/components/ui/separator"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+} from "@/components/plugin-identity";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 /**
  * One plugin, however it was reached. An installed plugin and a catalogue
@@ -35,44 +35,44 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
  * from.
  */
 export type PluginView = {
-  id: string
-  name: string
-  version: string
-  description: string | null
-  iconUrl: string | null
-  bannerUrl: string | null
-  type: PluginType
-  namespace: string | null
-  capabilities: CapabilityReport
-  dependencies: PluginDependency[]
-  allowedHosts: string[]
-  requiredSecrets: SecretDefinition[]
-  sha256: string | null
+  id: string;
+  name: string;
+  version: string;
+  description: string | null;
+  iconUrl: string | null;
+  bannerUrl: string | null;
+  type: PluginType;
+  namespace: string | null;
+  capabilities: CapabilityReport;
+  dependencies: PluginDependency[];
+  allowedHosts: string[];
+  requiredSecrets: SecretDefinition[];
+  sha256: string | null;
   /** Where the module came from. Absent for a catalogue entry. */
-  source: { kind: "file" | "url"; url: string | null } | null
-  installed: boolean
+  source: { kind: "file" | "url"; url: string | null } | null;
+  installed: boolean;
   /** Set when installed and the catalogue knows a newer release. */
-  updateAvailable: boolean
-  latestVersion: string | null
+  updateAvailable: boolean;
+  latestVersion: string | null;
   /** Every release the catalogue knows, newest first. */
-  releases: ReleaseEntry[]
+  releases: ReleaseEntry[];
   /** The publisher's long-form prose, where the catalogue has any. */
-  sections: PluginSections
-}
+  sections: PluginSections;
+};
 
 function Fact({
   label,
   children,
 }: {
-  label: string
-  children: React.ReactNode
+  label: string;
+  children: React.ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-1">
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="text-sm break-words">{children}</dd>
     </div>
-  )
+  );
 }
 
 export function PluginDetail({
@@ -80,13 +80,13 @@ export function PluginDetail({
   actions,
   settings,
 }: {
-  plugin: PluginView
+  plugin: PluginView;
   /** Install, or the controls an installed plugin has. */
-  actions: React.ReactNode
+  actions: React.ReactNode;
   /** Secrets and hosts, rendered only where they can be saved. */
-  settings?: React.ReactNode
+  settings?: React.ReactNode;
 }) {
-  const capabilities = visibleCapabilities(plugin.capabilities)
+  const capabilities = visibleCapabilities(plugin.capabilities);
 
   return (
     <div className="flex flex-col gap-6">
@@ -141,7 +141,9 @@ export function PluginDetail({
             ) : null}
           </TabsTrigger>
           <TabsTrigger value="permissions">Permissions</TabsTrigger>
-          {settings ? <TabsTrigger value="settings">Settings</TabsTrigger> : null}
+          {settings ? (
+            <TabsTrigger value="settings">Settings</TabsTrigger>
+          ) : null}
         </TabsList>
 
         <TabsContent value="overview" className="flex flex-col gap-6 pt-4">
@@ -241,7 +243,7 @@ export function PluginDetail({
           ) : (
             <ul className="flex max-w-xl flex-col divide-y rounded-lg border">
               {plugin.releases.map((release) => {
-                const current = release.version === plugin.version
+                const current = release.version === plugin.version;
                 return (
                   <li
                     key={release.version}
@@ -268,7 +270,7 @@ export function PluginDetail({
                       ) : null}
                     </div>
                   </li>
-                )
+                );
               })}
             </ul>
           )}
@@ -322,7 +324,7 @@ export function PluginDetail({
         ) : null}
       </Tabs>
     </div>
-  )
+  );
 }
 
 /** The one control whose state differs between the two routes. */
@@ -331,9 +333,9 @@ export function InstallAction({
   installing,
   onInstall,
 }: {
-  installed: boolean
-  installing?: boolean
-  onInstall?: () => void
+  installed: boolean;
+  installing?: boolean;
+  onInstall?: () => void;
 }) {
   if (installed) {
     return (
@@ -341,12 +343,12 @@ export function InstallAction({
         <Check />
         Installed
       </Button>
-    )
+    );
   }
   return (
     <Button onClick={onInstall} disabled={installing}>
       {installing ? <Loader2 className="animate-spin" /> : null}
       Install
     </Button>
-  )
+  );
 }

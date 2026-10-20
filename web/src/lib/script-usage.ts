@@ -9,13 +9,13 @@
  */
 export type ScriptLanguage = {
   /** The interpreter's `language_id`, which is also what `scripts.script_type` holds. */
-  id: string
-  label: string
+  id: string;
+  label: string;
   /** A Shiki bundled grammar id. */
-  grammar: string
+  grammar: string;
   /** The line that binds `namespace` to a local name. */
-  importLine: (binding: string, namespace: string) => string
-}
+  importLine: (binding: string, namespace: string) => string;
+};
 
 export const SCRIPT_LANGUAGES: ScriptLanguage[] = [
   {
@@ -42,14 +42,14 @@ export const SCRIPT_LANGUAGES: ScriptLanguage[] = [
     importLine: (binding, namespace) =>
       `import ${binding} from "${namespace}";`,
   },
-]
+];
 
 /**
  * The local name a namespace is bound to: its last segment, made safe to use
  * as an identifier so the line can be pasted as-is.
  */
 export function bindingFor(namespace: string): string {
-  const last = namespace.split(".").pop() ?? namespace
-  const safe = last.replace(/[^A-Za-z0-9_$]/g, "_")
-  return /^[0-9]/.test(safe) ? `_${safe}` : safe || "lib"
+  const last = namespace.split(".").pop() ?? namespace;
+  const safe = last.replace(/[^A-Za-z0-9_$]/g, "_");
+  return /^[0-9]/.test(safe) ? `_${safe}` : safe || "lib";
 }

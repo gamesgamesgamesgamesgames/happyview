@@ -299,7 +299,8 @@ function TriggerComposer({
   );
 
   const isJob = state.source === JOB_SOURCE;
-  const jobProblem = state.suffix.length > 0 ? jobTypeProblem(state.suffix) : null;
+  const jobProblem =
+    state.suffix.length > 0 ? jobTypeProblem(state.suffix) : null;
 
   const stateRef = useRef(state);
   useEffect(() => {

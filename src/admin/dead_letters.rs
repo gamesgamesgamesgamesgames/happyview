@@ -29,7 +29,6 @@ use super::permissions::Permission;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
-use crate::lua::{RecordEventPayload, run_record_event_once};
 use crate::record_handler::RecordEvent;
 
 // ---------------------------------------------------------------------------
@@ -132,7 +131,6 @@ struct DeadLetterRow {
     /// Always `"record"` for legacy rows. Retries are only supported
     /// for record dead letters.
     host_kind: String,
-    uri: String,
     did: String,
     collection: String,
     rkey: String,
@@ -709,7 +707,6 @@ async fn fetch_dead_letter_for_action(
                 id: row.0,
                 source,
                 host_kind: "record".to_string(),
-                uri: row.2,
                 did: row.3,
                 collection: row.4,
                 rkey: row.5,
@@ -752,7 +749,6 @@ async fn fetch_dead_letter_for_action(
                 id: row.0.to_string(),
                 source,
                 host_kind: row.1.clone(),
-                uri: s("uri"),
                 did: s("did"),
                 collection: s("collection"),
                 rkey: s("rkey"),
@@ -900,24 +896,48 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
         .record
         .as_deref()
         .and_then(|r| serde_json::from_str(r).ok());
-
-    match run_record_event_once(
-        state,
-        &resolved,
-        RecordEventPayload {
-            nsid: &dl.collection,
-            action: &dl.action,
-            uri: &dl.uri,
-            did: &dl.did,
-            rkey: &dl.rkey,
-            record: record.as_ref(),
+    let Some(action) = crate::ingest::Action::parse(&dl.action) else {
+        return Err(AppError::BadRequest(format!(
+            "dead letter {id} has an unknown record action {:?}",
+            dl.action
+        )));
+    };
+    // The dead letter keeps no CID, so the CID check is skipped, as for a
+    // reindex.
+    let event = crate::ingest::RecordEvent {
+        key: crate::ingest::RecordKey {
+            did: dl.did.clone(),
+            collection: dl.collection.clone(),
+            rkey: dl.rkey.clone(),
         },
-    )
-    .await
-    {
-        Ok(_) => {
+        action,
+        cid: None,
+        rev: None,
+        body: record,
+        time_us: None,
+        origin: crate::ingest::Origin::Retry,
+        // A claimed collection's record lives in the external storage, and
+        // only its stored events reach a hook, so a retry applies a delta.
+        stored: state.records.external_route(&dl.collection).is_some(),
+    };
+
+    // The script runs once; what it returns is applied, as the original
+    // event would have been had it succeeded.
+    match crate::ingest::apply_retry(state, &resolved, &event).await {
+        Ok(
+            crate::ingest::IngestOutcome::Matched
+            | crate::ingest::IngestOutcome::Skipped
+            | crate::ingest::IngestOutcome::SchemaEvent,
+        ) => {
             mark_resolved(state, &dl.id, dl.source).await?;
             Ok(())
+        }
+        Ok(outcome) => {
+            let e = format!("the retried event did not apply ({outcome:?}); see the event log");
+            update_error(state, &dl.id, dl.source, &e).await?;
+            Err(AppError::Internal(format!(
+                "retry failed for dead letter {id}: {e}"
+            )))
         }
         Err(e) => {
             update_error(state, &dl.id, dl.source, &e).await?;

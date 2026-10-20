@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use crate::db::{adapt_sql, now_rfc3339};
 use crate::plugin::attestation::AttestationSigner;
 use crate::profile;
 
@@ -244,10 +244,10 @@ fn too_large(size: u64, cap: u64) -> AtprotoError {
 /// present in the result, possibly with an empty list — a URI this instance
 /// has never indexed is not an error, just unlabelled.
 pub async fn labels_get(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     uris: &[String],
 ) -> Result<BTreeMap<String, Vec<Label>>, AtprotoError> {
+    let (db, backend) = (store.db(), store.backend());
     if uris.len() > MAX_LABEL_URIS {
         return Err(AtprotoError::Other(format!(
             "too many URIs: {} > {MAX_LABEL_URIS}",
@@ -282,7 +282,6 @@ pub async fn labels_get(
         }
     }
 
-    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     for uri in uris {
         let Some(stored) = store.get(uri).await? else {
             continue;
@@ -355,6 +354,11 @@ pub fn attest_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseBackend;
+
+    fn store(pool: &sqlx::AnyPool) -> crate::record_store::RecordStore {
+        crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite)
+    }
 
     async fn seeded_pool() -> sqlx::AnyPool {
         let pool = crate::test_support::migrated_memory_pool().await;
@@ -371,13 +375,9 @@ mod tests {
     #[tokio::test]
     async fn labels_get_excludes_expired_and_includes_self_labels() {
         let pool = seeded_pool().await;
-        let result = labels_get(
-            &pool,
-            DatabaseBackend::Sqlite,
-            &["at://did:plc:a/c/1".to_string()],
-        )
-        .await
-        .unwrap();
+        let result = labels_get(&store(&pool), &["at://did:plc:a/c/1".to_string()])
+            .await
+            .unwrap();
 
         let labels = result.get("at://did:plc:a/c/1").expect("uri present");
         assert_eq!(labels.len(), 2, "{labels:?}");
@@ -402,13 +402,9 @@ mod tests {
     #[tokio::test]
     async fn labels_get_yields_empty_vec_for_missing_uri() {
         let pool = seeded_pool().await;
-        let result = labels_get(
-            &pool,
-            DatabaseBackend::Sqlite,
-            &["at://nowhere/c/1".to_string()],
-        )
-        .await
-        .unwrap();
+        let result = labels_get(&store(&pool), &["at://nowhere/c/1".to_string()])
+            .await
+            .unwrap();
 
         assert_eq!(
             result.get("at://nowhere/c/1"),
@@ -421,8 +417,7 @@ mod tests {
     async fn labels_get_covers_every_requested_uri() {
         let pool = seeded_pool().await;
         let result = labels_get(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &store(&pool),
             &[
                 "at://did:plc:a/c/1".to_string(),
                 "at://nowhere/c/1".to_string(),
@@ -874,9 +869,7 @@ mod tests {
             .map(|i| format!("at://did:plc:a/c/{i}"))
             .collect();
 
-        let err = labels_get(&pool, DatabaseBackend::Sqlite, &too_many)
-            .await
-            .unwrap_err();
+        let err = labels_get(&store(&pool), &too_many).await.unwrap_err();
 
         assert!(matches!(err, AtprotoError::Other(_)), "{err}");
     }

@@ -52,7 +52,10 @@ test.describe("Script validation reaches the interpreter", () => {
 
   test("a body the interpreter accepts is stored", async ({ page }) => {
     const saved = await page.request.post("/admin/scripts", {
-      data: { id: ID, body: "function handle(input, ctx)\n  return input\nend\n" },
+      data: {
+        id: ID,
+        body: "function handle(input, ctx)\n  return input\nend\n",
+      },
     });
     expect(saved.status()).toBe(201);
     expect((await saved.json()).runnable).toBe(true);

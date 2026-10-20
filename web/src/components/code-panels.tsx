@@ -109,7 +109,9 @@ export function CodePanels({
             /* Narrow: hide when Lua tab is active */
             hasLua && activeTab !== "json" ? "hidden lg:flex" : "",
             /* Wide: dim inactive panel */
-            hasLua ? "lg:border-e lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity" : "",
+            hasLua
+              ? "lg:border-e lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity"
+              : "",
           )}
           label="Lexicon JSON"
           value={jsonValue}
@@ -118,11 +120,17 @@ export function CodePanels({
           lang="json"
         />
         {/* Wrapper stays in the DOM so the grid column can animate closed */}
-        <div className={cn(
-          "overflow-hidden min-w-0 flex flex-col min-h-0",
-          /* Narrow: hide when JSON tab is active */
-          hasLua && activeTab !== "lua" ? "hidden lg:flex" : hasLua ? "" : "hidden lg:flex",
-        )}>
+        <div
+          className={cn(
+            "overflow-hidden min-w-0 flex flex-col min-h-0",
+            /* Narrow: hide when JSON tab is active */
+            hasLua && activeTab !== "lua"
+              ? "hidden lg:flex"
+              : hasLua
+                ? ""
+                : "hidden lg:flex",
+          )}
+        >
           {hasLua && (
             <Panel
               className="lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity min-w-[300px]"

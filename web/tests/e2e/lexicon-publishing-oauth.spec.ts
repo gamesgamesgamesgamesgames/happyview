@@ -251,7 +251,9 @@ test.describe("Lexicon publishing — real linked repo", () => {
     const row = lexiconRow(page, NOTE);
     await row.getByRole("button", { name: "Publish", exact: true }).click();
     await expect(row).toContainText("Published", { timeout: 30000 });
-    await expect(row.getByRole("button", { name: `Unpublish ${NOTE}` })).toBeVisible();
+    await expect(
+      row.getByRole("button", { name: `Unpublish ${NOTE}` }),
+    ).toBeVisible();
 
     const record = await getSchemaRecord(account.did, NOTE);
     expect(record.status, await record.clone().text()).toBe(200);
@@ -384,7 +386,9 @@ test.describe("Lexicon publishing — real linked repo", () => {
     await page.getByRole("button", { name: "Add default" }).click();
     const sheet = page.getByRole("dialog");
     await sheet.getByLabel("Pattern").fill("test.e2e.*");
-    await expect(sheet.getByText("Covers every lexicon under test.e2e")).toBeVisible();
+    await expect(
+      sheet.getByText("Covers every lexicon under test.e2e"),
+    ).toBeVisible();
     await capture(page, "add-default-dialog");
     await sheet.getByRole("button", { name: "Cancel" }).click();
 

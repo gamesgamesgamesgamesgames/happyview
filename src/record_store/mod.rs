@@ -30,6 +30,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use sqlx::{AnyConnection, AnyPool};
 
+use happyview_provider::{Delta, ReadRoute, RecordKey, RecordStorage};
+
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::tombstones::WriteCandidate;
@@ -42,6 +44,10 @@ pub const RECORDS_PER_UPSERT: usize = 100;
 
 /// Ids per `IN (…)` list when deleting.
 const DELETE_CHUNK: usize = 500;
+
+/// Label subjects of claimed collections per page of the orphaned-label
+/// sweep, each checked with the external storage.
+const LABEL_GC_PAGE: i64 = 500;
 
 /// The id of a DID, bound by text; NULL when the DID was never interned.
 pub(crate) const DID_ID: &str = "(SELECT id FROM happyview_dids WHERE did = ?)";
@@ -193,12 +199,17 @@ const STORED_COLUMNS: &str = "rec.uri, rec.did, rec.collection, rec.rkey, rec.re
 
 /// A handle on the record tables. Cheap to clone; clones share the interned
 /// id cache and the body codec.
+///
+/// With an external [`RecordStorage`] (see [`RecordStore::with_external`]),
+/// every collection it claims is read from its [`ReadRoute`] and written as a
+/// [`Delta`] to it; nothing for a claimed collection touches the local tables.
 #[derive(Clone)]
 pub struct RecordStore {
     db: AnyPool,
     backend: DatabaseBackend,
     interner: Arc<Interner>,
     bodies: Arc<compression::BodyCodec>,
+    external: Option<Arc<dyn RecordStorage>>,
 }
 
 /// A row an upsert inserted or changed: its id, its collection's id, and
@@ -222,6 +233,14 @@ fn last_copies(records: &[PreparedRecord]) -> Vec<&PreparedRecord> {
         .filter(|(i, rec)| last[&rec.uri()] == *i)
         .map(|(_, rec)| rec)
         .collect()
+}
+
+fn record_key(record: &PreparedRecord) -> RecordKey {
+    RecordKey {
+        did: record.did.clone(),
+        collection: record.collection.clone(),
+        rkey: record.rkey.clone(),
+    }
 }
 
 fn placeholders(n: usize) -> String {
@@ -257,6 +276,39 @@ impl RecordStore {
             backend,
             interner: Arc::new(Interner::new(DID_CACHE_CAPACITY)),
             bodies: Arc::new(bodies),
+            external: None,
+        }
+    }
+
+    /// This store, with `external` serving every collection it claims.
+    pub fn with_external(mut self, external: Arc<dyn RecordStorage>) -> Self {
+        self.external = Some(external);
+        self
+    }
+
+    /// The external storage, whatever it claims.
+    pub fn external(&self) -> Option<&Arc<dyn RecordStorage>> {
+        self.external.as_ref()
+    }
+
+    /// The external storage when it claims `collection`.
+    pub fn external_route(&self, collection: &str) -> Option<&Arc<dyn RecordStorage>> {
+        self.external.as_ref().filter(|ext| ext.claims(collection))
+    }
+
+    /// Where reads of `collection` run: the external storage's route when it
+    /// claims the collection, otherwise this instance's own database.
+    pub fn read_route(&self, collection: Option<&str>) -> ReadRoute {
+        match collection.and_then(|c| self.external_route(c).map(|ext| ext.read_route(c))) {
+            Some(route) => route,
+            None => self.local_route(),
+        }
+    }
+
+    fn local_route(&self) -> ReadRoute {
+        ReadRoute {
+            pool: self.db.clone(),
+            backend: self.backend,
         }
     }
 
@@ -596,6 +648,28 @@ impl RecordStore {
                 "a network write goes through upsert_batch, not write_local".to_string(),
             )));
         }
+        if let Some(ext) = self.external_route(&record.collection) {
+            // Shown by the claiming store until its own copy (the echo)
+            // arrives.
+            let created_at_us = serde_json::from_str::<Value>(&record.record_json)
+                .ok()
+                .and_then(|body| {
+                    body.get("createdAt")
+                        .and_then(Value::as_str)
+                        .and_then(codec::parse_micros)
+                })
+                .unwrap_or_else(codec::now_micros);
+            let delta = Delta::Pending {
+                cid: record.cid.clone(),
+                rev: record.rev.clone(),
+                body: record.record_json.clone(),
+                created_at_us,
+            };
+            return ext
+                .apply_delta(&record_key(record), delta, None)
+                .await
+                .map_err(LocalWriteError::Row);
+        }
         let records = [record];
         let targets = ref_targets(std::iter::once(record.record_json.as_str()));
         let mut scope = InternScope::default();
@@ -680,6 +754,16 @@ impl RecordStore {
         let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
             return Ok(false);
         };
+        if let Some(ext) = self.external_route(collection) {
+            // Hidden from this instance's view; the claiming store keeps it.
+            let key = RecordKey {
+                did: did.to_string(),
+                collection: collection.to_string(),
+                rkey: rkey.to_string(),
+            };
+            ext.apply_delta(&key, Delta::Hide, None).await?;
+            return Ok(true);
+        }
         let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
         let deleted = match self.find(&mut tx, did, collection, rkey).await? {
             Some((id, _)) => self.delete_ids(&mut tx, &[id]).await? > 0,
@@ -695,12 +779,14 @@ impl RecordStore {
     /// create cannot bring the record back. A delete that finds no row
     /// tombstones only when a create could still be on its way: the account
     /// holds network records in the collection, or a backfill still writing
-    /// covers it.
+    /// covers it (`backfill_running`, which the caller asks the record source
+    /// for).
     /// Otherwise it is a delete for a record this instance never held, and the
     /// network sends millions of those. A delete without a rev (a dead-letter
     /// retry) deletes the row whatever its rev and tombstones it at the rev it
     /// was stored at, if any, so a replay of that create cannot bring it back.
     /// The record's refs go with it; a surviving newer row keeps its own.
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_network(
         &self,
         pool: &AnyPool,
@@ -709,6 +795,7 @@ impl RecordStore {
         collection: &str,
         rev: Option<&str>,
         now: &str,
+        backfill_running: bool,
     ) -> Result<(), sqlx::Error> {
         let backend = self.backend;
         let mut tx = crate::db::begin_write(pool, backend).await?;
@@ -731,7 +818,10 @@ impl RecordStore {
                 };
                 let survived = !deleted && found.is_some();
                 let tombstone = deleted
-                    || (!survived && self.create_may_follow(&mut tx, did, collection).await?);
+                    || (!survived
+                        && self
+                            .create_may_follow(&mut tx, did, collection, backfill_running)
+                            .await?);
                 if tombstone {
                     crate::tombstones::write_record_tombstone(&mut tx, backend, uri, rev, now)
                         .await?;
@@ -756,16 +846,64 @@ impl RecordStore {
         tx.commit().await
     }
 
+    /// [`Self::delete_network`] without a rev, but only while the stored row
+    /// still holds `expected` as its body: a dead-letter retry whose hook now
+    /// skips the record removes what the failed-open delivery stored, and
+    /// leaves a row a newer write has replaced since. The check and the
+    /// delete run in one transaction under the record's locks. Returns
+    /// whether a row was removed.
+    pub async fn delete_network_if_body(
+        &self,
+        pool: &AnyPool,
+        uri: &str,
+        did: &str,
+        collection: &str,
+        expected: &Value,
+        now: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let backend = self.backend;
+        let Some((_, _, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(false);
+        };
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
+        crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
+        let sql = adapt_sql(&Self::get_sql(backend), backend);
+        let stored = crate::db::query_as::<StoredRow>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(StoredRecord::from);
+        let holds_expected = stored
+            .and_then(|r| serde_json::from_str::<Value>(&r.record).ok())
+            .is_some_and(|body| &body == expected);
+        if !holds_expected {
+            return Ok(false);
+        }
+        let Some((id, stored_rev)) = self.find(&mut tx, did, collection, rkey).await? else {
+            return Ok(false);
+        };
+        self.delete_ids(&mut tx, &[id]).await?;
+        if let Some(stored_rev) = stored_rev {
+            crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &stored_rev, now)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Whether a create for a record `did` holds no row for could still arrive
     /// out of order: the account holds network records in `collection` (live
     /// ingest or a past backfill reached it), or a backfill covering the
-    /// collection may still write: running, or pausing or cancelling (both stop
-    /// once in-flight pages are written).
+    /// collection may still write (`backfill_running`).
     async fn create_may_follow(
         &self,
         conn: &mut AnyConnection,
         did: &str,
         collection: &str,
+        backfill_running: bool,
     ) -> Result<bool, sqlx::Error> {
         let sql = adapt_sql(
             &format!(
@@ -781,20 +919,7 @@ impl RecordStore {
             .fetch_optional(&mut *conn)
             .await?
             .is_some();
-        if held {
-            return Ok(true);
-        }
-        let sql = adapt_sql(
-            "SELECT 1 FROM happyview_backfill_jobs \
-             WHERE status IN ('running', 'pausing', 'cancelling') \
-             AND (collection IS NULL OR collection = ?) LIMIT 1",
-            self.backend,
-        );
-        Ok(crate::db::query(&sql)
-            .bind(collection)
-            .fetch_optional(&mut *conn)
-            .await?
-            .is_some())
+        Ok(held || backfill_running)
     }
 
     /// The ids of up to `limit` of the network records `did` holds,
@@ -877,6 +1002,43 @@ impl RecordStore {
         Ok(ids.len() as u64)
     }
 
+    /// Up to `limit` DIDs after `after_did`, in ascending order, that hold
+    /// network records in `collections`, read on `pool`. The query of the
+    /// replay job's held-DID sweep, keyed by DID rather than by row id.
+    pub async fn held_dids_page(
+        &self,
+        pool: &AnyPool,
+        collections: &[String],
+        after_did: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if collections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; collections.len()].join(", ");
+        let sql = crate::db::adapt_sql(
+            &format!(
+                "SELECT d.did FROM happyview_dids d WHERE d.did > ? AND EXISTS ( \
+                   SELECT 1 FROM happyview_records_v2 r \
+                   WHERE r.did_id = d.id AND r.indexed_at IS NOT NULL AND r.collection_id IN ( \
+                     SELECT id FROM happyview_collections WHERE nsid IN ({placeholders}))) \
+                 ORDER BY d.did LIMIT ?"
+            ),
+            self.backend,
+        );
+        let mut query = crate::db::query_as::<(String,)>(&sql).bind(after_did.unwrap_or(""));
+        for collection in collections {
+            query = query.bind(collection.as_str());
+        }
+        Ok(query
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(did,)| did)
+            .collect())
+    }
+
     /// [`Self::holds_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(
@@ -915,6 +1077,9 @@ impl RecordStore {
         collection: &str,
         limit: i64,
     ) -> Result<u64, sqlx::Error> {
+        if let Some(ext) = self.external_route(collection) {
+            return ext.delete_collection_batch(collection, limit).await;
+        }
         let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
         let ids: Vec<i64> = crate::db::query_as::<(i64,)>(&adapt_sql(
             &format!(
@@ -935,14 +1100,18 @@ impl RecordStore {
     }
 
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
+        Self::count_collection_on(&self.read_route(Some(collection)), collection).await
+    }
+
+    async fn count_collection_on(route: &ReadRoute, collection: &str) -> Result<i64, sqlx::Error> {
         crate::db::query_scalar::<i64>(&adapt_sql(
             &format!(
                 "SELECT COUNT(*) FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID}"
             ),
-            self.backend,
+            route.backend,
         ))
         .bind(collection)
-        .fetch_one(&self.db)
+        .fetch_one(&route.pool)
         .await
     }
 
@@ -957,35 +1126,76 @@ impl RecordStore {
     }
 
     pub async fn get(&self, uri: &str) -> Result<Option<StoredRecord>, sqlx::Error> {
+        let Some((_, collection, _)) = codec::parse_record_uri(uri) else {
+            return Ok(None);
+        };
+        Self::get_on(&self.read_route(Some(collection)), uri).await
+    }
+
+    /// [`Self::get`] on `route`, unrouted: the plugin query DSL runs it on
+    /// the route it already chose.
+    pub(crate) async fn get_on(
+        route: &ReadRoute,
+        uri: &str,
+    ) -> Result<Option<StoredRecord>, sqlx::Error> {
         let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
             return Ok(None);
         };
-        let sql = adapt_sql(&Self::get_sql(self.backend), self.backend);
+        let sql = adapt_sql(&Self::get_sql(route.backend), route.backend);
         Ok(crate::db::query_as::<StoredRow>(&sql)
             .bind(did)
             .bind(collection)
             .bind(rkey)
-            .fetch_optional(&self.db)
+            .fetch_optional(&route.pool)
             .await?
             .map(StoredRecord::from))
+    }
+
+    /// The stored body and rev of `uri` on `route`, unrouted: what a
+    /// dead-letter retry checks before it changes a claimed record's view.
+    pub(crate) async fn stored_version_on(
+        route: &ReadRoute,
+        uri: &str,
+    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(None);
+        };
+        let record = match route.backend {
+            DatabaseBackend::Sqlite => "hv_record(body, body_dict)",
+            DatabaseBackend::Postgres => "record",
+        };
+        let sql = adapt_sql(
+            &format!(
+                "SELECT {record}, rev FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ?"
+            ),
+            route.backend,
+        );
+        crate::db::query_as::<(String, Option<String>)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&route.pool)
+            .await
     }
 
     pub async fn stored_cid(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
         let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
             return Ok(None);
         };
+        let route = self.read_route(Some(collection));
         let sql = adapt_sql(
             &format!(
                 "SELECT hv_cid_text(cid) FROM happyview_records_v2 \
                  WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ?"
             ),
-            self.backend,
+            route.backend,
         );
         Ok(crate::db::query_as::<(Option<String>,)>(&sql)
             .bind(did)
             .bind(collection)
             .bind(rkey)
-            .fetch_optional(&self.db)
+            .fetch_optional(&route.pool)
             .await?
             .and_then(|(cid,)| cid))
     }
@@ -999,7 +1209,11 @@ impl RecordStore {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredRecord>, sqlx::Error> {
-        let sql = adapt_sql(&list_recent_sql(self.backend, did.is_some()), self.backend);
+        let route = self.read_route(Some(collection));
+        let sql = adapt_sql(
+            &list_recent_sql(route.backend, did.is_some()),
+            route.backend,
+        );
         let mut query = crate::db::query_as::<StoredRow>(&sql).bind(collection);
         if let Some(did) = did {
             query = query.bind(did);
@@ -1007,7 +1221,7 @@ impl RecordStore {
         Ok(query
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.db)
+            .fetch_all(&route.pool)
             .await?
             .into_iter()
             .map(StoredRecord::from)
@@ -1015,21 +1229,44 @@ impl RecordStore {
     }
 
     pub async fn count_all(&self) -> Result<i64, sqlx::Error> {
+        if self.external.is_some() {
+            return Ok(self
+                .count_by_collection()
+                .await?
+                .iter()
+                .map(|(_, n)| n)
+                .sum());
+        }
         crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records_v2")
             .fetch_one(&self.db)
             .await
     }
 
-    /// Records per collection, largest first.
+    /// Records per collection, largest first. A claimed collection is
+    /// counted in the external storage, in place of any local rows; like a
+    /// local one, it is listed only when it holds records.
     pub async fn count_by_collection(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        crate::db::query_as::<(String, i64)>(
+        let mut counts = crate::db::query_as::<(String, i64)>(
             "SELECT c.nsid, n.cnt FROM \
              (SELECT collection_id, COUNT(*) AS cnt FROM happyview_records_v2 GROUP BY collection_id) n \
              JOIN happyview_collections c ON c.id = n.collection_id \
              ORDER BY n.cnt DESC, c.nsid",
         )
         .fetch_all(&self.db)
-        .await
+        .await?;
+        let Some(ext) = &self.external else {
+            return Ok(counts);
+        };
+        let claimed = ext.claimed();
+        counts.retain(|(nsid, _)| !claimed.contains(nsid));
+        for collection in claimed {
+            let n = Self::count_collection_on(&ext.read_route(&collection), &collection).await?;
+            if n > 0 {
+                counts.push((collection, n));
+            }
+        }
+        counts.sort_by(|(a, x), (b, y)| y.cmp(x).then_with(|| a.cmp(b)));
+        Ok(counts)
     }
 
     /// The first record of `collection` whose `field_sql` (a validated
@@ -1041,35 +1278,111 @@ impl RecordStore {
         field_sql: &str,
         value: &str,
     ) -> Result<Option<(String, String)>, sqlx::Error> {
+        let route = self.read_route(Some(collection));
         let sql = adapt_sql(
             &format!(
                 "SELECT rec.uri, rec.cid FROM {} \
                  WHERE rec.collection_id = {COLLECTION_ID} AND {field_sql} = ? LIMIT 1",
-                records_relation(self.backend)
+                records_relation(route.backend)
             ),
-            self.backend,
+            route.backend,
         );
         crate::db::query_as::<(String, String)>(&sql)
             .bind(collection)
             .bind(value)
-            .fetch_optional(&self.db)
+            .fetch_optional(&route.pool)
             .await
     }
 
     /// Delete every record label whose subject this instance no longer holds
     /// (moved from `labeler::delete_orphaned_labels`; its rationale stays
     /// there). The subject is looked up by identity, not by derived URI.
+    ///
+    /// With an external storage, labels of claimed collections are left out
+    /// of that statement and kept or deleted on the storage's
+    /// [`RecordStorage::is_live`], a page of subjects at a time.
     pub async fn delete_orphaned_labels(&self) -> Result<u64, sqlx::Error> {
-        crate::db::query(
-            "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS ( \
+        const ORPHANED: &str = "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS ( \
                SELECT 1 FROM happyview_records_v2 r \
                 WHERE r.did_id = (SELECT id FROM happyview_dids WHERE did = hv_ref_part(happyview_labels.uri, 0)) \
                   AND r.collection_id = (SELECT id FROM happyview_collections WHERE nsid = hv_ref_part(happyview_labels.uri, 1)) \
-                  AND r.rkey = hv_ref_part(happyview_labels.uri, 2))",
-        )
-        .execute(&self.db)
-        .await
-        .map(|r| r.rows_affected())
+                  AND r.rkey = hv_ref_part(happyview_labels.uri, 2))";
+        let claimed = self
+            .external
+            .as_ref()
+            .map(|ext| ext.claimed())
+            .unwrap_or_default();
+        let (Some(ext), false) = (&self.external, claimed.is_empty()) else {
+            return crate::db::query(ORPHANED)
+                .execute(&self.db)
+                .await
+                .map(|r| r.rows_affected());
+        };
+
+        let sql = adapt_sql(
+            &format!(
+                "{ORPHANED} AND COALESCE(hv_ref_part(uri, 1), '') NOT IN ({})",
+                placeholders(claimed.len())
+            ),
+            self.backend,
+        );
+        let mut local = crate::db::query(&sql);
+        for collection in &claimed {
+            local = local.bind(collection.as_str());
+        }
+        let mut deleted = local.execute(&self.db).await?.rows_affected();
+
+        let page_sql = adapt_sql(
+            &format!(
+                "SELECT DISTINCT uri FROM happyview_labels \
+                 WHERE uri LIKE 'at://%' AND hv_ref_part(uri, 1) IN ({}) AND uri > ? \
+                 ORDER BY uri LIMIT ?",
+                placeholders(claimed.len())
+            ),
+            self.backend,
+        );
+        let mut after = String::new();
+        loop {
+            let mut page = crate::db::query_as::<(String,)>(&page_sql);
+            for collection in &claimed {
+                page = page.bind(collection.as_str());
+            }
+            let uris: Vec<String> = page
+                .bind(after.as_str())
+                .bind(LABEL_GC_PAGE)
+                .fetch_all(&self.db)
+                .await?
+                .into_iter()
+                .map(|(uri,)| uri)
+                .collect();
+            let Some(last) = uris.last().cloned() else {
+                return Ok(deleted);
+            };
+            let mut dead = Vec::new();
+            for uri in &uris {
+                if !ext.is_live(uri).await? {
+                    dead.push(uri.as_str());
+                }
+            }
+            if !dead.is_empty() {
+                let sql = adapt_sql(
+                    &format!(
+                        "DELETE FROM happyview_labels WHERE uri IN ({})",
+                        placeholders(dead.len())
+                    ),
+                    self.backend,
+                );
+                let mut delete = crate::db::query(&sql);
+                for uri in dead {
+                    delete = delete.bind(uri);
+                }
+                deleted += delete.execute(&self.db).await?.rows_affected();
+            }
+            if (uris.len() as i64) < LABEL_GC_PAGE {
+                return Ok(deleted);
+            }
+            after = last;
+        }
     }
 
     /// Whether any record holds a ref: the probe that tells the one-time
@@ -1654,14 +1967,14 @@ mod tests {
                 .expect("write");
             let now = crate::db::now_rfc3339();
             store
-                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(10)), &now)
+                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(10)), &now, false)
                 .await
                 .expect("older delete");
             assert!(row(&store, &rec.uri()).await.is_some(), "{backend:?}");
             assert_eq!(ref_count(&store, &rec.uri()).await, 1, "{backend:?}");
 
             store
-                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(30)), &now)
+                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(30)), &now, false)
                 .await
                 .expect("newer delete");
             assert!(row(&store, &rec.uri()).await.is_none(), "{backend:?}");

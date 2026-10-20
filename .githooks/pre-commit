@@ -27,3 +27,43 @@ if [ $? -ne 0 ]; then
     echo "clippy check failed. Fix the warnings above."
     exit 1
 fi
+
+# Format the dashboard's staged files. The checks above refuse and tell you
+# what to run; this rewrites instead, which is the point of adding prettier —
+# neither the author nor a reviewer should have to remember it. Scope is
+# `web/` alone; see web/prettier.config.mjs.
+#
+# A fresh clone has no web/node_modules, and a Rust-only commit should not
+# have to install one, so a missing prettier is skipped rather than fatal.
+prettier=web/node_modules/.bin/prettier
+if [ -x "$prettier" ]; then
+    staged=$(mktemp)
+    dirty=$(mktemp)
+    trap 'rm -f "$staged" "$dirty"' EXIT
+
+    git diff --cached --name-only --diff-filter=ACMR -- web |
+        grep -E '\.(ts|tsx|js|jsx|mjs|cjs|css|json|md|ya?ml)$' > "$staged"
+
+    # A file that is staged *and* modified in the working tree would have its
+    # unstaged half formatted into the commit, which is work the author did
+    # not choose to include. Leave those alone and say so.
+    git diff --name-only --diff-filter=ACMR -- web > "$dirty"
+    partial=$(grep -Fxf "$dirty" "$staged")
+    targets=$(grep -Fxvf "$dirty" "$staged")
+
+    if [ -n "$partial" ]; then
+        echo "prettier: skipped (staged but also modified in the working tree):"
+        echo "$partial" | sed 's/^/  /'
+    fi
+
+    if [ -n "$targets" ]; then
+        echo "$targets" | tr '\n' '\0' | xargs -0 "$prettier" --write --log-level warn
+        if [ $? -ne 0 ]; then
+            echo "prettier failed. Fix the errors above."
+            exit 1
+        fi
+        # `[id]` route directories are glob syntax to a git pathspec.
+        echo "$targets" | tr '\n' '\0' |
+            GIT_LITERAL_PATHSPECS=1 xargs -0 git add --
+    fi
+fi

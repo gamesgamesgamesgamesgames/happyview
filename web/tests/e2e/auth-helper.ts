@@ -148,9 +148,7 @@ export async function getOauthSessionSigningKid(
   }
 }
 
-export async function getOauthSessionTokenState(
-  did: string,
-): Promise<{
+export async function getOauthSessionTokenState(did: string): Promise<{
   accessToken: string;
   expiresAt: string | null;
   /** What the authorization server granted. */

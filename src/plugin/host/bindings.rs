@@ -870,6 +870,7 @@ pub(crate) fn define_host_functions(
         "host_records_index_put",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {
+                // Plugin unit tests build no app state: their own pool then.
                 let shared = shared_records(caller.data());
                 host_spec_impl(
                     caller,
@@ -891,6 +892,7 @@ pub(crate) fn define_host_functions(
         "host_records_index_delete",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {
+                // Plugin unit tests build no app state: their own pool then.
                 let shared = shared_records(caller.data());
                 host_spec_impl(
                     caller,
@@ -1552,6 +1554,7 @@ fn build_host_context(state: &PluginState) -> Option<super::HostContext> {
         scope: state.scope.clone(),
         secrets: state.secrets.clone(),
         config: state.config.clone(),
+        records: records_or_local(state, &db),
         db,
         db_backend: state.db_backend,
         http_client: state.http_client.clone(),
@@ -1869,11 +1872,75 @@ async fn host_allowed_hosts_impl(
     write_guest_response(caller, &response).await
 }
 
-/// The instance's shared record store, which carries the interned-id cache
-/// and the compression dictionaries; `None` for an instance built without
-/// the app state, which then writes through a store of its own.
+/// The instance's shared record store, which carries the interned-id cache,
+/// the compression dictionaries and the external storage's routing; `None`
+/// for an instance built without the app state (plugin unit tests), which
+/// then reads and writes through a store of its own.
 fn shared_records(state: &PluginState) -> Option<crate::record_store::RecordStore> {
     state.app_state.as_ref().map(|app| app.records.clone())
+}
+
+/// [`shared_records`], or, for an instance built without the app state
+/// (plugin unit tests), a local store over its own pool.
+fn records_or_local(state: &PluginState, db: &sqlx::AnyPool) -> crate::record_store::RecordStore {
+    shared_records(state)
+        .unwrap_or_else(|| crate::record_store::RecordStore::new(db.clone(), state.db_backend))
+}
+
+/// The record collection a spec reads, which picks the database it runs on
+/// (an external storage's route when that claims the collection).
+trait SpecCollection {
+    fn collection(&self) -> Option<&str>;
+}
+
+impl SpecCollection for happyview_plugin_sdk::wire::RecordsQuery {
+    fn collection(&self) -> Option<&str> {
+        Some(&self.collection)
+    }
+}
+
+impl SpecCollection for happyview_plugin_sdk::wire::RecordsCount {
+    fn collection(&self) -> Option<&str> {
+        Some(&self.collection)
+    }
+}
+
+impl SpecCollection for happyview_plugin_sdk::wire::RecordsSearch {
+    fn collection(&self) -> Option<&str> {
+        Some(&self.collection)
+    }
+}
+
+impl SpecCollection for happyview_plugin_sdk::wire::BacklinksQuery {
+    fn collection(&self) -> Option<&str> {
+        Some(&self.collection)
+    }
+}
+
+impl SpecCollection for GetSpec {
+    fn collection(&self) -> Option<&str> {
+        crate::record_store::codec::parse_record_uri(&self.uri).map(|(_, collection, _)| collection)
+    }
+}
+
+/// A table query reads the instance's own tables.
+impl SpecCollection for happyview_plugin_sdk::wire::TableQuery {
+    fn collection(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Index writes route inside the shared store, not by pool.
+impl SpecCollection for happyview_plugin_sdk::wire::IndexPut {
+    fn collection(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl SpecCollection for happyview_plugin_sdk::wire::IndexDelete {
+    fn collection(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// One entry point for every spec-taking record/table query import: gate on
@@ -1889,7 +1956,7 @@ async fn host_spec_impl<S, R, F, Fut>(
     run: F,
 ) -> i64
 where
-    S: serde::de::DeserializeOwned,
+    S: serde::de::DeserializeOwned + SpecCollection,
     R: serde::Serialize,
     F: FnOnce(sqlx::AnyPool, crate::db::DatabaseBackend, S) -> Fut,
     Fut: std::future::Future<Output = Result<R, super::RecordsError>>,
@@ -1913,6 +1980,18 @@ where
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
     let backend = caller.data().db_backend;
+    // A claimed collection is read on the external storage's route; every
+    // other spec runs on the instance's own database, as it always has.
+    let route = caller.data().app_state.as_ref().and_then(|app| {
+        let collection = spec.collection()?;
+        app.records
+            .external_route(collection)
+            .map(|ext| ext.read_route(collection))
+    });
+    let (db, backend) = match route {
+        Some(route) => (route.pool, route.backend),
+        None => (db, backend),
+    };
     let response = match run(db, backend, spec).await {
         Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
         Err(super::RecordsError::InvalidSpec(msg)) => error_envelope("INVALID_SPEC", msg),
@@ -2409,6 +2488,18 @@ async fn host_db_impl(
             Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
         }
     }
+    let external = caller
+        .data()
+        .app_state
+        .as_ref()
+        .and_then(|app| app.records.external().cloned());
+    if let Some(external) = external
+        && let Err(e) = crate::raw_sql_guard::check_claimed_record_writes(&sql, &params, &|c| {
+            external.claims(c)
+        })
+    {
+        return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await;
+    }
     let Some(db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
@@ -2800,8 +2891,8 @@ async fn host_labels_get_impl(
     let Some(db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
-    let backend = caller.data().db_backend;
-    let response = match super::labels_get(&db, backend, &spec.uris).await {
+    let records = records_or_local(caller.data(), &db);
+    let response = match super::labels_get(&records, &spec.uris).await {
         Ok(map) => serde_json::to_vec(&serde_json::json!({"ok": map})).unwrap_or_default(),
         // `labels_get`'s only source of `Other` is the URI-count cap — a
         // caller-fixable mistake, not a host failure, so it gets `BAD_INPUT`

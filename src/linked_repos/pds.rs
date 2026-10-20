@@ -418,12 +418,10 @@ mod tests {
     #[tokio::test]
     async fn a_test_runs_linked_repo_write_reaches_the_fake() {
         let harness = std::sync::Arc::new(crate::testing::TestHarness::new("a.test.lua"));
-        let state = crate::AppState {
-            test: Some(harness.clone()),
-            ..crate::test_support::test_state_with_pool(
-                crate::test_support::migrated_memory_pool().await,
-            )
-        };
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(harness.clone());
         let grant = bound_grant(&state).await;
         let (uri, _cid) = create_record(&state, &grant, "app.test.rec", Some("1"), json!({"a": 1}))
             .await

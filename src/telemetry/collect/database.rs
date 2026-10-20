@@ -6,16 +6,12 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::record_store::RecordStore;
 use crate::telemetry::payload;
 
-/// Tables counted into `totals`, as (payload key, table name).
+/// Tables counted into `totals`, as (payload key, table name). The record
+/// source counts its own tables (`RecordSource::metrics`).
 const COUNTED_TABLES: &[(&str, &str)] = &[
     ("space_records", "happyview_space_records"),
     ("event_logs", "happyview_event_logs"),
     ("space_record_oplog", "happyview_space_record_oplog"),
-    ("backfill_repos", "happyview_backfill_repos"),
-    ("backfill_queue", "happyview_backfill_queue"),
-    ("backfill_completions", "happyview_backfill_completions"),
-    ("backfill_pds_stats", "happyview_backfill_pds_stats"),
-    ("backfill_cursors", "happyview_backfill_cursors"),
     ("jobs", "happyview_jobs"),
     ("lexicons", crate::catalog::lexicon_rows::TABLE),
     ("spaces", "happyview_spaces"),
@@ -28,20 +24,12 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
 /// How many collections appear in `top_collection_shares`.
 const TOP_COLLECTIONS: usize = 10;
 
-async fn count_table(pool: &AnyPool, backend: DatabaseBackend, table: &'static str) -> Option<i64> {
-    let sql = adapt_sql(&format!("SELECT COUNT(*) FROM {table}"), backend);
-    match crate::db::query_as::<(i64,)>(&sql).fetch_one(pool).await {
-        Ok((n,)) => Some(n),
-        Err(e) => {
-            tracing::debug!(table, error = %e, "telemetry could not count table");
-            None
-        }
-    }
-}
+pub(crate) use happyview_provider::telemetry::count_table;
 
-pub async fn totals(pool: &AnyPool, backend: DatabaseBackend) -> payload::Counters {
+pub async fn totals(records: &RecordStore) -> payload::Counters {
+    let (pool, backend) = (records.db(), records.backend());
     let mut out = payload::Counters::new();
-    match RecordStore::new(pool.clone(), backend).count_all().await {
+    match records.count_all().await {
         Ok(n) => {
             out.insert("records".to_string(), n);
         }
@@ -98,16 +86,13 @@ pub async fn job_runtime_seconds(pool: &AnyPool, backend: DatabaseBackend) -> Op
     }
 }
 
-async fn collection_counts(pool: &AnyPool, backend: DatabaseBackend) -> Vec<(String, i64)> {
-    RecordStore::new(pool.clone(), backend)
-        .count_by_collection()
-        .await
-        .unwrap_or_default()
+async fn collection_counts(records: &RecordStore) -> Vec<(String, i64)> {
+    records.count_by_collection().await.unwrap_or_default()
 }
 
 /// Row-count share of the largest collections, as percentages, largest first.
-pub async fn collection_shares(pool: &AnyPool, backend: DatabaseBackend) -> Vec<f32> {
-    let counts = collection_counts(pool, backend).await;
+pub async fn collection_shares(records: &RecordStore) -> Vec<f32> {
+    let counts = collection_counts(records).await;
     let total: i64 = counts.iter().map(|(_, n)| *n).sum();
     if total == 0 {
         return Vec::new();
@@ -119,8 +104,8 @@ pub async fn collection_shares(pool: &AnyPool, backend: DatabaseBackend) -> Vec<
         .collect()
 }
 
-pub async fn collection_names(pool: &AnyPool, backend: DatabaseBackend) -> Vec<String> {
-    collection_counts(pool, backend)
+pub async fn collection_names(records: &RecordStore) -> Vec<String> {
+    collection_counts(records)
         .await
         .into_iter()
         .take(TOP_COLLECTIONS)
@@ -160,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn totals_reports_zero_on_an_empty_database() {
         let pool = pool_with_records().await;
-        let totals = totals(&pool, DatabaseBackend::Sqlite).await;
+        let totals = totals(&RecordStore::new(pool.clone(), DatabaseBackend::Sqlite)).await;
         assert_eq!(totals.get("records"), Some(&0));
     }
 
@@ -175,7 +160,7 @@ mod tests {
             )
             .await;
         }
-        let totals = totals(&pool, DatabaseBackend::Sqlite).await;
+        let totals = totals(&RecordStore::new(pool.clone(), DatabaseBackend::Sqlite)).await;
         assert_eq!(totals.get("records"), Some(&3));
     }
 
@@ -197,7 +182,8 @@ mod tests {
         )
         .await;
 
-        let shares = collection_shares(&pool, DatabaseBackend::Sqlite).await;
+        let shares =
+            collection_shares(&RecordStore::new(pool.clone(), DatabaseBackend::Sqlite)).await;
         assert_eq!(shares.len(), 2);
         assert!((shares[0] - 90.0).abs() < 0.01, "got {:?}", shares);
         assert!((shares[1] - 10.0).abs() < 0.01, "got {:?}", shares);
@@ -207,7 +193,7 @@ mod tests {
     async fn collection_shares_are_empty_rather_than_nan_when_there_are_no_records() {
         let pool = pool_with_records().await;
         assert!(
-            collection_shares(&pool, DatabaseBackend::Sqlite)
+            collection_shares(&RecordStore::new(pool.clone(), DatabaseBackend::Sqlite))
                 .await
                 .is_empty()
         );
@@ -321,7 +307,8 @@ mod tests {
         )
         .await;
 
-        let names = collection_names(&pool, DatabaseBackend::Sqlite).await;
+        let names =
+            collection_names(&RecordStore::new(pool.clone(), DatabaseBackend::Sqlite)).await;
         assert_eq!(names, vec!["app.bsky.feed.post".to_string()]);
     }
 }

@@ -31,7 +31,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import {
   Table,
   TableBody,
@@ -72,7 +77,13 @@ function blobCids(value: unknown, found: string[] = []): string[] {
   return found;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-0.5">
       <span className="text-muted-foreground text-xs">{label}</span>
@@ -112,7 +123,8 @@ export default function SpaceDetail() {
       setLoading(true);
       try {
         const data = await getAdminSpaceRecords(id, {
-          collection: filters.collection === ALL ? undefined : filters.collection,
+          collection:
+            filters.collection === ALL ? undefined : filters.collection,
           repo: filters.repo === ALL ? undefined : filters.repo,
           limit: PAGE_SIZE,
           cursor,
@@ -207,7 +219,9 @@ export default function SpaceDetail() {
               {new Date(space.created_at).toLocaleString()}
             </Field>
             <Field label="Read policy">
-              <Badge variant="outline">{policyLabel(space.read_policy.$type)}</Badge>
+              <Badge variant="outline">
+                {policyLabel(space.read_policy.$type)}
+              </Badge>
             </Field>
             <Field label="Write policy">
               <Badge variant="outline">
@@ -215,7 +229,9 @@ export default function SpaceDetail() {
               </Badge>
             </Field>
             <Field label="App access">
-              <Badge variant="outline">{policyLabel(space.app_access.$type)}</Badge>
+              <Badge variant="outline">
+                {policyLabel(space.app_access.$type)}
+              </Badge>
             </Field>
           </CardContent>
         </Card>
@@ -247,7 +263,9 @@ export default function SpaceDetail() {
                         </TableCell>
                         <TableCell className="flex gap-1">
                           {member.read && <Badge variant="outline">read</Badge>}
-                          {member.write && <Badge variant="outline">write</Badge>}
+                          {member.write && (
+                            <Badge variant="outline">write</Badge>
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -316,7 +334,10 @@ export default function SpaceDetail() {
                       applyFilters({ collection: value, repo })
                     }
                   >
-                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Collection">
+                    <SelectTrigger
+                      className="h-8 w-72 text-sm"
+                      aria-label="Collection"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -334,7 +355,10 @@ export default function SpaceDetail() {
                       applyFilters({ collection, repo: value })
                     }
                   >
-                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Author">
+                    <SelectTrigger
+                      className="h-8 w-72 text-sm"
+                      aria-label="Author"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -478,7 +502,9 @@ export default function SpaceDetail() {
                   )}
 
                   <Field label="Record">
-                    <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                    <CodeBlock
+                      code={JSON.stringify(viewRecord.record, null, 2)}
+                    />
                   </Field>
                 </div>
               </>

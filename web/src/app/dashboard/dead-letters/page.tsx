@@ -195,8 +195,7 @@ export default function DeadLettersPage() {
     () =>
       (
         debouncedFilters.find((f) => f.id === "collection")?.value as
-          | string[]
-          | undefined
+          string[] | undefined
       )?.join(",") || undefined,
     [debouncedFilters],
   );
@@ -276,7 +275,13 @@ export default function DeadLettersPage() {
       if (action === "retry") await retryDeadLetter(viewDetail.id);
       else if (action === "reindex") await reindexDeadLetter(viewDetail.id);
       else await dismissDeadLetter(viewDetail.id);
-      toast.success(action === "retry" ? "Dead letter retried" : action === "reindex" ? "Dead letter re-indexed" : "Dead letter dismissed");
+      toast.success(
+        action === "retry"
+          ? "Dead letter retried"
+          : action === "reindex"
+            ? "Dead letter re-indexed"
+            : "Dead letter dismissed",
+      );
       setViewDetail(null);
       fetchItems();
     } catch (e: unknown) {
@@ -305,10 +310,17 @@ export default function DeadLettersPage() {
       if (action === "retry") await bulkRetryDeadLetters(body);
       else if (action === "reindex") await bulkReindexDeadLetters(body);
       else await bulkDismissDeadLetters(body);
-      const verb = action === "retry" ? "retried" : action === "reindex" ? "re-indexed" : "dismissed";
-      toast.success(scope === "all"
-        ? `All matching dead letters ${verb}`
-        : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`);
+      const verb =
+        action === "retry"
+          ? "retried"
+          : action === "reindex"
+            ? "re-indexed"
+            : "dismissed";
+      toast.success(
+        scope === "all"
+          ? `All matching dead letters ${verb}`
+          : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`,
+      );
       setRowSelection({});
       fetchItems();
     } catch (e: unknown) {
@@ -521,14 +533,23 @@ export default function DeadLettersPage() {
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>Dismiss {selectedIds.length} dead {selectedIds.length === 1 ? "letter" : "letters"}?</AlertDialogTitle>
+                  <AlertDialogTitle>
+                    Dismiss {selectedIds.length} dead{" "}
+                    {selectedIds.length === 1 ? "letter" : "letters"}?
+                  </AlertDialogTitle>
                   <AlertDialogDescription>
-                    Dismissed dead letters will be marked as resolved and will not be retried.
+                    Dismissed dead letters will be marked as resolved and will
+                    not be retried.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "selected")}>Dismiss</AlertDialogAction>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={() => handleBulkAction("dismiss", "selected")}
+                  >
+                    Dismiss
+                  </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>
@@ -550,9 +571,7 @@ export default function DeadLettersPage() {
                 >
                   Re-index all matching
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setDismissAllOpen(true)}
-                >
+                <DropdownMenuItem onClick={() => setDismissAllOpen(true)}>
                   Dismiss all matching
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -656,14 +675,22 @@ export default function DeadLettersPage() {
         <AlertDialog open={dismissAllOpen} onOpenChange={setDismissAllOpen}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Dismiss all matching dead letters?</AlertDialogTitle>
+              <AlertDialogTitle>
+                Dismiss all matching dead letters?
+              </AlertDialogTitle>
               <AlertDialogDescription>
-                All dead letters matching the current filters will be marked as resolved. This action cannot be undone.
+                All dead letters matching the current filters will be marked as
+                resolved. This action cannot be undone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "all")}>Dismiss All</AlertDialogAction>
+              <AlertDialogAction
+                variant="destructive"
+                onClick={() => handleBulkAction("dismiss", "all")}
+              >
+                Dismiss All
+              </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>

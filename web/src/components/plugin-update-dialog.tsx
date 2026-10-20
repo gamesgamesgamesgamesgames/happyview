@@ -1,10 +1,10 @@
-"use client"
+"use client";
 
-import { useEffect, useState } from "react"
-import { AlertTriangle, Loader2 } from "lucide-react"
-import ReactMarkdown from "react-markdown"
-import remarkGfm from "remark-gfm"
-import { toast } from "sonner"
+import { useEffect, useState } from "react";
+import { AlertTriangle, Loader2 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 
 import {
   ResponsiveDialog,
@@ -13,22 +13,22 @@ import {
   ResponsiveDialogFooter,
   ResponsiveDialogHeader,
   ResponsiveDialogTitle,
-} from "@/components/ui/responsive-dialog"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
+} from "@/components/ui/responsive-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   previewPlugin,
   reloadPlugin,
   type PluginPreview,
   type PluginSummary,
   type SecretDefinition,
-} from "@/lib/api"
+} from "@/lib/api";
 
 interface PluginUpdateDialogProps {
-  plugin: PluginSummary | null
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onUpdated: (updated: PluginSummary) => void
+  plugin: PluginSummary | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onUpdated: (updated: PluginSummary) => void;
 }
 
 export function PluginUpdateDialog({
@@ -40,91 +40,91 @@ export function PluginUpdateDialog({
   // The entry the server's update gate approved for this install. The
   // catalogue listing is not consulted: it is one entry per id from any
   // publisher, and may have moved on since the gate ran.
-  const manifestUrl = plugin?.latest_manifest_url ?? null
+  const manifestUrl = plugin?.latest_manifest_url ?? null;
 
   const [newManifestPreview, setNewManifestPreview] =
-    useState<PluginPreview | null>(null)
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [updating, setUpdating] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+    useState<PluginPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !plugin) {
-      setNewManifestPreview(null)
-      setError(null)
-      return
+      setNewManifestPreview(null);
+      setError(null);
+      return;
     }
     if (!manifestUrl) {
-      setNewManifestPreview(null)
-      return
+      setNewManifestPreview(null);
+      return;
     }
 
-    let cancelled = false
-    setPreviewLoading(true)
+    let cancelled = false;
+    setPreviewLoading(true);
     previewPlugin(manifestUrl)
       .then((preview) => {
-        if (!cancelled) setNewManifestPreview(preview)
+        if (!cancelled) setNewManifestPreview(preview);
       })
       .catch(() => {
-        if (!cancelled) setNewManifestPreview(null)
+        if (!cancelled) setNewManifestPreview(null);
       })
       .finally(() => {
-        if (!cancelled) setPreviewLoading(false)
-      })
+        if (!cancelled) setPreviewLoading(false);
+      });
 
     return () => {
-      cancelled = true
-    }
-  }, [open, plugin, manifestUrl])
+      cancelled = true;
+    };
+  }, [open, plugin, manifestUrl]);
 
-  if (!plugin) return null
+  if (!plugin) return null;
 
   const installedKeys = new Set(
     plugin.required_secrets.map((secret) => secret.key),
-  )
+  );
   const newRequiredSecrets: SecretDefinition[] =
     newManifestPreview?.required_secrets.filter(
       (secret) => !installedKeys.has(secret.key),
-    ) ?? []
+    ) ?? [];
 
-  const pendingReleases = [...(plugin.pending_releases ?? [])]
-  const hasReleaseNotes = pendingReleases.length > 0
-  const hasLatestVersion = Boolean(plugin.latest_version)
+  const pendingReleases = [...(plugin.pending_releases ?? [])];
+  const hasReleaseNotes = pendingReleases.length > 0;
+  const hasLatestVersion = Boolean(plugin.latest_version);
 
   const handleUpdate = async () => {
     if (!manifestUrl) {
-      setError("No manifest URL available for this plugin.")
-      return
+      setError("No manifest URL available for this plugin.");
+      return;
     }
-    setUpdating(true)
-    setError(null)
+    setUpdating(true);
+    setError(null);
     try {
-      const updated = await reloadPlugin(plugin.id, { url: manifestUrl })
+      const updated = await reloadPlugin(plugin.id, { url: manifestUrl });
       if (plugin.latest_version) {
         try {
           window.localStorage.setItem(
             `happyview:plugin-update-seen:${plugin.id}`,
             plugin.latest_version,
-          )
+          );
         } catch {
           // ignore storage errors
         }
       }
-      onUpdated(updated)
-      onOpenChange(false)
+      onUpdated(updated);
+      onOpenChange(false);
       toast.success(
         `Updated ${plugin.name} to v${plugin.latest_version ?? updated.version}`,
-      )
+      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to update plugin"
-      setError(message)
+      const message =
+        err instanceof Error ? err.message : "Failed to update plugin";
+      setError(message);
     } finally {
-      setUpdating(false)
+      setUpdating(false);
     }
-  }
+  };
 
-  const updateDisabled =
-    updating || previewLoading || !manifestUrl
+  const updateDisabled = updating || previewLoading || !manifestUrl;
 
   return (
     <ResponsiveDialog open={open} onOpenChange={onOpenChange}>
@@ -135,9 +135,7 @@ export function PluginUpdateDialog({
             <div className="flex items-center gap-2">
               <Badge variant="outline">v{plugin.version}</Badge>
               <span aria-hidden>→</span>
-              <Badge>
-                v{plugin.latest_version ?? "unknown"}
-              </Badge>
+              <Badge>v{plugin.latest_version ?? "unknown"}</Badge>
             </div>
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
@@ -172,7 +170,10 @@ export function PluginUpdateDialog({
             <div className="max-h-96 overflow-y-auto rounded-md border p-4">
               <div className="flex flex-col gap-6">
                 {pendingReleases.map((release) => (
-                  <section key={release.version} className="flex flex-col gap-2">
+                  <section
+                    key={release.version}
+                    className="flex flex-col gap-2"
+                  >
                     <h3 className="text-sm font-semibold">
                       v{release.version} ·{" "}
                       {new Date(release.published_at).toLocaleDateString()}
@@ -216,5 +217,5 @@ export function PluginUpdateDialog({
         </ResponsiveDialogFooter>
       </ResponsiveDialogContent>
     </ResponsiveDialog>
-  )
+  );
 }

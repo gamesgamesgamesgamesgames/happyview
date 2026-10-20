@@ -17,8 +17,22 @@ test.describe("Labelers declared in happyview.toml", () => {
       if (route.request().method() !== "GET") return route.continue();
       return route.fulfill({
         json: [
-          { did: DECLARED, status: "active", cursor: null, created_at: STAMP, updated_at: STAMP, declared: true },
-          { did: DASHBOARD, status: "active", cursor: null, created_at: STAMP, updated_at: STAMP, declared: false },
+          {
+            did: DECLARED,
+            status: "active",
+            cursor: null,
+            created_at: STAMP,
+            updated_at: STAMP,
+            declared: true,
+          },
+          {
+            did: DASHBOARD,
+            status: "active",
+            cursor: null,
+            created_at: STAMP,
+            updated_at: STAMP,
+            declared: false,
+          },
         ],
       });
     });
@@ -26,14 +40,22 @@ test.describe("Labelers declared in happyview.toml", () => {
     await page.goto("/dashboard/settings/labelers");
   });
 
-  test("a declared labeler names the file and offers no delete", async ({ page }) => {
+  test("a declared labeler names the file and offers no delete", async ({
+    page,
+  }) => {
     const declared = page.getByRole("row").filter({ hasText: DECLARED });
     await expect(declared.getByText("happyview.toml")).toBeVisible();
-    await expect(declared.getByRole("button", { name: "Delete labeler" })).toHaveCount(0);
-    await expect(declared.getByRole("button", { name: "Pause labeler" })).toBeVisible();
+    await expect(
+      declared.getByRole("button", { name: "Delete labeler" }),
+    ).toHaveCount(0);
+    await expect(
+      declared.getByRole("button", { name: "Pause labeler" }),
+    ).toBeVisible();
 
     const own = page.getByRole("row").filter({ hasText: DASHBOARD });
     await expect(own.getByText("happyview.toml")).toHaveCount(0);
-    await expect(own.getByRole("button", { name: "Delete labeler" })).toBeVisible();
+    await expect(
+      own.getByRole("button", { name: "Delete labeler" }),
+    ).toBeVisible();
   });
 });

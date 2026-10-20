@@ -1,14 +1,14 @@
-import { test, expect } from "@playwright/test"
-import { loginAsTestAdmin } from "./auth-helper"
+import { test, expect } from "@playwright/test";
+import { loginAsTestAdmin } from "./auth-helper";
 
 // The e2e stack runs no project, so the API's answer for a project-owned entry
 // is supplied here. What this pins is how the dashboard renders an entry the
 // API says a file owns.
 
-const SCRIPT_ID = "xrpc.query:test.e2e.project.thing"
-const SCRIPT_PATH = "src/lexicons/test/e2e/project/thing.lua"
-const LEXICON_ID = "test.e2e.project.thing"
-const LEXICON_PATH = "src/lexicons/test/e2e/project/thing.json"
+const SCRIPT_ID = "xrpc.query:test.e2e.project.thing";
+const SCRIPT_PATH = "src/lexicons/test/e2e/project/thing.lua";
+const LEXICON_ID = "test.e2e.project.thing";
+const LEXICON_PATH = "src/lexicons/test/e2e/project/thing.json";
 
 const projectScript = {
   id: SCRIPT_ID,
@@ -24,7 +24,7 @@ const projectScript = {
   layer: "project",
   path: SCRIPT_PATH,
   shadows_stored: true,
-}
+};
 
 const projectLexicon = {
   id: LEXICON_ID,
@@ -47,95 +47,124 @@ const projectLexicon = {
     id: LEXICON_ID,
     defs: { main: { type: "query", output: { encoding: "application/json" } } },
   },
-}
+};
 
 test.describe("Project-owned entries", () => {
   test.beforeEach(async ({ page }) => {
-    await loginAsTestAdmin(page)
-  })
+    await loginAsTestAdmin(page);
+  });
 
-  test("a project script renders read-only with its file path", async ({ page }) => {
+  test("a project script renders read-only with its file path", async ({
+    page,
+  }) => {
     await page.route(
-      (url) => url.pathname.endsWith(`/admin/scripts/${encodeURIComponent(SCRIPT_ID)}`),
+      (url) =>
+        url.pathname.endsWith(
+          `/admin/scripts/${encodeURIComponent(SCRIPT_ID)}`,
+        ),
       async (route) => {
-        if (route.request().method() !== "GET") return route.continue()
-        await route.fulfill({ json: projectScript })
+        if (route.request().method() !== "GET") return route.continue();
+        await route.fulfill({ json: projectScript });
       },
-    )
+    );
 
-    await page.goto(`/dashboard/settings/scripts/${encodeURIComponent(SCRIPT_ID)}`)
+    await page.goto(
+      `/dashboard/settings/scripts/${encodeURIComponent(SCRIPT_ID)}`,
+    );
 
-    const footer = page.locator("footer")
-    await expect(footer.getByText(SCRIPT_PATH)).toBeVisible({ timeout: 5000 })
-    await expect(footer.getByRole("button", { name: /^save/i })).toHaveCount(0)
-    await expect(footer.getByRole("button", { name: /delete script/i })).toHaveCount(0)
-    await expect(page.locator("#description")).toHaveAttribute("readonly", "")
-    await expect(page.getByText(/dashboard version of this script is kept/i)).toBeVisible()
-  })
+    const footer = page.locator("footer");
+    await expect(footer.getByText(SCRIPT_PATH)).toBeVisible({ timeout: 5000 });
+    await expect(footer.getByRole("button", { name: /^save/i })).toHaveCount(0);
+    await expect(
+      footer.getByRole("button", { name: /delete script/i }),
+    ).toHaveCount(0);
+    await expect(page.locator("#description")).toHaveAttribute("readonly", "");
+    await expect(
+      page.getByText(/dashboard version of this script is kept/i),
+    ).toBeVisible();
+  });
 
-  test("the scripts list offers no delete for a project script", async ({ page }) => {
+  test("the scripts list offers no delete for a project script", async ({
+    page,
+  }) => {
     await page.route(
-      (url) => url.pathname.endsWith("/admin/scripts") && !url.searchParams.has("suffix"),
+      (url) =>
+        url.pathname.endsWith("/admin/scripts") &&
+        !url.searchParams.has("suffix"),
       async (route) => {
-        if (route.request().method() !== "GET") return route.continue()
-        await route.fulfill({ json: [projectScript] })
+        if (route.request().method() !== "GET") return route.continue();
+        await route.fulfill({ json: [projectScript] });
       },
-    )
+    );
 
-    await page.goto("/dashboard/settings/scripts")
+    await page.goto("/dashboard/settings/scripts");
 
-    const row = page.locator("table tbody tr", { hasText: "test.e2e.project.thing" })
-    await expect(row).toBeVisible({ timeout: 5000 })
-    await expect(row.getByText("Project file")).toBeVisible()
-    await expect(row.getByRole("button", { name: /delete script/i })).toHaveCount(0)
-  })
+    const row = page.locator("table tbody tr", {
+      hasText: "test.e2e.project.thing",
+    });
+    await expect(row).toBeVisible({ timeout: 5000 });
+    await expect(row.getByText("Project file")).toBeVisible();
+    await expect(
+      row.getByRole("button", { name: /delete script/i }),
+    ).toHaveCount(0);
+  });
 
-  test("a project lexicon renders read-only with its file path", async ({ page }) => {
+  test("a project lexicon renders read-only with its file path", async ({
+    page,
+  }) => {
     await page.route(
       (url) => url.pathname.endsWith(`/admin/lexicons/${LEXICON_ID}`),
       async (route) => {
-        if (route.request().method() !== "GET") return route.continue()
-        await route.fulfill({ json: projectLexicon })
+        if (route.request().method() !== "GET") return route.continue();
+        await route.fulfill({ json: projectLexicon });
       },
-    )
+    );
     await page.route(
-      (url) => url.pathname.endsWith("/admin/scripts") && url.searchParams.has("suffix"),
+      (url) =>
+        url.pathname.endsWith("/admin/scripts") &&
+        url.searchParams.has("suffix"),
       (route) => route.fulfill({ json: [] }),
-    )
+    );
 
-    await page.goto(`/dashboard/lexicons/${LEXICON_ID}`)
+    await page.goto(`/dashboard/lexicons/${LEXICON_ID}`);
 
-    const footer = page.locator("footer")
-    await expect(footer.getByText(LEXICON_PATH)).toBeVisible({ timeout: 5000 })
-    await expect(footer.getByRole("button", { name: /^save/i })).toHaveCount(0)
-    await expect(footer.getByRole("button", { name: /delete lexicon/i })).toHaveCount(0)
-    await expect(page.locator("#token-cost")).toBeDisabled()
-    await expect(page.getByText(/stored version of this lexicon is kept/i)).toBeVisible()
+    const footer = page.locator("footer");
+    await expect(footer.getByText(LEXICON_PATH)).toBeVisible({ timeout: 5000 });
+    await expect(footer.getByRole("button", { name: /^save/i })).toHaveCount(0);
+    await expect(
+      footer.getByRole("button", { name: /delete lexicon/i }),
+    ).toHaveCount(0);
+    await expect(page.locator("#token-cost")).toBeDisabled();
+    await expect(
+      page.getByText(/stored version of this lexicon is kept/i),
+    ).toBeVisible();
     // The JSON editor is read-only: typing into it must not change it.
-    const editor = page.locator(".monaco-editor").first()
-    await expect(editor).toBeVisible({ timeout: 10000 })
-    const lines = editor.locator(".view-lines")
-    await expect(lines).toContainText("application/json")
-    await lines.click()
-    await page.keyboard.type("zzz")
-    await expect(lines).not.toContainText("zzz")
-  })
+    const editor = page.locator(".monaco-editor").first();
+    await expect(editor).toBeVisible({ timeout: 10000 });
+    const lines = editor.locator(".view-lines");
+    await expect(lines).toContainText("application/json");
+    await lines.click();
+    await page.keyboard.type("zzz");
+    await expect(lines).not.toContainText("zzz");
+  });
 
-  test("the lexicons list offers no delete for a project lexicon", async ({ page }) => {
+  test("the lexicons list offers no delete for a project lexicon", async ({
+    page,
+  }) => {
     await page.route(
       (url) => url.pathname.endsWith("/admin/lexicons"),
       async (route) => {
-        if (route.request().method() !== "GET") return route.continue()
-        await route.fulfill({ json: [projectLexicon] })
+        if (route.request().method() !== "GET") return route.continue();
+        await route.fulfill({ json: [projectLexicon] });
       },
-    )
+    );
 
-    await page.goto("/dashboard/lexicons")
+    await page.goto("/dashboard/lexicons");
 
-    const row = page.locator("table tbody tr", { hasText: LEXICON_ID })
-    await expect(row).toBeVisible({ timeout: 5000 })
-    await expect(row.getByRole("button", { name: /delete/i })).toHaveCount(0)
-  })
+    const row = page.locator("table tbody tr", { hasText: LEXICON_ID });
+    await expect(row).toBeVisible({ timeout: 5000 });
+    await expect(row.getByRole("button", { name: /delete/i })).toHaveCount(0);
+  });
 
   test("the lexicons list filters to project lexicons", async ({ page }) => {
     const manualLexicon = {
@@ -145,25 +174,30 @@ test.describe("Project-owned entries", () => {
       layer: "manual",
       path: null,
       shadows_stored: false,
-    }
+    };
     await page.route(
       (url) => url.pathname.endsWith("/admin/lexicons"),
       async (route) => {
-        if (route.request().method() !== "GET") return route.continue()
-        await route.fulfill({ json: [projectLexicon, manualLexicon] })
+        if (route.request().method() !== "GET") return route.continue();
+        await route.fulfill({ json: [projectLexicon, manualLexicon] });
       },
-    )
+    );
 
-    await page.goto("/dashboard/lexicons")
+    await page.goto("/dashboard/lexicons");
 
-    const projectRow = page.locator("table tbody tr", { hasText: LEXICON_ID })
-    const manualRow = page.locator("table tbody tr", { hasText: manualLexicon.id })
-    await expect(manualRow).toBeVisible({ timeout: 5000 })
+    const projectRow = page.locator("table tbody tr", { hasText: LEXICON_ID });
+    const manualRow = page.locator("table tbody tr", {
+      hasText: manualLexicon.id,
+    });
+    await expect(manualRow).toBeVisible({ timeout: 5000 });
 
-    await page.getByRole("toolbar").getByRole("button", { name: "Source" }).click()
-    await page.getByRole("option", { name: /^project/i }).click()
+    await page
+      .getByRole("toolbar")
+      .getByRole("button", { name: "Source" })
+      .click();
+    await page.getByRole("option", { name: /^project/i }).click();
 
-    await expect(projectRow).toBeVisible()
-    await expect(manualRow).toHaveCount(0)
-  })
-})
+    await expect(projectRow).toBeVisible();
+    await expect(manualRow).toHaveCount(0);
+  });
+});

@@ -443,7 +443,8 @@ export function ScopeBuilder({
     let next = rows.filter((r) => r.prefix.trim() || r.rest.trim());
     for (const wanted of preset.rows) {
       const i = next.findIndex(
-        (r) => r.prefix.trim() === wanted.prefix && r.rest.trim() === wanted.rest,
+        (r) =>
+          r.prefix.trim() === wanted.prefix && r.rest.trim() === wanted.rest,
       );
       if (i === -1) {
         next = [...next, { ...wanted }];
@@ -650,7 +651,9 @@ export function ScopeBuilder({
                 )}
 
                 {cannotUpsert(row) && (
-                  <p className={cn(UNDER_VALUE, "text-muted-foreground text-xs")}>
+                  <p
+                    className={cn(UNDER_VALUE, "text-muted-foreground text-xs")}
+                  >
                     <code className="font-mono">update</code> without{" "}
                     <code className="font-mono">create</code> can&apos;t{" "}
                     <code className="font-mono">put_record</code>, which upserts
@@ -675,7 +678,6 @@ export function ScopeBuilder({
             </p>
           </div>
         )}
-
       </div>
 
       <div className="flex flex-col gap-2">
@@ -685,8 +687,9 @@ export function ScopeBuilder({
         </p>
         {grantsNoAccess(scopeString) && (
           <p className="text-muted-foreground text-xs">
-            Nothing selected yet. <code className="font-mono">{BASE_SCOPE}</code>{" "}
-            on its own authorizes no reads or writes.
+            Nothing selected yet.{" "}
+            <code className="font-mono">{BASE_SCOPE}</code> on its own
+            authorizes no reads or writes.
           </p>
         )}
       </div>

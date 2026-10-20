@@ -1,73 +1,74 @@
-"use client"
+"use client";
 
-import { useEffect, useMemo, useState } from "react"
-import Link from "next/link"
-import { useRouter } from "next/navigation"
-import { Link2, Search, X } from "lucide-react"
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { Link2, Search, X } from "lucide-react";
 
-import { useOfficialPlugins } from "@/hooks/use-official-plugins"
-import { getPlugins } from "@/lib/api"
-import { cataloguePluginHref, urlPluginHref } from "@/lib/plugin-routes"
-import { PluginMark } from "@/components/plugin-identity"
-import { PageBreadcrumbs } from "@/components/page-breadcrumbs"
-import { SiteHeader } from "@/components/site-header"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { useOfficialPlugins } from "@/hooks/use-official-plugins";
+import { getPlugins } from "@/lib/api";
+import { cataloguePluginHref, urlPluginHref } from "@/lib/plugin-routes";
+import { PluginMark } from "@/components/plugin-identity";
+import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
+import { SiteHeader } from "@/components/site-header";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Sheet,
   SheetContent,
   SheetDescription,
   SheetHeader,
   SheetTitle,
-} from "@/components/ui/sheet"
-import { Skeleton } from "@/components/ui/skeleton"
+} from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function isHttpUrl(value: string): boolean {
   try {
-    const parsed = new URL(value)
-    return parsed.protocol === "http:" || parsed.protocol === "https:"
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
   } catch {
-    return false
+    return false;
   }
 }
 
 export default function AddPluginPage() {
-  const router = useRouter()
-  const { plugins: catalogue, loading: catalogueLoading } = useOfficialPlugins()
+  const router = useRouter();
+  const { plugins: catalogue, loading: catalogueLoading } =
+    useOfficialPlugins();
 
-  const [query, setQuery] = useState("")
-  const [urlOpen, setUrlOpen] = useState(false)
-  const [url, setUrl] = useState("")
-  const [installed, setInstalled] = useState<Set<string>>(new Set())
-  const [showInstalled, setShowInstalled] = useState(false)
+  const [query, setQuery] = useState("");
+  const [urlOpen, setUrlOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [installed, setInstalled] = useState<Set<string>>(new Set());
+  const [showInstalled, setShowInstalled] = useState(false);
 
   useEffect(() => {
     void getPlugins()
       .then((r) => setInstalled(new Set(r.plugins.map((p) => p.id))))
       // An unreadable list only costs the installed badges, so the catalogue
       // still works without it.
-      .catch(() => setInstalled(new Set()))
-  }, [])
+      .catch(() => setInstalled(new Set()));
+  }, []);
 
   const results = useMemo(() => {
-    const q = query.trim().toLowerCase()
+    const q = query.trim().toLowerCase();
     return catalogue.filter((p) => {
-      if (!showInstalled && installed.has(p.id)) return false
-      if (!q) return true
+      if (!showInstalled && installed.has(p.id)) return false;
+      if (!q) return true;
       return (
         p.name.toLowerCase().includes(q) ||
         p.id.toLowerCase().includes(q) ||
         (p.description?.toLowerCase().includes(q) ?? false)
-      )
-    })
-  }, [catalogue, query, installed, showInstalled])
+      );
+    });
+  }, [catalogue, query, installed, showInstalled]);
 
   const hiddenCount = showInstalled
     ? 0
-    : catalogue.filter((p) => installed.has(p.id)).length
+    : catalogue.filter((p) => installed.has(p.id)).length;
 
   return (
     <>
@@ -140,7 +141,11 @@ export default function AddPluginPage() {
             <p className="text-sm text-muted-foreground">
               Install from a URL instead.
             </p>
-            <Button variant="outline" size="sm" onClick={() => setUrlOpen(true)}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setUrlOpen(true)}
+            >
               <Link2 />
               Install from URL
             </Button>
@@ -154,7 +159,11 @@ export default function AddPluginPage() {
               </span>
               .
             </p>
-            <Button variant="outline" size="sm" onClick={() => setUrlOpen(true)}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setUrlOpen(true)}
+            >
               <Link2 />
               Install from URL instead
             </Button>
@@ -239,8 +248,8 @@ export default function AddPluginPage() {
             <Button
               disabled={!isHttpUrl(url)}
               onClick={() => {
-                setUrlOpen(false)
-                router.push(urlPluginHref(url))
+                setUrlOpen(false);
+                router.push(urlPluginHref(url));
               }}
             >
               Continue
@@ -249,5 +258,5 @@ export default function AddPluginPage() {
         </SheetContent>
       </Sheet>
     </>
-  )
+  );
 }

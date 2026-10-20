@@ -32,7 +32,8 @@ pub async fn lookup_record(
     let field = super::records::record_text_field_sql(external_id_field)
         .map_err(|_| LookupError::InvalidFieldPath)?;
 
-    let result = crate::record_store::RecordStore::new(ctx.db.clone(), ctx.db_backend)
+    let result = ctx
+        .records
         .lookup_by_text_field(collection, &field, external_id_value)
         .await?;
 
@@ -106,6 +107,7 @@ mod tests {
             scope: "did:plc:test".to_string(),
             secrets: Default::default(),
             config: serde_json::Value::Null,
+            records: crate::record_store::RecordStore::new(db.clone(), db_backend),
             db,
             db_backend,
             http_client: reqwest::Client::new(),

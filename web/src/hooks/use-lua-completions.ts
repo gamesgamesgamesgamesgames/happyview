@@ -17,8 +17,9 @@ export function useLuaCompletions(jsonText: string): {
   collections: string[];
 } {
   const [collections, setCollections] = useState<string[]>([]);
-  const [collectionSchemas, setCollectionSchemas] =
-    useState<CollectionSchemas>({});
+  const [collectionSchemas, setCollectionSchemas] = useState<CollectionSchemas>(
+    {},
+  );
 
   useEffect(() => {
     getLexicons().then(async (lexicons) => {

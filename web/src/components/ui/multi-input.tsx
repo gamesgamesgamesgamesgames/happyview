@@ -45,7 +45,10 @@ export function MultiInput({
   // A pasted list becomes rows rather than one row holding the whole list:
   // the values come from a config file or another form far more often than
   // one is typed by hand.
-  function handlePaste(index: number, e: React.ClipboardEvent<HTMLInputElement>) {
+  function handlePaste(
+    index: number,
+    e: React.ClipboardEvent<HTMLInputElement>,
+  ) {
     const parts = e.clipboardData
       .getData("text")
       .split(/[,;\s]+/)
@@ -54,7 +57,9 @@ export function MultiInput({
     if (parts.length <= 1) return;
     e.preventDefault();
     const before = values.slice(0, index);
-    const after = values.slice(index + 1).filter((value) => value.trim() !== "");
+    const after = values
+      .slice(index + 1)
+      .filter((value) => value.trim() !== "");
     onChange([...before, ...parts, ...after, ""]);
   }
 

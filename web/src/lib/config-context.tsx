@@ -1,16 +1,16 @@
-"use client"
+"use client";
 
-import { createContext, useContext, useEffect, useState } from "react"
-import { TriangleAlert } from "lucide-react"
+import { createContext, useContext, useEffect, useState } from "react";
+import { TriangleAlert } from "lucide-react";
 
 interface ConfigContextType {
-  public_url: string
-  default_rate_limit_capacity: number
-  default_rate_limit_refill_rate: number
-  app_name: string | null
-  logo_url: string | null
-  platform_managed: boolean
-  configErrors: string[]
+  public_url: string;
+  default_rate_limit_capacity: number;
+  default_rate_limit_refill_rate: number;
+  app_name: string | null;
+  logo_url: string | null;
+  platform_managed: boolean;
+  configErrors: string[];
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -21,7 +21,7 @@ const ConfigContext = createContext<ConfigContextType>({
   logo_url: null,
   platform_managed: false,
   configErrors: [],
-})
+});
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
   return (
@@ -45,18 +45,18 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
         </div>
       </div>
     </div>
-  )
+  );
 }
 
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<ConfigContextType | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [config, setConfig] = useState<ConfigContextType | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
       .then((res) => {
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
-        return res.json()
+        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
+        return res.json();
       })
       .then((data) => {
         setConfig({
@@ -66,17 +66,23 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
           app_name: data.app_name ?? null,
           logo_url: data.logo_url ?? null,
           platform_managed: data.platform_managed === true,
-          configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
-        })
+          configErrors: Array.isArray(data.configErrors)
+            ? data.configErrors
+            : [],
+        });
       })
-      .catch((e) => setError(e.message))
-  }, [])
+      .catch((e) => setError(e.message));
+  }, []);
 
   if (error) {
-    return <div style={{ padding: "2rem", color: "red" }}>Failed to load config: {error}</div>
+    return (
+      <div style={{ padding: "2rem", color: "red" }}>
+        Failed to load config: {error}
+      </div>
+    );
   }
 
-  if (!config) return null
+  if (!config) return null;
 
   return (
     <ConfigContext.Provider value={config}>
@@ -85,9 +91,9 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
       )}
       {children}
     </ConfigContext.Provider>
-  )
+  );
 }
 
 export function useConfig() {
-  return useContext(ConfigContext)
+  return useContext(ConfigContext);
 }

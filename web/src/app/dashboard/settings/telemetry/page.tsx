@@ -70,7 +70,9 @@ const LEXICON_TOGGLES = [
 export default function TelemetryPage() {
   const [settings, setSettings] = useState<TelemetrySettings | null>(null);
   const [preview, setPreview] = useState<string>("");
-  const [benchmarks, setBenchmarks] = useState<TelemetryBenchmarks | null>(null);
+  const [benchmarks, setBenchmarks] = useState<TelemetryBenchmarks | null>(
+    null,
+  );
   const [sending, setSending] = useState(false);
   const [contactDraft, setContactDraft] = useState("");
   // Only seed the draft from the first load. Re-syncing on every `settings`
@@ -177,10 +179,10 @@ export default function TelemetryPage() {
           <CardHeader>
             <CardTitle>Contact (optional)</CardTitle>
             <CardDescription>
-              If you&apos;d like us to be able to reach you about what we see
-              in your reports, leave a way to reach you below. This is
-              separate from whether you send anything at all — you can report
-              without ever filling this in.
+              If you&apos;d like us to be able to reach you about what we see in
+              your reports, leave a way to reach you below. This is separate
+              from whether you send anything at all — you can report without
+              ever filling this in.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
@@ -214,7 +216,10 @@ export default function TelemetryPage() {
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             {LEXICON_TOGGLES.map((t) => (
-              <div key={t.key} className="flex items-start justify-between gap-4">
+              <div
+                key={t.key}
+                className="flex items-start justify-between gap-4"
+              >
                 <div className="grid gap-1">
                   <Label htmlFor={t.key}>{t.label}</Label>
                   <p className="text-muted-foreground text-sm">{t.hint}</p>
@@ -224,7 +229,9 @@ export default function TelemetryPage() {
                   aria-label={t.label}
                   disabled={!sharing}
                   checked={settings?.[t.key] ?? false}
-                  onCheckedChange={(checked) => void patch({ [t.key]: checked })}
+                  onCheckedChange={(checked) =>
+                    void patch({ [t.key]: checked })
+                  }
                 />
               </div>
             ))}

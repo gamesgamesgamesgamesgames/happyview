@@ -578,7 +578,7 @@ mod tests {
     // that stopped asking would throw away each module's compiled code.
     #[test]
     fn the_boot_sweep_asks_for_the_live_hashes() {
-        assert!(include_str!("../../main.rs").contains("script_module::boot_live_hashes("));
+        assert!(include_str!("../../run.rs").contains("script_module::boot_live_hashes("));
     }
 
     #[test]

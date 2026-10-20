@@ -19,10 +19,11 @@ use super::permissions::Permission;
 use super::types::{AddNetworkLexiconBody, NetworkLexiconSummary};
 
 /// Broadcast the current record collection list so the Jetstream
-/// subscription syncs its filter.
+/// subscription syncs its filter. Stored even when nothing listens yet: the
+/// backfill job system reads it to know what it may backfill.
 async fn notify_collections(state: &AppState) {
     let collections = state.lexicons.get_record_collections().await;
-    let _ = state.collections_tx.send(collections);
+    let _ = state.collections_tx.send_replace(collections);
 }
 
 /// GET /admin/network-lexicons/resolve/{nsid} — preview-resolve a network lexicon without persisting.
@@ -135,7 +136,8 @@ pub(super) async fn add(
         && tracked.revision == 1
         && auth.has(Permission::BackfillCreate)
     {
-        match crate::admin::backfill::start_automatic_backfill(&state, nsid.clone(), &auth.did)
+        match state
+            .start_automatic_backfill(nsid.clone(), &auth.did)
             .await
         {
             Ok(job_id) => job_id,

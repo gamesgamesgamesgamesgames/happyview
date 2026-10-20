@@ -1,26 +1,28 @@
-"use client"
+"use client";
 
-import { isValidElement, type ComponentProps, type ReactNode } from "react"
-import ReactMarkdown from "react-markdown"
-import remarkGfm from "remark-gfm"
+import { isValidElement, type ComponentProps, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-import { useHighlighted } from "@/lib/highlight"
-import { cn } from "@/lib/utils"
+import { useHighlighted } from "@/lib/highlight";
+import { cn } from "@/lib/utils";
 
-const FENCE_CODE_CLASS = "font-mono text-xs whitespace-pre"
+const FENCE_CODE_CLASS = "font-mono text-xs whitespace-pre";
 
 /** The fence's language, or null for an indented block or a bare fence. */
 function fenceGrammar(className: unknown): string | null {
   const match =
-    typeof className === "string" ? /(?:^|\s)language-(\S+)/.exec(className) : null
-  return match ? match[1] : null
+    typeof className === "string"
+      ? /(?:^|\s)language-(\S+)/.exec(className)
+      : null;
+  return match ? match[1] : null;
 }
 
 /** The code, which arrives as one string or a list of them. */
 function textOf(node: ReactNode): string {
-  if (typeof node === "string") return node
-  if (Array.isArray(node)) return node.map(textOf).join("")
-  return ""
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  return "";
 }
 
 /**
@@ -29,7 +31,7 @@ function textOf(node: ReactNode): string {
  * up the theme's background so the surface shows through.
  */
 function Fence({ code, grammar }: { code: string; grammar: string | null }) {
-  const nodes = useHighlighted(code, grammar, FENCE_CODE_CLASS)
+  const nodes = useHighlighted(code, grammar, FENCE_CODE_CLASS);
   return (
     <div className="not-prose shiki-on-surface my-4 overflow-x-auto rounded-lg border bg-muted/40 px-4 py-3">
       {nodes ?? (
@@ -38,7 +40,7 @@ function Fence({ code, grammar }: { code: string; grammar: string | null }) {
         </pre>
       )}
     </div>
-  )
+  );
 }
 
 /**
@@ -47,9 +49,9 @@ function Fence({ code, grammar }: { code: string; grammar: string | null }) {
  */
 function Pre({ children }: ComponentProps<"pre">) {
   if (!isValidElement<ComponentProps<"code">>(children)) {
-    return <pre>{children}</pre>
+    return <pre>{children}</pre>;
   }
-  const { className, children: body } = children.props
+  const { className, children: body } = children.props;
   return (
     <Fence
       // The text ends in the newline that closed the fence, which would
@@ -57,7 +59,7 @@ function Pre({ children }: ComponentProps<"pre">) {
       code={textOf(body).replace(/\n$/, "")}
       grammar={fenceGrammar(className)}
     />
-  )
+  );
 }
 
 /**
@@ -76,8 +78,8 @@ export function PublishedMarkdown({
   children,
   className,
 }: {
-  children: string
-  className?: string
+  children: string;
+  className?: string;
 }) {
   return (
     <div
@@ -94,5 +96,5 @@ export function PublishedMarkdown({
         {children}
       </ReactMarkdown>
     </div>
-  )
+  );
 }

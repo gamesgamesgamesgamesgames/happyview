@@ -223,10 +223,8 @@ mod tests {
     /// `test_pds_auth`.
     #[tokio::test]
     async fn create_with_auth_holding_the_test_pds_carries_no_ids() {
-        let state = AppState {
-            test: Some(Arc::new(crate::testing::TestHarness::new("a.test.lua"))),
-            ..seeded_state().await
-        };
+        let mut state = seeded_state().await;
+        state.test = Some(Arc::new(crate::testing::TestHarness::new("a.test.lua")));
         let session = CallerSession {
             pds_auth: Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             ..dpop_session(&state, "did:plc:caller")

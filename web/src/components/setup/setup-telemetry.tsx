@@ -8,7 +8,13 @@ import {
   type TelemetrySettings,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 
@@ -62,12 +68,11 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
       <CardHeader>
         <CardTitle>Help us build the right things</CardTitle>
         <CardDescription>
-          HappyView can send us a daily report about how this instance is
-          doing: how much data it holds, which features you use, and where it
-          is struggling. It never includes records, handles, DIDs, or the
-          contents of anything you have indexed. You can read the exact
-          payload — and change your mind — any time under Settings →
-          Telemetry.
+          HappyView can send us a daily report about how this instance is doing:
+          how much data it holds, which features you use, and where it is
+          struggling. It never includes records, handles, DIDs, or the contents
+          of anything you have indexed. You can read the exact payload — and
+          change your mind — any time under Settings → Telemetry.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -82,9 +87,7 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
                 id={`setup-telemetry-${o.value}`}
               />
               <div className="grid gap-1">
-                <Label htmlFor={`setup-telemetry-${o.value}`}>
-                  {o.label}
-                </Label>
+                <Label htmlFor={`setup-telemetry-${o.value}`}>{o.label}</Label>
                 <p className="text-muted-foreground text-sm">{o.hint}</p>
               </div>
             </div>

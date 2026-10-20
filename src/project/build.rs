@@ -348,8 +348,9 @@ pub async fn build_snapshot_with(
 /// before it keeps the snapshot it pinned and a run that starts after sees
 /// all of the new one.
 ///
-/// Installs come from one place at a time, boot and then the dev watcher,
-/// so reading the generation and storing the next one are not raced.
+/// A serving instance installs only under `project::boot`'s `INSTALL` lock,
+/// and `happyview test` only under its `RUN` mutex, so reading the
+/// generation and storing the next one are not raced.
 pub async fn install(state: &AppState, mut snapshot: ProjectSnapshot) {
     snapshot.generation = state.project.load().generation + 1;
     state.project.store(Arc::new(snapshot));

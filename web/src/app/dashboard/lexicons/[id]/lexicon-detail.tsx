@@ -69,8 +69,7 @@ export default function LexiconDetailPage() {
     load();
   }, [load]);
 
-  const isDirty =
-    jsonText !== originalJson || tokenCost !== originalTokenCost;
+  const isDirty = jsonText !== originalJson || tokenCost !== originalTokenCost;
 
   async function handleSave() {
     if (!lexicon) return;
@@ -241,12 +240,13 @@ export default function LexiconDetailPage() {
                   placeholder="default"
                   value={tokenCost}
                   onChange={(e) => setTokenCost(e.target.value)}
-                  disabled={projectPath !== null || !hasPermission("lexicons:create")}
+                  disabled={
+                    projectPath !== null || !hasPermission("lexicons:create")
+                  }
                 />
               </div>
             )}
           </div>
-
         </div>
 
         <div className="flex flex-col md:flex-row flex-1 min-h-0 gap-6 px-4 md:px-6 overflow-auto">
@@ -351,9 +351,7 @@ function ScriptsTargetingPanel({
 
   return (
     <div>
-      <Label className="text-muted-foreground mb-3 block">
-        Scripts
-      </Label>
+      <Label className="text-muted-foreground mb-3 block">Scripts</Label>
 
       <ul className="flex flex-col gap-2">
         {slots.map(({ kind, label, triggerId, script }) => (

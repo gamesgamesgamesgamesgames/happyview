@@ -46,4 +46,3 @@ export interface ExtendedColumnSort<TData> extends Omit<ColumnSort, "id"> {
 export interface ExtendedColumnFilter<TData> extends FilterItemSchema {
   id: Extract<keyof TData, string>;
 }
-

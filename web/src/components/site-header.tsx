@@ -1,28 +1,28 @@
-"use client"
+"use client";
 
-import { useState } from "react"
-import { IconArrowLeft } from "@tabler/icons-react"
-import { AlertTriangle, ChevronDown } from "lucide-react"
-import Link from "next/link"
+import { useState } from "react";
+import { IconArrowLeft } from "@tabler/icons-react";
+import { AlertTriangle, ChevronDown } from "lucide-react";
+import Link from "next/link";
 
-import { useRestart } from "@/lib/restart-context"
-import { Button } from "@/components/ui/button"
-import { Separator } from "@/components/ui/separator"
-import { SidebarTrigger } from "@/components/ui/sidebar"
-import { ThemeToggle } from "@/components/theme-toggle"
+import { useRestart } from "@/lib/restart-context";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { SidebarTrigger } from "@/components/ui/sidebar";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export function SiteHeader({
   title,
   backHref,
   actions,
 }: {
-  title: string
-  backHref?: string
+  title: string;
+  backHref?: string;
   /** Page-level links that would crowd a toolbar, set beside the theme toggle. */
-  actions?: React.ReactNode
+  actions?: React.ReactNode;
 }) {
-  const { reasons } = useRestart()
-  const [expanded, setExpanded] = useState(false)
+  const { reasons } = useRestart();
+  const [expanded, setExpanded] = useState(false);
 
   return (
     <header className="sticky top-0 z-10 bg-background">
@@ -34,7 +34,12 @@ export function SiteHeader({
             className="mx-2 data-[orientation=vertical]:h-4"
           />
           {backHref && (
-            <Button variant="ghost" size="icon" className="-ml-1 size-7" asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="-ml-1 size-7"
+              asChild
+            >
               <Link href={backHref}>
                 <IconArrowLeft className="size-4" />
                 <span className="sr-only">Back</span>
@@ -57,7 +62,9 @@ export function SiteHeader({
           >
             <AlertTriangle className="size-3.5 shrink-0" />
             <span className="font-medium">Restart required</span>
-            <ChevronDown className={`ml-auto size-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
+            <ChevronDown
+              className={`ml-auto size-3.5 transition-transform ${expanded ? "rotate-180" : ""}`}
+            />
           </button>
           {expanded && (
             <ul className="px-4 pb-2 text-xs text-amber-600 dark:text-amber-400 lg:px-6">
@@ -72,5 +79,5 @@ export function SiteHeader({
         </div>
       )}
     </header>
-  )
+  );
 }

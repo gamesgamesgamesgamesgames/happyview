@@ -107,28 +107,7 @@ pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
     (None, raw.to_string())
 }
 
-/// Render an error together with its full `source()` chain.
-///
-/// `reqwest::Error`'s `Display` deliberately omits its source, so a transport
-/// failure formats as nothing more than `error sending request for url (…)` —
-/// leaving NXDOMAIN, TLS failure, connection refused and timeout completely
-/// indistinguishable in the logs. That is exactly the information needed to
-/// tell "this host is gone" from "we are misconfigured", so walk the chain and
-/// append each cause.
-pub fn describe_error_chain(err: &dyn std::error::Error) -> String {
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        // Chains frequently restate the outer message; don't repeat it.
-        if !out.ends_with(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = cause.source();
-    }
-    out
-}
+pub use happyview_provider::http::describe_error_chain;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -174,6 +153,22 @@ pub enum AppError {
         line: Option<u32>,
         file: Option<String>,
     },
+}
+
+/// A failed record read as the client sees it: `503 ServiceUnavailable` when
+/// the store that holds the record could not be reached (`storage_down`), so
+/// a client knows to retry, otherwise the `Internal` error a failed query
+/// has always been.
+pub fn record_read_error(e: sqlx::Error, storage_down: bool) -> AppError {
+    if storage_down {
+        AppError::XrpcError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "ServiceUnavailable",
+            message: "the record store is unavailable".to_string(),
+        }
+    } else {
+        AppError::Internal(format!("DB query failed: {e}"))
+    }
 }
 
 /// The file a failure happened in, when the chunk names one. A dashboard

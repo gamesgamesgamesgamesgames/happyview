@@ -1,16 +1,9 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
 use serde_json::Value;
 
 use crate::AppState;
-use crate::db::now_rfc3339;
-use crate::event_log::{EventLog, Severity, log_event};
-use crate::lexicon::LexiconType;
-use crate::lua::RecordHookOutcome;
 
 /// The static collection we always include for lexicon schema updates.
-pub const LEXICON_SCHEMA_COLLECTION: &str = "com.atproto.lexicon.schema";
+pub use happyview_provider::LEXICON_SCHEMA_COLLECTION;
 
 /// A generic record event that can originate from any source (Jetstream, backfill, etc.).
 pub struct RecordEvent {
@@ -29,323 +22,58 @@ pub struct RecordEvent {
 /// The outcome of processing one record event, returned so a caller can
 /// account for it in telemetry rather than this function reaching into
 /// `state.telemetry_counters` itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub enum RecordOutcome {
-    Matched,
-    Skipped,
-    SchemaEvent,
-    Errored,
-    /// The write failed because the database could not be reached (see
-    /// `db::is_unavailable`); the same event should apply once it is back.
-    /// A caller that does not retry treats it like `Errored`.
-    Unavailable,
-    /// The event can never be applied as it stands: a write with no record
-    /// body, an unknown operation, a lexicon schema that does not parse, or
-    /// data the database refuses (see `db::is_invalid_data`). Retrying it
-    /// cannot help. A caller that does not distinguish it treats it like
-    /// `Errored`.
-    Invalid,
+pub use happyview_provider::IngestOutcome as RecordOutcome;
+
+impl RecordEvent {
+    /// This event as the ingest pipeline takes it, from `origin`. `None`
+    /// when its action is not one the pipeline knows.
+    pub fn to_source_event(
+        &self,
+        origin: crate::ingest::Origin,
+    ) -> Option<crate::ingest::SourceEvent> {
+        let action = crate::ingest::Action::parse(&self.action)?;
+        Some(crate::ingest::SourceEvent::Record(
+            crate::ingest::RecordEvent {
+                key: crate::ingest::RecordKey {
+                    did: self.did.clone(),
+                    collection: self.collection.clone(),
+                    rkey: self.rkey.clone(),
+                },
+                action,
+                cid: self.cid.clone(),
+                rev: self.rev.clone(),
+                body: self.record.clone(),
+                time_us: None,
+                origin,
+                stored: false,
+            },
+        ))
+    }
 }
 
-/// Process a record event: upsert/delete the record in the database, run index
-/// hooks, and handle lexicon schema events. Returns the outcome so the caller
-/// can account for it in telemetry — see `RecordOutcome`.
+/// Process a record event through `crate::ingest` as a live event: upsert or
+/// delete the record, run its hook, or handle a lexicon schema event. Returns
+/// the outcome so the caller can account for it in telemetry — see
+/// `RecordOutcome`.
+///
+/// An action the pipeline does not know is judged as before the pipeline
+/// existed: a lexicon schema event's own rules first, then an untracked
+/// collection is `Skipped`, and only a tracked one is `Invalid`.
 pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> RecordOutcome {
-    let db = &state.db;
-    let lexicons = &state.lexicons;
-
-    let uri = format!("at://{}/{}/{}", record.did, record.collection, record.rkey);
-
-    // Handle lexicon schema events for tracked network lexicons.
+    if let Some(event) = record.to_source_event(crate::ingest::Origin::Live) {
+        return crate::ingest::apply(state, event).await;
+    }
     if record.collection == LEXICON_SCHEMA_COLLECTION {
         return handle_lexicon_schema_event(state, &record.did, record).await;
     }
-
-    // Skip records whose collection is not tracked by a registered record-type lexicon.
-    let is_tracked = lexicons
-        .get(&record.collection)
-        .await
-        .is_some_and(|lex| lex.lexicon_type == LexiconType::Record);
-
-    if !is_tracked {
+    if !crate::ingest::is_tracked(state, &record.collection).await {
         tracing::debug!(
             collection = %record.collection,
             "skipping record for untracked collection"
         );
         return RecordOutcome::Skipped;
     }
-
-    match record.action.as_str() {
-        "create" | "update" => {
-            let rec = match &record.record {
-                Some(r) => r,
-                None => return RecordOutcome::Invalid,
-            };
-            let cid = record.cid.as_deref().unwrap_or_default();
-
-            // Reject records whose claimed CID doesn't match their content
-            // (security review L9). A hostile source can otherwise store a
-            // record under a mismatched CID. Skip indexing entirely on
-            // mismatch; `Skipped` (no/unencodable CID) proceeds unchanged.
-            if crate::cid_verify::verify_record_cid(cid, rec)
-                == crate::cid_verify::CidCheck::Mismatch
-            {
-                log_event(
-                    db,
-                    EventLog {
-                        event_type: "record.cid_mismatch".to_string(),
-                        severity: Severity::Warn,
-                        actor_did: None,
-                        subject: Some(uri.clone()),
-                        detail: serde_json::json!({
-                            "collection": record.collection,
-                            "did": record.did,
-                            "rkey": record.rkey,
-                            "claimed_cid": cid,
-                            "reason": "record content does not match claimed CID",
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
-                return RecordOutcome::Skipped;
-            }
-
-            // Run record-event script (if any) before storing. The script's
-            // return value determines what gets written:
-            //   Skip → skip indexing entirely
-            //   Replace(record) → upsert with that record body
-            //   Proceed → upsert with the record as it arrived
-            // The dispatcher cascades `record.<action>:<nsid>` →
-            // `record.index:<nsid>`; failures are dead-lettered fail-open.
-            let hook_result = crate::lua::run_record_event_script(
-                state,
-                crate::lua::RecordEventPayload {
-                    nsid: &record.collection,
-                    action: &record.action,
-                    uri: &uri,
-                    did: &record.did,
-                    rkey: &record.rkey,
-                    record: Some(rec),
-                },
-            )
-            .await;
-            let rec_to_store = match hook_result {
-                RecordHookOutcome::Skip => {
-                    // Gated like `record.created`/`record.deleted` below: a
-                    // filtering script skips far more records than it keeps, so
-                    // logging every skip writes a row per discarded firehose
-                    // record.
-                    if state.verbose_event_logging.load(Ordering::Relaxed) {
-                        log_event(
-                            db,
-                            EventLog {
-                                event_type: "record.skipped".to_string(),
-                                severity: Severity::Info,
-                                actor_did: None,
-                                subject: Some(uri.clone()),
-                                detail: serde_json::json!({
-                                    "collection": record.collection,
-                                    "did": record.did,
-                                    "rkey": record.rkey,
-                                    "reason": "script returned nil",
-                                }),
-                            },
-                            state.db_backend,
-                        )
-                        .await;
-                    }
-                    return RecordOutcome::Skipped;
-                }
-                RecordHookOutcome::Replace(v) => v,
-                RecordHookOutcome::Proceed => rec.clone(),
-            };
-
-            let backend = state.db_backend;
-            let prepared = crate::record_store::PreparedRecord {
-                did: record.did.clone(),
-                collection: record.collection.clone(),
-                rkey: record.rkey.clone(),
-                record_json: serde_json::to_string(&rec_to_store).unwrap_or_default(),
-                cid: cid.to_string(),
-                rev: record.rev.clone(),
-            };
-            let written = crate::db::retry_on_busy(|| {
-                state
-                    .records
-                    .write_network(db, std::slice::from_ref(&prepared))
-            })
-            .await
-            .map(|changed| !changed.is_empty());
-            match written {
-                Ok(changed) => {
-                    // An identical redelivery changed nothing, so there is
-                    // nothing new to log or to fetch labels for.
-                    if changed {
-                        if state.verbose_event_logging.load(Ordering::Relaxed) {
-                            log_event(
-                                db,
-                                EventLog {
-                                    event_type: "record.created".to_string(),
-                                    severity: Severity::Info,
-                                    actor_did: None,
-                                    subject: Some(uri.clone()),
-                                    detail: serde_json::json!({
-                                        "collection": record.collection,
-                                        "did": record.did,
-                                        "rkey": record.rkey,
-                                    }),
-                                },
-                                backend,
-                            )
-                            .await;
-                        }
-                        if crate::labeler::has_active_subscriptions(state).await {
-                            crate::labeler::backfill_labels_for_uri(
-                                Arc::new(state.clone()),
-                                uri.clone(),
-                            );
-                        }
-                    }
-                    RecordOutcome::Matched
-                }
-                Err(e) => {
-                    tracing::warn!(uri = %uri, "failed to upsert record: {e}");
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.created".to_string(),
-                            severity: Severity::Error,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "error": e.to_string(),
-                            }),
-                        },
-                        backend,
-                    )
-                    .await;
-                    failed_write_outcome(&e)
-                }
-            }
-        }
-        "delete" => {
-            let backend = state.db_backend;
-
-            // Run record-event script (if any) before deleting. Only a
-            // script that actually ran and returned `nil` aborts the
-            // delete — no script, or a dead-lettered one, proceeds.
-            let hook_result = crate::lua::run_record_event_script(
-                state,
-                crate::lua::RecordEventPayload {
-                    nsid: &record.collection,
-                    action: "delete",
-                    uri: &uri,
-                    did: &record.did,
-                    rkey: &record.rkey,
-                    record: None,
-                },
-            )
-            .await;
-            if hook_result == RecordHookOutcome::Skip {
-                // Gated for the same reason as the create path above.
-                if state.verbose_event_logging.load(Ordering::Relaxed) {
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.skipped".to_string(),
-                            severity: Severity::Info,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "reason": "script returned nil",
-                            }),
-                        },
-                        backend,
-                    )
-                    .await;
-                }
-                return RecordOutcome::Skipped;
-            }
-
-            let now = now_rfc3339();
-            match crate::db::retry_on_busy(|| {
-                state.records.delete_network(
-                    db,
-                    &uri,
-                    &record.did,
-                    &record.collection,
-                    record.rev.as_deref(),
-                    &now,
-                )
-            })
-            .await
-            {
-                Ok(_) => {
-                    if state.verbose_event_logging.load(Ordering::Relaxed) {
-                        log_event(
-                            db,
-                            EventLog {
-                                event_type: "record.deleted".to_string(),
-                                severity: Severity::Info,
-                                actor_did: None,
-                                subject: Some(uri.clone()),
-                                detail: serde_json::json!({
-                                    "collection": record.collection,
-                                    "did": record.did,
-                                    "rkey": record.rkey,
-                                }),
-                            },
-                            backend,
-                        )
-                        .await;
-                    }
-                    RecordOutcome::Matched
-                }
-                Err(e) => {
-                    tracing::warn!(uri = %uri, "failed to delete record: {e}");
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.deleted".to_string(),
-                            severity: Severity::Error,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "error": e.to_string(),
-                            }),
-                        },
-                        backend,
-                    )
-                    .await;
-                    failed_write_outcome(&e)
-                }
-            }
-        }
-        _ => RecordOutcome::Invalid,
-    }
-}
-
-/// `Unavailable` when `e` means the database could not be reached, `Invalid`
-/// when it refused the data itself, otherwise `Errored`.
-fn failed_write_outcome(e: &sqlx::Error) -> RecordOutcome {
-    if crate::db::is_unavailable(e) {
-        RecordOutcome::Unavailable
-    } else if crate::db::is_invalid_data(e) {
-        RecordOutcome::Invalid
-    } else {
-        RecordOutcome::Errored
-    }
+    RecordOutcome::Invalid
 }
 
 /// Handle a `com.atproto.lexicon.schema` record event for tracked network
@@ -356,75 +84,22 @@ pub async fn handle_lexicon_schema_event(
     did: &str,
     record: &RecordEvent,
 ) -> RecordOutcome {
-    let lexicons = &state.lexicons;
-    let nsid = &record.rkey;
-
-    // Only a tracked network lexicon, and only from the authority it resolved to.
-    let Some(tracked) = lexicons.get_network(nsid).await else {
-        return RecordOutcome::SchemaEvent;
-    };
-    if tracked.authority_did.as_deref() != Some(did) {
-        return RecordOutcome::SchemaEvent;
-    }
-
-    let failed = |e: crate::catalog::NetworkWriteError| match e {
-        crate::catalog::NetworkWriteError::Invalid(message) => {
-            tracing::warn!(nsid, "failed to parse lexicon schema event: {message}");
-            RecordOutcome::Invalid
-        }
-        // Memory is left alone too, so it and the table still agree. The
-        // outcome says whether the caller should retry this event (the
-        // Jetstream worker does); nothing else will.
-        crate::catalog::NetworkWriteError::Db(e) => {
-            tracing::warn!(nsid, error = %e, "failed to apply lexicon schema event");
-            failed_write_outcome(&e)
-        }
-    };
-
-    match record.action.as_str() {
-        "create" | "update" => {
-            let Some(rec) = &record.record else {
-                return RecordOutcome::Invalid;
-            };
-            match lexicons
-                .refresh_network(&state.db, state.db_backend, nsid, rec.clone())
-                .await
-            {
-                Ok(Some(_)) => {
-                    tracing::info!(nsid, "updated network lexicon from network event");
-                    if lexicons.get_network(nsid).await.is_some_and(|l| {
-                        l.parsed.lexicon_type == crate::lexicon::LexiconType::Record
-                    }) {
-                        let _ = state
-                            .collections_tx
-                            .send(lexicons.get_record_collections().await);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => return failed(e),
-            }
-        }
-        "delete" => match lexicons
-            .remove_network(&state.db, state.db_backend, nsid)
-            .await
-        {
-            Ok(true) => {
-                tracing::info!(nsid, "removed network lexicon from network delete event");
-                let _ = state
-                    .collections_tx
-                    .send(lexicons.get_record_collections().await);
-            }
-            Ok(false) => {}
-            Err(e) => return failed(e),
-        },
-        _ => return RecordOutcome::Invalid,
-    }
-    RecordOutcome::SchemaEvent
+    crate::ingest::lexicon_schema_event(
+        state,
+        did,
+        &record.rkey,
+        &record.action,
+        record.record.as_ref(),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    use crate::db::now_rfc3339;
 
     use crate::catalog::LexiconWrite;
     use crate::db::adapt_sql;
@@ -1298,10 +973,15 @@ mod tests {
     /// Ruling FR1: a delete for a record this instance never held, from an
     /// account it holds nothing for in the collection, leaves no tombstone
     /// unless a backfill still writing (running, pausing or cancelling)
-    /// covers the collection.
+    /// covers the collection. A job is running while the record source runs
+    /// it, so each one here is also entered into the source's running jobs.
     #[tokio::test]
     async fn a_delete_with_no_row_tombstones_only_when_a_create_may_follow() {
-        let state = tracked_state().await;
+        let mut state = tracked_state().await;
+        let running = crate::host::attach_jetstream(&mut state, Default::default())
+            .jobs()
+            .expect("attached")
+            .running;
         let did = "did:plc:stranger";
         let delete = |rkey: &str| RecordEvent {
             did: did.to_string(),
@@ -1320,7 +1000,8 @@ mod tests {
 
         // Another account's records and other collections' jobs don't count.
         insert_record(&state).await;
-        add_backfill_job(&state, "running", Some("com.example.other")).await;
+        let other = add_backfill_job(&state, "running", Some("com.example.other")).await;
+        let _other = running.enter(&other, Some("com.example.other".into()));
         add_backfill_job(&state, "completed", None).await;
         let _ = handle_record_event(&state, &delete("never")).await;
         assert!(!tombstoned("never").await, "nothing could resurrect it");
@@ -1331,6 +1012,7 @@ mod tests {
             ("cancelling", Some(NSID)),
         ] {
             let job = add_backfill_job(&state, status, collection).await;
+            let guard = running.enter(&job, collection.map(str::to_string));
             let rkey = format!("job{status}");
             let _ = handle_record_event(&state, &delete(&rkey)).await;
             assert!(
@@ -1342,6 +1024,7 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .expect("drop job");
+            drop(guard);
         }
 
         let held = RecordEvent {

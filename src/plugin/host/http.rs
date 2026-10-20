@@ -237,12 +237,17 @@ mod tests {
     /// fixtures) is enough without a real database.
     fn test_host_context() -> HostContext {
         crate::db::install_drivers();
+        let db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
         HostContext {
             plugin_id: "test-plugin".into(),
             scope: "did:example:test".into(),
             secrets: std::collections::HashMap::new(),
             config: serde_json::json!({}),
-            db: sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap(),
+            records: crate::record_store::RecordStore::new(
+                db.clone(),
+                crate::db::DatabaseBackend::Sqlite,
+            ),
+            db,
             db_backend: crate::db::DatabaseBackend::Sqlite,
             http_client: reqwest::Client::new(),
             lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),

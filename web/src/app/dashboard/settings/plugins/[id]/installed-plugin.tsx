@@ -1,12 +1,12 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react"
-import Link from "next/link"
-import { usePathname, useRouter } from "next/navigation"
-import { ArrowUpCircle, Loader2, RefreshCw, Trash2 } from "lucide-react"
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { ArrowUpCircle, Loader2, RefreshCw, Trash2 } from "lucide-react";
 
-import { useCurrentUser } from "@/hooks/use-current-user"
-import { useOfficialPlugins } from "@/hooks/use-official-plugins"
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { useOfficialPlugins } from "@/hooks/use-official-plugins";
 import {
   checkPluginUpdate,
   getPluginAllowedHosts,
@@ -16,93 +16,93 @@ import {
   removePlugin,
   updatePluginAllowedHosts,
   updatePluginSecrets,
-} from "@/lib/api"
-import type { PluginSummary } from "@/types/plugins"
-import { visibleCapabilities } from "@/components/plugin-capabilities"
-import { PluginDetail, type PluginView } from "@/components/plugin-detail"
-import { PluginUpdateDialog } from "@/components/plugin-update-dialog"
-import { PageBreadcrumbs } from "@/components/page-breadcrumbs"
-import { SiteHeader } from "@/components/site-header"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Skeleton } from "@/components/ui/skeleton"
+} from "@/lib/api";
+import type { PluginSummary } from "@/types/plugins";
+import { visibleCapabilities } from "@/components/plugin-capabilities";
+import { PluginDetail, type PluginView } from "@/components/plugin-detail";
+import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
+import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
+import { SiteHeader } from "@/components/site-header";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
 
 /** Only `network:request:defined` has a host list the operator may set. */
 function managesHosts(plugin: PluginSummary): boolean {
   return visibleCapabilities(plugin.capabilities).some(
     (c) => c.name === "network:request:defined",
-  )
+  );
 }
 
 export default function InstalledPlugin() {
   // The `[id]` segment carries the URL-encoded plugin id, which contains dots.
   const id = decodeURIComponent(
     usePathname().split("/").filter(Boolean).pop() ?? "",
-  )
-  const router = useRouter()
-  const { hasPermission } = useCurrentUser()
-  const { byId } = useOfficialPlugins()
+  );
+  const router = useRouter();
+  const { hasPermission } = useCurrentUser();
+  const { byId } = useOfficialPlugins();
 
-  const [plugin, setPlugin] = useState<PluginSummary | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<"reload" | "check" | "remove" | null>(null)
+  const [plugin, setPlugin] = useState<PluginSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"reload" | "check" | "remove" | null>(null);
 
-  const [secrets, setSecrets] = useState<Record<string, string>>({})
-  const [hosts, setHosts] = useState<string[]>([])
-  const [saving, setSaving] = useState(false)
-  const [updateOpen, setUpdateOpen] = useState(false)
+  const [secrets, setSecrets] = useState<Record<string, string>>({});
+  const [hosts, setHosts] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
 
-  const canManage = hasPermission("plugins:manage")
+  const canManage = hasPermission("plugins:manage");
 
   const load = useCallback(async () => {
     try {
-      const response = await getPlugins()
-      setPlugin(response.plugins.find((p) => p.id === id) ?? null)
+      const response = await getPlugins();
+      setPlugin(response.plugins.find((p) => p.id === id) ?? null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [id])
+  }, [id]);
 
   useEffect(() => {
-    void load()
-  }, [load])
+    void load();
+  }, [load]);
 
   useEffect(() => {
-    if (!plugin) return
-    let cancelled = false
+    if (!plugin) return;
+    let cancelled = false;
     void (async () => {
       try {
-        const stored = await getPluginSecrets(plugin.id)
-        const next: Record<string, string> = {}
+        const stored = await getPluginSecrets(plugin.id);
+        const next: Record<string, string> = {};
         for (const secret of plugin.required_secrets) {
-          next[secret.key] = stored.secrets[secret.key] ?? ""
+          next[secret.key] = stored.secrets[secret.key] ?? "";
         }
-        if (cancelled) return
-        setSecrets(next)
+        if (cancelled) return;
+        setSecrets(next);
         if (managesHosts(plugin)) {
-          const answered = await getPluginAllowedHosts(plugin.id)
-          if (cancelled) return
-          setHosts([...answered.hosts, ""])
+          const answered = await getPluginAllowedHosts(plugin.id);
+          if (cancelled) return;
+          setHosts([...answered.hosts, ""]);
         } else {
-          setHosts([])
+          setHosts([]);
         }
       } catch {
         // Configuration is a tab, not the page. Failing to read it should not
         // take the plugin's identity down with it.
       }
-    })()
+    })();
     return () => {
-      cancelled = true
-    }
-  }, [plugin])
+      cancelled = true;
+    };
+  }, [plugin]);
 
   const view: PluginView | null = useMemo(() => {
-    if (!plugin) return null
-    const catalogue = byId.get(plugin.id)
+    if (!plugin) return null;
+    const catalogue = byId.get(plugin.id);
     return {
       id: plugin.id,
       name: plugin.name,
@@ -123,52 +123,52 @@ export default function InstalledPlugin() {
       latestVersion: plugin.latest_version,
       releases: catalogue?.releases ?? plugin.pending_releases,
       sections: catalogue?.sections ?? {},
-    }
-  }, [plugin, byId])
+    };
+  }, [plugin, byId]);
 
   async function run(
     kind: "reload" | "check" | "remove",
     action: () => Promise<unknown>,
   ) {
-    setBusy(kind)
-    setError(null)
+    setBusy(kind);
+    setError(null);
     try {
-      await action()
+      await action();
       if (kind === "remove") {
-        router.push("/dashboard/settings/plugins")
-        return
+        router.push("/dashboard/settings/plugins");
+        return;
       }
-      await load()
+      await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null)
+      setBusy(null);
     }
   }
 
   async function saveSettings() {
-    if (!plugin) return
-    setSaving(true)
-    setError(null)
+    if (!plugin) return;
+    setSaving(true);
+    setError(null);
     try {
-      await updatePluginSecrets(plugin.id, secrets)
+      await updatePluginSecrets(plugin.id, secrets);
       if (managesHosts(plugin)) {
-        const trimmed = hosts.map((h) => h.trim()).filter(Boolean)
-        const answered = await updatePluginAllowedHosts(plugin.id, trimmed)
-        setHosts([...answered.hosts, ""])
+        const trimmed = hosts.map((h) => h.trim()).filter(Boolean);
+        const answered = await updatePluginAllowedHosts(plugin.id, trimmed);
+        setHosts([...answered.hosts, ""]);
       }
-      await load()
+      await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false)
+      setSaving(false);
     }
   }
 
   const hasSettings =
     plugin !== null &&
     canManage &&
-    (plugin.required_secrets.length > 0 || managesHosts(plugin))
+    (plugin.required_secrets.length > 0 || managesHosts(plugin));
 
   return (
     <>
@@ -232,7 +232,9 @@ export default function InstalledPlugin() {
                     }
                     disabled={busy !== null}
                   >
-                    {busy === "check" ? <Loader2 className="animate-spin" /> : null}
+                    {busy === "check" ? (
+                      <Loader2 className="animate-spin" />
+                    ) : null}
                     Check for update
                   </Button>
                   <Button
@@ -288,12 +290,9 @@ export default function InstalledPlugin() {
                           value={host}
                           placeholder="api.example.com"
                           onChange={(e) => {
-                            const next = [...hosts]
-                            next[index] = e.target.value
-                            setHosts([
-                              ...next.filter((h) => h.trim()),
-                              "",
-                            ])
+                            const next = [...hosts];
+                            next[index] = e.target.value;
+                            setHosts([...next.filter((h) => h.trim()), ""]);
                           }}
                         />
                       ))}
@@ -327,10 +326,10 @@ export default function InstalledPlugin() {
         open={updateOpen}
         onOpenChange={setUpdateOpen}
         onUpdated={() => {
-          setUpdateOpen(false)
-          void load()
+          setUpdateOpen(false);
+          void load();
         }}
       />
     </>
-  )
+  );
 }

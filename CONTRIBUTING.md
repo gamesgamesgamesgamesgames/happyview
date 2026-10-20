@@ -60,7 +60,11 @@ Point git at the tracked hooks once per clone:
 git config core.hooksPath .githooks
 ```
 
-- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins.
+- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins,
+  then formats the dashboard's staged files with prettier and restages them. A file
+  that is staged *and* modified in the working tree is left alone, so the hook never
+  commits work you did not stage. Needs `npm ci` in `web/`; without it the formatting
+  half is skipped.
 - **pre-push** runs `cargo clippy --all-targets`, which also covers test code.
 
 ## What CI checks
@@ -73,7 +77,7 @@ These checks must pass before merging:
 | `unit-tests`            | See [Unit tests](#unit-tests)                                                                                                                                                                  |
 | `e2e-tests`             | See [End-to-end tests](#end-to-end-tests)                                                                                                                                                      |
 | `playwright`            | See [Browser tests](#browser-tests)                                                                                                                                                            |
-| `frontend`              | `npm ci && npm run build` in `web/`                                                                                                                                                            |
+| `frontend`              | `npm ci`, `npm run format:check`, `npm run build` in `web/`                                                                                                                                    |
 | `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
 | `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 
@@ -117,7 +121,9 @@ docker compose -f docker-compose.test.yml down
 ```
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
-file. CI covers only Postgres, so run it this way once when you change SQL,
+file. Leaving the variable unset does not test SQLite: the end-to-end suite
+skips its database-backed tests silently, so point it at a file URL as
+below. Run it this way once when you change SQL,
 migrations or anything that touches the write path:
 
 ```bash
@@ -162,6 +168,10 @@ names the two variables, `HAPPYVIEW_LUA_PLUGIN` and `HAPPYVIEW_LUA_SRC`, that
 make those targets run. CI runs it in reporting mode, so absent is not a
 failure there.
 
+The provider conformance kit (`cargo test --features testkit --test
+conformance`) is the exception: it does not skip. It panics when
+`TEST_DATABASE_URL` or `HAPPYVIEW_LUA_PLUGIN` is unset.
+
 The job also runs the SDK crate's tests and the `migration_upgrade` target
 ahead of the full run, for a separately named signal. Both are already
 included in the commands above.
@@ -189,6 +199,10 @@ run — so without the build above every save is refused and the suite stops in
 only when the volume is new: on a reused one the PDS and PLC containers
 crash-loop over missing databases, and the specs that cover first-run setup
 need a database where setup has not happened.
+
+## The provider contract
+
+The `happyview-provider` crate is the contract that record sources and stores implement, and it is licensed MIT OR Apache-2.0 so providers can be built under any terms. A change to it is a contract change. If the change breaks existing providers, bump `CONTRACT_VERSION` in `crates/happyview-provider/src/types.rs`. See [Record providers](packages/docs/content/docs/guides/record-providers.md).
 
 ## Code of conduct
 

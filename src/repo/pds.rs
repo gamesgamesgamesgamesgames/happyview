@@ -551,13 +551,11 @@ mod tests {
     }
 
     async fn state(test: bool) -> AppState {
-        let state = crate::test_support::test_state_with_pool(
+        let mut state = crate::test_support::test_state_with_pool(
             crate::test_support::migrated_memory_pool().await,
         );
-        AppState {
-            test: test.then(|| Arc::new(crate::testing::TestHarness::new("a.test.lua"))),
-            ..state
-        }
+        state.test = test.then(|| Arc::new(crate::testing::TestHarness::new("a.test.lua")));
+        state
     }
 
     /// A caller with no session of any kind still writes in a test run.

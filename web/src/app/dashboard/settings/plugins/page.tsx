@@ -1,37 +1,41 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react"
-import Link from "next/link"
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import {
   AlertTriangle,
   ArrowUpCircle,
   Blocks,
   Plus,
   Search,
-} from "lucide-react"
+} from "lucide-react";
 
-import { useCurrentUser } from "@/hooks/use-current-user"
-import { getPlugins } from "@/lib/api"
-import { installedPluginHref } from "@/lib/plugin-routes"
-import type { PluginSummary, PluginType } from "@/types/plugins"
-import { PluginMark, TYPE_LABEL, TYPE_NOTE } from "@/components/plugin-identity"
-import { SiteHeader } from "@/components/site-header"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { getPlugins } from "@/lib/api";
+import { installedPluginHref } from "@/lib/plugin-routes";
+import type { PluginSummary, PluginType } from "@/types/plugins";
+import {
+  PluginMark,
+  TYPE_LABEL,
+  TYPE_NOTE,
+} from "@/components/plugin-identity";
+import { SiteHeader } from "@/components/site-header";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select"
-import { Skeleton } from "@/components/ui/skeleton"
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 
-type TypeFilter = PluginType | "all"
-type SortKey = "attention" | "name" | "version"
+type TypeFilter = PluginType | "all";
+type SortKey = "attention" | "name" | "version";
 
-const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"]
+const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"];
 
 /**
  * What the row says at a glance. A plugin that needs something is the only
@@ -39,54 +43,55 @@ const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"]
  * of green ticks.
  */
 function attention(plugin: PluginSummary): {
-  needs: boolean
-  label: string | null
-  kind: "config" | "update" | null
+  needs: boolean;
+  label: string | null;
+  kind: "config" | "update" | null;
 } {
   if (!plugin.secrets_configured) {
-    return { needs: true, label: "Needs configuration", kind: "config" }
+    return { needs: true, label: "Needs configuration", kind: "config" };
   }
   if (plugin.update_available) {
-    return { needs: true, label: "Update available", kind: "update" }
+    return { needs: true, label: "Update available", kind: "update" };
   }
-  return { needs: false, label: null, kind: null }
+  return { needs: false, label: null, kind: null };
 }
 
 export default function PluginsPage() {
-  const { hasPermission } = useCurrentUser()
-  const [plugins, setPlugins] = useState<PluginSummary[]>([])
-  const [encryptionConfigured, setEncryptionConfigured] = useState(true)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { hasPermission } = useCurrentUser();
+  const [plugins, setPlugins] = useState<PluginSummary[]>([]);
+  const [encryptionConfigured, setEncryptionConfigured] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const [query, setQuery] = useState("")
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all")
-  const [sort, setSort] = useState<SortKey>("attention")
-  const [grouped, setGrouped] = useState(true)
+  const [query, setQuery] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [sort, setSort] = useState<SortKey>("attention");
+  const [grouped, setGrouped] = useState(true);
 
-  const canManage = hasPermission("plugins:manage")
+  const canManage = hasPermission("plugins:manage");
 
   const load = useCallback(async () => {
     try {
-      const response = await getPlugins()
-      setPlugins(response.plugins)
-      setEncryptionConfigured(response.encryption_configured)
+      const response = await getPlugins();
+      setPlugins(response.plugins);
+      setEncryptionConfigured(response.encryption_configured);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    void load()
-  }, [load])
+    void load();
+  }, [load]);
 
   const visible = useMemo(() => {
-    const q = query.trim().toLowerCase()
+    const q = query.trim().toLowerCase();
     const matches = plugins.filter((plugin) => {
-      if (typeFilter !== "all" && plugin.plugin_type !== typeFilter) return false
-      if (!q) return true
+      if (typeFilter !== "all" && plugin.plugin_type !== typeFilter)
+        return false;
+      if (!q) return true;
       // What an operator would actually type: the name they see, the id they
       // installed, the namespace a script requires, or words from the blurb.
       return (
@@ -94,29 +99,29 @@ export default function PluginsPage() {
         plugin.id.toLowerCase().includes(q) ||
         (plugin.namespace?.toLowerCase().includes(q) ?? false) ||
         (plugin.description?.toLowerCase().includes(q) ?? false)
-      )
-    })
+      );
+    });
 
     const byName = (a: PluginSummary, b: PluginSummary) =>
-      a.name.localeCompare(b.name)
+      a.name.localeCompare(b.name);
 
     return [...matches].sort((a, b) => {
-      if (sort === "name") return byName(a, b)
-      if (sort === "version") return a.version.localeCompare(b.version)
-      const needs = Number(attention(b).needs) - Number(attention(a).needs)
-      return needs !== 0 ? needs : byName(a, b)
-    })
-  }, [plugins, query, typeFilter, sort])
+      if (sort === "name") return byName(a, b);
+      if (sort === "version") return a.version.localeCompare(b.version);
+      const needs = Number(attention(b).needs) - Number(attention(a).needs);
+      return needs !== 0 ? needs : byName(a, b);
+    });
+  }, [plugins, query, typeFilter, sort]);
 
   const sections = useMemo(() => {
-    if (!grouped) return [{ type: null as PluginType | null, rows: visible }]
+    if (!grouped) return [{ type: null as PluginType | null, rows: visible }];
     return TYPE_ORDER.map((type) => ({
       type,
       rows: visible.filter((p) => p.plugin_type === type),
-    })).filter((section) => section.rows.length > 0)
-  }, [visible, grouped])
+    })).filter((section) => section.rows.length > 0);
+  }, [visible, grouped]);
 
-  const needing = plugins.filter((p) => attention(p).needs).length
+  const needing = plugins.filter((p) => attention(p).needs).length;
 
   return (
     <>
@@ -255,8 +260,8 @@ export default function PluginsPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setQuery("")
-                setTypeFilter("all")
+                setQuery("");
+                setTypeFilter("all");
               }}
             >
               Clear filters
@@ -278,7 +283,7 @@ export default function PluginsPage() {
                 ) : null}
                 <ul className="flex flex-col gap-2">
                   {section.rows.map((plugin) => {
-                    const state = attention(plugin)
+                    const state = attention(plugin);
                     return (
                       <li key={plugin.id}>
                         <Link
@@ -333,7 +338,7 @@ export default function PluginsPage() {
                           </span>
                         </Link>
                       </li>
-                    )
+                    );
                   })}
                 </ul>
               </div>
@@ -342,5 +347,5 @@ export default function PluginsPage() {
         )}
       </div>
     </>
-  )
+  );
 }

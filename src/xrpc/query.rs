@@ -60,7 +60,7 @@ pub(crate) async fn handle_query(
         .records
         .list_recent(collection, did, limit, offset)
         .await
-        .map_err(|e| AppError::Internal(format!("DB query failed: {e}")))?;
+        .map_err(|e| read_error(state, collection, e))?;
 
     let has_next_page = rows.len() as i64 == limit;
 
@@ -88,11 +88,14 @@ pub(crate) async fn handle_query(
 }
 
 pub(super) async fn handle_get_record(state: &AppState, uri: &str) -> Result<Response, AppError> {
+    let collection = crate::record_store::codec::parse_record_uri(uri)
+        .map(|(_, collection, _)| collection)
+        .unwrap_or_default();
     let stored = state
         .records
         .get(uri)
         .await
-        .map_err(|e| AppError::Internal(format!("DB query failed: {e}")))?
+        .map_err(|e| read_error(state, collection, e))?
         .ok_or_else(|| AppError::NotFound("record not found".into()))?;
     let mut record: Value = serde_json::from_str(&stored.record)
         .map_err(|e| AppError::Internal(format!("invalid record JSON: {e}")))?;
@@ -102,4 +105,14 @@ pub(super) async fn handle_get_record(state: &AppState, uri: &str) -> Result<Res
         .map(|obj| obj.insert("uri".to_string(), json!(uri)));
 
     Ok(Json(json!({ "record": record })).into_response())
+}
+
+/// A failed read of `collection`: 503 when the external storage that claims
+/// it is down. A local collection's failure stays a 500, as it always was.
+fn read_error(state: &AppState, collection: &str, e: sqlx::Error) -> AppError {
+    let storage_down = state
+        .records
+        .external_route(collection)
+        .is_some_and(|ext| ext.unavailable(&e));
+    crate::error::record_read_error(e, storage_down)
 }
