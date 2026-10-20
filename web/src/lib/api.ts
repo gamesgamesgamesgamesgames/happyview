@@ -6,7 +6,6 @@ import type {
   CreatePublishRuleBody,
   LexiconDnsCheck,
   LexiconDnsEntry,
-  LexiconPublishingAvailability,
   LexiconPublishingOverview,
   PublishOutcome,
   PublishRule,
@@ -123,7 +122,11 @@ export type {
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
 } from "@/types/api-clients";
-export type { SettingEntry, InstanceSettings, ScriptLimitSettings } from "@/types/settings";
+export type {
+  SettingEntry,
+  InstanceSettings,
+  ScriptLimitSettings,
+} from "@/types/settings";
 export {
   INSTANCE_SETTING_KEYS,
   SCRIPT_LIMIT_BOUNDS,
@@ -250,12 +253,6 @@ export function getLexiconPublishingDns() {
   return apiFetch<LexiconDnsEntry[]>("/admin/lexicon-publishing/dns");
 }
 
-export function getLexiconPublishingAvailability() {
-  return apiFetch<LexiconPublishingAvailability>(
-    "/admin/lexicon-publishing/availability",
-  );
-}
-
 export function checkLexiconDns(nsid: string) {
   return apiFetch<LexiconDnsCheck>(
     `/admin/lexicon-publishing/dns/${encodeURIComponent(nsid)}`,
@@ -320,10 +317,7 @@ export function addNetworkLexicon(body: {
     authority_did: string;
     revision: number;
     backfill_job_id: string | null;
-  }>(
-    "/admin/network-lexicons",
-    { method: "POST", body: JSON.stringify(body) },
-  );
+  }>("/admin/network-lexicons", { method: "POST", body: JSON.stringify(body) });
 }
 
 export function deleteNetworkLexicon(nsid: string) {
@@ -1472,7 +1466,11 @@ export function deleteScript(id: string) {
  * Preview (or, with `apply`, perform) the v3 codemod on a stored script.
  * `CodemodRequestBody` says what each flag needs.
  */
-export function codemodScript(id: string, apply?: boolean, allowMarkers?: boolean) {
+export function codemodScript(
+  id: string,
+  apply?: boolean,
+  allowMarkers?: boolean,
+) {
   const body: CodemodRequestBody = {};
   if (apply) body.apply = true;
   if (allowMarkers) body.allow_markers = true;
@@ -1511,11 +1509,7 @@ export function isUnmigratedRefusal(e: unknown): boolean {
 // Setup
 export interface SetupStatus {
   identity_mode:
-    | "did_web"
-    | "did_plc"
-    | "attach_account"
-    | "not_exposed"
-    | null;
+    "did_web" | "did_plc" | "attach_account" | "not_exposed" | null;
   identity_configured: boolean;
   plc_verified: boolean;
   setup_complete: boolean;

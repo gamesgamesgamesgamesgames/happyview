@@ -47,7 +47,7 @@ const LOOKS: Record<PublishStatus, StatusLook> = {
     label: "Published",
     short: "Published",
     icon: CircleCheck,
-    tone: "",
+    tone: "text-success",
     explain: "The published record matches this lexicon.",
   },
   outdated: {
@@ -63,14 +63,14 @@ const LOOKS: Record<PublishStatus, StatusLook> = {
     icon: MoveRight,
     tone: "text-warning",
     explain:
-      "Published to a different account than its default names. Publishing writes it to the new one.",
+      "Published to a different account than its rule points to. Republish to move it.",
   },
   unpublished: {
     label: "Not published",
     short: "Not published",
     icon: CircleDashed,
     tone: "text-muted-foreground",
-    explain: "A default covers this lexicon, but it has not been published.",
+    explain: "Covered by a publishing rule, but not published.",
   },
   withdrawn: {
     label: "Withdrawn",
@@ -78,21 +78,21 @@ const LOOKS: Record<PublishStatus, StatusLook> = {
     icon: CircleSlash,
     tone: "text-muted-foreground",
     explain:
-      "Unpublished by hand. Auto-publish leaves it alone until you publish it again.",
+      "Unpublished manually. Auto-publish skips it until it's published again.",
   },
   target_unavailable: {
     label: "Destination unavailable",
     short: "Unavailable",
     icon: TriangleAlert,
     tone: "text-warning",
-    explain: "The account its default names cannot receive records right now.",
+    explain: "Its rule's destination can't be published to right now.",
   },
   no_rule: {
-    label: "No default",
-    short: "No default",
+    label: "No rule",
+    short: "No rule",
     icon: Minus,
     tone: "text-muted-foreground",
-    explain: "No publishing default covers this lexicon.",
+    explain: "No publishing rule covers this lexicon.",
   },
 };
 
@@ -123,7 +123,12 @@ export function PublishStatusBadge({
 }) {
   if (publishing) {
     return (
-      <span className={cn("inline-flex items-center gap-1.5 text-sm whitespace-nowrap", className)}>
+      <span
+        className={cn(
+          "inline-flex items-center gap-1.5 text-sm whitespace-nowrap",
+          className,
+        )}
+      >
         <Loader2
           className="text-muted-foreground size-4 animate-spin motion-reduce:animate-none"
           aria-hidden
@@ -141,7 +146,7 @@ export function PublishStatusBadge({
     lexicon.status === "target_unavailable"
       ? unavailableSentence(lexicon.target)
       : lexicon.status === "moved" && elsewhere
-        ? `Published to ${elsewhere}, not the account its default names. Publishing writes it to the new one.`
+        ? `Published to ${elsewhere}, not the account its rule points to. Republish to move it.`
         : null;
 
   if (explain) {
@@ -184,7 +189,12 @@ export function PublishStatusBadge({
   }
 
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-sm whitespace-nowrap", className)}>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-sm whitespace-nowrap",
+        className,
+      )}
+    >
       <Icon className={cn("size-4 shrink-0", look.tone)} aria-hidden />
       <span title={reason || look.explain}>
         {compact ? look.short : look.label}

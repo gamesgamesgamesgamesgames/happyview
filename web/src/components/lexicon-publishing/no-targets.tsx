@@ -12,16 +12,19 @@ export function NoTargets({ className }: { className?: string }) {
         className,
       )}
     >
-      <Info className="text-muted-foreground mt-0.5 size-4 shrink-0" aria-hidden />
+      <Info
+        className="text-muted-foreground mt-0.5 size-4 shrink-0"
+        aria-hidden
+      />
       <p>
-        Nothing can receive lexicons yet: attach an account in{" "}
+        No account is set up for publishing. Attach one in{" "}
         <Link
           href="/dashboard/settings/service-identity"
           className="font-medium underline underline-offset-4"
         >
           Service Identity
-        </Link>
-        , or link a repo with the lexicon publishing scope in{" "}
+        </Link>{" "}
+        or link a repo in{" "}
         <Link
           href="/dashboard/settings/linked-repos"
           className="font-medium underline underline-offset-4"

@@ -87,9 +87,9 @@ export function DnsStatus({
       );
     case "ok":
       return (
-        <span className="inline-flex items-center gap-1.5 text-sm whitespace-nowrap">
-          <CircleCheck className="size-4 shrink-0" aria-hidden />
-          Resolves here
+        <span className="inline-flex items-center" title="Resolves here">
+          <CircleCheck className="text-success size-4 shrink-0" aria-hidden />
+          <span className="sr-only">Resolves here</span>
         </span>
       );
     case "missing":
@@ -131,39 +131,46 @@ export function DnsRecord({
   expectedDid,
   currentDid,
   coverCount,
+  heading = true,
 }: {
   entry: LexiconDnsEntry;
   expectedDid: string;
   currentDid: string | null;
   coverCount: number;
+  /** Off where the surrounding row already says what is wrong and why. */
+  heading?: boolean;
 }) {
   const value = `did=${expectedDid}`;
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1">
-        <p className="text-sm font-medium">
-          {currentDid ? "Update this DNS record" : "Add this DNS record"}
-        </p>
-        <p className="text-muted-foreground text-xs">
-          Other apps find a published lexicon through this record, so until it
-          points at the account it will not resolve.
-        </p>
-      </div>
-      <div className="grid grid-cols-[3rem_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 text-sm">
+      {heading && (
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-medium">
+            {currentDid ? "Update this DNS record" : "Add this DNS record"}
+          </p>
+          <p className="text-muted-foreground text-xs">
+            Other apps find lexicons through this record. It has to point to the
+            account they&apos;re published to.
+          </p>
+        </div>
+      )}
+      <div className="grid grid-cols-[2.75rem_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 text-sm">
         <RecordField label="Name" value={entry.record_name} />
         <RecordField label="Type" value="TXT" copy={false} />
         <RecordField label="Value" value={value} />
       </div>
       {currentDid && (
-        <p className="text-muted-foreground text-xs">
-          It reads <span className="font-mono break-all">did={currentDid}</span>{" "}
-          today.
-        </p>
+        <div className="flex flex-col gap-1">
+          <p className="text-muted-foreground text-xs">Current value:</p>
+          <code className="text-muted-foreground font-mono text-xs break-all">
+            did={currentDid}
+          </code>
+        </div>
       )}
       <p className="text-muted-foreground text-xs">
         {coverCount === 1
-          ? `One record per authority: this one covers ${entry.authority}.`
-          : `One record per authority: this one covers all ${coverCount} lexicons under ${entry.authority}.`}
+          ? `This record covers every lexicon under ${entry.authority}.`
+          : `This record covers all ${coverCount} lexicons under ${entry.authority}.`}
       </p>
     </div>
   );
@@ -204,7 +211,9 @@ export function RecordField({
             size="icon-sm"
             className="size-7"
             onClick={handleCopy}
-            aria-label={copied ? `${label} copied` : `Copy ${label.toLowerCase()}`}
+            aria-label={
+              copied ? `${label} copied` : `Copy ${label.toLowerCase()}`
+            }
           >
             {copied ? <Check aria-hidden /> : <Copy aria-hidden />}
           </Button>

@@ -149,12 +149,12 @@ export function unavailableSentence(
   target: PublishTarget | null | undefined,
 ): string {
   if (target && isRedacted(target)) {
-    return "The linked repo it publishes to can't receive lexicons right now.";
+    return "Its linked repo can't be published to right now.";
   }
   return asSentence(target?.unavailable_reason);
 }
 
-/** Destinations a viewer may pick for a default; the server refuses the rest. */
+/** Destinations a viewer may pick for a rule; the server refuses the rest. */
 export function choosableTargets(
   targets: PublishTarget[],
   canSeeLinkedRepos: boolean,
@@ -177,12 +177,16 @@ export function targetKey(target: {
 }
 
 export function ruleTargetKey(rule: PublishRule): string {
-  return targetKey({ kind: rule.target_kind, linked_repo_id: rule.linked_repo_id });
+  return targetKey({
+    kind: rule.target_kind,
+    linked_repo_id: rule.linked_repo_id,
+  });
 }
 
 /** The account DNS should name for this lexicon, when there is one. */
 export function expectedDid(lexicon: PublishableLexicon): string | null {
-  if (lexicon.target?.available && lexicon.target.did) return lexicon.target.did;
+  if (lexicon.target?.available && lexicon.target.did)
+    return lexicon.target.did;
   return lexicon.publication?.did ?? null;
 }
 

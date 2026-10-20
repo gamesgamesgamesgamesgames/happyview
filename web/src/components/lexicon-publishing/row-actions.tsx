@@ -1,6 +1,6 @@
 "use client";
 
-import { CloudOff, Loader2 } from "lucide-react";
+import { CloudOff } from "lucide-react";
 
 import {
   AlertDialog,
@@ -38,58 +38,6 @@ export function isPublished(lexicon: PublishableLexicon): boolean {
   return Boolean(lexicon.publication?.uri);
 }
 
-/** Whether {@link RowActions} renders anything for this lexicon. */
-export function hasRowActions(lexicon: PublishableLexicon): boolean {
-  return canPublishNow(lexicon) || isPublished(lexicon);
-}
-
-export function RowActions({
-  lexicon,
-  busy,
-  onPublish,
-  onUnpublish,
-  className,
-}: {
-  lexicon: PublishableLexicon;
-  busy: boolean;
-  onPublish: () => void;
-  onUnpublish: () => void;
-  className?: string;
-}) {
-  const publishable = canPublishNow(lexicon);
-  const published = isPublished(lexicon);
-  if (!hasRowActions(lexicon)) return null;
-
-  return (
-    <div
-      className={cn("flex justify-end gap-1", className)}
-      onClick={(e) => e.stopPropagation()}
-    >
-      {published && (
-        <UnpublishButton
-          nsid={lexicon.nsid}
-          did={lexicon.publication?.did}
-          autoPublish={lexicon.auto_publish}
-          busy={busy}
-          onConfirm={onUnpublish}
-          compact
-        />
-      )}
-      {publishable && (
-        <Button size="sm" variant="outline" onClick={onPublish} disabled={busy}>
-          {busy && (
-            <Loader2
-              className="animate-spin motion-reduce:animate-none"
-              aria-hidden
-            />
-          )}
-          {publishLabel(lexicon)}
-        </Button>
-      )}
-    </div>
-  );
-}
-
 export function UnpublishButton({
   nsid,
   did: where,
@@ -101,7 +49,7 @@ export function UnpublishButton({
   nsid: string;
   /** The repo the record is in. */
   did: string | null | undefined;
-  /** Whether a default would otherwise publish it again on its own. */
+  /** Whether a rule would otherwise publish it again on its own. */
   autoPublish?: boolean;
   busy: boolean;
   onConfirm: () => void;
@@ -137,10 +85,9 @@ export function UnpublishButton({
                 from <span className="font-mono break-all">{where}</span>
               </>
             ) : null}
-            . Other apps can no longer resolve this lexicon, and anything built
-            against it may break.
+            . Other apps will no longer be able to resolve this lexicon.
             {autoPublish &&
-              " Auto-publish won't bring it back; it stays unpublished until you publish it again."}
+              " Auto-publish won't republish it until it's published manually."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

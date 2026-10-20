@@ -41,7 +41,7 @@ interface RuleSheetProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   overview: LexiconPublishingOverview;
-  /** The default being edited; absent to add one. */
+  /** The rule being edited; absent to add one. */
   rule: PublishRule | null;
   onSaved: () => void;
   /** Without `linked-repos:read`, only the instance account can be chosen. */
@@ -54,9 +54,7 @@ export function RuleSheet(props: RuleSheetProps) {
       <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
         {/* Keyed so every opening starts from the rule it edits, rather than
             whatever the previous session left behind. */}
-        {props.open && (
-          <RuleForm key={props.rule?.id ?? "new"} {...props} />
-        )}
+        {props.open && <RuleForm key={props.rule?.id ?? "new"} {...props} />}
       </SheetContent>
     </Sheet>
   );
@@ -74,7 +72,11 @@ function RuleForm({
   const firstAvailable = targets.find((t) => t.available);
   const [pattern, setPattern] = useState(rule?.pattern ?? "");
   const [destination, setDestination] = useState<string>(
-    rule ? ruleTargetKey(rule) : firstAvailable ? targetKey(firstAvailable) : "",
+    rule
+      ? ruleTargetKey(rule)
+      : firstAvailable
+        ? targetKey(firstAvailable)
+        : "",
   );
   const [autoPublish, setAutoPublish] = useState(rule?.auto_publish ?? true);
   const [touched, setTouched] = useState(false);
@@ -84,7 +86,7 @@ function RuleForm({
   const parsed = parsePattern(pattern);
   const target = targets.find((t) => targetKey(t) === destination);
   // A kept destination needs no target to match: one whose linked repo was
-  // removed is in no list, and the default can still have auto-publish changed.
+  // removed is in no list, and the rule can still have auto-publish changed.
   const keepsDestination = editing && destination === ruleTargetKey(rule);
   // `null` keeps the rule's destination; `undefined` means nothing valid is
   // chosen.
@@ -143,10 +145,10 @@ function RuleForm({
       submit(
         () =>
           updatePublishRule(rule.id, { ...fields, auto_publish: autoPublish }),
-        "Default saved",
+        "Rule saved",
       );
     } else if (fields) {
-      // A new default never keeps a destination, so fields is always set.
+      // A new rule never keeps a destination, so fields is always set.
       submit(
         () =>
           createPublishRule({
@@ -155,7 +157,7 @@ function RuleForm({
             linked_repo_id: fields.linked_repo_id ?? undefined,
             auto_publish: autoPublish,
           }),
-        "Default added",
+        "Rule added",
       );
     }
   }
@@ -171,10 +173,12 @@ function RuleForm({
       }}
     >
       <SheetHeader>
-        <SheetTitle>{editing ? "Edit default" : "Add a default"}</SheetTitle>
+        <SheetTitle>
+          {editing ? "Edit rule" : "Add a publishing rule"}
+        </SheetTitle>
         <SheetDescription>
-          A default sends every lexicon its pattern covers to one account. The
-          most specific default wins.
+          A rule publishes every lexicon its pattern matches to one account.
+          When rules overlap, the most specific one wins.
         </SheetDescription>
       </SheetHeader>
 
@@ -225,8 +229,8 @@ function RuleForm({
             )}
             {editing && (
               <p className="text-muted-foreground">
-                A pattern can&apos;t change. Delete this default and add another
-                to cover something else.
+                Patterns can&apos;t be edited. Delete this rule and add a new
+                one instead.
               </p>
             )}
           </div>
@@ -234,7 +238,8 @@ function RuleForm({
 
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-2 text-sm font-medium">Destination</legend>
-          {editing && rule.target.available === false &&
+          {editing &&
+            rule.target.available === false &&
             destination === ruleTargetKey(rule) && (
               <p className="text-muted-foreground text-xs">
                 Its current destination is unavailable
@@ -248,9 +253,9 @@ function RuleForm({
             !canSeeLinkedRepos &&
             rule.target_kind === "linked_repo" && (
               <p className="text-muted-foreground text-xs">
-                It publishes to a linked repo. Keep it and change only
-                auto-publish, or choose the instance account. Choosing a
-                linked repo needs permission to view linked repos.
+                This rule publishes to a linked repo you don&apos;t have
+                permission to view. You can change auto-publish or switch to the
+                instance account.
               </p>
             )}
           <RadioGroup
@@ -278,10 +283,13 @@ function RuleForm({
               aria-describedby="publish-rule-auto-help"
             />
           </div>
-          <p id="publish-rule-auto-help" className="text-muted-foreground text-xs">
+          <p
+            id="publish-rule-auto-help"
+            className="text-muted-foreground text-xs"
+          >
             {autoPublish
-              ? "Matching lexicons publish whenever they change."
-              : "Matching lexicons publish only when someone presses Publish."}
+              ? "Matching lexicons are published automatically when they change."
+              : "Matching lexicons are only published manually."}
           </p>
         </div>
 
@@ -306,9 +314,12 @@ function RuleForm({
         </Button>
         <Button type="submit" disabled={!canSave}>
           {saving && (
-            <Loader2 className="animate-spin motion-reduce:animate-none" aria-hidden />
+            <Loader2
+              className="animate-spin motion-reduce:animate-none"
+              aria-hidden
+            />
           )}
-          {editing ? "Save" : "Add default"}
+          {editing ? "Save" : "Add rule"}
         </Button>
       </SheetFooter>
     </form>
@@ -316,11 +327,13 @@ function RuleForm({
 }
 
 function coverageSentence(matched: number, claimed: number): string {
-  if (matched === 0) return "No lexicon here matches it yet.";
+  if (matched === 0) return "Matches no lexicons.";
   const head =
-    matched === 1 ? "Matches 1 lexicon here" : `Matches ${matched} lexicons here`;
+    matched === 1 ? "Matches 1 lexicon" : `Matches ${matched} lexicons`;
   if (claimed === 0) return `${head}.`;
-  return `${head}; a more specific default keeps ${claimed} of them.`;
+  return claimed === 1
+    ? `${head}. 1 of them follows a more specific rule.`
+    : `${head}. ${claimed} of them follow a more specific rule.`;
 }
 
 function DestinationOption({

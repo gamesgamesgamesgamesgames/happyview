@@ -39,7 +39,7 @@ import { useConfig } from "@/lib/config-context";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { usePluginUpdates } from "@/components/plugin-update-provider";
 import { useRestart } from "@/lib/restart-context";
-import { getDbInfo, getLexiconPublishingAvailability } from "@/lib/api";
+import { getDbInfo } from "@/lib/api";
 import { Scroller } from "@/components/ui/scroller";
 import {
   Sidebar,
@@ -61,8 +61,6 @@ type NavItem = {
   icon: React.ComponentType;
   requiredPermissions?: string[];
 };
-
-const LEXICON_PUBLISHING_URL = "/dashboard/settings/lexicon-publishing";
 
 const dataItems: NavItem[] = [
   { title: "Lexicons", url: "/dashboard/lexicons", icon: IconFileDescription },
@@ -163,7 +161,7 @@ const systemItems: NavItem[] = [
   },
   {
     title: "Lexicon Publishing",
-    url: LEXICON_PUBLISHING_URL,
+    url: "/dashboard/settings/lexicon-publishing",
     icon: IconWorldUpload,
     requiredPermissions: ["lexicons:read"],
   },
@@ -208,26 +206,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { addReason, removeReason } = useRestart();
 
   const [deadLetterCount, setDeadLetterCount] = useState(0);
-  const [publishingUsable, setPublishingUsable] = useState(false);
-  const canReadLexicons = hasPermission("lexicons:read");
-
-  // Asked again on every navigation, so attaching an account or linking a
-  // repo shows the entry without a reload.
-  useEffect(() => {
-    if (!canReadLexicons) return;
-    let cancelled = false;
-    getLexiconPublishingAvailability()
-      .then(({ usable }) => {
-        if (!cancelled) setPublishingUsable(usable);
-      })
-      .catch(() => {
-        if (!cancelled) setPublishingUsable(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [canReadLexicons, pathname]);
-
   useEffect(() => {
     let cancelled = false;
     async function fetchCount() {
@@ -286,9 +264,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const visibleData = filterByPermission(dataItems);
   const visibleAccess = filterByPermission(accessItems);
   const visibleIntegrations = filterByPermission(integrationItems);
-  const visibleSystem = filterByPermission(systemItems).filter(
-    (item) => item.url !== LEXICON_PUBLISHING_URL || publishingUsable,
-  );
+  const visibleSystem = filterByPermission(systemItems);
 
   return (
     <Sidebar collapsible="offcanvas" {...props}>

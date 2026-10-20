@@ -29,11 +29,11 @@ For example, publishing `com.example.notes.getNote` to `did:plc:abc123` needs:
 _lexicon.notes.example.com.  TXT  "did=did:plc:abc123"
 ```
 
-HappyView runs this check itself, from its own server. The publishing page checks every authority at once, and each lexicon's **Publishing** panel checks its own, with a **Check again** button for after you change DNS. When the record is missing or names a different DID, both show the record to add. If no default decides where a lexicon goes yet, the panel can only give the record's name, since the value depends on the account.
+HappyView runs this check itself, from its own server. The **DNS** column on the Lexicons page checks every authority at once, and each lexicon's **Publishing** panel checks its own, with a **Check again** button for after you change DNS. When the record is missing or names a different DID, both show the record to add. Until a rule decides where a lexicon goes, the panel can only give the record's name, since the value depends on the account.
 
 ## Targets
 
-Each default sends lexicons to one of two places.
+Each rule sends lexicons to one of two places.
 
 ### The instance's account
 
@@ -61,13 +61,13 @@ Scopes on a grant are immutable. If a grant is missing one, the target shows as 
 
 A PDS can approve fewer scopes than a grant asks for, and HappyView judges the target by what was approved. If it shows as unavailable because the PDS granted fewer scopes, the PDS probably cached HappyView's client details from before the grant existed; link the repo again later.
 
-## Publishing defaults
+## Publishing rules
 
-A publishing default is a rule that says where a set of lexicons goes. Manage them at **System > Lexicon Publishing** (`/dashboard/settings/lexicon-publishing`).
+A publishing rule says where a set of lexicons goes. Manage them at **System > Lexicon Publishing** (`/dashboard/settings/lexicon-publishing`).
 
-That page, and the **Published** column on the Lexicons page, only appear once some account can take a publish: an attached account with a session that grants the schema scope, or an active linked repo that does. Until then, each lexicon's Publishing panel says what to set up.
+Publishing needs an account to publish to: an attached account with a session that grants the schema scope, or an active linked repo that does. Until one exists, that page lists what each option still needs, with a link to fix it, and the Lexicons page shows no publishing columns.
 
-Each default has:
+Each rule has:
 
 - A **pattern**: `*` for everything, a prefix such as `com.example.*`, or one full NSID.
 - A **target**: the instance's account or a linked repo.
@@ -77,7 +77,7 @@ Each default has:
 
 ### Most specific wins
 
-When several defaults match a lexicon, the most specific one decides:
+When several rules match a lexicon, the most specific one decides:
 
 1. An exact NSID.
 2. The longest matching prefix.
@@ -87,7 +87,7 @@ So with `*` pointing at the instance and `com.example1.*` pointing at repo A, a 
 
 ### If a linked repo is removed
 
-Deleting a linked repo doesn't delete the defaults that used it, and those defaults don't fall through to a broader one. Their lexicons show as **target unavailable** until you point the default at something else. Publishing them somewhere you never chose would be worse than not publishing them.
+Deleting a linked repo doesn't delete the rules that used it, and those rules don't fall through to a broader one. Their lexicons show as **target unavailable** until you point the rule at something else. Publishing them somewhere you never chose would be worse than not publishing them.
 
 ## Status
 
@@ -95,33 +95,33 @@ Every publishable lexicon has one status:
 
 | Status               | Meaning                                                                                   |
 | -------------------- | ----------------------------------------------------------------------------------------- |
-| `no_rule`            | No default matches                                                                        |
-| `target_unavailable` | A default matches, but its target can't publish right now; the reason is shown            |
+| `no_rule`            | No rule matches                                                                           |
+| `target_unavailable` | A rule matches, but its target can't publish right now; the reason is shown               |
 | `unpublished`        | Never successfully published                                                              |
 | `withdrawn`          | Unpublished by hand; auto-publish leaves it alone until you publish it again               |
-| `moved`              | Published to a different account than its default points at now                           |
+| `moved`              | Published to a different account than its rule points at now                              |
 | `outdated`           | Published to the right account, but the lexicon has changed since                         |
 | `current`            | The last published record matches what HappyView would publish today                      |
 
-The last error, if any, is shown beside the status. Each lexicon's own page has a **Publishing** panel with the same information: which default applies and why, the status, the DNS record to add, and **Publish** and **Unpublish** buttons.
+The Lexicons page shows each lexicon's status in its **Published** column. **Destination** and **DNS** are off by default; turn them on from **View**. The last error, if any, is shown beside the status. Each lexicon's own page has a **Publishing** panel with the same information: which rule applies and why, the status, the DNS record to add, and **Publish** and **Unpublish** buttons.
 
 ## Auto-publish
 
-With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. A `withdrawn` lexicon is skipped. It runs after the server starts, after you upload a lexicon, and after you create, change or delete a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
+With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. A `withdrawn` lexicon is skipped. It runs after the server starts, after you upload a lexicon, and after you create, change or delete a rule. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
 
 Only one run happens at a time. A trigger that arrives mid-run doesn't start a second run: it marks the work pending and the running pass goes round once more, so a change made during a run isn't missed.
 
 ## Unpublishing
 
-**Nothing ever unpublishes automatically.** Deleting a lexicon, deleting a default, or pointing a default somewhere else leaves published records where they are. A published schema is a public contract that other apps resolve, and removing one can break them.
+**Nothing ever unpublishes automatically.** Deleting a lexicon, deleting a rule, or pointing a rule somewhere else leaves published records where they are. A published schema is a public contract that other apps resolve, and removing one can break them.
 
 To remove a record, use **Unpublish**. A record whose lexicon you've since deleted is listed under **Published records without a lexicon** on the publishing page, with its own **Unpublish** button. It deletes the record from the account it was published to, using whichever credential holds that DID: the attached account, or the linked repo bound to it. If nothing HappyView holds can act as that account any more, unpublishing is refused and names the DID.
 
-Unpublishing also withdraws the lexicon from auto-publish: its status becomes `withdrawn`, and no auto-publish run puts the record back, even under a default with auto-publish on. Publishing it by hand clears that and returns it to its default's normal handling.
+Unpublishing also withdraws the lexicon from auto-publish: its status becomes `withdrawn`, and no auto-publish run puts the record back, even under a rule with auto-publish on. Publishing it by hand clears that and returns it to its rule's normal handling.
 
 ## Permissions
 
-Reading the publishing page needs `lexicons:read`. Creating, changing, or deleting defaults, and publishing or unpublishing, needs `lexicons:publish`. Pointing a default at a linked repo also needs `linked-repos:read`; without it, the page shows linked-repo destinations only as "A linked repo".
+Reading the publishing page needs `lexicons:read`. Creating, changing, or deleting rules, and publishing or unpublishing, needs `lexicons:publish`. Pointing a rule at a linked repo also needs `linked-repos:read`; without it, the page shows linked-repo destinations only as "A linked repo".
 
 The **Manager** template includes `lexicons:publish` for users created from it going forward. Existing non-super users don't get it automatically: grant it to them explicitly from **Access > Users**. Super users can always publish.
 

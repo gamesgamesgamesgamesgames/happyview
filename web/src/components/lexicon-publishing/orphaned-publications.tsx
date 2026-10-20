@@ -31,8 +31,7 @@ export function OrphanedPublications({
         </h2>
         <p className="text-muted-foreground text-sm text-pretty">
           These lexicons were deleted after they were published. Their records
-          stay where they are, and other apps can still resolve them, until you
-          unpublish them.
+          remain until you unpublish them.
         </p>
       </div>
       <ul className="divide-y rounded-lg border">

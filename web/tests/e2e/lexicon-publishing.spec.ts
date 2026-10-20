@@ -1,4 +1,9 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import {
+  test,
+  expect,
+  type APIRequestContext,
+  type Page,
+} from "@playwright/test";
 import pg from "pg";
 import {
   loginAsTestAdmin,
@@ -30,7 +35,7 @@ const STANDBY_DID = "did:plc:e2epublishingstandby";
 const DID_WEB_REASON = "the instance identity is did:web and has no repo";
 const PENDING_REASON = "this linked repo has not been authorized yet";
 const NO_SESSION_REASON =
-  "the attached account has no session; sign it in again from Service Identity";
+  "the attached account needs to sign in again from Service Identity";
 const SCHEMA_SCOPE =
   "atproto repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
 const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
@@ -159,14 +164,23 @@ async function createRule(
   return request.post("/admin/lexicon-publishing/rules", { data: body });
 }
 
-function cascade(page: Page) {
-  return page.getByRole("list", {
-    name: "Publishing defaults, most specific first",
+function rulesTable(page: Page) {
+  return page.getByRole("table", {
+    name: "Publishing rules, most specific first",
   });
 }
 
-async function filterTo(page: Page, text: string) {
-  await page.getByPlaceholder("Filter by NSID...").fill(text);
+function ruleRows(page: Page) {
+  return rulesTable(page).locator("tbody tr");
+}
+
+/** The Lexicons page, filtered, with its Destination column shown. */
+async function lexiconsPage(page: Page, filter: string) {
+  await page.goto("/dashboard/lexicons");
+  await page.getByRole("combobox", { name: "Toggle columns" }).click();
+  await page.getByRole("option", { name: "Destination" }).click();
+  await page.keyboard.press("Escape");
+  await page.getByPlaceholder("Filter by ID...").fill(filter);
 }
 
 function lexiconRow(page: Page, nsid: string) {
@@ -175,10 +189,10 @@ function lexiconRow(page: Page, nsid: string) {
   });
 }
 
-async function openAddDefault(page: Page) {
-  await page.getByRole("button", { name: "Add default" }).click();
+async function openAddRule(page: Page) {
+  await page.getByRole("button", { name: "Add rule" }).click();
   const sheet = page.getByRole("dialog");
-  await expect(sheet.getByText("Add a default")).toBeVisible();
+  await expect(sheet.getByText("Add a publishing rule")).toBeVisible();
   return sheet;
 }
 
@@ -213,7 +227,10 @@ test.describe("Lexicon publishing dashboard", () => {
     const standby = await page.request.post("/admin/linked-repos", {
       data: { reason: "e2e lexicon publishing standby", scopes: SCHEMA_SCOPE },
     });
-    expect(standby.ok(), `create standby: ${await standby.text()}`).toBeTruthy();
+    expect(
+      standby.ok(),
+      `create standby: ${await standby.text()}`,
+    ).toBeTruthy();
     standbyId = (await standby.json()).id;
     await page.close();
   });
@@ -252,32 +269,55 @@ test.describe("Lexicon publishing dashboard", () => {
     await loginAsTestAdmin(page);
   });
 
-  test("with nowhere to publish, publishing stays closed and the API refuses", async ({
+  test("with nowhere to publish, the page says what to set up and the API refuses", async ({
     page,
   }) => {
     await page.goto("/dashboard/lexicons");
-    await expect(
-      page.getByRole("link", { name: "Lexicons", exact: true }),
-    ).toBeVisible();
-    await expect(sidebarLink(page)).toHaveCount(0);
+    await expect(sidebarLink(page)).toBeVisible();
     await expect(
       page.getByRole("columnheader", { name: "Published" }),
     ).toHaveCount(0);
 
     // The lexicon page says what to set up, and still checks DNS.
     await page.goto(`/dashboard/lexicons/${ALPHA}`);
-    const panel = page.locator('section[aria-labelledby="publishing-panel-title"]');
-    await expect(panel).toContainText("Nothing can receive lexicons yet");
-    await expect(panel.getByRole("link", { name: "Service Identity" })).toBeVisible();
-    await expect(panel.getByRole("link", { name: "Linked Repos" })).toBeVisible();
+    const panel = page.locator(
+      'section[aria-labelledby="publishing-panel-title"]',
+    );
+    await expect(panel).toContainText("No account is set up for publishing.");
+    await expect(
+      panel.getByRole("link", { name: "Service Identity" }),
+    ).toBeVisible();
+    await expect(
+      panel.getByRole("link", { name: "Linked Repos" }),
+    ).toBeVisible();
     await expect(panel).toContainText("_lexicon.pub.e2e.test");
-    await expect(panel).toContainText("Not set yet");
+    await expect(panel).toContainText("Not set");
+
+    await expect(
+      panel.getByRole("link", { name: "Set up publishing" }),
+    ).toHaveAttribute("href", PAGE);
 
     await page.goto(PAGE);
-    await expect(page).toHaveURL(/\/dashboard\/?$/);
+    await expect(page).toHaveURL(new RegExp(`${PAGE}/?$`));
+    const setup = page.locator(
+      'section[aria-labelledby="publishing-setup-title"]',
+    );
     await expect(
-      page.getByText("Lexicon publishing needs an account to publish to"),
+      setup.getByRole("heading", {
+        name: "Set up an account to publish to",
+      }),
     ).toBeVisible();
+    await expect(setup).toContainText(
+      "The instance identity is a did:web, which has no repo. Attach an account instead.",
+    );
+    await expect(
+      setup.getByRole("link", { name: "Open Service Identity" }),
+    ).toHaveAttribute("href", "/dashboard/settings/service-identity");
+    await expect(setup).toContainText("Not authorized yet.");
+    await expect(
+      setup.getByRole("link", { name: "Link a repo" }),
+    ).toHaveAttribute("href", "/dashboard/settings/linked-repos");
+    await expect(page.getByRole("button", { name: "Add rule" })).toHaveCount(0);
 
     const instance = await createRule(page.request, {
       pattern: PREFIX,
@@ -314,7 +354,15 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(target.unavailable_reason).toBe(NO_SESSION_REASON);
 
     await page.goto(PAGE);
-    await expect(page).toHaveURL(/\/dashboard\/?$/);
+    const setup = page.locator(
+      'section[aria-labelledby="publishing-setup-title"]',
+    );
+    await expect(setup).toContainText(
+      "The attached account needs to sign in again.",
+    );
+    await expect(
+      setup.getByRole("link", { name: "Sign in again" }),
+    ).toBeVisible();
 
     const refused = await createRule(page.request, {
       pattern: PREFIX,
@@ -338,14 +386,12 @@ test.describe("Lexicon publishing dashboard", () => {
     await sidebarLink(page).click();
     await expect(page).toHaveURL(new RegExp(`${PAGE}/?$`));
 
-    const list = cascade(page);
-    await expect(list.getByRole("listitem")).toHaveCount(1);
-    await expect(list.getByRole("listitem")).toContainText("Every lexicon");
-    await expect(list.getByRole("listitem")).toContainText("Not published");
+    await expect(ruleRows(page)).toHaveCount(1);
+    await expect(ruleRows(page)).toContainText("No publishing rules.");
 
-    await filterTo(page, "test.e2e.pub");
+    await lexiconsPage(page, "test.e2e.pub");
     for (const nsid of SEEDED) {
-      await expect(lexiconRow(page, nsid)).toContainText("No default");
+      await expect(lexiconRow(page, nsid)).toContainText("No rule");
     }
   });
 
@@ -355,13 +401,15 @@ test.describe("Lexicon publishing dashboard", () => {
     await seedAttachedSession();
     await page.goto(PAGE);
     await expect(
-      page.getByText("Nothing can receive lexicons yet", { exact: false }),
+      page.getByText("No account is set up for publishing.", { exact: false }),
     ).toHaveCount(0);
     await expect(
-      page.getByText("Nothing publishes until a default names an account."),
+      rulesTable(page).getByText("No publishing rules.", {
+        exact: false,
+      }),
     ).toBeVisible();
 
-    const sheet = await openAddDefault(page);
+    const sheet = await openAddRule(page);
     const instance = sheet.locator("label", { hasText: "Instance account" });
     await expect(instance).toContainText(ATTACHED_DID);
     await expect(instance.getByRole("radio")).toBeEnabled();
@@ -377,23 +425,21 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(
       sheet.getByText(`Covers every lexicon under test.e2e.pub`),
     ).toBeVisible();
-    await expect(sheet.getByText("Matches 3 lexicons here.")).toBeVisible();
+    await expect(sheet.getByText("Matches 3 lexicons.")).toBeVisible();
 
     // Nothing here can actually write, so a reconcile must have nothing to do.
     const auto = sheet.getByRole("switch", { name: "Auto-publish" });
     await expect(auto).toBeChecked();
     await auto.click();
     await expect(
-      sheet.getByText(
-        "Matching lexicons publish only when someone presses Publish.",
-      ),
+      sheet.getByText("Matching lexicons are only published manually."),
     ).toBeVisible();
 
-    await sheet.getByRole("button", { name: "Add default" }).click();
-    await expect(page.getByText("Default added")).toBeVisible();
+    await sheet.getByRole("button", { name: "Add rule" }).click();
+    await expect(page.getByText("Rule added")).toBeVisible();
     await expect(sheet).toBeHidden();
 
-    const items = cascade(page).getByRole("listitem");
+    const items = ruleRows(page);
     await expect(items).toHaveCount(2);
     await expect(items.nth(0)).toContainText(PREFIX);
     await expect(items.nth(0)).toContainText(
@@ -406,28 +452,28 @@ test.describe("Lexicon publishing dashboard", () => {
     ).not.toBeChecked();
     await expect(items.nth(1)).toContainText("Everything else");
 
-    await filterTo(page, "test.e2e.pub");
+    await lexiconsPage(page, "test.e2e.pub");
     for (const nsid of [ALPHA, BETA, GAMMA]) {
       await expect(lexiconRow(page, nsid)).toContainText("Not published");
     }
-    await expect(lexiconRow(page, OTHER)).toContainText("No default");
+    await expect(lexiconRow(page, OTHER)).toContainText("No rule");
 
-    // Losing the session strands the default rather than removing it, and
+    // Losing the session strands the rule rather than removing it, and
     // the edit dialog says why the instance cannot be chosen. The standby
     // repo keeps the page open meanwhile.
     await activateStandbyRepo(standbyId);
     await removeAttachedSession();
-    await page.reload();
-    const stranded = cascade(page).getByRole("listitem").nth(0);
+    await page.goto(PAGE);
+    const stranded = ruleRows(page).nth(0);
     await expect(stranded).toContainText("Destination unavailable");
     await expect(stranded).toContainText(
-      "The attached account has no session; sign it in again from Service Identity",
+      "The attached account needs to sign in again from Service Identity",
     );
     await stranded
-      .getByRole("button", { name: `Edit the default for ${PREFIX}` })
+      .getByRole("button", { name: `Edit the rule for ${PREFIX}` })
       .click();
     const edit = page.getByRole("dialog");
-    await expect(edit.getByText("Edit default")).toBeVisible();
+    await expect(edit.getByText("Edit rule")).toBeVisible();
     const disabled = edit.locator("label", { hasText: "Instance account" });
     await expect(disabled).toContainText(`Unavailable: ${NO_SESSION_REASON}`);
     await expect(disabled.getByRole("radio")).toBeDisabled();
@@ -435,12 +481,12 @@ test.describe("Lexicon publishing dashboard", () => {
     await seedAttachedSession();
   });
 
-  test("defaults are created, refused and ordered through the API", async ({
+  test("rules are created, refused and ordered through the API", async ({
     page,
   }) => {
     const request = page.request;
     const prefix = (await rules(request)).find((r) => r.pattern === PREFIX);
-    expect(prefix, "the dialog's default should exist").toBeTruthy();
+    expect(prefix, "the dialog's rule should exist").toBeTruthy();
 
     const catchAll = await createRule(request, {
       pattern: "*",
@@ -467,7 +513,7 @@ test.describe("Lexicon publishing dashboard", () => {
     });
     expect(duplicate.status()).toBe(409);
     expect((await duplicate.json()).error).toBe(
-      `a default for ${PREFIX} already exists`,
+      `a rule for ${PREFIX} already exists`,
     );
 
     for (const bad of ["com.*.foo", "**", "com", ""]) {
@@ -500,15 +546,15 @@ test.describe("Lexicon publishing dashboard", () => {
     ]);
 
     await page.goto(PAGE);
-    const items = cascade(page).getByRole("listitem");
+    const items = ruleRows(page);
     // A catch-all leaves nothing for the closing "Everything else" row.
     await expect(items).toHaveCount(3);
     await expect(items.nth(0)).toContainText(`Covers only ${ALPHA}`);
     await expect(items.nth(1)).toContainText(PREFIX);
     await expect(items.nth(2)).toContainText("Covers every lexicon");
-    await expect(cascade(page)).not.toContainText("Everything else");
+    await expect(rulesTable(page)).not.toContainText("Everything else");
 
-    await filterTo(page, "test.e2e.pub");
+    await lexiconsPage(page, "test.e2e.pub");
     await expect(lexiconRow(page, ALPHA)).toContainText(`via ${ALPHA}`);
     await expect(lexiconRow(page, BETA)).toContainText(`via ${PREFIX}`);
     await expect(lexiconRow(page, OTHER)).toContainText("via *");
@@ -537,43 +583,45 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(total).toBeGreaterThanOrEqual(SEEDED.length);
 
     await page.goto(PAGE);
-    const sheet = await openAddDefault(page);
+    const sheet = await openAddRule(page);
     const pattern = sheet.getByLabel("Pattern");
     const help = sheet.locator("#publish-rule-pattern-help");
 
-    // ALPHA's exact default and PREFIX's together claim the three under
+    // ALPHA's exact rule and PREFIX's together claim the three under
     // test.e2e.pub, all more specific than *.
     await pattern.fill("*");
     await expect(help).toContainText("Covers every lexicon");
     await expect(help).toContainText(
-      `Matches ${total} lexicons here; a more specific default keeps 3 of them.`,
+      `Matches ${total} lexicons. 3 of them follow a more specific rule.`,
     );
 
     await pattern.fill(PREFIX);
     await expect(help).toContainText("Covers every lexicon under test.e2e.pub");
     await expect(help).toContainText(
-      "Matches 3 lexicons here; a more specific default keeps 1 of them.",
+      "Matches 3 lexicons. 1 of them follows a more specific rule.",
     );
 
     await pattern.fill("TEST.E2E.PUBOTHER.*");
     await expect(help).toContainText(
       "Covers every lexicon under test.e2e.pubother",
     );
-    await expect(help).toContainText("Matches 1 lexicon here.");
+    await expect(help).toContainText("Matches 1 lexicon.");
 
     await pattern.fill(BETA);
     await expect(help).toContainText(`Covers only ${BETA}`);
-    await expect(help).toContainText("Matches 1 lexicon here.");
+    await expect(help).toContainText("Matches 1 lexicon.");
 
     await pattern.fill("test.e2e.nothing.*");
-    await expect(help).toContainText("No lexicon here matches it yet.");
+    await expect(help).toContainText("Matches no lexicons.");
 
     await pattern.fill("com.*.foo");
     await pattern.blur();
     await expect(help).toContainText(
       "* works alone, or as a trailing .* after a prefix",
     );
-    await expect(sheet.getByRole("button", { name: "Add default" })).toBeDisabled();
+    await expect(
+      sheet.getByRole("button", { name: "Add rule" }),
+    ).toBeDisabled();
 
     await sheet.getByRole("button", { name: "Cancel" }).click();
     await expect(sheet).toBeHidden();
@@ -583,14 +631,15 @@ test.describe("Lexicon publishing dashboard", () => {
     ]);
   });
 
-  test("the lexicon page shows the default that governs it", async ({
-    page,
-  }) => {
+  test("the lexicon page shows the rule that governs it", async ({ page }) => {
     await page.goto(`/dashboard/lexicons/${BETA}`);
-    const panel = page.locator('section[aria-labelledby="publishing-panel-title"]');
+    const panel = page.locator(
+      'section[aria-labelledby="publishing-panel-title"]',
+    );
     await expect(panel).toContainText("Not published");
     await expect(panel).toContainText("Instance account");
-    await expect(panel.getByRole("link", { name: PREFIX })).toHaveAttribute(
+    await expect(panel).toContainText(`Set by the ${PREFIX} rule.`);
+    await expect(panel.getByRole("link", { name: "Change" })).toHaveAttribute(
       "href",
       new RegExp(PAGE),
     );
@@ -598,18 +647,22 @@ test.describe("Lexicon publishing dashboard", () => {
 
     // HappyView knows where BETA goes, so it gives the whole record to add.
     await expect(panel).toContainText("_lexicon.pub.e2e.test");
-    await expect(panel).toContainText("Not set yet");
+    await expect(panel).toContainText("Not set");
     await expect(panel).toContainText(`did=${ATTACHED_DID}`);
-    await expect(panel.getByRole("button", { name: "Check again" })).toBeVisible();
+    await expect(
+      panel.getByRole("button", { name: "Check again" }),
+    ).toBeVisible();
 
     await page.goto(`/dashboard/lexicons/${OTHER}`);
-    await expect(panel).toContainText("No default");
-    await expect(panel).toContainText("No default covers it.");
-    await expect(panel.getByRole("link", { name: "Add one" })).toBeVisible();
-    await expect(panel.getByRole("button", { name: /publish/i })).toHaveCount(0);
+    await expect(panel).toContainText("No rule");
+    await expect(panel).toContainText("No rule covers this lexicon.");
+    await expect(panel.getByRole("link", { name: "Add a rule" })).toBeVisible();
+    await expect(panel.getByRole("button", { name: /publish/i })).toHaveCount(
+      0,
+    );
     // Nothing decides OTHER's account, so only the record's name is known.
     await expect(panel).toContainText("_lexicon.pubother.e2e.test");
-    await expect(panel).toContainText("Not set yet");
+    await expect(panel).toContainText("Not set");
     await expect(panel).not.toContainText("did=did:");
   });
 
@@ -626,48 +679,48 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(write.status()).toBe(403);
 
     await page.goto(`/dashboard/lexicons/${ALPHA}`);
-    const panel = page.locator('section[aria-labelledby="publishing-panel-title"]');
+    const panel = page.locator(
+      'section[aria-labelledby="publishing-panel-title"]',
+    );
     await expect(panel).toContainText("Not published");
-    await expect(panel.getByRole("link", { name: ALPHA })).toBeVisible();
-    await expect(panel.getByRole("button", { name: /publish/i })).toHaveCount(0);
-
-    await page.goto(PAGE);
-    const items = cascade(page).getByRole("listitem");
-    await expect(items.nth(0)).toContainText("Auto-publish off");
-    await expect(cascade(page).getByRole("switch")).toHaveCount(0);
-    await expect(cascade(page).getByRole("button")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Add default" })).toHaveCount(
+    await expect(panel).toContainText(`Set by the ${ALPHA} rule.`);
+    await expect(panel.getByRole("link", { name: "See rules" })).toBeVisible();
+    await expect(panel.getByRole("button", { name: /publish/i })).toHaveCount(
       0,
     );
-    await filterTo(page, "test.e2e.pub");
+
+    await page.goto(PAGE);
+    const items = ruleRows(page);
+    await expect(items.nth(0)).toContainText("Auto-publish off");
+    await expect(rulesTable(page).getByRole("switch")).toHaveCount(0);
+    await expect(rulesTable(page).getByRole("button")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Add rule" })).toHaveCount(0);
+    await lexiconsPage(page, "test.e2e.pub");
     await expect(lexiconRow(page, ALPHA)).toContainText("Not published");
-    await expect(
-      page.getByRole("button", { name: /publish/i }),
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /publish/i })).toHaveCount(0);
   });
 
-  test("a did:web instance leaves its defaults unavailable, with the reason", async ({
+  test("a did:web instance leaves its rules unavailable, with the reason", async ({
     page,
   }) => {
     await setServiceIdentityMode("did_web", { did: "did:web:localhost" });
     await page.goto(PAGE);
 
-    const first = cascade(page).getByRole("listitem").nth(0);
+    const first = ruleRows(page).nth(0);
     await expect(first).toContainText("Destination unavailable");
     await expect(first).toContainText(
       "The instance identity is did:web and has no repo",
     );
 
-    await filterTo(page, "test.e2e.pub");
-    await expect(lexiconRow(page, ALPHA)).toContainText(
-      "Destination unavailable",
-    );
+    await lexiconsPage(page, "test.e2e.pub");
+    await expect(lexiconRow(page, ALPHA)).toContainText("Unavailable");
 
+    await page.goto(PAGE);
     await first
-      .getByRole("button", { name: `Edit the default for ${ALPHA}` })
+      .getByRole("button", { name: `Edit the rule for ${ALPHA}` })
       .click();
     const sheet = page.getByRole("dialog");
-    await expect(sheet.getByText("Edit default")).toBeVisible();
+    await expect(sheet.getByText("Edit rule")).toBeVisible();
     await expect(sheet).toContainText(
       `Its current destination is unavailable: ${DID_WEB_REASON}.`,
     );
@@ -676,18 +729,18 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(instance.getByRole("radio")).toBeDisabled();
     await sheet.getByRole("button", { name: "Cancel" }).click();
 
-    // The pencil's sibling deletes; the page goes back to the empty cascade.
+    // The pencil's sibling deletes; the page goes back to the empty table.
     for (const pattern of [ALPHA, PREFIX]) {
-      await cascade(page)
-        .getByRole("button", { name: `Delete the default for ${pattern}` })
+      await rulesTable(page)
+        .getByRole("button", { name: `Delete the rule for ${pattern}` })
         .click();
       await page
         .getByRole("alertdialog")
         .getByRole("button", { name: "Delete" })
         .click();
-      await expect(cascade(page)).not.toContainText(pattern);
+      await expect(rulesTable(page)).not.toContainText(pattern);
     }
-    await expect(cascade(page).getByRole("listitem")).toHaveCount(1);
+    await expect(ruleRows(page)).toHaveCount(1);
     expect(await rules(page.request)).toEqual([]);
   });
 });

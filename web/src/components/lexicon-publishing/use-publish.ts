@@ -53,7 +53,7 @@ export function usePublish(onChanged: () => Promise<void> | void) {
               ? failed.length === 1
                 ? `Couldn't publish ${failed[0].nsid}`
                 : `Couldn't publish ${failed.length} lexicons`
-              : `Published ${ok}; ${failed.length} failed`;
+              : `Published ${ok}, ${failed.length} failed`;
         setAnnouncement(sentence);
         if (failed.length === 0) {
           toast.success(sentence);
@@ -69,7 +69,7 @@ export function usePublish(onChanged: () => Promise<void> | void) {
         // Earlier batches have already published, so say how far it got.
         const ok = results.filter((r) => r.ok).length;
         setAnnouncement(
-          ok === 0 ? "Publishing failed" : `Published ${ok}, then publishing failed`,
+          ok === 0 ? "Publishing failed" : `Published ${ok} before an error`,
         );
         toastError("Failed to publish", e);
       } finally {

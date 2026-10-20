@@ -1,31 +1,31 @@
-export type PublishTargetKind = "instance" | "linked_repo"
+export type PublishTargetKind = "instance" | "linked_repo";
 
 /**
  * For a caller without `linked-repos:read`, a linked repo keeps `kind`,
  * `available` and `can_unpublish`, and its identity fields are `null`.
  */
 export interface PublishTarget {
-  kind: PublishTargetKind
-  linked_repo_id: string | null
-  did: string | null
-  handle: string | null
-  available: boolean
-  unavailable_reason: string | null
-  can_unpublish: boolean
+  kind: PublishTargetKind;
+  linked_repo_id: string | null;
+  did: string | null;
+  handle: string | null;
+  available: boolean;
+  unavailable_reason: string | null;
+  can_unpublish: boolean;
 }
 
 export interface PublishRule {
-  id: string
+  id: string;
   /** `*`, `com.example.*`, or an exact NSID, as stored after normalisation. */
-  pattern: string
-  target_kind: PublishTargetKind
+  pattern: string;
+  target_kind: PublishTargetKind;
   /** `null` once the linked repo it named has been removed, or when the caller can't see linked repos. */
-  linked_repo_id: string | null
-  auto_publish: boolean
-  created_by: string
-  created_at: string
-  updated_at: string
-  target: PublishTarget
+  linked_repo_id: string | null;
+  auto_publish: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  target: PublishTarget;
 }
 
 export type PublishStatus =
@@ -35,79 +35,75 @@ export type PublishStatus =
   | "withdrawn"
   | "moved"
   | "outdated"
-  | "current"
+  | "current";
 
 export interface Publication {
-  nsid: string
+  nsid: string;
   /** `null` when only failed attempts exist. */
-  did: string | null
-  uri: string | null
-  cid: string | null
-  published_at: string | null
-  last_error: string | null
-  last_attempt_at: string | null
+  did: string | null;
+  uri: string | null;
+  cid: string | null;
+  published_at: string | null;
+  last_error: string | null;
+  last_attempt_at: string | null;
   /** Set by an explicit unpublish; auto-publish skips the lexicon until it is published by hand. */
-  withdrawn_at: string | null
+  withdrawn_at: string | null;
 }
 
 export interface PublishableLexicon {
-  nsid: string
-  layer: "manual" | "project"
-  rule_id: string | null
-  rule_pattern: string | null
-  auto_publish: boolean
-  target: PublishTarget | null
-  status: PublishStatus
-  publication: Publication | null
+  nsid: string;
+  layer: "manual" | "project";
+  rule_id: string | null;
+  rule_pattern: string | null;
+  auto_publish: boolean;
+  target: PublishTarget | null;
+  status: PublishStatus;
+  publication: Publication | null;
 }
 
 export interface LexiconPublishingOverview {
-  /** Some account can take a publish or give up a record; the page stays closed otherwise. */
-  usable: boolean
-  targets: PublishTarget[]
+  /** Some account can be published to, or holds a record HappyView can remove. */
+  usable: boolean;
+  targets: PublishTarget[];
   /** Most specific first: the order in which they win a match. */
-  rules: PublishRule[]
-  lexicons: PublishableLexicon[]
+  rules: PublishRule[];
+  lexicons: PublishableLexicon[];
   /** Records still in a repo whose lexicon this instance no longer publishes. */
-  orphans: Publication[]
+  orphans: Publication[];
 }
 
 export interface LexiconDnsEntry {
-  authority: string
-  record_name: string
+  authority: string;
+  record_name: string;
   /** `null` when no `_lexicon` record exists. */
-  did: string | null
-  error: string | null
+  did: string | null;
+  error: string | null;
 }
 
 /** One lexicon's `_lexicon` record, looked up by HappyView itself. */
 export interface LexiconDnsCheck extends LexiconDnsEntry {
-  nsid: string
+  nsid: string;
   /** The DID the record should name; `null` until a default or a publication decides it. */
-  expected_did: string | null
-}
-
-export interface LexiconPublishingAvailability {
-  usable: boolean
+  expected_did: string | null;
 }
 
 export interface CreatePublishRuleBody {
-  pattern: string
-  target_kind: PublishTargetKind
-  linked_repo_id?: string
-  auto_publish?: boolean
+  pattern: string;
+  target_kind: PublishTargetKind;
+  linked_repo_id?: string;
+  auto_publish?: boolean;
 }
 
 export interface UpdatePublishRuleBody {
-  target_kind?: PublishTargetKind
-  linked_repo_id?: string | null
-  auto_publish?: boolean
+  target_kind?: PublishTargetKind;
+  linked_repo_id?: string | null;
+  auto_publish?: boolean;
 }
 
 export interface PublishOutcome {
-  nsid: string
-  ok: boolean
-  uri: string | null
-  cid: string | null
-  error: string | null
+  nsid: string;
+  ok: boolean;
+  uri: string | null;
+  cid: string | null;
+  error: string | null;
 }
