@@ -113,8 +113,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 urlencoding = "2.1.3"
 webpki-roots = "1.0"
 zstd = "0.13"
-wasmtime = { version = ">=49.0.3, <50", features = ["async"] }
-wasmtime-wasi = { version = ">=49.0.3, <50", default-features = false, features = ["p1"] }
+wasmtime = { version = ">=49.0.4, <50", features = ["async"] }
+wasmtime-wasi = { version = ">=49.0.4, <50", default-features = false, features = ["p1"] }
 regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"
