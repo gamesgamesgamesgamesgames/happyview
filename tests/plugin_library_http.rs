@@ -259,3 +259,52 @@ async fn allowed_hosts_export_is_empty_under_the_fixtures_own_unrestricted_manif
         .unwrap();
     assert_eq!(out, serde_json::json!([]));
 }
+
+/// A test file's budget counts only guest time, so a library call waiting on
+/// a server that never answers is bounded on its own in a test run.
+#[tokio::test]
+async fn a_test_run_stops_a_library_call_that_never_answers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fast"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hi"))
+        .mount(&server)
+        .await;
+
+    let mut state = state_with_http().await;
+    state.test = Some(std::sync::Arc::new(
+        happyview::testing::TestHarness::new("a.test.lua")
+            .with_library_call_limit(std::time::Duration::from_secs(5)),
+    ));
+    let executor = state.plugin_executor();
+    let get = |url: String| {
+        let executor = executor.clone();
+        async move {
+            executor
+                .call_library(
+                    "sdk_http",
+                    "get",
+                    &[serde_json::json!(url)],
+                    &LibraryCallContext::default(),
+                    0,
+                )
+                .await
+        }
+    };
+
+    let fast = get(format!("{}/fast", server.uri())).await.unwrap();
+    assert_eq!(fast["body"], "hi");
+
+    let started = std::time::Instant::now();
+    let slow = get(format!("{}/slow", server.uri())).await;
+    assert!(
+        matches!(slow, Err(happyview::plugin::ExecutionError::Timeout)),
+        "{slow:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
