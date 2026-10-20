@@ -16,7 +16,7 @@ const SCHEMA = "com.atproto.lexicon.schema";
 const SCOPES = `atproto repo:${SCHEMA}?action=create&action=update&action=delete`;
 
 const NOTE = "test.e2e.lexpub.note";
-// Covered by the same default but never published by hand, so a reconcile
+// Covered by the same rule but never published by hand, so a reconcile
 // that runs is visible next to the withdrawn lexicon it must leave alone.
 const DRAFT = "test.e2e.lexpub.draft";
 // Covered by nothing.
@@ -85,10 +85,28 @@ function lexiconRow(page: Page, nsid: string) {
   });
 }
 
-async function openPublishing(page: Page) {
-  await page.goto(PAGE);
-  await page.getByPlaceholder("Filter by NSID...").fill("test.e2e.lexpub");
+/** The Lexicons page, filtered to these lexicons, with its publishing columns shown. */
+async function openLexicons(page: Page) {
+  await page.goto("/dashboard/lexicons");
+  for (const column of ["Destination", "DNS"]) {
+    await page.getByRole("combobox", { name: "Toggle columns" }).click();
+    const option = page.getByRole("option", { name: column });
+    await option.click();
+    await page.keyboard.press("Escape");
+    await expect(option).toHaveCount(0);
+  }
+  await page.getByPlaceholder("Filter by ID...").fill("test.e2e.lexpub");
   await expect(lexiconRow(page, NOTE)).toBeVisible();
+}
+
+/** A lexicon's own page, opened at its Publishing panel. */
+async function openPanel(page: Page, nsid: string) {
+  await page.goto(`/dashboard/lexicons/${nsid}`);
+  const panel = page.locator(
+    'section[aria-labelledby="publishing-panel-title"]',
+  );
+  await expect(panel).toBeVisible();
+  return panel;
 }
 
 const VIEWPORTS = [
@@ -222,7 +240,7 @@ test.describe("Lexicon publishing — real linked repo", () => {
     expect(new URL(page.url()).searchParams.get("status")).toBe("success");
   });
 
-  test("a default sends the lexicon to the linked repo", async ({ page }) => {
+  test("a rule sends the lexicon to the linked repo", async ({ page }) => {
     await loginAsTestAdmin(page);
     const resp = await page.request.post("/admin/lexicon-publishing/rules", {
       data: {
@@ -239,20 +257,21 @@ test.describe("Lexicon publishing — real linked repo", () => {
     expect(rule.target.can_unpublish).toBe(true);
     expect(rule.target.did).toBe(account.did);
 
-    await openPublishing(page);
+    await openLexicons(page);
     await expect(lexiconRow(page, NOTE)).toContainText("Not published");
     await expect(lexiconRow(page, NOTE)).toContainText(`via ${PATTERN}`);
-    await expect(lexiconRow(page, ASIDE)).toContainText("No default");
+    await expect(lexiconRow(page, ASIDE)).toContainText("No rule");
   });
 
   test("Publish writes the schema record to the PDS", async ({ page }) => {
     await loginAsTestAdmin(page);
-    await openPublishing(page);
-    const row = lexiconRow(page, NOTE);
-    await row.getByRole("button", { name: "Publish", exact: true }).click();
-    await expect(row).toContainText("Published", { timeout: 30000 });
+    const panel = await openPanel(page, NOTE);
+    await panel.getByRole("button", { name: "Publish", exact: true }).click();
+    await expect(panel).toContainText("Published, but not resolvable", {
+      timeout: 30000,
+    });
     await expect(
-      row.getByRole("button", { name: `Unpublish ${NOTE}` }),
+      panel.getByRole("button", { name: "Unpublish", exact: true }),
     ).toBeVisible();
 
     const record = await getSchemaRecord(account.did, NOTE);
@@ -270,12 +289,15 @@ test.describe("Lexicon publishing — real linked repo", () => {
     expect(entry.publication.did).toBe(account.did);
     expect(entry.publication.cid).toBe(body.cid);
 
-    await capture(page, "publishing-page-published-and-pending");
+    await openLexicons(page);
+    await expect(lexiconRow(page, NOTE)).toContainText("Published");
+    await expect(lexiconRow(page, DRAFT)).toContainText("Not published");
+    await capture(page, "lexicons-published-and-pending");
   });
 
   test("the DNS column names the record to add", async ({ page }) => {
     await loginAsTestAdmin(page);
-    await openPublishing(page);
+    await openLexicons(page);
     const dns = lexiconRow(page, NOTE).getByRole("button", { name: "Not set" });
     await expect(dns).toBeVisible({ timeout: 20000 });
     await dns.click();
@@ -286,10 +308,8 @@ test.describe("Lexicon publishing — real linked repo", () => {
     await expect(popover).toContainText("TXT");
     await expect(popover).toContainText(`did=${account.did}`);
     await expect(popover).toContainText(
-      "this one covers all 2 lexicons under lexpub.e2e.test",
+      "This record covers all 2 lexicons under lexpub.e2e.test.",
     );
-    // The DNS column is hidden on narrow screens, where the lexicon's own
-    // Publishing panel carries the record instead.
     await capture(
       page,
       "publishing-dns-popover",
@@ -311,22 +331,22 @@ test.describe("Lexicon publishing — real linked repo", () => {
     });
     expect(edit.ok(), await edit.text()).toBeTruthy();
 
-    await openPublishing(page);
-    const row = lexiconRow(page, NOTE);
-    await expect(row).toContainText("Outdated");
-    await capture(page, "publishing-page-outdated");
+    await openLexicons(page);
+    await expect(lexiconRow(page, NOTE)).toContainText("Outdated");
+    await capture(page, "lexicons-outdated");
 
+    const panel = await openPanel(page, NOTE);
+    await expect(panel).toContainText("Outdated");
     if (SCREENS) {
-      await page.goto(`/dashboard/lexicons/${NOTE}`);
       await expect(page.locator(".monaco-editor .view-lines")).toContainText(
         NOTE,
       );
       await capture(page, "lexicon-detail-publishing-panel-outdated");
     }
-
-    await openPublishing(page);
-    await row.getByRole("button", { name: "Republish" }).click();
-    await expect(row).toContainText("Published", { timeout: 30000 });
+    await panel.getByRole("button", { name: "Republish" }).click();
+    await expect(panel).toContainText("Published, but not resolvable", {
+      timeout: 30000,
+    });
 
     const body = await (await getSchemaRecord(account.did, NOTE)).json();
     expect(body.value.description).toBe(description);
@@ -338,22 +358,22 @@ test.describe("Lexicon publishing — real linked repo", () => {
     page,
   }) => {
     await loginAsTestAdmin(page);
-    await openPublishing(page);
-    const row = lexiconRow(page, NOTE);
-    await row.getByRole("button", { name: `Unpublish ${NOTE}` }).click();
+    const panel = await openPanel(page, NOTE);
+    await panel.getByRole("button", { name: "Unpublish", exact: true }).click();
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toContainText(`Unpublish ${NOTE}?`);
     await expect(dialog).toContainText(account.did);
     await dialog.getByRole("button", { name: "Unpublish" }).click();
-    await expect(row).toContainText("Withdrawn", { timeout: 30000 });
+    await expect(panel).toContainText("Unpublished", { timeout: 30000 });
 
     const gone = await getSchemaRecord(account.did, NOTE);
     expect(gone.status).toBeGreaterThanOrEqual(400);
     expect(gone.status).toBeLessThan(500);
 
+    await page.goto(PAGE);
     const auto = page
-      .getByRole("list", { name: "Publishing defaults, most specific first" })
-      .getByRole("switch", { name: "Auto-publish" });
+      .getByRole("table", { name: "Publishing rules, most specific first" })
+      .getByRole("switch", { name: `Auto-publish lexicons under ${PATTERN}` });
     await auto.click();
     await expect(auto).toBeChecked();
 
@@ -372,10 +392,10 @@ test.describe("Lexicon publishing — real linked repo", () => {
     expect(entry.status).toBe("withdrawn");
     expect(entry.publication.withdrawn_at).toEqual(expect.any(String));
 
-    await openPublishing(page);
+    await openLexicons(page);
     await expect(lexiconRow(page, NOTE)).toContainText("Withdrawn");
     await expect(lexiconRow(page, DRAFT)).toContainText("Published");
-    await capture(page, "publishing-page-withdrawn-and-auto");
+    await capture(page, "lexicons-withdrawn-and-auto");
   });
 
   test("screens for design review", async ({ page }) => {
@@ -383,13 +403,13 @@ test.describe("Lexicon publishing — real linked repo", () => {
     await loginAsTestAdmin(page);
 
     await page.goto(PAGE);
-    await page.getByRole("button", { name: "Add default" }).click();
+    await page.getByRole("button", { name: "Add rule" }).click();
     const sheet = page.getByRole("dialog");
     await sheet.getByLabel("Pattern").fill("test.e2e.*");
     await expect(
       sheet.getByText("Covers every lexicon under test.e2e"),
     ).toBeVisible();
-    await capture(page, "add-default-dialog");
+    await capture(page, "add-rule-dialog");
     await sheet.getByRole("button", { name: "Cancel" }).click();
 
     await page.goto("/dashboard/lexicons");

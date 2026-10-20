@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 import {
   getOauthSessionTokenState,
   loginAsTestAdmin,
@@ -41,12 +41,6 @@ async function getSchemaRecord(did: string, nsid: string) {
   url.searchParams.set("collection", SCHEMA);
   url.searchParams.set("rkey", nsid);
   return fetch(url);
-}
-
-function lexiconRow(page: Page, nsid: string) {
-  return page.locator("table tbody tr", {
-    has: page.getByText(nsid, { exact: true }),
-  });
 }
 
 test.describe("Setup - Attach Account", () => {
@@ -245,12 +239,15 @@ test.describe("Setup - Attach Account", () => {
       expect(rule.target.can_unpublish).toBe(true);
       expect(rule.target.did).toBe(account.did);
 
-      await page.goto("/dashboard/settings/lexicon-publishing");
-      await page.getByPlaceholder("Filter by NSID...").fill(nsid);
-      const row = lexiconRow(page, nsid);
-      await expect(row).toContainText("Not published");
-      await row.getByRole("button", { name: "Publish", exact: true }).click();
-      await expect(row).toContainText("Published", { timeout: 30000 });
+      await page.goto(`/dashboard/lexicons/${nsid}`);
+      const panel = page.locator(
+        'section[aria-labelledby="publishing-panel-title"]',
+      );
+      await expect(panel).toContainText("Not published");
+      await panel.getByRole("button", { name: "Publish", exact: true }).click();
+      await expect(panel).toContainText("Published, but not resolvable", {
+        timeout: 30000,
+      });
 
       const record = await getSchemaRecord(account.did, nsid);
       expect(record.status, await record.clone().text()).toBe(200);
@@ -259,11 +256,13 @@ test.describe("Setup - Attach Account", () => {
       expect(body.value.$type).toBe(SCHEMA);
       expect(body.value.id).toBe(nsid);
 
-      await row.getByRole("button", { name: `Unpublish ${nsid}` }).click();
+      await panel
+        .getByRole("button", { name: "Unpublish", exact: true })
+        .click();
       const dialog = page.getByRole("alertdialog");
       await expect(dialog).toContainText(`Unpublish ${nsid}?`);
       await dialog.getByRole("button", { name: "Unpublish" }).click();
-      await expect(row).toContainText("Withdrawn", { timeout: 30000 });
+      await expect(panel).toContainText("Unpublished", { timeout: 30000 });
 
       const gone = await getSchemaRecord(account.did, nsid);
       expect(gone.status).toBeGreaterThanOrEqual(400);

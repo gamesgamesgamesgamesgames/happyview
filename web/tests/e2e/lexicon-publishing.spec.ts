@@ -295,7 +295,7 @@ test.describe("Lexicon publishing dashboard", () => {
 
     await expect(
       panel.getByRole("link", { name: "Set up publishing" }),
-    ).toHaveAttribute("href", PAGE);
+    ).toHaveAttribute("href", new RegExp(`^${PAGE}/?$`));
 
     await page.goto(PAGE);
     await expect(page).toHaveURL(new RegExp(`${PAGE}/?$`));
@@ -312,11 +312,11 @@ test.describe("Lexicon publishing dashboard", () => {
     );
     await expect(
       setup.getByRole("link", { name: "Open Service Identity" }),
-    ).toHaveAttribute("href", "/dashboard/settings/service-identity");
+    ).toHaveAttribute("href", /^\/dashboard\/settings\/service-identity\/?$/);
     await expect(setup).toContainText("Not authorized yet.");
     await expect(
       setup.getByRole("link", { name: "Link a repo" }),
-    ).toHaveAttribute("href", "/dashboard/settings/linked-repos");
+    ).toHaveAttribute("href", /^\/dashboard\/settings\/linked-repos\/?$/);
     await expect(page.getByRole("button", { name: "Add rule" })).toHaveCount(0);
 
     const instance = await createRule(page.request, {
@@ -697,7 +697,9 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(page.getByRole("button", { name: "Add rule" })).toHaveCount(0);
     await lexiconsPage(page, "test.e2e.pub");
     await expect(lexiconRow(page, ALPHA)).toContainText("Not published");
-    await expect(page.getByRole("button", { name: /publish/i })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: /^(re|un)?publish( |$)/i }),
+    ).toHaveCount(0);
   });
 
   test("a did:web instance leaves its rules unavailable, with the reason", async ({
