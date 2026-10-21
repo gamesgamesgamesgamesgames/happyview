@@ -949,11 +949,26 @@ jobs:
         with:
           node-version: 22
 
+      # Which channel a tag was released on lives in a git note, and
+      # actions/checkout does not fetch notes. semantic-release fetches them
+      # itself but cannot fail loudly doing it: it tries `--unshallow` first,
+      # which always errors on the complete clone `fetch-depth: 0` produces,
+      # and the fallback ignores its own failure. A notes fetch that quietly
+      # does nothing costs every tag its channel, so a prerelease branch sees
+      # no prerelease of its own and the version counter restarts from the
+      # newest tag on main. That is a silently wrong version, not a failure,
+      # so it is fetched here where a failure stops the release.
+      - name: Fetch release channel notes
+        run: git fetch --no-tags origin '+refs/notes/*:refs/notes/*'
+
+      # Pinned, not resolved per run: this step decides the next version
+      # number, and an unpinned `npx` is free to pick up a new major in the
+      # middle of a release line.
       - name: Release
         id: semantic
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-        run: npx -p semantic-release -p semantic-release-gha-output semantic-release
+        run: npx -p semantic-release@25.0.9 -p semantic-release-gha-output@1.1.6 semantic-release
 
   # Starts release.yml for the tag semantic-release just created. A job of its
   # own so a failed dispatch is a visible red job that can be re-run, rather
