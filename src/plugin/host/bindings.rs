@@ -1930,16 +1930,17 @@ impl SpecCollection for happyview_plugin_sdk::wire::TableQuery {
     }
 }
 
-/// Index writes route inside the shared store, not by pool.
+/// Index writes route inside the shared store, not by pool; their collection
+/// says whose storage a failure belongs to.
 impl SpecCollection for happyview_plugin_sdk::wire::IndexPut {
     fn collection(&self) -> Option<&str> {
-        None
+        Some(&self.collection)
     }
 }
 
 impl SpecCollection for happyview_plugin_sdk::wire::IndexDelete {
     fn collection(&self) -> Option<&str> {
-        None
+        crate::record_store::codec::parse_record_uri(&self.uri).map(|(_, collection, _)| collection)
     }
 }
 
@@ -1982,19 +1983,28 @@ where
     let backend = caller.data().db_backend;
     // A claimed collection is read on the external storage's route; every
     // other spec runs on the instance's own database, as it always has.
-    let route = caller.data().app_state.as_ref().and_then(|app| {
+    let external = caller.data().app_state.as_ref().and_then(|app| {
         let collection = spec.collection()?;
         app.records
             .external_route(collection)
-            .map(|ext| ext.read_route(collection))
+            .map(|ext| (ext.clone(), ext.read_route(collection)))
     });
-    let (db, backend) = match route {
-        Some(route) => (route.pool, route.backend),
+    let (db, backend) = match &external {
+        Some((_, route)) => (route.pool.clone(), route.backend),
         None => (db, backend),
     };
     let response = match run(db, backend, spec).await {
         Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
         Err(super::RecordsError::InvalidSpec(msg)) => error_envelope("INVALID_SPEC", msg),
+        // The claiming storage is down: a code of its own, so a script that
+        // passes it on answers 503 rather than failing.
+        Err(super::RecordsError::Database(e))
+            if external
+                .as_ref()
+                .is_some_and(|(ext, _)| ext.unavailable(&e)) =>
+        {
+            error_envelope(crate::error::STORAGE_UNAVAILABLE, e)
+        }
         Err(e) => error_envelope("DB_ERROR", e),
     };
     write_guest_response(caller, &response).await

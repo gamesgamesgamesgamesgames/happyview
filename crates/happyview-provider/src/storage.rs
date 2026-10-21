@@ -61,6 +61,31 @@ pub trait RecordStorage: Send + Sync + 'static {
         limit: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn is_live(&self, uri: &str) -> Result<bool, sqlx::Error>;
+    /// Whether `did` holds records in the claimed `collections` (all of
+    /// them when `None`) in this instance's view. HappyView asks on account
+    /// deletions and on live inactive statuses (deactivated, desynchronized,
+    /// throttled), for every such DID that holds no records locally: most
+    /// accounts on the network, so answer it cheaply. A yes makes a deletion
+    /// check the account's PDS before anything is purged, as it does for an
+    /// account held locally, and has an inactive status logged. An `Err` is
+    /// taken as yes. The default, `false`, skips both for accounts held only
+    /// here.
+    async fn holds_account(
+        &self,
+        _did: &str,
+        _collections: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(false)
+    }
+    /// How many records of `collection` this instance's view holds, when
+    /// the storage can say without a scan. HappyView calls it for every
+    /// claimed collection on each stats request, and for the
+    /// delete-collection job's total, so a storage serving claimed
+    /// collections through a view or other relation should answer it
+    /// cheaply. `None` (the default): HappyView counts on the read route.
+    async fn count(&self, _collection: &str) -> Result<Option<i64>, sqlx::Error> {
+        Ok(None)
+    }
     fn unavailable(&self, e: &sqlx::Error) -> bool {
         crate::db::is_unavailable(e)
     }

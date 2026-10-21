@@ -78,6 +78,16 @@ fn invalid_cursor_error(texts: &[&str]) -> Option<AppError> {
         })
 }
 
+/// The 503 a record import's `STORAGE_UNAVAILABLE` recovers: the storage
+/// claiming the collection is down, which a caller can retry, and the
+/// script that passed it on has not itself failed.
+fn storage_unavailable_error(texts: &[&str]) -> Option<AppError> {
+    texts
+        .iter()
+        .any(|text| text.contains(crate::error::STORAGE_UNAVAILABLE))
+        .then(crate::error::storage_unavailable)
+}
+
 /// A failure the script owns: its kind, its own text and its line reach the
 /// caller, which is what [`AppError::ScriptError`] exists to allow. A spent
 /// budget carries [`EXECUTION_LIMIT_MESSAGE`] instead, since the limit is the
@@ -122,6 +132,7 @@ fn returned_value(
         }) => {
             let error = auth_error(&[&message, &raw])
                 .or_else(|| invalid_cursor_error(&[&message, &raw]))
+                .or_else(|| storage_unavailable_error(&[&message, &raw]))
                 .unwrap_or_else(|| {
                     script_error(method, kind.into(), message, line, file_of(chunk))
                 });

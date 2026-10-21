@@ -970,8 +970,43 @@ impl RecordStore {
     }
 
     /// Whether `did` holds any network record (`indexed_at` set), optionally
-    /// only in `collections`. Reads without a lock or a write transaction.
+    /// only in `collections`: locally, or, with an external storage, in the
+    /// claimed collections among them (all of them when `None`). A storage
+    /// that cannot answer counts as holding, so a caller deciding whether to
+    /// check the account's PDS checks it. Reads without a lock or a write
+    /// transaction.
     pub async fn holds_network_records(
+        &self,
+        did: &str,
+        collections: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        if self.holds_local_network_records(did, collections).await? {
+            return Ok(true);
+        }
+        let Some(ext) = &self.external else {
+            return Ok(false);
+        };
+        let claimed: Option<Vec<String>> = collections.map(|collections| {
+            collections
+                .iter()
+                .filter(|c| ext.claims(c))
+                .cloned()
+                .collect()
+        });
+        if claimed.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(false);
+        }
+        Ok(ext
+            .holds_account(did, claimed.as_deref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(did, error = %e, "the record storage could not say whether it holds an account");
+                true
+            }))
+    }
+
+    /// [`Self::holds_network_records`] in this instance's own tables only.
+    pub async fn holds_local_network_records(
         &self,
         did: &str,
         collections: Option<&[String]>,
@@ -1039,7 +1074,7 @@ impl RecordStore {
             .collect())
     }
 
-    /// [`Self::holds_network_records`], counting only rows older than
+    /// [`Self::holds_local_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(
         &self,
@@ -1100,7 +1135,22 @@ impl RecordStore {
     }
 
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
-        Self::count_collection_on(&self.read_route(Some(collection)), collection).await
+        match self.external_route(collection) {
+            Some(ext) => Self::count_claimed(ext, collection).await,
+            None => Self::count_collection_on(&self.local_route(), collection).await,
+        }
+    }
+
+    /// A claimed collection's count: the storage's own when it gives one,
+    /// otherwise counted on its read route.
+    async fn count_claimed(
+        ext: &Arc<dyn RecordStorage>,
+        collection: &str,
+    ) -> Result<i64, sqlx::Error> {
+        match ext.count(collection).await? {
+            Some(n) => Ok(n),
+            None => Self::count_collection_on(&ext.read_route(collection), collection).await,
+        }
     }
 
     async fn count_collection_on(route: &ReadRoute, collection: &str) -> Result<i64, sqlx::Error> {
@@ -1260,7 +1310,7 @@ impl RecordStore {
         let claimed = ext.claimed();
         counts.retain(|(nsid, _)| !claimed.contains(nsid));
         for collection in claimed {
-            let n = Self::count_collection_on(&ext.read_route(&collection), &collection).await?;
+            let n = Self::count_claimed(ext, &collection).await?;
             if n > 0 {
                 counts.push((collection, n));
             }
@@ -2136,6 +2186,134 @@ mod tests {
             assert!(store.count_all().await.expect("count") >= 2);
             store.delete(&first.uri()).await.expect("clean up");
             store.delete(&second.uri()).await.expect("clean up");
+        }
+    }
+
+    /// A storage claiming one collection, read on `route`, that answers
+    /// `count` with `counted`.
+    struct CountingStorage {
+        collection: String,
+        route: ReadRoute,
+        counted: Option<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecordStorage for CountingStorage {
+        fn claims(&self, collection: &str) -> bool {
+            collection == self.collection
+        }
+
+        fn read_route(&self, _collection: &str) -> ReadRoute {
+            self.route.clone()
+        }
+
+        async fn apply_delta(
+            &self,
+            _key: &RecordKey,
+            _delta: Delta,
+            _for_rev: Option<&str>,
+        ) -> Result<(), sqlx::Error> {
+            Ok(())
+        }
+
+        async fn forget_account(
+            &self,
+            _did: &str,
+            _collections: Option<&[String]>,
+        ) -> Result<u64, sqlx::Error> {
+            Ok(0)
+        }
+
+        async fn delete_collection_batch(
+            &self,
+            _collection: &str,
+            _limit: i64,
+        ) -> Result<u64, sqlx::Error> {
+            Ok(0)
+        }
+
+        async fn is_live(&self, _uri: &str) -> Result<bool, sqlx::Error> {
+            Ok(false)
+        }
+
+        async fn count(&self, _collection: &str) -> Result<Option<i64>, sqlx::Error> {
+            Ok(self.counted)
+        }
+
+        fn claimed(&self) -> Vec<String> {
+            vec![self.collection.clone()]
+        }
+    }
+
+    /// A claimed collection's count is the storage's own when it gives one,
+    /// and the read route is not queried for it (here a closed pool, which
+    /// would fail); `None` counts on the route as before.
+    #[tokio::test]
+    async fn a_storage_count_replaces_the_scan() {
+        for (pool, backend) in test_pools().await {
+            let did = unique_did();
+            let collection = format!("app.test.counted{}", uuid::Uuid::new_v4().simple());
+            let records: Vec<PreparedRecord> = ["a", "b"]
+                .into_iter()
+                .map(|rkey| {
+                    let mut record = prepared(&did, rkey, r#"{"n":1}"#, "c", None);
+                    record.collection = collection.clone();
+                    record
+                })
+                .collect();
+            let held = RecordStore::new(pool.clone(), backend);
+            held.write_network(&pool, &records).await.expect("write");
+
+            let closed = crate::test_support::memory_pool().await;
+            closed.close().await;
+            for (route, counted, expected) in [
+                (
+                    ReadRoute {
+                        pool: closed,
+                        backend: DatabaseBackend::Sqlite,
+                    },
+                    Some(7),
+                    7,
+                ),
+                (
+                    ReadRoute {
+                        pool: pool.clone(),
+                        backend,
+                    },
+                    None,
+                    2,
+                ),
+            ] {
+                // An instance holding nothing locally, so its totals are the
+                // claimed collection's alone.
+                let store = RecordStore::new(
+                    crate::test_support::migrated_memory_pool().await,
+                    DatabaseBackend::Sqlite,
+                )
+                .with_external(Arc::new(CountingStorage {
+                    collection: collection.clone(),
+                    route,
+                    counted,
+                }));
+                assert_eq!(
+                    store.count_collection(&collection).await.expect("count"),
+                    expected,
+                    "{backend:?} {counted:?}"
+                );
+                assert_eq!(
+                    store.count_by_collection().await.expect("counts"),
+                    vec![(collection.clone(), expected)],
+                    "{backend:?} {counted:?}"
+                );
+                assert_eq!(
+                    store.count_all().await.expect("total"),
+                    expected,
+                    "{backend:?} {counted:?}"
+                );
+            }
+            for record in &records {
+                held.delete(&record.uri()).await.expect("clean up");
+            }
         }
     }
 

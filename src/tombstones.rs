@@ -402,7 +402,7 @@ async fn purge_local(
     before_rev: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let held = match before_rev {
-        None => store.holds_network_records(did, collections).await?,
+        None => store.holds_local_network_records(did, collections).await?,
         Some(before) => {
             store
                 .holds_network_records_before(did, collections, before)

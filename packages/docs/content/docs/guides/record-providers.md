@@ -82,18 +82,24 @@ HappyView keeps its own record tables for every collection a storage does not cl
 | `forget_account(did, collections)` | Account purges. It forgets this instance's deltas, not the records. |
 | `delete_collection_batch(collection, limit)` | One batch of the delete-collection job. |
 | `is_live(uri) -> bool` | Whether a record exists, for label cleanup. |
+| `holds_account(did, collections) -> bool` | Whether the account holds records in these claimed collections (all of them when `None`). HappyView asks on account deletions and on live inactive statuses (deactivated, desynchronized, throttled), for every such DID with no local records: most accounts on the network, so answer it cheaply. A yes makes a deletion ask the account's PDS whether it is still active before anything is purged, as it does for an account held locally, and has an inactive status logged. An error counts as yes. The default, `false`, skips both for accounts held only by the storage. |
+| `count(collection) -> Option<i64>` | How many records of the collection this instance's view holds. HappyView calls it for every claimed collection on each stats request, and for the delete-collection job's total, so answer it cheaply. `None`, the default, has HappyView run `COUNT(*)` on the read route. |
 | `unavailable(&sqlx::Error) -> bool` | Whether the error means the storage is down. The default uses the same test as the instance database. |
 
 ## Claimed collections
 
 For a collection a storage claims:
 
-- **Reads** go to the storage's `read_route`. The list, get and query endpoints and the plugin query DSL behave as they do for any collection.
+- **Reads** go to the storage's `read_route`. The list, get and query endpoints and the plugin query DSL behave as they do for any collection. HappyView's list and keyset queries page through `idx_records_v2_collection_indexed_at` and `idx_records_v2_collection_created_at_id`. Whatever relation the read route serves as `happyview_records_v2` must let the planner reach those indexes, or every page reads the whole collection.
 - **Writes** from HappyView go through the storage too. A local write is a `Pending` delta until the record comes back from the source.
 - **Deletes** from an event clear the delta unconditionally: a `Proceed` with `for_rev: None`, so no `Replace` or `Hide` outlives the record and covers a later re-create of the same key. The storage owns removing the record itself. An admin delete does not clear anything. It hides the record with a `Hide` delta, also with `for_rev: None`.
 - **Events** carry `stored: true` when the body is already in the storage. HappyView then runs the hook and writes only the hook's delta. HappyView refuses an event for a claimed collection that is not marked stored, with a `record.unstored_claimed` warning in the event log, so nothing is ever written to the local tables.
 - **Raw SQL** reads and writes the local tables as before for unclaimed collections. A claimed collection's records are queryable in the storage's own database. A `db.raw` write that names one of its records is refused with an error that says to use `records.indexPut`, so a hook cannot create a local row that reads never see. While a storage is configured, a raw write to `happyview_records` that names no collection or record URI is refused too, because HappyView cannot tell whether it touches a claimed record.
-- **Outages.** When the storage is down (`unavailable` says so), the default XRPC get and list of a claimed collection answer 503. An outage of the instance database stays a 500.
+- **Outages.** When the storage is down (`unavailable` says so), requests for a claimed collection answer 503 `ServiceUnavailable`, which a client can retry:
+  - every XRPC read, whether the default get and list or a script's record queries;
+  - a write that fails before anything else accepted it: a script's index write or index delete, and an admin delete.
+
+  A write the caller's PDS has already accepted still answers 200. HappyView cannot show it until the storage is back, and the storage's own ingest brings the record in. An outage of the instance database stays a 500.
 
 ## Composing with Jetstream
 

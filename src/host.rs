@@ -76,7 +76,7 @@ impl Host for AppHost {
     async fn holds_records(&self, did: &str, collections: &[String]) -> Result<bool, sqlx::Error> {
         self.state
             .records
-            .holds_network_records(did, Some(collections))
+            .holds_local_network_records(did, Some(collections))
             .await
     }
 
