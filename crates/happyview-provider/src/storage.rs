@@ -61,6 +61,19 @@ pub trait RecordStorage: Send + Sync + 'static {
         limit: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn is_live(&self, uri: &str) -> Result<bool, sqlx::Error>;
+    /// Whether `did` holds records in the claimed `collections` (all of
+    /// them when `None`) in this instance's view. HappyView asks before it
+    /// purges an account, and checks the account's PDS first when the
+    /// answer is yes, so an account held only here gets the same check as
+    /// one held locally. An `Err` is taken as yes. The default, `false`,
+    /// skips that check for accounts held only here.
+    async fn holds_account(
+        &self,
+        _did: &str,
+        _collections: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(false)
+    }
     fn unavailable(&self, e: &sqlx::Error) -> bool {
         crate::db::is_unavailable(e)
     }

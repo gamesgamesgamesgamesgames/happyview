@@ -82,6 +82,7 @@ HappyView keeps its own record tables for every collection a storage does not cl
 | `forget_account(did, collections)` | Account purges. It forgets this instance's deltas, not the records. |
 | `delete_collection_batch(collection, limit)` | One batch of the delete-collection job. |
 | `is_live(uri) -> bool` | Whether a record exists, for label cleanup. |
+| `holds_account(did, collections) -> bool` | Whether the account holds records in these claimed collections (all of them when `None`). Before purging a deleted account it holds records for, HappyView asks the account's PDS whether it is still active; this lets an account held only by the storage get that check. An error counts as yes. The default, `false`, skips the check for such accounts. |
 | `unavailable(&sqlx::Error) -> bool` | Whether the error means the storage is down. The default uses the same test as the instance database. |
 
 ## Claimed collections

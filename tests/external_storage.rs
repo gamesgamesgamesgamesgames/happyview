@@ -774,6 +774,67 @@ async fn an_admin_delete_of_a_claimed_record_answers_503_while_its_storage_is_do
     assert_storage_unavailable(status, &body);
 }
 
+/// An account deletion for a DID whose only records are in a claimed
+/// collection is checked against the account's PDS as a locally held one
+/// is: with the PDS saying the account is active, nothing is purged.
+#[tokio::test]
+async fn an_account_held_only_by_storage_gets_the_pds_check() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{DID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": DID,
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": mock.uri(),
+            }],
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.sync.getRepoStatus"))
+        .and(query_param("did", DID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"did": DID, "active": true})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let storage = Arc::new(FakeStorage::applying(&[CLAIMED]).await);
+    storage
+        .store(prepared(CLAIMED, "g1", json!({"text": "elsewhere"})))
+        .await;
+    let mut state = instance(Some(storage.clone())).await;
+    state.config.plc_url = mock.uri();
+
+    let outcome = happyview::ingest::apply(
+        &state,
+        SourceEvent::Account {
+            did: DID.to_string(),
+            active: false,
+            status: Some("deleted".to_string()),
+            as_of_us: None,
+            seq: Some(10),
+            time_us: None,
+            collections: None,
+        },
+    )
+    .await;
+    assert_eq!(outcome, IngestOutcome::Matched);
+    assert!(storage.forgotten.lock().unwrap().is_empty());
+    assert!(
+        state
+            .records
+            .get(&uri(CLAIMED, "g1"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// The `test_library` fixture, a library whose `sql_execute` runs raw SQL
 /// through `host_db_execute`.
 fn sql_library() -> LoadedPlugin {

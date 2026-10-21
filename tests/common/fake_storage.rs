@@ -274,6 +274,19 @@ impl RecordStorage for FakeStorage {
             .is_some())
     }
 
+    async fn holds_account(
+        &self,
+        did: &str,
+        collections: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        RecordStore::new(self.pool.clone(), DatabaseBackend::Sqlite)
+            .holds_local_network_records(did, collections)
+            .await
+    }
+
     fn claimed(&self) -> Vec<String> {
         let mut claimed: Vec<String> = self.claimed.iter().cloned().collect();
         claimed.sort();

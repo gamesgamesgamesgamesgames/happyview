@@ -970,8 +970,43 @@ impl RecordStore {
     }
 
     /// Whether `did` holds any network record (`indexed_at` set), optionally
-    /// only in `collections`. Reads without a lock or a write transaction.
+    /// only in `collections`: locally, or, with an external storage, in the
+    /// claimed collections among them (all of them when `None`). A storage
+    /// that cannot answer counts as holding, so a caller deciding whether to
+    /// check the account's PDS checks it. Reads without a lock or a write
+    /// transaction.
     pub async fn holds_network_records(
+        &self,
+        did: &str,
+        collections: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        if self.holds_local_network_records(did, collections).await? {
+            return Ok(true);
+        }
+        let Some(ext) = &self.external else {
+            return Ok(false);
+        };
+        let claimed: Option<Vec<String>> = collections.map(|collections| {
+            collections
+                .iter()
+                .filter(|c| ext.claims(c))
+                .cloned()
+                .collect()
+        });
+        if claimed.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(false);
+        }
+        Ok(ext
+            .holds_account(did, claimed.as_deref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(did, error = %e, "the record storage could not say whether it holds an account");
+                true
+            }))
+    }
+
+    /// [`Self::holds_network_records`] in this instance's own tables only.
+    pub async fn holds_local_network_records(
         &self,
         did: &str,
         collections: Option<&[String]>,
@@ -1039,7 +1074,7 @@ impl RecordStore {
             .collect())
     }
 
-    /// [`Self::holds_network_records`], counting only rows older than
+    /// [`Self::holds_local_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(
         &self,
