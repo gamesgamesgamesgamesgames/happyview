@@ -74,6 +74,15 @@ pub trait RecordStorage: Send + Sync + 'static {
     ) -> Result<bool, sqlx::Error> {
         Ok(false)
     }
+    /// How many records of `collection` this instance's view holds, when
+    /// the storage can say without a scan. HappyView calls it for every
+    /// claimed collection on each stats request, and for the
+    /// delete-collection job's total, so a storage serving claimed
+    /// collections through a view or other relation should answer it
+    /// cheaply. `None` (the default): HappyView counts on the read route.
+    async fn count(&self, _collection: &str) -> Result<Option<i64>, sqlx::Error> {
+        Ok(None)
+    }
     fn unavailable(&self, e: &sqlx::Error) -> bool {
         crate::db::is_unavailable(e)
     }

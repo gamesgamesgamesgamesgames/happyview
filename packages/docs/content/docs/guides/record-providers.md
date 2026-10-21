@@ -83,13 +83,14 @@ HappyView keeps its own record tables for every collection a storage does not cl
 | `delete_collection_batch(collection, limit)` | One batch of the delete-collection job. |
 | `is_live(uri) -> bool` | Whether a record exists, for label cleanup. |
 | `holds_account(did, collections) -> bool` | Whether the account holds records in these claimed collections (all of them when `None`). Before purging a deleted account it holds records for, HappyView asks the account's PDS whether it is still active; this lets an account held only by the storage get that check. An error counts as yes. The default, `false`, skips the check for such accounts. |
+| `count(collection) -> Option<i64>` | How many records of the collection this instance's view holds. HappyView calls it for every claimed collection on each stats request, and for the delete-collection job's total, so answer it cheaply. `None`, the default, has HappyView run `COUNT(*)` on the read route. |
 | `unavailable(&sqlx::Error) -> bool` | Whether the error means the storage is down. The default uses the same test as the instance database. |
 
 ## Claimed collections
 
 For a collection a storage claims:
 
-- **Reads** go to the storage's `read_route`. The list, get and query endpoints and the plugin query DSL behave as they do for any collection.
+- **Reads** go to the storage's `read_route`. The list, get and query endpoints and the plugin query DSL behave as they do for any collection. HappyView's list and keyset queries page through `idx_records_v2_collection_indexed_at` and `idx_records_v2_collection_created_at_id`. Whatever relation the read route serves as `happyview_records_v2` must let the planner reach those indexes, or every page reads the whole collection.
 - **Writes** from HappyView go through the storage too. A local write is a `Pending` delta until the record comes back from the source.
 - **Deletes** from an event clear the delta unconditionally: a `Proceed` with `for_rev: None`, so no `Replace` or `Hide` outlives the record and covers a later re-create of the same key. The storage owns removing the record itself. An admin delete does not clear anything. It hides the record with a `Hide` delta, also with `for_rev: None`.
 - **Events** carry `stored: true` when the body is already in the storage. HappyView then runs the hook and writes only the hook's delta. HappyView refuses an event for a claimed collection that is not marked stored, with a `record.unstored_claimed` warning in the event log, so nothing is ever written to the local tables.
