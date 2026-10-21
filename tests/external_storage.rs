@@ -815,6 +815,22 @@ async fn admin_stats_answer_503_while_claimed_storage_is_down() {
     assert_eq!(body["total_records"], 1);
 }
 
+/// A failure of the instance's own record tables is a 500 on the admin
+/// stats, as on a local read, even with an external storage configured
+/// and reachable.
+#[tokio::test]
+async fn admin_stats_answer_500_when_the_local_record_tables_fail() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let mut state = instance(Some(storage.clone())).await;
+    // Only the record store's pool is closed, so the admin is still found.
+    let closed = happyview::test_support::memory_pool().await;
+    closed.close().await;
+    state.records = RecordStore::new(closed, DatabaseBackend::Sqlite).with_external(storage);
+
+    let (status, body) = admin_get(&state, "/admin/stats").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
 /// The admin record listing of a claimed collection answers 503 while its
 /// storage is down; a local collection's listing still answers.
 #[tokio::test]

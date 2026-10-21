@@ -5,6 +5,7 @@ use axum::extract::State;
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::record_store::CountError;
 
 use super::auth::AllowPlatform;
 use super::permissions::Permission;
@@ -48,15 +49,15 @@ pub(super) async fn stats(
     }))
 }
 
-/// A failed count: 503 when the external storage is unreachable, as a read
-/// of a claimed collection answers, otherwise a 500. A count spans every
-/// collection, so the failure is classified by the external storage rather
-/// than by one collection's route.
-fn count_error(state: &AppState, what: &str, e: sqlx::Error) -> AppError {
-    let storage_down = state
-        .records
-        .external()
-        .is_some_and(|ext| ext.unavailable(&e));
+/// A failed count: 503 when it was a claimed collection's count and the
+/// storage that claims it is unreachable, as a read of it answers; a
+/// failure of this instance's own tables stays a 500.
+fn count_error(state: &AppState, what: &str, e: CountError) -> AppError {
+    let storage_down = e
+        .claimed
+        .as_deref()
+        .and_then(|collection| state.records.external_route(collection))
+        .is_some_and(|ext| ext.unavailable(&e.error));
     if storage_down {
         crate::error::storage_unavailable()
     } else {

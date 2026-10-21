@@ -261,6 +261,39 @@ fn ref_targets<'a>(bodies: impl Iterator<Item = &'a str>) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A failed count across collections: the error, and the claimed
+/// collection whose count failed, when it was one. `None` is this
+/// instance's own tables.
+#[derive(Debug)]
+pub struct CountError {
+    pub claimed: Option<String>,
+    pub error: sqlx::Error,
+}
+
+impl From<sqlx::Error> for CountError {
+    fn from(error: sqlx::Error) -> Self {
+        Self {
+            claimed: None,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for CountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.claimed {
+            Some(collection) => write!(f, "{collection}: {}", self.error),
+            None => self.error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CountError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 impl RecordStore {
     pub fn new(db: AnyPool, backend: DatabaseBackend) -> Self {
         Self::with_bodies(db, backend, compression::BodyCodec::disabled())
@@ -1278,7 +1311,7 @@ impl RecordStore {
             .collect())
     }
 
-    pub async fn count_all(&self) -> Result<i64, sqlx::Error> {
+    pub async fn count_all(&self) -> Result<i64, CountError> {
         if self.external.is_some() {
             return Ok(self
                 .count_by_collection()
@@ -1287,15 +1320,17 @@ impl RecordStore {
                 .map(|(_, n)| n)
                 .sum());
         }
-        crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records_v2")
-            .fetch_one(&self.db)
-            .await
+        Ok(
+            crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records_v2")
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     /// Records per collection, largest first. A claimed collection is
     /// counted in the external storage, in place of any local rows; like a
     /// local one, it is listed only when it holds records.
-    pub async fn count_by_collection(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    pub async fn count_by_collection(&self) -> Result<Vec<(String, i64)>, CountError> {
         let mut counts = crate::db::query_as::<(String, i64)>(
             "SELECT c.nsid, n.cnt FROM \
              (SELECT collection_id, COUNT(*) AS cnt FROM happyview_records_v2 GROUP BY collection_id) n \
@@ -1310,7 +1345,12 @@ impl RecordStore {
         let claimed = ext.claimed();
         counts.retain(|(nsid, _)| !claimed.contains(nsid));
         for collection in claimed {
-            let n = Self::count_claimed(ext, &collection).await?;
+            let n = Self::count_claimed(ext, &collection)
+                .await
+                .map_err(|error| CountError {
+                    claimed: Some(collection.clone()),
+                    error,
+                })?;
             if n > 0 {
                 counts.push((collection, n));
             }
