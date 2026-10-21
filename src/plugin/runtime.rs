@@ -270,6 +270,7 @@ impl WasmRuntime {
             wasm_bytes,
             &cache_key(&self.engine, &sha),
         )
+        .map(|compiled| compiled.module)
     }
 
     /// The compiled module for `plugin`, from this runtime's memory, from
@@ -380,8 +381,8 @@ fn resolve(
         modules.insert(id, plugin, &sha, module.clone());
         return Ok(module);
     }
-    let module = compile(engine, modules, &plugin.wasm_bytes, &key)?;
-    modules.write_to_disk(&key, &module);
+    let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
+    modules.write_to_disk(&key, &module, serialized.as_deref());
     modules.insert(id, plugin, &sha, module.clone());
     Ok(module)
 }
@@ -441,6 +442,13 @@ impl SharedModules {
     }
 }
 
+/// A module from [`compile`], with its serialized form when one is in hand,
+/// so the disk tier need not serialize it again.
+struct Compiled {
+    module: Module,
+    serialized: Option<Arc<[u8]>>,
+}
+
 /// The module for `wasm_bytes`, whose cache key is `key`: deserialized from
 /// the process's compiled modules, or compiled and added to them.
 fn compile(
@@ -448,7 +456,7 @@ fn compile(
     modules: &ModuleCache,
     wasm_bytes: &[u8],
     key: &str,
-) -> Result<Module, anyhow::Error> {
+) -> Result<Compiled, anyhow::Error> {
     let shared = (!modules.unshared).then_some(&*SHARED);
     let held = shared.and_then(|shared| shared.lock().unwrap_or_else(|e| e.into_inner()).get(key));
     if let Some(bytes) = held {
@@ -457,7 +465,12 @@ fn compile(
         // this engine's fingerprint. Wasmtime still verifies the
         // fingerprint embedded in them.
         match unsafe { Module::deserialize(engine, &bytes) } {
-            Ok(module) => return Ok(module),
+            Ok(module) => {
+                return Ok(Compiled {
+                    module,
+                    serialized: Some(bytes),
+                });
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "shared plugin module could not be loaded; recompiling")
             }
@@ -465,20 +478,32 @@ fn compile(
     }
     modules.compiles.fetch_add(1, Ordering::Relaxed);
     let module = Module::new(engine, wasm_bytes)?;
-    if let Some(shared) = shared {
-        match module.serialize() {
-            Ok(bytes) => {
-                shared
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .put(key.to_string(), bytes.into());
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "compiled plugin module could not be serialized for reuse")
-            }
+    let Some(shared) = shared else {
+        return Ok(Compiled {
+            module,
+            serialized: None,
+        });
+    };
+    match module.serialize() {
+        Ok(bytes) => {
+            let bytes: Arc<[u8]> = bytes.into();
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(key.to_string(), bytes.clone());
+            Ok(Compiled {
+                module,
+                serialized: Some(bytes),
+            })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "compiled plugin module could not be serialized for reuse");
+            Ok(Compiled {
+                module,
+                serialized: None,
+            })
         }
     }
-    Ok(module)
 }
 
 /// Create the cache directory for this process alone, or refuse one that
@@ -622,7 +647,9 @@ impl ModuleCache {
         }
     }
 
-    fn write_to_disk(&self, key: &str, module: &Module) {
+    /// Write `module` under `key`, from `serialized` when the caller already
+    /// holds its serialized form.
+    fn write_to_disk(&self, key: &str, module: &Module, serialized: Option<&[u8]>) {
         let Some((module_path, sidecar_path)) = self.paths(key) else {
             return;
         };
@@ -631,9 +658,13 @@ impl ModuleCache {
         };
         let result = (|| -> std::io::Result<()> {
             prepare_cache_dir(dir).map_err(std::io::Error::other)?;
-            let bytes = module
-                .serialize()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let bytes: std::borrow::Cow<[u8]> = match serialized {
+                Some(bytes) => bytes.into(),
+                None => module
+                    .serialize()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .into(),
+            };
             let sha = hex::encode(Sha256::digest(&bytes));
             // Written beside the final name and renamed into place, so a
             // reader never sees a half-written module.
