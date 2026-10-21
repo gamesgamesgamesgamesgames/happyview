@@ -276,25 +276,26 @@ pub(crate) async fn resume_backfill(
     admin.require("backfill:create")?;
 
     let sql = adapt_sql(
-        "SELECT status, source, scope FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT status, source, scope, collection FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
-    let row: Option<(String, String, String)> = happyview_provider::db::query_as(&sql)
-        .bind(&job_id)
-        .fetch_optional(&state.backfill_db)
-        .await
-        .map_err(|e| AdminError::Internal(format!("failed to query backfill job: {e}")))?;
+    let row: Option<(String, String, String, Option<String>)> =
+        happyview_provider::db::query_as(&sql)
+            .bind(&job_id)
+            .fetch_optional(&state.backfill_db)
+            .await
+            .map_err(|e| AdminError::Internal(format!("failed to query backfill job: {e}")))?;
 
     match row {
         None => Err(AdminError::NotFound("backfill job not found".into())),
-        Some((status, source, _))
+        Some((status, source, _, _))
             if status != "paused" && !(status == "failed" && source == "replay") =>
         {
             Err(AdminError::BadRequest(format!(
                 "job is not paused (status: {status})"
             )))
         }
-        Some((status, _, scope))
+        Some((status, _, scope, _))
             if status == "failed"
                 && scope == "dids"
                 && crate::backfill::replay_sweeps::job_dids(&state, &job_id)
@@ -306,7 +307,7 @@ pub(crate) async fn resume_backfill(
         {
             Err(AdminError::BadRequest(DIDS_GONE.into()))
         }
-        Some(_) => {
+        Some((_, _, _, collection)) => {
             // A failed job has a `completed_at`; a paused one has none.
             // Conditional, so of two resumes at once only one runs the job.
             let sql = adapt_sql(
@@ -328,11 +329,7 @@ pub(crate) async fn resume_backfill(
                 ));
             }
 
-            let spawn_state = state.clone();
-            let spawn_job_id = job_id.clone();
-            tokio::spawn(async move {
-                run_backfill_job(spawn_state, spawn_job_id).await;
-            });
+            spawn_job(&state, &job_id, collection);
 
             state
                 .host
@@ -1095,11 +1092,7 @@ pub async fn retry_failed_backfill(
             .await;
 
         // Spawned only now, so the driver finds the retries.
-        let spawn_state = state.clone();
-        let spawn_job_id = new_job_id.clone();
-        tokio::spawn(async move {
-            run_backfill_job(spawn_state, spawn_job_id).await;
-        });
+        spawn_job(&state, &new_job_id, collection);
 
         return Ok((
             StatusCode::CREATED,
@@ -1172,11 +1165,7 @@ pub async fn retry_failed_backfill(
         })
         .await;
 
-    let spawn_state = state.clone();
-    let spawn_job_id = new_job_id.clone();
-    tokio::spawn(async move {
-        run_backfill_job(spawn_state, spawn_job_id).await;
-    });
+    spawn_job(&state, &new_job_id, collection);
 
     Ok((
         StatusCode::CREATED,

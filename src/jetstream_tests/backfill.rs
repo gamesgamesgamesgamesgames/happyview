@@ -3954,3 +3954,49 @@ async fn a_resumed_job_runs_for_backfill_running_from_the_resume() {
     until_backfill_running(&state, POST, false).await;
     assert_eq!(job_row(&state, "resume-running").await.status, "completed");
 }
+
+/// A started job is running by the time `start_backfill` returns, before
+/// its task has run at all, and stops running once it completes.
+#[tokio::test]
+async fn a_started_job_runs_for_backfill_running_before_start_returns() {
+    let mock = MockServer::start().await;
+    let (state, _source) = running_source(&mock).await;
+
+    for _ in 0..20 {
+        mount_slow_relay_page(&mock, POST, "did:plc:slowstart", Duration::from_millis(200)).await;
+        mount_plc(&mock).await;
+        mount_records(&mock, "did:plc:slowstart", POST, 1).await;
+        assert!(!state.source.backfill_running(POST).await);
+        let job_id = state
+            .source
+            .start_backfill(happyview_provider::BackfillRequest {
+                collection: Some(POST.to_string()),
+                dids: Vec::new(),
+                source: Some("crawl".to_string()),
+                actor: "did:plc:testadmin".to_string(),
+                kind: happyview_provider::BackfillKind::Manual,
+            })
+            .await
+            .expect("start a backfill")
+            .expect("a job id");
+        assert!(state.source.backfill_running(POST).await);
+        until_backfill_running(&state, POST, false).await;
+        assert_eq!(job_row(&state, &job_id).await.status, "completed");
+        mock.verify().await;
+        mock.reset().await;
+    }
+
+    // A start that is refused leaves nothing running.
+    let refused = state
+        .source
+        .start_backfill(happyview_provider::BackfillRequest {
+            collection: Some(POST.to_string()),
+            dids: Vec::new(),
+            source: Some("nowhere".to_string()),
+            actor: "did:plc:testadmin".to_string(),
+            kind: happyview_provider::BackfillKind::Manual,
+        })
+        .await;
+    assert!(refused.is_err());
+    assert!(!state.source.backfill_running(POST).await);
+}

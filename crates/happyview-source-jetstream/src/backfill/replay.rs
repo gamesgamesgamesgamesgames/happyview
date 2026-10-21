@@ -1027,9 +1027,7 @@ pub(crate) async fn start_gap_replay(
             }),
         })
         .await;
-    let spawn_jobs = jobs.clone();
-    let spawn_id = job_id.clone();
-    tokio::spawn(async move { job_system::run_backfill_job(spawn_jobs, spawn_id).await });
+    job_system::spawn_job(jobs, &job_id, None);
     Ok((job_id, tip))
 }
 

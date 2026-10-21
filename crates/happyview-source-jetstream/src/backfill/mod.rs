@@ -109,7 +109,8 @@ impl JobState {
 
 /// The backfill jobs whose run is in progress in this process, with the
 /// collection each covers (`None`: every collection). A job is in it from
-/// the moment its run loads it until the run returns, which covers the
+/// the moment [`spawn_job`] spawns its run (or the run loads it, for a run
+/// started any other way) until the run returns, which covers the
 /// `running`, `pausing` and `cancelling` statuses: a pausing or cancelling
 /// job still writes the pages it has in flight.
 #[derive(Clone, Default)]
@@ -550,6 +551,20 @@ pub(crate) async fn complete_job(
 // ---------------------------------------------------------------------------
 // Background backfill worker
 // ---------------------------------------------------------------------------
+
+/// Spawn `job_id`'s run, which covers `collection`, noted as running from
+/// now rather than from when its task first runs: whoever started the job
+/// sees it running as soon as the start returns. The run notes itself as
+/// well, and the two guards nest.
+pub(crate) fn spawn_job(state: &JobState, job_id: &str, collection: Option<String>) {
+    let running = state.running.enter(job_id, collection);
+    let spawn_state = state.clone();
+    let spawn_job_id = job_id.to_string();
+    tokio::spawn(async move {
+        run_backfill_job(spawn_state, spawn_job_id).await;
+        drop(running);
+    });
+}
 
 pub(crate) async fn run_backfill_job(state: JobState, job_id: String) {
     let window = parse_discovery_window(
@@ -1065,11 +1080,7 @@ pub(crate) async fn start_backfill_with(
         })
         .await;
 
-    let spawn_state = state.clone();
-    let spawn_job_id = job_id.clone();
-    tokio::spawn(async move {
-        run_backfill_job(spawn_state, spawn_job_id).await;
-    });
+    spawn_job(state, &job_id, collection.clone());
 
     // A network backfill of every collection leaves the collections with an
     // executor out (see `run_backfill_job_with`); each gets its executor's
@@ -1155,11 +1166,7 @@ pub(crate) async fn start_executor_job(
         })
         .await;
 
-    let spawn_state = state.clone();
-    let spawn_job_id = job_id.clone();
-    tokio::spawn(async move {
-        run_backfill_job(spawn_state, spawn_job_id).await;
-    });
+    spawn_job(state, &job_id, Some(collection.to_string()));
     Ok(job_id)
 }
 
@@ -1433,13 +1440,7 @@ pub async fn resume_backfill_jobs(state: &JobState) {
             }
             _ => {
                 tracing::info!(job_id, "resuming interrupted backfill job");
-                // Running from now, not from when the task first runs.
-                let running = state.running.enter(&job_id, collection);
-                let spawn_state = state.clone();
-                tokio::spawn(async move {
-                    run_backfill_job(spawn_state, job_id).await;
-                    drop(running);
-                });
+                spawn_job(state, &job_id, collection);
             }
         }
     }
