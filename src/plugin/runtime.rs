@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -387,18 +386,60 @@ fn resolve(
     Ok(module)
 }
 
-/// How many compiled modules the process keeps for its runtimes. Installed
-/// plugins and project modules number a handful; the bound is for a long
-/// run that keeps rebuilding a project's modules, each build new bytes.
-const SHARED_MODULES: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+/// The total size of the compiled modules the process keeps for its
+/// runtimes. A serialized interpreter runs to several megabytes, and
+/// installed plugins and project modules number a handful; the bound is for
+/// a long run that keeps rebuilding a project's modules, each build new
+/// bytes.
+const SHARED_MODULE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Modules compiled in this process, serialized, by [`cache_key`]. A
 /// `Module` belongs to the engine that compiled it, and each runtime has an
 /// engine of its own because each keeps its own epoch clock, so another
 /// runtime takes a module from here by deserializing it, a small fraction of
 /// what compiling it again would cost.
-static SHARED: LazyLock<Mutex<LruCache<String, Arc<[u8]>>>> =
-    LazyLock::new(|| Mutex::new(LruCache::new(SHARED_MODULES)));
+static SHARED: LazyLock<Mutex<SharedModules>> =
+    LazyLock::new(|| Mutex::new(SharedModules::new(SHARED_MODULE_BYTES)));
+
+/// Serialized modules by key, at most `limit` bytes of them, the least
+/// recently used evicted first.
+struct SharedModules {
+    entries: LruCache<String, Arc<[u8]>>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl SharedModules {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<[u8]>> {
+        self.entries.get(key).cloned()
+    }
+
+    /// Keep `module` under `key`, evicting until the total fits. A module
+    /// larger than the whole limit is not kept.
+    fn put(&mut self, key: String, module: Arc<[u8]>) {
+        if module.len() > self.limit {
+            return;
+        }
+        self.bytes += module.len();
+        if let Some(replaced) = self.entries.put(key, module) {
+            self.bytes -= replaced.len();
+        }
+        while self.bytes > self.limit {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= evicted.len();
+        }
+    }
+}
 
 /// The module for `wasm_bytes`, whose cache key is `key`: deserialized from
 /// the process's compiled modules, or compiled and added to them.
@@ -409,13 +450,7 @@ fn compile(
     key: &str,
 ) -> Result<Module, anyhow::Error> {
     let shared = (!modules.unshared).then_some(&*SHARED);
-    let held = shared.and_then(|shared| {
-        shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned()
-    });
+    let held = shared.and_then(|shared| shared.lock().unwrap_or_else(|e| e.into_inner()).get(key));
     if let Some(bytes) = held {
         // SAFETY: the bytes are `Module::serialize`'s output from this
         // process, held in memory nothing else writes, under a key carrying
@@ -1128,6 +1163,30 @@ mod tests {
         wasm.extend_from_slice(NAME);
         wasm.extend_from_slice(id.as_bytes());
         wasm
+    }
+
+    /// The process's modules are bounded by their total size: the least
+    /// recently used go first, and one larger than the whole bound is not
+    /// kept at all.
+    #[test]
+    fn shared_modules_evict_the_least_recently_used_past_their_byte_bound() {
+        let bytes = |n: usize| -> Arc<[u8]> { vec![0u8; n].into() };
+        let mut shared = SharedModules::new(100);
+        shared.put("a".into(), bytes(40));
+        shared.put("b".into(), bytes(40));
+        assert!(shared.get("a").is_some());
+        shared.put("c".into(), bytes(40));
+        assert!(shared.get("b").is_none(), "b was the least recently used");
+        assert!(shared.get("a").is_some());
+        assert!(shared.get("c").is_some());
+        assert_eq!(shared.bytes, 80);
+
+        shared.put("a".into(), bytes(10));
+        assert_eq!(shared.bytes, 50, "a replaced entry gives its bytes back");
+
+        shared.put("huge".into(), bytes(101));
+        assert!(shared.get("huge").is_none());
+        assert_eq!(shared.bytes, 50);
     }
 
     /// The same bytes compile once per process: again on the same runtime,
