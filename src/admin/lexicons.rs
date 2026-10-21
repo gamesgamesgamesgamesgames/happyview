@@ -59,6 +59,8 @@ pub(super) async fn upload_lexicon(
             },
         )
         .await?;
+    crate::lexicon_publishing::spawn_reconcile(&state);
+
     let is_record = state
         .lexicons
         .get(&id)

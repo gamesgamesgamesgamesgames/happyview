@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 49 permissions organized by category:
+HappyView defines 51 permissions organized by category:
 
 ### Lexicons
 
@@ -15,6 +15,7 @@ HappyView defines 49 permissions organized by category:
 | `lexicons:create` | Upload and register new lexicon schemas |
 | `lexicons:read`   | View registered lexicon schemas      |
 | `lexicons:delete` | Remove lexicon schemas               |
+| `lexicons:publish` | Publish lexicons to the network and manage publishing rules |
 
 ### Records
 
@@ -138,6 +139,7 @@ Revoking an invite uses `linked-repos:create` rather than `linked-repos:delete`,
 | ------------ | ---------------------------------------- |
 | `stats:read` | View collection statistics and record counts |
 | `events:read` | View the event log                      |
+| `events:purge` | Bulk-delete event log entries matching a filter |
 
 ## Permission templates
 
@@ -157,13 +159,13 @@ Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`, `dead-letters:man
 
 ### Manager
 
-Everything in Operator, plus the ability to manage lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces.
+Everything in Operator, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces.
 
-Adds: `lexicons:create`, `lexicons:delete`, `scripts:manage`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
+Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
 
 ### Full Access
 
-All 49 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 51 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 

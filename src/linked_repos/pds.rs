@@ -129,14 +129,19 @@ pub async fn session_for(state: &AppState, grant: &LinkedRepo) -> Result<LinkedS
 }
 
 async fn post_json(session: &LinkedSession, nsid: &str, body: &Value) -> Result<Value, AppError> {
-    let session = match session {
-        LinkedSession::OAuth(session) => session,
-        LinkedSession::Test { pds, did } => {
-            return pds
-                .post(did, nsid, body)
-                .map_err(|e| AppError::Internal(format!("{nsid} failed: {e}")));
-        }
-    };
+    match session {
+        LinkedSession::OAuth(session) => post_json_oauth(session, nsid, body).await,
+        LinkedSession::Test { pds, did } => pds
+            .post(did, nsid, body)
+            .map_err(|e| AppError::Internal(format!("{nsid} failed: {e}"))),
+    }
+}
+
+pub(crate) async fn post_json_oauth(
+    session: &HappyViewOAuthSession,
+    nsid: &str,
+    body: &Value,
+) -> Result<Value, AppError> {
     let request = XrpcRequest {
         method: Method::POST,
         nsid: nsid.to_string(),
@@ -214,7 +219,7 @@ pub async fn unindex_write(state: &AppState, uri: &str) -> Result<bool, sqlx::Er
     state.records.delete(uri).await
 }
 
-fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
+pub(crate) fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
     let uri = value
         .get("uri")
         .and_then(|v| v.as_str())

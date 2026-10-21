@@ -112,7 +112,9 @@ test.describe("Lexicon Services", () => {
       hasText: QUERY_LEXICON.id,
     });
     await expect(queryRow).toBeVisible({ timeout: 5000 });
-    await queryRow.click();
+    // The row's centre is the Published badge, which opens its own popover
+    // rather than following the row link.
+    await queryRow.getByText(QUERY_LEXICON.id, { exact: true }).click();
 
     // Query lexicons have a Services button
     const servicesButton = page.getByRole("button", { name: /services/i });

@@ -31,6 +31,7 @@ mod jetstream_tests;
 pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
+pub mod lexicon_publishing;
 pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;

@@ -2,6 +2,15 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
+import type {
+  CreatePublishRuleBody,
+  LexiconDnsCheck,
+  LexiconDnsEntry,
+  LexiconPublishingOverview,
+  PublishOutcome,
+  PublishRule,
+  UpdatePublishRuleBody,
+} from "@/types/lexicon-publishing";
 import type { ResolvedIdentity } from "@/types/identity";
 import type {
   BackfillJob,
@@ -232,6 +241,55 @@ export function uploadLexicon(body: {
 export function deleteLexicon(id: string) {
   return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+// Lexicon publishing
+export function getLexiconPublishing() {
+  return apiFetch<LexiconPublishingOverview>("/admin/lexicon-publishing");
+}
+
+export function getLexiconPublishingDns() {
+  return apiFetch<LexiconDnsEntry[]>("/admin/lexicon-publishing/dns");
+}
+
+export function checkLexiconDns(nsid: string) {
+  return apiFetch<LexiconDnsCheck>(
+    `/admin/lexicon-publishing/dns/${encodeURIComponent(nsid)}`,
+  );
+}
+
+export function createPublishRule(body: CreatePublishRuleBody) {
+  return apiFetch<PublishRule>("/admin/lexicon-publishing/rules", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updatePublishRule(id: string, body: UpdatePublishRuleBody) {
+  return apiFetch<PublishRule>(
+    `/admin/lexicon-publishing/rules/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+export function deletePublishRule(id: string) {
+  return apiFetch(`/admin/lexicon-publishing/rules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function publishLexicons(nsids: string[]) {
+  return apiFetch<{ results: PublishOutcome[] }>(
+    "/admin/lexicon-publishing/publish",
+    { method: "POST", body: JSON.stringify({ nsids }) },
+  );
+}
+
+export function unpublishLexicon(nsid: string) {
+  return apiFetch("/admin/lexicon-publishing/unpublish", {
+    method: "POST",
+    body: JSON.stringify({ nsid }),
   });
 }
 

@@ -220,6 +220,8 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
         });
     }
 
+    crate::lexicon_publishing::spawn_reconcile(&state);
+
     let dev_mode = dev.is_some();
     let _watch = match dev {
         Some(session) => {
@@ -731,10 +733,7 @@ async fn boot(
 
     let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
 
-    let oauth_scopes = vec![
-        Scope::Known(KnownScope::Atproto),
-        Scope::Unknown("identity:*".to_string()),
-    ];
+    let oauth_scopes = crate::oauth::rotation::instance_scopes();
 
     let linked_repos_scopes = oauth_scopes.clone();
     let oauth_scopes_for_by_kid = oauth_scopes.clone();
