@@ -42,6 +42,23 @@ pub fn create_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Ve
     }
 }
 
+const SQLITE_RECORD_EXPR: &str = "hv_record(v.body, v.body_dict)";
+
+/// The two read-only compatibility views, records first. A record provider
+/// creates these on its raw read route (see `RecordStorage::raw_route`) with
+/// a search path that resolves `happyview_records_v2` and friends to the
+/// rows a tenant may see.
+pub fn view_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<String> {
+    let record_expr = match backend {
+        DatabaseBackend::Sqlite => SQLITE_RECORD_EXPR,
+        DatabaseBackend::Postgres => "v.record",
+    };
+    vec![
+        records_view(names.records, record_expr),
+        refs_view(names.refs),
+    ]
+}
+
 pub fn drop_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<String> {
     let CompatNames {
         records: r,
@@ -180,9 +197,8 @@ fn sqlite_statements(names: CompatNames<'_>) -> Vec<String> {
     } = names;
     let old_id = record_id("OLD.did", "OLD.collection", "OLD.rkey");
     let derived = "('at://' || NEW.did || '/' || NEW.collection || '/' || NEW.rkey)";
-    vec![
-        records_view(r, "hv_record(v.body, v.body_dict)"),
-        refs_view(f),
+    let mut statements = view_statements(DatabaseBackend::Sqlite, names);
+    statements.extend([
         format!(
             "CREATE TRIGGER {r}_insert INSTEAD OF INSERT ON {r} BEGIN \
              SELECT RAISE(ABORT, '{URI_MISMATCH}') WHERE NEW.uri IS NOT NULL AND NEW.uri IS NOT {derived}; \
@@ -234,7 +250,8 @@ fn sqlite_statements(names: CompatNames<'_>) -> Vec<String> {
             "CREATE TRIGGER {f}_delete INSTEAD OF DELETE ON {f} BEGIN {} END",
             sqlite_ref_delete("OLD")
         ),
-    ]
+    ]);
+    statements
 }
 
 fn postgres_statements(names: CompatNames<'_>) -> Vec<String> {
@@ -242,9 +259,8 @@ fn postgres_statements(names: CompatNames<'_>) -> Vec<String> {
         records: r,
         refs: f,
     } = names;
-    vec![
-        records_view(r, "v.record"),
-        refs_view(f),
+    let mut statements = view_statements(DatabaseBackend::Postgres, names);
+    statements.extend([
         format!(
             r#"CREATE OR REPLACE FUNCTION {r}_write() RETURNS trigger LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -347,13 +363,38 @@ END $fn$"#
         format!(
             "CREATE TRIGGER {f}_write INSTEAD OF INSERT OR UPDATE OR DELETE ON {f} FOR EACH ROW EXECUTE FUNCTION {f}_write()"
         ),
-    ]
+    ]);
+    statements
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::pre_upgrade_pools;
+
+    #[test]
+    fn view_statements_are_the_two_read_views() {
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            let s = view_statements(backend, LIVE);
+            assert_eq!(s.len(), 2, "{backend:?}");
+            assert!(
+                s[0].starts_with("CREATE VIEW happyview_records AS"),
+                "{}",
+                s[0]
+            );
+            assert!(
+                s[1].starts_with("CREATE VIEW happyview_record_refs AS"),
+                "{}",
+                s[1]
+            );
+            let all = create_statements(backend, LIVE);
+            assert_eq!(
+                &all[..2],
+                &s[..],
+                "create_statements must start with the read views"
+            );
+        }
+    }
 
     struct Staged {
         records: String,
