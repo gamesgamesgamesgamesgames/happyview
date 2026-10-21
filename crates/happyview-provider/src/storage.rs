@@ -62,11 +62,14 @@ pub trait RecordStorage: Send + Sync + 'static {
     ) -> Result<u64, sqlx::Error>;
     async fn is_live(&self, uri: &str) -> Result<bool, sqlx::Error>;
     /// Whether `did` holds records in the claimed `collections` (all of
-    /// them when `None`) in this instance's view. HappyView asks before it
-    /// purges an account, and checks the account's PDS first when the
-    /// answer is yes, so an account held only here gets the same check as
-    /// one held locally. An `Err` is taken as yes. The default, `false`,
-    /// skips that check for accounts held only here.
+    /// them when `None`) in this instance's view. HappyView asks on account
+    /// deletions and on live inactive statuses (deactivated, desynchronized,
+    /// throttled), for every such DID that holds no records locally: most
+    /// accounts on the network, so answer it cheaply. A yes makes a deletion
+    /// check the account's PDS before anything is purged, as it does for an
+    /// account held locally, and has an inactive status logged. An `Err` is
+    /// taken as yes. The default, `false`, skips both for accounts held only
+    /// here.
     async fn holds_account(
         &self,
         _did: &str,
