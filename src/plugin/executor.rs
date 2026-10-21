@@ -1243,6 +1243,7 @@ impl PluginExecutor {
         let module = self
             .runtime
             .module_for(plugin)
+            .await
             .map_err(ExecutionError::Instantiation)?;
 
         let linker = self.build_linker(&module)?;
@@ -2761,7 +2762,7 @@ mod cache {
             .unwrap(),
             manifest: Some(manifest),
         };
-        let runtime = Arc::new(WasmRuntime::new().unwrap());
+        let runtime = Arc::new(WasmRuntime::new().unwrap().without_shared_modules());
         let registry = Arc::new(PluginRegistry::new().with_runtime(runtime.clone()));
         registry.register(plugin).await;
         let executor = PluginExecutor::new(
@@ -3096,11 +3097,11 @@ mod baseline {
             ("sdk_http", executor.registry.get("sdk_http").await.unwrap()),
         ] {
             let writer = WasmRuntime::with_cache_dir(Some(dir.clone())).unwrap();
-            writer.module_for(&plugin).unwrap();
+            writer.module_for(&plugin).await.unwrap();
             for i in 0..3 {
                 let reader = WasmRuntime::with_cache_dir(Some(dir.clone())).unwrap();
                 let started = Instant::now();
-                reader.module_for(&plugin).unwrap();
+                reader.module_for(&plugin).await.unwrap();
                 println!(
                     "{label} disk load run {i}: {:.1} ms (compiles {})",
                     started.elapsed().as_secs_f64() * 1000.0,

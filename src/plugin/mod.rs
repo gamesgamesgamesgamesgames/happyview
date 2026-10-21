@@ -742,7 +742,11 @@ mod tests {
     /// compiled for it; the next instantiation compiles the new bytes.
     #[tokio::test]
     async fn re_registration_evicts_the_compiled_module() {
-        let runtime = Arc::new(WasmRuntime::without_ticker().unwrap());
+        let runtime = Arc::new(
+            WasmRuntime::without_ticker()
+                .unwrap()
+                .without_shared_modules(),
+        );
         let registry = PluginRegistry::new().with_runtime(runtime.clone());
         let plugin = |value: i32| {
             let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -777,6 +781,7 @@ mod tests {
             answer(
                 &runtime
                     .module_for(&registry.get("p").await.unwrap())
+                    .await
                     .unwrap()
             ),
             1
@@ -788,6 +793,7 @@ mod tests {
             answer(
                 &runtime
                     .module_for(&registry.get("p").await.unwrap())
+                    .await
                     .unwrap()
             ),
             2
@@ -798,6 +804,7 @@ mod tests {
         registry.register(plugin(2)).await;
         runtime
             .module_for(&registry.get("p").await.unwrap())
+            .await
             .unwrap();
         assert_eq!(runtime.compile_count(), 3);
     }

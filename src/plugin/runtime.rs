@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use sha2::{Digest, Sha256};
 use wasmtime::*;
 
@@ -167,7 +169,7 @@ pub struct WasmRuntime {
     /// accounting in [`GuestDeadline`] needs both.
     epoch: Arc<AtomicU64>,
     ticker_stop: Arc<AtomicBool>,
-    modules: ModuleCache,
+    modules: Arc<ModuleCache>,
 }
 
 impl WasmRuntime {
@@ -180,10 +182,11 @@ impl WasmRuntime {
     /// process.
     pub fn with_cache_dir(dir: Option<PathBuf>) -> Result<Self, anyhow::Error> {
         let mut runtime = Self::without_ticker()?;
-        runtime.modules.dir = dir.and_then(|dir| match prepare_cache_dir(&dir) {
+        let modules = Arc::get_mut(&mut runtime.modules).expect("a new runtime's cache is its own");
+        modules.dir = dir.and_then(|dir| match prepare_cache_dir(&dir) {
             Ok(()) => Some(dir),
             Err(reason) => {
-                runtime.modules.warned.store(true, Ordering::Relaxed);
+                modules.warned.store(true, Ordering::Relaxed);
                 tracing::warn!(
                     dir = %dir.display(),
                     "{reason}; compiled plugin modules are cached in memory only"
@@ -228,8 +231,19 @@ impl WasmRuntime {
             engine,
             epoch: Arc::new(AtomicU64::new(0)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
-            modules: ModuleCache::default(),
+            modules: Arc::default(),
         })
+    }
+
+    /// This runtime, compiling every module it does not hold itself rather
+    /// than taking it from the process's compiled modules: for a test that
+    /// counts its compiles while other tests compile the same bytes.
+    #[cfg(test)]
+    pub(crate) fn without_shared_modules(mut self) -> Self {
+        Arc::get_mut(&mut self.modules)
+            .expect("a new runtime's cache is its own")
+            .unshared = true;
+        self
     }
 
     pub fn engine(&self) -> &Engine {
@@ -246,33 +260,41 @@ impl WasmRuntime {
         tick(&self.engine, &self.epoch);
     }
 
-    /// Compile a WASM module
+    /// Compile a WASM module, or take it from the modules this process
+    /// has already compiled. It blocks for as long as a compile takes, so
+    /// an async caller goes through [`WasmRuntime::module_for`].
     pub fn compile(&self, wasm_bytes: &[u8]) -> Result<Module, anyhow::Error> {
-        self.modules.compiles.fetch_add(1, Ordering::Relaxed);
-        Ok(Module::new(&self.engine, wasm_bytes)?)
+        let sha = hex::encode(Sha256::digest(wasm_bytes));
+        compile(
+            &self.engine,
+            &self.modules,
+            wasm_bytes,
+            &cache_key(&self.engine, &sha),
+        )
     }
 
-    /// The compiled module for `plugin`, from memory, from disk, or by
-    /// compiling. The three tiers are checked in that order and a miss at
-    /// any tier fills the ones above it.
-    pub fn module_for(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
-        let id = plugin.info.id.as_str();
-        if let Some(module) = self.modules.get_by_identity(id, plugin) {
+    /// The compiled module for `plugin`, from this runtime's memory, from
+    /// disk, from the process's compiled modules, or by compiling. The
+    /// tiers are checked in that order and a miss at any tier fills the
+    /// ones above it. Everything past this runtime's memory runs on a
+    /// blocking thread: a compile takes up to seconds.
+    pub async fn module_for(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
+        if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
             return Ok(module);
         }
-        let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
-        if let Some(module) = self.modules.get_by_hash(id, plugin, &sha) {
+        let engine = self.engine.clone();
+        let modules = self.modules.clone();
+        let plugin = plugin.clone();
+        tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
+    }
+
+    /// [`WasmRuntime::module_for`] on the calling thread, for a caller
+    /// already off the async workers.
+    pub fn module_for_blocking(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
+        if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
             return Ok(module);
         }
-        let key = self.cache_key(&sha);
-        if let Some(module) = self.modules.load_from_disk(&self.engine, &key) {
-            self.modules.insert(id, plugin, &sha, module.clone());
-            return Ok(module);
-        }
-        let module = self.compile(&plugin.wasm_bytes)?;
-        self.modules.write_to_disk(&key, &module);
-        self.modules.insert(id, plugin, &sha, module.clone());
-        Ok(module)
+        resolve(&self.engine, &self.modules, plugin)
     }
 
     /// Drop the in-memory module held for `plugin_id`.
@@ -291,11 +313,7 @@ impl WasmRuntime {
     /// different engine is not loadable by this one, and a stale file must
     /// read as a miss rather than fail a call.
     pub fn cache_key(&self, wasm_sha256: &str) -> String {
-        let mut hasher = std::hash::DefaultHasher::new();
-        self.engine
-            .precompile_compatibility_hash()
-            .hash(&mut hasher);
-        format!("{wasm_sha256}-{:016x}", hasher.finish())
+        cache_key(&self.engine, wasm_sha256)
     }
 
     /// Delete every serialized module on disk that no installed plugin
@@ -338,6 +356,94 @@ impl WasmRuntime {
             }
         }
     }
+}
+
+fn cache_key(engine: &Engine, wasm_sha256: &str) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{wasm_sha256}-{:016x}", hasher.finish())
+}
+
+/// `plugin`'s module past the identity check: by hash in memory, from
+/// disk, or through [`compile`].
+fn resolve(
+    engine: &Engine,
+    modules: &ModuleCache,
+    plugin: &Arc<LoadedPlugin>,
+) -> Result<Module, anyhow::Error> {
+    let id = plugin.info.id.as_str();
+    let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
+    if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
+        return Ok(module);
+    }
+    let key = cache_key(engine, &sha);
+    if let Some(module) = modules.load_from_disk(engine, &key) {
+        modules.insert(id, plugin, &sha, module.clone());
+        return Ok(module);
+    }
+    let module = compile(engine, modules, &plugin.wasm_bytes, &key)?;
+    modules.write_to_disk(&key, &module);
+    modules.insert(id, plugin, &sha, module.clone());
+    Ok(module)
+}
+
+/// How many compiled modules the process keeps for its runtimes. Installed
+/// plugins and project modules number a handful; the bound is for a long
+/// run that keeps rebuilding a project's modules, each build new bytes.
+const SHARED_MODULES: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+
+/// Modules compiled in this process, serialized, by [`cache_key`]. A
+/// `Module` belongs to the engine that compiled it, and each runtime has an
+/// engine of its own because each keeps its own epoch clock, so another
+/// runtime takes a module from here by deserializing it, a small fraction of
+/// what compiling it again would cost.
+static SHARED: LazyLock<Mutex<LruCache<String, Arc<[u8]>>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(SHARED_MODULES)));
+
+/// The module for `wasm_bytes`, whose cache key is `key`: deserialized from
+/// the process's compiled modules, or compiled and added to them.
+fn compile(
+    engine: &Engine,
+    modules: &ModuleCache,
+    wasm_bytes: &[u8],
+    key: &str,
+) -> Result<Module, anyhow::Error> {
+    let shared = (!modules.unshared).then_some(&*SHARED);
+    let held = shared.and_then(|shared| {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    });
+    if let Some(bytes) = held {
+        // SAFETY: the bytes are `Module::serialize`'s output from this
+        // process, held in memory nothing else writes, under a key carrying
+        // this engine's fingerprint. Wasmtime still verifies the
+        // fingerprint embedded in them.
+        match unsafe { Module::deserialize(engine, &bytes) } {
+            Ok(module) => return Ok(module),
+            Err(e) => {
+                tracing::warn!(error = %e, "shared plugin module could not be loaded; recompiling")
+            }
+        }
+    }
+    modules.compiles.fetch_add(1, Ordering::Relaxed);
+    let module = Module::new(engine, wasm_bytes)?;
+    if let Some(shared) = shared {
+        match module.serialize() {
+            Ok(bytes) => {
+                shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(key.to_string(), bytes.into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "compiled plugin module could not be serialized for reuse")
+            }
+        }
+    }
+    Ok(module)
 }
 
 /// Create the cache directory for this process alone, or refuse one that
@@ -404,6 +510,8 @@ struct ModuleCache {
     dir: Option<PathBuf>,
     compiles: AtomicU64,
     warned: AtomicBool,
+    /// Set by [`WasmRuntime::without_shared_modules`].
+    unshared: bool,
 }
 
 impl ModuleCache {
@@ -1009,12 +1117,79 @@ mod tests {
         }
     }
 
+    /// `wasm` with a custom section holding a fresh id appended, so its
+    /// hash is one no other test has compiled into the process's modules.
+    fn unique(mut wasm: Vec<u8>) -> Vec<u8> {
+        const NAME: &[u8] = b"unique";
+        let id = uuid::Uuid::new_v4();
+        wasm.push(0);
+        wasm.push((1 + NAME.len() + id.as_bytes().len()) as u8);
+        wasm.push(NAME.len() as u8);
+        wasm.extend_from_slice(NAME);
+        wasm.extend_from_slice(id.as_bytes());
+        wasm
+    }
+
+    /// The same bytes compile once per process: again on the same runtime,
+    /// and on another runtime, as each app state builds its own.
+    #[test]
+    fn the_same_bytes_compile_once_per_process() {
+        let wasm = unique(wat::parse_str(answering(42)).unwrap());
+        let first = WasmRuntime::without_ticker().unwrap();
+        first.compile(&wasm).unwrap();
+        first.compile(&wasm).unwrap();
+        assert_eq!(first.compile_count(), 1);
+
+        let second = WasmRuntime::without_ticker().unwrap();
+        let module = second.compile(&wasm).unwrap();
+        assert_eq!(second.compile_count(), 0);
+        assert_eq!(answer(&second, &module), 42);
+    }
+
+    /// A compile runs off the async workers: on a single-threaded runtime,
+    /// a task spawned beside it keeps running while the real Lua
+    /// interpreter compiles. Skips unless `HAPPYVIEW_LUA_PLUGIN` names it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_compile_leaves_the_async_runtime_free() {
+        let Some(dir) = std::env::var_os("HAPPYVIEW_LUA_PLUGIN") else {
+            eprintln!("skipping: HAPPYVIEW_LUA_PLUGIN is unset");
+            return;
+        };
+        let mut plugin = crate::plugin::loader::load_from_file(Path::new(&dir))
+            .await
+            .expect("the Lua plugin should load");
+        plugin.wasm_bytes = unique(plugin.wasm_bytes);
+        let plugin = Arc::new(plugin);
+        let runtime = WasmRuntime::without_ticker().unwrap();
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let before = ticks.load(Ordering::Relaxed);
+        runtime.module_for(&plugin).await.unwrap();
+        let during = ticks.load(Ordering::Relaxed) - before;
+        ticker.abort();
+
+        assert_eq!(runtime.compile_count(), 1);
+        assert!(during > 0, "the ticker did not run during the compile");
+    }
+
     #[test]
     fn a_second_lookup_of_the_same_plugin_does_not_recompile() {
-        let runtime = WasmRuntime::without_ticker().unwrap();
+        let runtime = WasmRuntime::without_ticker()
+            .unwrap()
+            .without_shared_modules();
         let plugin = plugin("p", &answering(7));
-        let first = runtime.module_for(&plugin).unwrap();
-        let second = runtime.module_for(&plugin).unwrap();
+        let first = runtime.module_for_blocking(&plugin).unwrap();
+        let second = runtime.module_for_blocking(&plugin).unwrap();
         assert_eq!(runtime.compile_count(), 1);
         assert_eq!(answer(&runtime, &first), 7);
         assert_eq!(answer(&runtime, &second), 7);
@@ -1024,11 +1199,19 @@ mod tests {
     /// bytes under the same id miss and replace the entry.
     #[test]
     fn a_re_registration_hits_by_hash_and_new_bytes_replace_the_module() {
-        let runtime = WasmRuntime::without_ticker().unwrap();
-        runtime.module_for(&plugin("p", &answering(1))).unwrap();
-        runtime.module_for(&plugin("p", &answering(1))).unwrap();
+        let runtime = WasmRuntime::without_ticker()
+            .unwrap()
+            .without_shared_modules();
+        runtime
+            .module_for_blocking(&plugin("p", &answering(1)))
+            .unwrap();
+        runtime
+            .module_for_blocking(&plugin("p", &answering(1)))
+            .unwrap();
         assert_eq!(runtime.compile_count(), 1);
-        let module = runtime.module_for(&plugin("p", &answering(2))).unwrap();
+        let module = runtime
+            .module_for_blocking(&plugin("p", &answering(2)))
+            .unwrap();
         assert_eq!(runtime.compile_count(), 2);
         assert_eq!(answer(&runtime, &module), 2);
     }
@@ -1038,8 +1221,10 @@ mod tests {
         let dir = CacheDir::new("disk");
         let plugin = plugin("p", &answering(9));
 
-        let first = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        first.module_for(&plugin).unwrap();
+        let first = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        first.module_for_blocking(&plugin).unwrap();
         assert_eq!(first.compile_count(), 1);
         let key = first.cache_key(&hex::encode(Sha256::digest(&plugin.wasm_bytes)));
         assert_eq!(
@@ -1047,8 +1232,10 @@ mod tests {
             vec![format!("{key}.cwasm"), format!("{key}.cwasm.sha256")]
         );
 
-        let second = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        let module = second.module_for(&plugin).unwrap();
+        let second = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        let module = second.module_for_blocking(&plugin).unwrap();
         assert_eq!(second.compile_count(), 0);
         assert_eq!(answer(&second, &module), 9);
     }
@@ -1057,14 +1244,18 @@ mod tests {
     fn a_cache_file_whose_sidecar_does_not_match_is_recompiled_and_rewritten() {
         let dir = CacheDir::new("sidecar");
         let plugin = plugin("p", &answering(3));
-        let first = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        first.module_for(&plugin).unwrap();
+        let first = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        first.module_for_blocking(&plugin).unwrap();
         let key = first.cache_key(&hex::encode(Sha256::digest(&plugin.wasm_bytes)));
         let sidecar = dir.0.join(format!("{key}.cwasm.sha256"));
         std::fs::write(&sidecar, "0000").unwrap();
 
-        let second = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        let module = second.module_for(&plugin).unwrap();
+        let second = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        let module = second.module_for_blocking(&plugin).unwrap();
         assert_eq!(second.compile_count(), 1);
         assert_eq!(answer(&second, &module), 3);
         assert_ne!(std::fs::read_to_string(&sidecar).unwrap(), "0000");
@@ -1073,8 +1264,13 @@ mod tests {
         let module_path = dir.0.join(format!("{key}.cwasm"));
         std::fs::write(&module_path, b"not a module").unwrap();
         std::fs::write(&sidecar, hex::encode(Sha256::digest(b"not a module"))).unwrap();
-        let third = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        assert_eq!(answer(&third, &third.module_for(&plugin).unwrap()), 3);
+        let third = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        assert_eq!(
+            answer(&third, &third.module_for_blocking(&plugin).unwrap()),
+            3
+        );
         assert_eq!(third.compile_count(), 1);
     }
 
@@ -1084,7 +1280,9 @@ mod tests {
     fn a_key_under_a_different_engine_fingerprint_is_ignored() {
         let dir = CacheDir::new("engine");
         let plugin = plugin("p", &answering(4));
-        let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
+        let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
         let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
         let key = runtime.cache_key(&sha);
         assert!(key.starts_with(&format!("{sha}-")));
@@ -1101,8 +1299,10 @@ mod tests {
         )
         .unwrap();
 
-        let fresh = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        fresh.module_for(&plugin).unwrap();
+        let fresh = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
+        fresh.module_for_blocking(&plugin).unwrap();
         assert_eq!(fresh.compile_count(), 1);
     }
 
@@ -1112,9 +1312,13 @@ mod tests {
         // A file where the directory should be: nothing under it can be
         // created.
         std::fs::write(&dir.0, b"").unwrap();
-        let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
+        let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone()))
+            .unwrap()
+            .without_shared_modules();
         for value in [1, 2, 3] {
-            let module = runtime.module_for(&plugin("p", &answering(value))).unwrap();
+            let module = runtime
+                .module_for_blocking(&plugin("p", &answering(value)))
+                .unwrap();
             assert_eq!(answer(&runtime, &module), value);
         }
         assert_eq!(runtime.compile_count(), 3);
@@ -1147,7 +1351,9 @@ mod tests {
         let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
         assert!(runtime.modules.dir.is_none());
         assert!(runtime.modules.warned.load(Ordering::Relaxed));
-        let module = runtime.module_for(&plugin("p", &answering(5))).unwrap();
+        let module = runtime
+            .module_for_blocking(&plugin("p", &answering(5)))
+            .unwrap();
         assert_eq!(answer(&runtime, &module), 5);
         assert!(dir.files().is_empty());
     }
@@ -1173,8 +1379,8 @@ mod tests {
         let live = plugin("live", &answering(1));
         let gone = plugin("gone", &answering(2));
         let runtime = WasmRuntime::with_cache_dir(Some(dir.0.clone())).unwrap();
-        runtime.module_for(&live).unwrap();
-        runtime.module_for(&gone).unwrap();
+        runtime.module_for_blocking(&live).unwrap();
+        runtime.module_for_blocking(&gone).unwrap();
         let live_sha = hex::encode(Sha256::digest(&live.wasm_bytes));
         let live_key = runtime.cache_key(&live_sha);
         std::fs::write(dir.0.join("notes.txt"), b"keep").unwrap();

@@ -310,7 +310,7 @@ fn load_one(
     });
     // Compiling here makes a module wasmtime rejects a build error, and
     // leaves the compiled module in the runtime's cache for the first run.
-    runtime.module_for(&plugin).map_err(|e| {
+    runtime.module_for_blocking(&plugin).map_err(|e| {
         vec![error(
             &artifact,
             format!("module '{name}' does not compile: {e}"),
