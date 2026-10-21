@@ -1,6 +1,6 @@
 # cargo-audit configuration.
 #
-# The single ignored advisory below has been triaged and has no upstream fix.
+# The ignored advisories below have been triaged and have no upstream fix.
 # Every other advisory must fail CI (see .github/workflows/ci.yml `audit` job) so
 # new ones are caught. Re-review this list when dependencies are updated.
 [advisories]
@@ -8,4 +8,10 @@ ignore = [
     # fxhash: unmaintained (warning, not a vulnerability). Transitive dependency
     # of wasmtime (via fxprof-processed-profile); not removable independently.
     "RUSTSEC-2025-0057",
+    # webpki-roots: distrusted emSign root, patched only in 1.0.10. The lockfile
+    # has 1.0.10, but tokio-tungstenite (0.29 and 0.30 alike) depends on 0.26,
+    # whose last release is a shim that re-exports 1.x and so carries 1.0.10's
+    # roots. The advisory matches the shim by version number alone. Remove this
+    # once tokio-tungstenite depends on webpki-roots 1.
+    "RUSTSEC-2026-0381",
 ]
