@@ -93,7 +93,11 @@ For a collection a storage claims:
 - **Deletes** from an event clear the delta unconditionally: a `Proceed` with `for_rev: None`, so no `Replace` or `Hide` outlives the record and covers a later re-create of the same key. The storage owns removing the record itself. An admin delete does not clear anything. It hides the record with a `Hide` delta, also with `for_rev: None`.
 - **Events** carry `stored: true` when the body is already in the storage. HappyView then runs the hook and writes only the hook's delta. HappyView refuses an event for a claimed collection that is not marked stored, with a `record.unstored_claimed` warning in the event log, so nothing is ever written to the local tables.
 - **Raw SQL** reads and writes the local tables as before for unclaimed collections. A claimed collection's records are queryable in the storage's own database. A `db.raw` write that names one of its records is refused with an error that says to use `records.indexPut`, so a hook cannot create a local row that reads never see. While a storage is configured, a raw write to `happyview_records` that names no collection or record URI is refused too, because HappyView cannot tell whether it touches a claimed record.
-- **Outages.** When the storage is down (`unavailable` says so), the default XRPC get and list of a claimed collection answer 503. An outage of the instance database stays a 500.
+- **Outages.** When the storage is down (`unavailable` says so), requests for a claimed collection answer 503 `ServiceUnavailable`, which a client can retry:
+  - every XRPC read, whether the default get and list or a script's record queries;
+  - a write that fails before anything else accepted it: a script's index write or index delete, and an admin delete.
+
+  A write the caller's PDS has already accepted still answers 200. HappyView cannot show it until the storage is back, and the storage's own ingest brings the record in. An outage of the instance database stays a 500.
 
 ## Composing with Jetstream
 

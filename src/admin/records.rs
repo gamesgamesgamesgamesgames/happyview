@@ -226,11 +226,16 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let deleted = state
-        .records
-        .delete(&params.uri)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to delete record: {e}")))?;
+    let deleted = state.records.delete(&params.uri).await.map_err(|e| {
+        let storage_down = crate::record_store::codec::parse_record_uri(&params.uri)
+            .and_then(|(_, collection, _)| state.records.external_route(collection))
+            .is_some_and(|ext| ext.unavailable(&e));
+        if storage_down {
+            crate::error::storage_unavailable()
+        } else {
+            AppError::Internal(format!("failed to delete record: {e}"))
+        }
+    })?;
     if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }

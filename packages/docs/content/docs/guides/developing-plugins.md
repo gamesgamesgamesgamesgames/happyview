@@ -430,7 +430,7 @@ A plugin declaring `database:read` or `database:write` can import:
 
 `host_call_library` calls nest; a library calling a library that calls a third is normal. Depth is capped at **8**: the ninth hop fails with a depth-exceeded error. Every hop, whether from WASM through `host_call_library` or from Lua through `require()`, goes through the same dispatch path (`PluginExecutor::call_library`), so mixing the two does not bypass the limit.
 
-A plugin declaring the listed capability can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope, with error codes `INVALID_SPEC`, `DB_ERROR`, `BAD_INPUT`, or `FORBIDDEN`:
+A plugin declaring the listed capability can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope, with error codes `INVALID_SPEC`, `DB_ERROR`, `STORAGE_UNAVAILABLE`, `BAD_INPUT`, or `FORBIDDEN`. `STORAGE_UNAVAILABLE` means the [record storage](record-providers.md) that claims the collection is down; a script that passes it on answers `503`, which a client can retry:
 
 | Import | Capability | Spec |
 | --------------------------- | ----------------------------------- | ------------------------------------------------------------------------------- |

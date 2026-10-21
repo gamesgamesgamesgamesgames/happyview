@@ -627,6 +627,153 @@ async fn external_storage_down_is_503_and_local_reads_work() {
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
 }
 
+/// The real Lua interpreter plugin, registered on `state` with the
+/// `sdk_objects` library (`require("objects")`) and the `sdk_caller` one
+/// (`require("caller")`), whose record reads and index writes go through the
+/// host's record imports; `false` when `HAPPYVIEW_LUA_PLUGIN` does not name
+/// the interpreter.
+async fn register_lua(state: &AppState) -> bool {
+    let Some(dir) = common::lua_plugin::plugin_dir() else {
+        return false;
+    };
+    let plugin = happyview::plugin::loader::load_from_file(&dir)
+        .await
+        .expect("the Lua plugin should load");
+    state.plugin_registry.register(plugin).await;
+    for fixture in ["sdk_objects", "sdk_caller"] {
+        let library = happyview::plugin::loader::load_from_file(
+            &std::path::Path::new("tests/fixtures").join(fixture),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{fixture} fixture not built: {e}"));
+        state.plugin_registry.install(library).await.unwrap();
+    }
+    true
+}
+
+/// `CLAIMED_QUERY` answered by a Lua script whose `handle` body is `body`.
+async fn install_query_script(state: &AppState, body: &str) {
+    install_script(
+        state,
+        &format!("xrpc.query:{CLAIMED_QUERY}"),
+        &format!(
+            "local objects = require(\"objects\")\n\
+             local caller = require(\"caller\")\n\
+             function handle(input, ctx)\n{body}\nend"
+        ),
+    )
+    .await;
+}
+
+/// The 503 a request answers while the claimed collection's storage is down.
+fn assert_storage_unavailable(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body,
+        &json!({"error": "ServiceUnavailable", "message": "the record store is unavailable"})
+    );
+}
+
+/// A script's read of a claimed collection answers the same 503 as the
+/// default query does while the storage is down, not a script failure.
+#[tokio::test]
+async fn a_script_read_of_a_claimed_collection_answers_503_while_its_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(CLAIMED, "g1", json!({"text": "elsewhere"}))])
+        .await;
+    let state = instance(Some(storage.clone())).await;
+    if !register_lua(&state).await {
+        return;
+    }
+    install_query_script(
+        &state,
+        &format!("return objects.records_query({{ collection = \"{CLAIMED}\" }})"),
+    )
+    .await;
+
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["records"][0]["uri"], uri(CLAIMED, "g1"));
+
+    storage.down.store(true, Ordering::SeqCst);
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_storage_unavailable(status, &body);
+}
+
+/// A script's index write to a claimed collection is a delta on the
+/// storage, and answers 503 while the storage is down.
+#[tokio::test]
+async fn a_script_index_write_to_a_claimed_collection_answers_503_while_its_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    if !register_lua(&state).await {
+        return;
+    }
+    install_query_script(
+        &state,
+        &format!(
+            "return caller.index_put({{ collection = \"{CLAIMED}\", rkey = \"w1\", \
+             did = \"{DID}\", record = {{ text = \"indexed\" }} }})"
+        ),
+    )
+    .await;
+
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(storage.deltas().len(), 1);
+
+    storage.down.store(true, Ordering::SeqCst);
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_storage_unavailable(status, &body);
+    assert_eq!(local_rows(&state).await, 0);
+}
+
+/// A script's index delete of a claimed record hides it on the storage, and
+/// answers 503 while the storage is down.
+#[tokio::test]
+async fn a_script_index_delete_of_a_claimed_record_answers_503_while_its_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(CLAIMED, "g1", json!({"text": "elsewhere"}))])
+        .await;
+    let state = instance(Some(storage.clone())).await;
+    if !register_lua(&state).await {
+        return;
+    }
+    install_query_script(
+        &state,
+        &format!(
+            "return {{ deleted = caller.index_delete({{ uri = \"{}\" }}) }}",
+            uri(CLAIMED, "g1")
+        ),
+    )
+    .await;
+
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        storage.deltas(),
+        vec![(key(CLAIMED, "g1"), Delta::Hide, None)]
+    );
+
+    storage.down.store(true, Ordering::SeqCst);
+    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
+    assert_storage_unavailable(status, &body);
+}
+
+/// An admin delete of a claimed record answers 503 while the storage is
+/// down, as a read of it does.
+#[tokio::test]
+async fn an_admin_delete_of_a_claimed_record_answers_503_while_its_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    storage.down.store(true, Ordering::SeqCst);
+
+    let (status, body) = admin_delete(&state, &uri(CLAIMED, "g1")).await;
+    assert_storage_unavailable(status, &body);
+}
+
 /// The `test_library` fixture, a library whose `sql_execute` runs raw SQL
 /// through `host_db_execute`.
 fn sql_library() -> LoadedPlugin {
