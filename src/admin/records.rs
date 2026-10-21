@@ -80,7 +80,7 @@ pub(super) async fn list_records(
         .records
         .list_recent(&params.collection, None, limit + 1, offset)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list records: {e}")))?
+        .map_err(|e| record_error(&state, Some(&params.collection), "list records", e))?
         .into_iter()
         .map(|r| {
             (
@@ -226,16 +226,13 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let deleted = state.records.delete(&params.uri).await.map_err(|e| {
-        let storage_down = crate::record_store::codec::parse_record_uri(&params.uri)
-            .and_then(|(_, collection, _)| state.records.external_route(collection))
-            .is_some_and(|ext| ext.unavailable(&e));
-        if storage_down {
-            crate::error::storage_unavailable()
-        } else {
-            AppError::Internal(format!("failed to delete record: {e}"))
-        }
-    })?;
+    let collection = crate::record_store::codec::parse_record_uri(&params.uri)
+        .map(|(_, collection, _)| collection);
+    let deleted = state
+        .records
+        .delete(&params.uri)
+        .await
+        .map_err(|e| record_error(&state, collection, "delete record", e))?;
     if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }
@@ -251,4 +248,22 @@ pub(super) async fn list_collections(
 
     let collections = state.lexicons.get_record_collections().await;
     Ok(Json(serde_json::json!({ "collections": collections })))
+}
+
+/// A failed record call on `collection`: 503 when the external storage that
+/// claims it is unreachable, otherwise a 500.
+fn record_error(
+    state: &AppState,
+    collection: Option<&str>,
+    what: &str,
+    e: sqlx::Error,
+) -> AppError {
+    let storage_down = collection
+        .and_then(|collection| state.records.external_route(collection))
+        .is_some_and(|ext| ext.unavailable(&e));
+    if storage_down {
+        crate::error::storage_unavailable()
+    } else {
+        AppError::Internal(format!("failed to {what}: {e}"))
+    }
 }
