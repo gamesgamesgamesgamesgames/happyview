@@ -47,7 +47,7 @@ const SQLITE_RECORD_EXPR: &str = "hv_record(v.body, v.body_dict)";
 /// The two read-only compatibility views, records first. A record provider
 /// creates these on its raw read route (see `RecordStorage::raw_route`) with
 /// a search path that resolves `happyview_records_v2` and friends to the
-/// rows a tenant may see.
+/// rows this instance may see.
 pub fn view_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<String> {
     let record_expr = match backend {
         DatabaseBackend::Sqlite => SQLITE_RECORD_EXPR,
