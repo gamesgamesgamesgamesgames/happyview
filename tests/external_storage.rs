@@ -1090,6 +1090,74 @@ async fn raw_writes_of_unclaimed_records_through_the_views_stay_local() {
     assert_eq!(local_rows(&state).await, 0);
 }
 
+/// The `sdk_objects` fixture, whose `table_query` runs through
+/// `host_table_query` as Lua's `sql.from` does.
+async fn install_objects(state: &AppState) {
+    let plugin = happyview::plugin::loader::load_from_file(std::path::Path::new(
+        "tests/fixtures/sdk_objects",
+    ))
+    .await
+    .expect("sdk_objects fixture not built");
+    state.plugin_registry.install(plugin).await.unwrap();
+}
+
+async fn table_query(state: &AppState, spec: Value) -> Result<Value, String> {
+    state
+        .plugin_executor()
+        .call_library(
+            "sdk_objects",
+            "table_query",
+            &[spec],
+            &LibraryCallContext::default(),
+            0,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn table_queries_of_record_views_use_the_raw_route() {
+    let storage = Arc::new(FakeStorage::claiming_with_raw(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(
+            CLAIMED,
+            "only-in-storage",
+            json!({"text": "from storage"}),
+        )])
+        .await;
+    let state = instance(Some(storage.clone())).await;
+    install_objects(&state).await;
+
+    let out = table_query(&state, json!({"table": "happyview_records"}))
+        .await
+        .expect("a routed table query");
+    let rows = out.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["rkey"], "only-in-storage");
+    let out = table_query(
+        &state,
+        json!({"table": "happyview_records", "count": true,
+               "filter": {"field": "rkey", "op": "=", "value": "only-in-storage"}}),
+    )
+    .await
+    .expect("a routed count");
+    assert_eq!(out, json!(1));
+    let out = table_query(&state, json!({"table": "happyview_record_refs"}))
+        .await
+        .expect("a routed table query of the refs view");
+    assert!(out.is_array(), "{out}");
+
+    storage.down.store(true, Ordering::SeqCst);
+    let err = table_query(&state, json!({"table": "happyview_records"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains(happyview::error::STORAGE_UNAVAILABLE), "{err}");
+    // Other tables stay local.
+    table_query(&state, json!({"table": "happyview_labels"}))
+        .await
+        .expect("a local table query");
+}
+
 #[tokio::test]
 async fn raw_reads_of_local_tables_stay_local() {
     let state = instance(Some(Arc::new(

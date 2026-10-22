@@ -1891,6 +1891,12 @@ fn records_or_local(state: &PluginState, db: &sqlx::AnyPool) -> crate::record_st
 /// (an external storage's route when that claims the collection).
 trait SpecCollection {
     fn collection(&self) -> Option<&str>;
+
+    /// True when the spec reads the record views, which run where raw SQL
+    /// reads of them do: on the external storage's raw read route, if any.
+    fn reads_record_views(&self) -> bool {
+        false
+    }
 }
 
 impl SpecCollection for happyview_plugin_sdk::wire::RecordsQuery {
@@ -1923,10 +1929,14 @@ impl SpecCollection for GetSpec {
     }
 }
 
-/// A table query reads the instance's own tables.
+/// A table query reads the instance's own tables, or the record views.
 impl SpecCollection for happyview_plugin_sdk::wire::TableQuery {
     fn collection(&self) -> Option<&str> {
         None
+    }
+
+    fn reads_record_views(&self) -> bool {
+        crate::raw_sql_guard::is_record_view(&self.table)
     }
 }
 
@@ -1981,9 +1991,14 @@ where
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
     let backend = caller.data().db_backend;
-    // A claimed collection is read on the external storage's route; every
-    // other spec runs on the instance's own database, as it always has.
+    // A claimed collection is read on the external storage's route, and the
+    // record views on its raw read route; every other spec runs on the
+    // instance's own database, as it always has.
     let external = caller.data().app_state.as_ref().and_then(|app| {
+        if spec.reads_record_views() {
+            let ext = app.records.external()?;
+            return ext.raw_route().map(|route| (ext.clone(), route));
+        }
         let collection = spec.collection()?;
         app.records
             .external_route(collection)

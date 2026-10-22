@@ -264,6 +264,11 @@ pub const RAW_MIXED_REFUSED: &str =
 /// The compat views that serve record reads.
 const RECORD_VIEWS: [&str; 2] = ["happyview_records", "happyview_record_refs"];
 
+/// True when `table`, an unquoted identifier, names a record view.
+pub fn is_record_view(table: &str) -> bool {
+    RECORD_VIEWS.contains(&table.to_ascii_lowercase().as_str())
+}
+
 /// Which relations a raw query reads, as far as the record views go.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecordViews {
