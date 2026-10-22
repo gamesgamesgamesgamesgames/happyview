@@ -1003,6 +1003,134 @@ async fn raw_sql_writes_to_a_claimed_collection_are_refused() {
     assert_eq!(local_rows(&state).await, 1);
 }
 
+async fn query_raw(state: &AppState, sql: &str) -> Result<Value, String> {
+    state
+        .plugin_executor()
+        .call_library(
+            "rawsql",
+            "sql_query",
+            &[json!(sql)],
+            &LibraryCallContext::default(),
+            0,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn raw_reads_of_record_views_use_the_raw_route() {
+    let storage = Arc::new(FakeStorage::claiming_with_raw(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(
+            CLAIMED,
+            "only-in-storage",
+            json!({"text": "from storage"}),
+        )])
+        .await;
+    let state = instance(Some(storage.clone())).await;
+    state.plugin_registry.register(sql_library()).await;
+
+    let out = query_raw(&state, "SELECT rkey FROM happyview_records")
+        .await
+        .expect("a routed read");
+    let rows = out.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["rkey"], "only-in-storage");
+
+    // The refs view is routed too: a read of it answers with the routed
+    // read's own error (no such column), tagged with the backend.
+    let err = query_raw(&state, "SELECT no_such_column FROM happyview_record_refs")
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("record views on this instance are served by"),
+        "{err}"
+    );
+    let out = query_raw(&state, "SELECT source_uri FROM happyview_record_refs")
+        .await
+        .expect("a routed read of the refs view");
+    assert!(out.is_array(), "{out}");
+}
+
+#[tokio::test]
+async fn raw_reads_of_local_tables_stay_local() {
+    let state = instance(Some(Arc::new(
+        FakeStorage::claiming_with_raw(&[CLAIMED]).await,
+    )))
+    .await;
+    state.plugin_registry.register(sql_library()).await;
+    happyview::db::query(
+        "INSERT INTO happyview_labels (src, uri, val, cts) VALUES ('did:plc:x', 'at://did:plc:x/a.b.c/1', 'spam', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let out = query_raw(&state, "SELECT val FROM happyview_labels")
+        .await
+        .expect("a local read");
+    assert_eq!(out[0]["val"], "spam", "{out}");
+}
+
+#[tokio::test]
+async fn mixed_raw_reads_are_refused() {
+    let state = instance(Some(Arc::new(
+        FakeStorage::claiming_with_raw(&[CLAIMED]).await,
+    )))
+    .await;
+    state.plugin_registry.register(sql_library()).await;
+    let err = query_raw(
+        &state,
+        "SELECT r.uri FROM happyview_records r JOIN happyview_labels l ON l.uri = r.uri",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("FORBIDDEN"), "{err}");
+    assert!(err.contains("split it"), "{err}");
+}
+
+#[tokio::test]
+async fn routed_raw_reads_answer_storage_unavailable_while_down() {
+    let storage = Arc::new(FakeStorage::claiming_with_raw(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    state.plugin_registry.register(sql_library()).await;
+    storage.down.store(true, Ordering::SeqCst);
+    let err = query_raw(&state, "SELECT uri FROM happyview_records")
+        .await
+        .unwrap_err();
+    assert!(err.contains(happyview::error::STORAGE_UNAVAILABLE), "{err}");
+}
+
+#[tokio::test]
+async fn a_failed_routed_read_says_which_backend_ran_it() {
+    let state = instance(Some(Arc::new(
+        FakeStorage::claiming_with_raw(&[CLAIMED]).await,
+    )))
+    .await;
+    state.plugin_registry.register(sql_library()).await;
+    let err = query_raw(&state, "SELECT no_such_column FROM happyview_records")
+        .await
+        .unwrap_err();
+    assert!(err.contains("DB_ERROR"), "{err}");
+    assert!(
+        err.contains("record views on this instance are served by a sqlite database"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_raw_route_record_view_reads_stay_local() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(CLAIMED, "only-in-storage", json!({"text": "x"}))])
+        .await;
+    let state = instance(Some(storage)).await;
+    state.plugin_registry.register(sql_library()).await;
+    let out = query_raw(&state, "SELECT rkey FROM happyview_records")
+        .await
+        .expect("a local read");
+    assert_eq!(out.as_array().map(Vec::len), Some(0), "{out}");
+}
+
 #[tokio::test]
 async fn label_gc_asks_the_external_storage_for_claimed_uris() {
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);

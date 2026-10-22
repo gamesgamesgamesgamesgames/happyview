@@ -49,6 +49,39 @@ pub(super) fn row_to_json(row: &sqlx::any::AnyRow) -> Map<String, Value> {
     out
 }
 
+/// Why a raw query did not run: the guard or a parameter refused it, or the
+/// database failed it. Callers that route a query to a database that may be
+/// unavailable need the second apart from the first.
+#[derive(Debug)]
+pub enum QueryError {
+    Refused(String),
+    Database(sqlx::Error),
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::Refused(m) => f.write_str(m),
+            QueryError::Database(e) => write!(f, "query failed: {e}"),
+        }
+    }
+}
+
+/// [`run_query`] with the failure kept typed.
+pub async fn run_query_on(
+    db: &sqlx::AnyPool,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Map<String, Value>>, QueryError> {
+    check_raw_sql_tables(sql).map_err(QueryError::Refused)?;
+    let rows = bind_params(crate::db::query(sql), params)
+        .map_err(QueryError::Refused)?
+        .fetch_all(db)
+        .await
+        .map_err(QueryError::Database)?;
+    Ok(rows.iter().map(row_to_json).collect())
+}
+
 /// SQL is passed through untranslated; placeholders are backend-native
 /// (`?` on SQLite, `$1`… on Postgres), as for Lua's `db.raw`.
 pub async fn run_query(
@@ -56,12 +89,9 @@ pub async fn run_query(
     sql: &str,
     params: &[Value],
 ) -> Result<Vec<Map<String, Value>>, String> {
-    check_raw_sql_tables(sql)?;
-    let rows = bind_params(crate::db::query(sql), params)?
-        .fetch_all(db)
+    run_query_on(db, sql, params)
         .await
-        .map_err(|e| format!("query failed: {e}"))?;
-    Ok(rows.iter().map(row_to_json).collect())
+        .map_err(|e| e.to_string())
 }
 
 /// SQL is passed through untranslated; placeholders are backend-native

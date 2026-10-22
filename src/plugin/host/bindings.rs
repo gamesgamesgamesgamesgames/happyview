@@ -2510,6 +2510,59 @@ async fn host_db_impl(
     {
         return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await;
     }
+    // Read-only SQL that touches only the record views runs on the external
+    // storage's raw read route, where those views show its records.
+    if !execute
+        && crate::raw_sql_guard::is_read_only(&sql) == Ok(true)
+        && let Some(ext) = caller
+            .data()
+            .app_state
+            .as_ref()
+            .and_then(|app| app.records.external().cloned())
+        && let Some(route) = ext.raw_route()
+    {
+        match crate::raw_sql_guard::record_view_use(&sql) {
+            Ok(crate::raw_sql_guard::RecordViews::Only) => {
+                let response = match super::run_query_on(&route.pool, &sql, &params).await {
+                    Ok(rows) => {
+                        serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default()
+                    }
+                    Err(super::QueryError::Database(e)) if ext.unavailable(&e) => {
+                        error_envelope(crate::error::STORAGE_UNAVAILABLE, e)
+                    }
+                    Err(e) => {
+                        let backend = match route.backend {
+                            crate::db::DatabaseBackend::Postgres => "postgres",
+                            crate::db::DatabaseBackend::Sqlite => "sqlite",
+                        };
+                        error_envelope(
+                            "DB_ERROR",
+                            format!(
+                                "{e} (record views on this instance are served by a {backend} database)"
+                            ),
+                        )
+                    }
+                };
+                return write_guest_response(caller, &response).await;
+            }
+            Ok(crate::raw_sql_guard::RecordViews::Mixed(_)) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
+                )
+                .await;
+            }
+            Ok(crate::raw_sql_guard::RecordViews::None) => {}
+            // A query the classifier cannot read is never sent to the local database.
+            Err(_) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
+                )
+                .await;
+            }
+        }
+    }
     let Some(db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
