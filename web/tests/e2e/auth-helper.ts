@@ -6,6 +6,7 @@ const SESSION_SECRET = "e2e-test-secret-that-is-at-least-32-bytes";
 const COOKIE_NAME = "happyview_session";
 const TEST_DID = "did:plc:e2e-test-admin";
 const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
+const PDS_DB_URL = "postgres://happyview:happyview@localhost:5434/pds";
 
 /**
  * HKDF-Expand (RFC 5869 section 2.3) — used by the cookie crate's
@@ -126,6 +127,27 @@ export async function restoreServiceIdentity(
         `INSERT INTO happyview_service_identity (${columns.join(", ")}) VALUES (${placeholders})`,
         columns.map((c) => row[c]),
       );
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * Marks a test PDS account's email as verified. Tranquil only sends secret
+ * codes, such as the one `requestPlcOperationSignature` issues, to a verified
+ * address, and the e2e stack has no mail to confirm one with.
+ */
+export async function markPdsEmailVerified(did: string): Promise<void> {
+  const client = new pg.Client(PDS_DB_URL);
+  await client.connect();
+  try {
+    const { rowCount } = await client.query(
+      "UPDATE users SET email_verified = TRUE WHERE did = $1",
+      [did],
+    );
+    if (rowCount !== 1) {
+      throw new Error(`no PDS account with DID ${did}`);
     }
   } finally {
     await client.end();
