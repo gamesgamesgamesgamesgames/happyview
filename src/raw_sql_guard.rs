@@ -300,7 +300,7 @@ pub fn record_view_use(sql: &str) -> Result<RecordViews, String> {
 }
 
 /// Schemas a record view may be qualified with.
-const VIEW_SCHEMAS: [&str; 3] = ["main", "public", "temp"];
+const VIEW_SCHEMAS: [&str; 2] = ["main", "public"];
 
 /// Collects the relations a query reads, resolving CTE names by scope.
 #[derive(Default)]
@@ -310,6 +310,10 @@ struct Relations {
     saw_view: bool,
     /// The first relation that is not a record view.
     other: Option<String>,
+    /// CTE bodies already checked on their own; the main walk skips them.
+    checked: std::collections::HashSet<*const sqlparser::ast::Query>,
+    /// How many enclosing queries are being skipped.
+    skipping: usize,
 }
 
 /// An identifier as the database compares it: unquoted names fold to lower case.
@@ -324,6 +328,9 @@ fn fold(ident: &sqlparser::ast::Ident) -> String {
 impl Relations {
     /// Record a relation read, given its optional schema and its name.
     fn record(&mut self, schema: Option<&str>, name: String) -> std::ops::ControlFlow<()> {
+        if self.skipping > 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
         let schema_ok = schema.is_none_or(|s| VIEW_SCHEMAS.contains(&s));
         // A CTE can only be named unqualified.
         if schema.is_none() && self.scopes.iter().any(|scope| scope.contains(&name)) {
@@ -366,6 +373,13 @@ impl sqlparser::ast::Visitor for Relations {
     fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
         use sqlparser::ast::Visit;
 
+        // A body checked on its own is not walked again, which would make
+        // nested CTEs cost exponential time.
+        if self.skipping > 0 || self.checked.contains(&(query as *const _)) {
+            self.skipping += 1;
+            self.scopes.push(Default::default());
+            return std::ops::ControlFlow::Continue(());
+        }
         let mut scope = std::collections::HashSet::new();
         if let Some(with) = &query.with {
             // Without RECURSIVE, a CTE body sees only the CTEs before it, so a
@@ -385,6 +399,7 @@ impl sqlparser::ast::Visitor for Relations {
                             .collect(),
                     );
                     let _ = cte.query.visit(&mut body);
+                    self.checked.insert(&*cte.query as *const _);
                     self.saw_view |= body.saw_view;
                     if let Some(name) = body.other {
                         self.other = Some(name);
@@ -400,6 +415,7 @@ impl sqlparser::ast::Visitor for Relations {
 
     fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
         self.scopes.pop();
+        self.skipping = self.skipping.saturating_sub(1);
         std::ops::ControlFlow::Continue(())
     }
 
@@ -437,6 +453,40 @@ impl sqlparser::ast::Visitor for Relations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_view_use_stays_fast_on_nested_and_many_ctes() {
+        use std::time::Instant;
+
+        // Each level wraps the last in a non-recursive CTE.
+        let mut sql = "SELECT * FROM happyview_records".to_string();
+        for i in 0..40 {
+            sql = format!("WITH c{i} AS ({sql}) SELECT * FROM c{i}");
+        }
+        let started = Instant::now();
+        assert_eq!(record_view_use(&sql), Ok(RecordViews::Only));
+        assert!(started.elapsed().as_secs() < 1, "nested CTEs are slow");
+
+        // The same, with a local table at the bottom.
+        let mut sql = "SELECT * FROM my_table, happyview_records".to_string();
+        for i in 0..40 {
+            sql = format!("WITH c{i} AS ({sql}) SELECT * FROM c{i}");
+        }
+        assert_eq!(
+            record_view_use(&sql),
+            Ok(RecordViews::Mixed("my_table".into()))
+        );
+
+        // Many sibling CTEs, each reading the one before.
+        let mut sql = "WITH c0 AS (SELECT * FROM happyview_records)".to_string();
+        for i in 1..1000 {
+            sql.push_str(&format!(", c{i} AS (SELECT * FROM c{})", i - 1));
+        }
+        sql.push_str(" SELECT * FROM c999");
+        let started = Instant::now();
+        assert_eq!(record_view_use(&sql), Ok(RecordViews::Only));
+        assert!(started.elapsed().as_secs() < 1, "many CTEs are slow");
+    }
 
     #[test]
     fn record_view_use_scopes_cte_names() {
@@ -503,7 +553,10 @@ mod tests {
                 "mixed:other.happyview_records",
             ),
             ("SELECT * FROM main.happyview_records", "only"),
-            ("SELECT * FROM temp.happyview_records", "only"),
+            (
+                "SELECT * FROM temp.happyview_records",
+                "mixed:temp.happyview_records",
+            ),
             (
                 "SELECT * FROM a.public.happyview_records",
                 "mixed:a.public.happyview_records",
