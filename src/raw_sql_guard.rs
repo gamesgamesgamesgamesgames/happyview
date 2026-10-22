@@ -284,8 +284,9 @@ pub enum RecordViews {
 /// views, only them (CTE names and table functions don't count), or them
 /// together with another relation. SQL that names a view but does not parse
 /// fails closed, and so does anything not plainly a view: a name qualified
-/// with a schema other than `main`, `public` or `temp`, or a name that is not
-/// a plain identifier, counts as another relation.
+/// with a schema other than `main` or `public`, or a name that is not a plain
+/// identifier, counts as another relation. So does a `WITH` defining more
+/// than [`MAX_CTES`] CTEs, which is refused.
 ///
 /// The check is syntactic, so it cannot see through a user function that reads
 /// the views (`my_func()`), or a user-created view built on them. The caller
@@ -318,12 +319,22 @@ pub fn record_view_use(sql: &str) -> Result<RecordViews, String> {
     for statement in &statements {
         let _ = statement.visit(&mut relations);
     }
+    if relations.too_many_ctes {
+        return Err(format!(
+            "raw SQL that reads record views may define at most {MAX_CTES} CTEs in one WITH"
+        ));
+    }
     Ok(match relations.other {
         Some(name) => RecordViews::Mixed(name),
         None if relations.saw_view => RecordViews::Only,
         None => RecordViews::None,
     })
 }
+
+/// The most CTEs one `WITH` may define in SQL that reads the record views.
+/// Each CTE body is checked against the ones before it, so the cost grows
+/// with the square of the count; more fails closed.
+const MAX_CTES: usize = 1000;
 
 /// Schemas a record view may be qualified with.
 const VIEW_SCHEMAS: [&str; 2] = ["main", "public"];
@@ -340,6 +351,8 @@ struct Relations {
     checked: std::collections::HashSet<*const sqlparser::ast::Query>,
     /// How many enclosing queries are being skipped.
     skipping: usize,
+    /// A `WITH` defined more than [`MAX_CTES`] CTEs; the walk stopped there.
+    too_many_ctes: bool,
 }
 
 /// An identifier as the database compares it: unquoted names fold to lower case.
@@ -408,6 +421,10 @@ impl sqlparser::ast::Visitor for Relations {
         }
         let mut scope = std::collections::HashSet::new();
         if let Some(with) = &query.with {
+            if with.cte_tables.len() > MAX_CTES {
+                self.too_many_ctes = true;
+                return std::ops::ControlFlow::Break(());
+            }
             // Without RECURSIVE, a CTE body sees only the CTEs before it, so a
             // name it shares with its own CTE or a later one is a real table.
             // The scope below covers every CTE, which is right for the main
@@ -427,6 +444,10 @@ impl sqlparser::ast::Visitor for Relations {
                     let _ = cte.query.visit(&mut body);
                     self.checked.insert(&*cte.query as *const _);
                     self.saw_view |= body.saw_view;
+                    if body.too_many_ctes {
+                        self.too_many_ctes = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
                     if let Some(name) = body.other {
                         self.other = Some(name);
                         return std::ops::ControlFlow::Break(());
@@ -856,6 +877,24 @@ mod tests {
         ] {
             assert!(!is_write(sql), "{sql}");
         }
+    }
+
+    #[test]
+    fn record_view_use_refuses_too_many_ctes() {
+        let ctes = |n: usize| {
+            let mut sql = "WITH c0 AS (SELECT * FROM happyview_records)".to_string();
+            for i in 1..n {
+                sql.push_str(&format!(", c{i} AS (SELECT * FROM c{})", i - 1));
+            }
+            sql.push_str(&format!(" SELECT * FROM c{}", n - 1));
+            sql
+        };
+        assert_eq!(record_view_use(&ctes(MAX_CTES)), Ok(RecordViews::Only));
+        let err = record_view_use(&ctes(MAX_CTES + 1)).unwrap_err();
+        assert!(err.contains("CTEs"), "{err}");
+        // Nested inside a subquery too.
+        let nested = format!("SELECT * FROM ({}) s", ctes(MAX_CTES + 1));
+        assert!(record_view_use(&nested).is_err());
     }
 
     #[test]
