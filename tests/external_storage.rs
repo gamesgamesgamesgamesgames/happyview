@@ -1085,7 +1085,27 @@ async fn mixed_raw_reads_are_refused() {
     .await
     .unwrap_err();
     assert!(err.contains("FORBIDDEN"), "{err}");
-    assert!(err.contains("split it"), "{err}");
+    assert!(
+        err.contains(happyview::raw_sql_guard::RAW_MIXED_REFUSED),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn record_view_reads_the_read_only_gate_cannot_vouch_for_are_refused() {
+    let state = instance(Some(Arc::new(
+        FakeStorage::claiming_with_raw(&[CLAIMED]).await,
+    )))
+    .await;
+    state.plugin_registry.register(sql_library()).await;
+    // The library holds database:write, so no earlier check refuses these.
+    for sql in [
+        "SELECT rkey FROM happyview_records FOR SHARE",
+        "SELECT rkey FROM happyview_records INDEXED BY no_such_index",
+    ] {
+        let err = query_raw(&state, sql).await.unwrap_err();
+        assert!(err.contains("FORBIDDEN"), "{sql}: {err}");
+    }
 }
 
 #[tokio::test]

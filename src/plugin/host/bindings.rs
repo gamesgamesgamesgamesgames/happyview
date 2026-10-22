@@ -2503,25 +2503,42 @@ async fn host_db_impl(
         .app_state
         .as_ref()
         .and_then(|app| app.records.external().cloned());
-    if let Some(external) = external
+    if let Some(external) = &external
         && let Err(e) = crate::raw_sql_guard::check_claimed_record_writes(&sql, &params, &|c| {
             external.claims(c)
         })
     {
         return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await;
     }
-    // Read-only SQL that touches only the record views runs on the external
-    // storage's raw read route, where those views show its records.
+    // SQL that reads the record views runs on the external storage's raw read
+    // route, where those views show its records. It is classified before the
+    // read-only gate: a read the gate cannot vouch for (a locking clause, SQL
+    // the parser rejects) must not fall through to the local views, which hold
+    // none of the claimed records.
     if !execute
-        && crate::raw_sql_guard::is_read_only(&sql) == Ok(true)
-        && let Some(ext) = caller
-            .data()
-            .app_state
-            .as_ref()
-            .and_then(|app| app.records.external().cloned())
+        && let Some(ext) = &external
         && let Some(route) = ext.raw_route()
     {
         match crate::raw_sql_guard::record_view_use(&sql) {
+            Ok(crate::raw_sql_guard::RecordViews::None) => {}
+            Err(e) => return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await,
+            Ok(_) if crate::raw_sql_guard::is_read_only(&sql) != Ok(true) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "raw SQL that reads claimed records must be a plain read-only query",
+                    ),
+                )
+                .await;
+            }
+            Ok(crate::raw_sql_guard::RecordViews::Mixed(_)) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
+                )
+                .await;
+            }
             Ok(crate::raw_sql_guard::RecordViews::Only) => {
                 let response = match super::run_query_on(&route.pool, &sql, &params).await {
                     Ok(rows) => {
@@ -2544,22 +2561,6 @@ async fn host_db_impl(
                     }
                 };
                 return write_guest_response(caller, &response).await;
-            }
-            Ok(crate::raw_sql_guard::RecordViews::Mixed(_)) => {
-                return write_guest_response(
-                    caller,
-                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
-                )
-                .await;
-            }
-            Ok(crate::raw_sql_guard::RecordViews::None) => {}
-            // A query the classifier cannot read is never sent to the local database.
-            Err(_) => {
-                return write_guest_response(
-                    caller,
-                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
-                )
-                .await;
             }
         }
     }
