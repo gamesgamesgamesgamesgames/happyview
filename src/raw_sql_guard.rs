@@ -215,9 +215,168 @@ pub fn is_read_only(sql: &str) -> Result<bool, String> {
         }))
 }
 
+/// Why a raw read that mixes record views with other relations is refused.
+pub const RAW_MIXED_REFUSED: &str =
+    "this query reads claimed records and local tables together; split it into two queries";
+
+/// The compat views that serve record reads.
+const RECORD_VIEWS: [&str; 2] = ["happyview_records", "happyview_record_refs"];
+
+/// Which relations a raw query reads, as far as the record views go.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordViews {
+    /// None of the record views.
+    None,
+    /// Only the record views.
+    Only,
+    /// The record views together with another relation, named here.
+    Mixed(String),
+}
+
+/// Which relations a read-only raw query reads: none of the record compat
+/// views, only them (CTE names and table functions don't count), or them
+/// together with another relation. SQL that names a view but does not parse
+/// fails closed.
+pub fn record_view_use(sql: &str) -> Result<RecordViews, String> {
+    use sqlparser::ast::Visit;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    // Cheap pre-check on tokens, so SQL that never names a view is never parsed.
+    let dialect = GenericDialect {};
+    let names_view = match Tokenizer::new(&dialect, sql).tokenize() {
+        Ok(tokens) => tokens.iter().any(|token| {
+            matches!(token, Token::Word(word)
+                if RECORD_VIEWS.contains(&word.value.to_ascii_lowercase().as_str()))
+        }),
+        Err(_) => {
+            let lowered = sql.to_ascii_lowercase();
+            RECORD_VIEWS.iter().any(|view| lowered.contains(view))
+        }
+    };
+    if !names_view {
+        return Ok(RecordViews::None);
+    }
+
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| format!("raw SQL that reads record views must parse: {e}"))?;
+    let mut relations = Relations::default();
+    for statement in &statements {
+        let _ = statement.visit(&mut relations);
+    }
+
+    let mut saw_view = false;
+    for name in relations.tables {
+        if relations.ctes.contains(&name) {
+            continue;
+        }
+        if RECORD_VIEWS.contains(&name.as_str()) {
+            saw_view = true;
+        } else {
+            return Ok(RecordViews::Mixed(name));
+        }
+    }
+    Ok(if saw_view {
+        RecordViews::Only
+    } else {
+        RecordViews::None
+    })
+}
+
+#[derive(Default)]
+struct Relations {
+    tables: Vec<String>,
+    ctes: std::collections::HashSet<String>,
+}
+
+impl sqlparser::ast::Visitor for Relations {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.ctes.insert(cte.alias.name.value.to_ascii_lowercase());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        // `args: Some(..)` is a table function (`json_each(..)`), not a relation.
+        if let sqlparser::ast::TableFactor::Table {
+            name, args: None, ..
+        } = factor
+            && let Some(sqlparser::ast::ObjectNamePart::Identifier(last)) = name.0.last()
+        {
+            self.tables.push(last.value.to_ascii_lowercase());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_view_use_classifies_relations() {
+        use RecordViews::*;
+        let cases: &[(&str, &str)] = &[
+            ("SELECT 1", "none"),
+            ("SELECT * FROM my_table", "none"),
+            (
+                "SELECT * FROM happyview_records WHERE collection = 'a.b.c'",
+                "only",
+            ),
+            (
+                "SELECT r.uri FROM happyview_records r JOIN happyview_record_refs f ON f.source_uri = r.uri",
+                "only",
+            ),
+            ("SELECT * FROM public.happyview_records", "only"),
+            (
+                "WITH x AS (SELECT * FROM happyview_records) SELECT * FROM x",
+                "only",
+            ),
+            (
+                "SELECT * FROM happyview_records r, json_each(r.record)",
+                "only",
+            ),
+            (
+                "SELECT * FROM happyview_records r JOIN my_table m ON m.uri = r.uri",
+                "mixed:my_table",
+            ),
+            (
+                "SELECT * FROM happyview_records WHERE uri IN (SELECT uri FROM happyview_labels)",
+                "mixed:happyview_labels",
+            ),
+            (
+                "SELECT (SELECT COUNT(*) FROM happyview_records), (SELECT COUNT(*) FROM notes)",
+                "mixed:notes",
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = match record_view_use(sql).unwrap() {
+                None => "none".to_string(),
+                Only => "only".to_string(),
+                Mixed(t) => format!("mixed:{t}"),
+            };
+            assert_eq!(&got, want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn record_view_use_fails_closed_on_unparseable_view_queries() {
+        assert!(record_view_use("SELECT * FROM happyview_records WHERE (").is_err());
+        // no view token: never parsed, never an error
+        assert!(matches!(
+            record_view_use("NOT SQL AT ALL"),
+            Ok(RecordViews::None)
+        ));
+    }
 
     #[test]
     fn raw_sql_allows_non_protected_tables() {
