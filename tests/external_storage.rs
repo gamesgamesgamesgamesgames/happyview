@@ -774,6 +774,77 @@ async fn an_admin_delete_of_a_claimed_record_answers_503_while_its_storage_is_do
     assert_storage_unavailable(status, &body);
 }
 
+async fn admin_get(state: &AppState, path: &str) -> (StatusCode, Value) {
+    let (name, value) = common::auth::admin_cookie_header(ADMIN, &state.cookie_key);
+    send(
+        state,
+        Request::get(path)
+            .header("host", "127.0.0.1")
+            .header(name, value)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+/// The admin stats answer 503 while a claimed collection's storage is down,
+/// as a read of it does; with nothing claimed they count the local records.
+#[tokio::test]
+async fn admin_stats_answer_503_while_claimed_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    storage
+        .seed(&[prepared(CLAIMED, "g1", json!({"text": "elsewhere"}))])
+        .await;
+    let state = instance(Some(storage.clone())).await;
+    let (status, body) = admin_get(&state, "/admin/stats").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_records"], 1);
+
+    storage.down.store(true, Ordering::SeqCst);
+    let (status, body) = admin_get(&state, "/admin/stats").await;
+    assert_storage_unavailable(status, &body);
+
+    let local = instance(None).await;
+    local
+        .records
+        .write_network(&local.db, &[prepared(LOCAL, "n1", json!({"text": "here"}))])
+        .await
+        .unwrap();
+    let (status, body) = admin_get(&local, "/admin/stats").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_records"], 1);
+}
+
+/// A failure of the instance's own record tables is a 500 on the admin
+/// stats, as on a local read, even with an external storage configured
+/// and reachable.
+#[tokio::test]
+async fn admin_stats_answer_500_when_the_local_record_tables_fail() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let mut state = instance(Some(storage.clone())).await;
+    // Only the record store's pool is closed, so the admin is still found.
+    let closed = happyview::test_support::memory_pool().await;
+    closed.close().await;
+    state.records = RecordStore::new(closed, DatabaseBackend::Sqlite).with_external(storage);
+
+    let (status, body) = admin_get(&state, "/admin/stats").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
+/// The admin record listing of a claimed collection answers 503 while its
+/// storage is down; a local collection's listing still answers.
+#[tokio::test]
+async fn admin_record_listing_answers_503_while_claimed_storage_is_down() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    storage.down.store(true, Ordering::SeqCst);
+
+    let (status, body) = admin_get(&state, &format!("/admin/records?collection={CLAIMED}")).await;
+    assert_storage_unavailable(status, &body);
+    let (status, body) = admin_get(&state, &format!("/admin/records?collection={LOCAL}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// An account deletion for a DID whose only records are in a claimed
 /// collection is checked against the account's PDS as a locally held one
 /// is: with the PDS saying the account is active, nothing is purged.

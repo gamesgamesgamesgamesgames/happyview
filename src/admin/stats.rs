@@ -5,6 +5,7 @@ use axum::extract::State;
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::record_store::CountError;
 
 use super::auth::AllowPlatform;
 use super::permissions::Permission;
@@ -20,7 +21,7 @@ pub(super) async fn stats(
         .records
         .count_all()
         .await
-        .map_err(|e| AppError::Internal(format!("failed to count records: {e}")))?;
+        .map_err(|e| count_error(&state, "count records", e))?;
 
     // Counted per collection and merged here rather than joined in SQL, so
     // the collection list is the catalog's: every layer, not only stored rows.
@@ -28,7 +29,7 @@ pub(super) async fn stats(
         .records
         .count_by_collection()
         .await
-        .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?
+        .map_err(|e| count_error(&state, "count by collection", e))?
         .into_iter()
         .collect();
     let collections: Vec<CollectionStat> = state
@@ -46,4 +47,20 @@ pub(super) async fn stats(
         total_records: total,
         collections,
     }))
+}
+
+/// A failed count: 503 when it was a claimed collection's count and the
+/// storage that claims it is unreachable, as a read of it answers; a
+/// failure of this instance's own tables stays a 500.
+fn count_error(state: &AppState, what: &str, e: CountError) -> AppError {
+    let storage_down = e
+        .claimed
+        .as_deref()
+        .and_then(|collection| state.records.external_route(collection))
+        .is_some_and(|ext| ext.unavailable(&e.error));
+    if storage_down {
+        crate::error::storage_unavailable()
+    } else {
+        AppError::Internal(format!("failed to {what}: {e}"))
+    }
 }
