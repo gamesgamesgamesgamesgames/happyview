@@ -185,7 +185,9 @@ fn query_is_read_only(query: &sqlparser::ast::Query) -> bool {
 
     fn set_expr_is_read_only(expr: &SetExpr) -> bool {
         match expr {
-            SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+            // `SELECT .. INTO` creates a table; both it and locking clauses write.
+            SetExpr::Select(select) => select.into.is_none(),
+            SetExpr::Values(_) | SetExpr::Table(_) => true,
             SetExpr::Query(q) => query_is_read_only(q),
             SetExpr::SetOperation { left, right, .. } => {
                 set_expr_is_read_only(left) && set_expr_is_read_only(right)
@@ -196,7 +198,7 @@ fn query_is_read_only(query: &sqlparser::ast::Query) -> bool {
         }
     }
 
-    set_expr_is_read_only(&query.body)
+    query.locks.is_empty() && set_expr_is_read_only(&query.body)
 }
 
 /// True when every statement is a query whose body and CTEs are all
@@ -210,9 +212,28 @@ pub fn is_read_only(sql: &str) -> Result<bool, String> {
         .map_err(|e| format!("could not parse SQL: {e}"))?;
     Ok(!statements.is_empty()
         && statements.iter().all(|s| match s {
-            Statement::Query(q) => query_is_read_only(q),
+            Statement::Query(q) => query_is_read_only(q) && !has_nested_locks(s),
             _ => false,
         }))
+}
+
+/// True when any query nested in the statement (a subquery, say) has a
+/// locking clause (`FOR UPDATE` / `FOR SHARE`).
+fn has_nested_locks(statement: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::Visit;
+
+    struct Locks;
+    impl sqlparser::ast::Visitor for Locks {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+            if query.locks.is_empty() {
+                std::ops::ControlFlow::Continue(())
+            } else {
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    }
+    statement.visit(&mut Locks).is_break()
 }
 
 /// Why a raw read that mixes record views with other relations is refused.
@@ -236,7 +257,13 @@ pub enum RecordViews {
 /// Which relations a read-only raw query reads: none of the record compat
 /// views, only them (CTE names and table functions don't count), or them
 /// together with another relation. SQL that names a view but does not parse
-/// fails closed.
+/// fails closed, and so does anything not plainly a view: a name qualified
+/// with a schema other than `main`, `public` or `temp`, or a name that is not
+/// a plain identifier, counts as another relation.
+///
+/// The check is syntactic, so it cannot see through a user function that reads
+/// the views (`my_func()`), or a user-created view built on them. The caller
+/// must gate the SQL with [`is_read_only`] first; writes are not classified.
 pub fn record_view_use(sql: &str) -> Result<RecordViews, String> {
     use sqlparser::ast::Visit;
     use sqlparser::dialect::GenericDialect;
@@ -265,40 +292,114 @@ pub fn record_view_use(sql: &str) -> Result<RecordViews, String> {
     for statement in &statements {
         let _ = statement.visit(&mut relations);
     }
-
-    let mut saw_view = false;
-    for name in relations.tables {
-        if relations.ctes.contains(&name) {
-            continue;
-        }
-        if RECORD_VIEWS.contains(&name.as_str()) {
-            saw_view = true;
-        } else {
-            return Ok(RecordViews::Mixed(name));
-        }
-    }
-    Ok(if saw_view {
-        RecordViews::Only
-    } else {
-        RecordViews::None
+    Ok(match relations.other {
+        Some(name) => RecordViews::Mixed(name),
+        None if relations.saw_view => RecordViews::Only,
+        None => RecordViews::None,
     })
 }
 
+/// Schemas a record view may be qualified with.
+const VIEW_SCHEMAS: [&str; 3] = ["main", "public", "temp"];
+
+/// Collects the relations a query reads, resolving CTE names by scope.
 #[derive(Default)]
 struct Relations {
-    tables: Vec<String>,
-    ctes: std::collections::HashSet<String>,
+    /// The CTE names visible at the current point, one set per enclosing query.
+    scopes: Vec<std::collections::HashSet<String>>,
+    saw_view: bool,
+    /// The first relation that is not a record view.
+    other: Option<String>,
+}
+
+/// An identifier as the database compares it: unquoted names fold to lower case.
+fn fold(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
+}
+
+impl Relations {
+    /// Record a relation read, given its optional schema and its name.
+    fn record(&mut self, schema: Option<&str>, name: String) -> std::ops::ControlFlow<()> {
+        let schema_ok = schema.is_none_or(|s| VIEW_SCHEMAS.contains(&s));
+        // A CTE can only be named unqualified.
+        if schema.is_none() && self.scopes.iter().any(|scope| scope.contains(&name)) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if schema_ok && RECORD_VIEWS.contains(&name.as_str()) {
+            self.saw_view = true;
+            return std::ops::ControlFlow::Continue(());
+        }
+        self.other = Some(match schema {
+            Some(schema) => format!("{schema}.{name}"),
+            None => name,
+        });
+        std::ops::ControlFlow::Break(())
+    }
+
+    fn scan_body(&mut self, body: &sqlparser::ast::SetExpr) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::SetExpr;
+        match body {
+            // `TABLE x` is a relation read that is not a `TableFactor`.
+            SetExpr::Table(table) => {
+                let schema = table.schema_name.as_deref().map(str::to_ascii_lowercase);
+                match &table.table_name {
+                    Some(name) => self.record(schema.as_deref(), name.to_ascii_lowercase()),
+                    None => self.record(schema.as_deref(), "table".into()),
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.scan_body(left)?;
+                self.scan_body(right)
+            }
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
 }
 
 impl sqlparser::ast::Visitor for Relations {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::Visit;
+
+        let mut scope = std::collections::HashSet::new();
         if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.ctes.insert(cte.alias.name.value.to_ascii_lowercase());
+            // Without RECURSIVE, a CTE body sees only the CTEs before it, so a
+            // name it shares with its own CTE or a later one is a real table.
+            // The scope below covers every CTE, which is right for the main
+            // body but would hide that; check each body on its own.
+            if !with.recursive {
+                for (i, cte) in with.cte_tables.iter().enumerate() {
+                    let mut body = Relations {
+                        scopes: self.scopes.clone(),
+                        ..Relations::default()
+                    };
+                    body.scopes.push(
+                        with.cte_tables[..i]
+                            .iter()
+                            .map(|c| fold(&c.alias.name))
+                            .collect(),
+                    );
+                    let _ = cte.query.visit(&mut body);
+                    self.saw_view |= body.saw_view;
+                    if let Some(name) = body.other {
+                        self.other = Some(name);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
             }
+            scope.extend(with.cte_tables.iter().map(|c| fold(&c.alias.name)));
         }
+        self.scopes.push(scope);
+        self.scan_body(&query.body)
+    }
+
+    fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        self.scopes.pop();
         std::ops::ControlFlow::Continue(())
     }
 
@@ -306,21 +407,168 @@ impl sqlparser::ast::Visitor for Relations {
         &mut self,
         factor: &sqlparser::ast::TableFactor,
     ) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::ObjectNamePart;
         // `args: Some(..)` is a table function (`json_each(..)`), not a relation.
-        if let sqlparser::ast::TableFactor::Table {
+        let sqlparser::ast::TableFactor::Table {
             name, args: None, ..
         } = factor
-            && let Some(sqlparser::ast::ObjectNamePart::Identifier(last)) = name.0.last()
-        {
-            self.tables.push(last.value.to_ascii_lowercase());
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let mut idents = Vec::new();
+        for part in &name.0 {
+            match part {
+                ObjectNamePart::Identifier(ident) => idents.push(fold(ident)),
+                // Not a plain name: fail closed.
+                ObjectNamePart::Function(_) => return self.record(Some("?"), name.to_string()),
+            }
         }
-        std::ops::ControlFlow::Continue(())
+        let Some(last) = idents.pop() else {
+            return self.record(Some("?"), name.to_string());
+        };
+        match idents.as_slice() {
+            [] => self.record(None, last),
+            [schema] => self.record(Some(schema), last),
+            _ => self.record(Some(&idents.join(".")), last),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_view_use_scopes_cte_names() {
+        use RecordViews::*;
+        let cases: &[(&str, &str)] = &[
+            // A CTE inside a join subquery does not hide the outer table.
+            (
+                "SELECT * FROM happyview_records JOIN (WITH my_table AS (SELECT 1 AS uri) SELECT * FROM my_table) s ON true JOIN my_table m ON m.uri = happyview_records.uri",
+                "mixed:my_table",
+            ),
+            // Nor does one in an IN subquery hide the name in a sibling.
+            (
+                "SELECT * FROM happyview_records WHERE uri IN (WITH notes AS (SELECT 'x' AS uri) SELECT uri FROM notes) AND did IN (SELECT did FROM notes)",
+                "mixed:notes",
+            ),
+            // A non-recursive CTE does not see itself.
+            (
+                "WITH my_table AS (SELECT * FROM my_table) SELECT * FROM my_table, happyview_records",
+                "mixed:my_table",
+            ),
+            // A CTE that shadows a view reads whatever its body reads.
+            (
+                "WITH happyview_records AS (SELECT * FROM my_table) SELECT * FROM happyview_records",
+                "mixed:my_table",
+            ),
+            (
+                "WITH recursive t AS (SELECT uri FROM happyview_records UNION ALL SELECT uri FROM t) SELECT * FROM t",
+                "only",
+            ),
+            (
+                "WITH a AS (SELECT * FROM happyview_records), b AS (SELECT * FROM a) SELECT * FROM b",
+                "only",
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = match record_view_use(sql).unwrap() {
+                None => "none".to_string(),
+                Only => "only".to_string(),
+                Mixed(t) => format!("mixed:{t}"),
+            };
+            assert_eq!(&got, want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn record_view_use_fails_closed_on_hard_shapes() {
+        use RecordViews::*;
+        let cases: &[(&str, &str)] = &[
+            (
+                "SELECT uri FROM happyview_records UNION TABLE my_table",
+                "mixed:my_table",
+            ),
+            (
+                "SELECT uri FROM happyview_records UNION SELECT uri FROM my_table",
+                "mixed:my_table",
+            ),
+            ("SELECT 1 UNION TABLE happyview_records", "only"),
+            (
+                "SELECT uri FROM happyview_records UNION TABLE other.my_table",
+                "mixed:other.my_table",
+            ),
+            (
+                "SELECT * FROM other.happyview_records",
+                "mixed:other.happyview_records",
+            ),
+            ("SELECT * FROM main.happyview_records", "only"),
+            ("SELECT * FROM temp.happyview_records", "only"),
+            (
+                "SELECT * FROM a.public.happyview_records",
+                "mixed:a.public.happyview_records",
+            ),
+            (
+                "SELECT * FROM happyview_records WHERE EXISTS (SELECT 1 FROM my_table)",
+                "mixed:my_table",
+            ),
+            (
+                "SELECT * FROM happyview_records WHERE EXISTS (SELECT 1 FROM happyview_record_refs)",
+                "only",
+            ),
+            (
+                "SELECT * FROM happyview_records; SELECT * FROM my_table",
+                "mixed:my_table",
+            ),
+            (
+                "SELECT * FROM happyview_records; SELECT * FROM happyview_record_refs",
+                "only",
+            ),
+            ("SELECT * FROM \"happyview_records\"", "only"),
+            ("SELECT * FROM HappyView_Records", "only"),
+            (
+                "SELECT * FROM \"HappyView_Records\"",
+                "mixed:HappyView_Records",
+            ),
+            (
+                "SELECT * FROM happyview_records, json_each((SELECT data FROM my_table))",
+                "mixed:my_table",
+            ),
+            // A schema-qualified name is never a CTE.
+            (
+                "WITH my_table AS (SELECT 1) SELECT * FROM happyview_records, public.my_table",
+                "mixed:public.my_table",
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = match record_view_use(sql).unwrap() {
+                None => "none".to_string(),
+                Only => "only".to_string(),
+                Mixed(t) => format!("mixed:{t}"),
+            };
+            assert_eq!(&got, want, "{sql}");
+        }
+        // SQLite-only syntax is outside the generic dialect: refused, not guessed at.
+        assert!(
+            record_view_use("SELECT * FROM happyview_records INDEXED BY idx WHERE uri = 'a'")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_select_into_and_locking_clauses() {
+        assert_eq!(
+            is_read_only("SELECT * INTO my_table FROM happyview_records"),
+            Ok(false)
+        );
+        assert_eq!(is_read_only("SELECT * FROM t FOR UPDATE"), Ok(false));
+        assert_eq!(is_read_only("SELECT * FROM t FOR SHARE"), Ok(false));
+        assert_eq!(
+            is_read_only("SELECT * FROM (SELECT * FROM t FOR UPDATE) s"),
+            Ok(false)
+        );
+        assert_eq!(is_read_only("SELECT * FROM t"), Ok(true));
+    }
 
     #[test]
     fn record_view_use_classifies_relations() {
