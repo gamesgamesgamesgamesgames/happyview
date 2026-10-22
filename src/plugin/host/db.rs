@@ -82,6 +82,34 @@ pub async fn run_query_on(
     Ok(rows.iter().map(row_to_json).collect())
 }
 
+/// [`run_query_on`] for a read routed to a database another owner also
+/// uses. On Postgres it runs in a read-only transaction that is rolled back,
+/// so it can neither write (`nextval`, say) nor leave session state
+/// (`set_config`) on a pooled connection that owner's own work reuses.
+pub async fn run_read_only_query_on(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Map<String, Value>>, QueryError> {
+    if backend == crate::db::DatabaseBackend::Sqlite {
+        return run_query_on(db, sql, params).await;
+    }
+    check_raw_sql_tables(sql).map_err(QueryError::Refused)?;
+    let query = bind_params(crate::db::query(sql), params).map_err(QueryError::Refused)?;
+    let mut tx = db.begin().await.map_err(QueryError::Database)?;
+    crate::db::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(QueryError::Database)?;
+    let rows = query
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(QueryError::Database)?;
+    tx.rollback().await.map_err(QueryError::Database)?;
+    Ok(rows.iter().map(row_to_json).collect())
+}
+
 /// SQL is passed through untranslated; placeholders are backend-native
 /// (`?` on SQLite, `$1`… on Postgres), as for Lua's `db.raw`.
 pub async fn run_query(
@@ -136,6 +164,52 @@ mod tests {
             DatabaseBackend::Sqlite => "?".to_string(),
             DatabaseBackend::Postgres => format!("${position}"),
         }
+    }
+
+    /// A read routed to Postgres runs in a read-only transaction that is
+    /// rolled back: it cannot write, and leaves no session state on the
+    /// pooled connection for the next query to inherit.
+    #[tokio::test]
+    #[serial]
+    async fn a_routed_read_on_postgres_can_neither_write_nor_change_the_session() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL unset: skipped");
+            return;
+        };
+        let backend = DatabaseBackend::from_url(&url);
+        if backend != DatabaseBackend::Postgres {
+            return;
+        }
+        // One connection, so the second query runs where the first did.
+        let db = crate::db::connect_with(&url, backend, 1).await;
+
+        let rows = run_read_only_query_on(
+            &db,
+            backend,
+            "SELECT set_config('application_name', 'changed by a read', false) AS v",
+            &[],
+        )
+        .await
+        .expect("the read runs");
+        assert_eq!(rows[0]["v"], json!("changed by a read"));
+        let rows = run_query(&db, "SELECT current_setting('application_name') AS v", &[])
+            .await
+            .unwrap();
+        assert_ne!(rows[0]["v"], json!("changed by a read"));
+
+        crate::db::query("CREATE SEQUENCE IF NOT EXISTS host_db_read_only_seq")
+            .execute(&db)
+            .await
+            .unwrap();
+        let err = run_read_only_query_on(
+            &db,
+            backend,
+            "SELECT nextval('host_db_read_only_seq') AS v",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("read-only transaction"), "{err}");
     }
 
     /// A boolean parameter against a boolean column. Binding it as an integer

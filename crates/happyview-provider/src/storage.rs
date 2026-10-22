@@ -92,6 +92,11 @@ pub trait RecordStorage: Send + Sync + 'static {
     /// When this returns a route, read-only raw SQL that reads only those
     /// views runs here instead of on the instance's own database. The
     /// default, `None`, keeps every raw query local.
+    ///
+    /// HappyView's read-only check is syntactic, and it cannot see what a
+    /// function a query calls does. On Postgres it runs each query in a
+    /// read-only transaction that it rolls back; even so, the route should
+    /// connect as a role that cannot write.
     fn raw_route(&self) -> Option<ReadRoute> {
         None
     }

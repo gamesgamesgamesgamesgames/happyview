@@ -2558,7 +2558,14 @@ async fn host_db_impl(
                 .await;
             }
             Ok(crate::raw_sql_guard::RecordViews::Only) => {
-                let response = match super::run_query_on(&route.pool, &sql, &params).await {
+                let response = match super::run_read_only_query_on(
+                    &route.pool,
+                    route.backend,
+                    &sql,
+                    &params,
+                )
+                .await
+                {
                     Ok(rows) => {
                         serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default()
                     }
