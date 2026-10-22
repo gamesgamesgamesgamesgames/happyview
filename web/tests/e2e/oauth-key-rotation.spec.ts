@@ -10,6 +10,7 @@ import {
   getOauthSessionTokenState,
   waitForRealAccessTokenExpiry,
   createFakeOauthSessionPinnedToKid,
+  markPdsEmailVerified,
 } from "./auth-helper";
 
 const PDS_URL = "http://localhost:3100";
@@ -36,6 +37,7 @@ async function createPdsAccount(): Promise<{ did: string; handle: string }> {
     );
   }
   const data = (await resp.json()) as { did: string; handle?: string };
+  await markPdsEmailVerified(data.did);
   return { did: data.did, handle: data.handle ?? handle };
 }
 
