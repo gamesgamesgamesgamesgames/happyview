@@ -1102,6 +1102,10 @@ async fn record_view_reads_the_read_only_gate_cannot_vouch_for_are_refused() {
     for sql in [
         "SELECT rkey FROM happyview_records FOR SHARE",
         "SELECT rkey FROM happyview_records INDEXED BY no_such_index",
+        // The refs view has no claimed-write guard in front of it, so these
+        // reach the routing arms themselves.
+        "SELECT source_uri FROM happyview_record_refs FOR SHARE",
+        "SELECT source_uri FROM happyview_record_refs INDEXED BY no_such_index",
     ] {
         let err = query_raw(&state, sql).await.unwrap_err();
         assert!(err.contains("FORBIDDEN"), "{sql}: {err}");
