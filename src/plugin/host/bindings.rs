@@ -2514,10 +2514,13 @@ async fn host_db_impl(
     // route, where those views show its records. It is classified before the
     // read-only gate: a read the gate cannot vouch for (a locking clause, SQL
     // the parser rejects) must not fall through to the local views, which hold
-    // none of the claimed records.
+    // none of the claimed records. A write runs locally as it always has, the
+    // claimed-write guard above covering claimed collections; one that also
+    // reads the views sees only the local rows.
     if !execute
         && let Some(ext) = &external
         && let Some(route) = ext.raw_route()
+        && !crate::raw_sql_guard::is_write(&sql)
     {
         match crate::raw_sql_guard::record_view_use(&sql) {
             Ok(crate::raw_sql_guard::RecordViews::None) => {}

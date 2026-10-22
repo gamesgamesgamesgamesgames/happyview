@@ -217,6 +217,27 @@ pub fn is_read_only(sql: &str) -> Result<bool, String> {
         }))
 }
 
+/// True when every statement is a write: a statement other than a query, or
+/// a query whose body is an `INSERT`, `UPDATE`, `DELETE` or `MERGE`. A read
+/// with a data-modifying CTE, a batch mixing reads and writes, and SQL that
+/// does not parse are not.
+pub fn is_write(sql: &str) -> bool {
+    use sqlparser::ast::{SetExpr, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return false;
+    };
+    !statements.is_empty()
+        && statements.iter().all(|s| match s {
+            Statement::Query(q) => matches!(
+                *q.body,
+                SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
+            ),
+            _ => true,
+        })
+}
+
 /// True when any query nested in the statement (a subquery, say) has a
 /// locking clause (`FOR UPDATE` / `FOR SHARE`).
 fn has_nested_locks(statement: &sqlparser::ast::Statement) -> bool {
@@ -803,6 +824,33 @@ mod tests {
             is_read_only("WITH x AS (DELETE FROM happyview_records RETURNING uri) SELECT * FROM x"),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn is_write_tells_writes_from_reads() {
+        for sql in [
+            "UPDATE happyview_records SET rev = 'x' WHERE collection = 'a.b.c'",
+            "DELETE FROM happyview_record_refs WHERE collection = 'a.b.c'",
+            "INSERT INTO my_table SELECT uri FROM happyview_records",
+            "WITH x AS (SELECT 1) DELETE FROM happyview_records",
+            "CREATE TABLE t AS SELECT * FROM happyview_records",
+            "UPDATE t SET a = 1; DELETE FROM u",
+        ] {
+            assert!(is_write(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM happyview_records",
+            "SELECT * FROM happyview_records FOR SHARE",
+            "SELECT * INTO t FROM happyview_records",
+            // A data-modifying CTE under a read is not a plain write.
+            "WITH x AS (DELETE FROM happyview_records RETURNING uri) SELECT * FROM x",
+            // Neither is a batch mixing a read with a write.
+            "SELECT * FROM happyview_records; DELETE FROM t",
+            "SELECT * FROM happyview_records INDEXED BY no_such_index",
+            "",
+        ] {
+            assert!(!is_write(sql), "{sql}");
+        }
     }
 
     #[test]

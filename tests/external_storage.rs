@@ -1052,6 +1052,44 @@ async fn raw_reads_of_record_views_use_the_raw_route() {
     assert!(out.is_array(), "{out}");
 }
 
+/// Writes through the record views run locally, as they did before the
+/// route, even sent through `host_db_query` as Lua's `sql.raw` sends them.
+#[tokio::test]
+async fn raw_writes_of_unclaimed_records_through_the_views_stay_local() {
+    let state = instance(Some(Arc::new(
+        FakeStorage::claiming_with_raw(&[CLAIMED]).await,
+    )))
+    .await;
+    state.plugin_registry.register(sql_library()).await;
+    state
+        .records
+        .write_network(
+            &state.db,
+            &[prepared(LOCAL, "n1", json!({"text": "before"}))],
+        )
+        .await
+        .unwrap();
+
+    query_raw(
+        &state,
+        &format!(
+            "UPDATE happyview_records SET record = '{{\"text\":\"after\"}}' WHERE collection = '{LOCAL}'"
+        ),
+    )
+    .await
+    .expect("a local update");
+    let stored = state.records.get(&uri(LOCAL, "n1")).await.unwrap().unwrap();
+    assert_eq!(stored.record, r#"{"text":"after"}"#);
+
+    query_raw(
+        &state,
+        &format!("DELETE FROM happyview_records WHERE collection = '{LOCAL}'"),
+    )
+    .await
+    .expect("a local delete");
+    assert_eq!(local_rows(&state).await, 0);
+}
+
 #[tokio::test]
 async fn raw_reads_of_local_tables_stay_local() {
     let state = instance(Some(Arc::new(
