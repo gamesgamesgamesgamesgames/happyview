@@ -206,6 +206,29 @@ async fn collection_listings_include_project_record_lexicons() {
     );
 }
 
+/// An unindexed project lexicon stays in the catalog for validation and refs,
+/// but its collection is left out of the listings built for ingestion.
+#[tokio::test]
+#[serial]
+async fn an_unindexed_project_lexicon_is_not_offered_for_ingestion() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut snap = owning_game();
+    snap.lexicons.get_mut(GAME).unwrap().indexed = false;
+    app.state.project.store(Arc::new(snap));
+
+    assert!(!app.state.lexicons.is_indexed(GAME));
+    let listed = app.get_json("/admin/records/collections").await;
+    assert!(
+        !listed["collections"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(GAME)),
+        "{listed}"
+    );
+    assert!(app.state.lexicons.get(GAME).await.is_some());
+}
+
 const SCRIPT: &str = "xrpc.query:games.gamesgamesgamesgames.listGames";
 const SCRIPT_PATH: &str = "src/lexicons/games/gamesgamesgamesgames/listGames.lua";
 

@@ -314,6 +314,44 @@ async fn a_declared_backfill_starts_once() {
 }
 
 #[tokio::test]
+async fn an_unindexed_lexicon_declaring_a_backfill_starts_none() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let root = tempfile::tempdir().unwrap();
+    let write = |rel: &str, contents: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "happyview.toml",
+        "[lexicons.\"com.example.project.quiet\"]\nbackfill = true\nindexed = false\n",
+    );
+    write(
+        "src/lexicons/com/example/project/quiet.json",
+        r#"{"lexicon":1,"id":"com.example.project.quiet","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}"#,
+    );
+    happyview::project::boot::build_and_install(&app.state, root.path())
+        .await
+        .unwrap();
+
+    assert!(
+        happyview::project::boot::start_declared_backfills(&app.state)
+            .await
+            .is_empty()
+    );
+    let (jobs,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ?",
+        app.state.db_backend,
+    ))
+    .bind("com.example.project.quiet")
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 0);
+}
+
+#[tokio::test]
 async fn a_backfill_of_named_accounts_does_not_stand_in_for_the_declared_one() {
     common::require_db!();
     let app = TestApp::new().await;
