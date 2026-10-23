@@ -1221,6 +1221,7 @@ import type {
   PluginType,
   PluginDependency,
   CapabilityReport,
+  LifecycleState,
 } from "@/types/plugins";
 export type {
   PluginSummary,
@@ -1228,17 +1229,37 @@ export type {
   OfficialPluginSummary,
   OfficialPluginsListResponse,
   ReleaseEntry,
+  ChannelEntry,
+  LifecycleState,
+  PluginRegistryStatus,
 } from "@/types/plugins";
 
 export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
 }
 
-export function addPlugin(body: {
-  url: string;
-  sha256?: string;
-  accepted_capabilities?: string[];
-}) {
+/** A registry project and which of its versions: a channel to follow
+ * (`latest` when neither is named) or one version to pin. */
+export interface RegistryProjectRef {
+  did: string;
+  name: string;
+  channel?: string;
+  version?: string;
+}
+
+/** Another version of the project a registry install came from. Empty keeps
+ * what it has: the channel it follows, or its pinned version. */
+export type RegistrySelector =
+  Record<string, never> | { channel: string } | { version: string };
+
+/** Where a plugin comes from: a manifest URL, or a registry project. A
+ * registry plugin is checked against its CIDs, so it takes no `sha256`. */
+export type PluginOrigin =
+  { url: string; sha256?: string } | { registry: RegistryProjectRef };
+
+export function addPlugin(
+  body: PluginOrigin & { accepted_capabilities?: string[] },
+) {
   return apiFetch<PluginSummary>("/admin/plugins", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1251,7 +1272,12 @@ export function removePlugin(id: string) {
   });
 }
 
-export function reloadPlugin(id: string, body?: { url?: string }) {
+export function reloadPlugin(
+  id: string,
+  body?:
+    | { url?: string; accepted_capabilities?: string[] }
+    | { registry: RegistrySelector; accepted_capabilities?: string[] },
+) {
   return apiFetch<PluginSummary>(
     `/admin/plugins/${encodeURIComponent(id)}/reload`,
     {
@@ -1333,12 +1359,27 @@ export interface PluginPreview {
   allowed_hosts: string[];
   capabilities: CapabilityReport;
   sha256: string;
+  /** The registry version a registry preview resolved to. */
+  registry?: PreviewRegistry;
 }
 
-export function previewPlugin(url: string, signal?: AbortSignal) {
+export interface PreviewRegistry {
+  did: string;
+  name: string;
+  channel: string | null;
+  version: string;
+  version_uri: string;
+  state: LifecycleState;
+}
+
+export function previewPlugin(
+  origin: string | { url: string } | { registry: RegistryProjectRef },
+  signal?: AbortSignal,
+) {
+  const body = typeof origin === "string" ? { url: origin } : origin;
   return apiFetch<PluginPreview>("/admin/plugins/preview", {
     method: "POST",
-    body: JSON.stringify({ url }),
+    body: JSON.stringify(body),
     signal,
   });
 }

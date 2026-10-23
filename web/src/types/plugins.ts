@@ -25,11 +25,58 @@ export interface PluginDependency {
 
 export type PluginType = "auth" | "interpreter" | "library";
 
+/** Where a publisher has put a version. `active` and `deprecated` may be
+ * installed; `unavailable` and `retired` may not. */
+export type LifecycleState =
+  "active" | "deprecated" | "unavailable" | "retired";
+
+/** Whether the registry holds a version's bytes. */
+export type Availability = "pending" | "available" | "deletedAtSource";
+
 export interface ReleaseEntry {
   version: string;
   name: string;
-  published_at: string;
-  body: string;
+  published_at: string | null;
+  /** The version's changelog, as markdown. */
+  body: string | null;
+  state: LifecycleState;
+  /** Why the publisher set `state`, when they said. */
+  reason: string | null;
+  /** The registry saw this version's records change after publication. */
+  suspect: boolean;
+  /** Its state allows it, the registry holds its bytes and it isn't
+   * suspect. A version that may not be installed is still listed. */
+  installable: boolean;
+  availability: Availability;
+  version_uri: string;
+  manifest_cid: string;
+  package_cid: string;
+  manifest_blob_cid: string;
+}
+
+/** Where one of a project's channels points. */
+export interface ChannelEntry {
+  version: string;
+  state: LifecycleState;
+  installable: boolean;
+  availability: Availability;
+}
+
+/** Where an installed plugin stands in the registry. */
+export interface PluginRegistryStatus {
+  /** `null` for a URL install no registry project matched. */
+  did: string | null;
+  name: string | null;
+  /** The channel the install follows; `null` when pinned to a version. */
+  channel: string | null;
+  version_uri: string | null;
+  /** `null` when the catalogue doesn't hold the project. */
+  installed_state: LifecycleState | null;
+  installed_reason: string | null;
+  /** The state of the version the followed channel points at. */
+  channel_state: LifecycleState | null;
+  /** A URL install that no registry project matched. */
+  unresolved: boolean;
 }
 
 export interface PluginSummary {
@@ -51,10 +98,17 @@ export interface PluginSummary {
   secrets_configured: boolean;
   loaded_at: string | null;
   update_available: boolean;
-  latest_version: string | null;
+  /** Where the followed channel points; absent when the catalogue has
+   * nothing to say about this plugin. */
+  latest_version?: string | null;
   pending_releases: ReleaseEntry[];
-  /** The manifest an update installs; absent when no update is offered. */
-  latest_manifest_url?: string;
+  /** Whether `latest_version` may be installed. A channel can move to a
+   * version that may not be, and then nothing is offered. */
+  latest_version_installable?: boolean;
+  latest_state?: LifecycleState;
+  /** `null` for a plugin installed from a file, or from a URL that was never
+   * checked against the registry. */
+  registry: PluginRegistryStatus | null;
   plugin_type: PluginType;
   namespace: string | null;
   dependencies: PluginDependency[];
@@ -68,11 +122,20 @@ export interface PluginsListResponse {
 }
 
 export interface OfficialPluginSummary {
+  /** The project name. With `publisher_did`, what an install names. */
   id: string;
+  publisher_did: string | null;
   name: string;
   description: string | null;
   icon_url: string | null;
-  latest_version: string;
+  plugin_type: PluginType;
+  /** The version `latest` points at; `null` when it points nowhere. */
+  latest_version: string | null;
+  /** Every channel the project publishes, by name. */
+  channels: Record<string, ChannelEntry>;
+  /** The project's own lifecycle state. */
+  lifecycle_state: LifecycleState;
+  /** Transitional: a catalogue plugin is installed by its registry project. */
   manifest_url: string;
   official: boolean;
   banner_url: string | null;

@@ -34,7 +34,18 @@ test("a publisher's fenced code is highlighted, and an unknown language still re
             name: "HTTP",
             description: null,
             icon_url: null,
+            publisher_did: "did:plc:mo7vq4jbioxwafy5zkcc3eux",
+            plugin_type: "library",
             latest_version: "1.0.0",
+            channels: {
+              latest: {
+                version: "1.0.0",
+                state: "active",
+                installable: true,
+                availability: "available",
+              },
+            },
+            lifecycle_state: "active",
             manifest_url: "https://example.com/http/manifest.json",
             official: true,
             banner_url: null,

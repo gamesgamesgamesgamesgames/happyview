@@ -3,7 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ArrowUpCircle, Loader2, RefreshCw, Trash2 } from "lucide-react";
+import {
+  ArrowUpCircle,
+  GitBranch,
+  Loader2,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useOfficialPlugins } from "@/hooks/use-official-plugins";
@@ -21,12 +27,105 @@ import type { PluginSummary } from "@/types/plugins";
 import { visibleCapabilities } from "@/components/plugin-capabilities";
 import { PluginDetail, type PluginView } from "@/components/plugin-detail";
 import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
+import { PluginChannelDialog } from "@/components/plugin-channel-dialog";
+import {
+  LifecycleNotice,
+  channelsFor,
+  unavailableChannelCopy,
+} from "@/components/plugin-lifecycle";
 import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+
+/**
+ * What the publisher has since said about the installed version, and about
+ * where its channel now points. A retired or unavailable version keeps
+ * running, so this is the only place an operator learns of it.
+ */
+function LifecycleNotices({ plugin }: { plugin: PluginSummary }) {
+  const registry = plugin.registry;
+  if (!registry) return null;
+  if (registry.unresolved) {
+    return (
+      <LifecycleNotice
+        tone="info"
+        title="Unresolved: not matched to a registry project"
+      >
+        This plugin was installed from a URL the registry doesn&apos;t
+        recognise, so its lifecycle and updates aren&apos;t tracked. Remove it
+        and add it from the registry to follow a channel.
+      </LifecycleNotice>
+    );
+  }
+
+  const notices: React.ReactNode[] = [];
+  const reason = registry.installed_reason;
+  switch (registry.installed_state) {
+    case "retired":
+      notices.push(
+        <LifecycleNotice
+          key="installed"
+          tone="danger"
+          title="This version is retired by its publisher"
+        >
+          {reason ? <p>{reason}</p> : null}
+          <p>It keeps running until you update, switch channel or remove it.</p>
+        </LifecycleNotice>,
+      );
+      break;
+    case "deprecated":
+      notices.push(
+        <LifecycleNotice
+          key="installed"
+          tone="warning"
+          title={
+            reason
+              ? `Deprecated: ${reason}`
+              : "This version is deprecated by its publisher"
+          }
+        />,
+      );
+      break;
+    case "unavailable":
+      notices.push(
+        <LifecycleNotice
+          key="installed"
+          tone="warning"
+          title="This version is no longer available from the registry"
+        >
+          {reason ? <p>{reason}</p> : null}
+          <p>
+            It keeps running, but it can&apos;t be reloaded from the registry.
+          </p>
+        </LifecycleNotice>,
+      );
+      break;
+  }
+
+  // The channel moved somewhere that can't be installed, so no update is
+  // offered; without this the plugin would look current.
+  if (registry.channel && plugin.latest_version_installable === false) {
+    notices.push(
+      <LifecycleNotice
+        key="channel"
+        tone="warning"
+        title={unavailableChannelCopy(
+          registry.channel,
+          plugin.latest_state ?? registry.channel_state,
+        )}
+      >
+        Nothing is offered until it moves to a version that can be installed.
+      </LifecycleNotice>,
+    );
+  }
+
+  return notices.length > 0 ? (
+    <div className="flex flex-col gap-3">{notices}</div>
+  ) : null;
+}
 
 /** Only `network:request:defined` has a host list the operator may set. */
 function managesHosts(plugin: PluginSummary): boolean {
@@ -53,6 +152,7 @@ export default function InstalledPlugin() {
   const [hosts, setHosts] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
+  const [channelOpen, setChannelOpen] = useState(false);
 
   const canManage = hasPermission("plugins:manage");
 
@@ -102,7 +202,13 @@ export default function InstalledPlugin() {
 
   const view: PluginView | null = useMemo(() => {
     if (!plugin) return null;
-    const catalogue = byId.get(plugin.id);
+    // A registry install's releases are its own project's; another
+    // publisher's project can hold the same name in the catalogue.
+    const listed = byId.get(plugin.registry?.name ?? plugin.id);
+    const catalogue =
+      plugin.registry?.did && listed?.publisher_did !== plugin.registry.did
+        ? undefined
+        : listed;
     return {
       id: plugin.id,
       name: plugin.name,
@@ -120,9 +226,18 @@ export default function InstalledPlugin() {
       source: { kind: plugin.source, url: plugin.url },
       installed: true,
       updateAvailable: plugin.update_available,
-      latestVersion: plugin.latest_version,
+      latestVersion: plugin.latest_version ?? null,
       releases: catalogue?.releases ?? plugin.pending_releases,
       sections: catalogue?.sections ?? {},
+      registry: plugin.registry
+        ? {
+            did: plugin.registry.did,
+            channel: plugin.registry.channel,
+            state: plugin.registry.installed_state,
+            reason: plugin.registry.installed_reason,
+            unresolved: plugin.registry.unresolved,
+          }
+        : null,
     };
   }, [plugin, byId]);
 
@@ -165,6 +280,15 @@ export default function InstalledPlugin() {
     }
   }
 
+  // Only a registry install follows a channel; any other has none to switch.
+  const followsProject = Boolean(plugin?.registry?.did && plugin.registry.name);
+  const projectChannels = plugin?.registry
+    ? channelsFor(
+        byId.get(plugin.registry.name ?? plugin.id),
+        plugin.registry.did,
+      )
+    : null;
+
   const hasSettings =
     plugin !== null &&
     canManage &&
@@ -202,127 +326,155 @@ export default function InstalledPlugin() {
             </Button>
           </div>
         ) : (
-          <PluginDetail
-            plugin={view}
-            actions={
-              canManage ? (
-                <>
-                  {plugin?.update_available ? (
-                    <Button onClick={() => setUpdateOpen(true)}>
-                      <ArrowUpCircle />
-                      Update
-                    </Button>
-                  ) : null}
-                  <Button
-                    variant="outline"
-                    onClick={() => void run("reload", () => reloadPlugin(id))}
-                    disabled={busy !== null}
-                  >
-                    {busy === "reload" ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <RefreshCw />
-                    )}
-                    Reload
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() =>
-                      void run("check", () => checkPluginUpdate(id))
-                    }
-                    disabled={busy !== null}
-                  >
-                    {busy === "check" ? (
-                      <Loader2 className="animate-spin" />
+          <>
+            {plugin ? <LifecycleNotices plugin={plugin} /> : null}
+            <PluginDetail
+              plugin={view}
+              actions={
+                canManage ? (
+                  <>
+                    {plugin?.update_available ? (
+                      <Button onClick={() => setUpdateOpen(true)}>
+                        <ArrowUpCircle />
+                        Update
+                      </Button>
                     ) : null}
-                    Check for update
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    onClick={() => void run("remove", () => removePlugin(id))}
-                    disabled={busy !== null}
-                  >
-                    {busy === "remove" ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <Trash2 />
-                    )}
-                    Remove
-                  </Button>
-                </>
-              ) : null
-            }
-            settings={
-              hasSettings && plugin ? (
-                <div className="flex max-w-xl flex-col gap-4">
-                  {plugin.required_secrets.map((secret) => (
-                    <div key={secret.key} className="flex flex-col gap-2">
-                      <Label htmlFor={`secret-${secret.key}`}>
-                        {secret.name}
-                      </Label>
-                      <Input
-                        id={`secret-${secret.key}`}
-                        type="password"
-                        autoComplete="off"
-                        placeholder={secret.key}
-                        value={secrets[secret.key] ?? ""}
-                        onChange={(e) =>
-                          setSecrets((prev) => ({
-                            ...prev,
-                            [secret.key]: e.target.value,
-                          }))
-                        }
-                      />
-                      {secret.description ? (
-                        <p className="text-xs text-muted-foreground">
-                          {secret.description}
-                        </p>
-                      ) : null}
-                    </div>
-                  ))}
-
-                  {managesHosts(plugin) ? (
-                    <div className="flex flex-col gap-2">
-                      <Label>Allowed hosts</Label>
-                      {hosts.map((host, index) => (
-                        <Input
-                          key={index}
-                          value={host}
-                          placeholder="api.example.com"
-                          onChange={(e) => {
-                            const next = [...hosts];
-                            next[index] = e.target.value;
-                            setHosts([...next.filter((h) => h.trim()), ""]);
-                          }}
-                        />
-                      ))}
-                      <p className="text-xs text-muted-foreground">
-                        A leading <code className="font-mono">*.</code> allows
-                        subdomains.
-                      </p>
-                    </div>
-                  ) : null}
-
-                  <div className="flex items-center gap-3">
-                    <Button onClick={saveSettings} disabled={saving} size="sm">
-                      {saving ? <Loader2 className="animate-spin" /> : null}
-                      Save
+                    {followsProject ? (
+                      <Button
+                        variant="outline"
+                        onClick={() => setChannelOpen(true)}
+                        disabled={busy !== null}
+                      >
+                        <GitBranch />
+                        Switch channel
+                      </Button>
+                    ) : null}
+                    <Button
+                      variant="outline"
+                      onClick={() => void run("reload", () => reloadPlugin(id))}
+                      disabled={busy !== null}
+                    >
+                      {busy === "reload" ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <RefreshCw />
+                      )}
+                      Reload
                     </Button>
-                    {plugin.secrets_configured ? null : (
-                      <span className="text-xs text-muted-foreground">
-                        Not configured
-                      </span>
-                    )}
+                    <Button
+                      variant="outline"
+                      onClick={() =>
+                        void run("check", () => checkPluginUpdate(id))
+                      }
+                      disabled={busy !== null}
+                    >
+                      {busy === "check" ? (
+                        <Loader2 className="animate-spin" />
+                      ) : null}
+                      Check for update
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      onClick={() => void run("remove", () => removePlugin(id))}
+                      disabled={busy !== null}
+                    >
+                      {busy === "remove" ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <Trash2 />
+                      )}
+                      Remove
+                    </Button>
+                  </>
+                ) : null
+              }
+              settings={
+                hasSettings && plugin ? (
+                  <div className="flex max-w-xl flex-col gap-4">
+                    {plugin.required_secrets.map((secret) => (
+                      <div key={secret.key} className="flex flex-col gap-2">
+                        <Label htmlFor={`secret-${secret.key}`}>
+                          {secret.name}
+                        </Label>
+                        <Input
+                          id={`secret-${secret.key}`}
+                          type="password"
+                          autoComplete="off"
+                          placeholder={secret.key}
+                          value={secrets[secret.key] ?? ""}
+                          onChange={(e) =>
+                            setSecrets((prev) => ({
+                              ...prev,
+                              [secret.key]: e.target.value,
+                            }))
+                          }
+                        />
+                        {secret.description ? (
+                          <p className="text-xs text-muted-foreground">
+                            {secret.description}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+
+                    {managesHosts(plugin) ? (
+                      <div className="flex flex-col gap-2">
+                        <Label>Allowed hosts</Label>
+                        {hosts.map((host, index) => (
+                          <Input
+                            key={index}
+                            value={host}
+                            placeholder="api.example.com"
+                            onChange={(e) => {
+                              const next = [...hosts];
+                              next[index] = e.target.value;
+                              setHosts([...next.filter((h) => h.trim()), ""]);
+                            }}
+                          />
+                        ))}
+                        <p className="text-xs text-muted-foreground">
+                          A leading <code className="font-mono">*.</code> allows
+                          subdomains.
+                        </p>
+                      </div>
+                    ) : null}
+
+                    <div className="flex items-center gap-3">
+                      <Button
+                        onClick={saveSettings}
+                        disabled={saving}
+                        size="sm"
+                      >
+                        {saving ? <Loader2 className="animate-spin" /> : null}
+                        Save
+                      </Button>
+                      {plugin.secrets_configured ? null : (
+                        <span className="text-xs text-muted-foreground">
+                          Not configured
+                        </span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ) : undefined
-            }
-          />
+                ) : undefined
+              }
+            />
+          </>
         )}
       </div>
 
+      {plugin && followsProject ? (
+        <PluginChannelDialog
+          plugin={plugin}
+          channels={projectChannels}
+          open={channelOpen}
+          onOpenChange={setChannelOpen}
+          onSwitched={() => void load()}
+        />
+      ) : null}
+
       <PluginUpdateDialog
         plugin={plugin}
+        catalogueEntry={plugin ? byId.get(plugin.id) : undefined}
         open={updateOpen}
         onOpenChange={setUpdateOpen}
         onUpdated={() => {

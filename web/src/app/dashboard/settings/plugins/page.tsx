@@ -45,8 +45,12 @@ const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"];
 function attention(plugin: PluginSummary): {
   needs: boolean;
   label: string | null;
-  kind: "config" | "update" | null;
+  kind: "config" | "update" | "retired" | null;
 } {
+  // A retired version keeps running, so the row is the operator's cue.
+  if (plugin.registry?.installed_state === "retired") {
+    return { needs: true, label: "Retired version", kind: "retired" };
+  }
   if (!plugin.secrets_configured) {
     return { needs: true, label: "Needs configuration", kind: "config" };
   }

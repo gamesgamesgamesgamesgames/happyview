@@ -19,28 +19,71 @@ import { Button } from "@/components/ui/button";
 import {
   previewPlugin,
   reloadPlugin,
+  type OfficialPluginSummary,
   type PluginPreview,
   type PluginSummary,
+  type RegistryProjectRef,
   type SecretDefinition,
 } from "@/lib/api";
+import { ReleaseStateBadge } from "@/components/plugin-lifecycle";
 
 interface PluginUpdateDialogProps {
   plugin: PluginSummary | null;
+  /** The catalogue's entry under the plugin's id, for an install that
+   * follows no registry project. */
+  catalogueEntry?: OfficialPluginSummary;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUpdated: (updated: PluginSummary) => void;
 }
 
+/**
+ * How the update is fetched. A registry install moves along the channel it
+ * follows, and the server resolves that version itself. A URL install takes
+ * the catalogue's manifest, but only when the listing offers the version the
+ * server's update gate approved: the listing is one entry per id from any
+ * publisher, and may have moved on, or be someone else's, since the gate ran.
+ */
+function updateSource(
+  plugin: PluginSummary | null,
+  entry: OfficialPluginSummary | undefined,
+):
+  | { kind: "registry"; project: RegistryProjectRef }
+  | { kind: "url"; url: string }
+  | null {
+  if (!plugin) return null;
+  const registry = plugin.registry;
+  if (registry?.did && registry.name) {
+    return {
+      kind: "registry",
+      project: {
+        did: registry.did,
+        name: registry.name,
+        ...(registry.channel ? { channel: registry.channel } : {}),
+      },
+    };
+  }
+  if (
+    entry &&
+    plugin.latest_version &&
+    entry.latest_version === plugin.latest_version
+  ) {
+    return { kind: "url", url: entry.manifest_url };
+  }
+  return null;
+}
+
 export function PluginUpdateDialog({
   plugin,
+  catalogueEntry,
   open,
   onOpenChange,
   onUpdated,
 }: PluginUpdateDialogProps) {
-  // The entry the server's update gate approved for this install. The
-  // catalogue listing is not consulted: it is one entry per id from any
-  // publisher, and may have moved on since the gate ran.
-  const manifestUrl = plugin?.latest_manifest_url ?? null;
+  const source = updateSource(plugin, catalogueEntry);
+  // Serialised so the preview effect runs when the source changes, not when
+  // a poll hands back an equal one.
+  const sourceKey = source ? JSON.stringify(source) : null;
 
   const [newManifestPreview, setNewManifestPreview] =
     useState<PluginPreview | null>(null);
@@ -54,14 +97,21 @@ export function PluginUpdateDialog({
       setError(null);
       return;
     }
-    if (!manifestUrl) {
+    if (!sourceKey) {
       setNewManifestPreview(null);
       return;
     }
 
+    const source = JSON.parse(sourceKey) as NonNullable<
+      ReturnType<typeof updateSource>
+    >;
     let cancelled = false;
     setPreviewLoading(true);
-    previewPlugin(manifestUrl)
+    previewPlugin(
+      source.kind === "registry"
+        ? { registry: source.project }
+        : { url: source.url },
+    )
       .then((preview) => {
         if (!cancelled) setNewManifestPreview(preview);
       })
@@ -75,7 +125,7 @@ export function PluginUpdateDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, plugin, manifestUrl]);
+  }, [open, plugin, sourceKey]);
 
   if (!plugin) return null;
 
@@ -92,14 +142,20 @@ export function PluginUpdateDialog({
   const hasLatestVersion = Boolean(plugin.latest_version);
 
   const handleUpdate = async () => {
-    if (!manifestUrl) {
-      setError("No manifest URL available for this plugin.");
+    if (!source) {
+      setError(
+        "The catalogue no longer offers this version. Check for an update and try again.",
+      );
       return;
     }
     setUpdating(true);
     setError(null);
     try {
-      const updated = await reloadPlugin(plugin.id, { url: manifestUrl });
+      // An empty selector keeps the channel the install follows.
+      const updated = await reloadPlugin(
+        plugin.id,
+        source.kind === "registry" ? { registry: {} } : { url: source.url },
+      );
       if (plugin.latest_version) {
         try {
           window.localStorage.setItem(
@@ -124,7 +180,7 @@ export function PluginUpdateDialog({
     }
   };
 
-  const updateDisabled = updating || previewLoading || !manifestUrl;
+  const updateDisabled = updating || previewLoading || !source;
 
   return (
     <ResponsiveDialog open={open} onOpenChange={onOpenChange}>
@@ -132,10 +188,15 @@ export function PluginUpdateDialog({
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Update {plugin.name}</ResponsiveDialogTitle>
           <ResponsiveDialogDescription asChild>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline">v{plugin.version}</Badge>
               <span aria-hidden>→</span>
               <Badge>v{plugin.latest_version ?? "unknown"}</Badge>
+              {plugin.registry?.channel ? (
+                <span className="text-muted-foreground">
+                  on the {plugin.registry.channel} channel
+                </span>
+              ) : null}
             </div>
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
@@ -174,15 +235,36 @@ export function PluginUpdateDialog({
                     key={release.version}
                     className="flex flex-col gap-2"
                   >
-                    <h3 className="text-sm font-semibold">
-                      v{release.version} ·{" "}
-                      {new Date(release.published_at).toLocaleDateString()}
-                    </h3>
-                    <div className="prose prose-sm dark:prose-invert max-w-none">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {release.body}
-                      </ReactMarkdown>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold">
+                        v{release.version}
+                        {release.published_at
+                          ? ` · ${new Date(release.published_at).toLocaleDateString()}`
+                          : null}
+                      </h3>
+                      <ReleaseStateBadge
+                        state={release.state}
+                        installable={release.installable}
+                      />
                     </div>
+                    {release.state === "deprecated" ? (
+                      <p className="text-sm text-muted-foreground">
+                        {release.reason
+                          ? `Deprecated: ${release.reason}`
+                          : "This version is deprecated by its publisher"}
+                      </p>
+                    ) : null}
+                    {release.body ? (
+                      <div className="prose prose-sm dark:prose-invert max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {release.body}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        No release notes.
+                      </p>
+                    )}
                   </section>
                 ))}
               </div>
@@ -192,6 +274,13 @@ export function PluginUpdateDialog({
               No release notes available.
             </p>
           )}
+
+          {!source ? (
+            <p className="text-sm text-muted-foreground">
+              The catalogue no longer offers this update. Check for an update to
+              see what it offers now.
+            </p>
+          ) : null}
 
           {error && (
             <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
