@@ -113,8 +113,26 @@ pub struct PluginSections {
 /// Cache state stored on `AppState` behind an `Arc<RwLock<_>>`.
 #[derive(Debug, Default)]
 pub struct OfficialRegistryState {
+    /// The catalogue: one project per name.
     pub plugins: HashMap<String, CatalogueEntry>,
+    /// Every project an installed plugin follows, by publisher DID and name.
+    /// Separate from `plugins` because a name there belongs to one publisher,
+    /// and an installed plugin's project may be another's that shares it.
+    pub installed: HashMap<(String, String), CatalogueEntry>,
     pub last_refreshed_at: Option<String>,
+}
+
+impl OfficialRegistryState {
+    /// The freshest entry read for `did`'s project `name`.
+    pub fn project(&self, did: &str, name: &str) -> Option<&CatalogueEntry> {
+        self.installed
+            .get(&(did.to_owned(), name.to_owned()))
+            .or_else(|| {
+                self.plugins
+                    .get(name)
+                    .filter(|e| e.publisher_did.as_deref() == Some(did))
+            })
+    }
 }
 
 pub type SharedRegistry = Arc<RwLock<OfficialRegistryState>>;
@@ -227,13 +245,18 @@ async fn hold(state: &SharedRegistry, plugin: CatalogueEntry) -> CatalogueEntry 
     plugin
 }
 
-/// Rebuild the cache from the registry. On error, the previous cache is
-/// retained and the error is returned; a listing cut off at the page cap is
-/// one, since it would otherwise replace the catalogue with part of it.
+/// Rebuild the cache from the registry, along with the projects `installed`
+/// (publisher DID, name) plugins follow. Those the listing doesn't carry, or
+/// carries under a name another publisher holds, are each read on their own;
+/// one that can't be read keeps its previous entry. On error, the previous
+/// cache is retained and the error is returned; a listing cut off at the page
+/// cap is one, since it would otherwise replace the catalogue with part of
+/// it.
 pub async fn refresh_full(
     client: &reqwest::Client,
     config: &RegistryConfig,
     state: &SharedRegistry,
+    installed: &[(String, String)],
 ) -> Result<(), RegistryError> {
     if config.disabled {
         return Ok(());
@@ -242,16 +265,74 @@ pub async fn refresh_full(
         return Ok(());
     };
 
-    let listed = super::registry_source::fetch_catalogue(client, source).await?;
+    let listed = super::registry_source::fetch_listing(client, source).await?;
     tracing::info!(
         count = listed.len(),
         "official_registry: catalogue read from the registry"
     );
 
+    let key = |e: &CatalogueEntry| (e.publisher_did.clone().unwrap_or_default(), e.id.clone());
+    let mut followed: HashMap<(String, String), CatalogueEntry> = listed
+        .iter()
+        .filter(|e| installed.contains(&key(e)))
+        .map(|e| (key(e), e.clone()))
+        .collect();
+    let previous = state.read().await.installed.clone();
+    for project in installed {
+        if followed.contains_key(project) {
+            continue;
+        }
+        let (did, name) = project;
+        match super::registry_source::fetch_project(client, source, did, name).await {
+            Ok(Some(entry)) => {
+                followed.insert(project.clone(), entry);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(plugin = %name, publisher = %did, error = %e, "official_registry: installed project unreadable");
+                if let Some(entry) = previous.get(project) {
+                    followed.insert(project.clone(), entry.clone());
+                }
+            }
+        }
+    }
+
+    let catalogue = super::registry_source::one_per_name(listed);
     let mut guard = state.write().await;
-    guard.plugins = listed.into_iter().map(|p| (p.id.clone(), p)).collect();
+    guard.plugins = catalogue.into_iter().map(|p| (p.id.clone(), p)).collect();
+    guard.installed = followed;
     guard.last_refreshed_at = Some(crate::db::now_rfc3339());
     Ok(())
+}
+
+/// The registry projects installed plugins follow, as (publisher DID, name).
+pub async fn installed_projects(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let sql = crate::db::adapt_sql(
+        "SELECT DISTINCT registry_did, registry_name FROM happyview_plugins
+         WHERE registry_did IS NOT NULL AND registry_name IS NOT NULL",
+        backend,
+    );
+    crate::db::query_as(&sql).fetch_all(db).await
+}
+
+/// `refresh_full`, for the projects this instance's plugins follow.
+pub async fn refresh_for_installs(
+    client: &reqwest::Client,
+    config: &RegistryConfig,
+    state: &SharedRegistry,
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> Result<(), RegistryError> {
+    // Without the list, the catalogue still refreshes; installed projects
+    // shadowed by another publisher's name just go stale until next time.
+    let installed = installed_projects(db, backend).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "official_registry: installed projects unreadable");
+        Vec::new()
+    });
+    refresh_full(client, config, state, &installed).await
 }
 
 /// Refresh just one plugin's cache entry, from the publisher the cache names
@@ -309,10 +390,16 @@ pub async fn refresh_project(
     match super::registry_source::fetch_project(client, source, did, name).await? {
         Some(project) => {
             hold(state, project.clone()).await;
+            state
+                .write()
+                .await
+                .installed
+                .insert((did.to_owned(), name.to_owned()), project.clone());
             Ok(Some(project))
         }
         None => {
             let mut guard = state.write().await;
+            guard.installed.remove(&(did.to_owned(), name.to_owned()));
             if guard
                 .plugins
                 .get(name)
@@ -331,6 +418,8 @@ pub fn spawn_refresh_task(
     client: reqwest::Client,
     config: RegistryConfig,
     state: SharedRegistry,
+    db: sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if config.disabled {
         tracing::info!(
@@ -340,7 +429,7 @@ pub fn spawn_refresh_task(
     }
     Some(tokio::spawn(async move {
         loop {
-            match refresh_full(&client, &config, &state).await {
+            match refresh_for_installs(&client, &config, &state, &db, backend).await {
                 Ok(()) => tracing::info!("official_registry: cache refreshed"),
                 Err(e) => tracing::warn!(error = %e, "official_registry: refresh failed"),
             }
@@ -391,6 +480,7 @@ mod tests {
     fn cache_of(entries: Vec<CatalogueEntry>) -> SharedRegistry {
         Arc::new(RwLock::new(OfficialRegistryState {
             plugins: entries.into_iter().map(|e| (e.id.clone(), e)).collect(),
+            installed: HashMap::new(),
             last_refreshed_at: Some("2026-04-12T00:00:00Z".into()),
         }))
     }
@@ -461,7 +551,7 @@ mod tests {
     async fn an_off_catalogue_refreshes_nothing_and_checks_refuse() {
         let (server, off) = unreachable_sources(true).await;
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
-        refresh_full(&reqwest::Client::new(), &off, &state)
+        refresh_full(&reqwest::Client::new(), &off, &state, &[])
             .await
             .unwrap();
         assert!(state.read().await.last_refreshed_at.is_none());
@@ -556,7 +646,7 @@ mod tests {
             .await;
 
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
-        refresh_full(&reqwest::Client::new(), &registry_at(&server), &state)
+        refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[])
             .await
             .unwrap();
         let guard = state.read().await;
@@ -582,7 +672,8 @@ mod tests {
             .await;
 
         let state = cached_official_lua();
-        let result = refresh_full(&reqwest::Client::new(), &registry_at(&server), &state).await;
+        let result =
+            refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[]).await;
         assert!(
             matches!(result, Err(RegistryError::Registry(_))),
             "{result:?}"
@@ -626,7 +717,8 @@ mod tests {
             .await;
 
         let state = cached_official_lua();
-        let result = refresh_full(&reqwest::Client::new(), &registry_at(&server), &state).await;
+        let result =
+            refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[]).await;
         assert!(
             matches!(
                 result,
@@ -846,7 +938,13 @@ mod tests {
         let (server, off) = unreachable_sources(true).await;
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
 
-        let handle = spawn_refresh_task(reqwest::Client::new(), off, state.clone());
+        let handle = spawn_refresh_task(
+            reqwest::Client::new(),
+            off,
+            state.clone(),
+            crate::test_support::memory_pool().await,
+            crate::db::DatabaseBackend::Sqlite,
+        );
         assert!(handle.is_none(), "an off catalogue should spawn nothing");
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

@@ -323,11 +323,15 @@ async fn app_on(registry: &Registry) -> TestApp {
     TestApp::new_with_persisted_plugins(registry.config()).await
 }
 
+/// The periodic refresh: the catalogue, and every project an installed
+/// plugin follows.
 async fn refresh(app: &TestApp) {
-    happyview::plugin::official_registry::refresh_full(
+    happyview::plugin::official_registry::refresh_for_installs(
         &app.state.http,
         &app.state.official_registry_config,
         &app.state.official_registry,
+        &app.state.db,
+        app.state.db_backend,
     )
     .await
     .unwrap();
@@ -543,6 +547,16 @@ async fn an_install_by_version_is_pinned_and_a_bad_request_is_refused() {
         )
         .await;
     assert_eq!(status, 400, "a url and a registry project at once: {body}");
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            json!({ "registry": { "did": OFFICIAL, "name": "lua" }, "sha256": "abc" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a registry install is checked by CID, not sha256: {body}"
+    );
     let (status, body) =
         install_from_registry(&app, json!({ "did": OFFICIAL, "name": "nope" })).await;
     assert_eq!(status, 404, "{body}");
@@ -1080,33 +1094,88 @@ async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
 }
 
 /// An official registry install, while the catalogue holds the stranger's
-/// `lua`: the listing offers nothing, and the on-demand check reads the
-/// official project itself and offers only its version.
+/// `lua`: the listing judges it by its own project, which the refresh reads
+/// on its own, and never offers the stranger's version. The on-demand check
+/// reads the official project too.
 #[tokio::test]
 #[serial]
-async fn check_update_never_offers_a_strangers_project_to_an_official_install() {
+async fn an_official_install_is_judged_by_its_own_project_when_a_stranger_holds_the_name() {
     common::require_db!();
     let mut registry = registry_with_only_a_strangers_lua(false).await;
     let app = app_on(&registry).await;
     let (status, body) =
         install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
     assert_eq!(status, 200, "{body}");
-    refresh_and_expect_no_offer(&app).await;
 
     registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+    refresh(&app).await;
+    assert_eq!(
+        app.state.official_registry.read().await.plugins["lua"]
+            .publisher_did
+            .as_deref(),
+        Some(STRANGER),
+        "the catalogue lists only the stranger's lua"
+    );
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true, "{summary}");
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    registry.project(OFFICIAL, "lua").publish("1.2.0");
     registry.serve().await;
     let (status, body) = app
         .post_json_status("/admin/plugins/lua/check-update", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], true);
-    assert_eq!(body["latest_version"], "1.1.0");
+    assert_eq!(body["latest_version"], "1.2.0");
 
     let (status, body) = app
         .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["version"], "1.1.0");
+    assert_eq!(body["version"], "1.2.0");
+}
+
+/// A stranger's install of `lua`, whose name the official project holds in
+/// the catalogue, still shows its own version's state: retired here. Whether
+/// the registry lists the stranger's project or not, the refresh reads it.
+#[tokio::test]
+#[serial]
+async fn a_shadowed_strangers_install_shows_its_own_lifecycle() {
+    common::require_db!();
+    for listed in [true, false] {
+        let mut registry = Registry::start().await;
+        registry.project(STRANGER, "lua").publish("1.0.0");
+        registry.project(OFFICIAL, "lua").publish("2.0.0");
+        registry.serve().await;
+        let app = app_on(&registry).await;
+        let (status, body) =
+            install_from_registry(&app, json!({ "did": STRANGER, "name": "lua" })).await;
+        assert_eq!(status, 200, "{body}");
+
+        let theirs = registry.project(STRANGER, "lua");
+        theirs.listed = listed;
+        theirs.version("1.0.0").state = "retired";
+        registry.serve().await;
+        app.state.official_registry.write().await.installed.clear();
+        refresh(&app).await;
+        assert_eq!(
+            app.state.official_registry.read().await.plugins["lua"]
+                .publisher_did
+                .as_deref(),
+            Some(OFFICIAL),
+            "the official project holds the name"
+        );
+
+        let summary = summary_of(&app, "lua").await;
+        assert_eq!(
+            summary["registry"]["installed_state"], "retired",
+            "listed: {listed}: {summary}"
+        );
+        assert_eq!(summary["registry"]["channel_state"], "retired");
+        assert_eq!(summary["update_available"], false);
+    }
 }
 
 /// A stranger's install of a name the official publisher also uses is never
@@ -1125,9 +1194,10 @@ async fn a_strangers_install_is_never_updated_from_the_official_project() {
     assert_eq!(status, 200, "{body}");
     refresh(&app).await;
 
+    // Judged by its own project, not the official 2.0.0 holding the name.
     let summary = summary_of(&app, "lua").await;
     assert_eq!(summary["update_available"], false);
-    assert!(summary["latest_version"].is_null());
+    assert_eq!(summary["latest_version"], "1.0.0");
 
     registry.project(STRANGER, "lua").publish("1.0.1");
     registry.serve().await;

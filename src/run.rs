@@ -1053,6 +1053,8 @@ async fn boot(
         http.clone(),
         official_registry_config.clone(),
         official_registry.clone(),
+        db_pool.clone(),
+        db_backend,
     );
 
     let proxy_config = {

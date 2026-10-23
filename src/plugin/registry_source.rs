@@ -551,16 +551,32 @@ pub async fn fetch_catalogue(
     client: &reqwest::Client,
     source: &RegistrySource,
 ) -> Result<Vec<CatalogueEntry>, SourceError> {
-    let projects = source.search_projects(client).await?;
+    Ok(one_per_name(fetch_listing(client, source).await?))
+}
 
-    // Keyed by name, as the cache is. Anyone can publish any name, so the
-    // official publisher's project wins a collision; otherwise the first
-    // listed stays.
-    let mut entries: Vec<CatalogueEntry> = Vec::new();
+/// Every project the registry lists, each publisher's own, including those
+/// that share a name. A project whose versions cannot be read is left out
+/// with a line saying so.
+pub async fn fetch_listing(
+    client: &reqwest::Client,
+    source: &RegistrySource,
+) -> Result<Vec<CatalogueEntry>, SourceError> {
+    let projects = source.search_projects(client).await?;
+    let mut entries = Vec::new();
     for project in projects {
-        let Some(entry) = entry_for(client, source, project).await else {
-            continue;
-        };
+        if let Some(entry) = entry_for(client, source, project).await {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// Keyed by name, as the catalogue is. Anyone can publish any name, so the
+/// official publisher's project wins a collision; otherwise the first listed
+/// stays.
+pub fn one_per_name(listed: Vec<CatalogueEntry>) -> Vec<CatalogueEntry> {
+    let mut entries: Vec<CatalogueEntry> = Vec::new();
+    for entry in listed {
         match entries.iter_mut().find(|e| e.id == entry.id) {
             Some(existing) if entry.official && !existing.official => *existing = entry,
             Some(_) => tracing::warn!(
@@ -571,7 +587,7 @@ pub async fn fetch_catalogue(
             None => entries.push(entry),
         }
     }
-    Ok(entries)
+    entries
 }
 
 /// One project, read fresh, for an on-demand check. `None` when the registry

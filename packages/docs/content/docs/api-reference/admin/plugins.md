@@ -183,7 +183,7 @@ curl http://127.0.0.1:3000/admin/plugins -H "$AUTH"
 }
 ```
 
-`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available`, `latest_version`, `latest_version_installable`, `latest_state` and `pending_releases` come from the cached catalogue — call `POST /admin/plugins/{id}/check-update` to refresh them. An update is offered when the followed channel points at a version other than the installed one and that version may be installed (its state is `active` or `deprecated`, the registry holds its files, and it isn't flagged suspect). When the channel moves to a version that may not be installed, `latest_version_installable` is `false` and `latest_state` says why; nothing is offered. `pending_releases` lists the installable releases on the channel's track (`latest` carries releases, `beta` and `alpha` their own prereleases) newer than the installed version, up to the channel's.
+`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available`, `latest_version`, `latest_version_installable`, `latest_state` and `pending_releases` come from the cached catalogue — call `POST /admin/plugins/{id}/check-update` to refresh them. For a registry plugin, an update is offered when the channel it follows points at a version other than the installed one and that version may be installed; a plugin installed from a URL is judged against `latest` and offered only a newer version. A version may be installed when its state is `active` or `deprecated`, the registry holds its files, and it isn't flagged suspect. When the channel moves to a version that may not be installed, `latest_version_installable` is `false` and `latest_state` says why; nothing is offered. `pending_releases` lists the installable releases on the channel's track (`latest` carries releases, `beta` and `alpha` their own prereleases) newer than the installed version, up to the channel's. The cache keeps every project an installed registry plugin follows, so a plugin whose project shares its name with another publisher's in the catalogue is still judged by its own.
 
 `registry` is set for a plugin installed from a registry project. `installed_state` is the installed version's lifecycle state: a plugin whose version its publisher later retires keeps running, and `installed_state` is `"retired"`, with `installed_reason` when the publisher gave one.
 
@@ -385,7 +385,7 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 | ------------------------ | ---------- | -------- | --------------------------------------------------------------------------------------------------- |
 | `url`                    | string     | one of   | URL to the plugin's `manifest.json`                                                                  |
 | `registry`               | object     | one of   | `{ did, name, channel? , version? }`: a registry project and the channel to follow (`latest` by default) or the version to pin. The install records the project, the channel, the version and the CIDs its files were checked against, and the project's DID as its publisher |
-| `sha256`                 | string     | no       | Optional sha256 of the WASM binary. If provided, install fails when the downloaded hash mismatches   |
+| `sha256`                 | string     | no       | Optional sha256 of the WASM binary, with `url` only. If provided, install fails when the downloaded hash mismatches |
 | `accepted_capabilities`  | string[]   | no       | Capability names the operator consents to grant (e.g. from a consent dialog built on `POST /admin/plugins/preview`'s `capabilities` report). When present, every capability the plugin would actually be granted must be covered, or the install is refused |
 
 **Response**: `200 OK` returning the same `PluginSummary` shape as the list endpoint. `secrets_configured` will be `false` if the plugin requires any secrets — call `PUT /admin/plugins/{id}/secrets` to configure them before the plugin can run.
@@ -393,13 +393,13 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 `400 Bad Request` on any of:
 
 - The manifest can't be fetched/parsed, the WASM can't be downloaded, `sha256` doesn't match, or `api_version` is unsupported.
-- Both or neither of `url` and `registry` were given, or `registry` names both a channel and a version, or a channel other than `latest`, `beta` or `alpha`.
+- Both or neither of `url` and `registry` were given, `sha256` was given with `registry` (a registry plugin is checked against its CIDs), or `registry` names both a channel and a version, or a channel other than `latest`, `beta` or `alpha`.
 - The registry version may not be installed, its files don't match their CIDs, or its manifest names a plugin other than the project.
-
-A registry project or version that doesn't exist is `404 Not Found`; a registry that can't be read is `502 Bad Gateway`.
 - The plugin's `dependencies` aren't satisfied — a dependency isn't installed, an installed dependency's version doesn't satisfy the requirement, installing would create a dependency cycle, or the manifest depends on itself. The error names the specific dependency graph problem.
 - The manifest doesn't declare a capability its compiled imports require — the same check `preview` surfaces as `capabilities.undeclared`.
 - `accepted_capabilities` was provided but doesn't cover every capability the plugin would be granted — the error lists the missing capability names.
+
+A registry project or version that doesn't exist is `404 Not Found`; a registry that can't be read is `502 Bad Gateway`.
 
 ## List official plugins
 
@@ -428,12 +428,15 @@ Requires `plugins:read`. Returns the cached catalog of plugins from the official
         "latest": { "version": "1.2.0", "state": "active", "installable": true, "availability": "available" }
       },
       "lifecycle_state": "active",
+      "manifest_url": "https://api.happyproto.at/xrpc/at.happyproto.registry.getArtifact?cid=bafkrei...",
       "releases": [],
       "sections": {}
     }
   ]
 }
 ```
+
+`manifest_url` is where the registry serves the latest version's manifest. It is transitional: install a catalogue plugin by its `publisher_did` and `id` through `registry`, not from this URL.
 
 ## Remove a plugin
 

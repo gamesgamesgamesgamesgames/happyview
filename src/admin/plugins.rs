@@ -14,7 +14,9 @@ use crate::plugin::capabilities;
 use crate::plugin::encryption::{decrypt, encrypt};
 use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
-use crate::plugin::official_registry::{CatalogueEntry, OFFICIAL_PUBLISHER_DID, ReleaseEntry};
+use crate::plugin::official_registry::{
+    CatalogueEntry, OFFICIAL_PUBLISHER_DID, OfficialRegistryState, ReleaseEntry,
+};
 use crate::plugin::registry_source::{LATEST, RegistrySource, TRACKS, VersionView};
 use crate::plugin::{LoadedPlugin, PluginSource, PluginType, RegistryInstall};
 
@@ -82,15 +84,36 @@ impl InstalledRow {
         ))
     }
 
-    /// The channel an update follows. A plugin with no registry project is
-    /// judged against `latest`, the channel its catalogue entry advertises;
-    /// one pinned to a version follows none.
-    fn followed_channel(&self) -> Option<&str> {
+    /// How updates are judged for this plugin.
+    fn follows(&self) -> Follows<'_> {
         match self.project() {
-            Some(_) => self.registry_channel.as_deref(),
-            None => Some(LATEST),
+            Some(_) => Follows::Registry(self.registry_channel.as_deref()),
+            None => Follows::Url,
         }
     }
+}
+
+/// Whether `entry` describes the project this plugin was installed from: for
+/// a registry install, only that publisher's project of that name; for any
+/// other plugin, whatever the catalogue holds under its id.
+fn speaks_for(row: &InstalledRow, entry: &CatalogueEntry) -> bool {
+    match row.project() {
+        Some((did, name)) => entry.publisher_did.as_deref() == Some(did) && entry.id == name,
+        None => true,
+    }
+}
+
+/// What an installed plugin's updates are judged against.
+#[derive(Debug, Clone, Copy)]
+enum Follows<'a> {
+    /// A registry install, following a channel, or pinned (`None`). The
+    /// channel is the publisher's say: whatever version it names other than
+    /// the installed one is the update, even an older one.
+    Registry(Option<&'a str>),
+    /// A plugin installed from a URL, judged against `latest`. Nothing ties
+    /// it to the channel, so only a newer version is offered: a prerelease
+    /// installed by hand isn't "updated" back to an older release.
+    Url,
 }
 
 type InstalledRowTuple = (
@@ -214,16 +237,20 @@ fn on_track(channel: &str, version: &semver::Version) -> bool {
     }
 }
 
-/// What the catalogue offers an installed plugin. `followed` is the channel
-/// it follows, `None` when pinned: a pinned plugin is shown where `latest`
-/// stands but offered nothing. An update is offered when the channel points
-/// at a version other than the installed one that may be installed.
+/// What the catalogue offers an installed plugin. A pinned plugin is shown
+/// where `latest` stands but offered nothing. Otherwise an update is offered
+/// when the followed channel points at a version that may be installed and
+/// that, as `follows` says, differs from or is newer than the installed one.
 fn compute_update_info(
     installed_version: &str,
     installed: &InstalledPublisher,
-    followed: Option<&str>,
+    follows: Follows<'_>,
     cache_entry: Option<&CatalogueEntry>,
 ) -> UpdateInfo {
+    let followed = match follows {
+        Follows::Registry(channel) => channel,
+        Follows::Url => Some(LATEST),
+    };
     let Some(entry) = cache_entry.filter(|e| installed.may_be_updated_by(e)) else {
         return UpdateInfo::default();
     };
@@ -257,8 +284,19 @@ fn compute_update_info(
         _ => Vec::new(),
     };
 
+    let moved = match follows {
+        Follows::Registry(_) => head.version != installed_version,
+        Follows::Url => match (
+            semver::Version::parse(&head.version),
+            semver::Version::parse(installed_version),
+        ) {
+            (Ok(head), Ok(installed)) => head > installed,
+            _ => false,
+        },
+    };
+
     UpdateInfo {
-        update_available: followed.is_some() && installable && head.version != installed_version,
+        update_available: followed.is_some() && installable && moved,
         latest_version: Some(head.version.clone()),
         latest_version_installable: Some(installable),
         latest_state: Some(state),
@@ -277,12 +315,7 @@ fn registry_status(
     if row.project().is_none() && !row.unresolved {
         return None;
     }
-    // The catalogue holds one project per name; only the one this plugin
-    // was installed from speaks for it.
-    let entry = entry.filter(|e| {
-        row.project()
-            .is_some_and(|(did, name)| e.publisher_did.as_deref() == Some(did) && e.id == name)
-    });
+    let entry = entry.filter(|e| row.project().is_some() && speaks_for(row, e));
     let installed = entry.and_then(|e| {
         e.releases
             .iter()
@@ -306,17 +339,17 @@ fn registry_status(
     })
 }
 
-/// The catalogue entry that speaks for an installed plugin: the one under
-/// its id, and for a registry install only when it is that project's.
+/// The catalogue entry that speaks for an installed plugin: its own
+/// project's for a registry install, whoever holds the name in the
+/// catalogue; for any other plugin, the entry under its id.
 fn entry_for<'a>(
     row: &InstalledRow,
     plugin_id: &str,
-    catalogue: &'a HashMap<String, CatalogueEntry>,
+    cache: &'a OfficialRegistryState,
 ) -> Option<&'a CatalogueEntry> {
-    let entry = catalogue.get(plugin_id)?;
     match row.project() {
-        Some((did, _)) if entry.publisher_did.as_deref() != Some(did) => None,
-        _ => Some(entry),
+        Some((did, name)) => cache.project(did, name),
+        None => cache.plugins.get(plugin_id),
     }
 }
 
@@ -396,23 +429,24 @@ fn required_secrets(p: &LoadedPlugin) -> Vec<super::types::SecretDefinition> {
     }
 }
 
-/// Whether a plugin's secrets are configured: it needs none, or has a
-/// config row.
-async fn secrets_configured(state: &AppState, p: &LoadedPlugin) -> bool {
-    if required_secrets(p).is_empty() {
-        return true;
-    }
+/// The plugins with a stored configuration.
+async fn configured_plugins(state: &AppState) -> HashSet<String> {
     let sql = adapt_sql(
-        "SELECT 1 FROM happyview_plugin_configs WHERE plugin_id = ?",
+        "SELECT plugin_id FROM happyview_plugin_configs WHERE config IS NOT NULL",
         state.db_backend,
     );
-    crate::db::query_scalar::<i32>(&sql)
-        .bind(&p.info.id)
-        .fetch_optional(&state.db)
+    crate::db::query_scalar::<String>(&sql)
+        .fetch_all(&state.db)
         .await
-        .ok()
-        .flatten()
-        .is_some()
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Whether a plugin's secrets are configured: it needs none, or has a
+/// stored configuration.
+fn secrets_configured(p: &LoadedPlugin, configured: &HashSet<String>) -> bool {
+    required_secrets(p).is_empty() || configured.contains(&p.info.id)
 }
 
 /// A plugin's summary, judged against `entry`, the catalogue entry under its
@@ -430,14 +464,11 @@ fn summarize(
             ("url".to_string(), Some(url.clone()), sha256.clone())
         }
     };
-    let entry = entry.filter(|e| match row.project() {
-        Some((did, _)) => e.publisher_did.as_deref() == Some(did),
-        None => true,
-    });
+    let entry = entry.filter(|e| speaks_for(row, e));
     let update = compute_update_info(
         &p.info.version,
         &InstalledPublisher::of(row.publisher_did.clone()),
-        row.followed_channel(),
+        row.follows(),
         entry,
     );
     let cap_fields = capability_fields(p);
@@ -478,12 +509,12 @@ async fn summary_of(
     loaded_at: Option<String>,
 ) -> Result<PluginSummary, AppError> {
     let row = installed_row(state, &p.info.id).await?;
-    let configured = secrets_configured(state, p).await;
+    let configured = secrets_configured(p, &configured_plugins(state).await);
     let guard = state.official_registry.read().await;
     Ok(summarize(
         p,
         &row,
-        entry_for(&row, &p.info.id, &guard.plugins),
+        entry_for(&row, &p.info.id, &guard),
         configured,
         loaded_at,
     ))
@@ -506,19 +537,7 @@ pub(super) async fn list(
         state.plugin_registry.list().await
     };
 
-    // Query which plugins have secrets configured
-    let configured_plugins: HashSet<String> = {
-        let sql = adapt_sql(
-            "SELECT plugin_id FROM happyview_plugin_configs WHERE config IS NOT NULL",
-            state.db_backend,
-        );
-        crate::db::query_scalar::<String>(&sql)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
-    };
+    let configured = configured_plugins(&state).await;
 
     let rows = installed_rows(&state).await?;
     let official_guard = state.official_registry.read().await;
@@ -527,13 +546,11 @@ pub(super) async fn list(
         .into_iter()
         .map(|p| {
             let row = rows.get(&p.info.id).cloned().unwrap_or_default();
-            let configured =
-                required_secrets(&p).is_empty() || configured_plugins.contains(&p.info.id);
             summarize(
                 &p,
                 &row,
-                entry_for(&row, &p.info.id, &official_guard.plugins),
-                configured,
+                entry_for(&row, &p.info.id, &official_guard),
+                secrets_configured(&p, &configured),
                 None, // Would need to track this in registry
             )
         })
@@ -826,6 +843,25 @@ fn registry_detail(install: &RegistryInstall) -> serde_json::Value {
     })
 }
 
+/// Read a just-installed registry plugin's project into the cache, so the
+/// listing can show its state before the next full refresh even when another
+/// publisher holds its name in the catalogue. The install has happened; a
+/// registry that can't be read now only delays that.
+async fn track_installed_project(state: &AppState, name: &str, did: Option<&str>) {
+    let Some(did) = did else { return };
+    if let Err(e) = crate::plugin::official_registry::refresh_project(
+        &state.http,
+        &state.official_registry_config,
+        &state.official_registry,
+        did,
+        name,
+    )
+    .await
+    {
+        tracing::warn!(plugin = %name, publisher = %did, error = %e, "installed project not cached");
+    }
+}
+
 /// POST /admin/plugins - add a plugin from a URL or a registry project
 pub(super) async fn add(
     State(state): State<AppState>,
@@ -835,6 +871,13 @@ pub(super) async fn add(
     auth.require(Permission::PluginsCreate).await?;
 
     let origin = origin(&body.url, &body.registry)?;
+    if matches!(origin, Origin::Registry(_)) && body.sha256.is_some() {
+        return Err(AppError::BadRequest(
+            "sha256 checks a plugin added from a url; a registry plugin is checked against \
+             the CIDs its version names"
+                .into(),
+        ));
+    }
     let (plugin, mut detail) = match origin {
         Origin::Url(url) => {
             let preview = loader::fetch_manifest(&state.http, url)
@@ -893,6 +936,7 @@ pub(super) async fn add(
             if let Err(e) = set_publisher(&state, &plugin_id, registry_publisher.as_deref()).await {
                 tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
             }
+            track_installed_project(&state, &plugin_id, registry_publisher.as_deref()).await;
         }
     }
 
@@ -1191,6 +1235,7 @@ pub(super) async fn reload(
         // updated is the official publisher's from now on.
         Reloaded::Registry(_) => {
             set_publisher(&state, &plugin_id, registry_publisher.as_deref()).await?;
+            track_installed_project(&state, &plugin_id, registry_publisher.as_deref()).await;
         }
     }
 
@@ -1542,7 +1587,7 @@ pub(super) async fn check_update(
         .get(&plugin_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
-    let configured = secrets_configured(&state, &current).await;
+    let configured = secrets_configured(&current, &configured_plugins(&state).await);
     Ok(Json(summarize(
         &current,
         &row,
@@ -1651,7 +1696,7 @@ mod tests {
         publisher: &InstalledPublisher,
         entry: Option<&CatalogueEntry>,
     ) -> UpdateInfo {
-        compute_update_info(installed, publisher, Some(LATEST), entry)
+        compute_update_info(installed, publisher, Follows::Registry(Some(LATEST)), entry)
     }
 
     #[test]
@@ -1739,13 +1784,23 @@ mod tests {
             versions(latest("1.0.0", &unrecorded(), Some(&cached))),
             vec!["1.1.0"]
         );
-        let beta = compute_update_info("1.0.0", &unrecorded(), Some("beta"), Some(&cached));
+        let beta = compute_update_info(
+            "1.0.0",
+            &unrecorded(),
+            Follows::Registry(Some("beta")),
+            Some(&cached),
+        );
         assert!(beta.update_available);
         assert_eq!(beta.latest_version.as_deref(), Some("2.0.0-beta.1"));
         assert_eq!(versions(beta), vec!["2.0.0-beta.1"]);
         assert!(
-            !compute_update_info("1.0.0", &unrecorded(), Some("alpha"), Some(&cached))
-                .update_available,
+            !compute_update_info(
+                "1.0.0",
+                &unrecorded(),
+                Follows::Registry(Some("alpha")),
+                Some(&cached),
+            )
+            .update_available,
             "a channel the project doesn't publish offers nothing"
         );
     }
@@ -1754,7 +1809,12 @@ mod tests {
     #[test]
     fn a_pinned_install_is_offered_nothing() {
         let cached = entry(&["1.2.0", "1.0.0"]);
-        let info = compute_update_info("1.0.0", &unrecorded(), None, Some(&cached));
+        let info = compute_update_info(
+            "1.0.0",
+            &unrecorded(),
+            Follows::Registry(None),
+            Some(&cached),
+        );
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
@@ -1803,16 +1863,39 @@ mod tests {
         assert!(info.pending_releases.is_empty());
     }
 
-    /// An installed version that isn't semver can't be placed among the
-    /// releases, so none is listed as pending; the channel's version still
-    /// differs from it, which is what offers an update.
+    fn url_install(installed: &str, entry: &CatalogueEntry) -> UpdateInfo {
+        compute_update_info(installed, &unrecorded(), Follows::Url, Some(entry))
+    }
+
+    /// A URL install whose version isn't semver can't be placed against the
+    /// channel, so nothing is offered.
     #[test]
     fn compute_update_info_handles_malformed_installed_version() {
         let cached = entry(&["1.2.0"]);
-        let info = latest("not-semver", &unrecorded(), Some(&cached));
-        assert!(info.update_available);
+        let info = url_install("not-semver", &cached);
+        assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
+    }
+
+    /// A URL install is offered only a newer version: one installed ahead
+    /// of `latest`, as a prerelease, isn't offered the older release.
+    #[test]
+    fn a_url_install_ahead_of_latest_is_offered_nothing() {
+        let cached = entry(&["0.4.0"]);
+        let info = url_install("0.5.0-alpha.3", &cached);
+        assert!(!info.update_available);
+        assert!(info.pending_releases.is_empty());
+        assert!(url_install("0.3.0", &cached).update_available);
+    }
+
+    /// A registry install follows its channel wherever the publisher points
+    /// it, even back to an older version.
+    #[test]
+    fn a_registry_install_is_offered_whatever_its_channel_names() {
+        let cached = entry(&["0.4.0"]);
+        assert!(latest("0.5.0-alpha.3", &unrecorded(), Some(&cached)).update_available);
+        assert!(latest("not-semver", &unrecorded(), Some(&cached)).update_available);
     }
 
     fn registry_row(channel: Option<&str>) -> InstalledRow {
