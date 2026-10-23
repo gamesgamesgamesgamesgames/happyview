@@ -209,7 +209,12 @@ export default function LexiconsPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Backfill" />
         ),
-        cell: ({ row }) => (row.original.backfill ? "Yes" : "No"),
+        cell: ({ row }) =>
+          !row.original.indexed
+            ? "Not indexed"
+            : row.original.backfill
+              ? "Yes"
+              : "No",
         enableSorting: true,
       },
       {
