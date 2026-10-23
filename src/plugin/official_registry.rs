@@ -387,7 +387,7 @@ async fn attach_url_installs(
             tracing::warn!(plugin = %id, publisher = %did, "official_registry: no registry project matches this plugin; it keeps updating from its url");
             let sql = crate::db::adapt_sql(
                 "UPDATE happyview_plugins SET registry_unresolved = 1
-                 WHERE id = ? AND registry_did IS NULL",
+                 WHERE id = ? AND registry_did IS NULL AND registry_unresolved = 0",
                 backend,
             );
             crate::db::query(&sql).bind(&id).execute(db).await?;
@@ -407,16 +407,21 @@ async fn attach_url_installs(
         let sql = crate::db::adapt_sql(
             "UPDATE happyview_plugins
              SET registry_did = ?, registry_name = ?, registry_channel = 'latest', version_uri = ?
-             WHERE id = ? AND registry_did IS NULL",
+             WHERE id = ? AND registry_did IS NULL AND registry_unresolved = 0",
             backend,
         );
-        crate::db::query(&sql)
+        // Another pass may have decided this plugin since it was read; the
+        // guard keeps that decision, and then nothing here happened.
+        let done = crate::db::query(&sql)
             .bind(&did)
             .bind(&id)
             .bind(version_uri)
             .bind(&id)
             .execute(db)
             .await?;
+        if done.rows_affected() != 1 {
+            continue;
+        }
         tracing::info!(plugin = %id, publisher = %did, "official_registry: plugin attached to its registry project");
         // Tracked from now on, so the next listing judges it by its own
         // project even when another publisher holds the name in the catalogue.

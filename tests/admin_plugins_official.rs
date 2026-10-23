@@ -1036,7 +1036,7 @@ async fn registry_with_only_a_strangers_lua(official_versions_fail: bool) -> Reg
 
 /// Refresh, check the cache holds only the stranger's `lua`, and that the
 /// official install is offered nothing from it.
-async fn refresh_and_expect_no_offer(app: &TestApp) {
+async fn refresh_and_expect_no_offer(app: &TestApp, official_latest: Value) {
     refresh(app).await;
     assert_eq!(
         app.state.official_registry.read().await.plugins["lua"]
@@ -1049,7 +1049,7 @@ async fn refresh_and_expect_no_offer(app: &TestApp) {
     assert_eq!(summary["update_available"], false);
     // The official project, if the install was attached to it, is its own
     // project's version; the stranger's is never shown.
-    assert_ne!(summary["latest_version"], "9.0.0");
+    assert_eq!(summary["latest_version"], official_latest);
     assert!(summary["pending_releases"].as_array().unwrap().is_empty());
 }
 
@@ -1062,7 +1062,7 @@ async fn a_strangers_lua_is_not_offered_when_the_official_one_is_not_listed() {
     common::require_db!();
     let registry = registry_with_only_a_strangers_lua(false).await;
     let app = an_official_lua_install(registry.config()).await;
-    refresh_and_expect_no_offer(&app).await;
+    refresh_and_expect_no_offer(&app, json!("1.0.0")).await;
 }
 
 /// The official project is listed but its versions cannot be read, so it
@@ -1073,7 +1073,7 @@ async fn a_strangers_lua_is_not_offered_when_the_official_entry_fails_to_build()
     common::require_db!();
     let registry = registry_with_only_a_strangers_lua(true).await;
     let app = an_official_lua_install(registry.config()).await;
-    refresh_and_expect_no_offer(&app).await;
+    refresh_and_expect_no_offer(&app, Value::Null).await;
 }
 
 /// A restart: the cache starts empty. The on-demand check for a URL install,
@@ -1085,14 +1085,14 @@ async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
     let registry = registry_with_only_a_strangers_lua(false).await;
     let app = an_official_lua_install(registry.config()).await;
     app.state.official_registry.write().await.plugins.clear();
-    refresh_and_expect_no_offer(&app).await;
+    refresh_and_expect_no_offer(&app, json!("1.0.0")).await;
 
     let (status, body) = app
         .post_json_status("/admin/plugins/lua/check-update", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], false);
-    assert_ne!(body["latest_version"], "9.0.0");
+    assert_eq!(body["latest_version"], "1.0.0");
 }
 
 /// An official registry install, while the catalogue holds the stranger's
@@ -1643,10 +1643,29 @@ async fn matching_runs_once_and_an_unknown_plugin_stays_loaded() {
 
     assert_eq!(unresolved_flag(&app, "mystery").await, 1);
     assert_eq!(row_of(&app, "mystery").await.unwrap()["registry_did"], None);
-    assert_eq!(
-        row_of(&app, "lua").await.unwrap()["registry_channel"].as_deref(),
-        Some("beta")
-    );
+    let lua = row_of(&app, "lua").await.unwrap();
+    assert_eq!(lua["registry_channel"].as_deref(), Some("beta"));
+    assert_eq!(lua["registry_did"].as_deref(), Some(OFFICIAL));
+}
+
+/// With no recorded publisher the official one is asked, and only it: a
+/// stranger's project of the same name is never joined.
+#[tokio::test]
+#[serial]
+async fn an_unrecorded_install_is_never_attached_to_a_strangers_project() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "extra", "extra", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "extra").await, None);
+
+    refresh(&app).await;
+
+    assert_eq!(row_of(&app, "extra").await.unwrap()["registry_did"], None);
+    assert_eq!(unresolved_flag(&app, "extra").await, 1);
 }
 
 /// A recorded publisher decides whose project the plugin is matched to, and
