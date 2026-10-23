@@ -9,7 +9,7 @@
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -19,18 +19,50 @@ pub const OFFICIAL_REPO: &str = "happyproto/plugins";
 /// The account HappyProto publishes its own plugins from.
 pub const OFFICIAL_PUBLISHER_DID: &str = "did:plc:mo7vq4jbioxwafy5zkcc3eux";
 
-/// A release entry for the update preview UI.
+/// One version of a catalogue entry, for the update preview and detail page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseEntry {
     pub version: String,
     pub name: String,
-    pub published_at: String,
-    pub body: String,
+    pub published_at: Option<String>,
+    /// The version's changelog, as markdown.
+    pub body: Option<String>,
+    /// The lifecycle state: `active`, `deprecated`, `unavailable` or
+    /// `retired`.
+    pub state: String,
+    /// Whether this version may be installed: its lifecycle allows it and the
+    /// registry holds its bytes. A version that may not is still listed, so
+    /// an operator can see it exists.
+    pub installable: bool,
+    /// Whether the registry holds the bytes: `pending`, `available` or
+    /// `deletedAtSource`.
+    pub availability: String,
+    /// The `software.release.version` record.
+    pub version_uri: String,
+    /// The `software.release.manifest` record's CID.
+    pub manifest_cid: String,
+    /// The module's blob CID, which its bytes are fetched by and checked
+    /// against.
+    pub package_cid: String,
+    /// The plugin manifest file's blob CID.
+    pub manifest_blob_cid: String,
+}
+
+/// Where one of a project's channels points.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelEntry {
+    pub version: String,
+    pub state: String,
+    /// Whether the version may be installed: its state allows it and the
+    /// registry holds its bytes.
+    pub installable: bool,
+    pub availability: String,
 }
 
 /// One plugin in the catalogue.
 #[derive(Debug, Clone, Serialize)]
-pub struct OfficialPlugin {
+pub struct CatalogueEntry {
+    /// The project name, which is the plugin's id.
     pub id: String,
     /// The registry account that published it; `None` for an entry from the
     /// GitHub walk.
@@ -44,13 +76,25 @@ pub struct OfficialPlugin {
     pub icon_url: Option<String>,
     /// Independent of `icon_url`: an entry may carry either, both, or neither.
     pub banner_url: Option<String>,
-    pub latest_version: String,
-    pub manifest_url: String,
-    pub wasm_url: String,
+    /// `auth`, `library` or `interpreter`.
+    pub plugin_type: String,
+    /// Every channel the project publishes, by name.
+    pub channels: BTreeMap<String, ChannelEntry>,
+    /// The version the `latest` channel points at, if it has one.
+    pub latest_version: Option<String>,
+    /// Every version, newest first.
     pub releases: Vec<ReleaseEntry>,
-    /// The publisher's long-form prose. Empty for a GitHub-sourced entry,
-    /// which has no profile record to carry it.
+    /// The publisher's long-form prose, from the latest version's artifact,
+    /// with that version's changelog. Empty for a GitHub-sourced entry.
     pub sections: PluginSections,
+    /// The project's own lifecycle state.
+    pub lifecycle_state: String,
+    /// Where the latest version's manifest is served. Empty when there is
+    /// no latest version.
+    pub manifest_url: String,
+    /// Where the latest version's module is served. Empty when there is no
+    /// latest version.
+    pub wasm_url: String,
 }
 
 /// The four long-form fields of `at.happyproto.plugin.profile`. CommonMark
@@ -71,7 +115,7 @@ pub struct PluginSections {
 /// Cache state stored on `AppState` behind an `Arc<RwLock<_>>`.
 #[derive(Debug, Default)]
 pub struct OfficialRegistryState {
-    pub plugins: HashMap<String, OfficialPlugin>,
+    pub plugins: HashMap<String, CatalogueEntry>,
     pub last_refreshed_at: Option<String>,
 }
 
@@ -124,8 +168,17 @@ pub fn to_release_entries(entries: &[(Version, GithubRelease)]) -> Vec<ReleaseEn
                 .name
                 .clone()
                 .unwrap_or_else(|| release.tag_name.clone()),
-            published_at: release.published_at.clone(),
-            body: release.body.clone().unwrap_or_default(),
+            published_at: Some(release.published_at.clone()),
+            body: release.body.clone(),
+            // A GitHub release has no lifecycle and names its assets by URL,
+            // so it is active, installable, and carries no CIDs.
+            state: "active".into(),
+            installable: true,
+            availability: "available".into(),
+            version_uri: String::new(),
+            manifest_cid: String::new(),
+            package_cid: String::new(),
+            manifest_blob_cid: String::new(),
         })
         .collect()
 }
@@ -246,7 +299,7 @@ async fn build_official_plugin(
     config: &RegistryConfig,
     id: &str,
     entries: &[(Version, GithubRelease)],
-) -> OfficialPlugin {
+) -> CatalogueEntry {
     let (latest_version, _) = entries
         .first()
         .map(|(v, _)| (v.to_string(), ()))
@@ -255,13 +308,17 @@ async fn build_official_plugin(
     let manifest_url = format!("{}/{}/manifest.json", config.release_base, tag);
 
     // Try to enrich with manifest fields. On failure, fall back to id.
-    let (name, description, icon_url, wasm_url) =
+    let (name, description, icon_url, wasm_url, plugin_type) =
         match loader::fetch_manifest(client, &manifest_url).await {
             Ok(preview) => (
                 preview.manifest.name,
                 preview.manifest.description,
                 preview.manifest.icon_url,
                 preview.wasm_url,
+                serde_json::to_value(preview.manifest.plugin_type)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
             ),
             Err(e) => {
                 tracing::warn!(
@@ -274,18 +331,23 @@ async fn build_official_plugin(
                     None,
                     None,
                     format!("{}/{}/{}.wasm", config.release_base, tag, id),
+                    String::new(),
                 )
             }
         };
 
-    OfficialPlugin {
+    CatalogueEntry {
         id: id.to_string(),
         publisher_did: None,
         official: true,
         name,
         description,
         icon_url,
-        latest_version,
+        plugin_type,
+        // A GitHub release has no channels or lifecycle of its own.
+        channels: BTreeMap::new(),
+        latest_version: Some(latest_version),
+        lifecycle_state: "active".into(),
         manifest_url,
         wasm_url,
         // A GitHub release names no banner; only a registry entry can.
@@ -312,7 +374,7 @@ async fn build_official_plugin(
 /// Who an entry speaks for: [`OFFICIAL_PUBLISHER_DID`] for an official entry,
 /// including a GitHub-walk one that names no DID, and otherwise the registry
 /// account that published it.
-pub fn effective_publisher(plugin: &OfficialPlugin) -> Option<&str> {
+pub fn effective_publisher(plugin: &CatalogueEntry) -> Option<&str> {
     if plugin.official {
         Some(OFFICIAL_PUBLISHER_DID)
     } else {
@@ -387,7 +449,7 @@ pub fn is_official_manifest_url(config: &RegistryConfig, url: &str) -> bool {
 /// Put a freshly read entry in the cache unless it would displace an official
 /// entry with another publisher's, and answer whichever entry the cache now
 /// holds for that id.
-async fn hold(state: &SharedRegistry, plugin: OfficialPlugin) -> OfficialPlugin {
+async fn hold(state: &SharedRegistry, plugin: CatalogueEntry) -> CatalogueEntry {
     let mut guard = state.write().await;
     if let Some(existing) = guard.plugins.get(&plugin.id)
         && existing.official
@@ -404,7 +466,7 @@ async fn hold(state: &SharedRegistry, plugin: OfficialPlugin) -> OfficialPlugin 
 async fn github_walk(
     client: &reqwest::Client,
     config: &RegistryConfig,
-) -> Result<HashMap<String, OfficialPlugin>, RegistryError> {
+) -> Result<HashMap<String, CatalogueEntry>, RegistryError> {
     let releases = fetch_releases(client, config).await?;
     let mut plugins = HashMap::new();
     for (id, entries) in group_releases(releases) {
@@ -433,7 +495,7 @@ pub async fn refresh_full(
     // by construction: its entries take any id the registry gave only to
     // another publisher, which covers an official package that is not
     // published to the registry yet, failed to read, or sits past the page.
-    let mut plugins: HashMap<String, OfficialPlugin> = HashMap::new();
+    let mut plugins: HashMap<String, CatalogueEntry> = HashMap::new();
     if let Some(source) = &config.registry {
         match super::registry_source::fetch_catalogue(client, source).await {
             Ok(listed) => {
@@ -489,16 +551,16 @@ pub async fn refresh_full(
 /// and only then the other publisher the cache names for this id, if any.
 /// The entry is removed only when every source was read and none has it.
 ///
-/// A check therefore costs up to three requests rather than one: a
-/// `getPackage` for the official publisher, the GitHub releases listing, and
-/// a second `getPackage` for another publisher, plus a manifest download when
-/// the walk answers. It runs only on an operator's request.
+/// A check therefore costs up to five requests rather than one: a
+/// `getProject` and `listVersions` for the official publisher, the GitHub
+/// releases listing, and the same pair for another publisher, plus a manifest
+/// download when the walk answers. It runs only on an operator's request.
 pub async fn refresh_plugin(
     client: &reqwest::Client,
     config: &RegistryConfig,
     state: &SharedRegistry,
     plugin_id: &str,
-) -> Result<Option<OfficialPlugin>, RegistryError> {
+) -> Result<Option<CatalogueEntry>, RegistryError> {
     if config.disabled {
         return Err(RegistryError::Disabled);
     }
@@ -513,7 +575,7 @@ pub async fn refresh_plugin(
     let mut unread: Option<RegistryError> = None;
 
     if let Some(source) = &config.registry {
-        match super::registry_source::fetch_package(
+        match super::registry_source::fetch_project(
             client,
             source,
             OFFICIAL_PUBLISHER_DID,
@@ -545,7 +607,7 @@ pub async fn refresh_plugin(
     }
 
     if let (Some(source), Some(did)) = (&config.registry, other_publisher) {
-        match super::registry_source::fetch_package(client, source, &did, plugin_id).await {
+        match super::registry_source::fetch_project(client, source, &did, plugin_id).await {
             Ok(Some(plugin)) => return Ok(Some(hold(state, plugin).await)),
             Ok(None) => {}
             Err(e) => unread = Some(e.into()),
@@ -646,7 +708,7 @@ mod tests {
         let entries = to_release_entries(grouped.get("steam").unwrap());
         assert_eq!(entries[0].version, "1.2.0");
         assert_eq!(entries[1].version, "1.1.0");
-        assert_eq!(entries[0].body, "body for steam-v1.2.0");
+        assert_eq!(entries[0].body.as_deref(), Some("body for steam-v1.2.0"));
     }
 
     use wiremock::matchers::{method, path, query_param};
@@ -825,7 +887,7 @@ mod tests {
         assert_eq!(guard.plugins.len(), 2);
 
         let steam = guard.plugins.get("steam").unwrap();
-        assert_eq!(steam.latest_version, "1.2.0");
+        assert_eq!(steam.latest_version.as_deref(), Some("1.2.0"));
         assert_eq!(steam.releases.len(), 2);
         assert_eq!(steam.releases[0].version, "1.2.0");
         assert_eq!(steam.releases[1].version, "1.1.0");
@@ -849,14 +911,17 @@ mod tests {
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState {
             plugins: HashMap::from([(
                 "steam".to_string(),
-                OfficialPlugin {
+                CatalogueEntry {
                     id: "steam".into(),
                     publisher_did: None,
                     official: true,
                     name: "steam Plugin".into(),
                     description: None,
                     icon_url: None,
-                    latest_version: "1.0.0".into(),
+                    plugin_type: "auth".into(),
+                    channels: Default::default(),
+                    latest_version: Some("1.0.0".into()),
+                    lifecycle_state: "active".into(),
                     manifest_url: "https://example.com/m".into(),
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
@@ -920,23 +985,32 @@ mod tests {
 
     const STRANGER: &str = "did:plc:someoneelse";
 
-    fn registry_package(did: &str, slug: &str, latest: &str) -> serde_json::Value {
+    fn registry_package(did: &str, name: &str, latest: &str) -> serde_json::Value {
         serde_json::json!({
-            "uri": format!("at://{did}/at.happyproto.plugin.profile/{slug}"),
+            "uri": format!("at://{did}/software.release.project/{name}"),
             "did": did,
-            "status": "active",
-            "latestVersion": latest,
-            "record": { "name": format!("{slug} by {did}") },
+            "name": name,
+            "publication": { "name": format!("{name} by {did}") },
+            "pluginType": "interpreter",
+            "channels": { "latest": {
+                "version": latest,
+                "uri": format!("at://{did}/software.release.version/{name}:{latest}"),
+                "cid": "bafyversion",
+                "state": "active",
+                "availability": "available",
+            } },
+            "lifecycle": { "state": "active" },
         })
     }
 
-    fn registry_release(slug: &str, version: &str) -> serde_json::Value {
+    fn registry_release(name: &str, version: &str) -> serde_json::Value {
         serde_json::json!({
-            "status": "active",
-            "record": {
-                "version": version,
-                "artifacts": { "package": { "url": format!("https://elsewhere.example/{slug}-v{version}/{slug}.wasm") } },
-            },
+            "uri": format!("at://{STRANGER}/software.release.version/{name}:{version}"),
+            "did": STRANGER,
+            "name": name,
+            "version": version,
+            "availability": "available",
+            "lifecycle": { "state": "active", "installable": true, "events": [] },
         })
     }
 
@@ -944,14 +1018,14 @@ mod tests {
     /// publisher nothing.
     async fn stranger_holds_lua(server: &MockServer) {
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.searchPackages"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "packages": [registry_package(STRANGER, "lua", "9.0.0")]
+                "projects": [registry_package(STRANGER, "lua", "9.0.0")]
             })))
             .mount(server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.getPackage"))
+            .and(path("/xrpc/at.happyproto.registry.getProject"))
             .and(query_param("actor", STRANGER))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -960,17 +1034,17 @@ mod tests {
             .mount(server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.getPackage"))
+            .and(path("/xrpc/at.happyproto.registry.getProject"))
             .and(query_param("actor", OFFICIAL_PUBLISHER_DID))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "PackageNotFound", "message": "no such package"
+                "error": "ProjectNotFound", "message": "no such project"
             })))
             .mount(server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.listReleases"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "releases": [registry_release("lua", "9.0.0")]
+                "versions": [registry_release("lua", "9.0.0")]
             })))
             .mount(server)
             .await;
@@ -1004,14 +1078,17 @@ mod tests {
         Arc::new(RwLock::new(OfficialRegistryState {
             plugins: HashMap::from([(
                 "lua".to_string(),
-                OfficialPlugin {
+                CatalogueEntry {
                     id: "lua".into(),
                     publisher_did: None,
                     official: true,
                     name: "lua".into(),
                     description: None,
                     icon_url: None,
-                    latest_version: "1.0.0".into(),
+                    plugin_type: "auth".into(),
+                    channels: Default::default(),
+                    latest_version: Some("1.0.0".into()),
+                    lifecycle_state: "active".into(),
                     manifest_url: "https://example.com/m".into(),
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
@@ -1044,7 +1121,7 @@ mod tests {
         let guard = state.read().await;
         let lua = &guard.plugins["lua"];
         assert!(lua.official);
-        assert_eq!(lua.latest_version, "1.1.0");
+        assert_eq!(lua.latest_version.as_deref(), Some("1.1.0"));
     }
 
     /// The same, with the walk unreadable this time: the cached official
@@ -1066,7 +1143,10 @@ mod tests {
         .unwrap();
         let guard = state.read().await;
         assert!(guard.plugins["lua"].official);
-        assert_eq!(guard.plugins["lua"].latest_version, "1.0.0");
+        assert_eq!(
+            guard.plugins["lua"].latest_version.as_deref(),
+            Some("1.0.0")
+        );
     }
 
     /// A check on an id the cache holds as official asks the official
@@ -1076,7 +1156,7 @@ mod tests {
     async fn a_check_never_replaces_an_official_entry_with_a_strangers() {
         let registry = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.getPackage"))
+            .and(path("/xrpc/at.happyproto.registry.getProject"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(registry_package(STRANGER, "lua", "9.0.0")),
@@ -1084,9 +1164,9 @@ mod tests {
             .mount(&registry)
             .await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.listReleases"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "releases": [registry_release("lua", "9.0.0")]
+                "versions": [registry_release("lua", "9.0.0")]
             })))
             .mount(&registry)
             .await;
@@ -1193,14 +1273,17 @@ mod tests {
     fn an_install_takes_the_publisher_of_its_own_id_when_two_entries_share_a_url() {
         // Not under the official release base, so the entry decides.
         let url = "https://mirror.example/lua-v1.0.0/manifest.json";
-        let official = OfficialPlugin {
+        let official = CatalogueEntry {
             id: "lua".into(),
             publisher_did: None,
             official: true,
             name: "lua".into(),
             description: None,
             icon_url: None,
-            latest_version: "1.0.0".into(),
+            plugin_type: "auth".into(),
+            channels: Default::default(),
+            latest_version: Some("1.0.0".into()),
+            lifecycle_state: "active".into(),
             manifest_url: url.into(),
             wasm_url: url.replace("manifest.json", "lua.wasm"),
             releases: vec![],
@@ -1216,7 +1299,7 @@ mod tests {
                 let id = format!("notlua{n}");
                 state.plugins.insert(
                     id.clone(),
-                    OfficialPlugin {
+                    CatalogueEntry {
                         id,
                         publisher_did: Some(STRANGER.into()),
                         official: false,
@@ -1246,14 +1329,17 @@ mod tests {
         let mut state = OfficialRegistryState::default();
         state.plugins.insert(
             "lua".into(),
-            OfficialPlugin {
+            CatalogueEntry {
                 id: "lua".into(),
                 publisher_did: Some(STRANGER.into()),
                 official: false,
                 name: "lua".into(),
                 description: None,
                 icon_url: None,
-                latest_version: "1.0.0".into(),
+                plugin_type: "auth".into(),
+                channels: Default::default(),
+                latest_version: Some("1.0.0".into()),
+                lifecycle_state: "active".into(),
                 manifest_url: url.clone(),
                 wasm_url: url.replace("manifest.json", "lua.wasm"),
                 releases: vec![],
@@ -1276,21 +1362,24 @@ mod tests {
     #[test]
     fn an_install_url_names_the_publisher_of_the_entry_offering_it() {
         let mut state = OfficialRegistryState::default();
-        let walked = OfficialPlugin {
+        let walked = CatalogueEntry {
             id: "lua".into(),
             publisher_did: None,
             official: true,
             name: "lua".into(),
             description: None,
             icon_url: None,
-            latest_version: "1.0.0".into(),
+            plugin_type: "auth".into(),
+            channels: Default::default(),
+            latest_version: Some("1.0.0".into()),
+            lifecycle_state: "active".into(),
             manifest_url: "https://a.example/lua/manifest.json".into(),
             wasm_url: "https://a.example/lua/lua.wasm".into(),
             releases: vec![],
             sections: Default::default(),
             banner_url: None,
         };
-        let registry = OfficialPlugin {
+        let registry = CatalogueEntry {
             id: "extra".into(),
             publisher_did: Some(STRANGER.into()),
             official: false,

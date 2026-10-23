@@ -14,7 +14,7 @@ use crate::plugin::capabilities;
 use crate::plugin::encryption::{decrypt, encrypt};
 use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
-use crate::plugin::official_registry::{OfficialPlugin, ReleaseEntry};
+use crate::plugin::official_registry::{CatalogueEntry, ReleaseEntry};
 use crate::plugin::{LoadedPlugin, PluginType};
 
 /// If the reload request provides a new URL, use it and clear the old sha256
@@ -60,7 +60,7 @@ impl InstalledPublisher {
         Self::Unrecorded { official_url }
     }
 
-    fn may_be_updated_by(&self, entry: &OfficialPlugin) -> bool {
+    fn may_be_updated_by(&self, entry: &CatalogueEntry) -> bool {
         match self {
             Self::Recorded(did) => {
                 crate::plugin::official_registry::effective_publisher(entry) == Some(did.as_str())
@@ -135,7 +135,7 @@ struct UpdateInfo {
 fn compute_update_info(
     installed_version: &str,
     installed: &InstalledPublisher,
-    cache_entry: Option<&OfficialPlugin>,
+    cache_entry: Option<&CatalogueEntry>,
 ) -> UpdateInfo {
     let Some(entry) = cache_entry.filter(|e| installed.may_be_updated_by(e)) else {
         return UpdateInfo {
@@ -151,7 +151,7 @@ fn compute_update_info(
         Err(_) => {
             return UpdateInfo {
                 update_available: false,
-                latest_version: Some(entry.latest_version.clone()),
+                latest_version: entry.latest_version.clone(),
                 pending_releases: Vec::new(),
                 latest_manifest_url: Some(entry.manifest_url.clone()),
             };
@@ -171,7 +171,7 @@ fn compute_update_info(
 
     UpdateInfo {
         update_available: !pending.is_empty(),
-        latest_version: Some(entry.latest_version.clone()),
+        latest_version: entry.latest_version.clone(),
         pending_releases: pending,
         latest_manifest_url: Some(entry.manifest_url.clone()),
     }
@@ -1171,7 +1171,7 @@ pub(super) async fn list_official(
             name: p.name.clone(),
             description: p.description.clone(),
             icon_url: p.icon_url.clone(),
-            latest_version: p.latest_version.clone(),
+            latest_version: p.latest_version.clone().unwrap_or_default(),
             manifest_url: p.manifest_url.clone(),
             official: p.official,
             banner_url: p.banner_url.clone(),
@@ -1189,17 +1189,20 @@ pub(super) async fn list_official(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::official_registry::{OfficialPlugin, ReleaseEntry};
+    use crate::plugin::official_registry::{CatalogueEntry, ReleaseEntry};
 
-    fn entry(versions: &[&str]) -> OfficialPlugin {
-        OfficialPlugin {
+    fn entry(versions: &[&str]) -> CatalogueEntry {
+        CatalogueEntry {
             id: "steam".into(),
             publisher_did: None,
             official: true,
             name: "steam".into(),
             description: None,
             icon_url: None,
-            latest_version: versions[0].into(),
+            plugin_type: "auth".into(),
+            channels: Default::default(),
+            latest_version: Some(versions[0].into()),
+            lifecycle_state: "active".into(),
             manifest_url: "m".into(),
             wasm_url: "w".into(),
             releases: versions
@@ -1207,8 +1210,15 @@ mod tests {
                 .map(|v| ReleaseEntry {
                     version: (*v).into(),
                     name: format!("v{v}"),
-                    published_at: "2026-04-10T00:00:00Z".into(),
-                    body: "notes".into(),
+                    published_at: Some("2026-04-10T00:00:00Z".into()),
+                    body: Some("notes".into()),
+                    state: "active".into(),
+                    installable: true,
+                    availability: "available".into(),
+                    version_uri: String::new(),
+                    manifest_cid: String::new(),
+                    package_cid: String::new(),
+                    manifest_blob_cid: String::new(),
                 })
                 .collect(),
             sections: Default::default(),
@@ -1240,8 +1250,8 @@ mod tests {
         InstalledPublisher::Unrecorded { official_url }
     }
 
-    fn stranger(versions: &[&str]) -> OfficialPlugin {
-        OfficialPlugin {
+    fn stranger(versions: &[&str]) -> CatalogueEntry {
+        CatalogueEntry {
             official: false,
             publisher_did: Some("did:plc:someoneelse".into()),
             ..entry(versions)

@@ -1,36 +1,33 @@
-//! The plugin catalogue, read from an AT Protocol registry.
+//! The plugin catalogue, read from the HappyProto registry.
 //!
-//! [`official_registry`](super::official_registry) enumerates one GitHub
-//! org's releases, which only ever describes plugins that org publishes. A
-//! registry is an AppView over `at.happyproto.plugin.*` records, so it
-//! describes whatever anyone has published, and it is the surface the
-//! HappyProto registry exists to serve.
-//!
-//! What this module does *not* change is installation. A registry answers
-//! where a release's module lives (`artifacts.package.url`), and the existing
-//! loader already derives a manifest from a sibling `.wasm` URL, so a
-//! registry-sourced entry installs through exactly the path a GitHub-sourced
-//! one does. A release that carries only a blob and no URL has no manifest to
-//! derive and is skipped here rather than offered and then failing at install;
-//! serving those needs a reconstructed manifest, which is its own change.
+//! The registry is an AppView over `software.release.*` records: a project,
+//! its versions, its channels and its lifecycle statuses, each version
+//! carrying an `at.happyproto.plugin.v1` artifact that names its module and
+//! manifest by blob CID. Bytes are fetched by CID from the registry's own
+//! copy (`getArtifact?cid=`), never from a URL a publisher gave, so whatever
+//! is fetched can be checked against the CID that named it.
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use super::official_registry::{OfficialPlugin, PluginSections, ReleaseEntry};
+use super::official_registry::{CatalogueEntry, ChannelEntry, PluginSections, ReleaseEntry};
 
-/// How many of a package's releases one refresh reads. The registry clamps a
-/// page to 100, so asking for its ceiling costs the same as asking for less.
-const RELEASES_PER_PACKAGE: u32 = 100;
+/// How many versions one `listVersions` page asks for: the registry's own
+/// ceiling, so a project's whole history is usually one request.
+const VERSIONS_PER_PAGE: u32 = 100;
 
-/// Where to look for packages, and under whose authority.
+/// The channel a project's current version is published on.
+const LATEST: &str = "latest";
+
+/// Where to look for projects.
 #[derive(Debug, Clone)]
 pub struct RegistrySource {
     /// An instance serving `at.happyproto.registry.*`, without a trailing
     /// slash, e.g. `https://api.happyproto.at`.
     pub base_url: String,
-    /// How many packages one refresh will read. The registry pages, and a
-    /// refresh that walked every page would make the cost of a cold cache
-    /// depend on how big the registry has grown.
+    /// How many projects one `searchProjects` page asks for. The registry
+    /// clamps it to 1–100.
     pub limit: u32,
 }
 
@@ -41,6 +38,163 @@ impl RegistrySource {
             limit: 100,
         }
     }
+
+    fn base(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
+
+    /// Where the registry serves the bytes a CID names.
+    pub fn artifact_url(&self, cid: &str) -> String {
+        format!(
+            "{}/xrpc/at.happyproto.registry.getArtifact?cid={}",
+            self.base(),
+            urlencoding::encode(cid)
+        )
+    }
+
+    /// Every project the registry lists, following its cursors to the end.
+    pub async fn search_projects(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<Vec<ProjectView>, SourceError> {
+        #[derive(Deserialize)]
+        struct Page {
+            #[serde(default)]
+            projects: Vec<ProjectView>,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let mut projects = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{}/xrpc/at.happyproto.registry.searchProjects?limit={}",
+                self.base(),
+                self.limit
+            );
+            if let Some(c) = &cursor {
+                url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+            }
+            let page: Page = get(client, "searchProjects", url).await?;
+            projects.extend(page.projects);
+            match next_cursor(cursor.as_deref(), page.cursor) {
+                Some(next) => cursor = Some(next),
+                None => return Ok(projects),
+            }
+        }
+    }
+
+    /// One project, or `None` when the registry knows neither it nor its
+    /// publisher.
+    pub async fn get_project(
+        &self,
+        client: &reqwest::Client,
+        did: &str,
+        name: &str,
+    ) -> Result<Option<ProjectView>, SourceError> {
+        get_opt(
+            client,
+            "getProject",
+            format!(
+                "{}/xrpc/at.happyproto.registry.getProject?actor={}&name={}",
+                self.base(),
+                urlencoding::encode(did),
+                urlencoding::encode(name),
+            ),
+            &["ProjectNotFound", "ActorNotFound"],
+        )
+        .await
+    }
+
+    /// Every version of a project, newest indexed first, following cursors.
+    pub async fn list_versions(
+        &self,
+        client: &reqwest::Client,
+        did: &str,
+        name: &str,
+    ) -> Result<Vec<VersionView>, SourceError> {
+        #[derive(Deserialize)]
+        struct Page {
+            #[serde(default)]
+            versions: Vec<VersionView>,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let mut versions = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{}/xrpc/at.happyproto.registry.listVersions?did={}&name={}&limit={VERSIONS_PER_PAGE}",
+                self.base(),
+                urlencoding::encode(did),
+                urlencoding::encode(name),
+            );
+            if let Some(c) = &cursor {
+                url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+            }
+            let page: Page = get(client, "listVersions", url).await?;
+            versions.extend(page.versions);
+            match next_cursor(cursor.as_deref(), page.cursor) {
+                Some(next) => cursor = Some(next),
+                None => return Ok(versions),
+            }
+        }
+    }
+
+    /// One version by its version string, or `None` when there is no such
+    /// version.
+    pub async fn get_version(
+        &self,
+        client: &reqwest::Client,
+        did: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<VersionView>, SourceError> {
+        get_opt(
+            client,
+            "getVersion",
+            format!(
+                "{}/xrpc/at.happyproto.registry.getVersion?did={}&name={}&version={}",
+                self.base(),
+                urlencoding::encode(did),
+                urlencoding::encode(name),
+                urlencoding::encode(version),
+            ),
+            &["VersionNotFound", "ProjectNotFound"],
+        )
+        .await
+    }
+
+    /// The version a channel points at, or `None` when the channel or the
+    /// version it names does not exist.
+    pub async fn resolve_channel(
+        &self,
+        client: &reqwest::Client,
+        did: &str,
+        name: &str,
+        channel: &str,
+    ) -> Result<Option<VersionView>, SourceError> {
+        get_opt(
+            client,
+            "resolveChannel",
+            format!(
+                "{}/xrpc/at.happyproto.registry.resolveChannel?did={}&name={}&channel={}",
+                self.base(),
+                urlencoding::encode(did),
+                urlencoding::encode(name),
+                urlencoding::encode(channel),
+            ),
+            &["ChannelNotFound", "VersionNotFound", "ProjectNotFound"],
+        )
+        .await
+    }
+}
+
+/// The cursor to ask for next, or `None` to stop. A registry that answers
+/// the cursor it was given would otherwise be asked for the same page
+/// forever.
+fn next_cursor(asked: Option<&str>, answered: Option<String>) -> Option<String> {
+    answered.filter(|c| !c.is_empty() && Some(c.as_str()) != asked)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,154 +212,206 @@ pub enum SourceError {
 }
 
 // ---------------------------------------------------------------------------
-// The wire shapes, as the registry's lexicons describe them. Only the fields
-// a catalogue entry needs: a package view and a release view both carry more.
+// The wire shapes. Only the fields a consumer reads; every view carries more.
+// Fields default where the registry may omit them, so one sparse record does
+// not fail a whole listing.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct SearchPackages {
+/// A `software.release.project`, as the registry describes it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectView {
+    pub uri: String,
+    pub did: String,
     #[serde(default)]
-    packages: Vec<PackageView>,
+    pub handle: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub publication: Publication,
+    #[serde(default)]
+    pub plugin_type: String,
+    #[serde(default)]
+    pub channels: BTreeMap<String, ChannelView>,
+    #[serde(default)]
+    pub banner: Option<ImageView>,
+    #[serde(default)]
+    pub lifecycle: ProjectLifecycle,
+    #[serde(default)]
+    pub indexed_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PackageView {
-    uri: String,
-    did: String,
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Publication {
     #[serde(default)]
-    record: ProfileRecord,
-    #[serde(default, rename = "latestVersion")]
-    latest_version: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    status: Option<String>,
+    pub description: Option<String>,
+    /// A CID, served by `getArtifact`.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ProfileRecord {
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelView {
+    pub version: String,
     #[serde(default)]
-    name: Option<String>,
+    pub uri: String,
     #[serde(default)]
-    description: Option<String>,
-    /// The publisher's long-form prose. Absent for a profile written before
-    /// the field existed, which is why every field inside it is optional too.
+    pub cid: String,
+    #[serde(default = "active")]
+    pub state: String,
     #[serde(default)]
-    sections: PluginSections,
+    pub availability: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListReleases {
-    #[serde(default)]
-    releases: Vec<ReleaseView>,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageView {
+    pub cid: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ReleaseView {
-    #[serde(default)]
-    record: ReleaseRecord,
-    #[serde(default, rename = "indexedAt")]
-    indexed_at: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectLifecycle {
+    #[serde(default = "active")]
+    pub state: String,
 }
 
-impl ReleaseView {
-    /// A pending release has not been confirmed and a deleted one has been
-    /// withdrawn; neither is offered. Absent reads as active, which is what a
-    /// registry that predates the field meant.
-    fn is_active(&self) -> bool {
-        self.status.as_deref().is_none_or(|s| s == "active")
+impl Default for ProjectLifecycle {
+    fn default() -> Self {
+        Self { state: active() }
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ReleaseRecord {
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    notes: Option<String>,
-    #[serde(default)]
-    artifacts: Artifacts,
+fn active() -> String {
+    "active".into()
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Artifacts {
+/// One published version of a project.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionView {
+    pub uri: String,
     #[serde(default)]
-    package: Option<Artifact>,
+    pub cid: String,
+    pub did: String,
+    pub name: String,
+    pub version: String,
+    /// The `software.release.manifest` record, not the plugin's own manifest
+    /// file: that one is `artifact.manifest`.
     #[serde(default)]
-    icon: Option<Artifact>,
+    pub manifest: StrongRef,
     #[serde(default)]
-    banner: Option<Artifact>,
-    /// The module's own `manifest.json`, where the publisher uploaded one.
-    /// A release whose module is a blob has no sibling file to derive a
-    /// manifest from, so this is the only way such a release is installable.
+    pub artifact: PluginArtifact,
     #[serde(default)]
-    manifest: Option<Artifact>,
+    pub changelog: Option<Changelog>,
+    #[serde(default)]
+    pub availability: String,
+    #[serde(default)]
+    pub suspect: bool,
+    #[serde(default)]
+    pub lifecycle: VersionLifecycle,
+    #[serde(default)]
+    pub indexed_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Artifact {
-    #[serde(default)]
-    url: Option<String>,
-    /// Set when the publisher uploaded the bytes rather than linking them,
-    /// which is what the HappyProto registry's own publisher does. The blob
-    /// itself is never read here: `getArtifact` serves it, so only its
-    /// presence matters.
-    #[serde(default)]
-    blob: Option<serde_json::Value>,
-}
-
-/// Where an artifact's bytes are served from: the URL the publisher gave, or
-/// the registry's own copy when they uploaded a blob instead.
-///
-/// `getArtifact` answers any kind the copy job holds, and it holds every
-/// artifact the release declared, so a blob needs no special case beyond
-/// naming its kind.
-fn artifact_url(
-    base: &str,
-    did: &str,
-    slug: &str,
-    version: &str,
-    kind: &str,
-    artifact: &Artifact,
-) -> Option<String> {
-    if let Some(url) = &artifact.url {
-        return Some(url.clone());
+impl VersionView {
+    /// Whether this version may be installed: its lifecycle allows it and the
+    /// registry holds its bytes. One the registry has not copied yet, or has
+    /// lost at the source, has nothing to fetch.
+    pub fn installable(&self) -> bool {
+        self.lifecycle.installable && self.availability == "available"
     }
-    artifact.blob.as_ref()?;
-    Some(format!(
-        "{base}/xrpc/at.happyproto.registry.getArtifact?did={}&slug={}&version={}&type={kind}",
-        urlencoding::encode(did),
-        urlencoding::encode(slug),
-        urlencoding::encode(version),
-    ))
 }
 
-/// The highest version among `releases`, by semver precedence, or `None`
-/// when none of them carries a version that parses.
-///
-/// A prerelease sorts below the same core version without one, so an
-/// `alpha` line never shadows the stable release it leads to — the rule the
-/// registry's own ordering follows.
-fn highest_version(releases: &[ReleaseView]) -> Option<String> {
-    releases
-        .iter()
-        .filter_map(|r| {
-            let raw = r.record.version.as_deref()?;
-            Some((semver::Version::parse(raw).ok()?, raw.to_owned()))
-        })
-        .max_by(|(a, _), (b, _)| a.cmp(b))
-        .map(|(_, raw)| raw)
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StrongRef {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub cid: String,
 }
 
-/// The slug a package's profile URI ends with, which is the plugin's id.
-///
-/// Taken from the URI rather than from a field: a profile record carries no
-/// slug of its own, the record key is the slug, and the URI is where the
-/// registry puts it.
-fn slug_of(uri: &str) -> Option<&str> {
-    let slug = uri.rsplit('/').next()?;
-    (!slug.is_empty() && slug != uri).then_some(slug)
+/// An `at.happyproto.plugin.v1`, as published.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginArtifact {
+    #[serde(default)]
+    pub package: BlobRef,
+    #[serde(default)]
+    pub manifest: BlobRef,
+    #[serde(default)]
+    pub plugin_type: Option<String>,
+    #[serde(default)]
+    pub sections: PluginSections,
 }
+
+/// A blob reference; only its CID is read.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BlobRef {
+    #[serde(default, rename = "ref")]
+    pub link: CidLink,
+}
+
+impl BlobRef {
+    pub fn cid(&self) -> &str {
+        &self.link.link
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CidLink {
+    #[serde(default, rename = "$link")]
+    pub link: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Changelog {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionLifecycle {
+    #[serde(default = "active")]
+    pub state: String,
+    #[serde(default = "yes")]
+    pub installable: bool,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Default for VersionLifecycle {
+    fn default() -> Self {
+        Self {
+            state: active(),
+            installable: true,
+            superseded_by: None,
+            reason: None,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Whether a lifecycle state still allows an install. A channel carries only
+/// its state, not the version's own `installable`, so this is the table both
+/// are derived from.
+fn state_installable(state: &str) -> bool {
+    matches!(state, "active" | "deprecated")
+}
+
+// ---------------------------------------------------------------------------
+// Requests.
+// ---------------------------------------------------------------------------
 
 /// The registry's Lua queries answer `{ error, message }` with 200, so a body
 /// carrying a string `error` is an error whatever the status.
@@ -264,15 +470,16 @@ async fn get<T: for<'de> Deserialize<'de>>(
     }
 }
 
-/// `get`, with the registry's own not-found as `None`.
+/// `get`, with the errors named in `not_found` answered as `None`.
 async fn get_opt<T: for<'de> Deserialize<'de>>(
     client: &reqwest::Client,
     method: &'static str,
     url: String,
+    not_found: &[&str],
 ) -> Result<Option<T>, SourceError> {
     match get_value(client, method, url).await? {
         Ok(value) => decode(method, value).map(Some),
-        Err((name, _)) if name == "PackageNotFound" => Ok(None),
+        Err((name, _)) if not_found.contains(&name.as_str()) => Ok(None),
         Err((name, message)) => Err(SourceError::Xrpc {
             method,
             name,
@@ -281,225 +488,201 @@ async fn get_opt<T: for<'de> Deserialize<'de>>(
     }
 }
 
-/// Read the catalogue. Answers one entry per package that has an installable
-/// release; a package whose latest release carries no module URL is left out,
-/// with a line saying which and why.
+// ---------------------------------------------------------------------------
+// Catalogue entries.
+// ---------------------------------------------------------------------------
+
+/// Read the catalogue: one entry per project, keyed by project name. A
+/// project whose versions cannot be read is left out with a line saying so.
 pub async fn fetch_catalogue(
     client: &reqwest::Client,
     source: &RegistrySource,
-) -> Result<Vec<OfficialPlugin>, SourceError> {
-    let base = source.base_url.trim_end_matches('/');
-    let listing: SearchPackages = get(
-        client,
-        "searchPackages",
-        format!(
-            "{base}/xrpc/at.happyproto.registry.searchPackages?limit={}",
-            source.limit
-        ),
-    )
-    .await?;
+) -> Result<Vec<CatalogueEntry>, SourceError> {
+    let projects = source.search_projects(client).await?;
 
-    // Keyed by slug, as the cache is. Anyone can publish any slug, so the
-    // official publisher's package wins a collision; otherwise the first
+    // Keyed by name, as the cache is. Anyone can publish any name, so the
+    // official publisher's project wins a collision; otherwise the first
     // listed stays.
-    let mut plugins: Vec<OfficialPlugin> = Vec::new();
-    for package in listing.packages {
-        let Some(plugin) = entry_for(client, base, package).await else {
+    let mut entries: Vec<CatalogueEntry> = Vec::new();
+    for project in projects {
+        let Some(entry) = entry_for(client, source, project).await else {
             continue;
         };
-        match plugins.iter_mut().find(|p| p.id == plugin.id) {
-            Some(existing) if plugin.official && !existing.official => *existing = plugin,
+        match entries.iter_mut().find(|e| e.id == entry.id) {
+            Some(existing) if entry.official && !existing.official => *existing = entry,
             Some(_) => tracing::warn!(
-                plugin = %plugin.id,
-                publisher = ?plugin.publisher_did,
-                "registry_source: another publisher already holds this slug; not listed"
+                plugin = %entry.id,
+                publisher = ?entry.publisher_did,
+                "registry_source: another publisher already holds this name; not listed"
             ),
-            None => plugins.push(plugin),
+            None => entries.push(entry),
         }
     }
-
-    Ok(plugins)
+    Ok(entries)
 }
 
-/// One package's catalogue entry, or `None` with a line saying why it is
-/// not installable.
-async fn entry_for(
-    client: &reqwest::Client,
-    base: &str,
-    package: PackageView,
-) -> Option<OfficialPlugin> {
-    // `getPackage` still answers a withdrawn package, flagged deleted.
-    if package.status.as_deref() == Some("deleted") {
-        return None;
-    }
-    let Some(slug) = slug_of(&package.uri).map(str::to_owned) else {
-        tracing::warn!(uri = %package.uri, "registry_source: package uri has no slug");
-        return None;
-    };
-    // Every release rather than just the latest: the update preview lists
-    // each version between what is installed and what is current, so a
-    // catalogue carrying only the newest would show one entry where the
-    // GitHub walk showed several. `RELEASES_PER_PACKAGE` is the registry's
-    // own ceiling, so this is one request either way.
-    let mut listing: ListReleases = match get(
-        client,
-        "listReleases",
-        format!(
-            "{base}/xrpc/at.happyproto.registry.listReleases?did={}&slug={}&limit={RELEASES_PER_PACKAGE}",
-            urlencoding::encode(&package.did),
-            urlencoding::encode(&slug),
-        ),
-    )
-    .await
-    {
-        Ok(view) => view,
-        Err(e) => {
-            tracing::warn!(plugin = %slug, error = %e, "registry_source: releases unreadable");
-            return None;
-        }
-    };
-    listing.releases.retain(ReleaseView::is_active);
-
-    // Which release is current is worked out here rather than taken from the
-    // package view: `searchPackages` answers no `latestVersion` at all — it
-    // skips the per-package lookup that would cost, the same way it skips
-    // `handle` — so trusting the field skipped every package the registry
-    // served. The releases are already in hand for the update preview, so
-    // the highest active one costs nothing extra. A registry that does
-    // supply the field is still honoured, as long as it names a release this
-    // listing calls active.
-    let Some(version) = package
-        .latest_version
-        .clone()
-        .filter(|named| {
-            listing
-                .releases
-                .iter()
-                .any(|r| r.record.version.as_deref() == Some(named.as_str()))
-        })
-        .or_else(|| highest_version(&listing.releases))
-    else {
-        // No active release means nothing to install. A package can be
-        // indexed before its first release is, and a withdrawn one keeps its
-        // profile.
-        return None;
-    };
-
-    // The module comes from the release named current; the others are listed
-    // for the preview but are not what gets installed.
-    let release = listing
-        .releases
-        .iter()
-        .find(|r| r.record.version.as_deref() == Some(version.as_str()))?;
-
-    let Some(module) = release.record.artifacts.package.as_ref() else {
-        tracing::info!(
-            plugin = %slug,
-            version = %version,
-            "registry_source: skipping a release that declares no module"
-        );
-        return None;
-    };
-    let wasm_url = artifact_url(base, &package.did, &slug, &version, "package", module)?;
-
-    // A published manifest is the authority. Where the release declares
-    // none, the module's own directory answers — but only when the publisher
-    // linked the module, because that fallback means "the file beside it".
-    // A module served from the registry's copy has no directory of its own:
-    // every blob's URL shares one `/xrpc/` path, so the sibling of any of
-    // them is the same meaningless `/xrpc/manifest.json`. Such a release is
-    // skipped rather than offered with a URL that cannot resolve.
-    let manifest_url = match (release.record.artifacts.manifest.as_ref(), &module.url) {
-        (Some(a), _) => artifact_url(base, &package.did, &slug, &version, "manifest", a),
-        (None, Some(linked)) => linked
-            .rsplit_once('/')
-            .map(|(dir, _)| format!("{dir}/manifest.json")),
-        (None, None) => None,
-    };
-    let Some(manifest_url) = manifest_url else {
-        tracing::info!(
-            plugin = %slug,
-            version = %version,
-            "registry_source: skipping a release whose module is uploaded rather \
-             than linked and which publishes no manifest artifact, so nothing \
-             names how to load it"
-        );
-        return None;
-    };
-
-    Some(OfficialPlugin {
-        id: slug.clone(),
-        official: package.did == super::official_registry::OFFICIAL_PUBLISHER_DID,
-        publisher_did: Some(package.did.clone()),
-        name: package.record.name.clone().unwrap_or_else(|| slug.clone()),
-        description: package.record.description.clone(),
-        icon_url: release
-            .record
-            .artifacts
-            .icon
-            .as_ref()
-            .and_then(|a| artifact_url(base, &package.did, &slug, &version, "icon", a)),
-        banner_url: release
-            .record
-            .artifacts
-            .banner
-            .as_ref()
-            .and_then(|a| artifact_url(base, &package.did, &slug, &version, "banner", a)),
-        latest_version: version,
-        manifest_url,
-        wasm_url,
-        sections: package.record.sections.clone(),
-        releases: listing
-            .releases
-            .iter()
-            .filter_map(|r| {
-                Some(ReleaseEntry {
-                    version: r.record.version.clone()?,
-                    name: format!("{slug}-v{}", r.record.version.as_deref()?),
-                    published_at: r.indexed_at.clone().unwrap_or_default(),
-                    // Markdown, rendered for an operator deciding whether
-                    // to upgrade. Absent is normal: `notes` is optional and
-                    // a release published before the field existed has none.
-                    body: r.record.notes.clone().unwrap_or_default(),
-                })
-            })
-            .collect(),
-    })
-}
-
-/// One package, read fresh, for an on-demand update check. `None` when the
-/// registry no longer has it or it has no installable release.
-pub async fn fetch_package(
+/// One project, read fresh, for an on-demand check. `None` when the registry
+/// does not have it.
+pub async fn fetch_project(
     client: &reqwest::Client,
     source: &RegistrySource,
     did: &str,
-    slug: &str,
-) -> Result<Option<OfficialPlugin>, SourceError> {
-    let base = source.base_url.trim_end_matches('/');
-    let package: Option<PackageView> = get_opt(
-        client,
-        "getPackage",
-        format!(
-            "{base}/xrpc/at.happyproto.registry.getPackage?actor={}&slug={}",
-            urlencoding::encode(did),
-            urlencoding::encode(slug),
-        ),
-    )
-    .await?;
-    Ok(match package {
-        Some(package) => entry_for(client, base, package).await,
-        None => None,
-    })
+    name: &str,
+) -> Result<Option<CatalogueEntry>, SourceError> {
+    let Some(project) = source.get_project(client, did, name).await? else {
+        return Ok(None);
+    };
+    let versions = source
+        .list_versions(client, &project.did, &project.name)
+        .await?;
+    let latest = latest_version_view(client, source, &project, &versions).await;
+    Ok(Some(build_entry(source, project, versions, latest)))
+}
+
+async fn entry_for(
+    client: &reqwest::Client,
+    source: &RegistrySource,
+    project: ProjectView,
+) -> Option<CatalogueEntry> {
+    let versions = match source
+        .list_versions(client, &project.did, &project.name)
+        .await
+    {
+        Ok(versions) => versions,
+        Err(e) => {
+            tracing::warn!(
+                plugin = %project.name,
+                publisher = %project.did,
+                error = %e,
+                "registry_source: versions unreadable"
+            );
+            return None;
+        }
+    };
+    let latest = latest_version_view(client, source, &project, &versions).await;
+    Some(build_entry(source, project, versions, latest))
+}
+
+/// The version the `latest` channel points at. Usually already in the
+/// listing; one indexed too long ago to be on its pages is asked for by
+/// channel instead.
+async fn latest_version_view(
+    client: &reqwest::Client,
+    source: &RegistrySource,
+    project: &ProjectView,
+    versions: &[VersionView],
+) -> Option<VersionView> {
+    let channel = project.channels.get(LATEST)?;
+    if let Some(found) = versions
+        .iter()
+        .find(|v| v.uri == channel.uri || v.version == channel.version)
+    {
+        return Some(found.clone());
+    }
+    match source
+        .resolve_channel(client, &project.did, &project.name, LATEST)
+        .await
+    {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(
+                plugin = %project.name,
+                publisher = %project.did,
+                error = %e,
+                "registry_source: latest channel unreadable"
+            );
+            None
+        }
+    }
+}
+
+fn build_entry(
+    source: &RegistrySource,
+    project: ProjectView,
+    versions: Vec<VersionView>,
+    latest: Option<VersionView>,
+) -> CatalogueEntry {
+    let channels = project
+        .channels
+        .iter()
+        .map(|(name, c)| {
+            (
+                name.clone(),
+                ChannelEntry {
+                    version: c.version.clone(),
+                    state: c.state.clone(),
+                    installable: state_installable(&c.state) && c.availability == "available",
+                    availability: c.availability.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let sections = latest
+        .as_ref()
+        .map(|v| PluginSections {
+            changelog: v.changelog.as_ref().and_then(|c| c.markdown.clone()),
+            ..v.artifact.sections.clone()
+        })
+        .unwrap_or_default();
+
+    let releases = versions
+        .iter()
+        .map(|v| ReleaseEntry {
+            version: v.version.clone(),
+            name: format!("{}-v{}", project.name, v.version),
+            published_at: v.indexed_at.clone(),
+            body: v.changelog.as_ref().and_then(|c| c.markdown.clone()),
+            state: v.lifecycle.state.clone(),
+            installable: v.installable(),
+            availability: v.availability.clone(),
+            version_uri: v.uri.clone(),
+            manifest_cid: v.manifest.cid.clone(),
+            package_cid: v.artifact.package.cid().to_owned(),
+            manifest_blob_cid: v.artifact.manifest.cid().to_owned(),
+        })
+        .collect();
+
+    let cid_url = |cid: &str| (!cid.is_empty()).then(|| source.artifact_url(cid));
+
+    CatalogueEntry {
+        official: project.did == super::official_registry::OFFICIAL_PUBLISHER_DID,
+        publisher_did: Some(project.did.clone()),
+        name: project
+            .publication
+            .name
+            .clone()
+            .unwrap_or_else(|| project.name.clone()),
+        description: project.publication.description.clone(),
+        icon_url: project.publication.icon.as_deref().and_then(cid_url),
+        banner_url: project.banner.as_ref().and_then(|b| cid_url(&b.cid)),
+        plugin_type: project.plugin_type.clone(),
+        latest_version: project.channels.get(LATEST).map(|c| c.version.clone()),
+        channels,
+        releases,
+        sections,
+        lifecycle_state: project.lifecycle.state.clone(),
+        manifest_url: latest
+            .as_ref()
+            .and_then(|v| cid_url(v.artifact.manifest.cid()))
+            .unwrap_or_default(),
+        wasm_url: latest
+            .as_ref()
+            .and_then(|v| cid_url(v.artifact.package.cid()))
+            .unwrap_or_default(),
+        id: project.name,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const HP: &str = super::super::official_registry::OFFICIAL_PUBLISHER_DID;
+    const STRANGER: &str = "did:plc:someoneelse";
 
     fn source(server: &MockServer) -> RegistrySource {
         RegistrySource {
@@ -508,131 +691,309 @@ mod tests {
         }
     }
 
-    fn package(did: &str, slug: &str, latest: &str) -> serde_json::Value {
+    fn version_uri(did: &str, name: &str, version: &str) -> String {
+        format!("at://{did}/software.release.version/{name}:{version}")
+    }
+
+    fn channel(
+        did: &str,
+        name: &str,
+        version: &str,
+        state: &str,
+        availability: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
-            "uri": format!("at://{did}/at.happyproto.plugin.profile/{slug}"),
+            "version": version,
+            "uri": version_uri(did, name, version),
+            "cid": format!("bafyversion{version}"),
+            "state": state,
+            "availability": availability,
+        })
+    }
+
+    fn project(did: &str, name: &str, channels: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "uri": format!("at://{did}/software.release.project/{name}"),
+            "cid": "bafyproject",
             "did": did,
-            "status": "active",
-            "latestVersion": latest,
-            "record": { "name": format!("{slug} plugin") },
-        })
-    }
-
-    fn release(slug: &str, version: &str, status: &str) -> serde_json::Value {
-        serde_json::json!({
-            "uri": format!("at://{HP}/at.happyproto.plugin.release/{slug}:{version}"),
-            "status": status,
-            "indexedAt": "2026-10-01T00:00:00Z",
-            "record": {
-                "version": version,
-                "artifacts": { "package": { "url": format!("https://example.com/{slug}-v{version}/{slug}.wasm") } },
+            "name": name,
+            "sidecar": { "uri": format!("at://{did}/at.happyproto.registry.project/{name}") },
+            "publication": {
+                "uri": format!("at://{did}/site.standard.publication/{name}"),
+                "cid": "bafypublication",
+                "name": format!("{name} plugin"),
+                "description": format!("The {name} plugin"),
+                "url": "https://example.com",
+                "icon": format!("bafkreiicon{name}"),
             },
+            "pluginType": "interpreter",
+            "keywords": [],
+            "authors": [],
+            "security": [],
+            "channels": channels,
+            "banner": { "cid": format!("bafkreibanner{name}"), "width": 1200, "height": 400 },
+            "lifecycle": { "state": "active" },
+            "indexedAt": "2026-10-01T00:00:00Z",
         })
     }
 
-    async fn mount(server: &MockServer, packages: serde_json::Value, releases: serde_json::Value) {
+    fn version(
+        did: &str,
+        name: &str,
+        version: &str,
+        state: &str,
+        installable: bool,
+        availability: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "uri": version_uri(did, name, version),
+            "cid": format!("bafyversion{version}"),
+            "did": did,
+            "name": name,
+            "version": version,
+            "manifest": {
+                "uri": format!("at://{did}/software.release.manifest/{name}:{version}"),
+                "cid": format!("bafymanifestrecord{version}"),
+            },
+            "artifact": {
+                "$type": "at.happyproto.plugin.v1",
+                "package": { "$type": "blob", "ref": { "$link": format!("bafkreipackage{version}") }, "mimeType": "application/wasm", "size": 1 },
+                "manifest": { "$type": "blob", "ref": { "$link": format!("bafkreimanifest{version}") }, "mimeType": "application/json", "size": 1 },
+                "pluginType": "interpreter",
+                "apiVersion": "2",
+                "capabilities": [],
+                "license": "MIT",
+                "sections": { "description": format!("# {name} {version}"), "security": "Report privately." },
+            },
+            "changelog": {
+                "uri": format!("at://{did}/site.standard.document/{name}-{version}"),
+                "title": version,
+                "markdown": format!("- {version} notes"),
+                "fetchedAt": "2026-10-02T00:00:00Z",
+            },
+            "availability": availability,
+            "suspect": false,
+            "lifecycle": { "state": state, "installable": installable, "events": [] },
+            "indexedAt": format!("2026-10-01T00:00:00Z"),
+        })
+    }
+
+    async fn mount_projects(server: &MockServer, projects: serde_json::Value) {
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.searchPackages"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "packages": packages })),
+                    .set_body_json(serde_json::json!({ "projects": projects })),
             )
             .mount(server)
             .await;
+    }
+
+    async fn mount_versions(
+        server: &MockServer,
+        did: &str,
+        name: &str,
+        versions: serde_json::Value,
+    ) {
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.listReleases"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
+            .and(query_param("did", did))
+            .and(query_param("name", name))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "releases": releases })),
+                    .set_body_json(serde_json::json!({ "versions": versions })),
             )
             .mount(server)
             .await;
     }
 
     #[tokio::test]
-    async fn the_catalogue_lists_every_publisher_and_marks_the_official_one() {
+    async fn the_catalogue_is_built_from_projects_and_their_versions() {
         let server = MockServer::start().await;
-        mount(
+        mount_projects(
             &server,
             serde_json::json!([
-                package(HP, "lua", "1.2.0"),
-                package("did:plc:someoneelse", "extra", "9.0.0")
-            ]),
-            serde_json::json!([
-                release("lua", "1.2.0", "active"),
-                release("extra", "9.0.0", "active")
+                project(HP, "lua", serde_json::json!({ "latest": channel(HP, "lua", "1.2.0", "active", "available") })),
+                project(STRANGER, "extra", serde_json::json!({ "latest": channel(STRANGER, "extra", "9.0.0", "active", "available") })),
             ]),
         )
         .await;
-        let mut plugins = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([
+                version(HP, "lua", "1.2.0", "active", true, "available"),
+                version(HP, "lua", "1.1.0", "active", true, "available"),
+            ]),
+        )
+        .await;
+        mount_versions(
+            &server,
+            STRANGER,
+            "extra",
+            serde_json::json!([version(
+                STRANGER,
+                "extra",
+                "9.0.0",
+                "active",
+                true,
+                "available"
+            )]),
+        )
+        .await;
+
+        let src = source(&server);
+        let mut entries = fetch_catalogue(&reqwest::Client::new(), &src)
             .await
             .unwrap();
-        plugins.sort_by(|a, b| a.id.cmp(&b.id));
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(
-            plugins
+            entries
                 .iter()
-                .map(|p| (p.id.as_str(), p.official))
+                .map(|e| (e.id.as_str(), e.official, e.publisher_did.as_deref()))
                 .collect::<Vec<_>>(),
-            [("extra", false), ("lua", true)]
+            [("extra", false, Some(STRANGER)), ("lua", true, Some(HP))]
         );
-        assert_eq!(
-            plugins[0].publisher_did.as_deref(),
-            Some("did:plc:someoneelse")
-        );
-    }
 
-    #[tokio::test]
-    async fn an_official_package_wins_a_slug_collision() {
-        let server = MockServer::start().await;
-        // The impostor is listed first, so a first-wins rule would keep it.
-        mount(
-            &server,
-            serde_json::json!([
-                package("did:plc:someoneelse", "lua", "9.0.0"),
-                package(HP, "lua", "1.2.0")
-            ]),
-            serde_json::json!([
-                release("lua", "9.0.0", "active"),
-                release("lua", "1.2.0", "active")
-            ]),
-        )
-        .await;
-        let plugins = fetch_catalogue(&reqwest::Client::new(), &source(&server))
-            .await
-            .unwrap();
-        assert_eq!(plugins.len(), 1);
-        assert!(plugins[0].official);
-        assert_eq!(plugins[0].publisher_did.as_deref(), Some(HP));
-    }
-
-    #[tokio::test]
-    async fn only_active_releases_are_listed_or_installed() {
-        let server = MockServer::start().await;
-        mount(
-            &server,
-            serde_json::json!([package(HP, "lua", "1.2.0")]),
-            serde_json::json!([
-                release("lua", "1.3.0-beta.1", "pending"),
-                release("lua", "1.2.0", "active"),
-                release("lua", "1.1.0", "active"),
-                release("lua", "1.0.0", "deleted"),
-            ]),
-        )
-        .await;
-        let plugins = fetch_catalogue(&reqwest::Client::new(), &source(&server))
-            .await
-            .unwrap();
+        let lua = &entries[1];
+        assert_eq!(lua.name, "lua plugin");
+        assert_eq!(lua.description.as_deref(), Some("The lua plugin"));
+        assert_eq!(lua.icon_url, Some(src.artifact_url("bafkreiiconlua")));
+        assert_eq!(lua.banner_url, Some(src.artifact_url("bafkreibannerlua")));
+        assert_eq!(lua.plugin_type, "interpreter");
+        assert_eq!(lua.latest_version.as_deref(), Some("1.2.0"));
+        assert_eq!(lua.lifecycle_state, "active");
         assert_eq!(
-            plugins[0]
-                .releases
+            lua.releases
                 .iter()
                 .map(|r| r.version.as_str())
                 .collect::<Vec<_>>(),
-            ["1.2.0", "1.1.0"]
+            ["1.2.0", "1.1.0"],
+            "newest first, as listed"
         );
         assert_eq!(
-            plugins[0].wasm_url,
-            "https://example.com/lua-v1.2.0/lua.wasm"
+            lua.sections.description.as_deref(),
+            Some("# lua 1.2.0"),
+            "sections come from the latest channel's artifact"
+        );
+        assert_eq!(lua.sections.security.as_deref(), Some("Report privately."));
+        assert_eq!(lua.sections.changelog.as_deref(), Some("- 1.2.0 notes"));
+    }
+
+    #[tokio::test]
+    async fn channels_carry_their_version_state_and_whether_they_install() {
+        let server = MockServer::start().await;
+        mount_projects(
+            &server,
+            serde_json::json!([project(
+                HP,
+                "lua",
+                serde_json::json!({
+                    "latest": channel(HP, "lua", "1.2.0", "deprecated", "available"),
+                    "beta": channel(HP, "lua", "1.3.0-beta.1", "active", "pending"),
+                    "old": channel(HP, "lua", "0.9.0", "retired", "available"),
+                })
+            )]),
+        )
+        .await;
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([version(HP, "lua", "1.2.0", "deprecated", true, "available")]),
+        )
+        .await;
+
+        let entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap();
+        let channels = &entries[0].channels;
+        assert_eq!(
+            channels.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["beta", "latest", "old"]
+        );
+        let latest = &channels["latest"];
+        assert_eq!(latest.version, "1.2.0");
+        assert_eq!(latest.state, "deprecated");
+        assert_eq!(latest.availability, "available");
+        assert!(latest.installable, "a deprecated version still installs");
+        assert!(
+            !channels["beta"].installable,
+            "a version the registry has not copied yet has nothing to fetch"
+        );
+        assert!(
+            !channels["old"].installable,
+            "a retired version does not install"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_official_project_wins_a_name_collision_and_otherwise_the_first_stays() {
+        let server = MockServer::start().await;
+        let third = "did:plc:third";
+        // The stranger is listed first, so a first-wins rule alone would keep it.
+        mount_projects(
+            &server,
+            serde_json::json!([
+                project(STRANGER, "lua", serde_json::json!({})),
+                project(HP, "lua", serde_json::json!({})),
+                project(STRANGER, "extra", serde_json::json!({})),
+                project(third, "extra", serde_json::json!({})),
+            ]),
+        )
+        .await;
+        for (did, name) in [
+            (STRANGER, "lua"),
+            (HP, "lua"),
+            (STRANGER, "extra"),
+            (third, "extra"),
+        ] {
+            mount_versions(&server, did, name, serde_json::json!([])).await;
+        }
+
+        let mut entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.id.as_str(), e.publisher_did.as_deref()))
+                .collect::<Vec<_>>(),
+            [("extra", Some(STRANGER)), ("lua", Some(HP))]
+        );
+        assert!(entries[1].official);
+    }
+
+    #[tokio::test]
+    async fn search_follows_cursors_to_the_last_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [project(HP, "lua", serde_json::json!({}))],
+                "cursor": "page2",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .and(query_param("cursor", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [project(HP, "extra", serde_json::json!({}))],
+            })))
+            .mount(&server)
+            .await;
+
+        let projects = source(&server)
+            .search_projects(&reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["lua", "extra"]
         );
     }
 
@@ -640,7 +1001,7 @@ mod tests {
     async fn a_200_carrying_an_error_is_an_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.searchPackages"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "error": "NotConfigured", "message": "no identity"
             })))
@@ -653,282 +1014,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_package_reads_one_package_and_answers_none_when_gone() {
+    async fn a_missing_project_version_or_channel_is_none() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.getPackage"))
-            .and(query_param("slug", "lua"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(package(HP, "lua", "1.2.0")))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/xrpc/at.happyproto.registry.getPackage"))
-            .and(query_param("slug", "gone"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "PackageNotFound", "message": "gone"
-            })))
-            .mount(&server)
-            .await;
-        mount(
-            &server,
-            serde_json::json!([]),
-            serde_json::json!([release("lua", "1.2.0", "active")]),
-        )
-        .await;
-
+        for (xrpc, error) in [
+            ("getProject", "ProjectNotFound"),
+            ("getVersion", "VersionNotFound"),
+            ("resolveChannel", "ChannelNotFound"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/xrpc/at.happyproto.registry.{xrpc}")))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": error, "message": "not here"
+                })))
+                .mount(&server)
+                .await;
+        }
         let client = reqwest::Client::new();
-        let lua = fetch_package(&client, &source(&server), HP, "lua")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(lua.latest_version, "1.2.0");
-        assert!(lua.official);
+        let src = source(&server);
         assert!(
-            fetch_package(&client, &source(&server), HP, "gone")
+            src.get_project(&client, HP, "gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fetch_project(&client, &src, HP, "gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            src.get_version(&client, HP, "lua", "9.9.9")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            src.resolve_channel(&client, HP, "lua", "nightly")
                 .await
                 .unwrap()
                 .is_none()
         );
     }
 
-    #[test]
-    fn a_slug_is_the_last_segment_of_the_profile_uri() {
-        assert_eq!(
-            slug_of("at://did:plc:abc/at.happyproto.plugin.profile/happyview-http"),
-            Some("happyview-http")
-        );
-        assert_eq!(slug_of(""), None);
-        assert_eq!(slug_of("no-slashes-here"), None);
-        assert_eq!(slug_of("at://did:plc:abc/collection/"), None);
-    }
-
-    /// The registry's own field names, so a rename on either side is a test
-    /// failure rather than a silently empty catalogue.
-    #[test]
-    fn a_package_view_deserialises_from_the_registrys_shape() {
-        let listing: SearchPackages = serde_json::from_value(serde_json::json!({
-            "packages": [{
-                "uri": "at://did:plc:abc/at.happyproto.plugin.profile/demo",
-                "cid": "bafy",
-                "did": "did:plc:abc",
-                "record": { "name": "Demo", "description": "A demo." },
-                "status": "active",
-                "latestVersion": "1.2.3",
-                "indexedAt": "2026-01-01T00:00:00.000000+00:00"
-            }]
-        }))
-        .expect("the listing should parse");
-
-        let package = &listing.packages[0];
-        assert_eq!(package.did, "did:plc:abc");
-        assert_eq!(package.latest_version.as_deref(), Some("1.2.3"));
-        assert_eq!(package.record.name.as_deref(), Some("Demo"));
-    }
-
-    /// A package with no active release is not installable, and neither is a
-    /// release whose module is a blob with no url: both are left out rather
-    /// than offered and then failing at install.
-    #[test]
-    fn a_release_view_deserialises_and_distinguishes_a_blob_only_module() {
-        let with_url: ReleaseView = serde_json::from_value(serde_json::json!({
-            "uri": "at://did:plc:abc/at.happyproto.plugin.release/demo:1.0.0",
-            "record": {
-                "version": "1.0.0",
-                "notes": "## 1.0.0\n\n- first release",
-                "artifacts": { "package": { "url": "https://example.com/d/m.wasm" } }
-            },
-            "indexedAt": "2026-01-01T00:00:00.000000+00:00"
-        }))
-        .expect("the release should parse");
-        assert_eq!(
-            with_url.record.notes.as_deref(),
-            Some("## 1.0.0\n\n- first release"),
-            "notes are markdown and are read verbatim"
-        );
-        assert_eq!(
-            with_url.record.artifacts.package.and_then(|a| a.url),
-            Some("https://example.com/d/m.wasm".into())
-        );
-
-        let blob_only: ReleaseView = serde_json::from_value(serde_json::json!({
-            "record": {
-                "version": "1.0.0",
-                "artifacts": { "package": { "checksum": "bafkrei" } }
-            }
-        }))
-        .expect("a blob-only release should still parse");
-        assert!(
-            blob_only
-                .record
-                .artifacts
-                .package
-                .and_then(|a| a.url)
-                .is_none(),
-            "a blob-only module has no url to install from"
-        );
-    }
-
-    /// `searchPackages` answers no `latestVersion` — it skips the per-package
-    /// lookup that would cost, exactly as it skips `handle` — so a source
-    /// that trusted the field skipped every package the registry served.
-    #[test]
-    fn the_current_version_is_the_highest_active_release() {
-        let releases: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
-            { "record": { "version": "1.0.0" } },
-            { "record": { "version": "1.2.0" } },
-            { "record": { "version": "1.10.0" } },
-            { "record": { "version": "1.3.0" } },
-        ]))
-        .expect("the releases should parse");
-
-        assert_eq!(
-            highest_version(&releases).as_deref(),
-            Some("1.10.0"),
-            "versions order numerically, not as strings"
-        );
-        assert_eq!(highest_version(&[]), None, "no releases, no version");
-    }
-
-    /// A prerelease never shadows the stable release it leads to, which is
-    /// the ordering the registry itself applies.
-    #[test]
-    fn a_prerelease_sorts_below_the_release_it_leads_to() {
-        let mixed: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
-            { "record": { "version": "1.0.0-alpha.2" } },
-            { "record": { "version": "1.0.0" } },
-            { "record": { "version": "1.0.0-alpha.10" } },
-        ]))
-        .expect("the releases should parse");
-        assert_eq!(highest_version(&mixed).as_deref(), Some("1.0.0"));
-
-        let only_pre: Vec<ReleaseView> = serde_json::from_value(serde_json::json!([
-            { "record": { "version": "1.0.0-alpha.2" } },
-            { "record": { "version": "1.0.0-alpha.10" } },
-        ]))
-        .expect("the releases should parse");
-        assert_eq!(
-            highest_version(&only_pre).as_deref(),
-            Some("1.0.0-alpha.10"),
-            "alpha.10 is after alpha.2: prerelease identifiers compare numerically"
-        );
-    }
-
-    /// A blob has no URL of its own, so the registry's own copy is where its
-    /// bytes come from. A linked artifact keeps the URL the publisher gave.
-    #[test]
-    fn an_artifact_resolves_to_its_url_or_to_the_registrys_copy() {
-        let linked = Artifact {
-            url: Some("https://example.com/d/m.wasm".into()),
-            blob: None,
-        };
-        assert_eq!(
-            artifact_url(
-                "https://reg.example",
-                "did:plc:abc",
-                "demo",
-                "1.0.0",
-                "package",
-                &linked
-            )
-            .as_deref(),
-            Some("https://example.com/d/m.wasm"),
-        );
-
-        let uploaded = Artifact {
-            url: None,
-            blob: Some(serde_json::json!({ "$type": "blob" })),
-        };
-        let url = artifact_url(
-            "https://reg.example",
-            "did:plc:abc",
-            "demo",
-            "1.0.0-alpha.1",
-            "manifest",
-            &uploaded,
+    #[tokio::test]
+    async fn fetch_project_reads_one_project_and_its_latest_version() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.getProject"))
+            .and(query_param("actor", HP))
+            .and(query_param("name", "lua"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(project(
+                HP,
+                "lua",
+                serde_json::json!({ "latest": channel(HP, "lua", "1.0.0", "active", "available") }),
+            )))
+            .mount(&server)
+            .await;
+        // The listing's first page does not reach the latest version, so it
+        // is asked for by channel.
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([version(
+                HP,
+                "lua",
+                "2.0.0-beta.1",
+                "active",
+                true,
+                "available"
+            )]),
         )
-        .expect("an uploaded artifact resolves to getArtifact");
-        assert!(url.starts_with("https://reg.example/xrpc/at.happyproto.registry.getArtifact?"));
-        assert!(url.contains("type=manifest"));
-        assert!(
-            url.contains("version=1.0.0-alpha.1"),
-            "the version is carried as given: {url}"
-        );
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.resolveChannel"))
+            .and(query_param("channel", "latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(version(
+                HP,
+                "lua",
+                "1.0.0",
+                "active",
+                true,
+                "available",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let neither = Artifact {
-            url: None,
-            blob: None,
+        let lua = fetch_project(&reqwest::Client::new(), &source(&server), HP, "lua")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lua.official);
+        assert_eq!(lua.latest_version.as_deref(), Some("1.0.0"));
+        assert_eq!(lua.sections.description.as_deref(), Some("# lua 1.0.0"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn release_entries_carry_lifecycle_availability_and_cids() {
+        let server = MockServer::start().await;
+        mount_projects(
+            &server,
+            serde_json::json!([project(
+                HP,
+                "lua",
+                serde_json::json!({ "latest": channel(HP, "lua", "1.2.0", "active", "available") })
+            )]),
+        )
+        .await;
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([
+                version(HP, "lua", "1.3.0", "active", true, "pending"),
+                version(HP, "lua", "1.2.0", "active", true, "available"),
+                version(HP, "lua", "1.1.0", "deprecated", true, "available"),
+                version(HP, "lua", "1.0.0", "retired", false, "available"),
+                version(HP, "lua", "0.9.0", "active", true, "deletedAtSource"),
+            ]),
+        )
+        .await;
+
+        let entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap();
+        let releases = &entries[0].releases;
+        assert_eq!(
+            releases
+                .iter()
+                .map(|r| (
+                    r.version.as_str(),
+                    r.state.as_str(),
+                    r.availability.as_str(),
+                    r.installable
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("1.3.0", "active", "pending", false),
+                ("1.2.0", "active", "available", true),
+                ("1.1.0", "deprecated", "available", true),
+                ("1.0.0", "retired", "available", false),
+                ("0.9.0", "active", "deletedAtSource", false),
+            ],
+            "every version is listed; only one the registry holds and the lifecycle allows installs"
+        );
+        let r = &releases[1];
+        assert_eq!(r.version_uri, version_uri(HP, "lua", "1.2.0"));
+        assert_eq!(r.manifest_cid, "bafymanifestrecord1.2.0");
+        assert_eq!(r.package_cid, "bafkreipackage1.2.0");
+        assert_eq!(r.manifest_blob_cid, "bafkreimanifest1.2.0");
+        assert_eq!(r.published_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert_eq!(r.body.as_deref(), Some("- 1.2.0 notes"));
+    }
+
+    #[test]
+    fn an_artifact_url_names_the_cid_on_the_registry() {
+        let src = RegistrySource {
+            base_url: "https://reg.example/".into(),
+            limit: 100,
         };
         assert_eq!(
-            artifact_url(
-                "https://reg.example",
-                "did:plc:abc",
-                "demo",
-                "1.0.0",
-                "package",
-                &neither
-            ),
-            None,
-            "an artifact naming no bytes resolves to nothing"
+            src.artifact_url("bafkreiabc"),
+            "https://reg.example/xrpc/at.happyproto.registry.getArtifact?cid=bafkreiabc"
         );
     }
 
-    /// The sibling-manifest fallback means "the file beside the module", so
-    /// it only answers for a module the publisher linked. Every uploaded
-    /// module is served from the one `/xrpc/` path, where the sibling of any
-    /// of them is the same meaningless `/xrpc/manifest.json`.
     #[test]
-    fn an_uploaded_module_has_no_sibling_manifest_to_fall_back_on() {
-        let uploaded = artifact_url(
-            "https://reg.example",
-            "did:plc:abc",
-            "demo",
-            "1.0.0",
-            "package",
-            &Artifact {
-                url: None,
-                blob: Some(serde_json::json!({ "$type": "blob" })),
-            },
-        )
-        .expect("an uploaded module resolves to getArtifact");
-        let sibling = uploaded
-            .rsplit_once('/')
-            .map(|(dir, _)| format!("{dir}/manifest.json"));
-        assert_eq!(
-            sibling.as_deref(),
-            Some("https://reg.example/xrpc/manifest.json"),
-            "which names no plugin at all, and is why the fallback is not taken"
-        );
-    }
-
-    /// The prose a detail page shows. Every field is optional, and a profile
-    /// written before `sections` existed parses to an empty set rather than
-    /// failing the whole catalogue.
-    #[test]
-    fn a_profiles_sections_survive_the_parse_and_are_each_optional() {
-        let listing: SearchPackages = serde_json::from_value(serde_json::json!({
-            "packages": [{
-                "uri": "at://did:plc:abc/at.happyproto.plugin.profile/demo",
-                "did": "did:plc:abc",
-                "record": {
-                    "name": "Demo",
-                    "sections": { "description": "# What it does", "security": "Report privately." }
-                }
-            }, {
-                "uri": "at://did:plc:abc/at.happyproto.plugin.profile/bare",
-                "did": "did:plc:abc",
-                "record": { "name": "Bare" }
-            }]
-        }))
-        .expect("the listing should parse");
-
-        let sections = &listing.packages[0].record.sections;
-        assert_eq!(sections.description.as_deref(), Some("# What it does"));
-        assert_eq!(sections.security.as_deref(), Some("Report privately."));
-        assert_eq!(sections.installation, None);
-        assert_eq!(sections.changelog, None);
-        assert_eq!(
-            listing.packages[1].record.sections,
-            PluginSections::default()
-        );
+    fn a_repeated_or_empty_cursor_ends_paging() {
+        assert_eq!(next_cursor(None, Some("a".into())).as_deref(), Some("a"));
+        assert_eq!(next_cursor(Some("a"), Some("a".into())), None);
+        assert_eq!(next_cursor(Some("a"), Some(String::new())), None);
+        assert_eq!(next_cursor(Some("a"), None), None);
     }
 }

@@ -509,11 +509,11 @@ async fn the_registry_is_preferred_over_the_github_walk() {
     // The release's own notes are what the update dialog renders, so they have
     // to survive the catalogue rather than being dropped on the way through.
     assert_eq!(
-        cached.plugins["happyview-http"].releases[0].body,
-        "- faster\n- fewer bugs"
+        cached.plugins["happyview-http"].releases[0].body.as_deref(),
+        Some("- faster\n- fewer bugs")
     );
     assert_eq!(
-        cached.plugins["happyview-http"].releases[1].body, "",
+        cached.plugins["happyview-http"].releases[1].body, None,
         "a release that published no notes carries none"
     );
 }
@@ -905,16 +905,19 @@ fn catalogue_entry(
     publisher: Option<&str>,
     manifest_url: &str,
     versions: &[&str],
-) -> happyview::plugin::official_registry::OfficialPlugin {
+) -> happyview::plugin::official_registry::CatalogueEntry {
     use happyview::plugin::official_registry::{OFFICIAL_PUBLISHER_DID, ReleaseEntry};
-    happyview::plugin::official_registry::OfficialPlugin {
+    happyview::plugin::official_registry::CatalogueEntry {
         id: id.into(),
         publisher_did: publisher.map(str::to_owned),
         official: publisher.is_none_or(|p| p == OFFICIAL_PUBLISHER_DID),
         name: id.into(),
         description: None,
         icon_url: None,
-        latest_version: versions[0].into(),
+        plugin_type: "auth".into(),
+        channels: Default::default(),
+        latest_version: Some(versions[0].into()),
+        lifecycle_state: "active".into(),
         manifest_url: manifest_url.into(),
         wasm_url: manifest_url.replace("manifest.json", "plugin.wasm"),
         releases: versions
@@ -922,8 +925,15 @@ fn catalogue_entry(
             .map(|v| ReleaseEntry {
                 version: (*v).into(),
                 name: format!("{id}-v{v}"),
-                published_at: "2026-10-01T00:00:00Z".into(),
-                body: String::new(),
+                published_at: Some("2026-10-01T00:00:00Z".into()),
+                body: None,
+                state: "active".into(),
+                installable: true,
+                availability: "available".into(),
+                version_uri: String::new(),
+                manifest_cid: String::new(),
+                package_cid: String::new(),
+                manifest_blob_cid: String::new(),
             })
             .collect(),
         sections: Default::default(),
@@ -933,7 +943,7 @@ fn catalogue_entry(
 
 async fn put_in_catalogue(
     app: &TestApp,
-    entry: happyview::plugin::official_registry::OfficialPlugin,
+    entry: happyview::plugin::official_registry::CatalogueEntry,
 ) {
     app.state
         .official_registry
