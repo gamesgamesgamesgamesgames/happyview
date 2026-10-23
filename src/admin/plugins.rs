@@ -259,8 +259,8 @@ fn compute_update_info(
     let Some(head) = entry.channels.get(channel) else {
         return UpdateInfo::default();
     };
-    // The channel carries only its version's state; the release also knows
-    // whether the registry flagged it suspect.
+    // The channel says whether its version may be installed, suspect
+    // included; the release, when the catalogue lists it, carries its state.
     let release = entry.releases.iter().find(|r| r.version == head.version);
     let installable = head.installable && release.is_none_or(|r| r.installable);
     let state = release.map_or_else(|| head.state.clone(), |r| r.state.clone());

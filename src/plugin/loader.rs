@@ -2,6 +2,10 @@ use crate::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource, Regi
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use crate::plugin::registry_source::{
+    MAX_MANIFEST_BYTES, MAX_PACKAGE_BYTES, ReadError, read_capped,
+};
+
 /// Highest plugin API version this binary understands. Version 2 added
 /// `plugin_type`, capabilities, dependencies, and the library/interpreter
 /// exports.
@@ -34,6 +38,8 @@ pub enum LoadError {
     },
     #[error("Failed to parse plugin info: {0}")]
     ParseInfo(#[from] serde_json::Error),
+    #[error("the plugin's {what} is larger than {limit} bytes")]
+    TooLarge { what: &'static str, limit: usize },
     #[error("Plugin API version {0} not supported (max {MAX_API_VERSION})")]
     UnsupportedApiVersion(String),
     #[error(
@@ -117,7 +123,8 @@ pub async fn fetch_manifest(
         .error_for_status()
         .map_err(|_| LoadError::ManifestNotFound(manifest_url.clone()))?;
 
-    let manifest: PluginManifest = response.json().await?;
+    let manifest: PluginManifest =
+        serde_json::from_slice(&read_artifact(response, "manifest", MAX_MANIFEST_BYTES).await?)?;
 
     // Derive WASM URL from manifest
     let wasm_url = format!("{}/{}", base_url, manifest.wasm_file);
@@ -142,13 +149,20 @@ pub async fn fetch_registry_artifacts(
     let manifest_bytes = fetch_verified(
         client,
         "manifest",
+        MAX_MANIFEST_BYTES,
         &install.manifest_url,
         &install.manifest_blob_cid,
     )
     .await?;
     let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes)?;
-    let wasm_bytes =
-        fetch_verified(client, "module", &install.package_url, &install.package_cid).await?;
+    let wasm_bytes = fetch_verified(
+        client,
+        "module",
+        MAX_PACKAGE_BYTES,
+        &install.package_url,
+        &install.package_cid,
+    )
+    .await?;
 
     Ok(PluginPreview {
         manifest,
@@ -159,9 +173,23 @@ pub async fn fetch_registry_artifacts(
     })
 }
 
+/// Read an artifact's body, refusing one past `limit` bytes.
+async fn read_artifact(
+    response: reqwest::Response,
+    what: &'static str,
+    limit: usize,
+) -> Result<Vec<u8>, LoadError> {
+    match read_capped(response, limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(ReadError::Http(e)) => Err(LoadError::from(e)),
+        Err(ReadError::TooLarge { limit }) => Err(LoadError::TooLarge { what, limit }),
+    }
+}
+
 async fn fetch_verified(
     client: &reqwest::Client,
     what: &'static str,
+    limit: usize,
     url: &str,
     expected_cid: &str,
 ) -> Result<Vec<u8>, LoadError> {
@@ -174,14 +202,8 @@ async fn fetch_verified(
             actual: "no CID to check against".to_string(),
         });
     }
-    let bytes = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?
-        .to_vec();
+    let response = client.get(url).send().await?.error_for_status()?;
+    let bytes = read_artifact(response, what, limit).await?;
     check_cid(
         what,
         expected_cid,
@@ -214,14 +236,14 @@ pub async fn load_from_manifest(
 
     let wasm_bytes = match &preview.wasm_bytes {
         Some(bytes) => bytes.clone(),
-        None => client
-            .get(&preview.wasm_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec(),
+        None => {
+            let response = client
+                .get(&preview.wasm_url)
+                .send()
+                .await?
+                .error_for_status()?;
+            read_artifact(response, "module", MAX_PACKAGE_BYTES).await?
+        }
     };
 
     // Verify SHA256 if provided
@@ -1293,6 +1315,44 @@ mod registry_tests {
     use super::registry_fixture::*;
     use super::*;
     use wiremock::MockServer;
+
+    /// An artifact past the contract's size is refused before it is hashed:
+    /// 1 MiB for a manifest, 16 MiB for a module.
+    #[tokio::test]
+    async fn an_oversized_artifact_is_refused() {
+        let server = MockServer::start().await;
+        let install = install_for(&server, "p");
+        serve(
+            &server,
+            &install.manifest_blob_cid,
+            vec![b' '; MAX_MANIFEST_BYTES + 1],
+        )
+        .await;
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoadError::TooLarge { what: "manifest", limit } if limit == MAX_MANIFEST_BYTES),
+            "{err:?}"
+        );
+
+        let server = MockServer::start().await;
+        let install = install_for(&server, "p");
+        serve(&server, &install.manifest_blob_cid, manifest_bytes("p")).await;
+        serve(
+            &server,
+            &install.package_cid,
+            vec![0; MAX_PACKAGE_BYTES + 1],
+        )
+        .await;
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoadError::TooLarge { what: "module", limit } if limit == MAX_PACKAGE_BYTES),
+            "{err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn registry_artifacts_whose_bytes_match_their_cids_load() {

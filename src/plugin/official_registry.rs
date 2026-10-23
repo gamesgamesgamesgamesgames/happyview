@@ -51,8 +51,8 @@ pub struct ReleaseEntry {
 pub struct ChannelEntry {
     pub version: String,
     pub state: String,
-    /// Whether the version may be installed: its state allows it and the
-    /// registry holds its bytes.
+    /// Whether the version may be installed: its state allows it, the
+    /// registry holds its bytes, and the registry hasn't flagged it suspect.
     pub installable: bool,
     pub availability: String,
 }
@@ -220,9 +220,10 @@ async fn hold(state: &SharedRegistry, plugin: CatalogueEntry) -> CatalogueEntry 
 }
 
 /// Rebuild the cache from the registry, along with the projects `installed`
-/// (publisher DID, name) plugins follow. Those the listing doesn't carry, or
-/// carries under a name another publisher holds, are each read on their own;
-/// one that can't be read keeps its previous entry. On error, the previous
+/// (publisher DID, name) plugins follow. A listed project whose versions
+/// can't be read keeps its previous entry. Followed projects the listing
+/// doesn't carry, or carries under a name another publisher holds, are each
+/// read on their own; one that can't be read keeps its previous entry. On error, the previous
 /// cache is retained and the error is returned; a listing cut off at the page
 /// cap is one, since it would otherwise replace the catalogue with part of
 /// it.
@@ -239,11 +240,23 @@ pub async fn refresh_full(
         return Ok(());
     };
 
-    let listed = super::registry_source::fetch_listing(client, source).await?;
+    let listing = super::registry_source::fetch_listing(client, source).await?;
+    let mut listed = listing.entries;
     tracing::info!(
         count = listed.len(),
+        unreadable = listing.unreadable.len(),
         "official_registry: catalogue read from the registry"
     );
+    // A project listed but unreadable this time keeps the entry the cache
+    // already had for it, rather than leaving the catalogue until it reads.
+    {
+        let previous = state.read().await;
+        for (did, name) in &listing.unreadable {
+            if let Some(kept) = previous.project(did, name) {
+                listed.push(kept.clone());
+            }
+        }
+    }
 
     let key = |e: &CatalogueEntry| (e.publisher_did.clone().unwrap_or_default(), e.id.clone());
     let mut followed: HashMap<(String, String), CatalogueEntry> = listed
@@ -839,6 +852,43 @@ mod tests {
         );
         drop(guard);
         server.verify().await;
+    }
+
+    /// A listed project whose versions can't be read this time keeps the
+    /// entry the cache already had, instead of leaving the catalogue.
+    #[tokio::test]
+    async fn refresh_full_keeps_an_entry_whose_versions_fail() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [
+                    registry_package(OFFICIAL_PUBLISHER_DID, "lua", "2.0.0"),
+                    registry_package(STRANGER, "extra", "0.1.0"),
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
+            .and(query_param("name", "lua"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        list_versions_answers(&server, STRANGER, "extra", "0.1.0").await;
+
+        let state = cached_official_lua();
+        refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[])
+            .await
+            .unwrap();
+        let guard = state.read().await;
+        assert_eq!(guard.plugins.len(), 2);
+        assert_eq!(
+            guard.plugins["lua"].latest_version.as_deref(),
+            Some("1.0.0"),
+            "the previous entry stays"
+        );
+        assert!(guard.plugins.contains_key("extra"));
     }
 
     /// With no cached entry, a check asks for the official publisher's

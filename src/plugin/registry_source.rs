@@ -22,6 +22,48 @@ const VERSIONS_PER_PAGE: u32 = 100;
 /// pages is far past any real catalogue or version history.
 const MAX_PAGES: usize = 300;
 
+/// The most a registry JSON answer may be. Far past any real listing page or
+/// version; a larger one is refused rather than held in memory.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most a plugin's module may be, as the artifact contract sets.
+pub const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most a plugin's manifest file may be, as the artifact contract sets.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
+/// Why a body wasn't read.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error("the response is larger than {limit} bytes")]
+    TooLarge { limit: usize },
+}
+
+/// Read a response body of at most `limit` bytes. A declared length past the
+/// limit is refused before reading, and an undeclared one as soon as the
+/// bytes read pass it, so nothing past the limit is held.
+pub async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ReadError> {
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > limit as u64)
+    {
+        return Err(ReadError::TooLarge { limit });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(ReadError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// The channel a project's current version is published on.
 pub const LATEST: &str = "latest";
 
@@ -259,6 +301,8 @@ pub enum SourceError {
     },
     #[error("registry was still paging {method} after {pages} pages; the listing is incomplete")]
     Truncated { method: &'static str, pages: usize },
+    #[error("registry answered {method} with more than {limit} bytes")]
+    TooLarge { method: &'static str, limit: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +519,12 @@ async fn get_value(
 ) -> Result<Result<serde_json::Value, (String, String)>, SourceError> {
     let response = client.get(&url).send().await?;
     let status = response.status();
-    let body: Option<serde_json::Value> = response.json().await.ok();
+    let bytes = match read_capped(response, MAX_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(ReadError::Http(e)) => return Err(SourceError::Http(e)),
+        Err(ReadError::TooLarge { limit }) => return Err(SourceError::TooLarge { method, limit }),
+    };
+    let body: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
     if let Some(name) = body
         .as_ref()
         .and_then(|b| b.get("error"))
@@ -551,24 +600,34 @@ pub async fn fetch_catalogue(
     client: &reqwest::Client,
     source: &RegistrySource,
 ) -> Result<Vec<CatalogueEntry>, SourceError> {
-    Ok(one_per_name(fetch_listing(client, source).await?))
+    Ok(one_per_name(fetch_listing(client, source).await?.entries))
+}
+
+/// What a listing read: an entry for each project whose versions could be
+/// read, and the (publisher DID, name) of each that couldn't.
+#[derive(Debug, Default)]
+pub struct Listing {
+    pub entries: Vec<CatalogueEntry>,
+    pub unreadable: Vec<(String, String)>,
 }
 
 /// Every project the registry lists, each publisher's own, including those
-/// that share a name. A project whose versions cannot be read is left out
-/// with a line saying so.
+/// that share a name. A project whose versions cannot be read is named in
+/// `unreadable`, with a line saying so, so a caller can keep what it had.
 pub async fn fetch_listing(
     client: &reqwest::Client,
     source: &RegistrySource,
-) -> Result<Vec<CatalogueEntry>, SourceError> {
+) -> Result<Listing, SourceError> {
     let projects = source.search_projects(client).await?;
-    let mut entries = Vec::new();
+    let mut listing = Listing::default();
     for project in projects {
-        if let Some(entry) = entry_for(client, source, project).await {
-            entries.push(entry);
+        let key = (project.did.clone(), project.name.clone());
+        match entry_for(client, source, project).await {
+            Some(entry) => listing.entries.push(entry),
+            None => listing.unreadable.push(key),
         }
     }
-    Ok(entries)
+    Ok(listing)
 }
 
 /// Keyed by name, as the catalogue is. Anyone can publish any name, so the
@@ -671,6 +730,15 @@ fn build_entry(
     versions: Vec<VersionView>,
     latest: Option<VersionView>,
 ) -> CatalogueEntry {
+    // A channel carries its version's state and availability, not whether
+    // the registry flagged it suspect; the version itself says that.
+    let suspect = |c: &ChannelView| {
+        versions
+            .iter()
+            .chain(latest.iter())
+            .find(|v| (!c.uri.is_empty() && v.uri == c.uri) || v.version == c.version)
+            .is_some_and(|v| v.suspect)
+    };
     let channels = project
         .channels
         .iter()
@@ -680,7 +748,9 @@ fn build_entry(
                 ChannelEntry {
                     version: c.version.clone(),
                     state: c.state.clone(),
-                    installable: state_installable(&c.state) && c.availability == "available",
+                    installable: state_installable(&c.state)
+                        && c.availability == "available"
+                        && !suspect(c),
                     availability: c.availability.clone(),
                 },
             )
@@ -1325,6 +1395,99 @@ mod tests {
         value["suspect"] = serde_json::json!(true);
         let view: VersionView = serde_json::from_value(value).unwrap();
         assert!(!view.installable());
+    }
+
+    /// A channel pointing at a suspect version may not be installed, even
+    /// though the channel itself carries no suspect flag.
+    #[tokio::test]
+    async fn a_channel_on_a_suspect_version_is_not_installable() {
+        let server = MockServer::start().await;
+        mount_projects(
+            &server,
+            serde_json::json!([project(
+                HP,
+                "lua",
+                serde_json::json!({
+                    "latest": channel(HP, "lua", "1.2.0", "active", "available"),
+                    "beta": channel(HP, "lua", "1.3.0-beta.1", "active", "available"),
+                })
+            )]),
+        )
+        .await;
+        let mut suspect = version(HP, "lua", "1.2.0", "active", true, "available");
+        suspect["suspect"] = serde_json::json!(true);
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([
+                version(HP, "lua", "1.3.0-beta.1", "active", true, "available"),
+                suspect,
+            ]),
+        )
+        .await;
+        let entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap();
+        assert!(!entries[0].channels["latest"].installable);
+        assert!(entries[0].channels["beta"].installable);
+    }
+
+    /// A JSON answer past the cap is refused, not read into memory.
+    #[tokio::test]
+    async fn an_oversized_registry_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b' '; MAX_RESPONSE_BYTES + 1], "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SourceError::TooLarge {
+                    method: "searchProjects",
+                    limit: MAX_RESPONSE_BYTES
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A body with no declared length is cut off once it passes the cap.
+    #[tokio::test]
+    async fn a_body_without_a_length_is_refused_past_the_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await;
+            let chunk = vec![b'x'; 64 * 1024];
+            // Far past the cap; the reader stops long before the end.
+            for _ in 0..64 {
+                if socket.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        assert!(response.content_length().is_none());
+        let err = read_capped(response, 256 * 1024).await.unwrap_err();
+        assert!(
+            matches!(err, ReadError::TooLarge { limit } if limit == 256 * 1024),
+            "{err:?}"
+        );
     }
 
     /// An install names the version and the CIDs it is fetched by, served
