@@ -19,7 +19,6 @@ import { Button } from "@/components/ui/button";
 import {
   previewPlugin,
   reloadPlugin,
-  type OfficialPluginSummary,
   type PluginPreview,
   type PluginSummary,
   type RegistryProjectRef,
@@ -34,64 +33,34 @@ import {
 
 interface PluginUpdateDialogProps {
   plugin: PluginSummary | null;
-  /** The catalogue's entry under the plugin's id, for an install that
-   * follows no registry project. */
-  catalogueEntry?: OfficialPluginSummary;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUpdated: (updated: PluginSummary) => void;
 }
 
 /**
- * How the update is fetched. A registry install moves along the channel it
- * follows, and the server resolves that version itself.
- *
- * A URL install, with no registry project or an unresolved one, takes the
- * catalogue's `manifest_url`. That field is transitional: the catalogue
- * names projects, not URLs, and this path goes when it does, leaving such an
- * install to be added again from the registry. Until then it is used only
- * when the listing offers the version the server's update gate approved: the
- * listing is one entry per id from any publisher, and may have moved on, or
- * be someone else's, since the gate ran. The server still holds a recorded
- * install to its publisher.
+ * The registry project an update comes from: the one the install follows,
+ * moving along its channel, whose version the server resolves itself. A
+ * plugin with no registry project is offered no update; it is added from the
+ * registry to follow one.
  */
-function updateSource(
-  plugin: PluginSummary | null,
-  entry: OfficialPluginSummary | undefined,
-):
-  | { kind: "registry"; project: RegistryProjectRef }
-  | { kind: "url"; url: string }
-  | null {
-  if (!plugin) return null;
-  const registry = plugin.registry;
-  if (registry?.did && registry.name) {
-    return {
-      kind: "registry",
-      project: {
-        did: registry.did,
-        name: registry.name,
-        ...(registry.channel ? { channel: registry.channel } : {}),
-      },
-    };
-  }
-  if (
-    entry &&
-    plugin.latest_version &&
-    entry.latest_version === plugin.latest_version
-  ) {
-    return { kind: "url", url: entry.manifest_url };
-  }
-  return null;
+function updateSource(plugin: PluginSummary | null): RegistryProjectRef | null {
+  const registry = plugin?.registry;
+  if (!registry?.did || !registry.name) return null;
+  return {
+    did: registry.did,
+    name: registry.name,
+    ...(registry.channel ? { channel: registry.channel } : {}),
+  };
 }
 
 export function PluginUpdateDialog({
   plugin,
-  catalogueEntry,
   open,
   onOpenChange,
   onUpdated,
 }: PluginUpdateDialogProps) {
-  const source = updateSource(plugin, catalogueEntry);
+  const source = updateSource(plugin);
   // Serialized so the preview effect runs when the source changes, not when
   // a poll hands back an equal one.
   const sourceKey = source ? JSON.stringify(source) : null;
@@ -117,16 +86,10 @@ export function PluginUpdateDialog({
       return;
     }
 
-    const source = JSON.parse(sourceKey) as NonNullable<
-      ReturnType<typeof updateSource>
-    >;
+    const source = JSON.parse(sourceKey) as RegistryProjectRef;
     let cancelled = false;
     setPreviewLoading(true);
-    previewPlugin(
-      source.kind === "registry"
-        ? { registry: source.project }
-        : { url: source.url },
-    )
+    previewPlugin({ registry: source })
       .then((preview) => {
         if (!cancelled) setNewManifestPreview(preview);
       })
@@ -175,12 +138,10 @@ export function PluginUpdateDialog({
     ).map((c) => c.name);
     try {
       // An empty selector keeps the channel the install follows.
-      const updated = await reloadPlugin(
-        plugin.id,
-        source.kind === "registry"
-          ? { registry: {}, accepted_capabilities }
-          : { url: source.url, accepted_capabilities },
-      );
+      const updated = await reloadPlugin(plugin.id, {
+        registry: {},
+        accepted_capabilities,
+      });
       if (plugin.latest_version) {
         try {
           window.localStorage.setItem(
@@ -324,8 +285,8 @@ export function PluginUpdateDialog({
 
           {!source ? (
             <p className="text-sm text-muted-foreground">
-              The catalogue no longer offers this update. Check for an update to
-              see what it offers now.
+              This plugin doesn&apos;t follow a registry project, so it
+              isn&apos;t offered updates. Add it from the registry to get them.
             </p>
           ) : null}
 

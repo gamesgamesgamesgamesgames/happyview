@@ -61,8 +61,8 @@ export default function CataloguePlugin() {
   const entry = id === URL_PLUGIN_ID ? undefined : byId.get(id);
   const pastedUrl = search.get("manifest");
   const retired = entry?.lifecycle_state === "retired";
-  // A catalogue entry is installed by its registry project. Only a pasted
-  // URL, or an entry with no publisher to name, is installed from a URL.
+  // A catalogue entry is installed by its registry project; only a pasted
+  // URL is installed from a URL.
   const byProject = Boolean(entry?.publisher_did) && !pastedUrl;
 
   const channelNames = useMemo(
@@ -85,17 +85,11 @@ export default function CataloguePlugin() {
     let origin: PluginOrigin | null = null;
     if (pastedUrl) {
       origin = { url: pastedUrl };
-    } else if (entry && !retired) {
-      if (entry.publisher_did) {
-        // The server refuses to preview a version that may not be installed.
-        if (headOk) {
-          origin = {
-            registry: { did: entry.publisher_did, name: entry.id, channel },
-          };
-        }
-      } else {
-        origin = { url: entry.manifest_url };
-      }
+    } else if (entry?.publisher_did && !retired && headOk) {
+      // The server refuses to preview a version that may not be installed.
+      origin = {
+        registry: { did: entry.publisher_did, name: entry.id, channel },
+      };
     }
     return origin ? JSON.stringify(origin) : null;
   }, [pastedUrl, entry, retired, headOk, channel]);

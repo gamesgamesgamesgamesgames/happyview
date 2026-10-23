@@ -135,8 +135,6 @@ export interface OfficialPluginSummary {
   channels: Record<string, ChannelEntry>;
   /** The project's own lifecycle state. */
   lifecycle_state: LifecycleState;
-  /** Transitional: a catalogue plugin is installed by its registry project. */
-  manifest_url: string;
   official: boolean;
   banner_url: string | null;
   /** Every release the catalogue knows, newest first. */

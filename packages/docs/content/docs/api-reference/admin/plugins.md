@@ -183,7 +183,7 @@ curl http://127.0.0.1:3000/admin/plugins -H "$AUTH"
 }
 ```
 
-`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available`, `latest_version`, `latest_version_installable`, `latest_state` and `pending_releases` come from the cached catalogue — call `POST /admin/plugins/{id}/check-update` to refresh them. For a registry plugin, an update is offered when the channel it follows points at a version other than the installed one and that version may be installed; a plugin installed from a URL is judged against `latest` and offered only a newer version. A version may be installed when its state is `active` or `deprecated`, the registry holds its files, and it isn't flagged suspect. When the channel moves to a version that may not be installed, `latest_version_installable` is `false` and `latest_state` says why; nothing is offered. `pending_releases` lists the installable releases on the channel's track (`latest` carries releases, `beta` and `alpha` their own prereleases) newer than the installed version, up to the channel's. The cache keeps every project an installed registry plugin follows, so a plugin whose project shares its name with another publisher's in the catalogue is still judged by its own.
+`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available`, `latest_version`, `latest_version_installable`, `latest_state` and `pending_releases` come from the cached catalogue — call `POST /admin/plugins/{id}/check-update` to refresh them. For a registry plugin, an update is offered when the channel it follows points at a version other than the installed one and that version may be installed. A plugin installed from a URL is offered nothing until it is attached to a registry project (see [Installing from a URL](../../guides/plugins.md#from-a-url)); once attached, it follows its channel but is offered only a newer version until its first install from the registry. A version may be installed when its state is `active` or `deprecated`, the registry holds its files, and it isn't flagged suspect. When the channel moves to a version that may not be installed, `latest_version_installable` is `false` and `latest_state` says why; nothing is offered. `pending_releases` lists the installable releases on the channel's track (`latest` carries releases, `beta` and `alpha` their own prereleases) newer than the installed version, up to the channel's. The cache keeps every project an installed registry plugin follows, so a plugin whose project shares its name with another publisher's in the catalogue is still judged by its own.
 
 `registry` is set for a plugin installed from a registry project. `installed_state` is the installed version's lifecycle state: a plugin whose version its publisher later retires keeps running, and `installed_state` is `"retired"`, with `installed_reason` when the publisher gave one.
 
@@ -428,7 +428,6 @@ Requires `plugins:read`. Returns the cached catalog of plugins from the official
         "latest": { "version": "1.2.0", "state": "active", "installable": true, "availability": "available" }
       },
       "lifecycle_state": "active",
-      "manifest_url": "https://api.happyproto.at/xrpc/at.happyproto.registry.getArtifact?cid=bafkrei...",
       "releases": [],
       "sections": {}
     }
@@ -436,7 +435,7 @@ Requires `plugins:read`. Returns the cached catalog of plugins from the official
 }
 ```
 
-`manifest_url` is where the registry serves the latest version's manifest. It is transitional: install a catalogue plugin by its `publisher_did` and `id` through `registry`, not from this URL.
+An entry names a project, not a URL: install it by its `publisher_did` and `id` through `registry`.
 
 ## Remove a plugin
 
@@ -499,7 +498,7 @@ The body is optional. To point the plugin at a new URL, pass:
 
 When a new URL is provided, the stored `sha256` is cleared (the new version has its own hash). File-based plugins cannot be reloaded via this endpoint and return `400 Bad Request`.
 
-An install from the catalogue records the publisher of the entry it came from, and a reload to a new URL must stay with that publisher. If the URL is not one the catalogue offers under this plugin's id from the recorded publisher, the reload is refused with `409 Conflict` and the installed version keeps running. To move a plugin to another publisher's package, remove it and add it again. A plugin installed from a URL the catalogue did not offer has no recorded publisher and is not checked.
+A plugin that recorded a publisher stays with it, and no URL can be checked against a publisher, so a reload of such a plugin to a new URL is refused with `409 Conflict` and the installed version keeps running. Update it from the registry, or remove it and add it again from the URL. A plugin installed from a URL records no publisher and may be pointed at a new one.
 
 A reloaded version can import host functions the operator never consented to. `accepted_capabilities` guards a reload the same way it guards [`POST /admin/plugins`](#install-a-plugin): when present, every capability the reloaded plugin would be granted must be listed, or the reload is refused with `400 Bad Request` naming the missing ones. The check runs before the installed version is removed, so a refusal leaves it running.
 

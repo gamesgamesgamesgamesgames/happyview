@@ -55,9 +55,9 @@ function LifecycleNotices({ plugin }: { plugin: PluginSummary }) {
         title="Unresolved: not matched to a registry project"
       >
         This plugin was installed from a URL that no registry project matched,
-        so it doesn&apos;t follow a channel and has no lifecycle state. Newer
-        releases published under the same name are still offered as updates. To
-        follow a channel, remove it and add it from the registry.
+        so it doesn&apos;t follow a channel, has no lifecycle state, and
+        isn&apos;t offered updates. It is matched again each time the catalogue
+        refreshes. To get updates now, remove it and add it from the registry.
       </LifecycleNotice>
     );
   }
@@ -338,7 +338,7 @@ export default function InstalledPlugin() {
               actions={
                 canManage ? (
                   <>
-                    {plugin?.update_available ? (
+                    {plugin?.update_available && followsProject ? (
                       <Button onClick={() => setUpdateOpen(true)}>
                         <ArrowUpCircle />
                         Update
@@ -480,7 +480,6 @@ export default function InstalledPlugin() {
 
       <PluginUpdateDialog
         plugin={plugin}
-        catalogueEntry={plugin ? byId.get(plugin.id) : undefined}
         open={updateOpen}
         onOpenChange={setUpdateOpen}
         onUpdated={() => {

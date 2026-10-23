@@ -73,6 +73,10 @@ struct InstalledRow {
     registry_channel: Option<String>,
     version_uri: Option<String>,
     unresolved: bool,
+    /// The module was installed by its CID from the registry. A plugin
+    /// attached to its project after a URL install has none until its first
+    /// registry install.
+    installed_by_cid: bool,
 }
 
 impl InstalledRow {
@@ -86,9 +90,11 @@ impl InstalledRow {
 
     /// How updates are judged for this plugin.
     fn follows(&self) -> Follows<'_> {
+        let channel = self.registry_channel.as_deref();
         match self.project() {
-            Some(_) => Follows::Registry(self.registry_channel.as_deref()),
-            None => Follows::Url,
+            Some(_) if self.installed_by_cid => Follows::Registry(channel),
+            Some(_) => Follows::Attached(channel),
+            None => Follows::Nothing,
         }
     }
 }
@@ -110,10 +116,15 @@ enum Follows<'a> {
     /// channel is the publisher's say: whatever version it names other than
     /// the installed one is the update, even an older one.
     Registry(Option<&'a str>),
-    /// A plugin installed from a URL, judged against `latest`. Nothing ties
-    /// it to the channel, so only a newer version is offered: a prerelease
-    /// installed by hand isn't "updated" back to an older release.
-    Url,
+    /// A URL install attached to its registry project, following a channel,
+    /// until its first install by CID. Its version was chosen by hand, not
+    /// by the channel, so only a newer version is offered: a prerelease
+    /// installed ahead of the channel isn't "updated" back to an older one.
+    Attached(Option<&'a str>),
+    /// A URL install with no registry project. Nothing names its updates,
+    /// so none are offered; adding it from the registry makes it follow a
+    /// channel.
+    Nothing,
 }
 
 type InstalledRowTuple = (
@@ -124,10 +135,11 @@ type InstalledRowTuple = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 const INSTALLED_ROW_SELECT: &str = "SELECT id, publisher_did, registry_did, registry_name,
-        registry_channel, version_uri, CAST(registry_unresolved AS BIGINT)
+        registry_channel, version_uri, CAST(registry_unresolved AS BIGINT), package_cid
      FROM happyview_plugins";
 
 fn installed_row_from(row: InstalledRowTuple) -> (String, InstalledRow) {
@@ -140,6 +152,7 @@ fn installed_row_from(row: InstalledRowTuple) -> (String, InstalledRow) {
             registry_channel: row.4,
             version_uri: row.5,
             unresolved: row.6 != 0,
+            installed_by_cid: row.7.is_some_and(|c| !c.is_empty()),
         },
     )
 }
@@ -186,19 +199,6 @@ async fn set_publisher(
     Ok(())
 }
 
-/// Record the publisher of the catalogue entry this plugin was installed
-/// from, or clear it when the entry under its id does not offer `url`.
-/// Derived here, never taken from the request, so a caller cannot claim an
-/// install is someone else's.
-async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
-    let publisher = crate::plugin::official_registry::publisher_for_install(
-        &*state.official_registry.read().await,
-        plugin_id,
-        url,
-    );
-    set_publisher(state, plugin_id, publisher.as_deref()).await
-}
-
 /// A plugin installed from a plain URL is no registry project's, whatever
 /// it was before: keeping the old project would offer it that project's
 /// updates and reload it through the registry.
@@ -237,10 +237,11 @@ fn on_track(channel: &str, version: &semver::Version) -> bool {
     }
 }
 
-/// What the catalogue offers an installed plugin. A pinned plugin is shown
-/// where `latest` stands but offered nothing. Otherwise an update is offered
-/// when the followed channel points at a version that may be installed and
-/// that, as `follows` says, differs from or is newer than the installed one.
+/// What the catalogue offers an installed plugin. A plugin with no registry
+/// project is offered nothing, and a pinned one is shown where `latest`
+/// stands but offered nothing. Otherwise an update is offered when the
+/// followed channel points at a version that may be installed and that, as
+/// `follows` says, differs from or is newer than the installed one.
 fn compute_update_info(
     installed_version: &str,
     installed: &InstalledPublisher,
@@ -248,8 +249,8 @@ fn compute_update_info(
     cache_entry: Option<&CatalogueEntry>,
 ) -> UpdateInfo {
     let followed = match follows {
-        Follows::Registry(channel) => channel,
-        Follows::Url => Some(LATEST),
+        Follows::Registry(channel) | Follows::Attached(channel) => channel,
+        Follows::Nothing => return UpdateInfo::default(),
     };
     let Some(entry) = cache_entry.filter(|e| installed.may_be_updated_by(e)) else {
         return UpdateInfo::default();
@@ -286,7 +287,8 @@ fn compute_update_info(
 
     let moved = match follows {
         Follows::Registry(_) => head.version != installed_version,
-        Follows::Url => match (
+        Follows::Nothing => false,
+        Follows::Attached(_) => match (
             semver::Version::parse(&head.version),
             semver::Version::parse(installed_version),
         ) {
@@ -918,16 +920,16 @@ pub(super) async fn add(
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     match origin {
-        Origin::Url(url) => {
+        Origin::Url(_) => {
             if let Err(e) = forget_registry_project(&state, &plugin_id).await {
                 tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed from a url still names its registry project");
             }
-            // The plugin is installed whatever happens here. A row left
-            // without a publisher is judged by its URL instead, which is
-            // weaker but not open, so a failed write is not worth failing
-            // the install over.
-            if let Err(e) = record_publisher(&state, &plugin_id, url).await {
-                tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
+            // A URL is no publisher's offer, so nothing is recorded: the
+            // plugin is matched to the official project of its name at the
+            // next refresh, or to none. The plugin is installed whatever
+            // happens here.
+            if let Err(e) = set_publisher(&state, &plugin_id, None).await {
+                tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed from a url keeps an earlier publisher");
             }
         }
         Origin::Registry(_) => {
@@ -1139,26 +1141,17 @@ pub(super) async fn reload(
         (None, new_url, None) => {
             let installed_url = url.clone();
             let (url, sha256) = resolve_reload_url((url, sha256), new_url);
-            // A recorded install stays with its publisher: a new URL must be
-            // one the catalogue offers under this id from that same
-            // publisher. Without this the update gate decides what is offered
-            // and anything else decides what is installed. An unrecorded
-            // install has no publisher to hold to.
+            // A recorded install stays with its publisher, and a URL is no
+            // publisher's offer, so it can't be moved to a new one. An
+            // unrecorded install has no publisher to hold to.
             if url != installed_url
                 && let Some(recorded) = &row.publisher_did
             {
-                let offered = crate::plugin::official_registry::publisher_for_install(
-                    &*state.official_registry.read().await,
-                    &plugin_id,
-                    &url,
-                );
-                if offered.as_deref() != Some(recorded.as_str()) {
-                    return Err(AppError::Conflict(format!(
-                        "'{plugin_id}' was installed from {recorded}'s package, and this URL is not \
-                         one that publisher offers. Remove the plugin and add it again to install \
-                         another publisher's."
-                    )));
-                }
+                return Err(AppError::Conflict(format!(
+                    "'{plugin_id}' was installed from {recorded}'s package, and a URL can't be \
+                     checked against that publisher. Update it from the registry, or remove the \
+                     plugin and add it again from the URL."
+                )));
             }
             let preview = loader::fetch_manifest(&state.http, &url)
                 .await
@@ -1220,13 +1213,11 @@ pub(super) async fn reload(
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     match &reloaded {
-        // A new URL may come from a different catalogue entry, so its
-        // publisher is derived afresh, and it is no registry project's any
-        // more; reloading the same URL keeps both.
-        Reloaded::Url {
-            changed: true, url, ..
-        } => {
-            record_publisher(&state, &plugin_id, url).await?;
+        // A new URL is no publisher's and no registry project's (the guard
+        // above let it through only for an unrecorded install); reloading
+        // the same URL keeps both.
+        Reloaded::Url { changed: true, .. } => {
+            set_publisher(&state, &plugin_id, None).await?;
             forget_registry_project(&state, &plugin_id).await?;
         }
         Reloaded::Url { .. } => {}
@@ -1618,7 +1609,6 @@ pub(super) async fn list_official(
             latest_version: p.latest_version.clone(),
             channels: p.channels.clone(),
             lifecycle_state: p.lifecycle_state.clone(),
-            manifest_url: p.manifest_url.clone(),
             official: p.official,
             banner_url: p.banner_url.clone(),
             releases: p.releases.clone(),
@@ -1679,8 +1669,6 @@ mod tests {
                 .collect(),
             latest_version: Some(versions[0].into()),
             lifecycle_state: "active".into(),
-            manifest_url: "m".into(),
-            wasm_url: "w".into(),
             releases: versions.iter().map(|v| release(v)).collect(),
             sections: Default::default(),
             banner_url: None,
@@ -1863,30 +1851,55 @@ mod tests {
         assert!(info.pending_releases.is_empty());
     }
 
-    fn url_install(installed: &str, entry: &CatalogueEntry) -> UpdateInfo {
-        compute_update_info(installed, &unrecorded(), Follows::Url, Some(entry))
+    fn attached(installed: &str, entry: &CatalogueEntry) -> UpdateInfo {
+        compute_update_info(
+            installed,
+            &unrecorded(),
+            Follows::Attached(Some(LATEST)),
+            Some(entry),
+        )
     }
 
-    /// A URL install whose version isn't semver can't be placed against the
-    /// channel, so nothing is offered.
+    /// A URL install with no registry project is offered nothing, whatever
+    /// the catalogue holds under its id.
+    #[test]
+    fn a_url_install_with_no_project_is_offered_nothing() {
+        let cached = entry(&["9.0.0", "1.0.0"]);
+        let info = compute_update_info("1.0.0", &unrecorded(), Follows::Nothing, Some(&cached));
+        assert!(!info.update_available);
+        assert!(info.latest_version.is_none());
+        assert!(info.pending_releases.is_empty());
+        let row = InstalledRow::default();
+        assert!(matches!(row.follows(), Follows::Nothing));
+    }
+
+    /// An attached install whose version isn't semver can't be placed
+    /// against the channel, so nothing is offered.
     #[test]
     fn compute_update_info_handles_malformed_installed_version() {
         let cached = entry(&["1.2.0"]);
-        let info = url_install("not-semver", &cached);
+        let info = attached("not-semver", &cached);
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
     }
 
-    /// A URL install is offered only a newer version: one installed ahead
-    /// of `latest`, as a prerelease, isn't offered the older release.
+    /// A URL install attached to its project is offered only a newer
+    /// version until it is first installed by CID: one installed ahead of
+    /// its channel isn't offered the older version. Once installed by CID it
+    /// follows the channel wherever it goes.
     #[test]
-    fn a_url_install_ahead_of_latest_is_offered_nothing() {
+    fn an_attached_install_ahead_of_its_channel_is_offered_nothing() {
         let cached = entry(&["0.4.0"]);
-        let info = url_install("0.5.0-alpha.3", &cached);
+        let info = attached("0.5.0-alpha.3", &cached);
         assert!(!info.update_available);
         assert!(info.pending_releases.is_empty());
-        assert!(url_install("0.3.0", &cached).update_available);
+        assert!(attached("0.3.0", &cached).update_available);
+
+        let mut row = registry_row(Some(LATEST));
+        assert!(matches!(row.follows(), Follows::Registry(Some(LATEST))));
+        row.installed_by_cid = false;
+        assert!(matches!(row.follows(), Follows::Attached(Some(LATEST))));
     }
 
     /// A registry install follows its channel wherever the publisher points
@@ -1906,6 +1919,7 @@ mod tests {
             registry_channel: channel.map(str::to_owned),
             version_uri: Some("at://did:plc:x/software.release.version/steam:1.0.0".into()),
             unresolved: false,
+            installed_by_cid: true,
         }
     }
 

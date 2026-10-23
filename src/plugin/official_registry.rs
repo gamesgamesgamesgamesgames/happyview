@@ -85,14 +85,6 @@ pub struct CatalogueEntry {
     pub sections: PluginSections,
     /// The project's own lifecycle state.
     pub lifecycle_state: String,
-    /// Where the registry serves the latest version's manifest, by CID. Kept
-    /// for callers that work from URLs: the loader cannot install a registry
-    /// entry from it. Empty when there is no latest version.
-    pub manifest_url: String,
-    /// Where the registry serves the latest version's module, by CID. Kept
-    /// for callers that work from URLs, and not installable from by the
-    /// loader. Empty when there is no latest version.
-    pub wasm_url: String,
 }
 
 /// The four long-form fields a plugin version's artifact carries. CommonMark
@@ -195,11 +187,11 @@ pub enum RegistryError {
 // other than whoever published what is installed. Four places hold the line:
 // an official entry is never displaced from the cache by another publisher's;
 // an on-demand check asks the publisher the cache names for the id (the
-// official one when it names none); an install records the publisher of the
-// catalogue entry it was installed from (`publisher_for_install`); and an
-// update is offered only from an entry by that same publisher
-// (`effective_publisher`). An install that recorded none may be updated only
-// by the official publisher.
+// official one when it names none); a registry install records the
+// publisher of the project it was installed from; and an update is offered
+// only from that same publisher's project (`effective_publisher`). A URL
+// install is offered nothing until it is attached to the project of its name
+// by the publisher it recorded, or the official one when it recorded none.
 
 /// Who an entry speaks for: [`OFFICIAL_PUBLISHER_DID`] for an official entry,
 /// and otherwise the registry account that published it.
@@ -209,24 +201,6 @@ pub fn effective_publisher(plugin: &CatalogueEntry) -> Option<&str> {
     } else {
         plugin.publisher_did.as_deref()
     }
-}
-
-/// The publisher of the catalogue entry an install came from: the entry under
-/// the installed plugin's own id, and only when its manifest URL is exactly
-/// the one installed. Looked up by id because two packages can name the same
-/// artifact, and a stranger's entry pointing at the official module must not
-/// lend its DID to the official install. `None` for any URL the entry does
-/// not offer, such as one typed by hand.
-pub fn publisher_for_install(
-    state: &OfficialRegistryState,
-    plugin_id: &str,
-    url: &str,
-) -> Option<String> {
-    state
-        .plugins
-        .get(plugin_id)
-        .filter(|p| p.manifest_url == url)
-        .and_then(|p| effective_publisher(p).map(str::to_owned))
 }
 
 /// Put a freshly read entry in the cache unless it would displace an official
@@ -340,14 +314,17 @@ pub async fn refresh_for_installs(
 }
 
 /// Attach plugins installed from a URL to the registry project of the same
-/// name, so their updates come from the registry. Each plugin is tried once:
-/// a match records the project, and no match flags the plugin unresolved,
-/// which keeps it out of later passes. The installed bytes are never
-/// touched, and nothing is unloaded.
+/// name, so their updates come from the registry. Every plugin not yet
+/// attached is tried on each refresh: a match records the project, and no
+/// match flags the plugin unresolved until a project appears. The installed
+/// bytes are never touched, and nothing is unloaded.
 ///
-/// A project that can't be read at the moment is left for the next refresh
-/// instead of being flagged, since "not found" is the only answer that means
-/// the registry has no such project.
+/// Matching reads the cache the refresh just filled. The official
+/// publisher's projects are all in the listing, so one missing from it has
+/// no project; another publisher's may be shadowed there by a project of the
+/// same name, so that one is asked for. A project that can't be read at the
+/// moment is left for the next refresh instead of being flagged, since "not
+/// found" is the only answer that means the registry has no such project.
 async fn attach_url_installs(
     client: &reqwest::Client,
     config: &RegistryConfig,
@@ -359,21 +336,22 @@ async fn attach_url_installs(
         return Ok(());
     };
     let sql = crate::db::adapt_sql(
-        "SELECT id, publisher_did, manifest FROM happyview_plugins
-         WHERE source = 'url' AND enabled = TRUE
-           AND registry_did IS NULL AND registry_unresolved = 0",
+        "SELECT id, publisher_did, manifest, CAST(registry_unresolved AS BIGINT)
+         FROM happyview_plugins
+         WHERE source = 'url' AND enabled = TRUE AND registry_did IS NULL",
         backend,
     );
-    let candidates: Vec<(String, Option<String>, Option<String>)> =
+    let candidates: Vec<(String, Option<String>, Option<String>, i64)> =
         crate::db::query_as(&sql).fetch_all(db).await?;
 
-    for (id, publisher, manifest) in candidates {
+    for (id, publisher, manifest, flagged) in candidates {
         // The publisher a URL install recorded; one that recorded none was
         // offered by the official publisher.
         let did = publisher.unwrap_or_else(|| OFFICIAL_PUBLISHER_DID.to_owned());
         let cached = state.read().await.project(&did, &id).cloned();
         let entry = match cached {
             Some(entry) => Some(entry),
+            None if did == OFFICIAL_PUBLISHER_DID => None,
             None => match super::registry_source::fetch_project(client, source, &did, &id).await {
                 Ok(entry) => entry,
                 Err(e) => {
@@ -384,19 +362,30 @@ async fn attach_url_installs(
         };
 
         let Some(entry) = entry else {
-            tracing::warn!(plugin = %id, publisher = %did, "official_registry: no registry project matches this plugin; it keeps updating from its url");
+            if flagged != 0 {
+                continue;
+            }
             let sql = crate::db::adapt_sql(
                 "UPDATE happyview_plugins SET registry_unresolved = 1
                  WHERE id = ? AND registry_did IS NULL AND registry_unresolved = 0",
                 backend,
             );
-            crate::db::query(&sql).bind(&id).execute(db).await?;
+            let done = crate::db::query(&sql).bind(&id).execute(db).await?;
+            if done.rows_affected() == 1 {
+                tracing::warn!(plugin = %id, publisher = %did, "official_registry: no registry project matches this plugin; it gets no updates until one is published or it is added from the registry");
+            }
             continue;
         };
 
         let installed_version = manifest
             .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
             .and_then(|m| m.get("version").and_then(|v| v.as_str()).map(str::to_owned));
+        let channel = installed_version
+            .as_deref()
+            .map_or(super::registry_source::LATEST, |v| {
+                channel_for_installed(&entry, v)
+            })
+            .to_owned();
         let version_uri = installed_version.and_then(|v| {
             entry
                 .releases
@@ -406,15 +395,17 @@ async fn attach_url_installs(
         });
         let sql = crate::db::adapt_sql(
             "UPDATE happyview_plugins
-             SET registry_did = ?, registry_name = ?, registry_channel = 'latest', version_uri = ?
-             WHERE id = ? AND registry_did IS NULL AND registry_unresolved = 0",
+             SET registry_did = ?, registry_name = ?, registry_channel = ?, version_uri = ?,
+                 registry_unresolved = 0
+             WHERE id = ? AND registry_did IS NULL",
             backend,
         );
-        // Another pass may have decided this plugin since it was read; the
+        // Another pass may have attached this plugin since it was read; the
         // guard keeps that decision, and then nothing here happened.
         let done = crate::db::query(&sql)
             .bind(&did)
             .bind(&id)
+            .bind(&channel)
             .bind(version_uri)
             .bind(&id)
             .execute(db)
@@ -422,12 +413,29 @@ async fn attach_url_installs(
         if done.rows_affected() != 1 {
             continue;
         }
-        tracing::info!(plugin = %id, publisher = %did, "official_registry: plugin attached to its registry project");
+        tracing::info!(plugin = %id, publisher = %did, channel = %channel, "official_registry: plugin attached to its registry project");
         // Tracked from now on, so the next listing judges it by its own
         // project even when another publisher holds the name in the catalogue.
         state.write().await.installed.insert((did, id), entry);
     }
     Ok(())
+}
+
+/// The channel a plugin attached at `installed_version` follows: the
+/// prerelease channel its version was published on (`1.1.0-alpha.2` on
+/// `alpha`) when the project publishes that channel, and otherwise `latest`.
+/// Attaching a prerelease to `latest` would leave it waiting for a release
+/// rather than offered the next prerelease.
+pub fn channel_for_installed<'a>(entry: &'a CatalogueEntry, installed_version: &str) -> &'a str {
+    let track = semver::Version::parse(installed_version)
+        .ok()
+        .and_then(|v| v.pre.as_str().split('.').next().map(str::to_owned))
+        .filter(|t| !t.is_empty());
+    track
+        .and_then(|t| entry.channels.get_key_value(t.as_str()))
+        .map(|(name, _)| name.as_str())
+        .filter(|name| super::registry_source::TRACKS.contains(name))
+        .unwrap_or(super::registry_source::LATEST)
 }
 
 /// Refresh just one plugin's cache entry, from the publisher the cache names
@@ -564,8 +572,6 @@ mod tests {
             channels: Default::default(),
             latest_version: Some("1.0.0".into()),
             lifecycle_state: "active".into(),
-            manifest_url: "https://example.com/m".into(),
-            wasm_url: "https://example.com/w".into(),
             releases: vec![],
             sections: Default::default(),
             banner_url: None,
@@ -968,62 +974,28 @@ mod tests {
         assert!(state.read().await.plugins.contains_key("lua"));
     }
 
+    /// A plugin attached at a prerelease follows the channel its version was
+    /// published on when the project has it, and `latest` otherwise.
     #[test]
-    fn an_install_url_names_the_publisher_of_the_entry_offering_it() {
-        let mut state = OfficialRegistryState::default();
-        let mut official = cached("lua", Some(OFFICIAL_PUBLISHER_DID), true);
-        official.manifest_url = "https://a.example/lua/manifest.json".into();
-        let mut theirs = cached("extra", Some(STRANGER), false);
-        theirs.manifest_url = "https://b.example/extra/manifest.json".into();
-        state.plugins.insert(official.id.clone(), official);
-        state.plugins.insert(theirs.id.clone(), theirs);
-
-        assert_eq!(
-            publisher_for_install(&state, "lua", "https://a.example/lua/manifest.json").as_deref(),
-            Some(OFFICIAL_PUBLISHER_DID)
-        );
-        assert_eq!(
-            publisher_for_install(&state, "extra", "https://b.example/extra/manifest.json")
-                .as_deref(),
-            Some(STRANGER)
-        );
-        assert!(
-            publisher_for_install(&state, "lua", "https://typed.example/manifest.json").is_none(),
-            "a URL the entry does not offer records no publisher"
-        );
-    }
-
-    /// Two packages can name the same artifact; installing `lua` from that
-    /// URL still records `lua`'s own publisher, however the cache iterates.
-    #[test]
-    fn an_install_takes_the_publisher_of_its_own_id_when_two_entries_share_a_url() {
-        let url = "https://mirror.example/lua-v1.0.0/manifest.json";
-        let mut official = cached("lua", Some(OFFICIAL_PUBLISHER_DID), true);
-        official.manifest_url = url.into();
-        for impostors in [1, 8, 64] {
-            let mut state = OfficialRegistryState::default();
-            state.plugins.insert("lua".into(), official.clone());
-            for n in 0..impostors {
-                let id = format!("notlua{n}");
-                state.plugins.insert(
-                    id.clone(),
-                    CatalogueEntry {
-                        id,
-                        publisher_did: Some(STRANGER.into()),
-                        official: false,
-                        ..official.clone()
-                    },
-                );
-            }
-            assert_eq!(
-                publisher_for_install(&state, "lua", url).as_deref(),
-                Some(OFFICIAL_PUBLISHER_DID)
-            );
-            assert_eq!(
-                publisher_for_install(&state, "notlua0", url).as_deref(),
-                Some(STRANGER)
-            );
-        }
+    fn an_attached_prerelease_follows_its_own_channel() {
+        let mut entry = cached("lua", Some(OFFICIAL_PUBLISHER_DID), true);
+        let head = |version: &str| ChannelEntry {
+            version: version.into(),
+            state: "active".into(),
+            installable: true,
+            availability: "available".into(),
+        };
+        entry.channels = [
+            ("latest".to_string(), head("1.0.0")),
+            ("alpha".to_string(), head("1.1.0-alpha.3")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(channel_for_installed(&entry, "1.1.0-alpha.2"), "alpha");
+        assert_eq!(channel_for_installed(&entry, "1.1.0-beta.1"), "latest");
+        assert_eq!(channel_for_installed(&entry, "1.0.0"), "latest");
+        assert_eq!(channel_for_installed(&entry, "not-semver"), "latest");
+        assert_eq!(channel_for_installed(&entry, "1.1.0-rc.1"), "latest");
     }
 
     /// An instance with no outbound network sets `PLUGIN_REGISTRY_URL=off`,

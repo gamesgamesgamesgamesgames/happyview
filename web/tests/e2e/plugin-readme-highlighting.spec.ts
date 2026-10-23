@@ -46,7 +46,6 @@ test("a publisher's fenced code is highlighted, and an unknown language still re
               },
             },
             lifecycle_state: "active",
-            manifest_url: "https://example.com/http/manifest.json",
             official: true,
             banner_url: null,
             releases: [],

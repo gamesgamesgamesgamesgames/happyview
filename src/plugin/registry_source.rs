@@ -733,14 +733,6 @@ fn build_entry(
         releases,
         sections,
         lifecycle_state: project.lifecycle.state.clone(),
-        manifest_url: latest
-            .as_ref()
-            .and_then(|v| cid_url(v.artifact.manifest.cid()))
-            .unwrap_or_default(),
-        wasm_url: latest
-            .as_ref()
-            .and_then(|v| cid_url(v.artifact.package.cid()))
-            .unwrap_or_default(),
         id: project.name,
     }
 }

@@ -56,9 +56,9 @@ Set `PLUGIN_REGISTRY_URL` to `off`, or to an empty value, to turn the catalogue 
 
 ### From a URL
 
-**Add plugin** also takes the URL of a plugin's `manifest.json` or `.wasm` file, for a plugin you host yourself or one that isn't in the registry. A URL install is checked against the `sha256` you give it, if any, and is offered updates only to newer versions of the catalogue's `latest` channel.
+**Add plugin** also takes the URL of a plugin's `manifest.json` or `.wasm` file, for a plugin you host yourself or one that isn't in the registry. A URL install is checked against the `sha256` you give it, if any. A URL names no project, so it is offered no updates until it is matched to one.
 
-A plugin installed from a URL, by the dashboard or `PLUGIN_URLS`, is matched to its registry project at the next catalogue refresh: the project with the plugin's id, from its recorded publisher or else the official one. A matched plugin follows that project's `latest` channel from then on, and its next update installs from the registry by CID. One no project matches is marked **Unresolved** and keeps working as a URL install. Each plugin is matched once.
+A plugin installed from a URL, by the dashboard or `PLUGIN_URLS`, is matched to the official publisher's registry project with the plugin's id at each catalogue refresh. A matched plugin follows that project's channel from then on: the prerelease channel its version was published on (`alpha` for `1.1.0-alpha.2`) when the project has one, and `latest` otherwise. Until its first update installs it from the registry by CID, it is offered only versions newer than the one installed. One no project matches is marked **Unresolved**, keeps working as a URL install, and is offered no updates; it is matched again at every refresh, so it attaches if its project is published later. To get updates sooner, remove it and add it from the registry.
 
 ### Via Environment Variables
 

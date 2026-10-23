@@ -359,7 +359,6 @@ pub(super) struct OfficialPluginSummary {
         std::collections::BTreeMap<String, crate::plugin::official_registry::ChannelEntry>,
     /// The project's own lifecycle state.
     pub(super) lifecycle_state: String,
-    pub(super) manifest_url: String,
     pub(super) official: bool,
     pub(super) banner_url: Option<String>,
     /// Every release the catalogue knows, newest first. A detail page lists

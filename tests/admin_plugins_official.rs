@@ -1062,7 +1062,7 @@ async fn a_strangers_lua_is_not_offered_when_the_official_one_is_not_listed() {
     common::require_db!();
     let registry = registry_with_only_a_strangers_lua(false).await;
     let app = an_official_lua_install(registry.config()).await;
-    refresh_and_expect_no_offer(&app, json!("1.0.0")).await;
+    refresh_and_expect_no_offer(&app, Value::Null).await;
 }
 
 /// The official project is listed but its versions cannot be read, so it
@@ -1085,14 +1085,14 @@ async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
     let registry = registry_with_only_a_strangers_lua(false).await;
     let app = an_official_lua_install(registry.config()).await;
     app.state.official_registry.write().await.plugins.clear();
-    refresh_and_expect_no_offer(&app, json!("1.0.0")).await;
+    refresh_and_expect_no_offer(&app, Value::Null).await;
 
     let (status, body) = app
         .post_json_status("/admin/plugins/lua/check-update", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], false);
-    assert_eq!(body["latest_version"], "1.0.0");
+    assert!(body["latest_version"].is_null());
 }
 
 /// An official registry install, while the catalogue holds the stranger's
@@ -1247,7 +1247,7 @@ async fn a_registry_reload_from_another_publisher_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// URL installs keep their publisher rules.
+// URL installs: no publisher, and no updates without a registry project.
 // ---------------------------------------------------------------------------
 
 /// Serve a library plugin's manifest and module under `/<dir>/` on the app's
@@ -1272,19 +1272,14 @@ async fn serve_module(app: &TestApp, dir: &str, id: &str, version: &str) -> Stri
     format!("{}/{dir}/manifest.json", app.mock_server.uri())
 }
 
-/// A catalogue entry by `publisher` (official when `None`) offering
-/// `manifest_url` as its latest version.
-fn catalogue_entry(
-    id: &str,
-    publisher: Option<&str>,
-    manifest_url: &str,
-    versions: &[&str],
-) -> happyview::plugin::official_registry::CatalogueEntry {
+/// An official catalogue entry for `id` whose `latest` is the first of
+/// `versions`, put straight in the cache.
+async fn put_in_catalogue(app: &TestApp, id: &str, versions: &[&str]) {
     use happyview::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
-    CatalogueEntry {
+    let entry = CatalogueEntry {
         id: id.into(),
-        publisher_did: publisher.map(str::to_owned),
-        official: publisher.is_none_or(|p| p == OFFICIAL),
+        publisher_did: Some(OFFICIAL.into()),
+        official: true,
         name: id.into(),
         description: None,
         icon_url: None,
@@ -1302,8 +1297,6 @@ fn catalogue_entry(
         .collect(),
         latest_version: Some(versions[0].into()),
         lifecycle_state: "active".into(),
-        manifest_url: manifest_url.into(),
-        wasm_url: manifest_url.replace("manifest.json", "plugin.wasm"),
         releases: versions
             .iter()
             .map(|v| ReleaseEntry {
@@ -1324,13 +1317,7 @@ fn catalogue_entry(
             .collect(),
         sections: Default::default(),
         banner_url: None,
-    }
-}
-
-async fn put_in_catalogue(
-    app: &TestApp,
-    entry: happyview::plugin::official_registry::CatalogueEntry,
-) {
+    };
     app.state
         .official_registry
         .write()
@@ -1346,130 +1333,53 @@ async fn install(app: &TestApp, url: &str) {
     assert_eq!(status, 200, "{body}");
 }
 
-/// The server derives the publisher from the catalogue entry whose manifest
-/// URL was installed: a registry entry's account, the official DID for an
-/// official entry, and nothing for a URL the catalogue does not offer. A
-/// reload to a new URL derives it again.
+/// A URL is no publisher's offer: a URL install records no publisher,
+/// clearing one an earlier install recorded, and until it is attached to a
+/// registry project it is offered nothing, whatever the catalogue holds
+/// under its id.
 #[tokio::test]
 #[serial]
-async fn an_install_records_the_publisher_of_its_catalogue_entry() {
+async fn a_url_install_records_no_publisher_and_is_offered_nothing() {
     common::require_db!();
     let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
+    put_in_catalogue(&app, "lua", &["2.0.0", "1.0.0"]).await;
+    let url = serve_module(&app, "lua", "lua", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "lua").await, None);
 
-    let extra = serve_module(&app, "extra", "extra", "1.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("extra", Some(STRANGER), &extra, &["1.0.0"]),
-    )
-    .await;
-    install(&app, &extra).await;
-    assert_eq!(
-        recorded_publisher(&app, "extra").await.as_deref(),
-        Some(STRANGER)
-    );
-
-    let walked = serve_module(&app, "walked", "walked", "1.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("walked", None, &walked, &["1.0.0"])).await;
-    install(&app, &walked).await;
-    assert_eq!(
-        recorded_publisher(&app, "walked").await.as_deref(),
-        Some(OFFICIAL)
-    );
-
-    let typed = serve_module(&app, "typed", "typed", "1.0.0").await;
-    install(&app, &typed).await;
-    assert!(recorded_publisher(&app, "typed").await.is_none());
-
-    let typed_official = serve_module(&app, "typed-v2", "typed", "1.1.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("typed", None, &typed_official, &["1.1.0"]),
-    )
-    .await;
-    let (status, body) = app
-        .post_json_status(
-            "/admin/plugins/typed/reload",
-            json!({ "url": typed_official }),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        recorded_publisher(&app, "typed").await.as_deref(),
-        Some(OFFICIAL)
-    );
-}
-
-/// A third party's URL install of a name the official publisher also uses is
-/// never offered the official release.
-#[tokio::test]
-#[serial]
-async fn a_third_party_install_is_never_offered_the_official_entry() {
-    common::require_db!();
-    let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
-    let theirs = serve_module(&app, "their-lua", "lua", "1.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("lua", Some(STRANGER), &theirs, &["1.0.0"]),
-    )
-    .await;
-    install(&app, &theirs).await;
-
-    put_in_catalogue(
-        &app,
-        catalogue_entry(
-            "lua",
-            None,
-            "https://elsewhere.example/lua/manifest.json",
-            &["2.0.0"],
-        ),
-    )
-    .await;
     let summary = summary_of(&app, "lua").await;
     assert_eq!(summary["update_available"], false);
     assert!(summary["latest_version"].is_null());
+    assert!(summary["pending_releases"].as_array().unwrap().is_empty());
+
+    set_column(&app, "lua", "publisher_did", STRANGER).await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "lua").await, None);
 }
 
-/// Install the official `lua` from a URL an official catalogue entry offers,
-/// with stranger entries naming the same artifact under other ids, so only
-/// the recorded publisher keeps a stranger's release away from it. Answers
-/// the app.
+/// Install `lua` from a URL, as the official publisher's plugin was before
+/// the registry, recording no publisher. Answers the app.
 async fn an_official_lua_install(config: RegistryConfig) -> TestApp {
     let app = TestApp::new_with_persisted_plugins(config).await;
     let ours = serve_module(&app, "our-lua", "lua", "1.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("lua", None, &ours, &["1.0.0"])).await;
-    for n in 0..16 {
-        put_in_catalogue(
-            &app,
-            catalogue_entry(&format!("notlua{n}"), Some(STRANGER), &ours, &["1.0.0"]),
-        )
-        .await;
-    }
     install(&app, &ours).await;
-    assert_eq!(
-        recorded_publisher(&app, "lua").await.as_deref(),
-        Some(OFFICIAL)
-    );
     app
 }
 
-/// A recorded URL install is never re-bound to another publisher by a
-/// reload: a URL the catalogue offers under this id from someone else is
-/// refused with 409 and the install is left as it was, while the recorded
-/// publisher's own new release reloads.
+/// A recorded install is never moved to another URL, since no URL can be
+/// checked against its publisher: the reload is refused with 409 and the
+/// install left as it was. Reloading the URL it has still works, and an
+/// unrecorded install may move.
 #[tokio::test]
 #[serial]
-async fn reload_refuses_a_url_from_another_publisher() {
+async fn reload_refuses_a_new_url_for_a_recorded_install() {
     common::require_db!();
     let app = an_official_lua_install(RegistryConfig::production()).await;
+    set_column(&app, "lua", "publisher_did", OFFICIAL).await;
 
-    let theirs = serve_module(&app, "their-lua-v2", "lua", "2.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("lua", Some(STRANGER), &theirs, &["2.0.0"]),
-    )
-    .await;
+    let elsewhere = serve_module(&app, "their-lua-v2", "lua", "2.0.0").await;
     let (status, body) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": theirs }))
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": elsewhere }))
         .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(
@@ -1478,24 +1388,19 @@ async fn reload_refuses_a_url_from_another_publisher() {
     );
     assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
 
-    // A hand-typed URL is no publisher's offer either.
-    let typed = serve_module(&app, "typed-lua", "lua", "2.0.0").await;
-    let (status, _) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": typed }))
-        .await;
-    assert_eq!(status, 409);
-
-    let ours = serve_module(&app, "our-lua-v2", "lua", "2.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("lua", None, &ours, &["2.0.0"])).await;
     let (status, body) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": ours }))
+        .post_json_status("/admin/plugins/lua/reload", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(summary_of(&app, "lua").await["version"], "2.0.0");
-    assert_eq!(
-        recorded_publisher(&app, "lua").await.as_deref(),
-        Some(OFFICIAL)
-    );
+
+    let unrecorded = an_official_lua_install(RegistryConfig::production()).await;
+    let moved = serve_module(&unrecorded, "moved-lua", "lua", "2.0.0").await;
+    let (status, body) = unrecorded
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": moved }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(summary_of(&unrecorded, "lua").await["version"], "2.0.0");
+    assert_eq!(recorded_publisher(&unrecorded, "lua").await, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,12 +1514,12 @@ async fn a_url_install_of_an_official_plugin_is_attached_to_its_registry_project
     assert_eq!(summary["update_available"], false);
 }
 
-/// A plugin the registry has no project for is flagged and left running.
-/// Neither outcome is retried: a flagged row stays flagged even once a
-/// project appears, and a matched row keeps what it was given.
+/// A plugin the registry has no project for is flagged and left running,
+/// offered nothing. Each refresh checks it again, so it attaches once its
+/// project is published; a matched row keeps what it was given.
 #[tokio::test]
 #[serial]
-async fn matching_runs_once_and_an_unknown_plugin_stays_loaded() {
+async fn a_flagged_plugin_attaches_once_its_project_appears() {
     common::require_db!();
     let mut registry = Registry::start().await;
     registry.project(OFFICIAL, "lua").publish("1.0.0");
@@ -1633,19 +1538,78 @@ async fn matching_runs_once_and_an_unknown_plugin_stays_loaded() {
     let summary = summary_of(&app, "mystery").await;
     assert_eq!(summary["registry"]["unresolved"], true);
     assert_eq!(summary["registry"]["did"], Value::Null);
+    assert_eq!(summary["update_available"], false);
     assert_eq!(unresolved_flag(&app, "lua").await, 0);
 
+    // A refresh that still finds no project leaves the flag as it was.
+    refresh(&app).await;
+    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
+
     // The registry now has the project, and the operator moved the match.
-    registry.project(OFFICIAL, "mystery").publish("1.0.0");
+    registry
+        .project(OFFICIAL, "mystery")
+        .publish("1.0.0")
+        .publish("1.1.0");
     registry.serve().await;
     set_column(&app, "lua", "registry_channel", "beta").await;
     refresh(&app).await;
 
-    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
-    assert_eq!(row_of(&app, "mystery").await.unwrap()["registry_did"], None);
+    assert_eq!(unresolved_flag(&app, "mystery").await, 0);
+    let row = row_of(&app, "mystery").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    let summary = summary_of(&app, "mystery").await;
+    assert_eq!(summary["registry"]["unresolved"], false);
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0");
+
     let lua = row_of(&app, "lua").await.unwrap();
     assert_eq!(lua["registry_channel"].as_deref(), Some("beta"));
     assert_eq!(lua["registry_did"].as_deref(), Some(OFFICIAL));
+}
+
+/// A prerelease installed from a URL attaches to the channel it was
+/// published on, and until its first install by CID is offered only a newer
+/// version: the alpha that follows it, never the older `latest`.
+#[tokio::test]
+#[serial]
+async fn an_attached_prerelease_follows_its_channel_and_is_never_offered_an_older_release() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .release("1.1.0-alpha.2");
+    registry.project(OFFICIAL, "lua").release("1.1.0-alpha.3");
+    registry
+        .project(OFFICIAL, "lua")
+        .channel("alpha", "1.1.0-alpha.3");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "alpha-lua", "lua", "1.1.0-alpha.2").await;
+    install(&app, &url).await;
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_channel"].as_deref(), Some("alpha"));
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0-alpha.3");
+    let pending: Vec<&str> = summary["pending_releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(pending, vec!["1.1.0-alpha.3"]);
+
+    // Moved onto `latest` by hand, it still isn't offered the older 1.0.0.
+    set_column(&app, "lua", "registry_channel", "latest").await;
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], false);
+    assert_eq!(summary["latest_version"], "1.0.0");
 }
 
 /// With no recorded publisher the official one is asked, and only it: a
