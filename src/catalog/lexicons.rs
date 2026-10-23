@@ -334,6 +334,13 @@ impl LexiconCatalog {
             .collect()
     }
 
+    /// Every record lexicon's id, indexed or not, sorted. The operator views
+    /// list these, so rows held in an unindexed collection can be browsed,
+    /// counted and deleted; ingestion uses [`Self::get_record_collections`].
+    pub async fn get_record_lexicon_ids(&self) -> Vec<String> {
+        self.ids_of_type(LexiconType::Record)
+    }
+
     pub async fn get_queries(&self) -> Vec<String> {
         self.ids_of_type(LexiconType::Query)
     }

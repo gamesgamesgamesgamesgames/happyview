@@ -188,6 +188,28 @@ async fn stats_include_project_record_lexicons() {
     assert_eq!(game.map(|c| c["count"].clone()), Some(json!(0)), "{stats}");
 }
 
+/// Stats count an unindexed collection too, labelled, so the per-collection
+/// counts add up to the total.
+#[tokio::test]
+#[serial]
+async fn stats_list_an_unindexed_collection_with_its_flag() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut snap = owning_game();
+    snap.lexicons.get_mut(GAME).unwrap().indexed = false;
+    app.state.project.store(Arc::new(snap));
+
+    let stats = app.get_json("/admin/stats").await;
+    let game = stats["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["collection"] == GAME)
+        .unwrap_or_else(|| panic!("{stats}"));
+    assert_eq!(game["indexed"], json!(false), "{stats}");
+    assert_eq!(game["count"], json!(0), "{stats}");
+}
+
 /// The records page lists collections from the catalog too.
 #[tokio::test]
 #[serial]
@@ -207,7 +229,7 @@ async fn collection_listings_include_project_record_lexicons() {
 }
 
 /// An unindexed project lexicon stays in the catalog for validation and refs,
-/// but its collection is left out of the listings built for ingestion.
+/// but its collection is left out of ingestion and still listed to operators.
 #[tokio::test]
 #[serial]
 async fn an_unindexed_project_lexicon_is_not_offered_for_ingestion() {
@@ -220,11 +242,18 @@ async fn an_unindexed_project_lexicon_is_not_offered_for_ingestion() {
     assert!(!app.state.lexicons.is_indexed(GAME));
     let listed = app.get_json("/admin/records/collections").await;
     assert!(
-        !listed["collections"]
+        listed["collections"]
             .as_array()
             .unwrap()
             .contains(&json!(GAME)),
         "{listed}"
+    );
+    assert!(
+        !app.state
+            .lexicons
+            .get_record_collections()
+            .await
+            .contains(&GAME.to_string())
     );
     assert!(app.state.lexicons.get(GAME).await.is_some());
 }

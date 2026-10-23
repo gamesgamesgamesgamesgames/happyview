@@ -259,6 +259,7 @@ curl http://127.0.0.1:3000/admin/lexicons -H "$AUTH"
     "revision": 1,
     "lexicon_type": "record",
     "backfill": true,
+    "indexed": true,
     "created_at": "2025-01-01T00:00:00Z",
     "updated_at": "2025-01-01T00:00:00Z"
   }
@@ -303,6 +304,8 @@ curl http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status -H "$AUTH"
 ```
 
 **Response**: `200 OK` with full lexicon details including raw JSON.
+
+The response carries the same `indexed` boolean as the list (`true` for every lexicon that is not an unindexed record type).
 
 ## Delete a lexicon
 

@@ -110,6 +110,9 @@ pub(super) struct StatsResponse {
 pub(super) struct CollectionStat {
     pub(super) collection: String,
     pub(super) count: i64,
+    /// Whether the ingest watches this collection; rows in an unindexed one
+    /// were written locally.
+    pub(super) indexed: bool,
 }
 
 // ---------------------------------------------------------------------------

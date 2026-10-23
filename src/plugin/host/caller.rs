@@ -754,5 +754,13 @@ mod tests {
             .expect("the mirrored row is readable");
         assert_eq!(got["cid"], reference.cid.as_str());
         assert_eq!(got["record"]["text"], "hi");
+
+        let (indexed_at,): (Option<String>,) =
+            crate::db::query_as("SELECT indexed_at FROM happyview_records WHERE uri = ?")
+                .bind(&reference.uri)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(indexed_at, None);
     }
 }
