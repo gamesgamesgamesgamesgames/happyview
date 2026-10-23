@@ -358,6 +358,7 @@ async fn pipeline_state(mock: &MockServer, collections: &[&str]) -> AppState {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await
@@ -694,6 +695,7 @@ async fn an_all_collections_job_includes_a_project_only_record_lexicon() {
             parsed: record_lexicon(POST).1,
             path: "src/lexicons/post.json".into(),
             backfill: false,
+            indexed: true,
         },
     );
     state.project.store(Arc::new(snap));

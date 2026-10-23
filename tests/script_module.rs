@@ -69,6 +69,7 @@ fn lexicon(id: &str, kind: &str) -> (String, ProjectLexicon) {
             parsed,
             path: format!("src/lexicons/{id}.json").into(),
             backfill: false,
+            indexed: true,
         },
     )
 }

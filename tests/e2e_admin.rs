@@ -753,6 +753,7 @@ async fn stats_with_seeded_records() {
                 action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await

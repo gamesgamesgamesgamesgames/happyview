@@ -91,6 +91,7 @@ pub(crate) async fn track_network_lexicon(
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some(authority_did.clone()),
+                indexed: true,
             },
         )
         .await?;
@@ -356,6 +357,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await
@@ -392,6 +394,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await

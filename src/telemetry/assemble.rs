@@ -487,6 +487,7 @@ mod tests {
                 parsed,
                 path: "lexicons/thing.json".into(),
                 backfill: false,
+                indexed: true,
             },
         );
         let catalog = LexiconCatalog::new(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(

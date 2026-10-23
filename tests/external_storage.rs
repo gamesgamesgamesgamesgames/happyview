@@ -120,6 +120,7 @@ async fn put_lexicon(state: &AppState, lexicon: Value, target: Option<&str>) {
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await

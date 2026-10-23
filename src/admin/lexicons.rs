@@ -56,6 +56,7 @@ pub(super) async fn upload_lexicon(
                 action,
                 token_cost: body.token_cost,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await?;

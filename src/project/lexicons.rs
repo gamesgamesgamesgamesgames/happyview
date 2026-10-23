@@ -69,6 +69,7 @@ fn project_lexicon(parsed: ParsedLexicon, path: PathBuf, backfill: bool) -> Proj
         parsed,
         path,
         backfill,
+        indexed: true,
     }
 }
 
