@@ -623,13 +623,24 @@ impl LexiconCatalog {
     /// exercise readers rather than storage.
     #[cfg(test)]
     pub(crate) async fn upsert(&self, parsed: ParsedLexicon) {
+        self.upsert_with(parsed, true);
+    }
+
+    /// [`Self::upsert`] for a lexicon installed without indexing.
+    #[cfg(test)]
+    pub(crate) async fn upsert_unindexed(&self, parsed: ParsedLexicon) {
+        self.upsert_with(parsed, false);
+    }
+
+    #[cfg(test)]
+    fn upsert_with(&self, parsed: ParsedLexicon, indexed: bool) {
         self.stored_mut().insert(
             parsed.id.clone(),
             StoredLexicon {
                 parsed,
                 layer: Layer::Manual,
                 authority_did: None,
-                indexed: true,
+                indexed,
             },
         );
     }
