@@ -68,14 +68,43 @@ interface PluginSummary {
   secrets_configured: boolean;
   loaded_at: string | null;
   update_available: boolean;
-  latest_version: string;
-  pending_releases: string[];
-  latest_manifest_url?: string; // the manifest an update installs
+  latest_version?: string; // where the followed channel points
+  latest_version_installable?: boolean;
+  latest_state?: "active" | "deprecated" | "unavailable" | "retired";
+  pending_releases: ReleaseEntry[];
+  registry: PluginRegistryStatus | null;
   plugin_type: "auth" | "library" | "interpreter";
   namespace: string | null; // library plugins only
   dependencies: PluginDependency[];
   allowed_hosts: string[];
   capabilities: CapabilityReport;
+}
+
+interface ReleaseEntry {
+  version: string;
+  name: string;
+  published_at: string | null;
+  body: string | null; // the changelog, as markdown
+  state: "active" | "deprecated" | "unavailable" | "retired";
+  reason: string | null;
+  suspect: boolean;
+  installable: boolean;
+  availability: "pending" | "available" | "deletedAtSource";
+  version_uri: string;
+  manifest_cid: string;
+  package_cid: string;
+  manifest_blob_cid: string;
+}
+
+interface PluginRegistryStatus {
+  did: string | null; // the publisher; null for an unresolved URL install
+  name: string | null; // the project name
+  channel: "latest" | "beta" | "alpha" | null; // null when pinned to a version
+  version_uri: string | null;
+  installed_state: string | null; // the installed version's lifecycle state
+  installed_reason: string | null; // the publisher's reason for it
+  channel_state: string | null; // the state of the version the channel points at
+  unresolved: boolean; // a URL install no registry project matched
 }
 
 interface PluginsResponse {
@@ -154,7 +183,9 @@ curl http://127.0.0.1:3000/admin/plugins -H "$AUTH"
 }
 ```
 
-`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available` and `pending_releases` are populated from the cached official registry — call `POST /admin/plugins/{id}/check-update` to refresh them.
+`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available`, `latest_version`, `latest_version_installable`, `latest_state` and `pending_releases` come from the cached catalogue — call `POST /admin/plugins/{id}/check-update` to refresh them. An update is offered when the followed channel points at a version other than the installed one and that version may be installed (its state is `active` or `deprecated`, the registry holds its files, and it isn't flagged suspect). When the channel moves to a version that may not be installed, `latest_version_installable` is `false` and `latest_state` says why; nothing is offered. `pending_releases` lists the installable releases on the channel's track (`latest` carries releases, `beta` and `alpha` their own prereleases) newer than the installed version, up to the channel's.
+
+`registry` is set for a plugin installed from a registry project. `installed_state` is the installed version's lifecycle state: a plugin whose version its publisher later retires keeps running, and `installed_state` is `"retired"`, with `installed_reason` when the publisher gave one.
 
 `plugin_type`, `namespace`, `dependencies`, and `allowed_hosts` mirror the manifest fields (see [Plugin Types](../../guides/developing-plugins.md#plugin-types)). `capabilities` is the same report `POST /admin/plugins/preview` returns: `declared` is what the manifest lists, `required_by_imports` is the least-privilege set the module's imports need (computed from the imports alone), and `undeclared` is anything required but not declared. A plugin is granted exactly `declared`; `undeclared` is non-empty only for a plugin the loader refuses.
 
@@ -165,6 +196,14 @@ POST /admin/plugins/preview
 ```
 
 Requires `plugins:create`. Fetches the manifest and downloads the WASM without installing it, so the capability report and `sha256` are what an install would use. A `400 Bad Request` carries the loader's own message: an undeclared import, an unsupported `api_version`, or a bad manifest.
+
+The body names the plugin by `url`, or by registry project:
+
+```json
+{ "registry": { "did": "did:plc:mo7vq4jbioxwafy5zkcc3eux", "name": "happyview-lua", "channel": "latest" } }
+```
+
+`channel` is `latest`, `beta` or `alpha` and defaults to `latest`; pass `version` instead to name one version. The server resolves the version, refuses one that may not be installed with `400 Bad Request` naming its state and the publisher's reason, fetches the manifest and module from the registry and checks each against the CID the version names. Bytes that don't match are refused with a message naming both CIDs. A registry preview also returns `registry: { did, name, channel, version, version_uri, state }`.
 
 ```ts tab="TypeScript" tab-group="language"
 interface PluginPreview {
@@ -279,7 +318,7 @@ Returns `400 Bad Request` if the manifest can't be fetched or parsed, if the WAS
 POST /admin/plugins
 ```
 
-Requires `plugins:create`. Fetches the manifest, downloads the WASM, registers the plugin, and persists it.
+Requires `plugins:create`. Fetches the manifest, downloads the WASM, registers the plugin, and persists it. Name the plugin by `url`, or by `registry` project as in [the preview](#preview-a-plugin-before-installing); exactly one.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("http://127.0.0.1:3000/admin/plugins", {
@@ -344,7 +383,8 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 
 | Field                    | Type       | Required | Description                                                                                        |
 | ------------------------ | ---------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `url`                    | string     | yes      | URL to the plugin's `manifest.json`                                                                  |
+| `url`                    | string     | one of   | URL to the plugin's `manifest.json`                                                                  |
+| `registry`               | object     | one of   | `{ did, name, channel? , version? }`: a registry project and the channel to follow (`latest` by default) or the version to pin. The install records the project, the channel, the version and the CIDs its files were checked against, and the project's DID as its publisher |
 | `sha256`                 | string     | no       | Optional sha256 of the WASM binary. If provided, install fails when the downloaded hash mismatches   |
 | `accepted_capabilities`  | string[]   | no       | Capability names the operator consents to grant (e.g. from a consent dialog built on `POST /admin/plugins/preview`'s `capabilities` report). When present, every capability the plugin would actually be granted must be covered, or the install is refused |
 
@@ -353,6 +393,10 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 `400 Bad Request` on any of:
 
 - The manifest can't be fetched/parsed, the WASM can't be downloaded, `sha256` doesn't match, or `api_version` is unsupported.
+- Both or neither of `url` and `registry` were given, or `registry` names both a channel and a version, or a channel other than `latest`, `beta` or `alpha`.
+- The registry version may not be installed, its files don't match their CIDs, or its manifest names a plugin other than the project.
+
+A registry project or version that doesn't exist is `404 Not Found`; a registry that can't be read is `502 Bad Gateway`.
 - The plugin's `dependencies` aren't satisfied — a dependency isn't installed, an installed dependency's version doesn't satisfy the requirement, installing would create a dependency cycle, or the manifest depends on itself. The error names the specific dependency graph problem.
 - The manifest doesn't declare a capability its compiled imports require — the same check `preview` surfaces as `capabilities.undeclared`.
 - `accepted_capabilities` was provided but doesn't cover every capability the plugin would be granted — the error lists the missing capability names.
@@ -373,11 +417,19 @@ Requires `plugins:read`. Returns the cached catalog of plugins from the official
   "plugins": [
     {
       "id": "steam",
+      "publisher_did": "did:plc:mo7vq4jbioxwafy5zkcc3eux",
+      "official": true,
       "name": "Steam",
       "description": "Import your Steam game library and playtime data.",
-      "icon_url": "https://example.com/steam-icon.png",
+      "icon_url": "https://api.happyproto.at/xrpc/at.happyproto.registry.getArtifact?cid=bafkrei...",
+      "plugin_type": "auth",
       "latest_version": "1.2.0",
-      "manifest_url": "https://example.com/plugins/steam/manifest.json"
+      "channels": {
+        "latest": { "version": "1.2.0", "state": "active", "installable": true, "availability": "available" }
+      },
+      "lifecycle_state": "active",
+      "releases": [],
+      "sections": {}
     }
   ]
 }
@@ -426,7 +478,15 @@ When exactly one plugin is removed (the common case: no dependents, or `force=tr
 POST /admin/plugins/{id}/reload
 ```
 
-Requires `plugins:create`. Re-fetches the plugin from its current source URL and re-registers it. Useful after publishing a new version of a plugin you host yourself.
+Requires `plugins:create`. Re-fetches the plugin from its current source and re-registers it. Useful after publishing a new version of a plugin you host yourself.
+
+A plugin installed from the registry reloads from the registry. With no body it fetches the version it has again, by CID. To update it, switch channel or pin a version, pass `registry`:
+
+```json
+{ "registry": { "channel": "beta" } }
+```
+
+`{ "registry": {} }` installs the current version of the channel it follows (or its pinned version again); `channel` switches to that channel's version and follows it from then on; `version` pins one version. The project is the one it was installed from, and its publisher must be the one the install recorded, or the reload is refused with `409 Conflict`. A version that may not be installed is refused with `400 Bad Request`, and the installed version keeps running. A registry plugin can't be reloaded from a `url`; remove it and add it from the URL instead. Adding a plugin from a URL over a registry plugin makes it a URL install, with no registry project.
 
 The body is optional. To point the plugin at a new URL, pass:
 
@@ -455,7 +515,7 @@ A reloaded version can import host functions the operator never consented to. `a
 POST /admin/plugins/{id}/check-update
 ```
 
-Requires `plugins:create`. Forces a cache refresh for one plugin from the official registry, then returns the updated `PluginSummary` with `update_available`, `latest_version`, `pending_releases` and `latest_manifest_url` reflecting the latest catalog state. An update is offered only from the publisher the install recorded, and `latest_manifest_url` is that entry's manifest: pass it as the reload `url` to apply the update.
+Requires `plugins:create`. Reads one plugin's project from the registry now, then returns the updated `PluginSummary`. A registry plugin's own project is read, even when another publisher's project holds its name in the catalogue. An update is offered only from the publisher the install recorded; apply it with `POST /admin/plugins/{id}/reload` and `{ "registry": {} }`.
 
 **Response**: `200 OK` with a `PluginSummary`.
 
