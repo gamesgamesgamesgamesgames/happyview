@@ -1391,15 +1391,21 @@ mod registry_tests {
     #[tokio::test]
     async fn an_empty_expected_cid_is_refused_without_fetching() {
         let server = MockServer::start().await;
-        let mut install = serve_release(&server, "p").await;
-        install.package_cid = String::new();
+        // Nothing is mounted, and the manifest is fetched first, so its CID
+        // is the one emptied.
+        let mut install = install_for(&server, "p");
+        install.manifest_blob_cid = String::new();
 
         let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, LoadError::CidMismatch { what: "module", expected, .. } if expected.is_empty()),
+            matches!(&err, LoadError::CidMismatch { what: "manifest", expected, .. } if expected.is_empty()),
             "{err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the registry should not have been asked for the artifact"
         );
     }
 

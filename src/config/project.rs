@@ -452,9 +452,10 @@ impl PluginEntry {
             (Some(_), Some(_)) | (None, None) => {
                 Err(format!("{key}: set exactly one of channel and version"))
             }
-            (Some(channel), None) if !is_project_name(channel) => {
-                Err(format!("{key}: channel '{channel}' {PROJECT_NAME_SHAPE}"))
-            }
+            (Some(channel), None) if !TRACKS.contains(&channel.as_str()) => Err(format!(
+                "{key}: channel '{channel}' must be one of {}",
+                TRACKS.join(", ")
+            )),
             (None, Some(version)) if !is_release_version(version) => Err(format!(
                 "{key}: version '{version}' must be MAJOR.MINOR.PATCH with an optional -prerelease, at most 64 characters"
             )),
@@ -462,6 +463,9 @@ impl PluginEntry {
         }
     }
 }
+
+/// The channels a registry offers, so a name outside them can never resolve.
+const TRACKS: [&str; 3] = ["latest", "beta", "alpha"];
 
 const PROJECT_NAME_SHAPE: &str = "must be lowercase letters, digits and '-', start and end with a letter or digit, and be at most 64 characters";
 
@@ -667,7 +671,7 @@ typescript = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-types
 
 [libraries]
 "happyview.record" = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-record", version = "2.1.0" }
-http = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-http", channel = "stable" }
+http = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-http", channel = "beta" }
 
 [dev]
 port = 3000
@@ -740,7 +744,7 @@ capabilities = ["library:call"]
             config.libraries["happyview.record"].version.as_deref(),
             Some("2.1.0")
         );
-        assert_eq!(config.libraries["http"].channel.as_deref(), Some("stable"));
+        assert_eq!(config.libraries["http"].channel.as_deref(), Some("beta"));
         assert_eq!(config.dev.port, Some(3000));
         assert_eq!(
             config.network_lexicons.include,
@@ -1030,6 +1034,10 @@ capabilities = ["library:call"]
             (
                 &format!("did = \"{DID}\", name = \"p\", channel = \"Latest\""),
                 "Latest",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", channel = \"stable\""),
+                "latest, beta, alpha",
             ),
             (
                 &format!("did = \"{DID}\", name = \"p\", version = \"1.0\""),

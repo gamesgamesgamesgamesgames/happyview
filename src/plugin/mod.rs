@@ -693,6 +693,8 @@ impl PluginRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_row_missing_its_record_columns_reloads_without_inventing_them() {
         let row = StoredPlugin {
@@ -720,8 +722,6 @@ mod tests {
         };
         assert!(row.registry_install().is_none());
     }
-
-    use super::*;
     use crate::test_support::migrated_memory_pool;
 
     fn echo_like_interpreter(version: &str) -> LoadedPlugin {
