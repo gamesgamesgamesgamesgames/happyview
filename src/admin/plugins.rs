@@ -34,38 +34,26 @@ enum InstalledPublisher {
     /// The publisher of the catalogue entry it was installed from.
     Recorded(String),
     /// Installed from a URL the catalogue did not offer, or before the
-    /// publisher was recorded: judged by whether its stored manifest URL lies
-    /// under the official repo's releases.
-    Unrecorded { official_url: bool },
+    /// publisher was recorded. Nothing ties it to a publisher, so only the
+    /// official one may update it.
+    Unrecorded,
 }
 
 impl InstalledPublisher {
-    fn of(
-        state: &AppState,
-        recorded: Option<String>,
-        source: &crate::plugin::PluginSource,
-    ) -> Self {
-        if let Some(did) = recorded {
-            return Self::Recorded(did);
+    fn of(recorded: Option<String>) -> Self {
+        match recorded {
+            Some(did) => Self::Recorded(did),
+            None => Self::Unrecorded,
         }
-        let official_url = match source {
-            crate::plugin::PluginSource::Url { url, .. } => {
-                crate::plugin::official_registry::is_official_manifest_url(
-                    &state.official_registry_config,
-                    url,
-                )
-            }
-            crate::plugin::PluginSource::File { .. } => false,
-        };
-        Self::Unrecorded { official_url }
     }
 
     fn may_be_updated_by(&self, entry: &CatalogueEntry) -> bool {
+        let publisher = crate::plugin::official_registry::effective_publisher(entry);
         match self {
-            Self::Recorded(did) => {
-                crate::plugin::official_registry::effective_publisher(entry) == Some(did.as_str())
+            Self::Recorded(did) => publisher == Some(did.as_str()),
+            Self::Unrecorded => {
+                publisher == Some(crate::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
             }
-            Self::Unrecorded { official_url } => entry.official || !official_url,
         }
     }
 }
@@ -104,7 +92,6 @@ async fn recorded_publisher(state: &AppState, plugin_id: &str) -> Result<Option<
 /// install is someone else's.
 async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
     let publisher = crate::plugin::official_registry::publisher_for_install(
-        &state.official_registry_config,
         &*state.official_registry.read().await,
         plugin_id,
         url,
@@ -305,7 +292,7 @@ pub(super) async fn list(
 
             let update_info = compute_update_info(
                 &p.info.version,
-                &InstalledPublisher::of(&state, publishers.get(&p.info.id).cloned(), &p.source),
+                &InstalledPublisher::of(publishers.get(&p.info.id).cloned()),
                 official_guard.plugins.get(&p.info.id),
             );
             let cap_fields = capability_fields(&p);
@@ -653,7 +640,6 @@ pub(super) async fn reload(
         && let Some(recorded) = recorded_publisher(&state, &plugin_id).await?
     {
         let offered = crate::plugin::official_registry::publisher_for_install(
-            &state.official_registry_config,
             &*state.official_registry.read().await,
             &plugin_id,
             &url,
@@ -1088,7 +1074,7 @@ pub(super) async fn check_update(
     let guard = state.official_registry.read().await;
     let update_info = compute_update_info(
         &current.info.version,
-        &InstalledPublisher::of(&state, recorded, &current.source),
+        &InstalledPublisher::of(recorded),
         guard.plugins.get(&plugin_id),
     );
 
@@ -1229,7 +1215,7 @@ mod tests {
     #[test]
     fn compute_update_info_flags_update_when_behind() {
         let cached = entry(&["1.2.0", "1.1.0", "1.0.0"]);
-        let info = compute_update_info("1.0.0", &unrecorded(false), Some(&cached));
+        let info = compute_update_info("1.0.0", &unrecorded(), Some(&cached));
         assert!(info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert_eq!(info.pending_releases.len(), 2);
@@ -1240,14 +1226,14 @@ mod tests {
     #[test]
     fn compute_update_info_no_update_when_current() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("1.2.0", &unrecorded(false), Some(&cached));
+        let info = compute_update_info("1.2.0", &unrecorded(), Some(&cached));
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
     }
 
-    fn unrecorded(official_url: bool) -> InstalledPublisher {
-        InstalledPublisher::Unrecorded { official_url }
+    fn unrecorded() -> InstalledPublisher {
+        InstalledPublisher::Unrecorded
     }
 
     fn stranger(versions: &[&str]) -> CatalogueEntry {
@@ -1283,31 +1269,22 @@ mod tests {
         );
     }
 
-    /// A row that recorded no publisher keeps the URL rule: from the official
-    /// repo's releases, only official entries; from anywhere else, any.
+    /// A row that recorded no publisher is tied to none, so only the
+    /// official publisher's entry is offered to it.
     #[test]
-    fn an_unrecorded_install_falls_back_to_its_url() {
+    fn an_unrecorded_install_is_only_updated_by_the_official_publisher() {
         assert!(
-            !compute_update_info("1.0.0", &unrecorded(true), Some(&stranger(&["9.0.0"])))
+            !compute_update_info("1.0.0", &unrecorded(), Some(&stranger(&["9.0.0"])))
                 .update_available
         );
         assert!(
-            compute_update_info("1.0.0", &unrecorded(true), Some(&entry(&["1.2.0"])))
-                .update_available
-        );
-        assert!(
-            compute_update_info("1.0.0", &unrecorded(false), Some(&stranger(&["9.0.0"])))
-                .update_available
-        );
-        assert!(
-            compute_update_info("1.0.0", &unrecorded(false), Some(&entry(&["1.2.0"])))
-                .update_available
+            compute_update_info("1.0.0", &unrecorded(), Some(&entry(&["1.2.0"]))).update_available
         );
     }
 
     #[test]
     fn compute_update_info_no_cache_entry() {
-        let info = compute_update_info("1.2.0", &unrecorded(false), None);
+        let info = compute_update_info("1.2.0", &unrecorded(), None);
         assert!(!info.update_available);
         assert!(info.latest_version.is_none());
         assert!(info.pending_releases.is_empty());
@@ -1316,7 +1293,7 @@ mod tests {
     #[test]
     fn compute_update_info_handles_malformed_installed_version() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("not-semver", &unrecorded(false), Some(&cached));
+        let info = compute_update_info("not-semver", &unrecorded(), Some(&cached));
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
     }

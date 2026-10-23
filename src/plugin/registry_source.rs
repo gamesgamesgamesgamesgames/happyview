@@ -17,6 +17,11 @@ use super::official_registry::{CatalogueEntry, ChannelEntry, PluginSections, Rel
 /// ceiling, so a project's whole history is usually one request.
 const VERSIONS_PER_PAGE: u32 = 100;
 
+/// The most pages a cursor loop follows. A registry that keeps handing out
+/// fresh cursors would otherwise hold a refresh open forever; a few hundred
+/// pages is far past any real catalogue or version history.
+const MAX_PAGES: usize = 300;
+
 /// The channel a project's current version is published on.
 const LATEST: &str = "latest";
 
@@ -66,9 +71,11 @@ impl RegistrySource {
         }
         let mut projects = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_PAGES {
+            // Retired projects stay listed so an installed plugin whose
+            // project was retired can still say so.
             let mut url = format!(
-                "{}/xrpc/at.happyproto.registry.searchProjects?limit={}",
+                "{}/xrpc/at.happyproto.registry.searchProjects?includeRetired=true&limit={}",
                 self.base(),
                 self.limit
             );
@@ -82,6 +89,11 @@ impl RegistrySource {
                 None => return Ok(projects),
             }
         }
+        tracing::warn!(
+            pages = MAX_PAGES,
+            "registry_source: searchProjects still had more pages; the catalogue is cut short"
+        );
+        Ok(projects)
     }
 
     /// One project, or `None` when the registry knows neither it nor its
@@ -122,7 +134,7 @@ impl RegistrySource {
         }
         let mut versions = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_PAGES {
             let mut url = format!(
                 "{}/xrpc/at.happyproto.registry.listVersions?did={}&name={}&limit={VERSIONS_PER_PAGE}",
                 self.base(),
@@ -139,6 +151,12 @@ impl RegistrySource {
                 None => return Ok(versions),
             }
         }
+        tracing::warn!(
+            pages = MAX_PAGES,
+            plugin = name,
+            "registry_source: listVersions still had more pages; the version list is cut short"
+        );
+        Ok(versions)
     }
 
     /// One version by its version string, or `None` when there is no such
@@ -774,7 +792,7 @@ mod tests {
             "availability": availability,
             "suspect": false,
             "lifecycle": { "state": state, "installable": installable, "events": [] },
-            "indexedAt": format!("2026-10-01T00:00:00Z"),
+            "indexedAt": "2026-10-01T00:00:00Z",
         })
     }
 
@@ -995,6 +1013,65 @@ mod tests {
             projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["lua", "extra"]
         );
+    }
+
+    /// Retired projects are asked for and kept, with their state on the
+    /// entry, so an installed plugin whose project was retired can say so.
+    #[tokio::test]
+    async fn the_catalogue_asks_for_retired_projects_and_keeps_them() {
+        let server = MockServer::start().await;
+        let mut retired = project(HP, "old", serde_json::json!({}));
+        retired["lifecycle"] = serde_json::json!({ "state": "retired" });
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .and(query_param("includeRetired", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [retired]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "versions": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].lifecycle_state, "retired");
+        server.verify().await;
+    }
+
+    /// A registry that keeps answering fresh cursors cannot hold a refresh
+    /// open: paging stops at the cap and returns what was read.
+    #[tokio::test]
+    async fn a_registry_that_never_stops_paging_is_cut_off() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projects": [],
+                    "cursor": format!("page{n}"),
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        source(&server)
+            .search_projects(&reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PAGES);
     }
 
     #[tokio::test]
