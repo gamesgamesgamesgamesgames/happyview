@@ -7,6 +7,7 @@ use sha2::Sha256;
 
 use crate::error::AppError;
 
+#[derive(Debug, Clone)]
 pub struct SignedCommit {
     pub ver: u32,
     pub hash: [u8; 32],

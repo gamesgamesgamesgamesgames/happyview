@@ -278,18 +278,13 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     }
 
     // Verify with two independent checks. Both must pass.
+    // Authenticity: the commit is signed by, or MACed under, the author's key.
     let commit =
-        native_client::get_latest_commit(state, &session, &space_uri, &input.author_did).await?;
+        native_client::get_verified_commit(state, &session, &space_uri, &input.author_did).await?;
 
-    // Authenticity: the commit carries a valid signature from the author's key.
-    let key =
-        native_client::author_signing_key(&state.http, &state.config.plc_url, &input.author_did)
-            .await?;
-    crate::spaces::commit::verify_commit(&commit, &space_uri, &input.author_did, &key)?;
-
-    // Agreement: the signed hash describes the records we sent. An authentic
-    // commit can still summarise a different record set.
-    if commit.hash != expected_commit_hash(&records) {
+    // Agreement: the authenticated hash describes the records we sent. An
+    // authentic commit can still summarise a different record set.
+    if *commit.hash() != expected_commit_hash(&records) {
         return Err(AppError::Internal(format!(
             "the PDS's commit does not describe the {total} records we replayed; \
              leaving this repo on HappyView"
@@ -311,7 +306,7 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
             &input.author_did,
         )
         .await?;
-        repo_state.sync_cursor = Some(commit.rev.clone());
+        repo_state.sync_cursor = Some(commit.rev().to_string());
         db::update_repo_state(&mut *conn, state.db_backend, &repo_state).await?;
     }
 
@@ -320,7 +315,7 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     Ok(NativeOutcome::Completed(serde_json::json!({
         "status": "migrated",
         "records": total,
-        "rev": commit.rev,
+        "rev": commit.rev(),
     })))
 }
 
