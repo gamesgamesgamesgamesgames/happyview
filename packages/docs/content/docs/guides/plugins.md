@@ -52,7 +52,9 @@ An install records its project's publisher. Updates come only from that publishe
 
 #### Turning the catalogue off
 
-Set `PLUGIN_REGISTRY_URL` to `off`, or to an empty value, to turn the catalogue off. No registry is contacted, **Add plugin** offers only URL installs, and installed plugins are offered no updates. Point it at another URL to read another registry.
+Set `PLUGIN_REGISTRY_URL` to `off`, or to an empty value, to turn the catalogue off. The catalogue isn't read, **Add plugin** offers only URL installs, and installed plugins are offered no updates. Point it at another URL to read another registry.
+
+Turning the catalogue off doesn't cut a plugin installed from the registry off from it. Each registry install stores the `getArtifact` URLs its manifest and module were fetched from, and fetches them again, checked against their CIDs, at every boot and reload. The registry it came from is a boot dependency for that plugin: while it can't be reached, the plugin isn't loaded. Changing `PLUGIN_REGISTRY_URL` doesn't move stored installs either; they keep fetching from the registry they were installed from. To run with no registry at all, install your plugins from URLs or the file system instead.
 
 ### From a URL
 
@@ -69,6 +71,8 @@ PLUGIN_URLS=steam|https://example.com/plugins/steam/manifest.json
 ```
 
 Format: `id|url` or `id|url|sha256:hash` (comma-separated for multiple).
+
+A `PLUGIN_URLS` plugin is registered from its environment URL at every boot. It is matched to its registry project like any URL install, but an update installed through the registry lasts only until the next restart, which loads the environment URL again. Install plugins that are in the registry through the registry instead, and keep `PLUGIN_URLS` for plugins you host yourself.
 
 ### Via File System
 

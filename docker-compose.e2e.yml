@@ -100,10 +100,10 @@ services:
       # collector and the telemetry test sees a send fail.
       TELEMETRY_COLLECTOR_URL: http://127.0.0.1:9/v1/snapshot
       # The plugin catalogue reaches nothing live: empty turns it off.
-      # Otherwise a run's toasts
-      # depend on what has been released since the stack's pins were set --
-      # a newer `happyview-lua` than the pinned one put an "update available"
-      # toast on screen and broke two unrelated specs.
+      # Otherwise a run's toasts depend on what has been released since the
+      # stack's pins were set -- a newer `happyview-lua` than the pinned one
+      # put an "update available" toast on screen and broke two unrelated
+      # specs.
       PLUGIN_REGISTRY_URL: ""
     ports:
       - "3200:3000"
