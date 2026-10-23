@@ -135,6 +135,12 @@ version = "3.0.0"            # warns at boot when the running binary differs
 app_name = "HappyProto Registry"           # stands in for APP_NAME
 superadmin = "did:plc:..."                 # stands in for SUPERADMIN_DID
 
+[interpreters]
+lua = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-lua", channel = "latest" }
+
+[libraries]
+"happyview.http" = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-http", version = "1.0.3" }
+
 [dev]
 port = 3000                  # stands in for PORT, under `happyview dev` only
 backfill = false             # stands in for HAPPYVIEW_DEV_BACKFILL, under `happyview dev` only
@@ -157,6 +163,7 @@ backfill = true              # backfill this record collection once
 - `[labels] subscribe` labelers are subscribed at boot. Pausing one from the dashboard sticks across restarts.
 - Neither can be removed from the dashboard or the admin API (`409`); remove the line from the file. A line removed from the file leaves its subscription or lexicon in place, now removable from the dashboard.
 - `backfill = true` on a record lexicon in the project's `src/lexicons/` starts a backfill only the first time. Under `happyview dev`, only when `[dev] backfill = true`; dev also checks after every rebuild, so a lexicon added while dev runs gets its backfill then. At boot, HappyView starts one for the collection unless a network backfill of that collection already exists, whatever its outcome: completed, failed, cancelled or still running. A backfill of named accounts does not count, and neither does a backfill of all collections, so either of those leaves the declared one to start. Restarting does not crawl the network again, even if the first backfill failed or was cancelled. To run it again, open **Backfill** in the dashboard, choose **Create Backfill Job** and select the collection, or call [`POST /admin/backfill`](../api-reference/admin/backfill.md) with `{"collection": "..."}`.
+- `[interpreters]` and `[libraries]` name the plugins a project uses, keyed by language id or library namespace. Each value is a table naming a registry project: `did` is the publisher's DID and `name` the project name, followed by exactly one of `channel` (a channel name, such as `latest`) or `version` (a pinned release, such as `1.2.0` or `1.2.0-rc.1`). `hpy happyview add` writes these entries. The older `lua = "1.4.0"` form is refused with a message showing the table form.
 - Unknown sections and keys are refused, and every error names the file, line and column: `happyview.toml:3:1: unknown field ...`.
 
 ## Checking a project
