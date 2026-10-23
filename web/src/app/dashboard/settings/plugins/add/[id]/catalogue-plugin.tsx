@@ -22,6 +22,7 @@ import {
 import {
   ChannelSelect,
   LifecycleNotice,
+  headInstallable,
   ReleaseStateBadge,
   orderedChannels,
   unavailableChannelCopy,
@@ -76,8 +77,9 @@ export default function CataloguePlugin() {
       : (channelNames[0] ?? DEFAULT_CHANNEL));
   const head = entry?.channels[channel];
   const headRelease = entry?.releases.find((r) => r.version === head?.version);
+  const headOk = headInstallable(head, entry?.releases);
 
-  // Serialised so the preview effect runs when the origin changes, not each
+  // Serialized so the preview effect runs when the origin changes, not each
   // time the catalogue poll hands back an equal entry.
   const originKey = useMemo(() => {
     let origin: PluginOrigin | null = null;
@@ -86,7 +88,7 @@ export default function CataloguePlugin() {
     } else if (entry && !retired) {
       if (entry.publisher_did) {
         // The server refuses to preview a version that may not be installed.
-        if (head?.installable) {
+        if (headOk) {
           origin = {
             registry: { did: entry.publisher_did, name: entry.id, channel },
           };
@@ -96,7 +98,7 @@ export default function CataloguePlugin() {
       }
     }
     return origin ? JSON.stringify(origin) : null;
-  }, [pastedUrl, entry, retired, head, channel]);
+  }, [pastedUrl, entry, retired, headOk, channel]);
 
   useEffect(() => {
     if (!originKey) return;
@@ -203,6 +205,7 @@ export default function CataloguePlugin() {
         <ChannelSelect
           id="plugin-channel"
           channels={entry?.channels ?? null}
+          releases={entry?.releases}
           value={channel}
           onValueChange={(next) => {
             setChosenChannel(next);
@@ -211,10 +214,7 @@ export default function CataloguePlugin() {
           disabled={installing}
         />
         {head ? (
-          <ReleaseStateBadge
-            state={head.state}
-            installable={head.installable}
-          />
+          <ReleaseStateBadge state={head.state} installable={headOk} />
         ) : null}
       </div>
     ) : null;
@@ -235,7 +235,7 @@ export default function CataloguePlugin() {
     >
       There is no version to install yet.
     </LifecycleNotice>
-  ) : byProject && head && !head.installable ? (
+  ) : byProject && head && !headOk ? (
     <LifecycleNotice
       tone={head.state === "retired" ? "danger" : "warning"}
       title={unavailableChannelCopy(channel, head.state)}
@@ -248,24 +248,32 @@ export default function CataloguePlugin() {
   ) : null;
 
   // Installable, but the publisher has said something an operator should
-  // read before choosing it.
+  // read before choosing it. The project and the version are deprecated
+  // separately, and each notice says its own.
+  const projectDeprecated = entry?.lifecycle_state === "deprecated";
+  const versionDeprecated = byProject && headOk && head?.state === "deprecated";
   const caution =
-    entry?.lifecycle_state === "deprecated" ? (
-      <LifecycleNotice
-        tone="warning"
-        title="This plugin is deprecated by its publisher"
-      />
-    ) : byProject && head?.installable && head.state === "deprecated" ? (
-      <LifecycleNotice
-        tone="warning"
-        title={
-          headRelease?.reason
-            ? `Deprecated: ${headRelease.reason}`
-            : "This version is deprecated by its publisher"
-        }
-      >
-        It still installs, but its publisher recommends against it.
-      </LifecycleNotice>
+    projectDeprecated || versionDeprecated ? (
+      <div className="flex flex-col gap-3">
+        {projectDeprecated ? (
+          <LifecycleNotice
+            tone="warning"
+            title="This plugin is deprecated by its publisher"
+          />
+        ) : null}
+        {versionDeprecated ? (
+          <LifecycleNotice
+            tone="warning"
+            title={
+              headRelease?.reason
+                ? `Deprecated: ${headRelease.reason}`
+                : "This version is deprecated by its publisher"
+            }
+          >
+            It still installs, but its publisher recommends against it.
+          </LifecycleNotice>
+        ) : null}
+      </div>
     ) : null;
 
   return (

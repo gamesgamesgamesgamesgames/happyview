@@ -54,9 +54,10 @@ function LifecycleNotices({ plugin }: { plugin: PluginSummary }) {
         tone="info"
         title="Unresolved: not matched to a registry project"
       >
-        This plugin was installed from a URL the registry doesn&apos;t
-        recognise, so its lifecycle and updates aren&apos;t tracked. Remove it
-        and add it from the registry to follow a channel.
+        This plugin was installed from a URL that no registry project matched,
+        so it doesn&apos;t follow a channel and has no lifecycle state. Newer
+        releases published under the same name are still offered as updates. To
+        follow a channel, remove it and add it from the registry.
       </LifecycleNotice>
     );
   }
@@ -282,12 +283,16 @@ export default function InstalledPlugin() {
 
   // Only a registry install follows a channel; any other has none to switch.
   const followsProject = Boolean(plugin?.registry?.did && plugin.registry.name);
+  const projectEntry = plugin?.registry
+    ? byId.get(plugin.registry.name ?? plugin.id)
+    : undefined;
   const projectChannels = plugin?.registry
-    ? channelsFor(
-        byId.get(plugin.registry.name ?? plugin.id),
-        plugin.registry.did,
-      )
+    ? channelsFor(projectEntry, plugin.registry.did)
     : null;
+  // Only the install's own project's releases; `channelsFor` says whether
+  // the entry is that project.
+  const projectReleases =
+    projectChannels && projectEntry ? projectEntry.releases : [];
 
   const hasSettings =
     plugin !== null &&
@@ -466,6 +471,7 @@ export default function InstalledPlugin() {
         <PluginChannelDialog
           plugin={plugin}
           channels={projectChannels}
+          releases={projectReleases}
           open={channelOpen}
           onOpenChange={setChannelOpen}
           onSwitched={() => void load()}

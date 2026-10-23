@@ -26,6 +26,11 @@ import {
   type SecretDefinition,
 } from "@/lib/api";
 import { ReleaseStateBadge } from "@/components/plugin-lifecycle";
+import {
+  CapabilityConsent,
+  newCapabilities,
+  visibleCapabilities,
+} from "@/components/plugin-capabilities";
 
 interface PluginUpdateDialogProps {
   plugin: PluginSummary | null;
@@ -39,10 +44,16 @@ interface PluginUpdateDialogProps {
 
 /**
  * How the update is fetched. A registry install moves along the channel it
- * follows, and the server resolves that version itself. A URL install takes
- * the catalogue's manifest, but only when the listing offers the version the
- * server's update gate approved: the listing is one entry per id from any
- * publisher, and may have moved on, or be someone else's, since the gate ran.
+ * follows, and the server resolves that version itself.
+ *
+ * A URL install, with no registry project or an unresolved one, takes the
+ * catalogue's `manifest_url`. That field is transitional: the catalogue
+ * names projects, not URLs, and this path goes when it does, leaving such an
+ * install to be added again from the registry. Until then it is used only
+ * when the listing offers the version the server's update gate approved: the
+ * listing is one entry per id from any publisher, and may have moved on, or
+ * be someone else's, since the gate ran. The server still holds a recorded
+ * install to its publisher.
  */
 function updateSource(
   plugin: PluginSummary | null,
@@ -81,17 +92,21 @@ export function PluginUpdateDialog({
   onUpdated,
 }: PluginUpdateDialogProps) {
   const source = updateSource(plugin, catalogueEntry);
-  // Serialised so the preview effect runs when the source changes, not when
+  // Serialized so the preview effect runs when the source changes, not when
   // a poll hands back an equal one.
   const sourceKey = source ? JSON.stringify(source) : null;
 
   const [newManifestPreview, setNewManifestPreview] =
     useState<PluginPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [accepted, setAccepted] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setAccepted(false);
+    setPreviewError(null);
     if (!open || !plugin) {
       setNewManifestPreview(null);
       setError(null);
@@ -115,8 +130,10 @@ export function PluginUpdateDialog({
       .then((preview) => {
         if (!cancelled) setNewManifestPreview(preview);
       })
-      .catch(() => {
-        if (!cancelled) setNewManifestPreview(null);
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setNewManifestPreview(null);
+        setPreviewError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
         if (!cancelled) setPreviewLoading(false);
@@ -137,24 +154,32 @@ export function PluginUpdateDialog({
       (secret) => !installedKeys.has(secret.key),
     ) ?? [];
 
+  // What the update adds is asked for; what it keeps was granted already.
+  const addedCapabilities = newManifestPreview
+    ? newCapabilities(plugin.capabilities, newManifestPreview.capabilities)
+    : [];
+  const consented = addedCapabilities.length === 0 || accepted;
+
   const pendingReleases = [...(plugin.pending_releases ?? [])];
   const hasReleaseNotes = pendingReleases.length > 0;
   const hasLatestVersion = Boolean(plugin.latest_version);
 
   const handleUpdate = async () => {
-    if (!source) {
-      setError(
-        "The catalogue no longer offers this version. Check for an update and try again.",
-      );
-      return;
-    }
+    if (!source || !newManifestPreview || !consented) return;
     setUpdating(true);
     setError(null);
+    // Everything the new version declares, so the server refuses a version
+    // that would be granted more than this dialog showed.
+    const accepted_capabilities = visibleCapabilities(
+      newManifestPreview.capabilities,
+    ).map((c) => c.name);
     try {
       // An empty selector keeps the channel the install follows.
       const updated = await reloadPlugin(
         plugin.id,
-        source.kind === "registry" ? { registry: {} } : { url: source.url },
+        source.kind === "registry"
+          ? { registry: {}, accepted_capabilities }
+          : { url: source.url, accepted_capabilities },
       );
       if (plugin.latest_version) {
         try {
@@ -180,7 +205,8 @@ export function PluginUpdateDialog({
     }
   };
 
-  const updateDisabled = updating || previewLoading || !source;
+  const updateDisabled =
+    updating || previewLoading || !source || !newManifestPreview || !consented;
 
   return (
     <ResponsiveDialog open={open} onOpenChange={onOpenChange}>
@@ -274,6 +300,27 @@ export function PluginUpdateDialog({
               No release notes available.
             </p>
           )}
+
+          {newManifestPreview ? (
+            <CapabilityConsent
+              id="update-capabilities-consent"
+              entries={addedCapabilities}
+              allowedHosts={newManifestPreview.allowed_hosts}
+              accepted={accepted}
+              onAcceptedChange={setAccepted}
+              disabled={updating}
+            />
+          ) : null}
+
+          {previewError ? (
+            <p
+              role="alert"
+              className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+            >
+              Couldn&apos;t read the new version, so its permissions can&apos;t
+              be shown: {previewError}
+            </p>
+          ) : null}
 
           {!source ? (
             <p className="text-sm text-muted-foreground">

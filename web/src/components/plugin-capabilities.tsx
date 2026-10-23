@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import type {
   CapabilityEntry,
   CapabilityReport,
@@ -77,6 +78,55 @@ export function PluginCapabilities({
         </li>
       ))}
     </ul>
+  );
+}
+
+/** What `next` declares that `installed` doesn't. */
+export function newCapabilities(
+  installed: CapabilityReport,
+  next: CapabilityReport,
+): CapabilityEntry[] {
+  const held = new Set(visibleCapabilities(installed).map((c) => c.name));
+  return visibleCapabilities(next).filter((c) => !held.has(c.name));
+}
+
+/**
+ * Asks for consent to what a new version adds. The reload names everything
+ * the new version declares, so the server grants no more than was shown
+ * here; with nothing new there is nothing to ask.
+ */
+export function CapabilityConsent({
+  id,
+  entries,
+  allowedHosts,
+  accepted,
+  onAcceptedChange,
+  disabled,
+}: {
+  id: string;
+  entries: CapabilityEntry[];
+  allowedHosts?: string[];
+  accepted: boolean;
+  onAcceptedChange: (accepted: boolean) => void;
+  disabled?: boolean;
+}) {
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border p-4">
+      <p className="text-sm font-medium">
+        This version asks for new permissions
+      </p>
+      <PluginCapabilities entries={entries} allowedHosts={allowedHosts} />
+      <label htmlFor={id} className="flex items-center gap-2 text-sm">
+        <Checkbox
+          id={id}
+          checked={accepted}
+          onCheckedChange={(v) => onAcceptedChange(v === true)}
+          disabled={disabled}
+        />
+        Allow these permissions
+      </label>
+    </div>
   );
 }
 

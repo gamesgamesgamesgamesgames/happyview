@@ -7,6 +7,7 @@ import type {
   ChannelEntry,
   LifecycleState,
   OfficialPluginSummary,
+  ReleaseEntry,
 } from "@/types/plugins";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -45,6 +46,20 @@ export function channelsFor(
 ): Record<string, ChannelEntry> | null {
   if (!entry || !did || entry.publisher_did !== did) return null;
   return entry.channels;
+}
+
+/**
+ * Whether a channel's version may be installed. The channel carries only
+ * its version's state; the release also knows whether the registry flagged
+ * it suspect.
+ */
+export function headInstallable(
+  head: ChannelEntry | undefined,
+  releases: ReleaseEntry[] | undefined,
+): boolean {
+  if (!head) return false;
+  const release = releases?.find((r) => r.version === head.version);
+  return head.installable && release?.installable !== false;
 }
 
 /**
@@ -150,6 +165,7 @@ export function LifecycleNotice({
 export function ChannelSelect({
   id,
   channels,
+  releases,
   names,
   value,
   onValueChange,
@@ -158,8 +174,11 @@ export function ChannelSelect({
   id?: string;
   /** What each channel points at, when the catalogue holds the project. */
   channels: Record<string, ChannelEntry> | null;
+  /** The project's releases, which know what its channels don't. */
+  releases?: ReleaseEntry[];
   /** The channels to offer when `channels` is null. */
   names?: string[];
+  /** Empty when nothing is chosen yet. */
   value: string;
   onValueChange: (channel: string) => void;
   disabled?: boolean;
@@ -170,7 +189,7 @@ export function ChannelSelect({
   return (
     <Select value={value} onValueChange={onValueChange} disabled={disabled}>
       <SelectTrigger id={id} className="w-56">
-        <SelectValue />
+        <SelectValue placeholder="Choose a channel" />
       </SelectTrigger>
       <SelectContent>
         {options.map((name) => {
@@ -178,7 +197,7 @@ export function ChannelSelect({
           const state = head
             ? head.state !== "active"
               ? STATE_LABEL[head.state].toLowerCase()
-              : head.installable
+              : headInstallable(head, releases)
                 ? null
                 : "not installable"
             : null;
