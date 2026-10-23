@@ -332,7 +332,97 @@ pub async fn refresh_for_installs(
         tracing::warn!(error = %e, "official_registry: installed projects unreadable");
         Vec::new()
     });
-    refresh_full(client, config, state, &installed).await
+    refresh_full(client, config, state, &installed).await?;
+    if let Err(e) = attach_url_installs(client, config, state, db, backend).await {
+        tracing::warn!(error = %e, "official_registry: url installs not matched to registry projects");
+    }
+    Ok(())
+}
+
+/// Attach plugins installed from a URL to the registry project of the same
+/// name, so their updates come from the registry. Each plugin is tried once:
+/// a match records the project, and no match flags the plugin unresolved,
+/// which keeps it out of later passes. The installed bytes are never
+/// touched, and nothing is unloaded.
+///
+/// A project that can't be read at the moment is left for the next refresh
+/// instead of being flagged, since "not found" is the only answer that means
+/// the registry has no such project.
+async fn attach_url_installs(
+    client: &reqwest::Client,
+    config: &RegistryConfig,
+    state: &SharedRegistry,
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> Result<(), sqlx::Error> {
+    let Some(source) = &config.registry else {
+        return Ok(());
+    };
+    let sql = crate::db::adapt_sql(
+        "SELECT id, publisher_did, manifest FROM happyview_plugins
+         WHERE source = 'url' AND enabled = TRUE
+           AND registry_did IS NULL AND registry_unresolved = 0",
+        backend,
+    );
+    let candidates: Vec<(String, Option<String>, Option<String>)> =
+        crate::db::query_as(&sql).fetch_all(db).await?;
+
+    for (id, publisher, manifest) in candidates {
+        // The publisher a URL install recorded; one that recorded none was
+        // offered by the official publisher.
+        let did = publisher.unwrap_or_else(|| OFFICIAL_PUBLISHER_DID.to_owned());
+        let cached = state.read().await.project(&did, &id).cloned();
+        let entry = match cached {
+            Some(entry) => Some(entry),
+            None => match super::registry_source::fetch_project(client, source, &did, &id).await {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(plugin = %id, publisher = %did, error = %e, "official_registry: project unreadable, will retry");
+                    continue;
+                }
+            },
+        };
+
+        let Some(entry) = entry else {
+            tracing::warn!(plugin = %id, publisher = %did, "official_registry: no registry project matches this plugin; it keeps updating from its url");
+            let sql = crate::db::adapt_sql(
+                "UPDATE happyview_plugins SET registry_unresolved = 1
+                 WHERE id = ? AND registry_did IS NULL",
+                backend,
+            );
+            crate::db::query(&sql).bind(&id).execute(db).await?;
+            continue;
+        };
+
+        let installed_version = manifest
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|m| m.get("version").and_then(|v| v.as_str()).map(str::to_owned));
+        let version_uri = installed_version.and_then(|v| {
+            entry
+                .releases
+                .iter()
+                .find(|r| r.version == v)
+                .map(|r| r.version_uri.clone())
+        });
+        let sql = crate::db::adapt_sql(
+            "UPDATE happyview_plugins
+             SET registry_did = ?, registry_name = ?, registry_channel = 'latest', version_uri = ?
+             WHERE id = ? AND registry_did IS NULL",
+            backend,
+        );
+        crate::db::query(&sql)
+            .bind(&did)
+            .bind(&id)
+            .bind(version_uri)
+            .bind(&id)
+            .execute(db)
+            .await?;
+        tracing::info!(plugin = %id, publisher = %did, "official_registry: plugin attached to its registry project");
+        // Tracked from now on, so the next listing judges it by its own
+        // project even when another publisher holds the name in the catalogue.
+        state.write().await.installed.insert((did, id), entry);
+    }
+    Ok(())
 }
 
 /// Refresh just one plugin's cache entry, from the publisher the cache names

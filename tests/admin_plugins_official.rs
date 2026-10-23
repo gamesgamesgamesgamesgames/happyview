@@ -1047,7 +1047,9 @@ async fn refresh_and_expect_no_offer(app: &TestApp) {
     );
     let summary = summary_of(app, "lua").await;
     assert_eq!(summary["update_available"], false);
-    assert!(summary["latest_version"].is_null());
+    // The official project, if the install was attached to it, is its own
+    // project's version; the stranger's is never shown.
+    assert_ne!(summary["latest_version"], "9.0.0");
     assert!(summary["pending_releases"].as_array().unwrap().is_empty());
 }
 
@@ -1090,7 +1092,7 @@ async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], false);
-    assert!(body["latest_version"].is_null());
+    assert_ne!(body["latest_version"], "9.0.0");
 }
 
 /// An official registry install, while the catalogue holds the stranger's
@@ -1494,4 +1496,187 @@ async fn reload_refuses_a_url_from_another_publisher() {
         recorded_publisher(&app, "lua").await.as_deref(),
         Some(OFFICIAL)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plugins installed from a GitHub release URL before the registry existed.
+// ---------------------------------------------------------------------------
+
+async fn unresolved_flag(app: &TestApp, id: &str) -> i64 {
+    let sql = happyview::db::adapt_sql(
+        "SELECT CAST(registry_unresolved AS BIGINT) FROM happyview_plugins WHERE id = ?",
+        app.state.db_backend,
+    );
+    let row: (i64,) = happyview::db::query_as(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn set_column(app: &TestApp, id: &str, column: &str, value: &str) {
+    let sql = happyview::db::adapt_sql(
+        &format!("UPDATE happyview_plugins SET {column} = ? WHERE id = ?"),
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(value)
+        .bind(id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+/// A URL-installed official plugin is attached to its registry project
+/// without touching its bytes, then updates through the registry by CID.
+#[tokio::test]
+#[serial]
+async fn a_url_install_of_an_official_plugin_is_attached_to_its_registry_project() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .publish("1.1.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "alpha-lua", "lua", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(row_of(&app, "lua").await.unwrap()["registry_did"], None);
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_name"].as_deref(), Some("lua"));
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(OFFICIAL, "lua", "1.0.0"))
+    );
+    // The installed bytes came from the URL and stay that way.
+    for column in [
+        "manifest_cid",
+        "manifest_blob_cid",
+        "package_cid",
+        "manifest_url",
+    ] {
+        assert_eq!(row[column], None, "{column} should stay empty");
+    }
+    assert_eq!(unresolved_flag(&app, "lua").await, 0);
+
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["registry"]["did"], OFFICIAL);
+    assert_eq!(summary["registry"]["channel"], "latest");
+    assert_eq!(summary["registry"]["installed_state"], "active");
+    assert_eq!(summary["registry"]["unresolved"], false);
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    // A bare reload keeps the URL it was installed from.
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["package_cid"], None);
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+
+    // Applying the update installs by CID and fills the artifact columns.
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(
+        row["package_cid"].clone(),
+        Some(cid(&module_bytes("lua", "1.1.0")))
+    );
+    assert_eq!(
+        row["manifest_blob_cid"].clone(),
+        Some(cid(&manifest_bytes("lua", "1.1.0")))
+    );
+    assert!(row["manifest_url"].is_some());
+    assert!(row["manifest_cid"].is_some());
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(OFFICIAL, "lua", "1.1.0"))
+    );
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["version"], "1.1.0");
+    assert_eq!(summary["update_available"], false);
+}
+
+/// A plugin the registry has no project for is flagged and left running.
+/// Neither outcome is retried: a flagged row stays flagged even once a
+/// project appears, and a matched row keeps what it was given.
+#[tokio::test]
+#[serial]
+async fn matching_runs_once_and_an_unknown_plugin_stays_loaded() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let mystery = serve_module(&app, "mystery", "mystery", "1.0.0").await;
+    install(&app, &mystery).await;
+    let lua = serve_module(&app, "alpha-lua", "lua", "1.0.0").await;
+    install(&app, &lua).await;
+
+    refresh(&app).await;
+
+    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
+    assert_eq!(row_of(&app, "mystery").await.unwrap()["registry_did"], None);
+    assert!(app.state.plugin_registry.get("mystery").await.is_some());
+    let summary = summary_of(&app, "mystery").await;
+    assert_eq!(summary["registry"]["unresolved"], true);
+    assert_eq!(summary["registry"]["did"], Value::Null);
+    assert_eq!(unresolved_flag(&app, "lua").await, 0);
+
+    // The registry now has the project, and the operator moved the match.
+    registry.project(OFFICIAL, "mystery").publish("1.0.0");
+    registry.serve().await;
+    set_column(&app, "lua", "registry_channel", "beta").await;
+    refresh(&app).await;
+
+    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
+    assert_eq!(row_of(&app, "mystery").await.unwrap()["registry_did"], None);
+    assert_eq!(
+        row_of(&app, "lua").await.unwrap()["registry_channel"].as_deref(),
+        Some("beta")
+    );
+}
+
+/// A recorded publisher decides whose project the plugin is matched to, and
+/// a registry that can't be read neither matches nor flags.
+#[tokio::test]
+#[serial]
+async fn a_recorded_publisher_decides_whose_project_a_url_install_joins() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("2.0.0");
+    registry.project(OFFICIAL, "extra").publish("1.0.0");
+    registry.project(STRANGER, "gone").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    for id in ["extra", "gone"] {
+        let url = serve_module(&app, id, id, "2.0.0").await;
+        install(&app, &url).await;
+        set_column(&app, id, "publisher_did", STRANGER).await;
+    }
+    // The stranger's `gone` is not served at all.
+    registry.projects.retain(|p| p.name != "gone");
+    registry.serve().await;
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "extra").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(STRANGER));
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(STRANGER, "extra", "2.0.0"))
+    );
+    assert_eq!(unresolved_flag(&app, "gone").await, 1);
 }
