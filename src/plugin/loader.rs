@@ -165,6 +165,15 @@ async fn fetch_verified(
     url: &str,
     expected_cid: &str,
 ) -> Result<Vec<u8>, LoadError> {
+    // Nothing hashes to an empty CID, so there is nothing to check against;
+    // refuse before fetching rather than serve unverified bytes.
+    if expected_cid.is_empty() {
+        return Err(LoadError::CidMismatch {
+            what,
+            expected: String::new(),
+            actual: "no CID to check against".to_string(),
+        });
+    }
     let bytes = client
         .get(url)
         .send()
@@ -173,17 +182,26 @@ async fn fetch_verified(
         .bytes()
         .await?
         .to_vec();
-    let actual = crate::cid_verify::raw_cid(&bytes)
-        .map(|cid| cid.to_string())
-        .unwrap_or_default();
-    if actual != expected_cid {
-        return Err(LoadError::CidMismatch {
-            what,
-            expected: expected_cid.to_string(),
-            actual,
-        });
-    }
+    check_cid(
+        what,
+        expected_cid,
+        crate::cid_verify::raw_cid(&bytes).map(|cid| cid.to_string()),
+    )?;
     Ok(bytes)
+}
+
+/// `actual` is `None` when the bytes could not be hashed. That is a
+/// mismatch, never a match: treating it as an empty CID would let an empty
+/// expected CID pass.
+fn check_cid(what: &'static str, expected: &str, actual: Option<String>) -> Result<(), LoadError> {
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        actual => Err(LoadError::CidMismatch {
+            what,
+            expected: expected.to_string(),
+            actual: actual.unwrap_or_else(|| "unhashable bytes".to_string()),
+        }),
+    }
 }
 
 /// Load a plugin from a manifest (fetches WASM separately)
@@ -1250,8 +1268,10 @@ pub(crate) mod registry_fixture {
             name: id.into(),
             channel: Some("latest".into()),
             version: "1.2.0".into(),
-            version_uri: format!("at://did:plc:publisher/software.release.version/{id}:1.2.0"),
-            manifest_cid: "bafyreimanifestrecord".into(),
+            version_uri: Some(format!(
+                "at://did:plc:publisher/software.release.version/{id}:1.2.0"
+            )),
+            manifest_cid: Some("bafyreimanifestrecord".into()),
             manifest_url: source.artifact_url(&manifest_blob_cid),
             manifest_blob_cid,
             package_url: source.artifact_url(&package_cid),
@@ -1354,6 +1374,33 @@ mod registry_tests {
         let message = err.to_string();
         assert!(message.contains(&install.package_cid), "{message}");
         assert!(message.contains(&actual), "{message}");
+    }
+
+    #[test]
+    fn bytes_that_cannot_be_hashed_never_match_a_cid() {
+        for expected in ["", "bafkreianything"] {
+            let err = check_cid("module", expected, None).unwrap_err();
+            assert!(
+                matches!(&err, LoadError::CidMismatch { what: "module", .. }),
+                "{err:?}"
+            );
+        }
+        assert!(check_cid("module", "bafy", Some("bafy".into())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_empty_expected_cid_is_refused_without_fetching() {
+        let server = MockServer::start().await;
+        let mut install = serve_release(&server, "p").await;
+        install.package_cid = String::new();
+
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, LoadError::CidMismatch { what: "module", expected, .. } if expected.is_empty()),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

@@ -81,8 +81,8 @@ impl StoredPlugin {
             channel: self.registry_channel.clone(),
             // Not stored: the verified manifest names it.
             version: String::new(),
-            version_uri: self.version_uri.clone().unwrap_or_default(),
-            manifest_cid: self.manifest_cid.clone().unwrap_or_default(),
+            version_uri: self.version_uri.clone(),
+            manifest_cid: self.manifest_cid.clone(),
             manifest_url: self.manifest_url.clone()?,
             manifest_blob_cid: self.manifest_blob_cid.clone()?,
             package_url: self.url.clone()?,
@@ -378,11 +378,11 @@ impl PluginRegistry {
             .bind(registry.map(|r| r.manifest_url.clone()))
             .bind(registry.map(|r| r.manifest_blob_cid.clone()))
             .bind(registry.map(|r| r.package_cid.clone()))
-            .bind(registry.map(|r| r.manifest_cid.clone()))
+            .bind(registry.and_then(|r| r.manifest_cid.clone()))
             .bind(registry.map(|r| r.did.clone()))
             .bind(registry.map(|r| r.name.clone()))
             .bind(registry.and_then(|r| r.channel.clone()))
-            .bind(registry.map(|r| r.version_uri.clone()))
+            .bind(registry.and_then(|r| r.version_uri.clone()))
             .execute(db)
             .await?;
 
@@ -693,6 +693,34 @@ impl PluginRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_missing_its_record_columns_reloads_without_inventing_them() {
+        let row = StoredPlugin {
+            id: "p".into(),
+            source: "url".into(),
+            url: Some("https://r.test/module".into()),
+            sha256: None,
+            manifest_url: Some("https://r.test/manifest".into()),
+            manifest_blob_cid: Some("bafkreimanifest".into()),
+            package_cid: Some("bafkreipackage".into()),
+            manifest_cid: None,
+            registry_did: Some("did:plc:publisher".into()),
+            registry_name: Some("p".into()),
+            registry_channel: None,
+            version_uri: None,
+        };
+        let install = row.registry_install().expect("still reloadable by CID");
+        assert_eq!(install.version_uri, None);
+        assert_eq!(install.manifest_cid, None);
+
+        // A column the fetch needs is another matter.
+        let row = StoredPlugin {
+            package_cid: None,
+            ..row
+        };
+        assert!(row.registry_install().is_none());
+    }
+
     use super::*;
     use crate::test_support::migrated_memory_pool;
 
@@ -1014,8 +1042,8 @@ mod tests {
                     Some(install.did.clone()),
                     Some(install.name.clone()),
                     install.channel.clone(),
-                    Some(install.version_uri.clone()),
-                    Some(install.manifest_cid.clone()),
+                    install.version_uri.clone(),
+                    install.manifest_cid.clone(),
                     0,
                 ),
                 "{backend:?}"

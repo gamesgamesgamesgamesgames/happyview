@@ -233,10 +233,11 @@ pub struct RegistryInstall {
     /// version.
     pub channel: Option<String>,
     pub version: String,
-    /// The `software.release.version` record.
-    pub version_uri: String,
-    /// The `software.release.manifest` record's CID.
-    pub manifest_cid: String,
+    /// The `software.release.version` record. `None` for a row stored
+    /// without it; a reload does not need it, so it is not invented.
+    pub version_uri: Option<String>,
+    /// The `software.release.manifest` record's CID, `None` as above.
+    pub manifest_cid: Option<String>,
     /// Where the registry serves the manifest file, by its blob CID.
     pub manifest_url: String,
     pub manifest_blob_cid: String,
