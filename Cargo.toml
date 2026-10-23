@@ -51,7 +51,7 @@ ciborium = "0.2"
 ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 multibase = "0.9"
-p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
+p256 = { version = "0.14", features = ["pkcs8", "ecdsa", "ecdh"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
 reqwest = { version = "0.12", features = ["json", "gzip"] }

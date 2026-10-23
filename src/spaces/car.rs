@@ -55,7 +55,14 @@ fn write_car_block(out: &mut Vec<u8>, cid: &Cid, block: &[u8]) {
     out.extend_from_slice(block);
 }
 
-pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<Vec<u8>, AppError> {
+/// The commit a CAR leads with, in either commit model.
+pub enum CarCommit<'a> {
+    Signed(&'a SignedCommit),
+    /// A proposal 0016 commit, which carries no authentication at rest.
+    Mac(&'a crate::spaces::space_mac::Commit),
+}
+
+pub fn serialize_repo(commit: CarCommit<'_>, records: &[SpaceRecord]) -> Result<Vec<u8>, AppError> {
     let mut indexed: Vec<(&SpaceRecord, Vec<u8>, Cid)> = records
         .iter()
         .map(|r| {
@@ -84,29 +91,24 @@ pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<
     let index_block = encode_cbor(&index_cbor)?;
     let index_cid = make_cid(DAG_CBOR, &index_block);
 
-    // Build signed commit block
-    let commit_cbor = ciborium::Value::Map(vec![
-        (
-            ciborium::Value::Text("ver".into()),
-            ciborium::Value::Integer(commit.ver.into()),
-        ),
-        (
-            ciborium::Value::Text("hash".into()),
-            ciborium::Value::Bytes(commit.hash.to_vec()),
-        ),
-        (
-            ciborium::Value::Text("ikm".into()),
-            ciborium::Value::Bytes(commit.ikm.to_vec()),
-        ),
-        (
-            ciborium::Value::Text("mac".into()),
-            ciborium::Value::Bytes(commit.mac.to_vec()),
-        ),
-        (
-            ciborium::Value::Text("rev".into()),
-            ciborium::Value::Text(commit.rev.clone()),
-        ),
-    ]);
+    let text = |s: &str| ciborium::Value::Text(s.into());
+    let commit_cbor = match commit {
+        CarCommit::Signed(commit) => ciborium::Value::Map(vec![
+            (text("ver"), ciborium::Value::Integer(commit.ver.into())),
+            (text("hash"), ciborium::Value::Bytes(commit.hash.to_vec())),
+            (text("ikm"), ciborium::Value::Bytes(commit.ikm.to_vec())),
+            (text("mac"), ciborium::Value::Bytes(commit.mac.to_vec())),
+            (text("rev"), ciborium::Value::Text(commit.rev.clone())),
+        ]),
+        // In DAG-CBOR's canonical key order: shorter keys first, then bytewise.
+        CarCommit::Mac(commit) => ciborium::Value::Map(vec![
+            (text("rev"), ciborium::Value::Text(commit.rev.clone())),
+            (text("ver"), ciborium::Value::Integer(commit.ver.into())),
+            (text("data"), ciborium::Value::Bytes(commit.data.to_vec())),
+            (text("repo"), ciborium::Value::Text(commit.repo.clone())),
+            (text("space"), ciborium::Value::Text(commit.space.clone())),
+        ]),
+    };
     let commit_block = encode_cbor(&commit_cbor)?;
     let commit_cid = make_cid(DAG_CBOR, &commit_block);
 
@@ -162,7 +164,7 @@ mod tests {
     #[test]
     fn serialize_empty_repo() {
         let commit = test_commit();
-        let car = serialize_repo(&commit, &[]).unwrap();
+        let car = serialize_repo(CarCommit::Signed(&commit), &[]).unwrap();
         assert!(!car.is_empty());
         // CAR starts with a varint-prefixed header — must be more than 10 bytes
         assert!(car.len() > 10);
@@ -205,7 +207,7 @@ mod tests {
             },
         ];
 
-        let car = serialize_repo(&commit, &records).unwrap();
+        let car = serialize_repo(CarCommit::Signed(&commit), &records).unwrap();
         assert!(car.len() > 100);
     }
 
@@ -225,7 +227,7 @@ mod tests {
             indexed_at: "2026-01-01".into(),
         }];
 
-        let car = serialize_repo(&test_commit(), &records).unwrap();
+        let car = serialize_repo(CarCommit::Signed(&test_commit()), &records).unwrap();
         let needle = expected.to_bytes();
         assert!(
             car.windows(needle.len()).any(|w| w == needle),
@@ -246,7 +248,7 @@ mod tests {
             indexed_at: "2026-01-01".into(),
         }];
 
-        let car = serialize_repo(&test_commit(), &records).unwrap();
+        let car = serialize_repo(CarCommit::Signed(&test_commit()), &records).unwrap();
         let json = br#"{"text":"hello"}"#;
         assert!(
             !car.windows(json.len()).any(|w| w == json),
@@ -284,7 +286,7 @@ mod tests {
             },
         ];
         // Should not panic, and produces valid output
-        let car = serialize_repo(&commit, &records).unwrap();
+        let car = serialize_repo(CarCommit::Signed(&commit), &records).unwrap();
         assert!(car.len() > 100);
     }
 }

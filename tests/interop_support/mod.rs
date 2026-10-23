@@ -272,3 +272,77 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
     );
     did
 }
+
+/// An author's DID document from the stack's PLC directory.
+pub async fn did_doc(plc_url: &str, did: &str) -> happyview::profile::DidDocument {
+    happyview::profile::resolve_did_document(&reqwest::Client::new(), plc_url, did)
+        .await
+        .unwrap_or_else(|e| panic!("PLC resolution failed for {did}: {e}"))
+}
+
+/// A `getLatestCommit` answer, with what a syncer needs to authenticate it.
+pub struct FetchedCommit {
+    pub json: Value,
+    pub mac_header: Option<reqwest::header::HeaderValue>,
+    pub exchange: Option<happyview::spaces::space_mac::Encapsulation>,
+}
+
+/// Fetch `repo`'s latest commit as native sync does, asking for a MAC keyed to
+/// `kem_doc`'s `#atproto_kem` key when it publishes one.
+///
+/// `kem_doc` is normally the repo author's own document. Passing another
+/// account's is how a test shows that a MAC is bound to the author's key.
+pub async fn fetch_latest_commit(
+    base: &str,
+    token: &str,
+    space_uri: &str,
+    repo: &str,
+    kem_doc: &happyview::profile::DidDocument,
+) -> FetchedCommit {
+    use happyview::spaces::space_mac;
+
+    let exchange = space_mac::author_kem_key(kem_doc)
+        .expect("the KEM key decodes")
+        .map(|key| space_mac::encapsulate(&key));
+    let mut req = reqwest::Client::new()
+        .get(format!("{base}/xrpc/com.atproto.space.getLatestCommit"))
+        .query(&[("space", space_uri), ("repo", repo)])
+        .bearer_auth(token);
+    if let Some(exchange) = &exchange {
+        req = req.header(
+            space_mac::WANT_MAC_HEADER,
+            space_mac::want_mac_header(&exchange.key_share).unwrap(),
+        );
+    }
+    let resp = req.send().await.expect("getLatestCommit request");
+    assert_eq!(resp.status().as_u16(), 200, "getLatestCommit failed");
+    let mac_header = resp.headers().get(space_mac::MAC_HEADER).cloned();
+    let json = resp.json::<Value>().await.expect("commit json")["commit"].clone();
+    FetchedCommit {
+        json,
+        mac_header,
+        exchange,
+    }
+}
+
+/// `repo`'s latest commit, fetched and authenticated exactly as native sync
+/// does, whichever commit model the host speaks.
+pub async fn verified_latest_commit(
+    base: &str,
+    plc_url: &str,
+    token: &str,
+    space_uri: &str,
+    repo: &str,
+) -> happyview::spaces::native_client::VerifiedCommit {
+    let doc = did_doc(plc_url, repo).await;
+    let fetched = fetch_latest_commit(base, token, space_uri, repo, &doc).await;
+    happyview::spaces::native_client::verify_remote_commit(
+        &fetched.json,
+        space_uri,
+        repo,
+        &doc,
+        fetched.exchange.as_ref(),
+        fetched.mac_header.as_ref(),
+    )
+    .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
+}
