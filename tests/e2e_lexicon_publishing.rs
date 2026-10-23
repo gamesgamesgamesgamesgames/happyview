@@ -281,6 +281,7 @@ async fn put_manual(s: &happyview::AppState, nsid: &str) {
                 action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await
@@ -555,6 +556,7 @@ async fn publish_refuses_a_network_lexicon_even_when_a_rule_matches() {
                 action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some("did:plc:other".into()),
+                indexed: true,
             },
         )
         .await
@@ -945,6 +947,7 @@ async fn overview_lists_a_manual_lexicon_with_no_rule_and_omits_network_ones() {
                 action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some("did:plc:other".into()),
+                indexed: true,
             },
         )
         .await

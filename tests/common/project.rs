@@ -23,6 +23,7 @@ pub fn add_lexicon(snap: &mut ProjectSnapshot, json: Value, path: &str) {
             parsed,
             path: PathBuf::from(path),
             backfill: false,
+            indexed: true,
         },
     );
 }

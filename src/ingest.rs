@@ -344,13 +344,11 @@ pub(crate) async fn apply_retry(
     Ok(apply_record(state, ev, Hook::Given(hook)).await)
 }
 
-/// Whether `collection` is a registered record-type lexicon.
+/// Whether `collection` is an indexed record lexicon. A record lexicon
+/// installed unindexed is known but not ingested, so its events are skipped
+/// like an unknown collection's.
 pub(crate) async fn is_tracked(state: &AppState, collection: &str) -> bool {
-    state
-        .lexicons
-        .get(collection)
-        .await
-        .is_some_and(|lex| lex.lexicon_type == LexiconType::Record)
+    state.lexicons.is_indexed(collection)
 }
 
 /// Run the record hook for one create/update and say what to store. The CID

@@ -80,6 +80,7 @@ export default function LexiconDetailPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: lexicon.backfill,
+        indexed: lexicon.indexed,
         token_cost: tokenCost ? Number(tokenCost) : null,
       });
       load();
@@ -182,6 +183,12 @@ export default function LexiconDetailPage() {
               <Label className="text-muted-foreground">Revision</Label>
               <p className="mt-1 tabular-nums">{lexicon.revision}</p>
             </div>
+            {lexicon.lexicon_type === "record" && (
+              <div>
+                <Label className="text-muted-foreground">Indexed</Label>
+                <p className="mt-1">{lexicon.indexed ? "Yes" : "No"}</p>
+              </div>
+            )}
             {lexicon.lexicon_type === "record" && (
               <div>
                 <Label className="text-muted-foreground">Backfill</Label>

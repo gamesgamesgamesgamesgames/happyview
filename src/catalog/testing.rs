@@ -12,6 +12,7 @@ pub(crate) async fn create_bare_lexicons_table(pool: &AnyPool) {
             revision INTEGER NOT NULL DEFAULT 1,
             lexicon_json TEXT NOT NULL,
             backfill INTEGER NOT NULL DEFAULT 1,
+            indexed INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )",
