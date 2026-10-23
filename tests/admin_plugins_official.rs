@@ -823,6 +823,55 @@ async fn reload_updates_to_the_channels_new_version() {
     assert_eq!(summary["update_available"], false);
 }
 
+/// An install or update names the version its preview showed. When the
+/// channel moved since, the request is refused with 409 and nothing changes;
+/// naming the version it now resolves to goes through.
+#[tokio::test]
+#[serial]
+async fn an_install_or_update_is_refused_when_the_channel_moved_after_its_preview() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+
+    let (status, body) = install_from_registry(
+        &app,
+        json!({ "did": OFFICIAL, "name": "lua", "expected_version": "0.9.0" }),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(row_of(&app, "lua").await.is_none());
+    assert!(app.state.plugin_registry.get("lua").await.is_none());
+
+    let (status, body) = install_from_registry(
+        &app,
+        json!({ "did": OFFICIAL, "name": "lua", "expected_version": "1.0.0" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "expected_version": "1.0.1" } }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "expected_version": "1.1.0" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.1.0");
+}
+
 /// Switching channel is a reload naming the new channel: it installs that
 /// channel's version and follows it from then on. Naming a version pins.
 #[tokio::test]

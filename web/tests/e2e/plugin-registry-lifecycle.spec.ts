@@ -170,11 +170,52 @@ test("the update dialog moves a registry install along its channel", async ({
 
   await expect
     .poll(() => reloaded)
-    .toEqual([{ registry: {}, accepted_capabilities: [UNRESTRICTED.name] }]);
+    .toEqual([
+      {
+        registry: { expected_version: "1.1.0" },
+        accepted_capabilities: [UNRESTRICTED.name],
+      },
+    ]);
   expect(JSON.stringify(previewed)).not.toContain("did:plc:stranger");
   expect(previewed).toContainEqual({
     registry: { did: OFFICIAL_DID, name: "lua", channel: "latest" },
   });
+});
+
+/**
+ * The update names the version its preview showed. When the channel moved
+ * in between, the server refuses with 409 and the dialog says so, leaving
+ * the installed version as it was.
+ */
+test("an update refused because the channel moved says so", async ({
+  page,
+}) => {
+  await serve(page, registryInstall(), []);
+  await page.route("**/admin/plugins/preview", (route) =>
+    route.fulfill({ json: previewOf("1.1.0") }),
+  );
+  const reloaded: unknown[] = [];
+  await page.route("**/admin/plugins/lua/reload", (route) => {
+    reloaded.push(route.request().postDataJSON());
+    return route.fulfill({
+      status: 409,
+      json: {
+        error:
+          "lua resolved to 1.2.0 where 1.1.0 was previewed; the channel moved, so preview it again",
+      },
+    });
+  });
+
+  await loginAsTestAdmin(page);
+  await page.goto("/dashboard/settings/plugins/lua");
+  await page.getByRole("button", { name: "Update", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Update to v1.1.0" }).click();
+
+  await expect(dialog.getByText("the channel moved")).toBeVisible();
+  expect(reloaded).toEqual([
+    { registry: { expected_version: "1.1.0" }, accepted_capabilities: [] },
+  ]);
 });
 
 /**
@@ -285,7 +326,12 @@ test("switch channel reloads the plugin onto the chosen channel", async ({
 
   await expect
     .poll(() => reloaded)
-    .toEqual([{ registry: { channel: "beta" }, accepted_capabilities: [] }]);
+    .toEqual([
+      {
+        registry: { channel: "beta", expected_version: "1.1.0-beta.1" },
+        accepted_capabilities: [],
+      },
+    ]);
   expect(previewed).toEqual([
     { registry: { did: OFFICIAL_DID, name: "lua", channel: "beta" } },
   ]);
@@ -461,7 +507,12 @@ test("the catalogue installs by project and channel", async ({ page }) => {
     .poll(() => added)
     .toEqual([
       {
-        registry: { did: OFFICIAL_DID, name: "lua", channel: "latest" },
+        registry: {
+          did: OFFICIAL_DID,
+          name: "lua",
+          channel: "latest",
+          expected_version: "1.0.0",
+        },
         accepted_capabilities: [],
       },
     ]);

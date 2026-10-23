@@ -28,6 +28,7 @@ import {
 } from "@/components/plugin-capabilities";
 import {
   previewPlugin,
+  previewedVersion,
   reloadPlugin,
   type ChannelEntry,
   type PluginPreview,
@@ -137,7 +138,7 @@ export function PluginChannelDialog({
     setError(null);
     try {
       const updated = await reloadPlugin(plugin.id, {
-        registry: { channel },
+        registry: { channel, expected_version: previewedVersion(preview) },
         // Everything the version declares, so the server refuses one that
         // would be granted more than this dialog showed.
         accepted_capabilities: visibleCapabilities(preview.capabilities).map(

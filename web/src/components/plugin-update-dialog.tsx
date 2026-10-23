@@ -18,6 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   previewPlugin,
+  previewedVersion,
   reloadPlugin,
   type PluginPreview,
   type PluginSummary,
@@ -138,8 +139,10 @@ export function PluginUpdateDialog({
     ).map((c) => c.name);
     try {
       // An empty selector keeps the channel the install follows.
+      // The previewed version is named, so a channel that moved since is
+      // refused rather than installing a version this dialog didn't show.
       const updated = await reloadPlugin(plugin.id, {
-        registry: {},
+        registry: { expected_version: previewedVersion(newManifestPreview) },
         accepted_capabilities,
       });
       if (plugin.latest_version) {

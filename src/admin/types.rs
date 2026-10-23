@@ -397,6 +397,11 @@ pub(super) struct RegistrySelector {
     pub(super) channel: Option<String>,
     #[serde(default)]
     pub(super) version: Option<String>,
+    /// The version the caller previewed. When the selector resolves to
+    /// another, the channel moved since, and the request is refused rather
+    /// than installing something nobody reviewed.
+    #[serde(default)]
+    pub(super) expected_version: Option<String>,
 }
 
 /// A registry project, and which of its versions.
@@ -409,6 +414,9 @@ pub(super) struct RegistryProjectRef {
     pub(super) channel: Option<String>,
     #[serde(default)]
     pub(super) version: Option<String>,
+    /// See [`RegistrySelector::expected_version`].
+    #[serde(default)]
+    pub(super) expected_version: Option<String>,
 }
 
 impl RegistryProjectRef {
@@ -416,6 +424,7 @@ impl RegistryProjectRef {
         RegistrySelector {
             channel: self.channel.clone(),
             version: self.version.clone(),
+            expected_version: self.expected_version.clone(),
         }
     }
 }

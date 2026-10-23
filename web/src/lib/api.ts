@@ -1245,12 +1245,25 @@ export interface RegistryProjectRef {
   name: string;
   channel?: string;
   version?: string;
+  /** The version a preview showed. The server refuses with 409 when the
+   * project now resolves to another, so nothing unreviewed is installed. */
+  expected_version?: string;
 }
 
 /** Another version of the project a registry install came from. Empty keeps
- * what it has: the channel it follows, or its pinned version. */
-export type RegistrySelector =
-  Record<string, never> | { channel: string } | { version: string };
+ * what it has: the channel it follows, or its pinned version.
+ * `expected_version` is as on {@link RegistryProjectRef}. */
+export type RegistrySelector = { expected_version?: string } & (
+  | { channel?: never; version?: never }
+  | { channel: string; version?: never }
+  | { version: string; channel?: never }
+);
+
+/** The version a registry preview resolved to, to send back as
+ * `expected_version`. */
+export function previewedVersion(preview: PluginPreview): string {
+  return preview.registry?.version ?? preview.version;
+}
 
 /** Where a plugin comes from: a manifest URL, or a registry project. A
  * registry plugin is checked against its CIDs, so it takes no `sha256`. */

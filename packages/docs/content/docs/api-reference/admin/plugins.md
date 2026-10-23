@@ -384,7 +384,7 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 | Field                    | Type       | Required | Description                                                                                        |
 | ------------------------ | ---------- | -------- | --------------------------------------------------------------------------------------------------- |
 | `url`                    | string     | one of   | URL to the plugin's `manifest.json`                                                                  |
-| `registry`               | object     | one of   | `{ did, name, channel? , version? }`: a registry project and the channel to follow (`latest` by default) or the version to pin. The install records the project, the channel, the version and the CIDs its files were checked against, and the project's DID as its publisher |
+| `registry`               | object     | one of   | `{ did, name, channel? , version?, expected_version? }`: a registry project and the channel to follow (`latest` by default) or the version to pin. `expected_version` is the version a preview showed: when the project now resolves to another, the install is refused with `409 Conflict`. The install records the project, the channel, the version and the CIDs its files were checked against, and the project's DID as its publisher |
 | `sha256`                 | string     | no       | Optional sha256 of the WASM binary, with `url` only. If provided, install fails when the downloaded hash mismatches |
 | `accepted_capabilities`  | string[]   | no       | Capability names the operator consents to grant (e.g. from a consent dialog built on `POST /admin/plugins/preview`'s `capabilities` report). When present, every capability the plugin would actually be granted must be covered, or the install is refused |
 
@@ -488,7 +488,7 @@ A plugin installed from the registry reloads from the registry. With no body it 
 { "registry": { "channel": "beta" } }
 ```
 
-`{ "registry": {} }` installs the current version of the channel it follows (or its pinned version again); `channel` switches to that channel's version and follows it from then on; `version` pins one version. The project is the one it was installed from, and its publisher must be the one the install recorded, or the reload is refused with `409 Conflict`. A version that may not be installed is refused with `400 Bad Request`, and the installed version keeps running. A registry plugin can't be reloaded from a `url`; remove it and add it from the URL instead. Adding a plugin from a URL over a registry plugin makes it a URL install, with no registry project.
+`{ "registry": {} }` installs the current version of the channel it follows (or its pinned version again); `channel` switches to that channel's version and follows it from then on; `version` pins one version. Add `expected_version`, the version a preview showed, and a channel that has since moved elsewhere is refused with `409 Conflict` instead of installing a version nobody reviewed. The project is the one it was installed from, and its publisher must be the one the install recorded, or the reload is refused with `409 Conflict`. A version that may not be installed is refused with `400 Bad Request`, and the installed version keeps running. A registry plugin can't be reloaded from a `url`; remove it and add it from the URL instead. Adding a plugin from a URL over a registry plugin makes it a URL install, with no registry project.
 
 The body is optional. To point the plugin at a new URL, pass:
 

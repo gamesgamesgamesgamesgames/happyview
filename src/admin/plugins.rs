@@ -682,6 +682,17 @@ async fn resolve_release(
             view.did, view.name
         )));
     }
+    // The caller reviewed one version; a channel that moved since names
+    // another, whose capabilities and notes nobody saw.
+    if let Some(expected) = &selector.expected_version
+        && expected != &view.version
+    {
+        return Err(AppError::Conflict(format!(
+            "{name} resolved to {} where {expected} was previewed; the channel moved, so \
+             preview it again",
+            view.version
+        )));
+    }
     if let Some(why) = not_installable_because(&view) {
         return Err(AppError::BadRequest(why));
     }
@@ -1112,6 +1123,7 @@ pub(super) async fn reload(
                     Some(channel) => RegistrySelector {
                         channel: Some(channel.clone()),
                         version: None,
+                        expected_version: selector.expected_version,
                     },
                     None => RegistrySelector {
                         channel: None,
@@ -1120,6 +1132,7 @@ pub(super) async fn reload(
                                 .map(|r| r.version)
                                 .unwrap_or_else(|| current.info.version.clone()),
                         ),
+                        expected_version: selector.expected_version,
                     },
                 },
                 _ => selector,
@@ -1972,6 +1985,7 @@ mod tests {
             check_selector(&RegistrySelector {
                 channel: channel.map(str::to_owned),
                 version: version.map(str::to_owned),
+                expected_version: None,
             })
             .is_ok()
         };

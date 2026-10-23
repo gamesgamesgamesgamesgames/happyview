@@ -9,6 +9,7 @@ import {
   addPlugin,
   getPlugins,
   previewPlugin,
+  previewedVersion,
   type PluginOrigin,
   type PluginPreview,
 } from "@/lib/api";
@@ -178,7 +179,13 @@ export default function CataloguePlugin() {
     try {
       await addPlugin(
         "registry" in origin
-          ? { registry: origin.registry, accepted_capabilities }
+          ? {
+              registry: {
+                ...origin.registry,
+                expected_version: previewedVersion(preview),
+              },
+              accepted_capabilities,
+            }
           : {
               url: preview.manifest_url,
               sha256: preview.sha256,
