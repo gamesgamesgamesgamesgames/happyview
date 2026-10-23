@@ -335,6 +335,7 @@ async fn an_unindexed_lexicon_declaring_a_backfill_starts_none() {
         .await
         .unwrap();
 
+    assert!(!app.state.lexicons.is_indexed("com.example.project.quiet"));
     assert!(
         happyview::project::boot::start_declared_backfills(&app.state)
             .await

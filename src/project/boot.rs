@@ -118,10 +118,11 @@ pub async fn shadow_warnings(state: &AppState) -> Vec<Diagnostic> {
 }
 
 /// Starts a backfill for each project record lexicon declaring
-/// `backfill = true` whose collection is indexed and has never had one. An upload backfills
-/// on a lexicon's first revision only; for a file, "first" is a collection
-/// the record source has never backfilled (`RecordSource::has_backfill`),
-/// which survives restarts because the source keeps that record.
+/// `backfill = true` whose collection is indexed and has never had one. An
+/// upload backfills on a lexicon's first revision only; for a file, "first" is
+/// a collection the record source has never backfilled
+/// (`RecordSource::has_backfill`), which survives restarts because the source
+/// keeps that record.
 pub async fn start_declared_backfills(state: &AppState) -> Vec<String> {
     let snapshot = state.project.load_full();
     let mut started = Vec::new();

@@ -705,4 +705,54 @@ mod tests {
                 .unwrap();
         assert_eq!(cid, reference.cid);
     }
+
+    /// An unindexed collection never sees a Jetstream echo, so the mirrored
+    /// row is the only copy a script's `db.get` can find. It must be stored,
+    /// and readable, even though `indexed_at` stays unset.
+    #[tokio::test]
+    async fn a_write_into_an_unindexed_collection_stays_readable() {
+        let harness = std::sync::Arc::new(crate::testing::TestHarness::new("a.test.lua"));
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(harness.clone());
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            json!({
+                "lexicon": 1,
+                "id": "app.test.quiet",
+                "defs": {"main": {"type": "record", "key": "tid"}},
+            }),
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        state.lexicons.upsert_unindexed(parsed).await;
+        assert!(!state.lexicons.is_indexed("app.test.quiet"));
+
+        let caller = CallerSession {
+            did: "did:plc:alice".into(),
+            delegate_did: None,
+            claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
+            pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
+            app_state: state.clone(),
+        };
+        let reference = create_record(
+            &caller,
+            serde_json::from_value(json!({
+                "collection": "app.test.quiet", "rkey": "1", "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let got = crate::plugin::host::records_get(&state.db, state.db_backend, &reference.uri)
+            .await
+            .unwrap()
+            .expect("the mirrored row is readable");
+        assert_eq!(got["cid"], reference.cid.as_str());
+        assert_eq!(got["record"]["text"], "hi");
+    }
 }
