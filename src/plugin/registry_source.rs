@@ -23,7 +23,10 @@ const VERSIONS_PER_PAGE: u32 = 100;
 const MAX_PAGES: usize = 300;
 
 /// The channel a project's current version is published on.
-const LATEST: &str = "latest";
+pub const LATEST: &str = "latest";
+
+/// The channels a registry offers, so a name outside them can never resolve.
+pub const TRACKS: [&str; 3] = [LATEST, "beta", "alpha"];
 
 /// Where to look for projects.
 #[derive(Debug, Clone)]
@@ -210,6 +213,31 @@ impl RegistrySource {
     }
 }
 
+/// The install a version describes: which project and version it is, and
+/// where this registry serves its manifest and module by the CIDs the
+/// version names. `channel` is the channel it was resolved through, `None`
+/// for a version named outright.
+pub fn registry_install_for(
+    source: &RegistrySource,
+    view: &VersionView,
+    channel: Option<String>,
+) -> super::RegistryInstall {
+    let manifest_blob_cid = view.artifact.manifest.cid().to_owned();
+    let package_cid = view.artifact.package.cid().to_owned();
+    super::RegistryInstall {
+        did: view.did.clone(),
+        name: view.name.clone(),
+        channel,
+        version: view.version.clone(),
+        version_uri: Some(view.uri.clone()).filter(|u| !u.is_empty()),
+        manifest_cid: Some(view.manifest.cid.clone()).filter(|c| !c.is_empty()),
+        manifest_url: source.artifact_url(&manifest_blob_cid),
+        manifest_blob_cid,
+        package_url: source.artifact_url(&package_cid),
+        package_cid,
+    }
+}
+
 /// The cursor to ask for next, or `None` to stop. A registry that answers
 /// the cursor it was given would otherwise be asked for the same page
 /// forever.
@@ -338,11 +366,14 @@ pub struct VersionView {
 }
 
 impl VersionView {
-    /// Whether this version may be installed: its lifecycle allows it and the
-    /// registry holds its bytes. One the registry has not copied yet, or has
-    /// lost at the source, has nothing to fetch.
+    /// Whether this version may be installed: its lifecycle allows it, the
+    /// registry holds its bytes, and it isn't suspect. One the registry has
+    /// not copied yet, or has lost at the source, has nothing to fetch. A
+    /// suspect one had its records changed after publication, which is what
+    /// a compromised publisher account looks like, so it is not offered even
+    /// though its bytes still match the CIDs it now names.
     pub fn installable(&self) -> bool {
-        self.lifecycle.installable && self.availability == "available"
+        self.lifecycle.installable && self.availability == "available" && !self.suspect
     }
 }
 
@@ -656,6 +687,8 @@ fn build_entry(
             published_at: v.indexed_at.clone(),
             body: v.changelog.as_ref().and_then(|c| c.markdown.clone()),
             state: v.lifecycle.state.clone(),
+            reason: v.lifecycle.reason.clone(),
+            suspect: v.suspect,
             installable: v.installable(),
             availability: v.availability.clone(),
             version_uri: v.uri.clone(),
@@ -1271,6 +1304,51 @@ mod tests {
         assert_eq!(
             src.artifact_url("bafkreiabc"),
             "https://reg.example/xrpc/at.happyproto.registry.getArtifact?cid=bafkreiabc"
+        );
+    }
+
+    /// A suspect version is never installable, whatever its lifecycle says:
+    /// its records changed after it was published.
+    #[test]
+    fn a_suspect_version_is_not_installable() {
+        let mut value = version(HP, "lua", "1.2.0", "active", true, "available");
+        let view: VersionView = serde_json::from_value(value.clone()).unwrap();
+        assert!(view.installable());
+        value["suspect"] = serde_json::json!(true);
+        let view: VersionView = serde_json::from_value(value).unwrap();
+        assert!(!view.installable());
+    }
+
+    /// An install names the version and the CIDs it is fetched by, served
+    /// from this registry.
+    #[test]
+    fn a_version_describes_its_install() {
+        let src = RegistrySource {
+            base_url: "https://reg.example".into(),
+            limit: 100,
+        };
+        let view: VersionView =
+            serde_json::from_value(version(HP, "lua", "1.2.0", "active", true, "available"))
+                .unwrap();
+        let install = registry_install_for(&src, &view, Some("beta".into()));
+        assert_eq!(install.did, HP);
+        assert_eq!(install.name, "lua");
+        assert_eq!(install.channel.as_deref(), Some("beta"));
+        assert_eq!(install.version, "1.2.0");
+        assert_eq!(
+            install.version_uri.as_deref(),
+            Some(version_uri(HP, "lua", "1.2.0").as_str())
+        );
+        assert_eq!(
+            install.manifest_cid.as_deref(),
+            Some("bafymanifestrecord1.2.0")
+        );
+        assert_eq!(install.package_cid, "bafkreipackage1.2.0");
+        assert_eq!(install.package_url, src.artifact_url("bafkreipackage1.2.0"));
+        assert_eq!(install.manifest_blob_cid, "bafkreimanifest1.2.0");
+        assert_eq!(
+            install.manifest_url,
+            src.artifact_url("bafkreimanifest1.2.0")
         );
     }
 

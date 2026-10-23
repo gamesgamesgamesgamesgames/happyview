@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
@@ -14,24 +14,26 @@ use crate::plugin::capabilities;
 use crate::plugin::encryption::{decrypt, encrypt};
 use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
-use crate::plugin::official_registry::{CatalogueEntry, ReleaseEntry};
-use crate::plugin::{LoadedPlugin, PluginType};
+use crate::plugin::official_registry::{CatalogueEntry, OFFICIAL_PUBLISHER_DID, ReleaseEntry};
+use crate::plugin::registry_source::{LATEST, RegistrySource, TRACKS, VersionView};
+use crate::plugin::{LoadedPlugin, PluginSource, PluginType, RegistryInstall};
 
 /// If the reload request provides a new URL, use it and clear the old sha256
 /// (the new version has its own hash). Otherwise keep the stored values.
 fn resolve_reload_url(
     current: (String, Option<String>),
-    body: Option<super::types::ReloadPluginBody>,
+    new_url: Option<String>,
 ) -> (String, Option<String>) {
-    match body {
-        Some(b) if b.url.is_some() => (b.url.unwrap(), None),
-        _ => current,
+    match new_url {
+        Some(url) => (url, None),
+        None => current,
     }
 }
 
 /// Whose updates an installed plugin may be offered (see `official_registry`).
 enum InstalledPublisher {
-    /// The publisher of the catalogue entry it was installed from.
+    /// The publisher of the catalogue entry or registry project it was
+    /// installed from.
     Recorded(String),
     /// Installed from a URL the catalogue did not offer, or before the
     /// publisher was recorded. Nothing ties it to a publisher, so only the
@@ -47,55 +49,107 @@ impl InstalledPublisher {
         }
     }
 
-    fn may_be_updated_by(&self, entry: &CatalogueEntry) -> bool {
-        let publisher = crate::plugin::official_registry::effective_publisher(entry);
+    /// Whether a release by `publisher` may replace this install.
+    fn accepts(&self, publisher: Option<&str>) -> bool {
         match self {
             Self::Recorded(did) => publisher == Some(did.as_str()),
-            Self::Unrecorded => {
-                publisher == Some(crate::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
-            }
+            Self::Unrecorded => publisher == Some(OFFICIAL_PUBLISHER_DID),
+        }
+    }
+
+    fn may_be_updated_by(&self, entry: &CatalogueEntry) -> bool {
+        self.accepts(crate::plugin::official_registry::effective_publisher(entry))
+    }
+}
+
+/// What a plugin's row says about where it came from.
+#[derive(Debug, Default, Clone)]
+struct InstalledRow {
+    publisher_did: Option<String>,
+    registry_did: Option<String>,
+    registry_name: Option<String>,
+    registry_channel: Option<String>,
+    version_uri: Option<String>,
+    unresolved: bool,
+}
+
+impl InstalledRow {
+    /// The registry project this plugin belongs to, when it has one.
+    fn project(&self) -> Option<(&str, &str)> {
+        Some((
+            self.registry_did.as_deref()?,
+            self.registry_name.as_deref()?,
+        ))
+    }
+
+    /// The channel an update follows. A plugin with no registry project is
+    /// judged against `latest`, the channel its catalogue entry advertises;
+    /// one pinned to a version follows none.
+    fn followed_channel(&self) -> Option<&str> {
+        match self.project() {
+            Some(_) => self.registry_channel.as_deref(),
+            None => Some(LATEST),
         }
     }
 }
 
-/// The publisher each installed plugin recorded, by id; ids that recorded
-/// none are absent.
-async fn recorded_publishers(state: &AppState) -> Result<HashMap<String, String>, AppError> {
-    let sql = adapt_sql(
-        "SELECT id, publisher_did FROM happyview_plugins WHERE publisher_did IS NOT NULL",
-        state.db_backend,
-    );
-    let rows: Vec<(String, String)> = crate::db::query_as(&sql)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to read plugin publishers: {e}")))?;
-    Ok(rows.into_iter().collect())
+type InstalledRowTuple = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
+const INSTALLED_ROW_SELECT: &str = "SELECT id, publisher_did, registry_did, registry_name,
+        registry_channel, version_uri, CAST(registry_unresolved AS BIGINT)
+     FROM happyview_plugins";
+
+fn installed_row_from(row: InstalledRowTuple) -> (String, InstalledRow) {
+    (
+        row.0,
+        InstalledRow {
+            publisher_did: row.1,
+            registry_did: row.2,
+            registry_name: row.3,
+            registry_channel: row.4,
+            version_uri: row.5,
+            unresolved: row.6 != 0,
+        },
+    )
 }
 
-/// The publisher one installed plugin recorded, if any.
-async fn recorded_publisher(state: &AppState, plugin_id: &str) -> Result<Option<String>, AppError> {
+/// Every plugin row, by id. A plugin registered without a row (file plugins
+/// on an instance that doesn't persist them) is absent.
+async fn installed_rows(state: &AppState) -> Result<HashMap<String, InstalledRow>, AppError> {
+    let sql = adapt_sql(INSTALLED_ROW_SELECT, state.db_backend);
+    let rows: Vec<InstalledRowTuple> = crate::db::query_as(&sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read plugin rows: {e}")))?;
+    Ok(rows.into_iter().map(installed_row_from).collect())
+}
+
+async fn installed_row(state: &AppState, plugin_id: &str) -> Result<InstalledRow, AppError> {
     let sql = adapt_sql(
-        "SELECT publisher_did FROM happyview_plugins WHERE id = ?",
+        &format!("{INSTALLED_ROW_SELECT} WHERE id = ?"),
         state.db_backend,
     );
-    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+    let row: Option<InstalledRowTuple> = crate::db::query_as(&sql)
         .bind(plugin_id)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to read plugin publisher: {e}")))?;
-    Ok(row.and_then(|(publisher,)| publisher))
+        .map_err(|e| AppError::Internal(format!("Failed to read plugin row: {e}")))?;
+    Ok(row.map(|r| installed_row_from(r).1).unwrap_or_default())
 }
 
-/// Record the publisher of the catalogue entry this plugin was installed
-/// from, or clear it when the entry under its id does not offer `url`.
-/// Derived here, never taken from the request, so a caller cannot claim an
-/// install is someone else's.
-async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
-    let publisher = crate::plugin::official_registry::publisher_for_install(
-        &*state.official_registry.read().await,
-        plugin_id,
-        url,
-    );
+async fn set_publisher(
+    state: &AppState,
+    plugin_id: &str,
+    publisher: Option<&str>,
+) -> Result<(), AppError> {
     let sql = adapt_sql(
         "UPDATE happyview_plugins SET publisher_did = ? WHERE id = ?",
         state.db_backend,
@@ -109,58 +163,160 @@ async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Resul
     Ok(())
 }
 
+/// Record the publisher of the catalogue entry this plugin was installed
+/// from, or clear it when the entry under its id does not offer `url`.
+/// Derived here, never taken from the request, so a caller cannot claim an
+/// install is someone else's.
+async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
+    let publisher = crate::plugin::official_registry::publisher_for_install(
+        &*state.official_registry.read().await,
+        plugin_id,
+        url,
+    );
+    set_publisher(state, plugin_id, publisher.as_deref()).await
+}
+
+/// A plugin installed from a plain URL is no registry project's, whatever
+/// it was before: keeping the old project would offer it that project's
+/// updates and reload it through the registry.
+async fn forget_registry_project(state: &AppState, plugin_id: &str) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_plugins SET registry_did = NULL, registry_name = NULL,
+             registry_channel = NULL, version_uri = NULL, registry_unresolved = 0
+         WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::query(&sql)
+        .bind(plugin_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to clear the plugin's project: {e}")))?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
 struct UpdateInfo {
     update_available: bool,
     latest_version: Option<String>,
+    latest_version_installable: Option<bool>,
+    latest_state: Option<String>,
     pending_releases: Vec<ReleaseEntry>,
-    /// The approved entry's manifest, so an update installs the entry the
-    /// gate passed rather than whatever the catalogue holds by the time it
-    /// is applied.
-    latest_manifest_url: Option<String>,
 }
 
+/// Whether `version` was published on `channel`'s track: `latest` carries
+/// releases, and a prerelease channel carries its own prereleases, named
+/// after it (`1.2.0-beta.1` on `beta`).
+fn on_track(channel: &str, version: &semver::Version) -> bool {
+    if channel == LATEST {
+        version.pre.is_empty()
+    } else {
+        version.pre.as_str().split('.').next() == Some(channel)
+    }
+}
+
+/// What the catalogue offers an installed plugin. `followed` is the channel
+/// it follows, `None` when pinned: a pinned plugin is shown where `latest`
+/// stands but offered nothing. An update is offered when the channel points
+/// at a version other than the installed one that may be installed.
 fn compute_update_info(
     installed_version: &str,
     installed: &InstalledPublisher,
+    followed: Option<&str>,
     cache_entry: Option<&CatalogueEntry>,
 ) -> UpdateInfo {
     let Some(entry) = cache_entry.filter(|e| installed.may_be_updated_by(e)) else {
-        return UpdateInfo {
-            update_available: false,
-            latest_version: None,
-            pending_releases: Vec::new(),
-            latest_manifest_url: None,
-        };
+        return UpdateInfo::default();
     };
+    let channel = followed.unwrap_or(LATEST);
+    let Some(head) = entry.channels.get(channel) else {
+        return UpdateInfo::default();
+    };
+    // The channel carries only its version's state; the release also knows
+    // whether the registry flagged it suspect.
+    let release = entry.releases.iter().find(|r| r.version == head.version);
+    let installable = head.installable && release.is_none_or(|r| r.installable);
+    let state = release.map_or_else(|| head.state.clone(), |r| r.state.clone());
 
-    let installed = match semver::Version::parse(installed_version) {
-        Ok(v) => v,
-        Err(_) => {
-            return UpdateInfo {
-                update_available: false,
-                latest_version: entry.latest_version.clone(),
-                pending_releases: Vec::new(),
-                latest_manifest_url: Some(entry.manifest_url.clone()),
-            };
+    let pending_releases = match (followed, semver::Version::parse(installed_version)) {
+        (Some(channel), Ok(installed)) => {
+            let head_version = semver::Version::parse(&head.version).ok();
+            entry
+                .releases
+                .iter()
+                .filter(|r| r.installable)
+                .filter(|r| {
+                    semver::Version::parse(&r.version).is_ok_and(|v| {
+                        v > installed
+                            && on_track(channel, &v)
+                            && head_version.as_ref().is_none_or(|head| &v <= head)
+                    })
+                })
+                .cloned()
+                .collect()
         }
+        _ => Vec::new(),
     };
-
-    let pending: Vec<ReleaseEntry> = entry
-        .releases
-        .iter()
-        .filter(|r| {
-            semver::Version::parse(&r.version)
-                .map(|v| v > installed)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
 
     UpdateInfo {
-        update_available: !pending.is_empty(),
-        latest_version: entry.latest_version.clone(),
-        pending_releases: pending,
-        latest_manifest_url: Some(entry.manifest_url.clone()),
+        update_available: followed.is_some() && installable && head.version != installed_version,
+        latest_version: Some(head.version.clone()),
+        latest_version_installable: Some(installable),
+        latest_state: Some(state),
+        pending_releases,
+    }
+}
+
+/// Where an installed plugin stands in the registry, from its row and the
+/// catalogue entry for its project. `None` for a plugin with no project
+/// that was never flagged unresolved.
+fn registry_status(
+    row: &InstalledRow,
+    installed_version: &str,
+    entry: Option<&CatalogueEntry>,
+) -> Option<super::types::PluginRegistryStatus> {
+    if row.project().is_none() && !row.unresolved {
+        return None;
+    }
+    // The catalogue holds one project per name; only the one this plugin
+    // was installed from speaks for it.
+    let entry = entry.filter(|e| {
+        row.project()
+            .is_some_and(|(did, name)| e.publisher_did.as_deref() == Some(did) && e.id == name)
+    });
+    let installed = entry.and_then(|e| {
+        e.releases
+            .iter()
+            .find(|r| row.version_uri.as_deref() == Some(r.version_uri.as_str()))
+            .or_else(|| e.releases.iter().find(|r| r.version == installed_version))
+    });
+    let channel_state = entry.and_then(|e| {
+        let head = e.channels.get(row.registry_channel.as_deref()?)?;
+        let release = e.releases.iter().find(|r| r.version == head.version);
+        Some(release.map_or_else(|| head.state.clone(), |r| r.state.clone()))
+    });
+    Some(super::types::PluginRegistryStatus {
+        did: row.registry_did.clone(),
+        name: row.registry_name.clone(),
+        channel: row.registry_channel.clone(),
+        version_uri: row.version_uri.clone(),
+        installed_state: installed.map(|r| r.state.clone()),
+        installed_reason: installed.and_then(|r| r.reason.clone()),
+        channel_state,
+        unresolved: row.unresolved,
+    })
+}
+
+/// The catalogue entry that speaks for an installed plugin: the one under
+/// its id, and for a registry install only when it is that project's.
+fn entry_for<'a>(
+    row: &InstalledRow,
+    plugin_id: &str,
+    catalogue: &'a HashMap<String, CatalogueEntry>,
+) -> Option<&'a CatalogueEntry> {
+    let entry = catalogue.get(plugin_id)?;
+    match row.project() {
+        Some((did, _)) if entry.publisher_did.as_deref() != Some(did) => None,
+        _ => Some(entry),
     }
 }
 
@@ -168,8 +324,8 @@ use super::auth::UserAuth;
 use super::permissions::Permission;
 use super::types::{
     AddPluginBody, ListPluginsQuery, PluginAllowedHostsResponse, PluginPreviewResponse,
-    PluginSecretsResponse, PluginSummary, PluginsListResponse, PreviewPluginBody,
-    RemovePluginQuery, UpdatePluginAllowedHostsBody, UpdatePluginSecretsBody,
+    PluginSecretsResponse, PluginSummary, PluginsListResponse, PreviewPluginBody, PreviewRegistry,
+    RegistrySelector, RemovePluginQuery, UpdatePluginAllowedHostsBody, UpdatePluginSecretsBody,
 };
 
 /// The type/namespace/dependency/host/capability fields shared by every
@@ -213,6 +369,126 @@ fn capability_fields(p: &LoadedPlugin) -> CapabilityFields {
     }
 }
 
+fn required_secrets(p: &LoadedPlugin) -> Vec<super::types::SecretDefinition> {
+    match &p.manifest {
+        Some(manifest) => manifest
+            .required_secrets
+            .iter()
+            .map(|s| super::types::SecretDefinition {
+                key: s.key.clone(),
+                name: s.name.clone(),
+                description: s.description.clone(),
+            })
+            .collect(),
+        // No manifest (the loader always attaches one; this only covers a
+        // plugin registered directly, bypassing it) - fall back to minimal
+        // definitions from the keys.
+        None => p
+            .info
+            .required_secrets
+            .iter()
+            .map(|key| super::types::SecretDefinition {
+                key: key.clone(),
+                name: key.clone(),
+                description: None,
+            })
+            .collect(),
+    }
+}
+
+/// Whether a plugin's secrets are configured: it needs none, or has a
+/// config row.
+async fn secrets_configured(state: &AppState, p: &LoadedPlugin) -> bool {
+    if required_secrets(p).is_empty() {
+        return true;
+    }
+    let sql = adapt_sql(
+        "SELECT 1 FROM happyview_plugin_configs WHERE plugin_id = ?",
+        state.db_backend,
+    );
+    crate::db::query_scalar::<i32>(&sql)
+        .bind(&p.info.id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// A plugin's summary, judged against `entry`, the catalogue entry under its
+/// id (or a fresher read of it).
+fn summarize(
+    p: &LoadedPlugin,
+    row: &InstalledRow,
+    entry: Option<&CatalogueEntry>,
+    secrets_configured: bool,
+    loaded_at: Option<String>,
+) -> PluginSummary {
+    let (source, url, sha256) = match &p.source {
+        PluginSource::File { path } => ("file".to_string(), Some(path.display().to_string()), None),
+        PluginSource::Url { url, sha256, .. } => {
+            ("url".to_string(), Some(url.clone()), sha256.clone())
+        }
+    };
+    let entry = entry.filter(|e| match row.project() {
+        Some((did, _)) => e.publisher_did.as_deref() == Some(did),
+        None => true,
+    });
+    let update = compute_update_info(
+        &p.info.version,
+        &InstalledPublisher::of(row.publisher_did.clone()),
+        row.followed_channel(),
+        entry,
+    );
+    let cap_fields = capability_fields(p);
+    let pres = presentation_fields(p);
+    PluginSummary {
+        id: p.info.id.clone(),
+        name: p.info.name.clone(),
+        version: p.info.version.clone(),
+        description: pres.description,
+        icon_url: pres.icon_url,
+        banner_url: pres.banner_url,
+        source,
+        url,
+        sha256,
+        enabled: true, // Currently all loaded plugins are enabled
+        auth_type: p.info.auth_type.clone(),
+        required_secrets: required_secrets(p),
+        secrets_configured,
+        loaded_at,
+        update_available: update.update_available,
+        latest_version: update.latest_version,
+        pending_releases: update.pending_releases,
+        latest_version_installable: update.latest_version_installable,
+        latest_state: update.latest_state,
+        registry: registry_status(row, &p.info.version, entry),
+        plugin_type: cap_fields.plugin_type,
+        namespace: cap_fields.namespace,
+        dependencies: cap_fields.dependencies,
+        allowed_hosts: cap_fields.allowed_hosts,
+        capabilities: cap_fields.capabilities,
+    }
+}
+
+/// `summarize`, reading the plugin's row and the cached catalogue entry.
+async fn summary_of(
+    state: &AppState,
+    p: &LoadedPlugin,
+    loaded_at: Option<String>,
+) -> Result<PluginSummary, AppError> {
+    let row = installed_row(state, &p.info.id).await?;
+    let configured = secrets_configured(state, p).await;
+    let guard = state.official_registry.read().await;
+    Ok(summarize(
+        p,
+        &row,
+        entry_for(&row, &p.info.id, &guard.plugins),
+        configured,
+        loaded_at,
+    ))
+}
+
 /// GET /admin/plugins - list all loaded plugins, optionally filtered by
 /// `?type=library|interpreter|auth`.
 pub(super) async fn list(
@@ -231,7 +507,7 @@ pub(super) async fn list(
     };
 
     // Query which plugins have secrets configured
-    let configured_plugins: std::collections::HashSet<String> = {
+    let configured_plugins: HashSet<String> = {
         let sql = adapt_sql(
             "SELECT plugin_id FROM happyview_plugin_configs WHERE config IS NOT NULL",
             state.db_backend,
@@ -244,85 +520,22 @@ pub(super) async fn list(
             .collect()
     };
 
-    let publishers = recorded_publishers(&state).await?;
+    let rows = installed_rows(&state).await?;
     let official_guard = state.official_registry.read().await;
 
     let summaries: Vec<PluginSummary> = plugins
         .into_iter()
         .map(|p| {
-            let (source, url, sha256) = match &p.source {
-                crate::plugin::PluginSource::File { path } => {
-                    ("file".to_string(), Some(path.display().to_string()), None)
-                }
-                crate::plugin::PluginSource::Url { url, sha256, .. } => {
-                    ("url".to_string(), Some(url.clone()), sha256.clone())
-                }
-            };
-
-            // Use manifest for rich secret metadata if available, otherwise fallback to basic keys
-            let required_secrets: Vec<super::types::SecretDefinition> =
-                if let Some(manifest) = &p.manifest {
-                    manifest
-                        .required_secrets
-                        .iter()
-                        .map(|s| super::types::SecretDefinition {
-                            key: s.key.clone(),
-                            name: s.name.clone(),
-                            description: s.description.clone(),
-                        })
-                        .collect()
-                } else {
-                    // No manifest (the loader always attaches one; this only
-                    // covers a plugin registered directly, bypassing it) -
-                    // fall back to minimal SecretDefinitions from the keys.
-                    p.info
-                        .required_secrets
-                        .iter()
-                        .map(|key| super::types::SecretDefinition {
-                            key: key.clone(),
-                            name: key.clone(), // No richer name available
-                            description: None,
-                        })
-                        .collect()
-                };
-
-            // Plugin is configured if it has no required secrets OR has a config entry
-            let secrets_configured =
-                required_secrets.is_empty() || configured_plugins.contains(&p.info.id);
-
-            let update_info = compute_update_info(
-                &p.info.version,
-                &InstalledPublisher::of(publishers.get(&p.info.id).cloned()),
-                official_guard.plugins.get(&p.info.id),
-            );
-            let cap_fields = capability_fields(&p);
-            let pres = presentation_fields(&p);
-
-            PluginSummary {
-                id: p.info.id.clone(),
-                name: p.info.name.clone(),
-                version: p.info.version.clone(),
-                description: pres.description,
-                icon_url: pres.icon_url,
-                banner_url: pres.banner_url,
-                source,
-                url,
-                sha256,
-                enabled: true, // Currently all loaded plugins are enabled
-                auth_type: p.info.auth_type.clone(),
-                required_secrets,
-                secrets_configured,
-                loaded_at: None, // Would need to track this in registry
-                update_available: update_info.update_available,
-                latest_version: update_info.latest_version,
-                pending_releases: update_info.pending_releases,
-                latest_manifest_url: update_info.latest_manifest_url,
-                plugin_type: cap_fields.plugin_type,
-                namespace: cap_fields.namespace,
-                dependencies: cap_fields.dependencies,
-                allowed_hosts: cap_fields.allowed_hosts,
-                capabilities: cap_fields.capabilities,
-            }
+            let row = rows.get(&p.info.id).cloned().unwrap_or_default();
+            let configured =
+                required_secrets(&p).is_empty() || configured_plugins.contains(&p.info.id);
+            summarize(
+                &p,
+                &row,
+                entry_for(&row, &p.info.id, &official_guard.plugins),
+                configured,
+                None, // Would need to track this in registry
+            )
         })
         .collect();
 
@@ -332,7 +545,169 @@ pub(super) async fn list(
     }))
 }
 
-/// POST /admin/plugins/preview - preview a plugin from URL (fetches manifest only)
+// ---------------------------------------------------------------------------
+// Installing from the registry.
+// ---------------------------------------------------------------------------
+
+/// The registry installs resolve against: the one the catalogue reads.
+fn registry_source(state: &AppState) -> Result<&RegistrySource, AppError> {
+    let config = &state.official_registry_config;
+    match &config.registry {
+        Some(source) if !config.disabled => Ok(source),
+        _ => Err(AppError::BadRequest(
+            "the plugin registry is turned off (PLUGIN_REGISTRY_URL=off)".into(),
+        )),
+    }
+}
+
+fn check_selector(selector: &RegistrySelector) -> Result<(), AppError> {
+    match (&selector.channel, &selector.version) {
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "name a channel or a version, not both".into(),
+        )),
+        (Some(channel), None) if !TRACKS.contains(&channel.as_str()) => Err(AppError::BadRequest(
+            format!("channel '{channel}' must be one of {}", TRACKS.join(", ")),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Why a version may not be installed, or `None` when it may. Says what an
+/// operator would act on: the publisher's state and reason, the registry
+/// not holding the files, or the version being suspect.
+fn not_installable_because(view: &VersionView) -> Option<String> {
+    if view.installable() {
+        return None;
+    }
+    let mut why = Vec::new();
+    if !view.lifecycle.installable {
+        why.push(match &view.lifecycle.reason {
+            Some(reason) => format!("its publisher marked it {}: {reason}", view.lifecycle.state),
+            None => format!("its publisher marked it {}", view.lifecycle.state),
+        });
+    }
+    if view.availability != "available" {
+        why.push(format!(
+            "the registry doesn't hold its files ({})",
+            view.availability
+        ));
+    }
+    if view.suspect {
+        why.push(
+            "the registry flagged it as suspect because its records changed after it was published"
+                .into(),
+        );
+    }
+    Some(format!(
+        "{} {} can't be installed: {}",
+        view.name,
+        view.version,
+        why.join("; ")
+    ))
+}
+
+/// A registry version, resolved, with its artifacts fetched and checked
+/// against their CIDs.
+struct ResolvedRelease {
+    view: VersionView,
+    channel: Option<String>,
+    preview: loader::PluginPreview,
+}
+
+/// Resolve `did`'s project `name` at `version`, or else at `channel`'s
+/// current version (`latest` by default), refusing a version that may not be
+/// installed, and fetch and verify its artifacts. Nothing is installed.
+async fn resolve_release(
+    state: &AppState,
+    did: &str,
+    name: &str,
+    selector: &RegistrySelector,
+) -> Result<ResolvedRelease, AppError> {
+    check_selector(selector)?;
+    let source = registry_source(state)?;
+    let unreadable = |e| AppError::BadGateway(format!("the registry could not be read: {e}"));
+    let (view, channel) = match &selector.version {
+        Some(version) => (
+            source
+                .get_version(&state.http, did, name, version)
+                .await
+                .map_err(unreadable)?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "{did} has published no version {version} of {name}"
+                    ))
+                })?,
+            None,
+        ),
+        None => {
+            let channel = selector.channel.as_deref().unwrap_or(LATEST);
+            (
+                source
+                    .resolve_channel(&state.http, did, name, channel)
+                    .await
+                    .map_err(unreadable)?
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!(
+                            "{did} has published no {name} on the {channel} channel"
+                        ))
+                    })?,
+                Some(channel.to_string()),
+            )
+        }
+    };
+    // The publisher recorded for the install is the registry's answer, so it
+    // must be the project that was asked for.
+    if view.did != did || view.name != name {
+        return Err(AppError::BadGateway(format!(
+            "the registry answered for {}'s {} when asked for {did}'s {name}",
+            view.did, view.name
+        )));
+    }
+    if let Some(why) = not_installable_because(&view) {
+        return Err(AppError::BadRequest(why));
+    }
+
+    let install =
+        crate::plugin::registry_source::registry_install_for(source, &view, channel.clone());
+    let preview = loader::fetch_registry_artifacts(&state.http, &install)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Failed to fetch the plugin: {e}")))?;
+    // The project name is the plugin's id; a manifest naming another plugin
+    // would install under an id the project doesn't own.
+    if preview.manifest.id != name {
+        return Err(AppError::BadRequest(format!(
+            "{name} {}'s manifest names the plugin '{}', not '{name}'",
+            view.version, preview.manifest.id
+        )));
+    }
+    Ok(ResolvedRelease {
+        view,
+        channel,
+        preview,
+    })
+}
+
+/// A URL or a registry project, exactly one.
+enum Origin<'a> {
+    Url(&'a str),
+    Registry(&'a super::types::RegistryProjectRef),
+}
+
+fn origin<'a>(
+    url: &'a Option<String>,
+    registry: &'a Option<super::types::RegistryProjectRef>,
+) -> Result<Origin<'a>, AppError> {
+    match (url, registry) {
+        (Some(url), None) => Ok(Origin::Url(url)),
+        (None, Some(project)) => Ok(Origin::Registry(project)),
+        _ => Err(AppError::BadRequest(
+            "name a plugin by its url or by its registry project, one of the two".into(),
+        )),
+    }
+}
+
+/// POST /admin/plugins/preview - preview a plugin from a URL or a registry
+/// project, fetching and checking everything an install would.
 pub(super) async fn preview(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -340,9 +715,27 @@ pub(super) async fn preview(
 ) -> Result<Json<PluginPreviewResponse>, AppError> {
     auth.require(Permission::PluginsCreate).await?;
 
-    let preview = loader::fetch_manifest(&state.http, &body.url)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
+    let (preview, registry) = match origin(&body.url, &body.registry)? {
+        Origin::Url(url) => (
+            loader::fetch_manifest(&state.http, url)
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?,
+            None,
+        ),
+        Origin::Registry(project) => {
+            let resolved =
+                resolve_release(&state, &project.did, &project.name, &project.selector()).await?;
+            let registry = PreviewRegistry {
+                did: resolved.view.did.clone(),
+                name: resolved.view.name.clone(),
+                channel: resolved.channel.clone(),
+                version: resolved.view.version.clone(),
+                version_uri: resolved.view.uri.clone(),
+                state: resolved.view.lifecycle.state.clone(),
+            };
+            (resolved.preview, Some(registry))
+        }
+    };
 
     // Download the WASM too, so the capability report and sha256 reflect
     // what would actually be installed. A `CapabilityMismatch` or
@@ -382,6 +775,7 @@ pub(super) async fn preview(
         allowed_hosts: cap_fields.allowed_hosts,
         capabilities: cap_fields.capabilities,
         sha256,
+        registry,
     }))
 }
 
@@ -415,7 +809,24 @@ fn check_capability_consent(
     Ok(Some(names))
 }
 
-/// POST /admin/plugins - add a new plugin from URL
+/// The registry release a loaded plugin was fetched from, if it was.
+fn registry_install_of(p: &LoadedPlugin) -> Option<&RegistryInstall> {
+    match &p.source {
+        PluginSource::Url { registry, .. } => registry.as_deref(),
+        PluginSource::File { .. } => None,
+    }
+}
+
+fn registry_detail(install: &RegistryInstall) -> serde_json::Value {
+    serde_json::json!({
+        "did": install.did,
+        "name": install.name,
+        "channel": install.channel,
+        "version": install.version,
+    })
+}
+
+/// POST /admin/plugins - add a plugin from a URL or a registry project
 pub(super) async fn add(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -423,76 +834,37 @@ pub(super) async fn add(
 ) -> Result<Json<PluginSummary>, AppError> {
     auth.require(Permission::PluginsCreate).await?;
 
-    // Load plugin via manifest (required)
-    let preview = loader::fetch_manifest(&state.http, &body.url)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
-
-    let plugin = loader::load_from_manifest(&state.http, &preview, body.sha256.as_deref())
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
+    let origin = origin(&body.url, &body.registry)?;
+    let (plugin, mut detail) = match origin {
+        Origin::Url(url) => {
+            let preview = loader::fetch_manifest(&state.http, url)
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
+            let plugin = loader::load_from_manifest(&state.http, &preview, body.sha256.as_deref())
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
+            (plugin, serde_json::json!({ "url": url }))
+        }
+        Origin::Registry(project) => {
+            let resolved =
+                resolve_release(&state, &project.did, &project.name, &project.selector()).await?;
+            let plugin = loader::load_from_manifest(&state.http, &resolved.preview, None)
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
+            let detail = match &resolved.preview.registry {
+                Some(install) => serde_json::json!({ "registry": registry_detail(install) }),
+                None => serde_json::json!({}),
+            };
+            (plugin, detail)
+        }
+    };
 
     // If the caller told us which capabilities they consent to, every
     // capability the plugin would actually be granted must be covered.
     let consented_capabilities = check_capability_consent(&plugin, &body.accepted_capabilities)?;
 
-    // Use manifest for rich secret metadata if available
-    let required_secrets: Vec<super::types::SecretDefinition> =
-        if let Some(manifest) = &plugin.manifest {
-            manifest
-                .required_secrets
-                .iter()
-                .map(|s| super::types::SecretDefinition {
-                    key: s.key.clone(),
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                })
-                .collect()
-        } else {
-            plugin
-                .info
-                .required_secrets
-                .iter()
-                .map(|key| super::types::SecretDefinition {
-                    key: key.clone(),
-                    name: key.clone(),
-                    description: None,
-                })
-                .collect()
-        };
-
-    // Newly added plugins are not configured (unless they have no required secrets)
-    let secrets_configured = required_secrets.is_empty();
-    let cap_fields = capability_fields(&plugin);
-    let pres = presentation_fields(&plugin);
-
-    let summary = PluginSummary {
-        id: plugin.info.id.clone(),
-        name: plugin.info.name.clone(),
-        version: plugin.info.version.clone(),
-        description: pres.description,
-        icon_url: pres.icon_url,
-        banner_url: pres.banner_url,
-        source: "url".to_string(),
-        url: Some(body.url.clone()),
-        sha256: body.sha256.clone(),
-        enabled: true,
-        auth_type: plugin.info.auth_type.clone(),
-        required_secrets,
-        secrets_configured,
-        loaded_at: Some(now_rfc3339()),
-        update_available: false,
-        latest_version: None,
-        pending_releases: Vec::new(),
-        latest_manifest_url: None,
-        plugin_type: cap_fields.plugin_type,
-        namespace: cap_fields.namespace,
-        dependencies: cap_fields.dependencies,
-        allowed_hosts: cap_fields.allowed_hosts,
-        capabilities: cap_fields.capabilities,
-    };
-
     let plugin_id = plugin.info.id.clone();
+    let registry_publisher = registry_install_of(&plugin).map(|r| r.did.clone());
 
     // Validate against the dependency graph and register (this also
     // persists to DB).
@@ -501,14 +873,39 @@ pub(super) async fn add(
         .install(plugin)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
-    // The plugin is installed whatever happens here. A row left without a
-    // publisher is judged by its URL instead, which is weaker but not open,
-    // so a failed write is not worth failing the install over.
-    if let Err(e) = record_publisher(&state, &plugin_id, &body.url).await {
-        tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
+
+    match origin {
+        Origin::Url(url) => {
+            if let Err(e) = forget_registry_project(&state, &plugin_id).await {
+                tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed from a url still names its registry project");
+            }
+            // The plugin is installed whatever happens here. A row left
+            // without a publisher is judged by its URL instead, which is
+            // weaker but not open, so a failed write is not worth failing
+            // the install over.
+            if let Err(e) = record_publisher(&state, &plugin_id, url).await {
+                tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
+            }
+        }
+        Origin::Registry(_) => {
+            // The registry's answer, checked against the request in
+            // `resolve_release`, is whose project this is.
+            if let Err(e) = set_publisher(&state, &plugin_id, registry_publisher.as_deref()).await {
+                tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
+            }
+        }
     }
 
-    let mut detail = serde_json::json!({ "url": body.url });
+    let installed =
+        state.plugin_registry.get(&plugin_id).await.ok_or_else(|| {
+            AppError::Internal(format!("'{plugin_id}' vanished as it was installed"))
+        })?;
+    let mut summary = summary_of(&state, &installed, Some(now_rfc3339())).await?;
+    if let Origin::Url(url) = origin {
+        summary.url = Some(url.to_string());
+        summary.sha256 = body.sha256.clone();
+    }
+
     if let Some(caps) = consented_capabilities {
         detail["capabilities"] = serde_json::json!(caps);
     }
@@ -602,7 +999,10 @@ pub(super) async fn remove(
     }
 }
 
-/// POST /admin/plugins/{id}/reload - reload a plugin from its source
+/// POST /admin/plugins/{id}/reload - reload a plugin from its source. A
+/// registry plugin reloads from the registry: by default the version it has,
+/// fetched again by CID; with `registry`, its channel's current version,
+/// another channel's, or a pinned version.
 pub(super) async fn reload(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -619,8 +1019,8 @@ pub(super) async fn reload(
         .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
 
     let (url, sha256) = match &current.source {
-        crate::plugin::PluginSource::Url { url, sha256, .. } => (url.clone(), sha256.clone()),
-        crate::plugin::PluginSource::File { .. } => {
+        PluginSource::Url { url, sha256, .. } => (url.clone(), sha256.clone()),
+        PluginSource::File { .. } => {
             return Err(AppError::BadRequest(
                 "Cannot reload file-based plugins via API".into(),
             ));
@@ -629,36 +1029,112 @@ pub(super) async fn reload(
 
     let body = body.map(|Json(b)| b);
     let accepted_capabilities = body.as_ref().and_then(|b| b.accepted_capabilities.clone());
-    let installed_url = url.clone();
-    let (url, sha256) = resolve_reload_url((url, sha256), body);
+    let selector = body.as_ref().and_then(|b| b.registry.clone());
+    let new_url = body.as_ref().and_then(|b| b.url.clone());
+    let row = installed_row(&state, &plugin_id).await?;
+    let installed_release = registry_install_of(&current).cloned();
 
-    // A recorded install stays with its publisher: a new URL must be one the
-    // catalogue offers under this id from that same publisher. Without this
-    // the update gate decides what is offered and anything else decides what
-    // is installed. An unrecorded install has no publisher to hold to.
-    if url != installed_url
-        && let Some(recorded) = recorded_publisher(&state, &plugin_id).await?
-    {
-        let offered = crate::plugin::official_registry::publisher_for_install(
-            &*state.official_registry.read().await,
-            &plugin_id,
-            &url,
-        );
-        if offered.as_deref() != Some(recorded.as_str()) {
-            return Err(AppError::Conflict(format!(
-                "'{plugin_id}' was installed from {recorded}'s package, and this URL is not \
-                 one that publisher offers. Remove the plugin and add it again to install \
-                 another publisher's."
+    let reloaded = match (selector, new_url, installed_release) {
+        (Some(_), Some(_), _) => {
+            return Err(AppError::BadRequest(
+                "name a url or a registry version, not both".into(),
+            ));
+        }
+        (Some(selector), None, installed_release) => {
+            let Some((did, name)) = row.project() else {
+                return Err(AppError::BadRequest(format!(
+                    "'{plugin_id}' wasn't installed from the registry; add it from the registry \
+                     to follow a channel"
+                )));
+            };
+            // A recorded install stays with its publisher, as a URL reload
+            // does: the project must be the recorded publisher's.
+            if !InstalledPublisher::of(row.publisher_did.clone()).accepts(Some(did)) {
+                return Err(AppError::Conflict(format!(
+                    "'{plugin_id}' was installed from {}'s package, and {did}'s {name} is \
+                     not that publisher's. Remove the plugin and add it again to install \
+                     another publisher's.",
+                    row.publisher_did
+                        .as_deref()
+                        .unwrap_or("an unrecorded publisher")
+                )));
+            }
+            // Naming neither keeps what it has: the channel it follows, or
+            // the version it is pinned to.
+            let selector = match (&selector.channel, &selector.version) {
+                (None, None) => match &row.registry_channel {
+                    Some(channel) => RegistrySelector {
+                        channel: Some(channel.clone()),
+                        version: None,
+                    },
+                    None => RegistrySelector {
+                        channel: None,
+                        version: Some(
+                            installed_release
+                                .map(|r| r.version)
+                                .unwrap_or_else(|| current.info.version.clone()),
+                        ),
+                    },
+                },
+                _ => selector,
+            };
+            let resolved = resolve_release(&state, did, name, &selector).await?;
+            Reloaded::Registry(Box::new(resolved.preview))
+        }
+        (None, Some(_), Some(_)) => {
+            return Err(AppError::BadRequest(format!(
+                "'{plugin_id}' is installed from the registry; reload it by channel or \
+                 version, or remove it and add it from the url"
             )));
         }
-    }
+        (None, None, Some(installed_release)) => Reloaded::Registry(Box::new(
+            loader::fetch_registry_artifacts(&state.http, &installed_release)
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to reload plugin: {e}")))?,
+        )),
+        (None, new_url, None) => {
+            let installed_url = url.clone();
+            let (url, sha256) = resolve_reload_url((url, sha256), new_url);
+            // A recorded install stays with its publisher: a new URL must be
+            // one the catalogue offers under this id from that same
+            // publisher. Without this the update gate decides what is offered
+            // and anything else decides what is installed. An unrecorded
+            // install has no publisher to hold to.
+            if url != installed_url
+                && let Some(recorded) = &row.publisher_did
+            {
+                let offered = crate::plugin::official_registry::publisher_for_install(
+                    &*state.official_registry.read().await,
+                    &plugin_id,
+                    &url,
+                );
+                if offered.as_deref() != Some(recorded.as_str()) {
+                    return Err(AppError::Conflict(format!(
+                        "'{plugin_id}' was installed from {recorded}'s package, and this URL is not \
+                         one that publisher offers. Remove the plugin and add it again to install \
+                         another publisher's."
+                    )));
+                }
+            }
+            let preview = loader::fetch_manifest(&state.http, &url)
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
+            Reloaded::Url {
+                changed: url != installed_url,
+                url,
+                sha256,
+                preview: Box::new(preview),
+            }
+        }
+    };
 
-    // Reload via manifest
-    let preview = loader::fetch_manifest(&state.http, &url)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
-
-    let plugin = loader::load_from_manifest(&state.http, &preview, sha256.as_deref())
+    let (preview, sha256) = match &reloaded {
+        Reloaded::Registry(preview) => (&**preview, None),
+        Reloaded::Url {
+            preview, sha256, ..
+        } => (&**preview, sha256.clone()),
+    };
+    let plugin = loader::load_from_manifest(&state.http, preview, sha256.as_deref())
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to reload plugin: {}", e)))?;
 
@@ -668,104 +1144,56 @@ pub(super) async fn reload(
     // version untouched rather than uninstalling it and then failing to
     // reinstall.
     let consented_capabilities = check_capability_consent(&plugin, &accepted_capabilities)?;
+    let registry_publisher = registry_install_of(&plugin).map(|r| r.did.clone());
+    let mut detail = match registry_install_of(&plugin) {
+        Some(install) => serde_json::json!({ "registry": registry_detail(install) }),
+        None => serde_json::json!({ "url": plugin_url(&reloaded) }),
+    };
 
     // Remove old plugin
     state.plugin_registry.remove(&plugin_id).await;
 
-    // Use manifest for rich secret metadata if available
-    let required_secrets: Vec<super::types::SecretDefinition> =
-        if let Some(manifest) = &plugin.manifest {
-            manifest
-                .required_secrets
-                .iter()
-                .map(|s| super::types::SecretDefinition {
-                    key: s.key.clone(),
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                })
-                .collect()
-        } else {
-            plugin
-                .info
-                .required_secrets
-                .iter()
-                .map(|key| super::types::SecretDefinition {
-                    key: key.clone(),
-                    name: key.clone(),
-                    description: None,
-                })
-                .collect()
-        };
-
-    // Check if reloaded plugin still has its config
-    let secrets_configured = required_secrets.is_empty() || {
-        let sql = adapt_sql(
-            "SELECT 1 FROM happyview_plugin_configs WHERE plugin_id = ?",
+    if let Reloaded::Url { url, .. } = &reloaded {
+        // Persist the (possibly new) URL so restarts pick it up
+        let persist_sql = adapt_sql(
+            "UPDATE happyview_plugins SET url = ?, sha256 = NULL WHERE id = ?",
             state.db_backend,
         );
-        crate::db::query_scalar::<i32>(&sql)
-            .bind(&plugin.info.id)
-            .fetch_optional(&state.db)
+        crate::db::query(&persist_sql)
+            .bind(url)
+            .bind(&plugin_id)
+            .execute(&state.db)
             .await
-            .ok()
-            .flatten()
-            .is_some()
-    };
-
-    let cap_fields = capability_fields(&plugin);
-    let pres = presentation_fields(&plugin);
-
-    let summary = PluginSummary {
-        id: plugin.info.id.clone(),
-        name: plugin.info.name.clone(),
-        version: plugin.info.version.clone(),
-        description: pres.description,
-        icon_url: pres.icon_url,
-        banner_url: pres.banner_url,
-        source: "url".to_string(),
-        url: Some(url.clone()),
-        sha256,
-        enabled: true,
-        auth_type: plugin.info.auth_type.clone(),
-        required_secrets,
-        secrets_configured,
-        loaded_at: Some(now_rfc3339()),
-        update_available: false,
-        latest_version: None,
-        pending_releases: Vec::new(),
-        latest_manifest_url: None,
-        plugin_type: cap_fields.plugin_type,
-        namespace: cap_fields.namespace,
-        dependencies: cap_fields.dependencies,
-        allowed_hosts: cap_fields.allowed_hosts,
-        capabilities: cap_fields.capabilities,
-    };
-
-    // Persist the (possibly new) URL so restarts pick it up
-    let persist_sql = adapt_sql(
-        "UPDATE happyview_plugins SET url = ?, sha256 = NULL WHERE id = ?",
-        state.db_backend,
-    );
-    crate::db::query(&persist_sql)
-        .bind(&url)
-        .bind(&plugin.info.id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to persist plugin URL: {}", e)))?;
-    // A new URL may come from a different catalogue entry, so its publisher is
-    // derived afresh; reloading the same URL keeps the recorded one.
-    if url != installed_url {
-        record_publisher(&state, &plugin_id, &url).await?;
+            .map_err(|e| AppError::Internal(format!("Failed to persist plugin URL: {}", e)))?;
     }
 
     // Validate against the dependency graph and register the reloaded plugin
+    // (which also persists it, registry columns included).
     state
         .plugin_registry
         .install(plugin)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    let mut detail = serde_json::json!({ "url": url });
+    match &reloaded {
+        // A new URL may come from a different catalogue entry, so its
+        // publisher is derived afresh, and it is no registry project's any
+        // more; reloading the same URL keeps both.
+        Reloaded::Url {
+            changed: true, url, ..
+        } => {
+            record_publisher(&state, &plugin_id, url).await?;
+            forget_registry_project(&state, &plugin_id).await?;
+        }
+        Reloaded::Url { .. } => {}
+        // The project's publisher, which the check above held to the
+        // recorded one. An unrecorded install the official publisher
+        // updated is the official publisher's from now on.
+        Reloaded::Registry(_) => {
+            set_publisher(&state, &plugin_id, registry_publisher.as_deref()).await?;
+        }
+    }
+
     if let Some(caps) = consented_capabilities {
         detail["capabilities"] = serde_json::json!(caps);
     }
@@ -776,14 +1204,43 @@ pub(super) async fn reload(
             event_type: "plugin.reloaded".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(plugin_id),
+            subject: Some(plugin_id.clone()),
             detail,
         },
         state.db_backend,
     )
     .await;
 
+    let reinstalled =
+        state.plugin_registry.get(&plugin_id).await.ok_or_else(|| {
+            AppError::Internal(format!("'{plugin_id}' vanished as it was reloaded"))
+        })?;
+    let mut summary = summary_of(&state, &reinstalled, Some(now_rfc3339())).await?;
+    if let Reloaded::Url { url, sha256, .. } = &reloaded {
+        summary.url = Some(url.clone());
+        summary.sha256 = sha256.clone();
+    }
     Ok(Json(summary))
+}
+
+/// What a reload fetched: a registry release, verified by CID, or a URL's
+/// manifest.
+enum Reloaded {
+    Registry(Box<loader::PluginPreview>),
+    Url {
+        url: String,
+        sha256: Option<String>,
+        /// The URL differs from the one installed.
+        changed: bool,
+        preview: Box<loader::PluginPreview>,
+    },
+}
+
+fn plugin_url(reloaded: &Reloaded) -> &str {
+    match reloaded {
+        Reloaded::Registry(preview) => &preview.manifest_url,
+        Reloaded::Url { url, .. } => url,
+    }
 }
 
 /// GET /admin/plugins/{id}/secrets - get plugin secrets (values masked)
@@ -1046,7 +1503,9 @@ pub(super) async fn update_allowed_hosts(
     Ok(Json(PluginAllowedHostsResponse { hosts: body.hosts }))
 }
 
-/// POST /admin/plugins/{id}/check-update — force a cache refresh for one plugin
+/// POST /admin/plugins/{id}/check-update — read one plugin's project from the
+/// registry now. A registry plugin's own project is read, whoever holds its
+/// name in the catalogue; any other plugin's is the catalogue entry's.
 pub(super) async fn check_update(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -1054,91 +1513,43 @@ pub(super) async fn check_update(
 ) -> Result<Json<PluginSummary>, AppError> {
     auth.require(Permission::PluginsCreate).await?;
 
-    crate::plugin::official_registry::refresh_plugin(
-        &state.http,
-        &state.official_registry_config,
-        &state.official_registry,
-        &plugin_id,
-    )
-    .await
+    let row = installed_row(&state, &plugin_id).await?;
+    let fresh = match row.project() {
+        Some((did, name)) => {
+            crate::plugin::official_registry::refresh_project(
+                &state.http,
+                &state.official_registry_config,
+                &state.official_registry,
+                did,
+                name,
+            )
+            .await
+        }
+        None => {
+            crate::plugin::official_registry::refresh_plugin(
+                &state.http,
+                &state.official_registry_config,
+                &state.official_registry,
+                &plugin_id,
+            )
+            .await
+        }
+    }
     .map_err(|e| AppError::BadRequest(format!("Update check failed: {}", e)))?;
 
-    // Return the refreshed PluginSummary by re-running the same join logic
     let current = state
         .plugin_registry
         .get(&plugin_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
-
-    let recorded = recorded_publisher(&state, &plugin_id).await?;
-    let guard = state.official_registry.read().await;
-    let update_info = compute_update_info(
-        &current.info.version,
-        &InstalledPublisher::of(recorded),
-        guard.plugins.get(&plugin_id),
-    );
-
-    let required_secrets: Vec<super::types::SecretDefinition> =
-        if let Some(manifest) = &current.manifest {
-            manifest
-                .required_secrets
-                .iter()
-                .map(|s| super::types::SecretDefinition {
-                    key: s.key.clone(),
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                })
-                .collect()
-        } else {
-            current
-                .info
-                .required_secrets
-                .iter()
-                .map(|key| super::types::SecretDefinition {
-                    key: key.clone(),
-                    name: key.clone(),
-                    description: None,
-                })
-                .collect()
-        };
-
-    let (source, url, sha256) = match &current.source {
-        crate::plugin::PluginSource::File { path } => {
-            ("file".to_string(), Some(path.display().to_string()), None)
-        }
-        crate::plugin::PluginSource::Url { url, sha256, .. } => {
-            ("url".to_string(), Some(url.clone()), sha256.clone())
-        }
-    };
-
-    let cap_fields = capability_fields(&current);
-    let pres = presentation_fields(&current);
-
-    Ok(Json(PluginSummary {
-        id: current.info.id.clone(),
-        name: current.info.name.clone(),
-        version: current.info.version.clone(),
-        description: pres.description,
-        icon_url: pres.icon_url,
-        banner_url: pres.banner_url,
-        source,
-        url,
-        sha256,
-        enabled: true,
-        auth_type: current.info.auth_type.clone(),
-        required_secrets,
-        secrets_configured: true,
-        loaded_at: None,
-        update_available: update_info.update_available,
-        latest_version: update_info.latest_version,
-        pending_releases: update_info.pending_releases,
-        latest_manifest_url: update_info.latest_manifest_url,
-        plugin_type: cap_fields.plugin_type,
-        namespace: cap_fields.namespace,
-        dependencies: cap_fields.dependencies,
-        allowed_hosts: cap_fields.allowed_hosts,
-        capabilities: cap_fields.capabilities,
-    }))
+    let configured = secrets_configured(&state, &current).await;
+    Ok(Json(summarize(
+        &current,
+        &row,
+        fresh.as_ref(),
+        configured,
+        None,
+    )))
 }
 
 /// GET /admin/plugins/official — list plugins from the official registry cache
@@ -1154,10 +1565,14 @@ pub(super) async fn list_official(
         .values()
         .map(|p| super::types::OfficialPluginSummary {
             id: p.id.clone(),
+            publisher_did: p.publisher_did.clone(),
             name: p.name.clone(),
             description: p.description.clone(),
             icon_url: p.icon_url.clone(),
-            latest_version: p.latest_version.clone().unwrap_or_default(),
+            plugin_type: p.plugin_type.clone(),
+            latest_version: p.latest_version.clone(),
+            channels: p.channels.clone(),
+            lifecycle_state: p.lifecycle_state.clone(),
             manifest_url: p.manifest_url.clone(),
             official: p.official,
             banner_url: p.banner_url.clone(),
@@ -1175,49 +1590,78 @@ pub(super) async fn list_official(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::official_registry::{CatalogueEntry, ReleaseEntry};
+    use crate::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
 
+    fn release(version: &str) -> ReleaseEntry {
+        ReleaseEntry {
+            version: version.into(),
+            name: format!("v{version}"),
+            published_at: Some("2026-04-10T00:00:00Z".into()),
+            body: Some("notes".into()),
+            state: "active".into(),
+            reason: None,
+            suspect: false,
+            installable: true,
+            availability: "available".into(),
+            version_uri: format!("at://did:plc:x/software.release.version/steam:{version}"),
+            manifest_cid: String::new(),
+            package_cid: String::new(),
+            manifest_blob_cid: String::new(),
+        }
+    }
+
+    fn channel(version: &str) -> ChannelEntry {
+        ChannelEntry {
+            version: version.into(),
+            state: "active".into(),
+            installable: true,
+            availability: "available".into(),
+        }
+    }
+
+    /// An official entry whose `latest` points at the first of `versions`.
     fn entry(versions: &[&str]) -> CatalogueEntry {
         CatalogueEntry {
             id: "steam".into(),
-            publisher_did: None,
+            publisher_did: Some(OFFICIAL_PUBLISHER_DID.into()),
             official: true,
             name: "steam".into(),
             description: None,
             icon_url: None,
             plugin_type: "auth".into(),
-            channels: Default::default(),
+            channels: [("latest".to_string(), channel(versions[0]))]
+                .into_iter()
+                .collect(),
             latest_version: Some(versions[0].into()),
             lifecycle_state: "active".into(),
             manifest_url: "m".into(),
             wasm_url: "w".into(),
-            releases: versions
-                .iter()
-                .map(|v| ReleaseEntry {
-                    version: (*v).into(),
-                    name: format!("v{v}"),
-                    published_at: Some("2026-04-10T00:00:00Z".into()),
-                    body: Some("notes".into()),
-                    state: "active".into(),
-                    installable: true,
-                    availability: "available".into(),
-                    version_uri: String::new(),
-                    manifest_cid: String::new(),
-                    package_cid: String::new(),
-                    manifest_blob_cid: String::new(),
-                })
-                .collect(),
+            releases: versions.iter().map(|v| release(v)).collect(),
             sections: Default::default(),
             banner_url: None,
         }
     }
 
+    fn unrecorded() -> InstalledPublisher {
+        InstalledPublisher::Unrecorded
+    }
+
+    fn latest(
+        installed: &str,
+        publisher: &InstalledPublisher,
+        entry: Option<&CatalogueEntry>,
+    ) -> UpdateInfo {
+        compute_update_info(installed, publisher, Some(LATEST), entry)
+    }
+
     #[test]
     fn compute_update_info_flags_update_when_behind() {
         let cached = entry(&["1.2.0", "1.1.0", "1.0.0"]);
-        let info = compute_update_info("1.0.0", &unrecorded(), Some(&cached));
+        let info = latest("1.0.0", &unrecorded(), Some(&cached));
         assert!(info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
+        assert_eq!(info.latest_version_installable, Some(true));
+        assert_eq!(info.latest_state.as_deref(), Some("active"));
         assert_eq!(info.pending_releases.len(), 2);
         assert_eq!(info.pending_releases[0].version, "1.2.0");
         assert_eq!(info.pending_releases[1].version, "1.1.0");
@@ -1226,14 +1670,94 @@ mod tests {
     #[test]
     fn compute_update_info_no_update_when_current() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("1.2.0", &unrecorded(), Some(&cached));
+        let info = latest("1.2.0", &unrecorded(), Some(&cached));
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
     }
 
-    fn unrecorded() -> InstalledPublisher {
-        InstalledPublisher::Unrecorded
+    /// A channel moved to a version that may not be installed: shown, with
+    /// its state, and not offered. Releases in between that may be
+    /// installed are still listed.
+    #[test]
+    fn a_channel_on_a_version_that_is_not_installable_is_not_offered() {
+        for (state, availability, suspect) in [
+            ("unavailable", "available", false),
+            ("retired", "available", false),
+            ("active", "deletedAtSource", false),
+            ("active", "available", true),
+        ] {
+            let mut cached = entry(&["1.2.0", "1.1.0", "1.0.0"]);
+            let head = cached.channels.get_mut("latest").unwrap();
+            head.state = state.into();
+            head.availability = availability.into();
+            head.installable =
+                !matches!(state, "unavailable" | "retired") && availability == "available";
+            cached.releases[0].state = state.into();
+            cached.releases[0].suspect = suspect;
+            cached.releases[0].installable = head.installable && !suspect;
+
+            let info = latest("1.0.0", &unrecorded(), Some(&cached));
+            assert!(!info.update_available, "{state}/{availability}/{suspect}");
+            assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
+            assert_eq!(info.latest_version_installable, Some(false));
+            assert_eq!(info.latest_state.as_deref(), Some(state));
+            let pending: Vec<&str> = info
+                .pending_releases
+                .iter()
+                .map(|r| r.version.as_str())
+                .collect();
+            assert_eq!(pending, vec!["1.1.0"]);
+        }
+    }
+
+    /// Each channel offers its own track: `latest` its releases, a
+    /// prerelease channel its own prereleases, never past where it points.
+    #[test]
+    fn pending_releases_follow_the_channels_track() {
+        let mut cached = entry(&[
+            "2.0.0-beta.2",
+            "2.0.0-beta.1",
+            "1.9.0-alpha.1",
+            "1.1.0",
+            "1.0.0",
+        ]);
+        cached.channels = [
+            ("latest".to_string(), channel("1.1.0")),
+            ("beta".to_string(), channel("2.0.0-beta.1")),
+        ]
+        .into_iter()
+        .collect();
+        let versions = |info: UpdateInfo| -> Vec<String> {
+            info.pending_releases
+                .into_iter()
+                .map(|r| r.version)
+                .collect()
+        };
+
+        assert_eq!(
+            versions(latest("1.0.0", &unrecorded(), Some(&cached))),
+            vec!["1.1.0"]
+        );
+        let beta = compute_update_info("1.0.0", &unrecorded(), Some("beta"), Some(&cached));
+        assert!(beta.update_available);
+        assert_eq!(beta.latest_version.as_deref(), Some("2.0.0-beta.1"));
+        assert_eq!(versions(beta), vec!["2.0.0-beta.1"]);
+        assert!(
+            !compute_update_info("1.0.0", &unrecorded(), Some("alpha"), Some(&cached))
+                .update_available,
+            "a channel the project doesn't publish offers nothing"
+        );
+    }
+
+    /// A pinned install is shown where `latest` stands and offered nothing.
+    #[test]
+    fn a_pinned_install_is_offered_nothing() {
+        let cached = entry(&["1.2.0", "1.0.0"]);
+        let info = compute_update_info("1.0.0", &unrecorded(), None, Some(&cached));
+        assert!(!info.update_available);
+        assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
+        assert!(info.pending_releases.is_empty());
     }
 
     fn stranger(versions: &[&str]) -> CatalogueEntry {
@@ -1249,80 +1773,130 @@ mod tests {
     /// install never sees the official one.
     #[test]
     fn an_install_is_only_updated_by_its_own_publisher() {
-        let official = InstalledPublisher::Recorded(
-            crate::plugin::official_registry::OFFICIAL_PUBLISHER_DID.into(),
-        );
+        let official = InstalledPublisher::Recorded(OFFICIAL_PUBLISHER_DID.into());
         let theirs = InstalledPublisher::Recorded("did:plc:someoneelse".into());
         let third = InstalledPublisher::Recorded("did:plc:third".into());
 
-        assert!(compute_update_info("1.0.0", &official, Some(&entry(&["1.2.0"]))).update_available);
-        let info = compute_update_info("1.0.0", &official, Some(&stranger(&["9.0.0"])));
+        assert!(latest("1.0.0", &official, Some(&entry(&["1.2.0"]))).update_available);
+        let info = latest("1.0.0", &official, Some(&stranger(&["9.0.0"])));
         assert!(!info.update_available);
         assert!(info.latest_version.is_none());
 
-        assert!(
-            compute_update_info("1.0.0", &theirs, Some(&stranger(&["9.0.0"]))).update_available
-        );
-        assert!(!compute_update_info("1.0.0", &theirs, Some(&entry(&["1.2.0"]))).update_available);
-        assert!(
-            !compute_update_info("1.0.0", &third, Some(&stranger(&["9.0.0"]))).update_available
-        );
+        assert!(latest("1.0.0", &theirs, Some(&stranger(&["9.0.0"]))).update_available);
+        assert!(!latest("1.0.0", &theirs, Some(&entry(&["1.2.0"]))).update_available);
+        assert!(!latest("1.0.0", &third, Some(&stranger(&["9.0.0"]))).update_available);
     }
 
     /// A row that recorded no publisher is tied to none, so only the
     /// official publisher's entry is offered to it.
     #[test]
     fn an_unrecorded_install_is_only_updated_by_the_official_publisher() {
-        assert!(
-            !compute_update_info("1.0.0", &unrecorded(), Some(&stranger(&["9.0.0"])))
-                .update_available
-        );
-        assert!(
-            compute_update_info("1.0.0", &unrecorded(), Some(&entry(&["1.2.0"]))).update_available
-        );
+        assert!(!latest("1.0.0", &unrecorded(), Some(&stranger(&["9.0.0"]))).update_available);
+        assert!(latest("1.0.0", &unrecorded(), Some(&entry(&["1.2.0"]))).update_available);
     }
 
     #[test]
     fn compute_update_info_no_cache_entry() {
-        let info = compute_update_info("1.2.0", &unrecorded(), None);
+        let info = latest("1.2.0", &unrecorded(), None);
         assert!(!info.update_available);
         assert!(info.latest_version.is_none());
         assert!(info.pending_releases.is_empty());
     }
 
+    /// An installed version that isn't semver can't be placed among the
+    /// releases, so none is listed as pending; the channel's version still
+    /// differs from it, which is what offers an update.
     #[test]
     fn compute_update_info_handles_malformed_installed_version() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("not-semver", &unrecorded(), Some(&cached));
-        assert!(!info.update_available);
+        let info = latest("not-semver", &unrecorded(), Some(&cached));
+        assert!(info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
+        assert!(info.pending_releases.is_empty());
+    }
+
+    fn registry_row(channel: Option<&str>) -> InstalledRow {
+        InstalledRow {
+            publisher_did: Some(OFFICIAL_PUBLISHER_DID.into()),
+            registry_did: Some(OFFICIAL_PUBLISHER_DID.into()),
+            registry_name: Some("steam".into()),
+            registry_channel: channel.map(str::to_owned),
+            version_uri: Some("at://did:plc:x/software.release.version/steam:1.0.0".into()),
+            unresolved: false,
+        }
+    }
+
+    /// The installed version's own state and reason, and where the followed
+    /// channel stands, from the project's catalogue entry.
+    #[test]
+    fn registry_status_reads_the_installed_versions_state() {
+        let mut cached = entry(&["1.2.0", "1.0.0"]);
+        cached.releases[1].state = "retired".into();
+        cached.releases[1].reason = Some("leaks tokens".into());
+        cached.channels.get_mut("latest").unwrap().state = "deprecated".into();
+        cached.releases[0].state = "deprecated".into();
+
+        let status =
+            registry_status(&registry_row(Some("latest")), "1.0.0", Some(&cached)).unwrap();
+        assert_eq!(status.installed_state.as_deref(), Some("retired"));
+        assert_eq!(status.installed_reason.as_deref(), Some("leaks tokens"));
+        assert_eq!(status.channel_state.as_deref(), Some("deprecated"));
+        assert_eq!(status.channel.as_deref(), Some("latest"));
+
+        // Another publisher's project under the same name says nothing
+        // about this one.
+        let status = registry_status(
+            &registry_row(Some("latest")),
+            "1.0.0",
+            Some(&stranger(&["1.0.0"])),
+        )
+        .unwrap();
+        assert!(status.installed_state.is_none());
+        assert!(status.channel_state.is_none());
+    }
+
+    /// A plugin with no project is reported only when it was flagged
+    /// unresolved.
+    #[test]
+    fn registry_status_is_absent_for_a_plain_install() {
+        assert!(registry_status(&InstalledRow::default(), "1.0.0", None).is_none());
+        let flagged = InstalledRow {
+            unresolved: true,
+            ..Default::default()
+        };
+        let status = registry_status(&flagged, "1.0.0", None).unwrap();
+        assert!(status.unresolved);
+        assert!(status.did.is_none());
+    }
+
+    #[test]
+    fn a_selector_names_one_known_channel_or_a_version() {
+        let ok = |channel: Option<&str>, version: Option<&str>| {
+            check_selector(&RegistrySelector {
+                channel: channel.map(str::to_owned),
+                version: version.map(str::to_owned),
+            })
+            .is_ok()
+        };
+        assert!(ok(None, None));
+        assert!(ok(Some("beta"), None));
+        assert!(ok(None, Some("1.0.0")));
+        assert!(!ok(Some("latest"), Some("1.0.0")));
+        assert!(!ok(Some("stable"), None));
     }
 
     #[test]
     fn resolve_reload_url_uses_override_and_clears_sha() {
         let current = ("https://old".to_string(), Some("deadbeef".to_string()));
-        let body = super::super::types::ReloadPluginBody {
-            url: Some("https://new".into()),
-            ..Default::default()
-        };
-        let (url, sha) = resolve_reload_url(current, Some(body));
+        let (url, sha) = resolve_reload_url(current, Some("https://new".into()));
         assert_eq!(url, "https://new");
         assert_eq!(sha, None);
     }
 
     #[test]
-    fn resolve_reload_url_keeps_current_when_body_absent() {
+    fn resolve_reload_url_keeps_current_without_a_new_url() {
         let current = ("https://old".to_string(), Some("deadbeef".to_string()));
         let (url, sha) = resolve_reload_url(current, None);
-        assert_eq!(url, "https://old");
-        assert_eq!(sha.as_deref(), Some("deadbeef"));
-    }
-
-    #[test]
-    fn resolve_reload_url_keeps_current_when_body_url_is_none() {
-        let current = ("https://old".to_string(), Some("deadbeef".to_string()));
-        let body = super::super::types::ReloadPluginBody::default();
-        let (url, sha) = resolve_reload_url(current, Some(body));
         assert_eq!(url, "https://old");
         assert_eq!(sha.as_deref(), Some("deadbeef"));
     }

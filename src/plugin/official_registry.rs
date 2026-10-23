@@ -24,9 +24,13 @@ pub struct ReleaseEntry {
     /// The lifecycle state: `active`, `deprecated`, `unavailable` or
     /// `retired`.
     pub state: String,
-    /// Whether this version may be installed: its lifecycle allows it and the
-    /// registry holds its bytes. A version that may not is still listed, so
-    /// an operator can see it exists.
+    /// Why the publisher set that state, when they said.
+    pub reason: Option<String>,
+    /// The registry saw this version's records change after publication.
+    pub suspect: bool,
+    /// Whether this version may be installed: its lifecycle allows it, the
+    /// registry holds its bytes and it isn't suspect. A version that may not
+    /// is still listed, so an operator can see it exists.
     pub installable: bool,
     /// Whether the registry holds the bytes: `pending`, `available` or
     /// `deletedAtSource`.
@@ -281,6 +285,41 @@ pub async fn refresh_plugin(
         Some(plugin) => Ok(Some(hold(state, plugin).await)),
         None => {
             state.write().await.plugins.remove(plugin_id);
+            Ok(None)
+        }
+    }
+}
+
+/// Read one project fresh, by its publisher and name, for a plugin installed
+/// from it. The cache keeps it unless that would displace an official entry
+/// with another publisher's; either way the project as read is answered,
+/// since it is what the installed plugin follows. When the registry was read
+/// and does not have it, a cached entry for that same project is dropped.
+pub async fn refresh_project(
+    client: &reqwest::Client,
+    config: &RegistryConfig,
+    state: &SharedRegistry,
+    did: &str,
+    name: &str,
+) -> Result<Option<CatalogueEntry>, RegistryError> {
+    let source = match &config.registry {
+        Some(source) if !config.disabled => source,
+        _ => return Err(RegistryError::Disabled),
+    };
+    match super::registry_source::fetch_project(client, source, did, name).await? {
+        Some(project) => {
+            hold(state, project.clone()).await;
+            Ok(Some(project))
+        }
+        None => {
+            let mut guard = state.write().await;
+            if guard
+                .plugins
+                .get(name)
+                .is_some_and(|p| p.publisher_did.as_deref() == Some(did))
+            {
+                guard.plugins.remove(name);
+            }
             Ok(None)
         }
     }

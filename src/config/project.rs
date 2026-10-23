@@ -12,6 +12,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
+use crate::plugin::registry_source::TRACKS;
+
 pub const PROJECT_FILE: &str = "happyview.toml";
 
 /// Which binary entry point is reading the file. `[dev]` applies only to
@@ -463,9 +465,6 @@ impl PluginEntry {
         }
     }
 }
-
-/// The channels a registry offers, so a name outside them can never resolve.
-const TRACKS: [&str; 3] = ["latest", "beta", "alpha"];
 
 const PROJECT_NAME_SHAPE: &str = "must be lowercase letters, digits and '-', start and end with a letter or digit, and be at most 64 characters";
 
