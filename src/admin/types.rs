@@ -87,12 +87,9 @@ pub(super) struct UploadLexiconBody {
     pub(super) target_collection: Option<String>,
     pub(super) action: Option<String>,
     pub(super) token_cost: Option<i32>,
-    #[serde(default = "default_indexed")]
-    pub(super) indexed: bool,
-}
-
-fn default_indexed() -> bool {
-    true
+    /// Left out, an update keeps the stored setting and a new lexicon is
+    /// indexed, so a client that predates the field never flips it.
+    pub(super) indexed: Option<bool>,
 }
 
 fn default_backfill() -> bool {
@@ -125,8 +122,8 @@ pub(super) struct AddNetworkLexiconBody {
     #[serde(default)]
     pub(super) backfill: bool,
     pub(super) target_collection: Option<String>,
-    #[serde(default = "default_indexed")]
-    pub(super) indexed: bool,
+    /// Left out, an existing lexicon keeps its setting and a new one is indexed.
+    pub(super) indexed: Option<bool>,
 }
 
 #[derive(Serialize)]

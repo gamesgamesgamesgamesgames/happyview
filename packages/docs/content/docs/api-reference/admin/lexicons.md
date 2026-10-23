@@ -174,6 +174,7 @@ curl -X POST http://127.0.0.1:3000/admin/lexicons \
 | `backfill`          | boolean | no       | Whether the first upload triggers a historical backfill (default `true`) |
 | `target_collection` | string  | no       | For query/procedure lexicons, the record collection they operate on   |
 | `token_cost`        | integer | no       | Token cost for query/procedure endpoints (overrides instance default) |
+| `indexed`           | boolean | no       | For record lexicons, whether HappyView ingests the collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept. An unindexed lexicon starts no backfill |
 
 The `id` must be a valid [NSID](https://atproto.com/specs/nsid) — it is the
 lexicon's primary key, the XRPC method it is served at, and, for record
@@ -433,6 +434,7 @@ curl -X POST http://127.0.0.1:3000/admin/network-lexicons \
 | ------------------- | ------ | -------- | ------------------------------------------------------------------- |
 | `nsid`              | string | yes      | The NSID of the lexicon to watch                                    |
 | `target_collection` | string | no       | For query/procedure lexicons, the record collection they operate on |
+| `indexed`           | boolean | no     | Whether HappyView ingests the record collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept |
 
 HappyView resolves the NSID authority via DNS TXT, fetches the lexicon from the authority's PDS, parses it, and stores it.
 
