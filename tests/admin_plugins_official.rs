@@ -1,876 +1,1303 @@
 mod common;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
-use tower::ServiceExt;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::app::TestApp;
+use happyview::plugin::official_registry::{OFFICIAL_PUBLISHER_DID, RegistryConfig};
 
-async fn json_body(resp: axum::response::Response) -> Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+const OFFICIAL: &str = OFFICIAL_PUBLISHER_DID;
+const STRANGER: &str = "did:plc:someoneelse";
+
+// ---------------------------------------------------------------------------
+// A registry, modelled: projects with their versions and channels, served
+// over the read API by a wiremock server. Change the model, then `serve` it
+// again.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Version {
+    version: String,
+    state: &'static str,
+    reason: Option<String>,
+    availability: &'static str,
+    suspect: bool,
+    /// Bytes the registry serves for the module instead of the published
+    /// ones, for a registry that serves the wrong bytes.
+    served_module: Option<Vec<u8>>,
 }
 
-fn admin_get(
-    uri: &str,
-    cookie: (axum::http::HeaderName, axum::http::HeaderValue),
-) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .header(cookie.0, cookie.1)
-        .body(Body::empty())
-        .unwrap()
+struct Project {
+    did: String,
+    name: String,
+    /// Returned by `searchProjects`; a project that isn't is still found by
+    /// `getProject`.
+    listed: bool,
+    /// `listVersions` fails for it.
+    versions_fail: bool,
+    /// Newest first, as the registry lists them.
+    versions: Vec<Version>,
+    channels: Vec<(String, String)>,
 }
 
-fn admin_post(
-    uri: &str,
-    cookie: (axum::http::HeaderName, axum::http::HeaderValue),
-) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(cookie.0, cookie.1)
-        .body(Body::empty())
-        .unwrap()
-}
-
-#[tokio::test]
-#[serial]
-async fn official_plugins_endpoint_returns_cached_list() {
-    common::require_db!();
-    let app = TestApp::new().await;
-
-    let gh = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "tag_name": "steam-v1.2.0",
-                "name": "steam-v1.2.0",
-                "published_at": "2026-04-10T00:00:00Z",
-                "body": "- logging improvements",
-                "html_url": "https://example.com/steam-v1.2.0"
-            }
-        ])))
-        .mount(&gh)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/download/steam-v1.2.0/manifest.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "steam",
-            "name": "Steam",
-            "version": "1.2.0",
-            "api_version": "2",
-            "description": "Steam OAuth plugin",
-            "icon_url": "https://example.com/steam.png",
-            "wasm_file": "steam.wasm",
-            "required_secrets": [],
-            "auth_type": "openid"
-        })))
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        // The GitHub fallback, deterministically: these assert on its output.
-        registry: None,
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins/official", app.admin_cookie()))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let plugins = body["plugins"].as_array().unwrap();
-    assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0]["id"], "steam");
-    assert_eq!(plugins[0]["name"], "Steam");
-    assert_eq!(plugins[0]["latest_version"], "1.2.0");
-    assert_eq!(
-        plugins[0]["official"], true,
-        "the GitHub walk reads only the official repo"
-    );
-    assert!(body["last_refreshed_at"].is_string());
-}
-
-#[tokio::test]
-#[serial]
-async fn plugins_list_populates_update_available_when_behind() {
-    common::require_db!();
-    let app = TestApp::new().await;
-
-    let gh = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "tag_name": "steam-v1.2.0",
-                "name": "steam-v1.2.0",
-                "published_at": "2026-04-10T00:00:00Z",
-                "body": "- logging improvements",
-                "html_url": "https://example.com/steam-v1.2.0"
+impl Project {
+    fn release(&mut self, version: &str) -> &mut Version {
+        self.versions.insert(
+            0,
+            Version {
+                version: version.into(),
+                state: "active",
+                reason: None,
+                availability: "available",
+                suspect: false,
+                served_module: None,
             },
-            {
-                "tag_name": "steam-v1.1.0",
-                "name": "steam-v1.1.0",
-                "published_at": "2026-03-01T00:00:00Z",
-                "body": "- initial",
-                "html_url": "https://example.com/steam-v1.1.0"
-            }
-        ])))
-        .mount(&gh)
-        .await;
+        );
+        &mut self.versions[0]
+    }
 
-    Mock::given(method("GET"))
-        .and(path("/download/steam-v1.2.0/manifest.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "steam",
-            "name": "Steam",
-            "version": "1.2.0",
-            "api_version": "2",
-            "wasm_file": "steam.wasm",
-            "required_secrets": [],
-            "auth_type": "openid"
-        })))
-        .mount(&gh)
-        .await;
+    fn version(&mut self, version: &str) -> &mut Version {
+        self.versions
+            .iter_mut()
+            .find(|v| v.version == version)
+            .expect("no such version in the model")
+    }
 
-    app.install_fake_plugin("steam", "1.1.0").await;
+    fn channel(&mut self, channel: &str, version: &str) -> &mut Self {
+        self.channels.retain(|(c, _)| c != channel);
+        self.channels.push((channel.into(), version.into()));
+        self
+    }
 
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        // The GitHub fallback, deterministically: these assert on its output.
-        registry: None,
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins", app.admin_cookie()))
-        .await
-        .unwrap();
-
-    let body = json_body(resp).await;
-    let plugins = body["plugins"].as_array().unwrap();
-    let steam = plugins.iter().find(|p| p["id"] == "steam").unwrap();
-    assert_eq!(steam["update_available"], true);
-    assert_eq!(steam["latest_version"], "1.2.0");
-    let pending = steam["pending_releases"].as_array().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0]["version"], "1.2.0");
-}
-
-#[tokio::test]
-#[serial]
-async fn check_update_endpoint_refreshes_cache_on_demand() {
-    common::require_db!();
-    // Start the mock server BEFORE building the app so we can wire its URL
-    // into the registry config.
-    let gh = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "tag_name": "steam-v2.0.0",
-                "name": "steam-v2.0.0",
-                "published_at": "2026-04-12T00:00:00Z",
-                "body": "- major rewrite",
-                "html_url": "https://example.com/steam-v2.0.0"
-            }
-        ])))
-        .mount(&gh)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/download/steam-v2.0.0/manifest.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "steam",
-            "name": "Steam",
-            "version": "2.0.0",
-            "api_version": "2",
-            "description": "Steam OAuth plugin",
-            "icon_url": null,
-            "wasm_file": "steam.wasm",
-            "required_secrets": [],
-            "auth_type": "openid"
-        })))
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        // The GitHub fallback, deterministically: these assert on its output.
-        registry: None,
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-    let app = TestApp::new_with_registry_config(config).await;
-
-    // Install a plugin at 1.0.0 — the cache starts empty, so /admin/plugins
-    // should initially report no update available.
-    app.install_fake_plugin("steam", "1.0.0").await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins", app.admin_cookie()))
-        .await
-        .unwrap();
-    let body = json_body(resp).await;
-    let steam_before = body["plugins"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["id"] == "steam")
-        .unwrap();
-    assert_eq!(steam_before["update_available"], false);
-    assert!(steam_before["latest_version"].is_null());
-
-    // Force an on-demand refresh. The handler should call the mock GH API,
-    // populate the cache, and return a summary with update fields filled in.
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_post(
-            "/admin/plugins/steam/check-update",
-            app.admin_cookie(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["id"], "steam");
-    assert_eq!(body["update_available"], true);
-    assert_eq!(body["latest_version"], "2.0.0");
-    let pending = body["pending_releases"].as_array().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0]["version"], "2.0.0");
-
-    // A follow-up /admin/plugins call should now also reflect the cache.
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins", app.admin_cookie()))
-        .await
-        .unwrap();
-    let body = json_body(resp).await;
-    let steam_after = body["plugins"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["id"] == "steam")
-        .unwrap();
-    assert_eq!(steam_after["update_available"], true);
-    assert_eq!(steam_after["latest_version"], "2.0.0");
-}
-
-/// Checking one plugin for an update reads the registry, as the full refresh
-/// does. The GitHub mock is asserted unused, so a check that still walked
-/// only GitHub would fail here rather than drop or misreport the plugin.
-#[tokio::test]
-#[serial]
-async fn check_update_reads_the_registry() {
-    common::require_db!();
-    let registry = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getPackage"))
-        .and(query_param("slug", "happyview-http"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uri": "at://did:plc:pub/at.happyproto.plugin.profile/happyview-http",
-            "cid": "bafy",
-            "did": "did:plc:pub",
-            "record": { "name": "HTTP", "description": "Outbound HTTP." },
-            "status": "active",
-            "latestVersion": "1.0.0",
-            "indexedAt": "2026-10-01T00:00:00.000000+00:00"
-        })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.listReleases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "releases": [
-                {
-                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:1.0.0",
-                    "record": {
-                        "version": "1.0.0",
-                        "notes": "- faster\n- fewer bugs",
-                        "artifacts": {
-                            "package": { "url": "https://example.com/d/happyview-http.wasm" }
-                        }
-                    },
-                    "indexedAt": "2026-10-01T00:00:00.000000+00:00"
-                },
-                {
-                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:0.9.0",
-                    "record": {
-                        "version": "0.9.0",
-                        "artifacts": {
-                            "package": { "url": "https://example.com/old/happyview-http.wasm" }
-                        }
-                    },
-                    "indexedAt": "2026-09-01T00:00:00.000000+00:00"
-                }
-            ]
-        })))
-        .mount(&registry)
-        .await;
-
-    let gh = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .expect(0)
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        registry: Some(happyview::plugin::registry_source::RegistrySource {
-            base_url: registry.uri(),
-            limit: 100,
-        }),
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-    let app = TestApp::new_with_registry_config(config).await;
-    app.install_fake_plugin("happyview-http", "0.9.0").await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_post(
-            "/admin/plugins/happyview-http/check-update",
-            app.admin_cookie(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["id"], "happyview-http");
-    assert_eq!(body["update_available"], true);
-    assert_eq!(body["latest_version"], "1.0.0");
-    assert_eq!(
-        body["latest_manifest_url"], "https://example.com/d/manifest.json",
-        "the update installs the entry the gate approved"
-    );
-    let pending = body["pending_releases"].as_array().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0]["version"], "1.0.0");
-}
-
-/// When the registry lists a package, that is its catalogue entry. The GitHub
-/// walk is still read, since it is official by construction, but here it lists
-/// nothing, so a regression that served the walk instead of the registry fails
-/// here rather than silently serving the old source.
-#[tokio::test]
-#[serial]
-async fn the_registry_is_preferred_over_the_github_walk() {
-    common::require_db!();
-    let app = TestApp::new().await;
-
-    let registry = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.searchPackages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "packages": [{
-                "uri": "at://did:plc:pub/at.happyproto.plugin.profile/happyview-http",
-                "cid": "bafy",
-                "did": "did:plc:pub",
-                "record": { "name": "HTTP", "description": "Outbound HTTP." },
-                "status": "active",
-                "latestVersion": "1.0.0",
-                "indexedAt": "2026-10-01T00:00:00.000000+00:00"
-            }]
-        })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.listReleases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "releases": [
-                {
-                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:1.0.0",
-                    "record": {
-                        "version": "1.0.0",
-                        "notes": "- faster\n- fewer bugs",
-                        "artifacts": {
-                            "package": { "url": "https://example.com/d/happyview-http.wasm" }
-                        }
-                    },
-                    "indexedAt": "2026-10-01T00:00:00.000000+00:00"
-                },
-                {
-                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:0.9.0",
-                    "record": {
-                        "version": "0.9.0",
-                        "artifacts": {
-                            "package": { "url": "https://example.com/old/happyview-http.wasm" }
-                        }
-                    },
-                    "indexedAt": "2026-09-01T00:00:00.000000+00:00"
-                }
-            ]
-        })))
-        .mount(&registry)
-        .await;
-
-    let gh = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        registry: Some(happyview::plugin::registry_source::RegistrySource {
-            base_url: registry.uri(),
-            limit: 100,
-        }),
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins/official", app.admin_cookie()))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let plugins = body["plugins"].as_array().unwrap();
-    assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0]["id"], "happyview-http");
-    assert_eq!(plugins[0]["name"], "HTTP");
-    assert_eq!(plugins[0]["latest_version"], "1.0.0");
-    assert_eq!(
-        plugins[0]["official"], false,
-        "a package from any publisher but HappyProto's is listed unbadged"
-    );
-    // Install still goes through the module's own url, so the manifest is the
-    // one beside it rather than anything the registry serves.
-    assert_eq!(
-        plugins[0]["manifest_url"],
-        "https://example.com/d/manifest.json"
-    );
-    // Every listed release, so the update preview can name each version
-    // between what is installed and what is current -- not just the newest.
-    // Read off the cache rather than the response: the browse endpoint serves
-    // a summary, and the releases are what `compute_update_info` consumes.
-    let cached = app.state.official_registry.read().await;
-    let versions: Vec<&str> = cached.plugins["happyview-http"]
-        .releases
-        .iter()
-        .map(|r| r.version.as_str())
-        .collect();
-    assert_eq!(versions, vec!["1.0.0", "0.9.0"]);
-    // The release's own notes are what the update dialog renders, so they have
-    // to survive the catalogue rather than being dropped on the way through.
-    assert_eq!(
-        cached.plugins["happyview-http"].releases[0].body,
-        "- faster\n- fewer bugs"
-    );
-    assert_eq!(
-        cached.plugins["happyview-http"].releases[1].body, "",
-        "a release that published no notes carries none"
-    );
-}
-
-/// An empty registry must not empty the catalogue. Replacing a working plugin
-/// list with no plugin list is worse than the staleness the fallback carries,
-/// so a registry with nothing to say falls through to GitHub.
-#[tokio::test]
-#[serial]
-async fn an_empty_registry_falls_back_to_github() {
-    common::require_db!();
-    let app = TestApp::new().await;
-
-    let registry = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.searchPackages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "packages": [] })))
-        .mount(&registry)
-        .await;
-
-    let gh = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-            "tag_name": "steam-v1.2.0",
-            "name": "steam-v1.2.0",
-            "published_at": "2026-04-10T00:00:00Z",
-            "body": "",
-            "html_url": "https://example.com/steam-v1.2.0"
-        }])))
-        .mount(&gh)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/download/steam-v1.2.0/manifest.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "steam",
-            "name": "Steam",
-            "version": "1.2.0",
-            "api_version": "2",
-            "wasm_file": "steam.wasm",
-            "required_secrets": [],
-            "auth_type": "openid"
-        })))
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        registry: Some(happyview::plugin::registry_source::RegistrySource {
-            base_url: registry.uri(),
-            limit: 100,
-        }),
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins/official", app.admin_cookie()))
-        .await
-        .unwrap();
-    let body = json_body(resp).await;
-    let plugins = body["plugins"].as_array().unwrap();
-    assert_eq!(plugins.len(), 1, "the fallback should have answered");
-    assert_eq!(plugins[0]["id"], "steam");
-}
-
-/// A registry that is down is the same case as an empty one: the catalogue it
-/// could not serve must not become an empty catalogue.
-#[tokio::test]
-#[serial]
-async fn an_unreachable_registry_falls_back_to_github() {
-    common::require_db!();
-    let app = TestApp::new().await;
-
-    let registry = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.searchPackages"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&registry)
-        .await;
-
-    let gh = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-            "tag_name": "steam-v1.2.0",
-            "name": "steam-v1.2.0",
-            "published_at": "2026-04-10T00:00:00Z",
-            "body": "",
-            "html_url": "https://example.com/steam-v1.2.0"
-        }])))
-        .mount(&gh)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/download/steam-v1.2.0/manifest.json"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&gh)
-        .await;
-
-    let config = happyview::plugin::official_registry::RegistryConfig {
-        registry: Some(happyview::plugin::registry_source::RegistrySource {
-            base_url: registry.uri(),
-            limit: 100,
-        }),
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
-    };
-
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins/official", app.admin_cookie()))
-        .await
-        .unwrap();
-    let body = json_body(resp).await;
-    assert_eq!(body["plugins"].as_array().unwrap().len(), 1);
-}
-
-/// A registry where a stranger has published `happyview-http` and the
-/// official publisher nothing, plus a GitHub walk listing `tags`.
-async fn a_stranger_publishes_an_official_slug(tags: &[&str]) -> (MockServer, MockServer) {
-    let registry = MockServer::start().await;
-    let stranger = json!({
-        "uri": "at://did:plc:someoneelse/at.happyproto.plugin.profile/happyview-http",
-        "did": "did:plc:someoneelse",
-        "record": { "name": "Not HTTP" },
-        "status": "active",
-        "latestVersion": "9.0.0"
-    });
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.searchPackages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "packages": [stranger] })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getPackage"))
-        .and(query_param("actor", "did:plc:someoneelse"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(stranger))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getPackage"))
-        .and(query_param(
-            "actor",
-            happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID,
-        ))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "PackageNotFound", "message": "no such package"
-        })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.listReleases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "releases": [{
-                "status": "active",
-                "record": {
-                    "version": "9.0.0",
-                    "artifacts": {
-                        "package": { "url": "https://elsewhere.example/happyview-http.wasm" }
-                    }
-                }
-            }]
-        })))
-        .mount(&registry)
-        .await;
-
-    let gh = MockServer::start().await;
-    let releases: Vec<Value> = tags
-        .iter()
-        .map(|tag| {
-            json!({
-                "tag_name": tag,
-                "name": tag,
-                "published_at": "2026-04-10T00:00:00Z",
-                "body": "",
-                "html_url": "https://example.com/release"
-            })
-        })
-        .collect();
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(Value::Array(releases)))
-        .mount(&gh)
-        .await;
-    (registry, gh)
-}
-
-fn config_for(
-    registry: &MockServer,
-    gh: &MockServer,
-) -> happyview::plugin::official_registry::RegistryConfig {
-    happyview::plugin::official_registry::RegistryConfig {
-        registry: Some(happyview::plugin::registry_source::RegistrySource {
-            base_url: registry.uri(),
-            limit: 100,
-        }),
-        api_base: gh.uri(),
-        release_base: format!("{}/download", gh.uri()),
-        disabled: false,
+    /// Publish `version` and point `latest` at it.
+    fn publish(&mut self, version: &str) -> &mut Self {
+        self.release(version);
+        self.channel("latest", version)
     }
 }
 
-async fn http_summary(app: &TestApp) -> Value {
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_get("/admin/plugins", app.admin_cookie()))
+struct Registry {
+    server: MockServer,
+    projects: Vec<Project>,
+}
+
+/// A distinct module per project version, so each has its own CID.
+fn module_bytes(name: &str, version: &str) -> Vec<u8> {
+    let tag: u32 = format!("{name}@{version}")
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+    wat::parse_str(format!(
+        "(module (memory (export \"memory\") 1) \
+         (global i32 (i32.const {})) \
+         (func (export \"alloc\") (param i32) (result i32) i32.const 8) \
+         (func (export \"dealloc\") (param i32 i32)))",
+        tag as i32
+    ))
+    .unwrap()
+}
+
+fn manifest_bytes(name: &str, version: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": name, "name": name, "version": version, "api_version": "2",
+        "plugin_type": "library", "capabilities": [], "wasm_file": "plugin.wasm",
+    }))
+    .unwrap()
+}
+
+fn cid(bytes: &[u8]) -> String {
+    happyview::cid_verify::raw_cid(bytes).unwrap().to_string()
+}
+
+fn version_uri(did: &str, name: &str, version: &str) -> String {
+    format!("at://{did}/software.release.version/{name}:{version}")
+}
+
+fn version_view(project: &Project, v: &Version) -> Value {
+    let (did, name) = (project.did.as_str(), project.name.as_str());
+    json!({
+        "uri": version_uri(did, name, &v.version),
+        "cid": format!("bafyversion{}", v.version),
+        "did": did,
+        "name": name,
+        "version": v.version,
+        "manifest": {
+            "uri": format!("at://{did}/software.release.manifest/{name}:{}", v.version),
+            "cid": format!("bafymanifestrecord{}", v.version),
+        },
+        "artifact": {
+            "$type": "at.happyproto.plugin.v1",
+            "package": { "$type": "blob", "ref": { "$link": cid(&module_bytes(name, &v.version)) } },
+            "manifest": { "$type": "blob", "ref": { "$link": cid(&manifest_bytes(name, &v.version)) } },
+            "pluginType": "library",
+        },
+        "changelog": { "uri": "at://x/site.standard.document/1", "title": v.version, "markdown": format!("- {}", v.version) },
+        "availability": v.availability,
+        "suspect": v.suspect,
+        "lifecycle": {
+            "state": v.state,
+            "installable": matches!(v.state, "active" | "deprecated"),
+            "reason": v.reason,
+            "events": [],
+        },
+        "indexedAt": "2026-10-01T00:00:00Z",
+    })
+}
+
+fn project_view(project: &Project) -> Value {
+    let channels: serde_json::Map<String, Value> = project
+        .channels
+        .iter()
+        .map(|(channel, version)| {
+            let v = project
+                .versions
+                .iter()
+                .find(|v| &v.version == version)
+                .unwrap();
+            (
+                channel.clone(),
+                json!({
+                    "version": version,
+                    "uri": version_uri(&project.did, &project.name, version),
+                    "cid": format!("bafyversion{version}"),
+                    "state": v.state,
+                    "availability": v.availability,
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "uri": format!("at://{}/software.release.project/{}", project.did, project.name),
+        "cid": "bafyproject",
+        "did": project.did,
+        "name": project.name,
+        "sidecar": { "uri": "at://x/at.happyproto.registry.project/1" },
+        "publication": { "uri": "at://x/site.standard.publication/1", "cid": "bafypub", "name": project.name, "url": "https://example.com" },
+        "pluginType": "library",
+        "keywords": [],
+        "authors": [],
+        "security": [],
+        "channels": channels,
+        "lifecycle": { "state": "active" },
+        "indexedAt": "2026-10-01T00:00:00Z",
+    })
+}
+
+fn xrpc(name: &str) -> String {
+    format!("/xrpc/at.happyproto.registry.{name}")
+}
+
+fn not_found(error: &str) -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({ "error": error, "message": "not found" }))
+}
+
+impl Registry {
+    async fn start() -> Self {
+        Self {
+            server: MockServer::start().await,
+            projects: Vec::new(),
+        }
+    }
+
+    fn project(&mut self, did: &str, name: &str) -> &mut Project {
+        if let Some(i) = self
+            .projects
+            .iter()
+            .position(|p| p.did == did && p.name == name)
+        {
+            return &mut self.projects[i];
+        }
+        self.projects.push(Project {
+            did: did.into(),
+            name: name.into(),
+            listed: true,
+            versions_fail: false,
+            versions: Vec::new(),
+            channels: Vec::new(),
+        });
+        self.projects.last_mut().unwrap()
+    }
+
+    fn config(&self) -> RegistryConfig {
+        RegistryConfig {
+            registry: Some(happyview::plugin::registry_source::RegistrySource {
+                base_url: self.server.uri(),
+                limit: 100,
+            }),
+            disabled: false,
+        }
+    }
+
+    /// Answer the read API from the model as it now stands.
+    async fn serve(&self) {
+        let server = &self.server;
+        server.reset().await;
+        let mut listed = Vec::new();
+        for p in &self.projects {
+            for v in &p.versions {
+                let module = module_bytes(&p.name, &v.version);
+                let manifest = manifest_bytes(&p.name, &v.version);
+                for (cid, bytes) in [
+                    (cid(&module), v.served_module.clone().unwrap_or(module)),
+                    (cid(&manifest), manifest),
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(xrpc("getArtifact")))
+                        .and(query_param("cid", cid))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                        .mount(server)
+                        .await;
+                }
+                Mock::given(method("GET"))
+                    .and(path(xrpc("getVersion")))
+                    .and(query_param("did", p.did.as_str()))
+                    .and(query_param("name", p.name.as_str()))
+                    .and(query_param("version", v.version.as_str()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(version_view(p, v)))
+                    .mount(server)
+                    .await;
+            }
+            for (channel, version) in &p.channels {
+                let v = p.versions.iter().find(|v| &v.version == version).unwrap();
+                Mock::given(method("GET"))
+                    .and(path(xrpc("resolveChannel")))
+                    .and(query_param("did", p.did.as_str()))
+                    .and(query_param("name", p.name.as_str()))
+                    .and(query_param("channel", channel.as_str()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(version_view(p, v)))
+                    .mount(server)
+                    .await;
+            }
+            let versions = if p.versions_fail {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "versions": p.versions.iter().map(|v| version_view(p, v)).collect::<Vec<_>>(),
+                }))
+            };
+            Mock::given(method("GET"))
+                .and(path(xrpc("listVersions")))
+                .and(query_param("did", p.did.as_str()))
+                .and(query_param("name", p.name.as_str()))
+                .respond_with(versions)
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(xrpc("getProject")))
+                .and(query_param("actor", p.did.as_str()))
+                .and(query_param("name", p.name.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(project_view(p)))
+                .mount(server)
+                .await;
+            if p.listed {
+                listed.push(project_view(p));
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path(xrpc("searchProjects")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "projects": listed })))
+            .mount(server)
+            .await;
+        for (name, error) in [
+            ("getProject", "ProjectNotFound"),
+            ("getVersion", "VersionNotFound"),
+            ("resolveChannel", "ChannelNotFound"),
+            ("listVersions", "ProjectNotFound"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(xrpc(name)))
+                .respond_with(not_found(error))
+                .with_priority(10)
+                .mount(server)
+                .await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers over the admin API.
+// ---------------------------------------------------------------------------
+
+async fn app_on(registry: &Registry) -> TestApp {
+    TestApp::new_with_persisted_plugins(registry.config()).await
+}
+
+/// The periodic refresh: the catalogue, and every project an installed
+/// plugin follows.
+async fn refresh(app: &TestApp) {
+    happyview::plugin::official_registry::refresh_for_installs(
+        &app.state.http,
+        &app.state.official_registry_config,
+        &app.state.official_registry,
+        &app.state.db,
+        app.state.db_backend,
+    )
+    .await
+    .unwrap();
+}
+
+async fn install_from_registry(app: &TestApp, registry: Value) -> (u16, Value) {
+    app.post_json_status("/admin/plugins", json!({ "registry": registry }))
         .await
-        .unwrap();
-    json_body(resp)
+}
+
+async fn summary_of(app: &TestApp, id: &str) -> Value {
+    app.get_json("/admin/plugins")
         .await
         .get("plugins")
         .and_then(|p| p.as_array())
-        .and_then(|p| p.iter().find(|p| p["id"] == "happyview-http").cloned())
+        .and_then(|p| p.iter().find(|p| p["id"] == id).cloned())
         .expect("the installed plugin should be listed")
 }
 
-/// A stranger publishing an official slug to the registry, while the official
-/// publisher has published nothing there, must not become the update offered
-/// to the installed official plugin: the offer comes from the official walk.
+/// The registry columns of a plugin's row, by name; `None` when there is no
+/// row.
+async fn row_of(
+    app: &TestApp,
+    id: &str,
+) -> Option<std::collections::HashMap<&'static str, Option<String>>> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT publisher_did, registry_did, registry_name, registry_channel, version_uri,
+                manifest_cid, manifest_blob_cid, package_cid, manifest_url
+         FROM happyview_plugins WHERE id = ?",
+        app.state.db_backend,
+    );
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = happyview::db::query_as(&sql)
+        .bind(id)
+        .fetch_optional(&app.state.db)
+        .await
+        .unwrap();
+    row.map(|r| {
+        [
+            ("publisher_did", r.0),
+            ("registry_did", r.1),
+            ("registry_name", r.2),
+            ("registry_channel", r.3),
+            ("version_uri", r.4),
+            ("manifest_cid", r.5),
+            ("manifest_blob_cid", r.6),
+            ("package_cid", r.7),
+            ("manifest_url", r.8),
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+async fn recorded_publisher(app: &TestApp, id: &str) -> Option<String> {
+    row_of(app, id)
+        .await
+        .and_then(|r| r["publisher_did"].clone())
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue.
+// ---------------------------------------------------------------------------
+
+/// The catalogue lists every project the registry does, official ones
+/// badged, with every version and its notes.
 #[tokio::test]
 #[serial]
-async fn a_strangers_package_is_never_the_update_for_an_official_install() {
+async fn the_catalogue_lists_registry_projects() {
     common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "steam")
+        .publish("1.1.0")
+        .publish("1.2.0");
+    registry.project(STRANGER, "extra").publish("0.1.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    refresh(&app).await;
 
-    // The walk still lists the official plugin: it is the offer.
-    let (registry, gh) = a_stranger_publishes_an_official_slug(&["happyview-http-v1.1.0"]).await;
-    let config = config_for(&registry, &gh);
-    let app = TestApp::new_with_registry_config(config.clone()).await;
-    app.install_fake_plugin_from(
-        "happyview-http",
-        "1.0.0",
-        &format!(
-            "{}/happyview-http-v1.0.0/happyview-http.wasm",
-            config.release_base
-        ),
+    let body = app.get_json("/admin/plugins/official").await;
+    let plugins = body["plugins"].as_array().unwrap();
+    assert_eq!(plugins.len(), 2);
+    let steam = plugins.iter().find(|p| p["id"] == "steam").unwrap();
+    assert_eq!(steam["latest_version"], "1.2.0");
+    assert_eq!(steam["official"], true);
+    assert_eq!(steam["publisher_did"], OFFICIAL);
+    assert_eq!(steam["channels"]["latest"]["version"], "1.2.0");
+    let versions: Vec<&str> = steam["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(versions, vec!["1.2.0", "1.1.0"]);
+    assert_eq!(steam["releases"][0]["body"], "- 1.2.0");
+    let extra = plugins.iter().find(|p| p["id"] == "extra").unwrap();
+    assert_eq!(extra["official"], false);
+    assert_eq!(extra["publisher_did"], STRANGER);
+    assert!(body["last_refreshed_at"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// Installing by registry identity.
+// ---------------------------------------------------------------------------
+
+/// A preview resolves the channel and verifies the artifacts; an install
+/// records the project, the channel, the version and the CIDs it was
+/// verified against, and its publisher from the registry.
+#[tokio::test]
+#[serial]
+async fn a_plugin_installs_by_its_registry_project_and_channel() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+
+    let (status, preview) = app
+        .post_json_status(
+            "/admin/plugins/preview",
+            json!({ "registry": { "did": STRANGER, "name": "extra" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["id"], "extra");
+    assert_eq!(preview["version"], "1.0.0");
+    assert_eq!(preview["registry"]["did"], STRANGER);
+    assert_eq!(preview["registry"]["name"], "extra");
+    assert_eq!(preview["registry"]["channel"], "latest");
+    assert_eq!(preview["registry"]["version"], "1.0.0");
+    assert_eq!(
+        preview["registry"]["version_uri"],
+        version_uri(STRANGER, "extra", "1.0.0")
+    );
+    assert_eq!(preview["registry"]["state"], "active");
+    assert!(
+        app.state.plugin_registry.get("extra").await.is_none(),
+        "a preview installs nothing"
+    );
+
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": STRANGER, "name": "extra" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.0.0");
+    assert_eq!(body["registry"]["channel"], "latest");
+
+    let row = row_of(&app, "extra").await.expect("a row is written");
+    assert_eq!(row["publisher_did"].as_deref(), Some(STRANGER));
+    assert_eq!(row["registry_did"].as_deref(), Some(STRANGER));
+    assert_eq!(row["registry_name"].as_deref(), Some("extra"));
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    assert_eq!(
+        row["version_uri"].as_deref(),
+        Some(version_uri(STRANGER, "extra", "1.0.0").as_str())
+    );
+    assert_eq!(
+        row["manifest_cid"].as_deref(),
+        Some("bafymanifestrecord1.0.0")
+    );
+    assert_eq!(
+        row["package_cid"].as_deref(),
+        Some(cid(&module_bytes("extra", "1.0.0")).as_str())
+    );
+    assert_eq!(
+        row["manifest_blob_cid"].as_deref(),
+        Some(cid(&manifest_bytes("extra", "1.0.0")).as_str())
+    );
+
+    let summary = summary_of(&app, "extra").await;
+    assert_eq!(summary["registry"]["did"], STRANGER);
+    assert_eq!(summary["registry"]["name"], "extra");
+    assert_eq!(summary["registry"]["channel"], "latest");
+    assert_eq!(summary["registry"]["unresolved"], false);
+}
+
+/// Naming a version pins the install to it: no channel is recorded. Naming
+/// both, a channel the registry has no track for, or neither project field
+/// is refused.
+#[tokio::test]
+#[serial]
+async fn an_install_by_version_is_pinned_and_a_bad_request_is_refused() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .publish("1.1.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+
+    for bad in [
+        json!({ "did": OFFICIAL, "name": "lua", "channel": "latest", "version": "1.0.0" }),
+        json!({ "did": OFFICIAL, "name": "lua", "channel": "stable" }),
+    ] {
+        let (status, body) = install_from_registry(&app, bad.clone()).await;
+        assert_eq!(status, 400, "{bad} should be refused: {body}");
+    }
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            json!({ "url": "https://example.com/m.json", "registry": { "did": OFFICIAL, "name": "lua" } }),
+        )
+        .await;
+    assert_eq!(status, 400, "a url and a registry project at once: {body}");
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            json!({ "registry": { "did": OFFICIAL, "name": "lua" }, "sha256": "abc" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a registry install is checked by CID, not sha256: {body}"
+    );
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "nope" })).await;
+    assert_eq!(status, 404, "{body}");
+    assert!(row_of(&app, "lua").await.is_none());
+
+    let (status, body) = install_from_registry(
+        &app,
+        json!({ "did": OFFICIAL, "name": "lua", "version": "1.0.0" }),
     )
     .await;
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-    let summary = http_summary(&app).await;
-    assert_eq!(summary["update_available"], true);
-    assert_eq!(summary["latest_version"], "1.1.0");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.0.0");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["registry_channel"], None);
     assert_eq!(
-        summary["latest_manifest_url"],
-        format!(
-            "{}/happyview-http-v1.1.0/manifest.json",
-            config.release_base
-        ),
-        "the update installs the official entry, not the stranger's"
+        row["version_uri"].as_deref(),
+        Some(version_uri(OFFICIAL, "lua", "1.0.0").as_str())
+    );
+
+    // Pinned, so a newer version on `latest` is not an update for it.
+    refresh(&app).await;
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], false);
+    assert!(summary["registry"]["channel"].is_null());
+}
+
+/// The registry serving module bytes whose CID is not the one the version
+/// names: the install is refused naming both CIDs, and nothing is written.
+#[tokio::test]
+#[serial]
+async fn bytes_that_do_not_match_their_cid_are_refused_and_nothing_is_written() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    let tampered = module_bytes("other", "6.6.6");
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .version("1.0.0")
+        .served_module = Some(tampered.clone());
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let expected = cid(&module_bytes("lua", "1.0.0"));
+    let actual = cid(&tampered);
+
+    for endpoint in ["/admin/plugins/preview", "/admin/plugins"] {
+        let (status, body) = app
+            .post_json_status(
+                endpoint,
+                json!({ "registry": { "did": OFFICIAL, "name": "lua" } }),
+            )
+            .await;
+        assert_eq!(status, 400, "{endpoint}: {body}");
+        let message = body["error"].as_str().unwrap();
+        assert!(
+            message.contains(&expected) && message.contains(&actual),
+            "{endpoint} should name both CIDs: {message}"
+        );
+    }
+    assert!(row_of(&app, "lua").await.is_none(), "no row is written");
+    assert!(app.state.plugin_registry.get("lua").await.is_none());
+}
+
+/// A manifest whose id isn't the project's name is refused: the project
+/// name is the plugin's id.
+#[tokio::test]
+#[serial]
+async fn a_manifest_naming_another_plugin_is_refused() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "lua").publish("1.0.0");
+    registry.serve().await;
+    // The registry's `lua` 1.0.0 answers with `notlua`'s manifest and module.
+    let mut view = version_view(&registry.projects[0], &registry.projects[0].versions[0]);
+    let manifest = manifest_bytes("notlua", "1.0.0");
+    let module = module_bytes("notlua", "1.0.0");
+    view["artifact"]["manifest"]["ref"]["$link"] = json!(cid(&manifest));
+    view["artifact"]["package"]["ref"]["$link"] = json!(cid(&module));
+    Mock::given(method("GET"))
+        .and(path(xrpc("resolveChannel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
+        .with_priority(1)
+        .mount(&registry.server)
+        .await;
+    for (c, bytes) in [(cid(&manifest), manifest), (cid(&module), module)] {
+        Mock::given(method("GET"))
+            .and(path(xrpc("getArtifact")))
+            .and(query_param("cid", c))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&registry.server)
+            .await;
+    }
+    let app = app_on(&registry).await;
+
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": STRANGER, "name": "lua" })).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("notlua"), "{body}");
+    assert!(row_of(&app, "lua").await.is_none());
+    assert!(app.state.plugin_registry.get("notlua").await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle.
+// ---------------------------------------------------------------------------
+
+/// A channel pointing at a version that isn't installable is refused on
+/// install with its state and reason, and once an installed plugin's channel
+/// moves to one, no update is offered and the summary says why.
+#[tokio::test]
+#[serial]
+async fn a_channel_on_a_version_that_is_not_installable_is_refused_and_not_offered() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    let http = registry.project(OFFICIAL, "http");
+    http.publish("2.0.0");
+    let gone = http.version("2.0.0");
+    gone.state = "retired";
+    gone.reason = Some("remote code execution".into());
+    let suspect = registry.project(OFFICIAL, "db");
+    suspect.publish("3.0.0").version("3.0.0").suspect = true;
+    registry.serve().await;
+    let app = app_on(&registry).await;
+
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "http" })).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("retired"), "{message}");
+    assert!(message.contains("remote code execution"), "{message}");
+    assert!(row_of(&app, "http").await.is_none());
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/preview",
+            json!({ "registry": { "did": OFFICIAL, "name": "db", "version": "3.0.0" } }),
+        )
+        .await;
+    assert_eq!(status, 400, "a suspect version is refused: {body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("suspect"),
+        "{body}"
+    );
+
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    // `latest` moves to a version the registry no longer holds.
+    let lua = registry.project(OFFICIAL, "lua");
+    lua.publish("1.1.0").version("1.1.0").state = "unavailable";
+    registry.serve().await;
+    refresh(&app).await;
+
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], false, "{summary}");
+    assert_eq!(summary["latest_version"], "1.1.0");
+    assert_eq!(summary["latest_version_installable"], false);
+    assert_eq!(summary["latest_state"], "unavailable");
+    assert_eq!(summary["registry"]["channel_state"], "unavailable");
+    assert_eq!(summary["registry"]["installed_state"], "active");
+    assert!(summary["pending_releases"].as_array().unwrap().is_empty());
+
+    // Nor can the update be forced.
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
+}
+
+/// An installed version its publisher later retires keeps running, and the
+/// listing flags it with the reason.
+#[tokio::test]
+#[serial]
+async fn an_installed_version_that_is_retired_stays_loaded_and_is_flagged() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let retired = registry.project(OFFICIAL, "lua").version("1.0.0");
+    retired.state = "retired";
+    retired.reason = Some("leaks tokens".into());
+    registry.serve().await;
+    refresh(&app).await;
+
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["version"], "1.0.0");
+    assert_eq!(summary["registry"]["installed_state"], "retired");
+    assert_eq!(summary["registry"]["installed_reason"], "leaks tokens");
+    assert!(app.state.plugin_registry.get("lua").await.is_some());
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/check-update", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["registry"]["installed_state"], "retired");
+}
+
+// ---------------------------------------------------------------------------
+// Updating and switching channel.
+// ---------------------------------------------------------------------------
+
+/// When the followed channel moves, the update is offered with the releases
+/// in between, and a reload installs the channel's new version.
+#[tokio::test]
+#[serial]
+async fn reload_updates_to_the_channels_new_version() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let lua = registry.project(OFFICIAL, "lua");
+    lua.publish("1.1.0").publish("1.2.0");
+    lua.release("1.3.0-beta.1");
+    lua.channel("beta", "1.3.0-beta.1");
+    registry.serve().await;
+    refresh(&app).await;
+
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true, "{summary}");
+    assert_eq!(summary["latest_version"], "1.2.0");
+    assert_eq!(summary["latest_version_installable"], true);
+    assert_eq!(summary["latest_state"], "active");
+    let pending: Vec<&str> = summary["pending_releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        pending,
+        vec!["1.2.0", "1.1.0"],
+        "only releases on latest's track"
+    );
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.2.0");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(
+        row["version_uri"].as_deref(),
+        Some(version_uri(OFFICIAL, "lua", "1.2.0").as_str())
+    );
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    assert_eq!(
+        row["package_cid"].as_deref(),
+        Some(cid(&module_bytes("lua", "1.2.0")).as_str())
+    );
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["version"], "1.2.0");
+    assert_eq!(summary["update_available"], false);
+}
+
+/// An install or update names the version its preview showed. When the
+/// channel moved since, the request is refused with 409 and nothing changes;
+/// naming the version it now resolves to goes through.
+#[tokio::test]
+#[serial]
+async fn an_install_or_update_is_refused_when_the_channel_moved_after_its_preview() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+
+    let (status, body) = install_from_registry(
+        &app,
+        json!({ "did": OFFICIAL, "name": "lua", "expected_version": "0.9.0" }),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(row_of(&app, "lua").await.is_none());
+    assert!(app.state.plugin_registry.get("lua").await.is_none());
+
+    let (status, body) = install_from_registry(
+        &app,
+        json!({ "did": OFFICIAL, "name": "lua", "expected_version": "1.0.0" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "expected_version": "1.0.1" } }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "expected_version": "1.1.0" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.1.0");
+}
+
+/// Switching channel is a reload naming the new channel: it installs that
+/// channel's version and follows it from then on. Naming a version pins.
+#[tokio::test]
+#[serial]
+async fn a_reload_switches_channel_or_pins_a_version() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    let lua = registry.project(OFFICIAL, "lua");
+    lua.publish("1.0.0");
+    lua.release("1.1.0-beta.1");
+    lua.channel("beta", "1.1.0-beta.1");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "channel": "beta" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.1.0-beta.1");
+    assert_eq!(
+        row_of(&app, "lua").await.unwrap()["registry_channel"].as_deref(),
+        Some("beta")
+    );
+
+    // Following beta, its next prerelease is the update.
+    let lua = registry.project(OFFICIAL, "lua");
+    lua.release("1.1.0-beta.2");
+    lua.channel("beta", "1.1.0-beta.2");
+    registry.serve().await;
+    refresh(&app).await;
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["registry"]["channel"], "beta");
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0-beta.2");
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "registry": { "version": "1.0.0" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.0.0");
+    assert_eq!(row_of(&app, "lua").await.unwrap()["registry_channel"], None);
+}
+
+/// A plain reload of a registry install fetches its own version again by
+/// CID, rather than treating the registry's artifact URL as a manifest URL.
+#[tokio::test]
+#[serial]
+async fn a_plain_reload_of_a_registry_install_refetches_its_version() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+    registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.0.0");
+    assert_eq!(
+        row_of(&app, "lua").await.unwrap()["registry_channel"].as_deref(),
+        Some("latest")
+    );
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins/lua/reload",
+            json!({ "url": "https://example.com/lua/manifest.json" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a registry install is reloaded from the registry: {body}"
     );
 }
 
-/// The same, with the walk listing nothing: no offer at all, rather than the
-/// stranger's.
+/// Installing over a registry plugin from a plain URL makes it a URL
+/// install: its registry identity goes with it.
 #[tokio::test]
 #[serial]
-async fn with_no_official_entry_an_official_install_is_offered_nothing() {
+async fn a_url_install_over_a_registry_install_clears_its_identity() {
     common::require_db!();
-    let (registry, gh) = a_stranger_publishes_an_official_slug(&[]).await;
-    let config = config_for(&registry, &gh);
-    let app = TestApp::new_with_registry_config(config.clone()).await;
-    app.install_fake_plugin_from(
-        "happyview-http",
-        "1.0.0",
-        &format!(
-            "{}/happyview-http-v1.0.0/happyview-http.wasm",
-            config.release_base
-        ),
-    )
-    .await;
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-    let summary = http_summary(&app).await;
-    assert_eq!(summary["update_available"], false);
-    assert!(summary["latest_version"].is_null());
-    assert!(summary["latest_manifest_url"].is_null());
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let url = serve_module(&app, "typed-lua", "lua", "2.0.0").await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins", json!({ "url": url }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let row = row_of(&app, "lua").await.unwrap();
+    for column in [
+        "registry_did",
+        "registry_name",
+        "registry_channel",
+        "version_uri",
+        "manifest_cid",
+        "package_cid",
+    ] {
+        assert_eq!(row[column], None, "{column} should be cleared");
+    }
+    assert!(summary_of(&app, "lua").await["registry"].is_null());
 }
 
-/// The same, through the on-demand check.
+/// The on-demand check reads the installed project itself.
 #[tokio::test]
 #[serial]
-async fn check_update_never_offers_a_strangers_package_to_an_official_install() {
+async fn check_update_reads_the_installed_project() {
     common::require_db!();
-    let (registry, gh) = a_stranger_publishes_an_official_slug(&[]).await;
-    let config = config_for(&registry, &gh);
-    let app = TestApp::new_with_registry_config(config.clone()).await;
-    app.install_fake_plugin_from(
-        "happyview-http",
-        "1.0.0",
-        &format!(
-            "{}/happyview-http-v1.0.0/happyview-http.wasm",
-            config.release_base
-        ),
-    )
-    .await;
-    // The cache names the stranger for this id, so the check reaches them.
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": STRANGER, "name": "extra" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(summary_of(&app, "extra").await["update_available"], false);
 
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_post(
-            "/admin/plugins/happyview-http/check-update",
-            app.admin_cookie(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
+    registry.project(STRANGER, "extra").publish("1.1.0");
+    registry.serve().await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins/extra/check-update", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["update_available"], true);
+    assert_eq!(body["latest_version"], "1.1.0");
+    assert_eq!(body["registry"]["channel_state"], "active");
+    let summary = summary_of(&app, "extra").await;
+    assert_eq!(summary["update_available"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Two publishers, one name. The official one holds the catalogue id, and an
+// install stays with the publisher it came from.
+// ---------------------------------------------------------------------------
+
+/// The official project wins the id, and is what an official install is
+/// offered; the stranger's newer version never is.
+#[tokio::test]
+#[serial]
+async fn a_strangers_project_is_never_the_update_for_an_official_install() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "lua").publish("9.0.0");
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+    refresh(&app).await;
+    assert_eq!(
+        app.state.official_registry.read().await.plugins["lua"]
+            .publisher_did
+            .as_deref(),
+        Some(OFFICIAL),
+        "the official project wins the id"
+    );
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.1.0");
+    assert_eq!(
+        recorded_publisher(&app, "lua").await.as_deref(),
+        Some(OFFICIAL)
+    );
+}
+
+/// A registry where the stranger's `lua` is listed and the official one is
+/// either not listed (past the page) or listed with unreadable versions.
+async fn registry_with_only_a_strangers_lua(official_versions_fail: bool) -> Registry {
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "lua").publish("9.0.0");
+    let official = registry.project(OFFICIAL, "lua");
+    official.publish("1.0.0");
+    if official_versions_fail {
+        official.versions_fail = true;
+    } else {
+        official.listed = false;
+    }
+    registry.serve().await;
+    registry
+}
+
+/// Refresh, check the cache holds only the stranger's `lua`, and that the
+/// official install is offered nothing from it.
+async fn refresh_and_expect_no_offer(app: &TestApp, official_latest: Value) {
+    refresh(app).await;
+    assert_eq!(
+        app.state.official_registry.read().await.plugins["lua"]
+            .publisher_did
+            .as_deref(),
+        Some(STRANGER),
+        "the scenario should leave only the stranger's entry"
+    );
+    let summary = summary_of(app, "lua").await;
+    assert_eq!(summary["update_available"], false);
+    // The official project, if the install was attached to it, is its own
+    // project's version; the stranger's is never shown.
+    assert_eq!(summary["latest_version"], official_latest);
+    assert!(summary["pending_releases"].as_array().unwrap().is_empty());
+}
+
+/// The official project sits past the registry's listing, so the catalogue
+/// holds only the stranger's `lua`: an official URL install, and an official
+/// registry install, are offered nothing from it.
+#[tokio::test]
+#[serial]
+async fn a_strangers_lua_is_not_offered_when_the_official_one_is_not_listed() {
+    common::require_db!();
+    let registry = registry_with_only_a_strangers_lua(false).await;
+    let app = an_official_lua_install(registry.config()).await;
+    refresh_and_expect_no_offer(&app, Value::Null).await;
+}
+
+/// The official project is listed but its versions cannot be read, so it
+/// yields no entry.
+#[tokio::test]
+#[serial]
+async fn a_strangers_lua_is_not_offered_when_the_official_entry_fails_to_build() {
+    common::require_db!();
+    let registry = registry_with_only_a_strangers_lua(true).await;
+    let app = an_official_lua_install(registry.config()).await;
+    refresh_and_expect_no_offer(&app, Value::Null).await;
+}
+
+/// A restart: the cache starts empty. The on-demand check for a URL install,
+/// which reaches the stranger through the cache, offers nothing either.
+#[tokio::test]
+#[serial]
+async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
+    common::require_db!();
+    let registry = registry_with_only_a_strangers_lua(false).await;
+    let app = an_official_lua_install(registry.config()).await;
+    app.state.official_registry.write().await.plugins.clear();
+    refresh_and_expect_no_offer(&app, Value::Null).await;
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/check-update", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], false);
     assert!(body["latest_version"].is_null());
-    assert!(body["latest_manifest_url"].is_null());
+}
+
+/// An official registry install, while the catalogue holds the stranger's
+/// `lua`: the listing judges it by its own project, which the refresh reads
+/// on its own, and never offers the stranger's version. The on-demand check
+/// reads the official project too.
+#[tokio::test]
+#[serial]
+async fn an_official_install_is_judged_by_its_own_project_when_a_stranger_holds_the_name() {
+    common::require_db!();
+    let mut registry = registry_with_only_a_strangers_lua(false).await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": OFFICIAL, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    registry.project(OFFICIAL, "lua").publish("1.1.0");
+    registry.serve().await;
+    refresh(&app).await;
+    assert_eq!(
+        app.state.official_registry.read().await.plugins["lua"]
+            .publisher_did
+            .as_deref(),
+        Some(STRANGER),
+        "the catalogue lists only the stranger's lua"
+    );
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true, "{summary}");
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    registry.project(OFFICIAL, "lua").publish("1.2.0");
+    registry.serve().await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/check-update", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["update_available"], true);
+    assert_eq!(body["latest_version"], "1.2.0");
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.2.0");
+}
+
+/// A stranger's install of `lua`, whose name the official project holds in
+/// the catalogue, still shows its own version's state: retired here. Whether
+/// the registry lists the stranger's project or not, the refresh reads it.
+#[tokio::test]
+#[serial]
+async fn a_shadowed_strangers_install_shows_its_own_lifecycle() {
+    common::require_db!();
+    for listed in [true, false] {
+        let mut registry = Registry::start().await;
+        registry.project(STRANGER, "lua").publish("1.0.0");
+        registry.project(OFFICIAL, "lua").publish("2.0.0");
+        registry.serve().await;
+        let app = app_on(&registry).await;
+        let (status, body) =
+            install_from_registry(&app, json!({ "did": STRANGER, "name": "lua" })).await;
+        assert_eq!(status, 200, "{body}");
+
+        let theirs = registry.project(STRANGER, "lua");
+        theirs.listed = listed;
+        theirs.version("1.0.0").state = "retired";
+        registry.serve().await;
+        app.state.official_registry.write().await.installed.clear();
+        refresh(&app).await;
+        assert_eq!(
+            app.state.official_registry.read().await.plugins["lua"]
+                .publisher_did
+                .as_deref(),
+            Some(OFFICIAL),
+            "the official project holds the name"
+        );
+
+        let summary = summary_of(&app, "lua").await;
+        assert_eq!(
+            summary["registry"]["installed_state"], "retired",
+            "listed: {listed}: {summary}"
+        );
+        assert_eq!(summary["registry"]["channel_state"], "retired");
+        assert_eq!(summary["update_available"], false);
+    }
+}
+
+/// A stranger's install of a name the official publisher also uses is never
+/// offered the official project, and its reload reads its own project.
+#[tokio::test]
+#[serial]
+async fn a_strangers_install_is_never_updated_from_the_official_project() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "lua").publish("1.0.0");
+    registry.project(OFFICIAL, "lua").publish("2.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": STRANGER, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+    refresh(&app).await;
+
+    // Judged by its own project, not the official 2.0.0 holding the name.
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], false);
+    assert_eq!(summary["latest_version"], "1.0.0");
+
+    registry.project(STRANGER, "lua").publish("1.0.1");
+    registry.serve().await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], "1.0.1", "its own publisher's version");
+    assert_eq!(
+        recorded_publisher(&app, "lua").await.as_deref(),
+        Some(STRANGER)
+    );
+}
+
+/// A reload's project must be the recorded publisher's: a registry install
+/// whose recorded publisher is someone else is refused with 409.
+#[tokio::test]
+#[serial]
+async fn a_registry_reload_from_another_publisher_is_refused() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let (status, body) =
+        install_from_registry(&app, json!({ "did": STRANGER, "name": "lua" })).await;
+    assert_eq!(status, 200, "{body}");
+    // The row says the official publisher installed it; the project it
+    // follows is the stranger's.
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_plugins SET publisher_did = ? WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(OFFICIAL)
+        .bind("lua")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 409, "{body}");
 }
 
 // ---------------------------------------------------------------------------
-// An install records the publisher of the catalogue entry it came from, and
-// is offered updates only from that publisher.
+// URL installs: no publisher, and no updates without a registry project.
 // ---------------------------------------------------------------------------
-
-const STRANGER: &str = "did:plc:someoneelse";
 
 /// Serve a library plugin's manifest and module under `/<dir>/` on the app's
 /// mock server, and answer the manifest URL.
@@ -884,76 +1311,68 @@ async fn serve_module(app: &TestApp, dir: &str, id: &str, version: &str) -> Stri
         .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
         .mount(&app.mock_server)
         .await;
-    let wasm = wat::parse_str(
-        "(module (memory (export \"memory\") 1) \
-         (func (export \"alloc\") (param i32) (result i32) i32.const 8) \
-         (func (export \"dealloc\") (param i32 i32)))",
-    )
-    .unwrap();
     Mock::given(method("GET"))
         .and(path(format!("/{dir}/plugin.wasm")))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(wasm, "application/wasm"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(module_bytes(id, version), "application/wasm"),
+        )
         .mount(&app.mock_server)
         .await;
     format!("{}/{dir}/manifest.json", app.mock_server.uri())
 }
 
-/// A catalogue entry: a GitHub-walk one when `publisher` is `None`, else a
-/// registry one by that publisher.
-fn catalogue_entry(
-    id: &str,
-    publisher: Option<&str>,
-    manifest_url: &str,
-    versions: &[&str],
-) -> happyview::plugin::official_registry::OfficialPlugin {
-    use happyview::plugin::official_registry::{OFFICIAL_PUBLISHER_DID, ReleaseEntry};
-    happyview::plugin::official_registry::OfficialPlugin {
+/// An official catalogue entry for `id` whose `latest` is the first of
+/// `versions`, put straight in the cache.
+async fn put_in_catalogue(app: &TestApp, id: &str, versions: &[&str]) {
+    use happyview::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
+    let entry = CatalogueEntry {
         id: id.into(),
-        publisher_did: publisher.map(str::to_owned),
-        official: publisher.is_none_or(|p| p == OFFICIAL_PUBLISHER_DID),
+        publisher_did: Some(OFFICIAL.into()),
+        official: true,
         name: id.into(),
         description: None,
         icon_url: None,
-        latest_version: versions[0].into(),
-        manifest_url: manifest_url.into(),
-        wasm_url: manifest_url.replace("manifest.json", "plugin.wasm"),
+        plugin_type: "library".into(),
+        channels: [(
+            "latest".to_string(),
+            ChannelEntry {
+                version: versions[0].into(),
+                state: "active".into(),
+                installable: true,
+                availability: "available".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        latest_version: Some(versions[0].into()),
+        lifecycle_state: "active".into(),
         releases: versions
             .iter()
             .map(|v| ReleaseEntry {
                 version: (*v).into(),
                 name: format!("{id}-v{v}"),
-                published_at: "2026-10-01T00:00:00Z".into(),
-                body: String::new(),
+                published_at: Some("2026-10-01T00:00:00Z".into()),
+                body: None,
+                state: "active".into(),
+                reason: None,
+                suspect: false,
+                installable: true,
+                availability: "available".into(),
+                version_uri: String::new(),
+                manifest_cid: String::new(),
+                package_cid: String::new(),
+                manifest_blob_cid: String::new(),
             })
             .collect(),
         sections: Default::default(),
         banner_url: None,
-    }
-}
-
-async fn put_in_catalogue(
-    app: &TestApp,
-    entry: happyview::plugin::official_registry::OfficialPlugin,
-) {
+    };
     app.state
         .official_registry
         .write()
         .await
         .plugins
         .insert(entry.id.clone(), entry);
-}
-
-async fn recorded_publisher(app: &TestApp, id: &str) -> Option<String> {
-    let sql = happyview::db::adapt_sql(
-        "SELECT publisher_did FROM happyview_plugins WHERE id = ?",
-        app.state.db_backend,
-    );
-    let (publisher,): (Option<String>,) = happyview::db::query_as(&sql)
-        .bind(id)
-        .fetch_one(&app.state.db)
-        .await
-        .unwrap();
-    publisher
 }
 
 async fn install(app: &TestApp, url: &str) {
@@ -963,320 +1382,333 @@ async fn install(app: &TestApp, url: &str) {
     assert_eq!(status, 200, "{body}");
 }
 
-async fn summary_of(app: &TestApp, id: &str) -> Value {
-    app.get_json("/admin/plugins")
-        .await
-        .get("plugins")
-        .and_then(|p| p.as_array())
-        .and_then(|p| p.iter().find(|p| p["id"] == id).cloned())
-        .expect("the installed plugin should be listed")
-}
-
-/// The server derives the publisher from the catalogue entry whose manifest
-/// URL was installed: a registry entry's account, the official DID for a
-/// GitHub-walk entry, and nothing for a URL the catalogue does not offer. A
-/// reload to a new URL derives it again.
+/// A URL is no publisher's offer: a URL install records no publisher,
+/// clearing one an earlier install recorded, and until it is attached to a
+/// registry project it is offered nothing, whatever the catalogue holds
+/// under its id.
 #[tokio::test]
 #[serial]
-async fn an_install_records_the_publisher_of_its_catalogue_entry() {
+async fn a_url_install_records_no_publisher_and_is_offered_nothing() {
     common::require_db!();
-    let app = TestApp::new_with_persisted_plugins(
-        happyview::plugin::official_registry::RegistryConfig::production(),
-    )
-    .await;
-    let official = happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID;
+    let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
+    put_in_catalogue(&app, "lua", &["2.0.0", "1.0.0"]).await;
+    let url = serve_module(&app, "lua", "lua", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "lua").await, None);
 
-    let extra = serve_module(&app, "extra", "extra", "1.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("extra", Some(STRANGER), &extra, &["1.0.0"]),
-    )
-    .await;
-    install(&app, &extra).await;
-    assert_eq!(
-        recorded_publisher(&app, "extra").await.as_deref(),
-        Some(STRANGER)
-    );
-
-    let walked = serve_module(&app, "walked", "walked", "1.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("walked", None, &walked, &["1.0.0"])).await;
-    install(&app, &walked).await;
-    assert_eq!(
-        recorded_publisher(&app, "walked").await.as_deref(),
-        Some(official)
-    );
-
-    let typed = serve_module(&app, "typed", "typed", "1.0.0").await;
-    install(&app, &typed).await;
-    assert!(recorded_publisher(&app, "typed").await.is_none());
-
-    let typed_official = serve_module(&app, "typed-v2", "typed", "1.1.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("typed", None, &typed_official, &["1.1.0"]),
-    )
-    .await;
-    let (status, body) = app
-        .post_json_status(
-            "/admin/plugins/typed/reload",
-            json!({ "url": typed_official }),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        recorded_publisher(&app, "typed").await.as_deref(),
-        Some(official)
-    );
-}
-
-/// A third party's install of a slug the official publisher also uses is never
-/// offered the official release.
-#[tokio::test]
-#[serial]
-async fn a_third_party_install_is_never_offered_the_official_entry() {
-    common::require_db!();
-    let app = TestApp::new_with_persisted_plugins(
-        happyview::plugin::official_registry::RegistryConfig::production(),
-    )
-    .await;
-    let theirs = serve_module(&app, "their-lua", "lua", "1.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("lua", Some(STRANGER), &theirs, &["1.0.0"]),
-    )
-    .await;
-    install(&app, &theirs).await;
-
-    put_in_catalogue(
-        &app,
-        catalogue_entry(
-            "lua",
-            None,
-            "https://elsewhere.example/lua/manifest.json",
-            &["2.0.0"],
-        ),
-    )
-    .await;
     let summary = summary_of(&app, "lua").await;
     assert_eq!(summary["update_available"], false);
     assert!(summary["latest_version"].is_null());
-    assert!(summary["latest_manifest_url"].is_null());
+    assert!(summary["pending_releases"].as_array().unwrap().is_empty());
+
+    set_column(&app, "lua", "publisher_did", STRANGER).await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "lua").await, None);
 }
 
-/// Install the official `lua` from a GitHub-walk entry, at a URL the fallback
-/// URL rule would not call official, so only the recorded publisher can keep
-/// a stranger's release away from it, with stranger packages naming the same
-/// artifact under other ids. Answers the app.
-async fn an_official_lua_install(
-    config: happyview::plugin::official_registry::RegistryConfig,
-) -> TestApp {
+/// Install `lua` from a URL, as the official publisher's plugin was before
+/// the registry, recording no publisher. Answers the app.
+async fn an_official_lua_install(config: RegistryConfig) -> TestApp {
     let app = TestApp::new_with_persisted_plugins(config).await;
     let ours = serve_module(&app, "our-lua", "lua", "1.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("lua", None, &ours, &["1.0.0"])).await;
-    // Packages naming the official artifact under other ids: the install
-    // still records `lua`'s own publisher.
-    for n in 0..16 {
-        put_in_catalogue(
-            &app,
-            catalogue_entry(&format!("notlua{n}"), Some(STRANGER), &ours, &["1.0.0"]),
-        )
-        .await;
-    }
     install(&app, &ours).await;
-    assert_eq!(
-        recorded_publisher(&app, "lua").await.as_deref(),
-        Some(happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
-    );
     app
 }
 
-/// A registry with the stranger's `lua`, and the official one listed too
-/// when `official_listed`, whose releases answer `official_releases`.
-async fn registry_with_a_strangers_lua(
-    official_listed: bool,
-    official_releases: u16,
-) -> MockServer {
-    let official = happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID;
-    let registry = MockServer::start().await;
-    let package = |did: &str, latest: &str| {
-        json!({
-            "uri": format!("at://{did}/at.happyproto.plugin.profile/lua"),
-            "did": did,
-            "status": "active",
-            "latestVersion": latest,
-            "record": { "name": "lua" }
-        })
-    };
-    let mut packages = vec![package(STRANGER, "9.0.0")];
-    if official_listed {
-        packages.push(package(official, "1.1.0"));
-    }
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.searchPackages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "packages": packages })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.listReleases"))
-        .and(query_param("did", STRANGER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "releases": [{
-                "status": "active",
-                "record": {
-                    "version": "9.0.0",
-                    "artifacts": { "package": { "url": "https://elsewhere.example/lua/plugin.wasm" } }
-                }
-            }]
-        })))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.listReleases"))
-        .and(query_param("did", official))
-        .respond_with(ResponseTemplate::new(official_releases))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getPackage"))
-        .and(query_param("actor", STRANGER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(package(STRANGER, "9.0.0")))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getPackage"))
-        .and(query_param("actor", official))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "PackageNotFound", "message": "no such package"
-        })))
-        .mount(&registry)
-        .await;
-    registry
-}
-
-/// Refresh the catalogue from the app's own sources, then check the cache holds only the stranger's
-/// `lua` and that the official install is offered nothing from it.
-async fn github_walk_answering(status: u16) -> MockServer {
-    let gh = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/repos/happyproto/plugins/releases"))
-        .respond_with(ResponseTemplate::new(status).set_body_json(json!([])))
-        .mount(&gh)
-        .await;
-    gh
-}
-
-async fn refresh_and_expect_no_offer(app: &TestApp) {
-    happyview::plugin::official_registry::refresh_full(
-        &app.state.http,
-        &app.state.official_registry_config,
-        &app.state.official_registry,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        app.state.official_registry.read().await.plugins["lua"]
-            .publisher_did
-            .as_deref(),
-        Some(STRANGER),
-        "the scenario should leave only the stranger's entry"
-    );
-
-    let summary = summary_of(app, "lua").await;
-    assert_eq!(summary["update_available"], false);
-    assert!(summary["latest_version"].is_null());
-    assert!(summary["latest_manifest_url"].is_null());
-}
-
-/// The official package sits past the registry's first page, so the listing
-/// shows only the stranger's.
+/// A recorded install is never moved to another URL, since no URL can be
+/// checked against its publisher: the reload is refused with 409 and the
+/// install left as it was. Reloading the URL it has still works, and an
+/// unrecorded install may move.
 #[tokio::test]
 #[serial]
-async fn a_strangers_lua_is_not_offered_when_the_official_one_is_past_the_page() {
+async fn reload_refuses_a_new_url_for_a_recorded_install() {
     common::require_db!();
-    let registry = registry_with_a_strangers_lua(false, 200).await;
-    let gh = github_walk_answering(200).await;
-    let app = an_official_lua_install(config_for(&registry, &gh)).await;
-    refresh_and_expect_no_offer(&app).await;
-}
+    let app = an_official_lua_install(RegistryConfig::production()).await;
+    set_column(&app, "lua", "publisher_did", OFFICIAL).await;
 
-/// The official package is listed but its releases cannot be read, so it
-/// yields no entry.
-#[tokio::test]
-#[serial]
-async fn a_strangers_lua_is_not_offered_when_the_official_entry_fails_to_build() {
-    common::require_db!();
-    let registry = registry_with_a_strangers_lua(true, 503).await;
-    let gh = github_walk_answering(200).await;
-    let app = an_official_lua_install(config_for(&registry, &gh)).await;
-    refresh_and_expect_no_offer(&app).await;
-}
-
-/// A restart: the cache starts empty and the GitHub walk is unreachable, so
-/// nothing official is carried over. The on-demand check, which then reaches
-/// the stranger through the cache, offers nothing either.
-#[tokio::test]
-#[serial]
-async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
-    common::require_db!();
-    let registry = registry_with_a_strangers_lua(false, 200).await;
-    let gh = github_walk_answering(503).await;
-    let app = an_official_lua_install(config_for(&registry, &gh)).await;
-    app.state.official_registry.write().await.plugins.clear();
-    refresh_and_expect_no_offer(&app).await;
-
+    let elsewhere = serve_module(&app, "their-lua-v2", "lua", "2.0.0").await;
     let (status, body) = app
-        .post_json_status("/admin/plugins/lua/check-update", json!({}))
-        .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["update_available"], false);
-    assert!(body["latest_version"].is_null());
-    assert!(body["latest_manifest_url"].is_null());
-}
-
-/// A recorded install is never re-bound to another publisher by a reload:
-/// a URL the catalogue offers under this id from someone else is refused
-/// with 409 and the install is left as it was, while the recorded
-/// publisher's own new release reloads.
-#[tokio::test]
-#[serial]
-async fn reload_refuses_a_url_from_another_publisher() {
-    common::require_db!();
-    let app =
-        an_official_lua_install(happyview::plugin::official_registry::RegistryConfig::production())
-            .await;
-
-    let theirs = serve_module(&app, "their-lua-v2", "lua", "2.0.0").await;
-    put_in_catalogue(
-        &app,
-        catalogue_entry("lua", Some(STRANGER), &theirs, &["2.0.0"]),
-    )
-    .await;
-    let (status, body) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": theirs }))
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": elsewhere }))
         .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(
         recorded_publisher(&app, "lua").await.as_deref(),
-        Some(happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
+        Some(OFFICIAL)
     );
     assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
 
-    // A hand-typed URL is no publisher's offer either.
-    let typed = serve_module(&app, "typed-lua", "lua", "2.0.0").await;
-    let (status, _) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": typed }))
-        .await;
-    assert_eq!(status, 409);
-
-    let ours = serve_module(&app, "our-lua-v2", "lua", "2.0.0").await;
-    put_in_catalogue(&app, catalogue_entry("lua", None, &ours, &["2.0.0"])).await;
     let (status, body) = app
-        .post_json_status("/admin/plugins/lua/reload", json!({ "url": ours }))
+        .post_json_status("/admin/plugins/lua/reload", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(summary_of(&app, "lua").await["version"], "2.0.0");
-    assert_eq!(
-        recorded_publisher(&app, "lua").await.as_deref(),
-        Some(happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
+
+    let unrecorded = an_official_lua_install(RegistryConfig::production()).await;
+    let moved = serve_module(&unrecorded, "moved-lua", "lua", "2.0.0").await;
+    let (status, body) = unrecorded
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": moved }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(summary_of(&unrecorded, "lua").await["version"], "2.0.0");
+    assert_eq!(recorded_publisher(&unrecorded, "lua").await, None);
+}
+
+// ---------------------------------------------------------------------------
+// Plugins installed from a GitHub release URL before the registry existed.
+// ---------------------------------------------------------------------------
+
+async fn unresolved_flag(app: &TestApp, id: &str) -> i64 {
+    let sql = happyview::db::adapt_sql(
+        "SELECT CAST(registry_unresolved AS BIGINT) FROM happyview_plugins WHERE id = ?",
+        app.state.db_backend,
     );
+    let row: (i64,) = happyview::db::query_as(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn set_column(app: &TestApp, id: &str, column: &str, value: &str) {
+    let sql = happyview::db::adapt_sql(
+        &format!("UPDATE happyview_plugins SET {column} = ? WHERE id = ?"),
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(value)
+        .bind(id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+/// A URL-installed official plugin is attached to its registry project
+/// without touching its bytes, then updates through the registry by CID.
+#[tokio::test]
+#[serial]
+async fn a_url_install_of_an_official_plugin_is_attached_to_its_registry_project() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .publish("1.1.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "alpha-lua", "lua", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(row_of(&app, "lua").await.unwrap()["registry_did"], None);
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_name"].as_deref(), Some("lua"));
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(OFFICIAL, "lua", "1.0.0"))
+    );
+    // The installed bytes came from the URL and stay that way.
+    for column in [
+        "manifest_cid",
+        "manifest_blob_cid",
+        "package_cid",
+        "manifest_url",
+    ] {
+        assert_eq!(row[column], None, "{column} should stay empty");
+    }
+    assert_eq!(unresolved_flag(&app, "lua").await, 0);
+
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["registry"]["did"], OFFICIAL);
+    assert_eq!(summary["registry"]["channel"], "latest");
+    assert_eq!(summary["registry"]["installed_state"], "active");
+    assert_eq!(summary["registry"]["unresolved"], false);
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    // A bare reload keeps the URL it was installed from.
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["package_cid"], None);
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+
+    // Applying the update installs by CID and fills the artifact columns.
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "registry": {} }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(
+        row["package_cid"].clone(),
+        Some(cid(&module_bytes("lua", "1.1.0")))
+    );
+    assert_eq!(
+        row["manifest_blob_cid"].clone(),
+        Some(cid(&manifest_bytes("lua", "1.1.0")))
+    );
+    assert!(row["manifest_url"].is_some());
+    assert!(row["manifest_cid"].is_some());
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(OFFICIAL, "lua", "1.1.0"))
+    );
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["version"], "1.1.0");
+    assert_eq!(summary["update_available"], false);
+}
+
+/// A plugin the registry has no project for is flagged and left running,
+/// offered nothing. Each refresh checks it again, so it attaches once its
+/// project is published; a matched row keeps what it was given.
+#[tokio::test]
+#[serial]
+async fn a_flagged_plugin_attaches_once_its_project_appears() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(OFFICIAL, "lua").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let mystery = serve_module(&app, "mystery", "mystery", "1.0.0").await;
+    install(&app, &mystery).await;
+    let lua = serve_module(&app, "alpha-lua", "lua", "1.0.0").await;
+    install(&app, &lua).await;
+
+    refresh(&app).await;
+
+    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
+    assert_eq!(row_of(&app, "mystery").await.unwrap()["registry_did"], None);
+    assert!(app.state.plugin_registry.get("mystery").await.is_some());
+    let summary = summary_of(&app, "mystery").await;
+    assert_eq!(summary["registry"]["unresolved"], true);
+    assert_eq!(summary["registry"]["did"], Value::Null);
+    assert_eq!(summary["update_available"], false);
+    assert_eq!(unresolved_flag(&app, "lua").await, 0);
+
+    // A refresh that still finds no project leaves the flag as it was.
+    refresh(&app).await;
+    assert_eq!(unresolved_flag(&app, "mystery").await, 1);
+
+    // The registry now has the project, and the operator moved the match.
+    registry
+        .project(OFFICIAL, "mystery")
+        .publish("1.0.0")
+        .publish("1.1.0");
+    registry.serve().await;
+    set_column(&app, "lua", "registry_channel", "beta").await;
+    refresh(&app).await;
+
+    assert_eq!(unresolved_flag(&app, "mystery").await, 0);
+    let row = row_of(&app, "mystery").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_channel"].as_deref(), Some("latest"));
+    let summary = summary_of(&app, "mystery").await;
+    assert_eq!(summary["registry"]["unresolved"], false);
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0");
+
+    let lua = row_of(&app, "lua").await.unwrap();
+    assert_eq!(lua["registry_channel"].as_deref(), Some("beta"));
+    assert_eq!(lua["registry_did"].as_deref(), Some(OFFICIAL));
+}
+
+/// A prerelease installed from a URL attaches to the channel it was
+/// published on, and until its first install by CID is offered only a newer
+/// version: the alpha that follows it, never the older `latest`.
+#[tokio::test]
+#[serial]
+async fn an_attached_prerelease_follows_its_channel_and_is_never_offered_an_older_release() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry
+        .project(OFFICIAL, "lua")
+        .publish("1.0.0")
+        .release("1.1.0-alpha.2");
+    registry.project(OFFICIAL, "lua").release("1.1.0-alpha.3");
+    registry
+        .project(OFFICIAL, "lua")
+        .channel("alpha", "1.1.0-alpha.3");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "alpha-lua", "lua", "1.1.0-alpha.2").await;
+    install(&app, &url).await;
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "lua").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(OFFICIAL));
+    assert_eq!(row["registry_channel"].as_deref(), Some("alpha"));
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], true);
+    assert_eq!(summary["latest_version"], "1.1.0-alpha.3");
+    let pending: Vec<&str> = summary["pending_releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(pending, vec!["1.1.0-alpha.3"]);
+
+    // Moved onto `latest` by hand, it still isn't offered the older 1.0.0.
+    set_column(&app, "lua", "registry_channel", "latest").await;
+    let summary = summary_of(&app, "lua").await;
+    assert_eq!(summary["update_available"], false);
+    assert_eq!(summary["latest_version"], "1.0.0");
+}
+
+/// With no recorded publisher the official one is asked, and only it: a
+/// stranger's project of the same name is never joined.
+#[tokio::test]
+#[serial]
+async fn an_unrecorded_install_is_never_attached_to_a_strangers_project() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    let url = serve_module(&app, "extra", "extra", "1.0.0").await;
+    install(&app, &url).await;
+    assert_eq!(recorded_publisher(&app, "extra").await, None);
+
+    refresh(&app).await;
+
+    assert_eq!(row_of(&app, "extra").await.unwrap()["registry_did"], None);
+    assert_eq!(unresolved_flag(&app, "extra").await, 1);
+}
+
+/// A recorded publisher decides whose project the plugin is matched to, and
+/// a registry that can't be read neither matches nor flags.
+#[tokio::test]
+#[serial]
+async fn a_recorded_publisher_decides_whose_project_a_url_install_joins() {
+    common::require_db!();
+    let mut registry = Registry::start().await;
+    registry.project(STRANGER, "extra").publish("2.0.0");
+    registry.project(OFFICIAL, "extra").publish("1.0.0");
+    registry.project(STRANGER, "gone").publish("1.0.0");
+    registry.serve().await;
+    let app = app_on(&registry).await;
+    for id in ["extra", "gone"] {
+        let url = serve_module(&app, id, id, "2.0.0").await;
+        install(&app, &url).await;
+        set_column(&app, id, "publisher_did", STRANGER).await;
+    }
+    // The stranger's `gone` is not served at all.
+    registry.projects.retain(|p| p.name != "gone");
+    registry.serve().await;
+
+    refresh(&app).await;
+
+    let row = row_of(&app, "extra").await.unwrap();
+    assert_eq!(row["registry_did"].as_deref(), Some(STRANGER));
+    assert_eq!(
+        row["version_uri"].clone(),
+        Some(version_uri(STRANGER, "extra", "2.0.0"))
+    );
+    assert_eq!(unresolved_flag(&app, "gone").await, 1);
 }

@@ -12,6 +12,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
+use crate::plugin::registry_source::TRACKS;
+
 pub const PROJECT_FILE: &str = "happyview.toml";
 
 /// Which binary entry point is reading the file. `[dev]` applies only to
@@ -28,10 +30,10 @@ pub enum ConfigMode {
 pub struct ProjectConfig {
     pub happyview: HappyviewSection,
     pub instance: InstanceSection,
-    #[serde(deserialize_with = "de_interpreter_versions")]
-    pub interpreters: BTreeMap<String, String>,
-    #[serde(deserialize_with = "de_library_versions")]
-    pub libraries: BTreeMap<String, String>,
+    #[serde(deserialize_with = "de_interpreter_plugins")]
+    pub interpreters: BTreeMap<String, PluginEntry>,
+    #[serde(deserialize_with = "de_library_plugins")]
+    pub libraries: BTreeMap<String, PluginEntry>,
     pub dev: DevSection,
     pub network_lexicons: NetworkLexiconsSection,
     pub labels: LabelsSection,
@@ -347,23 +349,153 @@ where
         .map(|map| map.into_iter().map(|(k, v)| (k.0, v)).collect())
 }
 
-fn de_versions<'de, D: Deserializer<'de>, K: Rule>(
+fn de_plugins<'de, D: Deserializer<'de>, K: Rule>(
     d: D,
-) -> Result<BTreeMap<String, String>, D::Error> {
-    BTreeMap::<Checked<K>, Checked<NonEmptyRule>>::deserialize(d)
-        .map(|map| map.into_iter().map(|(k, v)| (k.0, v.0)).collect())
+) -> Result<BTreeMap<String, PluginEntry>, D::Error> {
+    struct PluginsVisitor<K>(PhantomData<K>);
+
+    impl<'de, K: Rule> serde::de::Visitor<'de> for PluginsVisitor<K> {
+        type Value = BTreeMap<String, PluginEntry>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a table of plugin entries")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some(key) = map.next_key::<Checked<K>>()? {
+                // The entry is checked while its value is being read so a
+                // failure carries the value's own line, and the key is in
+                // hand to name in the message.
+                let entry = map.next_value_seed(EntrySeed { key: &key.0 })?;
+                entries.insert(key.0, entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    d.deserialize_map(PluginsVisitor::<K>(PhantomData))
 }
 
-fn de_interpreter_versions<'de, D: Deserializer<'de>>(
+fn de_interpreter_plugins<'de, D: Deserializer<'de>>(
     d: D,
-) -> Result<BTreeMap<String, String>, D::Error> {
-    de_versions::<D, IdentifierRule>(d)
+) -> Result<BTreeMap<String, PluginEntry>, D::Error> {
+    de_plugins::<D, IdentifierRule>(d)
 }
 
-fn de_library_versions<'de, D: Deserializer<'de>>(
+fn de_library_plugins<'de, D: Deserializer<'de>>(
     d: D,
-) -> Result<BTreeMap<String, String>, D::Error> {
-    de_versions::<D, NonEmptyRule>(d)
+) -> Result<BTreeMap<String, PluginEntry>, D::Error> {
+    de_plugins::<D, NonEmptyRule>(d)
+}
+
+/// A plugin a project names: a registry project, followed by channel or
+/// pinned to a version.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginEntry {
+    /// The publisher's DID.
+    pub did: String,
+    /// The project name in that publisher's registry.
+    pub name: String,
+    pub channel: Option<String>,
+    pub version: Option<String>,
+}
+
+struct EntrySeed<'a> {
+    key: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EntrySeed<'_> {
+    type Value = PluginEntry;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<PluginEntry, D::Error> {
+        struct EntryVisitor<'a>(&'a str);
+
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor<'_> {
+            type Value = PluginEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a table with did, name and channel or version")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<PluginEntry, E> {
+                let key = self.0;
+                Err(E::custom(format!(
+                    "{key} = \"…\" is the old form; name the plugin as {{ did = \"…\", name = \"…\", channel = \"latest\" }} (hpy happyview add writes it)"
+                )))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PluginEntry, A::Error> {
+                let entry =
+                    PluginEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                entry.check(self.0).map_err(A::Error::custom)?;
+                Ok(entry)
+            }
+        }
+
+        d.deserialize_any(EntryVisitor(self.key))
+    }
+}
+
+impl PluginEntry {
+    fn check(&self, key: &str) -> Result<(), String> {
+        DidRule::check(&self.did).map_err(|e| format!("{key}: {e}"))?;
+        if !is_project_name(&self.name) {
+            return Err(format!("{key}: name '{}' {PROJECT_NAME_SHAPE}", self.name));
+        }
+        match (&self.channel, &self.version) {
+            (Some(_), Some(_)) | (None, None) => {
+                Err(format!("{key}: set exactly one of channel and version"))
+            }
+            (Some(channel), None) if !TRACKS.contains(&channel.as_str()) => Err(format!(
+                "{key}: channel '{channel}' must be one of {}",
+                TRACKS.join(", ")
+            )),
+            (None, Some(version)) if !is_release_version(version) => Err(format!(
+                "{key}: version '{version}' must be MAJOR.MINOR.PATCH with an optional -prerelease, at most 64 characters"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+const PROJECT_NAME_SHAPE: &str = "must be lowercase letters, digits and '-', start and end with a letter or digit, and be at most 64 characters";
+
+/// A registry project name, which a channel name shares.
+fn is_project_name(value: &str) -> bool {
+    static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$").expect("valid pattern")
+    });
+    NAME.is_match(value)
+}
+
+/// The registry's version grammar. A numeric prerelease identifier may not
+/// have a leading zero, which the pattern alone cannot say.
+fn is_release_version(value: &str) -> bool {
+    static VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9a-z-]+(\.[0-9a-z-]+)*)?$",
+        )
+        .expect("valid pattern")
+    });
+    if value.len() > 64 || !VERSION.is_match(value) {
+        return false;
+    }
+    let Some((_, prerelease)) = value.split_once('-') else {
+        return true;
+    };
+    prerelease.split('.').all(|identifier| {
+        !(identifier.len() > 1
+            && identifier.starts_with('0')
+            && identifier.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 fn de_port<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
@@ -533,12 +665,12 @@ app_name = "HappyProto Registry"
 superadmin = "did:plc:ar7c4by46qjdydhdevvrndac"
 
 [interpreters]
-lua = "1.4.0"
-typescript = "0.2.0"
+lua = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-lua", channel = "latest" }
+typescript = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-typescript", version = "0.2.0-rc.1" }
 
 [libraries]
-"happyview.record" = "2.1.0"
-http = "1.0.3"
+"happyview.record" = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-record", version = "2.1.0" }
+http = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-http", channel = "beta" }
 
 [dev]
 port = 3000
@@ -594,8 +726,24 @@ capabilities = ["library:call"]
             config.instance.superadmin.as_deref(),
             Some("did:plc:ar7c4by46qjdydhdevvrndac")
         );
-        assert_eq!(config.interpreters["lua"], "1.4.0");
-        assert_eq!(config.libraries["happyview.record"], "2.1.0");
+        assert_eq!(
+            config.interpreters["lua"],
+            PluginEntry {
+                did: "did:plc:mo7vq4jbioxwafy5zkcc3eux".into(),
+                name: "happyview-lua".into(),
+                channel: Some("latest".into()),
+                version: None,
+            }
+        );
+        assert_eq!(
+            config.interpreters["typescript"].version.as_deref(),
+            Some("0.2.0-rc.1")
+        );
+        assert_eq!(
+            config.libraries["happyview.record"].version.as_deref(),
+            Some("2.1.0")
+        );
+        assert_eq!(config.libraries["http"].channel.as_deref(), Some("beta"));
         assert_eq!(config.dev.port, Some(3000));
         assert_eq!(
             config.network_lexicons.include,
@@ -826,14 +974,118 @@ capabilities = ["library:call"]
         );
     }
 
+    const DID: &str = "did:plc:mo7vq4jbioxwafy5zkcc3eux";
+
+    fn entry(fields: &str) -> String {
+        format!("{{ did = \"{DID}\", name = \"happyview-lua\", {fields} }}")
+    }
+
     #[test]
     fn an_interpreter_named_outside_the_language_id_shape_is_refused() {
-        assert_refused_at("[interpreters]\nLua = \"1.4.0\"\n", 2, "Lua");
+        assert_refused_at(
+            &format!("[interpreters]\nLua = {}\n", entry("channel = \"latest\"")),
+            2,
+            "Lua",
+        );
+    }
+
+    #[test]
+    fn a_plugin_entry_names_exactly_one_of_channel_and_version() {
+        for fields in ["", "channel = \"latest\", version = \"1.0.0\""] {
+            assert_refused_at(
+                &format!(
+                    "[libraries]\nhttp = {}\n",
+                    entry(fields).replace(", }", " }")
+                ),
+                2,
+                "http",
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_string_plugin_entry_is_refused_with_the_new_form() {
+        let err = parse_err("[interpreters]\nlua = \"1.4.0\"\n").to_string();
+        assert!(err.starts_with("happyview.toml:2:"), "{err}");
+        assert!(
+            err.contains(
+                "lua = \"…\" is the old form; name the plugin as { did = \"…\", name = \"…\", channel = \"latest\" } (hpy happyview add writes it)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_entry_with_a_bad_did_name_channel_or_version_is_refused() {
+        for (fields, needle) in [
+            (
+                "did = \"alice.bsky.social\", name = \"p\", channel = \"latest\"",
+                "alice.bsky.social",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"Bad_Name\", channel = \"latest\""),
+                "Bad_Name",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"-p\", channel = \"latest\""),
+                "-p",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", channel = \"Latest\""),
+                "Latest",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", channel = \"stable\""),
+                "latest, beta, alpha",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", version = \"1.0\""),
+                "1.0",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", version = \"01.0.0\""),
+                "01.0.0",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", version = \"1.0.0-01\""),
+                "1.0.0-01",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", version = \"1.0.0+build\""),
+                "1.0.0+build",
+            ),
+            (
+                &format!("did = \"{DID}\", name = \"p\", channel = \"latest\", extra = 1"),
+                "extra",
+            ),
+        ] {
+            assert_refused_at(&format!("[libraries]\nhttp = {{ {fields} }}\n"), 2, needle);
+        }
+        let long = format!("1.0.0-{}", "a".repeat(64));
+        assert_refused_at(
+            &format!(
+                "[libraries]\nhttp = {{ did = \"{DID}\", name = \"p\", version = \"{long}\" }}\n"
+            ),
+            2,
+            &long,
+        );
+    }
+
+    #[test]
+    fn prerelease_versions_with_dotted_identifiers_are_accepted() {
+        let text = format!(
+            "[libraries]\nhttp = {{ did = \"{DID}\", name = \"p\", version = \"1.0.0-rc.1.0a-b\" }}\n"
+        );
+        assert!(parse(&text).is_ok());
     }
 
     #[test]
     fn an_empty_version_is_refused() {
-        assert_refused_at("[libraries]\nhttp = \"\"\n", 2, "empty");
+        assert_refused_at(
+            &format!("[libraries]\nhttp = {}\n", entry("version = \"\"")),
+            2,
+            "version",
+        );
         assert_refused_at("[happyview]\nversion = \" \"\n", 2, "empty");
     }
 
