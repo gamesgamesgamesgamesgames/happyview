@@ -34,6 +34,8 @@ pub(super) struct LexiconSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) record_schema: Option<Value>,
     pub(super) token_cost: Option<i32>,
+    /// Whether the ingest watches this record lexicon's collection.
+    pub(super) indexed: bool,
 }
 
 impl From<crate::catalog::LexiconListing> for LexiconSummary {
@@ -72,6 +74,7 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             updated_at: l.updated_at,
             record_schema,
             token_cost: l.token_cost,
+            indexed: l.indexed,
         }
     }
 }
@@ -84,6 +87,12 @@ pub(super) struct UploadLexiconBody {
     pub(super) target_collection: Option<String>,
     pub(super) action: Option<String>,
     pub(super) token_cost: Option<i32>,
+    #[serde(default = "default_indexed")]
+    pub(super) indexed: bool,
+}
+
+fn default_indexed() -> bool {
+    true
 }
 
 fn default_backfill() -> bool {
@@ -116,6 +125,8 @@ pub(super) struct AddNetworkLexiconBody {
     #[serde(default)]
     pub(super) backfill: bool,
     pub(super) target_collection: Option<String>,
+    #[serde(default = "default_indexed")]
+    pub(super) indexed: bool,
 }
 
 #[derive(Serialize)]
@@ -126,6 +137,7 @@ pub(super) struct NetworkLexiconSummary {
     pub(super) last_fetched_at: Option<String>,
     pub(super) created_at: String,
     pub(super) declared: bool,
+    pub(super) indexed: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ pub async fn apply_at_boot(
             &nsid,
             None,
             false,
+            true,
         )
         .await
     })

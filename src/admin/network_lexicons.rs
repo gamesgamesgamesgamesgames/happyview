@@ -73,6 +73,7 @@ pub(crate) async fn track_network_lexicon(
     nsid: &str,
     target_collection: Option<String>,
     backfill: bool,
+    indexed: bool,
 ) -> Result<TrackedNetworkLexicon, AppError> {
     // Ahead of resolution: a file the project owns is never the network's.
     lexicons.check_writable(nsid)?;
@@ -91,7 +92,7 @@ pub(crate) async fn track_network_lexicon(
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some(authority_did.clone()),
-                indexed: true,
+                indexed,
             },
         )
         .await?;
@@ -125,6 +126,7 @@ pub(super) async fn add(
         nsid,
         body.target_collection.clone(),
         body.backfill,
+        body.indexed,
     )
     .await?;
 
@@ -134,6 +136,7 @@ pub(super) async fn add(
 
     let backfill_job_id: Option<String> = if tracked.is_record
         && body.backfill
+        && body.indexed
         && tracked.revision == 1
         && auth.has(Permission::BackfillCreate)
     {
@@ -184,6 +187,7 @@ pub(super) async fn list(
             target_collection: l.target_collection,
             last_fetched_at: l.last_fetched_at,
             created_at: l.created_at.unwrap_or_default(),
+            indexed: l.indexed,
         })
         .collect();
 

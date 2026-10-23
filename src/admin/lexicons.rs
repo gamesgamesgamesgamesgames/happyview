@@ -56,7 +56,7 @@ pub(super) async fn upload_lexicon(
                 action,
                 token_cost: body.token_cost,
                 authority_did: None,
-                indexed: true,
+                indexed: body.indexed,
             },
         )
         .await?;
@@ -72,21 +72,25 @@ pub(super) async fn upload_lexicon(
         notify_collections(&state).await;
     }
 
-    let backfill_job_id: Option<String> =
-        if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
-            match state.start_automatic_backfill(id.clone(), &auth.did).await {
-                Ok(job_id) => job_id,
-                Err(e) => {
-                    tracing::warn!(
-                        lexicon = id.as_str(),
-                        "failed to start backfill for uploaded lexicon: {e}"
-                    );
-                    None
-                }
+    let backfill_job_id: Option<String> = if is_record
+        && body.backfill
+        && body.indexed
+        && revision == 1
+        && auth.has(Permission::BackfillCreate)
+    {
+        match state.start_automatic_backfill(id.clone(), &auth.did).await {
+            Ok(job_id) => job_id,
+            Err(e) => {
+                tracing::warn!(
+                    lexicon = id.as_str(),
+                    "failed to start backfill for uploaded lexicon: {e}"
+                );
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     let status = if revision == 1 {
         StatusCode::CREATED

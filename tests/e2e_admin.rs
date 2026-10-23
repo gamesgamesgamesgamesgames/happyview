@@ -490,6 +490,93 @@ async fn record_lexicon_without_backfill_starts_no_job() {
     );
 }
 
+const GAME: &str = "games.gamesgamesgamesgames.game";
+
+#[tokio::test]
+#[serial]
+async fn an_unindexed_upload_is_reported_unindexed_and_neither_watched_nor_backfilled() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true,
+        "indexed": false
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{GAME}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["indexed"], json!(false));
+    assert!(!app.state.collections_tx.borrow().iter().any(|c| c == GAME));
+    assert_eq!(backfill_job_count(&app, GAME).await, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_as_indexed_starts_watching_without_a_backfill() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    for (indexed, expect_watched) in [(false, false), (true, true)] {
+        let body = json!({
+            "lexicon_json": fixtures::game_record_lexicon(),
+            "backfill": true,
+            "indexed": indexed
+        });
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(
+            app.state.collections_tx.borrow().iter().any(|c| c == GAME),
+            expect_watched
+        );
+    }
+    assert_eq!(backfill_job_count(&app, GAME).await, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_upload_without_the_field_is_indexed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "lexicon_json": fixtures::game_record_lexicon(), "backfill": false });
+    app.router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{GAME}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["indexed"], json!(true));
+    assert!(app.state.collections_tx.borrow().iter().any(|c| c == GAME));
+}
+
 #[tokio::test]
 #[serial]
 async fn query_lexicon_with_backfill_starts_no_job() {
