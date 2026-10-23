@@ -1269,6 +1269,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_project_entry_that_is_unindexed_shadows_an_indexed_stored_row() {
+        for (db, backend) in backends().await {
+            let project = shared_empty();
+            let catalog = LexiconCatalog::new(project.clone());
+            let id = unique("shadowquiet");
+            catalog
+                .put_manual(&db, backend, manual(record_json(&id)))
+                .await
+                .unwrap();
+            assert!(catalog.is_indexed(&id));
+
+            let mut snap = snapshot_with(&[(record_json(&id), "src/lexicons/shadow.json")]);
+            snap.lexicons.get_mut(&id).unwrap().indexed = false;
+            project.store(Arc::new(snap));
+
+            assert!(!catalog.is_indexed(&id));
+            assert!(!catalog.get_record_collections().await.contains(&id));
+
+            project.store(Arc::new(ProjectSnapshot::empty()));
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_entry_that_is_indexed_shadows_an_unindexed_stored_row() {
+        for (db, backend) in backends().await {
+            let project = shared_empty();
+            let catalog = LexiconCatalog::new(project.clone());
+            let id = unique("shadowloud");
+            let mut write = manual(record_json(&id));
+            write.indexed = false;
+            catalog.put_manual(&db, backend, write).await.unwrap();
+            assert!(!catalog.is_indexed(&id));
+
+            project.store(Arc::new(snapshot_with(&[(
+                record_json(&id),
+                "src/lexicons/shadow.json",
+            )])));
+
+            assert!(catalog.is_indexed(&id));
+            assert!(catalog.get_record_collections().await.contains(&id));
+
+            project.store(Arc::new(ProjectSnapshot::empty()));
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn indexed_survives_a_reload_from_the_database() {
         for (db, backend) in backends().await {
             let catalog = LexiconCatalog::detached();

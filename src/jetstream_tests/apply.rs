@@ -211,6 +211,49 @@ async fn clean_up(state: &AppState, did: &str) {
     }
 }
 
+/// Registers `NSID` as an unindexed record collection, replacing the indexed
+/// registration.
+async fn register_unindexed(state: &AppState) {
+    state
+        .lexicons
+        .put_manual(
+            &state.db,
+            state.db_backend,
+            crate::catalog::LexiconWrite {
+                lexicon_json: serde_json::json!({
+                    "lexicon": 1,
+                    "id": NSID,
+                    "defs": {"main": {"type": "record", "key": "tid"}},
+                }),
+                backfill: false,
+                target_collection: None,
+                action: ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: None,
+                indexed: false,
+            },
+        )
+        .await
+        .expect("install unindexed lexicon");
+}
+
+#[tokio::test]
+async fn a_commit_to_an_unindexed_collection_is_skipped() {
+    for state in states().await {
+        register_unindexed(&state).await;
+        let did = unique_did();
+        apply(&state, commit(&did, 1, "a", "create")).await;
+        assert!(rkeys(&state, &did).await.is_empty());
+        clean_up(&state, &did).await;
+        // The stored row is shared with every other test on this database.
+        state
+            .lexicons
+            .remove(&state.db, state.db_backend, NSID)
+            .await
+            .expect("remove unindexed lexicon");
+    }
+}
+
 #[tokio::test]
 async fn commits_go_through_the_record_pipeline_with_their_rev() {
     for state in states().await {
