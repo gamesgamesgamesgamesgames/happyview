@@ -58,6 +58,7 @@ impl RegistrySource {
     }
 
     /// Every project the registry lists, following its cursors to the end.
+    /// A listing still paging at the cap is an error.
     pub async fn search_projects(
         &self,
         client: &reqwest::Client,
@@ -89,11 +90,12 @@ impl RegistrySource {
                 None => return Ok(projects),
             }
         }
-        tracing::warn!(
-            pages = MAX_PAGES,
-            "registry_source: searchProjects still had more pages; the catalogue is cut short"
-        );
-        Ok(projects)
+        // A short listing would read as the whole catalogue and drop every
+        // project past the cap, so it is not returned at all.
+        Err(SourceError::Truncated {
+            method: "searchProjects",
+            pages: MAX_PAGES,
+        })
     }
 
     /// One project, or `None` when the registry knows neither it nor its
@@ -227,6 +229,8 @@ pub enum SourceError {
         name: String,
         message: String,
     },
+    #[error("registry was still paging {method} after {pages} pages; the listing is incomplete")]
+    Truncated { method: &'static str, pages: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1052,8 @@ mod tests {
     }
 
     /// A registry that keeps answering fresh cursors cannot hold a refresh
-    /// open: paging stops at the cap and returns what was read.
+    /// open: paging stops at the cap, and the listing is an error rather
+    /// than a short catalogue passed off as the whole one.
     #[tokio::test]
     async fn a_registry_that_never_stops_paging_is_cut_off() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1067,10 +1072,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        source(&server)
+        let err = source(&server)
             .search_projects(&reqwest::Client::new())
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SourceError::Truncated {
+                    method: "searchProjects",
+                    pages: MAX_PAGES
+                }
+            ),
+            "{err:?}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), MAX_PAGES);
     }
 

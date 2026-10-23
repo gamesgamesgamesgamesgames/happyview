@@ -224,7 +224,8 @@ async fn hold(state: &SharedRegistry, plugin: CatalogueEntry) -> CatalogueEntry 
 }
 
 /// Rebuild the cache from the registry. On error, the previous cache is
-/// retained and the error is returned.
+/// retained and the error is returned; a listing cut off at the page cap is
+/// one, since it would otherwise replace the catalogue with part of it.
 pub async fn refresh_full(
     client: &reqwest::Client,
     config: &RegistryConfig,
@@ -555,6 +556,57 @@ mod tests {
             guard.last_refreshed_at.as_deref(),
             Some("2026-04-12T00:00:00Z")
         );
+    }
+
+    /// A listing cut off at the page cap is not the catalogue: replacing the
+    /// cache with it would drop every project past the cap, so the previous
+    /// cache stays and the caller is told.
+    #[tokio::test]
+    async fn refresh_full_keeps_the_previous_cache_when_the_listing_is_cut_off() {
+        let server = MockServer::start().await;
+        let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = pages.clone();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.searchProjects"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projects": [registry_package(STRANGER, &format!("p{n}"), "1.0.0")],
+                    "cursor": format!("page{n}"),
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "versions": [] })),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let state = cached_official_lua();
+        let result = refresh_full(&reqwest::Client::new(), &registry_at(&server), &state).await;
+        assert!(
+            matches!(
+                result,
+                Err(RegistryError::Registry(
+                    super::super::registry_source::SourceError::Truncated { .. }
+                ))
+            ),
+            "{result:?}"
+        );
+
+        let guard = state.read().await;
+        assert_eq!(guard.plugins.len(), 1);
+        assert!(guard.plugins.contains_key("lua"));
+        assert_eq!(
+            guard.last_refreshed_at.as_deref(),
+            Some("2026-04-12T00:00:00Z")
+        );
+        drop(guard);
+        server.verify().await;
     }
 
     /// With no cached entry, a check asks for the official publisher's

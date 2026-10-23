@@ -1,4 +1,4 @@
-use crate::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
+use crate::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource, RegistryInstall};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -24,6 +24,14 @@ pub enum LoadError {
     Download(#[from] reqwest::Error),
     #[error("SHA256 mismatch: expected {expected}, got {actual}")]
     Sha256Mismatch { expected: String, actual: String },
+    #[error(
+        "the registry served {what} bytes that do not match their CID: expected {expected}, got {actual}"
+    )]
+    CidMismatch {
+        what: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("Failed to parse plugin info: {0}")]
     ParseInfo(#[from] serde_json::Error),
     #[error("Plugin API version {0} not supported (max {MAX_API_VERSION})")]
@@ -72,6 +80,14 @@ pub struct PluginPreview {
     pub manifest: PluginManifest,
     pub manifest_url: String,
     pub wasm_url: String,
+    /// The module, when it was already fetched and verified, so loading
+    /// installs exactly the bytes that were checked rather than fetching
+    /// again.
+    #[serde(skip)]
+    pub wasm_bytes: Option<Vec<u8>>,
+    /// The registry release both artifacts were verified against.
+    #[serde(skip)]
+    pub registry: Option<RegistryInstall>,
 }
 
 /// Fetch plugin manifest from a URL (or derive manifest URL from WASM URL)
@@ -110,7 +126,64 @@ pub async fn fetch_manifest(
         manifest,
         manifest_url,
         wasm_url,
+        wasm_bytes: None,
+        registry: None,
     })
+}
+
+/// Fetch a registry release's manifest and module from the URLs it names,
+/// refusing either unless its bytes hash to the blob CID the release
+/// declares. The registry is trusted to serve bytes, not to serve the right
+/// ones: the CIDs come from the publisher's signed records.
+pub async fn fetch_registry_artifacts(
+    client: &reqwest::Client,
+    install: &RegistryInstall,
+) -> Result<PluginPreview, LoadError> {
+    let manifest_bytes = fetch_verified(
+        client,
+        "manifest",
+        &install.manifest_url,
+        &install.manifest_blob_cid,
+    )
+    .await?;
+    let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes)?;
+    let wasm_bytes =
+        fetch_verified(client, "module", &install.package_url, &install.package_cid).await?;
+
+    Ok(PluginPreview {
+        manifest,
+        manifest_url: install.manifest_url.clone(),
+        wasm_url: install.package_url.clone(),
+        wasm_bytes: Some(wasm_bytes),
+        registry: Some(install.clone()),
+    })
+}
+
+async fn fetch_verified(
+    client: &reqwest::Client,
+    what: &'static str,
+    url: &str,
+    expected_cid: &str,
+) -> Result<Vec<u8>, LoadError> {
+    let bytes = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?
+        .to_vec();
+    let actual = crate::cid_verify::raw_cid(&bytes)
+        .map(|cid| cid.to_string())
+        .unwrap_or_default();
+    if actual != expected_cid {
+        return Err(LoadError::CidMismatch {
+            what,
+            expected: expected_cid.to_string(),
+            actual,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Load a plugin from a manifest (fetches WASM separately)
@@ -121,12 +194,17 @@ pub async fn load_from_manifest(
 ) -> Result<LoadedPlugin, LoadError> {
     validate_manifest(&preview.manifest)?;
 
-    let response = client
-        .get(&preview.wasm_url)
-        .send()
-        .await?
-        .error_for_status()?;
-    let wasm_bytes = response.bytes().await?.to_vec();
+    let wasm_bytes = match &preview.wasm_bytes {
+        Some(bytes) => bytes.clone(),
+        None => client
+            .get(&preview.wasm_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec(),
+    };
 
     // Verify SHA256 if provided
     if let Some(expected) = expected_sha256 {
@@ -151,6 +229,7 @@ pub async fn load_from_manifest(
         source: PluginSource::Url {
             url: preview.wasm_url.clone(),
             sha256: expected_sha256.map(String::from),
+            registry: preview.registry.clone().map(Box::new),
         },
         wasm_bytes,
         manifest: Some(preview.manifest.clone()),
@@ -1119,5 +1198,173 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_manifest(&manifest).is_ok());
+    }
+}
+
+/// A registry serving one release by CID, for tests of installs from it.
+#[cfg(test)]
+pub(crate) mod registry_fixture {
+    use crate::plugin::RegistryInstall;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    pub const GET_ARTIFACT: &str = "/xrpc/at.happyproto.registry.getArtifact";
+
+    pub fn manifest_bytes(id: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": id, "name": id, "version": "1.2.0", "api_version": "2",
+            "plugin_type": "library", "capabilities": [],
+        }))
+        .unwrap()
+    }
+
+    pub fn wasm_bytes() -> Vec<u8> {
+        wat::parse_str("(module)").unwrap()
+    }
+
+    pub fn cid_of(bytes: &[u8]) -> String {
+        crate::cid_verify::raw_cid(bytes).unwrap().to_string()
+    }
+
+    /// Serve `bytes` as the artifact `cid` names.
+    pub async fn serve(server: &MockServer, cid: &str, bytes: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(GET_ARTIFACT))
+            .and(query_param("cid", cid))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+
+    /// The install a registry would describe for `id` at 1.2.0, its CIDs
+    /// those of the fixture's own manifest and module. Nothing is served.
+    pub fn install_for(server: &MockServer, id: &str) -> RegistryInstall {
+        let source = crate::plugin::registry_source::RegistrySource {
+            base_url: server.uri(),
+            limit: 100,
+        };
+        let manifest_blob_cid = cid_of(&manifest_bytes(id));
+        let package_cid = cid_of(&wasm_bytes());
+        RegistryInstall {
+            did: "did:plc:publisher".into(),
+            name: id.into(),
+            channel: Some("latest".into()),
+            version: "1.2.0".into(),
+            version_uri: format!("at://did:plc:publisher/software.release.version/{id}:1.2.0"),
+            manifest_cid: "bafyreimanifestrecord".into(),
+            manifest_url: source.artifact_url(&manifest_blob_cid),
+            manifest_blob_cid,
+            package_url: source.artifact_url(&package_cid),
+            package_cid,
+        }
+    }
+
+    /// `install_for`, with both artifacts served as their CIDs name them.
+    pub async fn serve_release(server: &MockServer, id: &str) -> RegistryInstall {
+        let install = install_for(server, id);
+        serve(server, &install.manifest_blob_cid, manifest_bytes(id)).await;
+        serve(server, &install.package_cid, wasm_bytes()).await;
+        install
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::registry_fixture::*;
+    use super::*;
+    use wiremock::MockServer;
+
+    #[tokio::test]
+    async fn registry_artifacts_whose_bytes_match_their_cids_load() {
+        let server = MockServer::start().await;
+        let install = serve_release(&server, "p").await;
+
+        let preview = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap();
+        assert_eq!(preview.manifest.id, "p");
+        assert_eq!(preview.manifest_url, install.manifest_url);
+        assert_eq!(preview.wasm_url, install.package_url);
+        assert_eq!(preview.wasm_bytes.as_deref(), Some(&wasm_bytes()[..]));
+
+        // Loading takes the bytes already verified rather than fetching
+        // again, and records where they came from.
+        let plugin = load_from_manifest(&reqwest::Client::new(), &preview, None)
+            .await
+            .unwrap();
+        assert_eq!(plugin.wasm_bytes, wasm_bytes());
+        match &plugin.source {
+            PluginSource::Url { url, registry, .. } => {
+                assert_eq!(url, &install.package_url);
+                assert_eq!(registry.as_deref(), Some(&install));
+            }
+            other => panic!("expected a url source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_bytes_that_do_not_match_their_cid_are_refused_naming_both() {
+        let server = MockServer::start().await;
+        let install = install_for(&server, "p");
+        let tampered = manifest_bytes("q");
+        serve(&server, &install.manifest_blob_cid, tampered.clone()).await;
+        serve(&server, &install.package_cid, wasm_bytes()).await;
+
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        let actual = cid_of(&tampered);
+        match &err {
+            LoadError::CidMismatch {
+                what,
+                expected,
+                actual: got,
+            } => {
+                assert_eq!(*what, "manifest");
+                assert_eq!(expected, &install.manifest_blob_cid);
+                assert_eq!(got, &actual);
+            }
+            other => panic!("expected a cid mismatch, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains(&install.manifest_blob_cid), "{message}");
+        assert!(message.contains(&actual), "{message}");
+    }
+
+    #[tokio::test]
+    async fn module_bytes_that_do_not_match_their_cid_are_refused_naming_both() {
+        let server = MockServer::start().await;
+        let install = install_for(&server, "p");
+        let tampered = wat::parse_str(r#"(module (func (export "x")))"#).unwrap();
+        serve(&server, &install.manifest_blob_cid, manifest_bytes("p")).await;
+        serve(&server, &install.package_cid, tampered.clone()).await;
+
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        let actual = cid_of(&tampered);
+        assert!(
+            matches!(
+                &err,
+                LoadError::CidMismatch { what: "module", expected, actual: got }
+                    if expected == &install.package_cid && got == &actual
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&install.package_cid), "{message}");
+        assert!(message.contains(&actual), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_cannot_serve_an_artifact_fails_the_fetch() {
+        let server = MockServer::start().await;
+        let install = install_for(&server, "p");
+        serve(&server, &install.manifest_blob_cid, manifest_bytes("p")).await;
+
+        let err = fetch_registry_artifacts(&reqwest::Client::new(), &install)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Download(_)), "{err:?}");
     }
 }

@@ -254,7 +254,7 @@ pub(super) async fn list(
                 crate::plugin::PluginSource::File { path } => {
                     ("file".to_string(), Some(path.display().to_string()), None)
                 }
-                crate::plugin::PluginSource::Url { url, sha256 } => {
+                crate::plugin::PluginSource::Url { url, sha256, .. } => {
                     ("url".to_string(), Some(url.clone()), sha256.clone())
                 }
             };
@@ -619,7 +619,7 @@ pub(super) async fn reload(
         .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
 
     let (url, sha256) = match &current.source {
-        crate::plugin::PluginSource::Url { url, sha256 } => (url.clone(), sha256.clone()),
+        crate::plugin::PluginSource::Url { url, sha256, .. } => (url.clone(), sha256.clone()),
         crate::plugin::PluginSource::File { .. } => {
             return Err(AppError::BadRequest(
                 "Cannot reload file-based plugins via API".into(),
@@ -1106,7 +1106,7 @@ pub(super) async fn check_update(
         crate::plugin::PluginSource::File { path } => {
             ("file".to_string(), Some(path.display().to_string()), None)
         }
-        crate::plugin::PluginSource::Url { url, sha256 } => {
+        crate::plugin::PluginSource::Url { url, sha256, .. } => {
             ("url".to_string(), Some(url.clone()), sha256.clone())
         }
     };
