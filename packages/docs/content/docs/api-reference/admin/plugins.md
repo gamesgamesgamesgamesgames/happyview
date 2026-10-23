@@ -2,7 +2,7 @@
 title: "Plugins"
 ---
 
-Plugins extend HappyView with WebAssembly modules sourced from the [official plugin registry](../../guides/plugins.md) or any URL serving a `manifest.json`. Most endpoints take a plugin manifest URL and load (or reload) the plugin in place — no restart needed. Encrypted plugin secrets require `TOKEN_ENCRYPTION_KEY` to be configured.
+Plugins extend HappyView with WebAssembly modules sourced from the [plugin registry](../../guides/plugins.md#from-the-registry) or any URL serving a `manifest.json`. Most endpoints take a registry project or a plugin manifest URL and load (or reload) the plugin in place — no restart needed. Encrypted plugin secrets require `TOKEN_ENCRYPTION_KEY` to be configured.
 
 ```ts tab="TypeScript" tab-group="language"
 const TOKEN = "hv_..."; // your API key
