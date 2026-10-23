@@ -37,6 +37,8 @@ The capability column is what an operator grants when installing the library, an
 
 **Protected tables.** `happyview.sql` runs against the same database as the index, so `raw` and `from` are refused on HappyView's internal `happyview_*` tables other than the public AppView data. The allowlist is in [Developing Plugins](../../guides/developing-plugins.md#database-access).
 
+**Record views on a raw read route.** When an instance's [record storage](../../guides/record-providers.md) offers a raw read route, `raw` reads of `happyview_records` and `happyview_record_refs`, and `from` on either view, run on that route in its own SQL dialect, which `db.backend()` doesn't report. A query that reads those views together with other tables is refused, and a routed read fails with `STORAGE_UNAVAILABLE` while the storage is down. [Raw SQL on the record views](../../guides/database/database-setup.md#when-record-storage-offers-a-raw-read-route) has the details.
+
 ## Next steps
 
 - [Script Contract](script-contract.md): `handle(input, ctx)` and the `require` order

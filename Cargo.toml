@@ -122,7 +122,7 @@ blake3 = "1"
 fs4 = "0.13"
 hkdf = "0.13"
 hmac = "0.13"
-sqlparser = "0.62.0"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 subtle = "2"
 mime_guess = "2"
 rust-embed = { version = "8", optional = true }

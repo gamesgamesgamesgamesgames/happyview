@@ -25,6 +25,8 @@ pub struct FakeStorage {
     /// the storage is `down`.
     closed: sqlx::AnyPool,
     pub down: AtomicBool,
+    /// Whether `raw_route` offers the pool to raw SQL.
+    raw: bool,
     pub deltas: Mutex<Vec<(RecordKey, Delta, Option<String>)>>,
     pub forgotten: Mutex<Vec<(String, Option<Vec<String>>)>>,
     pub collection_deletes: Mutex<Vec<(String, i64)>>,
@@ -47,6 +49,7 @@ impl FakeStorage {
             pool: happyview::test_support::migrated_memory_pool().await,
             closed,
             down: AtomicBool::new(false),
+            raw: false,
             deltas: Mutex::new(Vec::new()),
             forgotten: Mutex::new(Vec::new()),
             collection_deletes: Mutex::new(Vec::new()),
@@ -54,6 +57,14 @@ impl FakeStorage {
             applying: false,
             stored: Mutex::new(HashMap::new()),
             overlays: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// [`FakeStorage::claiming`], offering its pool as a raw read route.
+    pub async fn claiming_with_raw(collections: &[&str]) -> Self {
+        Self {
+            raw: true,
+            ..Self::claiming(collections).await
         }
     }
 
@@ -185,6 +196,10 @@ impl RecordStorage for FakeStorage {
             pool,
             backend: DatabaseBackend::Sqlite,
         }
+    }
+
+    fn raw_route(&self) -> Option<ReadRoute> {
+        self.raw.then(|| self.read_route(""))
     }
 
     async fn apply_delta(

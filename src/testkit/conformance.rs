@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use super::ProviderApp;
 use super::app::LUA_PLUGIN_DIR;
 use crate::Providers;
+use crate::db::DatabaseBackend;
 
 /// The collection every case writes.
 pub const COLLECTION: &str = "com.example.conformance.note";
@@ -222,6 +223,7 @@ where
         account_deletion_removes_the_accounts_records,
         redelivery_is_idempotent,
         an_unavailable_store_answers_503,
+        raw_route_shows_claimed_records,
     );
     if !failures.is_empty() {
         panic!("{}", failures.join("\n"));
@@ -596,4 +598,37 @@ async fn an_unavailable_store_answers_503(app: &ProviderApp, feeder: &Feeder) {
             "{path} while the storage is down: {answer}"
         );
     }
+}
+
+/// When the storage offers a raw route, the compat views on it show the
+/// claimed record with the same body XRPC returns. A storage without one
+/// keeps raw reads local, so the case passes without checking.
+async fn raw_route_shows_claimed_records(app: &ProviderApp, feeder: &Feeder) {
+    app.track(COLLECTION, false).await;
+    feeder.put(created(ALICE, "a1", "raw", 1)).await;
+    let Some(route) = app
+        .state
+        .records
+        .external_route(COLLECTION)
+        .and_then(|storage| storage.raw_route())
+    else {
+        return;
+    };
+    let record_uri = uri(ALICE, "a1");
+
+    let sql = match route.backend {
+        DatabaseBackend::Sqlite => "SELECT record FROM happyview_records WHERE uri = ?",
+        DatabaseBackend::Postgres => "SELECT record FROM happyview_records WHERE uri = $1",
+    };
+    let (text,): (String,) = crate::db::query_as(sql)
+        .bind(&record_uri)
+        .fetch_one(&route.pool)
+        .await
+        .unwrap_or_else(|e| panic!("the raw route's record view failed: {e}"));
+    let raw: Value = serde_json::from_str(&text).expect("the view's record is JSON");
+    assert_eq!(
+        Some(raw),
+        app.get_record(&record_uri).await,
+        "the raw route shows the body that is served"
+    );
 }

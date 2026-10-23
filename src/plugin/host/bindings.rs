@@ -1891,6 +1891,12 @@ fn records_or_local(state: &PluginState, db: &sqlx::AnyPool) -> crate::record_st
 /// (an external storage's route when that claims the collection).
 trait SpecCollection {
     fn collection(&self) -> Option<&str>;
+
+    /// True when the spec reads the record views, which run where raw SQL
+    /// reads of them do: on the external storage's raw read route, if any.
+    fn reads_record_views(&self) -> bool {
+        false
+    }
 }
 
 impl SpecCollection for happyview_plugin_sdk::wire::RecordsQuery {
@@ -1923,10 +1929,14 @@ impl SpecCollection for GetSpec {
     }
 }
 
-/// A table query reads the instance's own tables.
+/// A table query reads the instance's own tables, or the record views.
 impl SpecCollection for happyview_plugin_sdk::wire::TableQuery {
     fn collection(&self) -> Option<&str> {
         None
+    }
+
+    fn reads_record_views(&self) -> bool {
+        crate::raw_sql_guard::is_record_view(&self.table)
     }
 }
 
@@ -1981,9 +1991,14 @@ where
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
     let backend = caller.data().db_backend;
-    // A claimed collection is read on the external storage's route; every
-    // other spec runs on the instance's own database, as it always has.
+    // A claimed collection is read on the external storage's route, and the
+    // record views on its raw read route; every other spec runs on the
+    // instance's own database, as it always has.
     let external = caller.data().app_state.as_ref().and_then(|app| {
+        if spec.reads_record_views() {
+            let ext = app.records.external()?;
+            return ext.raw_route().map(|route| (ext.clone(), route));
+        }
         let collection = spec.collection()?;
         app.records
             .external_route(collection)
@@ -2503,12 +2518,76 @@ async fn host_db_impl(
         .app_state
         .as_ref()
         .and_then(|app| app.records.external().cloned());
-    if let Some(external) = external
+    if let Some(external) = &external
         && let Err(e) = crate::raw_sql_guard::check_claimed_record_writes(&sql, &params, &|c| {
             external.claims(c)
         })
     {
         return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await;
+    }
+    // SQL that reads the record views runs on the external storage's raw read
+    // route, where those views show its records. It is classified before the
+    // read-only gate: a read the gate cannot vouch for (a locking clause, SQL
+    // the parser rejects) must not fall through to the local views, which hold
+    // none of the claimed records. A write runs locally as it always has, the
+    // claimed-write guard above covering claimed collections; one that also
+    // reads the views sees only the local rows.
+    if !execute
+        && let Some(ext) = &external
+        && let Some(route) = ext.raw_route()
+        && !crate::raw_sql_guard::is_write(&sql)
+    {
+        match crate::raw_sql_guard::record_view_use(&sql) {
+            Ok(crate::raw_sql_guard::RecordViews::None) => {}
+            Err(e) => return write_guest_response(caller, &error_envelope("FORBIDDEN", e)).await,
+            Ok(_) if crate::raw_sql_guard::is_read_only(&sql) != Ok(true) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "raw SQL that reads claimed records must be a plain read-only query",
+                    ),
+                )
+                .await;
+            }
+            Ok(crate::raw_sql_guard::RecordViews::Mixed(_)) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("FORBIDDEN", crate::raw_sql_guard::RAW_MIXED_REFUSED),
+                )
+                .await;
+            }
+            Ok(crate::raw_sql_guard::RecordViews::Only) => {
+                let response = match super::run_read_only_query_on(
+                    &route.pool,
+                    route.backend,
+                    &sql,
+                    &params,
+                )
+                .await
+                {
+                    Ok(rows) => {
+                        serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default()
+                    }
+                    Err(super::QueryError::Database(e)) if ext.unavailable(&e) => {
+                        error_envelope(crate::error::STORAGE_UNAVAILABLE, e)
+                    }
+                    Err(e) => {
+                        let backend = match route.backend {
+                            crate::db::DatabaseBackend::Postgres => "postgres",
+                            crate::db::DatabaseBackend::Sqlite => "sqlite",
+                        };
+                        error_envelope(
+                            "DB_ERROR",
+                            format!(
+                                "{e} (record views on this instance are served by a {backend} database)"
+                            ),
+                        )
+                    }
+                };
+                return write_guest_response(caller, &response).await;
+            }
+        }
     }
     let Some(db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;

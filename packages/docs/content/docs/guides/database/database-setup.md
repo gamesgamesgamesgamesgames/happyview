@@ -162,6 +162,17 @@ Some queries are slower through the views, because `uri`, `source_uri` and `targ
 
 HappyView's own queries read the tables directly and are not affected.
 
+#### When record storage offers a raw read route
+
+When an instance keeps some collections in external [record storage](../record-providers.md) that offers a raw read route, every read of the two views runs on that route instead of this database:
+
+- Read-only SQL that reads only `happyview_records` and `happyview_record_refs` runs on the route, and so does `sql.from` on either view. It sees the storage's records.
+- The route uses its own backend's dialect and placeholders, which can differ from this instance's: a SQLite instance can have its record views served by Postgres. A failed routed query's error names the backend that ran it.
+- A query must read only the two views, or neither. One that joins them with other tables is refused, as is a read of them that HappyView can't confirm is read-only, such as one with `FOR SHARE`. Split it into two queries.
+- While the storage is down, a routed query fails with `STORAGE_UNAVAILABLE`.
+- The views on the route show only the storage's records. Records of other collections held in this database can't be read through them.
+- Writes through the views run on this database as before and see only its rows, even a write that reads the views, such as `INSERT … SELECT`. Writes to the storage's collections are refused.
+
 ## Rolling back the record tombstones
 
 The release with the Jetstream v2 consumer adds two migrations: `20261010000000_records_rev` (a `rev` column on `happyview_records`) and `20261010000001_record_tombstones` (the `happyview_record_tombstones` and `happyview_did_tombstones` tables). An older release refuses to start on a database with migrations it doesn't know. To roll back, stop HappyView and delete their rows:
@@ -208,7 +219,7 @@ The default `docker-compose.yml` ships with the Postgres service commented out. 
 
 ## Lua scripts
 
-Both backends support the same Lua libraries. A `happyview.db` chain is portable: the host generates the SQL for whichever backend is running. `happyview.sql`'s `raw` is not: the statement goes to the backend untranslated, so its placeholders (`?` on SQLite, `$1` on Postgres) and functions must be the running backend's. A script that has to run on both branches on `db.backend()`.
+Both backends support the same Lua libraries. A `happyview.db` chain is portable: the host generates the SQL for whichever backend is running. `happyview.sql`'s `raw` is not: the statement goes to the backend untranslated, so its placeholders (`?` on SQLite, `$1` on Postgres) and functions must be the running backend's, or for reads of the record views, [the raw read route's](#when-record-storage-offers-a-raw-read-route) when there is one. A script that has to run on both branches on `db.backend()`.
 
 `happyview_records` and `happyview_record_refs` are views; see [raw SQL on the record views](#raw-sql-on-the-record-views) for what changes when a `raw` statement writes them or filters them by `uri`.
 

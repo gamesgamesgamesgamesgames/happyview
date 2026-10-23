@@ -86,6 +86,20 @@ pub trait RecordStorage: Send + Sync + 'static {
     async fn count(&self, _collection: &str) -> Result<Option<i64>, sqlx::Error> {
         Ok(None)
     }
+    /// A pool on which the compatibility views `happyview_records` and
+    /// `happyview_record_refs` show this storage's records for every
+    /// collection it claims, exactly as reads through `read_route` see them.
+    /// When this returns a route, read-only raw SQL that reads only those
+    /// views runs here instead of on the instance's own database. The
+    /// default, `None`, keeps every raw query local.
+    ///
+    /// HappyView's read-only check is syntactic, and it cannot see what a
+    /// function a query calls does. On Postgres it runs each query in a
+    /// read-only transaction that it rolls back; even so, the route should
+    /// connect as a role that cannot write.
+    fn raw_route(&self) -> Option<ReadRoute> {
+        None
+    }
     fn unavailable(&self, e: &sqlx::Error) -> bool {
         crate::db::is_unavailable(e)
     }
