@@ -11,6 +11,7 @@
     "record-scripts",
     "lua-scripting",
     "testing",
+    "editor-types",
     "migrating-scripts",
     "api-clients",
     "linked-repos",

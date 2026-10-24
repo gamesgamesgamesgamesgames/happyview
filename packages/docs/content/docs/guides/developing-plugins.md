@@ -205,6 +205,36 @@ A mocked call never reaches the library, and is recorded for `host_test_calls` w
 | `MOCK_EXHAUSTED` | A library call | The method's list of responses has run out |
 | Any `$error` code | A library call | The mock answered with `$error` |
 
+#### Editor declarations
+
+An interpreter can render the types a script sees into declaration files for its language, which `happyview types` writes for editors (see the [editor types guide](editor-types.md)). It is the optional `get_declarations` export, which `interpreter_plugin!` emits when given `declarations:`:
+
+```rust
+interpreter_plugin! {
+    info: PluginInfo::new("lua", "Lua", "1.0.0"),
+    execute: execute,
+    validate: validate,
+    declarations: declarations,
+}
+
+fn declarations(input: &DeclarationsInput) -> Result<Declarations, PluginError> {
+    Ok(Declarations { files: vec![DeclarationFile { path: "happyview/db.lua".into(), contents: render(input) }] })
+}
+```
+
+The input is already parsed, so an interpreter only renders:
+
+| Field | Holds |
+| --- | --- |
+| `libraries` | Each installed library's `namespace` and its surface as a `TypedSurface` |
+| `lexicons` | Each project lexicon's `nsid`, `kind`, and its `main` def (`params`, `input`, `output` or `record`) plus every other def by name |
+| `ctx` | The `ctx` object per script kind: `query`, `procedure`, `record`, `label`, `job`, `test` |
+| `events` | The `input` of a record-event script (its `record` is a type variable for the record lexicon) and of a label script |
+
+Every type is a `TypeExpr`. A `ref` names a library's named type, or a lexicon def as `nsid#name`; one that names nothing in the input should render as unknown. `ctx` holds the data HappyView sets; functions the interpreter adds itself, such as `ctx.job.progress`, are yours to declare.
+
+Return paths relative to your output directory, with `/`. A path that is absolute, uses `\` or `..`, or is `manifest.json` fails the run. The export takes no host imports, and has 30 seconds. An interpreter without it is skipped.
+
 ### Dependencies
 
 A `library` plugin may declare other libraries it calls through `host_call_library`:
@@ -355,7 +385,51 @@ A `library` plugin exports a callable API surface instead of the `auth` contract
 }
 ```
 
-`types` holds named types referenced by `params`/`returns`; the host treats it as opaque.
+#### Types
+
+Every `type` in a surface is a type string. HappyView parses them all, and an editor's declarations are rendered from what it reads, so a library describes itself once and every interpreter's language gets types for it.
+
+| Write | Means |
+| --- | --- |
+| `string`, `integer`, `number`, `boolean`, `bytes`, `null`, `blob`, `cid-link` | That value |
+| `unknown`, `any` | Anything. `unknown` asks the script to check first |
+| `object`, `array` | An object with any keys, a list of anything |
+| `'asc'`, `42`, `true` | Exactly that value |
+| `T[]` | A list of `T` |
+| `T?` | `T` or `null`. On a param or property it also means the caller may leave it out |
+| `A \| B` | Either. Parentheses group: `(string \| integer)[]` |
+| `Record` | A named type from the surface's `types` |
+
+A param or property is `{name, type, description?, required?, default?}`. `required` defaults to false when the type ends in `?` and true otherwise. A type can also be an object: `{"type": "object", "properties": [...]}` for an object whose keys you list, and `{"type": "array", "items": ...}` or `{"anyOf": [...]}`, which mean `T[]` and `A | B`.
+
+`types` holds the named types, each `{name, description?, type}`:
+
+```rust
+ApiSurface::new("happyview.db")
+    .named_type(
+        "RecordEnvelope",
+        "An indexed record and where it came from",
+        json!({"type": "object", "properties": [
+            {"name": "uri", "type": "string"},
+            {"name": "cid", "type": "string?"},
+            {"name": "record", "type": "object"}
+        ]}),
+    )
+    .export(ApiExport::function("get").param("uri", "string", "AT URI").returns(json!("RecordEnvelope?")))
+```
+
+A method on a constructor's object takes the same `description`, `params` and `returns` as an export, through `ApiMethod::lazy("where").param(...).returns(...)` and `ApiExport::method`. A lazy method that gives no `returns` returns the object it was called on.
+
+HappyView refuses to install a library whose surface does not parse, naming the export and the string: `library db describes itself wrongly: export 'get', returns: 'Recrd' names no type in this surface's types`. Check yours in the plugin's own tests:
+
+```rust
+#[test]
+fn surface_parses() {
+    happyview_plugin_sdk::declarations::assert_surface_parses(&surface());
+}
+```
+
+Leaving something out is never an error: an export with no `returns` is typed as unknown.
 
 #### Naming
 
@@ -365,7 +439,7 @@ Names are snake_case on the wire and in Lua — `namespace`, export `name`, meth
 
 An export's `kind` is `function`, `constant`, or `constructor`, and defaults to `function`.
 
-`require()` renders `function` exports (as shown above) and `constructor` exports. `constant` is reserved for future interpreters and is not rendered by `require()`. A `constructor` export returns an object. The surface lists the object's `methods`, each `{name, mode}` with mode `lazy` or `immediate`:
+`require()` renders `function` exports (as shown above) and `constructor` exports. `constant` is reserved for future interpreters and is not rendered by `require()`. A `constructor` export returns an object. The surface lists the object's `methods`, each `{name, mode}` with mode `lazy` or `immediate`, plus the signature fields described under [Types](#types):
 
 | Method mode | Calling it |
 | --- | --- |
