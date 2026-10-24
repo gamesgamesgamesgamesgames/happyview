@@ -401,18 +401,83 @@ async fn dev_rebuilds_once_per_interpreter_change_and_prints_it() {
         .register(echo_interpreter::plugin_with_extensions("echo", &["echo"]))
         .await;
 
-    let line = tokio::time::timeout(std::time::Duration::from_secs(30), lines.recv())
-        .await
-        .expect("no build line after the interpreter changed")
-        .expect("the watch loop ended");
+    // Editor types are reported beside builds; this test counts builds.
+    let line = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), lines.recv())
+            .await
+            .expect("no build line after the interpreter changed")
+            .expect("the watch loop ended");
+        if !line.starts_with("types: ") {
+            break line;
+        }
+    };
     assert!(line.starts_with("built in"), "{line}");
     assert_eq!(
         settled_generation_after(&app, installed.generation).await,
         installed.generation + 1
     );
-    assert!(
-        lines.try_recv().is_err(),
-        "a second build was reported for one change"
+    while let Ok(line) = lines.try_recv() {
+        assert!(
+            line.starts_with("types: "),
+            "a second build was reported for one change: {line}"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+async fn next(lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(30), lines.recv())
+        .await
+        .expect("no line from the dev server")
+        .expect("the watch loop ended")
+}
+
+/// The dev server keeps `.happyview/types/` current: written once the watch
+/// starts, rewritten after a build that changes what a script can see, and
+/// left alone, silently, after one that does not.
+#[tokio::test]
+async fn dev_writes_editor_types_at_start_and_after_a_change() {
+    use happyview::dev::watch::{WatchMode, spawn_with};
+    use happyview::project::boot::{Mode, start};
+    let Some(app) = app().await else { return };
+    let root = project_dir(&[("src/jobs/tick.echo", "value:none")]);
+    start(&app.state, &root, Mode::Dev)
+        .await
+        .unwrap_or_else(|d| panic!("{d:?}"));
+    let session = happyview::dev::DevSession {
+        root: root.clone(),
+        public_url: String::new(),
+        secrets: happyview::dev::secrets::load_or_create(&root.join(".happyview")).unwrap(),
+        watch_mode: WatchMode::Poll(std::time::Duration::from_millis(100)),
+    };
+    let (tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let _watch = spawn_with(app.state.clone(), session, move |line| {
+        let _ = tx.send(line);
+    })
+    .unwrap();
+    assert_eq!(next(&mut lines).await, "types: echo: wrote 1 file");
+    let written = root.join(".happyview/types/echo/input.json");
+    assert!(written.exists());
+
+    std::fs::create_dir_all(root.join("src/lexicons/com/example")).unwrap();
+    std::fs::write(
+        root.join("src/lexicons/com/example/thing.json"),
+        r#"{"lexicon": 1, "id": "com.example.thing", "defs": {"main": {"type": "record", "key": "tid", "record": {"type": "object", "properties": {}}}}}"#,
+    )
+    .unwrap();
+    let built = next(&mut lines).await;
+    assert!(built.starts_with("built in"), "{built}");
+    assert_eq!(next(&mut lines).await, "types: echo: wrote 1 file");
+    let input = std::fs::read_to_string(&written).unwrap();
+    assert!(input.contains("com.example.thing"), "{input}");
+
+    // Another pass over the same snapshot writes and reports nothing.
+    let before = std::fs::metadata(&written).unwrap().modified().unwrap();
+    let again = happyview::dev::watch::refresh_types(&app.state, &root, false).await;
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(
+        std::fs::metadata(&written).unwrap().modified().unwrap(),
+        before
     );
     std::fs::remove_dir_all(root).ok();
 }
