@@ -78,11 +78,14 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced, with its new `repoRev` and `hash`.
+    /// The repo that advanced, with its new `repoRev` and `data`.
     repo: Option<String>,
     repo_rev: Option<String>,
     /// The alpha lexicon's name for `repoRev`. Accepted until v3.
     rev: Option<String>,
+    data: Option<LexBytes>,
+    /// The name for `data` before proposal 0016. Accepted until every repo
+    /// host sends `data`.
     hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
     /// Accepted until v3.
@@ -104,7 +107,7 @@ impl LexBytes {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(self.bytes.trim_end_matches('='))
-            .map_err(|_| AppError::BadRequest("hash is not valid base64".into()))
+            .map_err(|_| AppError::BadRequest("data is not valid base64".into()))
     }
 }
 
@@ -1512,6 +1515,9 @@ async fn list_repos(
                 "repoRev": w.rev,
                 // The alpha lexicon's name for `repoRev`. Sent until v3.
                 "rev": w.rev,
+                "data": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+                // The name for `data` before proposal 0016. Sent until every
+                // syncer reads `data`.
                 "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
                 "spaceRev": w.space_rev,
             })
@@ -1792,7 +1798,10 @@ async fn notify_write(
         ),
     }
 
-    if let (Some(rev), Some(hash)) = (input.repo_rev.as_ref().or(input.rev.as_ref()), &input.hash) {
+    if let (Some(rev), Some(hash)) = (
+        input.repo_rev.as_ref().or(input.rev.as_ref()),
+        input.data.as_ref().or(input.hash.as_ref()),
+    ) {
         let hash = hash.decode()?;
         let mut conn = service::begin_space_write(&state, &space.id).await?;
         let recorded = crate::spaces::writers::record(
