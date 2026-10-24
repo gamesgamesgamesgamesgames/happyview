@@ -73,6 +73,11 @@ pub enum ExecutionError {
     #[error("Missing export: {0}")]
     MissingExport(String),
 
+    /// A library's `get_api_surface` answered something the type grammar
+    /// does not read. The message says where.
+    #[error("library {plugin_id} describes itself wrongly: {message}")]
+    BadSurface { plugin_id: String, message: String },
+
     #[error("Plugin is not a library: {0}")]
     NotALibrary(String),
 
@@ -470,6 +475,18 @@ fn settle_artifact(input: &mut ScriptExecuteInput, stamp: Option<&ArtifactStamp>
 /// guest's reaction to it is an ordinary trap; an interrupt is read first,
 /// because a guest that survived a refusal and then ran out of time timed
 /// out.
+fn typed(
+    plugin_id: &str,
+    surface: &ApiSurface,
+) -> Result<happyview_plugin_sdk::declarations::TypedSurface, ExecutionError> {
+    happyview_plugin_sdk::declarations::parse_surface(surface).map_err(|e| {
+        ExecutionError::BadSurface {
+            plugin_id: plugin_id.to_string(),
+            message: e.to_string(),
+        }
+    })
+}
+
 fn classify_error(state: &PluginState, e: wasmtime::Error) -> ExecutionError {
     match e.downcast_ref::<wasmtime::Trap>() {
         Some(wasmtime::Trap::Interrupt) | Some(wasmtime::Trap::OutOfFuel) => {
@@ -966,11 +983,40 @@ impl PluginExecutor {
         let mut inst = self
             .instantiate_library(lib_id, &LibraryCallContext::default(), None, 0)
             .await?;
-        let surface = Arc::new(inst.call_get_api_surface().await?);
+        let surface = inst.call_get_api_surface().await?;
+        typed(lib_id, &surface)?;
+        let surface = Arc::new(surface);
         self.registry
             .cache_api_surface(lib_id, surface.clone())
             .await;
         Ok(surface)
+    }
+
+    /// A library's surface read into the type model. Only a surface that
+    /// parses is ever cached, so this parse is the cheap second one.
+    pub async fn typed_surface(
+        &self,
+        lib_id: &str,
+    ) -> Result<happyview_plugin_sdk::declarations::TypedSurface, ExecutionError> {
+        typed(lib_id, &*self.api_surface(lib_id).await?)
+    }
+
+    /// Read the surface of a library that is not installed yet, so an install
+    /// can refuse one that does not parse. A module without
+    /// `get_api_surface` is `Ok(None)`: it has nothing to describe, and
+    /// refusing it is not this check's business.
+    pub async fn surface_of(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::TypedSurface>, ExecutionError> {
+        let mut inst = self
+            .instantiate_loaded(plugin, "library", HashMap::new(), serde_json::Value::Null)
+            .await?;
+        match inst.call_get_api_surface().await {
+            Ok(surface) => typed(&plugin.info.id, &surface).map(Some),
+            Err(ExecutionError::MissingExport(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Every installed library with its surface. Libraries whose surface
