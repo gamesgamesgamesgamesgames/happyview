@@ -90,6 +90,19 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             let code = crate::testing::runner::run(&args, &mut std::io::stdout()).await;
             return std::process::ExitCode::from(code);
         }
+        crate::cli::Command::Types(args) => {
+            // As `check`: logs to stderr, stdout for what was written.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn".parse().unwrap()),
+                )
+                .init();
+            let code =
+                crate::project::declarations::command::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
         crate::cli::Command::Help => {
             println!("{}", crate::cli::USAGE);
             return std::process::ExitCode::SUCCESS;

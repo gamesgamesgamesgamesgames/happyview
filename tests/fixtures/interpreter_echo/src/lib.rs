@@ -18,6 +18,10 @@
 //! `execute` answers a `test` run whose source starts `predates-tests` with a
 //! `BAD_INPUT` envelope, as an interpreter that predates test runs fails to
 //! decode the kind.
+//!
+//! `get_declarations` writes its whole input to `input.json`, unless the
+//! project has a lexicon whose NSID ends `.badpath` (then it names
+//! `../escape.json`) or `.trap` (then it traps).
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![allow(static_mut_refs)]
 
@@ -756,4 +760,26 @@ pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
         out
     };
     return_json(&json!({"ok": out}))
+}
+
+#[no_mangle]
+pub extern "C" fn get_declarations(ptr: u32, len: u32) -> i64 {
+    let Some(input) = read_input(ptr, len) else {
+        return return_json(&err("BAD_INPUT", "invalid JSON"));
+    };
+    let nsids: alloc::vec::Vec<&str> = input["lexicons"]
+        .as_array()
+        .map(|lexicons| lexicons.iter().filter_map(|l| l["nsid"].as_str()).collect())
+        .unwrap_or_default();
+    if nsids.iter().any(|nsid| nsid.ends_with(".trap")) {
+        #[cfg(target_arch = "wasm32")]
+        core::arch::wasm32::unreachable();
+    }
+    let path = if nsids.iter().any(|nsid| nsid.ends_with(".badpath")) {
+        "../escape.json"
+    } else {
+        "input.json"
+    };
+    let contents = serde_json::to_string(&input).unwrap_or_default();
+    return_json(&json!({"ok": {"files": [{"path": path, "contents": contents}]}}))
 }

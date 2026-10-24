@@ -235,6 +235,25 @@ impl PluginInstance {
         self.call_plugin_function("validate", &input).await
     }
 
+    /// Call an interpreter's optional `get_declarations`. `Ok(None)` when the
+    /// module has no such export: an interpreter built before it existed.
+    pub async fn call_declarations(
+        &mut self,
+        input: &happyview_plugin_sdk::declarations::DeclarationsInput,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::Declarations>, ExecutionError> {
+        const EXPORT: &str = "get_declarations";
+        if self
+            .instance
+            .get_typed_func::<(u32, u32), i64>(&mut self.store, EXPORT)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let input = serde_json::to_value(input)
+            .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
+        self.call_plugin_function(EXPORT, &input).await.map(Some)
+    }
+
     /// Call `call` on a library plugin with `{function, args, context}`.
     pub async fn call_library_function(
         &mut self,
@@ -475,6 +494,9 @@ fn settle_artifact(input: &mut ScriptExecuteInput, stamp: Option<&ArtifactStamp>
 /// guest's reaction to it is an ordinary trap; an interrupt is read first,
 /// because a guest that survived a refusal and then ran out of time timed
 /// out.
+/// How long an interpreter may spend rendering declarations.
+const DECLARATIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn typed(
     plugin_id: &str,
     surface: &ApiSurface,
@@ -880,6 +902,21 @@ impl PluginExecutor {
             ..ScriptValidateInput::default()
         })
         .await
+    }
+
+    /// Ask interpreter `plugin` to render `input` as editor declarations.
+    /// Rendering reads no run, so it gets no context and no session, and a
+    /// fixed deadline of its own rather than a script's.
+    pub async fn declarations_for(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: &happyview_plugin_sdk::declarations::DeclarationsInput,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::Declarations>, ExecutionError> {
+        let mut inst = self
+            .instantiate_interpreter(plugin, None, None, ModuleScope::Dashboard)
+            .await?;
+        inst.arm_guest_deadline(DECLARATIONS_DEADLINE);
+        inst.call_declarations(input).await
     }
 
     /// Validate `source` as `chunk_name` and keep what the interpreter
