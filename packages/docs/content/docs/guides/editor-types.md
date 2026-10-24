@@ -53,7 +53,7 @@ end
 import type { Params, Output } from "happyview:lexicons/com.example.getThing";
 import type { QueryCtx } from "happyview:ctx";
 
-export function handle(input: Params, ctx: QueryCtx): Output {
+export default async function handle(input: Params, ctx: QueryCtx): Promise<Output> {
 }
 ```
 

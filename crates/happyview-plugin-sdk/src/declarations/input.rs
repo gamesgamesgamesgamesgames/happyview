@@ -24,7 +24,7 @@ pub struct DeclarationsInput {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibraryDeclaration {
-    /// What a script requires it by, after the `happyview.` prefix.
+    /// What a script requires it by, such as `happyview.db`.
     pub namespace: String,
     pub surface: TypedSurface,
 }
