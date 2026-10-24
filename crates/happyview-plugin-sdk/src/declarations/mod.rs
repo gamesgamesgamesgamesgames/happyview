@@ -5,6 +5,7 @@
 //! gets types for it.
 
 mod grammar;
+mod surface;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use grammar::{parse_type, print_type, TypeError};
+pub use surface::{
+    assert_surface_parses, parse_surface, NamedType, SurfaceError, TypedExport, TypedMethod,
+    TypedSurface,
+};
 
 /// A type, as a surface's type strings and a lexicon's field definitions both
 /// describe one.

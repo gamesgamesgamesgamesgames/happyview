@@ -139,9 +139,7 @@ impl Parser {
     }
 
     fn union(&mut self) -> Result<TypeExpr, TypeError> {
-        let first = self.postfix()?;
-        let mut members = Vec::new();
-        push_member(&mut members, first);
+        let mut members = Vec::from([self.postfix()?]);
         loop {
             self.skip_space();
             if self.peek() != Some('|') {
@@ -149,17 +147,9 @@ impl Parser {
             }
             self.at += 1;
             self.skip_space();
-            let next = self.postfix()?;
-            push_member(&mut members, next);
+            members.push(self.postfix()?);
         }
-        Ok(if members.len() == 1 {
-            members.pop().unwrap_or(TypeExpr::Unknown)
-        } else {
-            TypeExpr::Union {
-                members,
-                open: false,
-            }
-        })
+        Ok(union_of(members))
     }
 
     fn postfix(&mut self) -> Result<TypeExpr, TypeError> {
@@ -292,6 +282,22 @@ impl Parser {
                 value: Value::Bool(false),
             },
             _ => TypeExpr::Ref { name: word },
+        }
+    }
+}
+
+/// One union of `members`, flattened, or the single member itself.
+pub(crate) fn union_of(members: Vec<TypeExpr>) -> TypeExpr {
+    let mut flat = Vec::new();
+    for member in members {
+        push_member(&mut flat, member);
+    }
+    if flat.len() == 1 {
+        flat.pop().unwrap_or(TypeExpr::Unknown)
+    } else {
+        TypeExpr::Union {
+            members: flat,
+            open: false,
         }
     }
 }
