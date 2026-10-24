@@ -235,6 +235,17 @@ pub fn dispatch_validate(
     dispatch_input(ptr, len, handler)
 }
 
+/// The body of the optional `get_declarations` export.
+pub fn dispatch_declarations(
+    ptr: u32,
+    len: u32,
+    handler: fn(
+        &crate::declarations::DeclarationsInput,
+    ) -> Result<crate::declarations::Declarations, PluginError>,
+) -> i64 {
+    dispatch_input(ptr, len, handler)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

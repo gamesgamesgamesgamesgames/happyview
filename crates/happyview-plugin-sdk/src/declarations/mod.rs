@@ -5,6 +5,7 @@
 //! gets types for it.
 
 mod grammar;
+mod input;
 mod surface;
 
 use alloc::boxed::Box;
@@ -15,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use grammar::{parse_type, print_type, TypeError};
+pub use input::{
+    CtxShapes, DeclarationFile, Declarations, DeclarationsInput, EventShapes, LexiconDeclaration,
+    LibraryDeclaration, MainDef,
+};
 pub use surface::{
     assert_surface_parses, parse_surface, NamedType, SurfaceError, TypedExport, TypedMethod,
     TypedSurface,
