@@ -14,4 +14,10 @@ ignore = [
     # roots. The advisory matches the shim by version number alone. Remove this
     # once tokio-tungstenite depends on webpki-roots 1.
     "RUSTSEC-2026-0381",
+    # crypto-bigint 0.5: timing variability in constant-time operations, fixed
+    # only in 0.7.6. 0.5.5 comes in through elliptic-curve 0.13 (p256/ecdsa),
+    # which atrium-oauth 0.1 and jose-jwk 0.1 require, so it can't be raised on
+    # its own. The 0.7 copy is updated. Remove this once atrium-oauth moves to
+    # elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
 ]
