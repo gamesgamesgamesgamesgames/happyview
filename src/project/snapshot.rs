@@ -45,6 +45,9 @@ pub struct ProjectLexicon {
     /// From `happyview.toml`: a lexicon document is published schema and has
     /// nowhere to carry it.
     pub backfill: bool,
+    /// From `happyview.toml`. A record lexicon that is not indexed validates
+    /// writes and serves refs, but its collection is never ingested.
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone)]

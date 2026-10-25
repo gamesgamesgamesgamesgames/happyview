@@ -20,6 +20,7 @@ pub async fn lexicon(state: &AppState, doc: Value) {
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await

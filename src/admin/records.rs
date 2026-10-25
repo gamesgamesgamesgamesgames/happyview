@@ -246,7 +246,7 @@ pub(super) async fn list_collections(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::RecordsRead).await?;
 
-    let collections = state.lexicons.get_record_collections().await;
+    let collections = state.lexicons.get_record_lexicon_ids().await;
     Ok(Json(serde_json::json!({ "collections": collections })))
 }
 

@@ -20,6 +20,7 @@ struct StoredLexicon {
     parsed: ParsedLexicon,
     layer: Layer,
     authority_did: Option<String>,
+    indexed: bool,
 }
 
 impl StoredLexicon {
@@ -45,6 +46,7 @@ fn project_entry(lex: &ProjectLexicon) -> Entry<ParsedLexicon> {
 pub struct NetworkLexicon {
     pub parsed: ParsedLexicon,
     pub authority_did: Option<String>,
+    pub indexed: bool,
 }
 
 impl From<&StoredLexicon> for NetworkLexicon {
@@ -52,6 +54,7 @@ impl From<&StoredLexicon> for NetworkLexicon {
         Self {
             parsed: s.parsed.clone(),
             authority_did: s.authority_did.clone(),
+            indexed: s.indexed,
         }
     }
 }
@@ -67,6 +70,9 @@ pub struct LexiconWrite {
     /// The DID the NSID resolved to. Required by `put_network`, ignored by
     /// `put_manual`.
     pub authority_did: Option<String>,
+    /// Whether the collection is ingested from the network. Only a record
+    /// lexicon can be indexed; the flag is inert on any other type.
+    pub indexed: bool,
 }
 
 impl LexiconWrite {
@@ -112,6 +118,7 @@ pub struct LexiconListing {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub token_cost: Option<i32>,
+    pub indexed: bool,
 }
 
 impl LexiconListing {
@@ -133,6 +140,7 @@ impl LexiconListing {
             created_at: Some(row.created_at),
             updated_at: Some(row.updated_at),
             token_cost: row.token_cost,
+            indexed: row.indexed,
         }
     }
 
@@ -152,6 +160,7 @@ impl LexiconListing {
             created_at: None,
             updated_at: None,
             token_cost: lex.parsed.token_cost.map(|c| c as i32),
+            indexed: lex.indexed,
         }
     }
 }
@@ -258,6 +267,7 @@ impl LexiconCatalog {
                             parsed,
                             layer: Layer::from_source(&row.source),
                             authority_did: row.authority_did,
+                            indexed: row.indexed,
                         },
                     );
                 }
@@ -303,9 +313,31 @@ impl LexiconCatalog {
         self.get_entry(id).await.map(|e| e.value)
     }
 
+    /// The layer answering for `id` says whether its collection is ingested.
+    /// Only a record lexicon can be; the flag means nothing on other types.
+    pub fn is_indexed(&self, id: &str) -> bool {
+        if let Some(lex) = self.project.load().lexicons.get(id) {
+            return lex.parsed.lexicon_type == LexiconType::Record && lex.indexed;
+        }
+        self.stored()
+            .get(id)
+            .is_some_and(|s| s.parsed.lexicon_type == LexiconType::Record && s.indexed)
+    }
+
     /// Sorted, so the Jetstream filter and every listing built from it are
-    /// stable between calls.
+    /// stable between calls. A record lexicon installed unindexed is left out:
+    /// nothing subscribes to, backfills or counts its collection.
     pub async fn get_record_collections(&self) -> Vec<String> {
+        self.ids_of_type(LexiconType::Record)
+            .into_iter()
+            .filter(|id| self.is_indexed(id))
+            .collect()
+    }
+
+    /// Every record lexicon's id, indexed or not, sorted. The operator views
+    /// list these, so rows held in an unindexed collection can be browsed,
+    /// counted and deleted; ingestion uses [`Self::get_record_collections`].
+    pub async fn get_record_lexicon_ids(&self) -> Vec<String> {
         self.ids_of_type(LexiconType::Record)
     }
 
@@ -398,6 +430,7 @@ impl LexiconCatalog {
                 parsed,
                 layer: Layer::Manual,
                 authority_did: None,
+                indexed: lexicon.indexed,
             },
         );
         Ok(revision)
@@ -425,6 +458,7 @@ impl LexiconCatalog {
                 parsed,
                 layer: Layer::Network,
                 authority_did: Some(authority_did),
+                indexed: lexicon.indexed,
             },
         );
         Ok(revision)
@@ -470,6 +504,7 @@ impl LexiconCatalog {
                 parsed,
                 layer: Layer::Network,
                 authority_did: current.authority_did,
+                indexed: current.indexed,
             },
         );
         Ok(Some(revision))
@@ -504,6 +539,7 @@ impl LexiconCatalog {
         Ok(Some(NetworkLexicon {
             parsed: placeholder,
             authority_did: row.authority_did,
+            indexed: row.indexed,
         }))
     }
 
@@ -594,12 +630,24 @@ impl LexiconCatalog {
     /// exercise readers rather than storage.
     #[cfg(test)]
     pub(crate) async fn upsert(&self, parsed: ParsedLexicon) {
+        self.upsert_with(parsed, true);
+    }
+
+    /// [`Self::upsert`] for a lexicon installed without indexing.
+    #[cfg(test)]
+    pub(crate) async fn upsert_unindexed(&self, parsed: ParsedLexicon) {
+        self.upsert_with(parsed, false);
+    }
+
+    #[cfg(test)]
+    fn upsert_with(&self, parsed: ParsedLexicon, indexed: bool) {
         self.stored_mut().insert(
             parsed.id.clone(),
             StoredLexicon {
                 parsed,
                 layer: Layer::Manual,
                 authority_did: None,
+                indexed,
             },
         );
     }
@@ -719,6 +767,7 @@ mod tests {
                     parsed,
                     path: PathBuf::from(path),
                     backfill: false,
+                    indexed: true,
                 },
             );
         }
@@ -971,6 +1020,7 @@ mod tests {
             action: ProcedureAction::Upsert,
             token_cost: None,
             authority_did: None,
+            indexed: true,
         }
     }
 
@@ -1145,6 +1195,160 @@ mod tests {
 
             catalog.remove(&db, backend, &net_id).await.unwrap();
             catalog.remove(&db, backend, &man_id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_record_lexicon_is_left_out_of_the_record_collections() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::detached();
+            let kept = unique("kept");
+            let quiet = unique("quiet");
+            catalog
+                .put_manual(&db, backend, manual(record_json(&kept)))
+                .await
+                .unwrap();
+            let mut write = manual(record_json(&quiet));
+            write.indexed = false;
+            catalog.put_manual(&db, backend, write).await.unwrap();
+
+            let collections = catalog.get_record_collections().await;
+            assert!(collections.contains(&kept));
+            assert!(!collections.contains(&quiet));
+            assert!(catalog.is_indexed(&kept));
+            assert!(!catalog.is_indexed(&quiet));
+            assert!(!catalog.is_indexed("com.example.missing"));
+
+            let listings = catalog.list(&db, backend).await.unwrap();
+            let indexed_of = |id: &str| listings.iter().find(|l| l.id == id).unwrap().indexed;
+            assert!(indexed_of(&kept));
+            assert!(!indexed_of(&quiet));
+
+            catalog.remove(&db, backend, &kept).await.unwrap();
+            catalog.remove(&db, backend, &quiet).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_record_lexicon_is_indexed() {
+        let catalog = LexiconCatalog::detached();
+        catalog.upsert(parse(query_lexicon_json(), 1)).await;
+        assert!(!catalog.is_indexed("games.gamesgamesgamesgames.listGames"));
+    }
+
+    #[tokio::test]
+    async fn refresh_network_keeps_indexed() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::detached();
+            let id = unique("net");
+            let mut write = network(record_json(&id), "did:plc:authority");
+            write.indexed = false;
+            catalog.put_network(&db, backend, write).await.unwrap();
+
+            let mut changed = record_json(&id);
+            changed["description"] = json!("v2");
+            catalog
+                .refresh_network(&db, backend, &id, changed)
+                .await
+                .unwrap();
+            assert!(!catalog.is_indexed(&id));
+            assert!(!catalog.get_record_collections().await.contains(&id));
+
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_project_lexicon_is_left_out() {
+        let project = shared_empty();
+        let catalog = LexiconCatalog::new(project.clone());
+        let mut snap = snapshot_with(&[
+            (
+                record_json("com.example.projquiet"),
+                "src/lexicons/quiet.json",
+            ),
+            (
+                record_json("com.example.projloud"),
+                "src/lexicons/loud.json",
+            ),
+        ]);
+        snap.lexicons
+            .get_mut("com.example.projquiet")
+            .unwrap()
+            .indexed = false;
+        project.store(Arc::new(snap));
+
+        assert_eq!(
+            catalog.get_record_collections().await,
+            vec!["com.example.projloud".to_string()]
+        );
+        assert!(catalog.is_indexed("com.example.projloud"));
+        assert!(!catalog.is_indexed("com.example.projquiet"));
+    }
+
+    #[tokio::test]
+    async fn a_project_entry_that_is_unindexed_shadows_an_indexed_stored_row() {
+        for (db, backend) in backends().await {
+            let project = shared_empty();
+            let catalog = LexiconCatalog::new(project.clone());
+            let id = unique("shadowquiet");
+            catalog
+                .put_manual(&db, backend, manual(record_json(&id)))
+                .await
+                .unwrap();
+            assert!(catalog.is_indexed(&id));
+
+            let mut snap = snapshot_with(&[(record_json(&id), "src/lexicons/shadow.json")]);
+            snap.lexicons.get_mut(&id).unwrap().indexed = false;
+            project.store(Arc::new(snap));
+
+            assert!(!catalog.is_indexed(&id));
+            assert!(!catalog.get_record_collections().await.contains(&id));
+
+            project.store(Arc::new(ProjectSnapshot::empty()));
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_entry_that_is_indexed_shadows_an_unindexed_stored_row() {
+        for (db, backend) in backends().await {
+            let project = shared_empty();
+            let catalog = LexiconCatalog::new(project.clone());
+            let id = unique("shadowloud");
+            let mut write = manual(record_json(&id));
+            write.indexed = false;
+            catalog.put_manual(&db, backend, write).await.unwrap();
+            assert!(!catalog.is_indexed(&id));
+
+            project.store(Arc::new(snapshot_with(&[(
+                record_json(&id),
+                "src/lexicons/shadow.json",
+            )])));
+
+            assert!(catalog.is_indexed(&id));
+            assert!(catalog.get_record_collections().await.contains(&id));
+
+            project.store(Arc::new(ProjectSnapshot::empty()));
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_survives_a_reload_from_the_database() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::detached();
+            let id = unique("reload");
+            let mut write = manual(record_json(&id));
+            write.indexed = false;
+            catalog.put_manual(&db, backend, write).await.unwrap();
+
+            let fresh = LexiconCatalog::detached();
+            fresh.load_from_db(&db).await.unwrap();
+            assert!(!fresh.is_indexed(&id));
+            assert!(!fresh.get_record_collections().await.contains(&id));
+
+            catalog.remove(&db, backend, &id).await.unwrap();
         }
     }
 

@@ -358,6 +358,7 @@ async fn pipeline_state(mock: &MockServer, collections: &[&str]) -> AppState {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await
@@ -694,6 +695,7 @@ async fn an_all_collections_job_includes_a_project_only_record_lexicon() {
             parsed: record_lexicon(POST).1,
             path: "src/lexicons/post.json".into(),
             backfill: false,
+            indexed: true,
         },
     );
     state.project.store(Arc::new(snap));
@@ -984,6 +986,37 @@ async fn a_discovery_that_cannot_write_its_queue_fails_the_job() {
     assert_eq!(status, "failed");
     let error = error.expect("a failed job says why");
     assert!(error.contains("cursor writes refused"), "{error}");
+}
+
+/// A collection with a record lexicon the catalog does not index is not
+/// tracked, so a job naming it fails and says so.
+#[tokio::test]
+async fn a_job_for_an_unindexed_collection_fails_naming_why() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[]).await;
+    state
+        .lexicons
+        .upsert_unindexed(record_lexicon(POST).1)
+        .await;
+    track_collections(&state).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &[])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let (status, error): (String, Option<String>) =
+        crate::db::query_as("SELECT status, error FROM happyview_backfill_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("job row");
+    assert_eq!(status, "failed");
+    assert_eq!(
+        error.as_deref(),
+        Some(format!("no indexed record lexicon for collection '{POST}'").as_str())
+    );
 }
 
 /// The same for a discovery that cannot read where it left off.
