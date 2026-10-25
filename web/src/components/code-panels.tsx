@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { MonacoEditor } from "@/components/monaco-editor";
-import type { LuaCompletions } from "@/lib/lua-completions";
 
 interface CodePanelsProps {
   jsonValue: string;
@@ -12,8 +11,6 @@ interface CodePanelsProps {
   luaValue?: string | null;
   onLuaChange?: (value: string) => void;
   luaReadOnly?: boolean;
-  luaCompletions?: LuaCompletions;
-  collections?: string[];
   className?: string;
 }
 
@@ -24,8 +21,6 @@ function Panel({
   onChange,
   readOnly,
   lang,
-  completions,
-  collections,
 }: {
   className?: string;
   label: string;
@@ -33,8 +28,6 @@ function Panel({
   onChange?: (value: string) => void;
   readOnly?: boolean;
   lang: string;
-  completions?: LuaCompletions;
-  collections?: string[];
 }) {
   return (
     <div className={cn("flex flex-col min-h-0 flex-1", className)}>
@@ -45,8 +38,6 @@ function Panel({
         onChange={onChange}
         language={lang}
         readOnly={readOnly || !onChange}
-        completions={completions}
-        collections={collections}
       />
     </div>
   );
@@ -59,8 +50,6 @@ export function CodePanels({
   luaValue,
   onLuaChange,
   luaReadOnly,
-  luaCompletions,
-  collections,
   className,
 }: CodePanelsProps) {
   const hasLua = luaValue != null || !!onLuaChange;
@@ -139,8 +128,6 @@ export function CodePanels({
               onChange={onLuaChange}
               readOnly={luaReadOnly}
               lang="lua"
-              completions={luaCompletions}
-              collections={collections}
             />
           )}
         </div>

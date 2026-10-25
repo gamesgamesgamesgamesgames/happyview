@@ -60,3 +60,9 @@ export default async function handle(input: Params, ctx: QueryCtx): Promise<Outp
 ```
 
 Pointing your editor at `.happyview/types/` is the language server's own setting: `workspace.library` in `.luarc.json` for LuaLS, and `include` or `typeRoots` in `tsconfig.json`.
+
+## In the dashboard
+
+The dashboard's script editor reads the same declarations, rendered for the whole instance through [`GET /admin/editor/declarations`](../api-reference/admin/scripts.md#editor-declarations). They cover every installed library and every lexicon the instance serves.
+- **Lua:** the editor completes the members of a `require`d library and of what its calls return. It types `input` and `ctx` from the script's trigger, so a handler needs no annotations there, and shows each member's type and description on hover.
+- **TypeScript and JavaScript:** `import type` from `happyview:ctx` and `happyview:lexicons/<nsid>` resolve as they do in an editor.
