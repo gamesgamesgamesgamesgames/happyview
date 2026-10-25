@@ -1417,8 +1417,7 @@ async fn an_official_lua_install(config: RegistryConfig) -> TestApp {
 
 /// A recorded install is never moved to another URL, since no URL can be
 /// checked against its publisher: the reload is refused with 409 and the
-/// install left as it was. Reloading the URL it has still works, and an
-/// unrecorded install may move.
+/// install left as it was. Reloading the URL it has still works.
 #[tokio::test]
 #[serial]
 async fn reload_refuses_a_new_url_for_a_recorded_install() {
@@ -1441,7 +1440,15 @@ async fn reload_refuses_a_new_url_for_a_recorded_install() {
         .post_json_status("/admin/plugins/lua/reload", json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
+}
 
+/// An install with no recorded publisher may move to another URL. (Its own
+/// test: a second `TestApp` in one test waits on the first one's
+/// database lock.)
+#[tokio::test]
+#[serial]
+async fn reload_moves_an_unrecorded_install_to_a_new_url() {
+    common::require_db!();
     let unrecorded = an_official_lua_install(RegistryConfig::production()).await;
     let moved = serve_module(&unrecorded, "moved-lua", "lua", "2.0.0").await;
     let (status, body) = unrecorded
