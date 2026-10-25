@@ -110,6 +110,7 @@ async fn a_query_served_on_a_test_state_cannot_reach_the_harness() {
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await
@@ -871,6 +872,7 @@ fn procedure_lexicon() -> LexiconWrite {
         action: ProcedureAction::Create,
         token_cost: None,
         authority_did: None,
+        indexed: true,
     }
 }
 

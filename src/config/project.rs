@@ -123,6 +123,7 @@ pub struct LexiconOverride {
     pub target_collection: Option<String>,
     pub action: Option<OverrideAction>,
     pub token_cost: Option<u32>,
+    pub indexed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -691,6 +692,7 @@ target_collection = "at.happyproto.registry.artifact"
 
 [lexicons."at.happyproto.registry.artifact"]
 backfill = true
+indexed = false
 
 [lexicons."at.happyproto.registry.putArtifact"]
 action = "create"
@@ -766,6 +768,11 @@ capabilities = ["library:call"]
             config.lexicons["at.happyproto.registry.artifact"].backfill,
             Some(true)
         );
+        assert_eq!(
+            config.lexicons["at.happyproto.registry.artifact"].indexed,
+            Some(false)
+        );
+        assert_eq!(get.indexed, None, "an unset override stays unset");
         let put = &config.lexicons["at.happyproto.registry.putArtifact"];
         assert_eq!(put.action, Some(OverrideAction::Create));
         assert_eq!(put.token_cost, Some(5));

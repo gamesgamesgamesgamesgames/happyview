@@ -3,6 +3,8 @@ export interface LexiconSummary {
   revision: number;
   lexicon_type: string;
   backfill: boolean;
+  /** `false` when records are not collected from the network. */
+  indexed: boolean;
   action: string | null;
   target_collection: string | null;
   source: string;

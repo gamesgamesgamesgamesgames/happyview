@@ -157,12 +157,14 @@ compression = true           # stands in for JETSTREAM_COMPRESSION
 
 [lexicons."com.example.thing"]
 backfill = true              # backfill this record collection once
+indexed = false              # keep the lexicon for validation and refs, without ingesting its collection
 ```
 
 - `[network_lexicons] include` lexicons are tracked at boot, with no target collection and no backfill. One whose id a dashboard lexicon already uses is skipped with a warning; the dashboard lexicon is kept.
 - `[labels] subscribe` labelers are subscribed at boot. Pausing one from the dashboard sticks across restarts.
 - Neither can be removed from the dashboard or the admin API (`409`); remove the line from the file. A line removed from the file leaves its subscription or lexicon in place, now removable from the dashboard.
 - `backfill = true` on a record lexicon in the project's `src/lexicons/` starts a backfill only the first time. Under `happyview dev`, only when `[dev] backfill = true`; dev also checks after every rebuild, so a lexicon added while dev runs gets its backfill then. At boot, HappyView starts one for the collection unless a network backfill of that collection already exists, whatever its outcome: completed, failed, cancelled or still running. A backfill of named accounts does not count, and neither does a backfill of all collections, so either of those leaves the declared one to start. Restarting does not crawl the network again, even if the first backfill failed or was cancelled. To run it again, open **Backfill** in the dashboard, choose **Create Backfill Job** and select the collection, or call [`POST /admin/backfill`](../api-reference/admin/backfill.md) with `{"collection": "..."}`.
+- `indexed` (default `true`): set `false` to keep a record lexicon for validation and refs without ingesting its collection from the network. An unindexed lexicon starts no backfill, even with `backfill = true`. Toggling it takes effect on the next build. The admin API's `indexed` field on [`POST /admin/lexicons`](../api-reference/admin/lexicons.md) does the same for a dashboard lexicon.
 - `[interpreters]` and `[libraries]` name the plugins a project uses, keyed by language id or library namespace. Each value is a table naming a registry project: `did` is the publisher's DID and `name` the project name, followed by exactly one of `channel` (`latest`, `beta` or `alpha`) or `version` (a pinned release, such as `1.2.0` or `1.2.0-rc.1`). `hpy happyview add` writes these entries. The older `lua = "1.4.0"` form is refused with a message showing the table form.
 - Unknown sections and keys are refused, and every error names the file, line and column: `happyview.toml:3:1: unknown field ...`.
 

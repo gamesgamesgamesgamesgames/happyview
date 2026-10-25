@@ -228,6 +228,7 @@ export function getLexicon(id: string) {
 export function uploadLexicon(body: {
   lexicon_json: unknown;
   backfill?: boolean;
+  indexed?: boolean;
   target_collection?: string;
   action?: string;
   token_cost?: number | null;
@@ -310,6 +311,7 @@ export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
 export function addNetworkLexicon(body: {
   nsid: string;
   backfill?: boolean;
+  indexed?: boolean;
   target_collection?: string;
 }) {
   return apiFetch<{

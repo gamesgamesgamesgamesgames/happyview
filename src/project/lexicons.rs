@@ -60,15 +60,22 @@ pub fn load_lexicon(
         parsed,
         path,
         overrides.and_then(|o| o.backfill).unwrap_or(false),
+        overrides.and_then(|o| o.indexed).unwrap_or(true),
     ))
 }
 
 /// The one place a `ProjectLexicon` is built.
-fn project_lexicon(parsed: ParsedLexicon, path: PathBuf, backfill: bool) -> ProjectLexicon {
+fn project_lexicon(
+    parsed: ParsedLexicon,
+    path: PathBuf,
+    backfill: bool,
+    indexed: bool,
+) -> ProjectLexicon {
     ProjectLexicon {
         parsed,
         path,
         backfill,
+        indexed,
     }
 }
 
@@ -184,6 +191,25 @@ mod tests {
         let plain = load_lexicon(&file, &BTreeMap::new()).unwrap();
         assert!(!plain.backfill);
         assert!(plain.parsed.target_collection.is_none());
+    }
+
+    #[test]
+    fn a_lexicon_is_indexed_unless_its_override_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write(
+            &dir,
+            "lexicons/com/example/getThing.json",
+            &query("com.example.getThing"),
+        );
+        let off = BTreeMap::from([(
+            "com.example.getThing".to_string(),
+            LexiconOverride {
+                indexed: Some(false),
+                ..Default::default()
+            },
+        )]);
+        assert!(!load_lexicon(&file, &off).unwrap().indexed);
+        assert!(load_lexicon(&file, &BTreeMap::new()).unwrap().indexed);
     }
 
     #[test]
