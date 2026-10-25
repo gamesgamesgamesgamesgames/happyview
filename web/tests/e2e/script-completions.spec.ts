@@ -23,11 +23,15 @@ function files(dir: string): { path: string; contents: string }[] {
   });
 }
 
-async function typeOnLine(page: Page, line: number, text: string) {
+/** Type at the end of the script, on a line of its own. Monaco reuses its
+ * line elements out of order, so clicking a line by index is not a way to
+ * reach it. */
+async function typeAtEnd(page: Page, text: string) {
   const editor = page.locator(".monaco-editor").first();
   await expect(editor).toBeVisible({ timeout: 10000 });
-  await editor.locator(".view-line").nth(line - 1).click();
-  await page.keyboard.press("End");
+  await editor.locator(".view-lines").click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("Enter");
   await page.keyboard.type(text);
 }
 
@@ -60,17 +64,17 @@ test.describe("Script editor completions", () => {
     await page.goto(`/dashboard/settings/scripts/${encodeURIComponent(ID)}`);
     const suggestions = page.locator(".suggest-widget");
 
-    await typeOnLine(page, 2, "db.");
+    await typeAtEnd(page, "db.");
     await expect(suggestions).toContainText("records", { timeout: 10000 });
     await expect(suggestions).toContainText("search");
     await page.keyboard.press("Escape");
 
     // `input` is the query's Params, `ctx` a QueryCtx.
-    await typeOnLine(page, 4, " input.");
+    await typeAtEnd(page, "input.");
     await expect(suggestions).toContainText("actor", { timeout: 10000 });
     await page.keyboard.press("Escape");
 
-    await typeOnLine(page, 4, " ctx.");
+    await typeAtEnd(page, "ctx.");
     await expect(suggestions).toContainText("caller_did", { timeout: 10000 });
   });
 });
