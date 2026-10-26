@@ -5,6 +5,7 @@ import { Check, ExternalLink, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type {
   CapabilityReport,
+  LifecycleState,
   PluginDependency,
   PluginType,
   PluginSections,
@@ -15,6 +16,7 @@ import {
   PluginCapabilities,
   visibleCapabilities,
 } from "@/components/plugin-capabilities";
+import { ReleaseStateBadge } from "@/components/plugin-lifecycle";
 import { PublishedMarkdown } from "@/components/published-markdown";
 import { UsageBlock } from "@/components/usage-block";
 import {
@@ -56,6 +58,17 @@ export type PluginView = {
   latestVersion: string | null;
   /** Every release the catalogue knows, newest first. */
   releases: ReleaseEntry[];
+  /** The registry project behind the plugin, and where this version stands
+   * in it. Absent for a plugin the registry knows nothing about. */
+  registry: {
+    did: string | null;
+    /** The channel followed, or offered; `null` when pinned. */
+    channel: string | null;
+    state: LifecycleState | null;
+    reason: string | null;
+    /** A URL install no registry project matched. */
+    unresolved: boolean;
+  } | null;
   /** The publisher's long-form prose, where the catalogue has any. */
   sections: PluginSections;
 };
@@ -161,9 +174,50 @@ export function PluginDetail({
                 Before one, the URL under Permissions is the honest version. */}
             {plugin.installed && plugin.source ? (
               <Fact label="Source">
-                {plugin.source.kind === "url"
-                  ? "Installed from URL"
-                  : "Local file"}
+                {plugin.registry?.did
+                  ? "Installed from the registry"
+                  : plugin.source.kind === "url"
+                    ? "Installed from URL"
+                    : "Local file"}
+              </Fact>
+            ) : null}
+            {plugin.registry?.did ? (
+              <>
+                <Fact label="Publisher">
+                  <span className="font-mono text-xs">
+                    {plugin.registry.did}
+                  </span>
+                </Fact>
+                {plugin.installed ? (
+                  <Fact label="Channel">
+                    {plugin.registry.channel ?? "Pinned to this version"}
+                  </Fact>
+                ) : null}
+                <Fact label="Version state">
+                  {plugin.registry.state ? (
+                    <span className="flex flex-col items-start gap-1">
+                      {plugin.registry.state === "active" ? (
+                        "Active"
+                      ) : (
+                        <ReleaseStateBadge state={plugin.registry.state} />
+                      )}
+                      {plugin.registry.reason ? (
+                        <span className="text-muted-foreground">
+                          {plugin.registry.reason}
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      Not in the catalogue
+                    </span>
+                  )}
+                </Fact>
+              </>
+            ) : null}
+            {plugin.registry?.unresolved ? (
+              <Fact label="Registry project">
+                <span className="text-muted-foreground">Unresolved</span>
               </Fact>
             ) : null}
             {plugin.allowedHosts.length > 0 ? (
@@ -245,30 +299,42 @@ export function PluginDetail({
               {plugin.releases.map((release) => {
                 const current = release.version === plugin.version;
                 return (
-                  <li
-                    key={release.version}
-                    className="flex flex-wrap items-baseline justify-between gap-3 p-3"
-                  >
-                    <span
-                      className={cn(
-                        "font-mono text-sm tabular-nums",
-                        current && "font-medium",
-                      )}
-                    >
-                      {release.version}
-                    </span>
-                    <div className="flex items-center gap-3">
-                      {release.published_at ? (
-                        <span className="text-xs text-muted-foreground">
-                          {new Date(release.published_at).toLocaleDateString()}
-                        </span>
-                      ) : null}
-                      {current ? (
-                        <Badge variant="secondary">
-                          {plugin.installed ? "Installed" : "Latest"}
-                        </Badge>
-                      ) : null}
+                  <li key={release.version} className="flex flex-col gap-1 p-3">
+                    <div className="flex flex-wrap items-baseline justify-between gap-3">
+                      <span
+                        className={cn(
+                          "font-mono text-sm tabular-nums",
+                          current && "font-medium",
+                        )}
+                      >
+                        {release.version}
+                      </span>
+                      <div className="flex items-center gap-3">
+                        {release.published_at ? (
+                          <span className="text-xs text-muted-foreground">
+                            {new Date(
+                              release.published_at,
+                            ).toLocaleDateString()}
+                          </span>
+                        ) : null}
+                        <ReleaseStateBadge
+                          state={release.state}
+                          installable={release.installable}
+                        />
+                        {current ? (
+                          <Badge variant="secondary">
+                            {plugin.installed
+                              ? "Installed"
+                              : `On ${plugin.registry?.channel ?? "latest"}`}
+                          </Badge>
+                        ) : null}
+                      </div>
                     </div>
+                    {release.reason && release.state !== "active" ? (
+                      <p className="text-xs text-muted-foreground">
+                        {release.reason}
+                      </p>
+                    ) : null}
                   </li>
                 );
               })}

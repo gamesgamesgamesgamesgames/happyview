@@ -60,6 +60,8 @@ https://github.com/happyproto/plugins/releases/download/happyview-lua-v1.0.0/man
 
 The `.wasm` module is fetched from beside the manifest, so that one URL is the whole install. The repository's releases page carries the current version; each plugin is tagged under its own name.
 
+Once it is published to the plugin registry, install it from the catalogue instead, by project and channel. An instance that installed it from a release URL needn't reinstall: the next catalogue refresh matches it to its [registry project](plugins.md#from-a-url), and its next update comes from the registry.
+
 Building it from source is the other way, and needs more: it vendors PUC Lua, which compiles with a C toolchain targeting WASI — [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) 34 — and the `wasm32-wasip1` Rust target. From the plugins repository's root, with wasi-sdk where its `.cargo/config.toml` expects it:
 
 ```sh
