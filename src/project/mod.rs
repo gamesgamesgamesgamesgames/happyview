@@ -3,6 +3,7 @@
 pub mod boot;
 pub mod build;
 pub mod check;
+pub mod declarations;
 pub mod describe;
 pub mod diagnostic;
 pub mod layout;

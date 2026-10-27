@@ -922,6 +922,7 @@ pub(super) async fn add(
     let plugin_id = plugin.info.id.clone();
     let registry_publisher = registry_install_of(&plugin).map(|r| r.did.clone());
 
+    refuse_a_bad_surface(&state, &plugin).await?;
     // Validate against the dependency graph and register (this also
     // persists to DB).
     state
@@ -1192,8 +1193,10 @@ pub(super) async fn reload(
     // a capability the operator never agreed to. Checked before the old
     // plugin is removed, so a refusal here leaves the currently-installed
     // version untouched rather than uninstalling it and then failing to
-    // reinstall.
+    // reinstall. A surface that does not parse is refused at the same point
+    // for the same reason.
     let consented_capabilities = check_capability_consent(&plugin, &accepted_capabilities)?;
+    refuse_a_bad_surface(&state, &plugin).await?;
     let registry_publisher = registry_install_of(&plugin).map(|r| r.did.clone());
     let mut detail = match registry_install_of(&plugin) {
         Some(install) => serde_json::json!({ "registry": registry_detail(install) }),
@@ -1633,6 +1636,34 @@ pub(super) async fn list_official(
         plugins,
         last_refreshed_at: guard.last_refreshed_at.clone(),
     }))
+}
+
+/// A library whose surface does not parse would install and then fail every
+/// `require` and every `happyview types` run, so it is refused here, naming
+/// what is wrong with it. A surface that cannot be read at all is left to
+/// the first call that needs it.
+async fn refuse_a_bad_surface(state: &AppState, plugin: &LoadedPlugin) -> Result<(), AppError> {
+    if plugin.plugin_type() != PluginType::Library {
+        return Ok(());
+    }
+    // A copy, because the module cache holds on to what it instantiates and
+    // the original is about to be installed.
+    let probe = std::sync::Arc::new(LoadedPlugin {
+        info: plugin.info.clone(),
+        source: plugin.source.clone(),
+        wasm_bytes: plugin.wasm_bytes.clone(),
+        manifest: plugin.manifest.clone(),
+    });
+    match state.plugin_executor().surface_of(&probe).await {
+        Err(e @ crate::plugin::ExecutionError::BadSurface { .. }) => {
+            Err(AppError::BadRequest(e.to_string()))
+        }
+        Err(e) => {
+            tracing::warn!(plugin = %plugin.info.id, error = %e, "could not read the library's API surface before install");
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 #[cfg(test)]

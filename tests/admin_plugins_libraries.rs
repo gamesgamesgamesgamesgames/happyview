@@ -311,6 +311,132 @@ async fn reload_requires_consent_to_cover_new_capabilities() {
     assert_eq!(status, 200);
 }
 
+/// A library module whose `get_api_surface` answers `surface` verbatim from a
+/// data segment, served like [`serve_plugin`]'s.
+async fn serve_library_with_surface(app: &TestApp, id: &str, surface: &Value) {
+    let manifest = json!({
+        "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+        "plugin_type": "library", "namespace": id, "capabilities": [], "wasm_file": "plugin.wasm",
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/{id}/manifest.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
+        .mount(&app.mock_server)
+        .await;
+    let wasm = surface_wasm(surface);
+    Mock::given(method("GET"))
+        .and(path(format!("/{id}/plugin.wasm")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(wasm, "application/wasm"))
+        .mount(&app.mock_server)
+        .await;
+}
+
+fn surface_wasm(surface: &Value) -> Vec<u8> {
+    let body = json!({ "ok": surface }).to_string();
+    let escaped: String = body.bytes().map(|b| format!("\\{b:02x}")).collect();
+    wat::parse_str(format!(
+        "(module (memory (export \"memory\") 1) \
+         (data (i32.const 1024) \"{escaped}\") \
+         (func (export \"alloc\") (param i32) (result i32) i32.const 8192) \
+         (func (export \"dealloc\") (param i32 i32)) \
+         (func (export \"get_api_surface\") (result i64) \
+           (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const {len}))) \
+         (func (export \"call\") (param i32 i32) (result i64) i64.const 0))",
+        len = body.len()
+    ))
+    .unwrap()
+}
+
+/// One installed before the check existed reaches `api_surface` instead,
+/// which reports it and caches nothing.
+#[tokio::test]
+#[serial]
+async fn an_installed_library_whose_surface_does_not_parse_is_reported() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let surface = json!({"namespace": "old", "exports": [{"name": "get", "params": [{"name": "n", "type": "integer |"}]}]});
+    let mut plugin = library("old", "1.0.0", &[]);
+    plugin.wasm_bytes = surface_wasm(&surface);
+    // Without a namespace `library_index` would skip it before reading.
+    plugin.manifest.as_mut().unwrap().namespace = Some("old".into());
+    app.state.plugin_registry.register(plugin).await;
+
+    let executor = app.state.plugin_executor();
+    let error = executor.api_surface("old").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "library old describes itself wrongly: export 'get', param 'n': 'integer |': expected a type at column 10"
+    );
+    assert!(
+        app.state
+            .plugin_registry
+            .cached_api_surface("old")
+            .await
+            .is_none()
+    );
+    assert!(
+        executor
+            .library_index()
+            .await
+            .iter()
+            .all(|entry| entry.id != "old")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_library_whose_surface_does_not_parse_is_refused() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    serve_library_with_surface(
+        &app,
+        "badsurface",
+        &json!({"namespace": "badsurface", "exports": [{"name": "get", "returns": "Nope"}]}),
+    )
+    .await;
+    serve_library_with_surface(
+        &app,
+        "goodsurface",
+        &json!({"namespace": "goodsurface", "exports": [{"name": "get", "returns": "string?"}]}),
+    )
+    .await;
+
+    let url = format!("{}/badsurface/manifest.json", app.mock_server.uri());
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            json!({"url": url, "accepted_capabilities": []}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"].as_str().unwrap(),
+        "library badsurface describes itself wrongly: export 'get', returns: 'Nope' names no type in this surface's types"
+    );
+    assert!(app.state.plugin_registry.get("badsurface").await.is_none());
+
+    let url = format!("{}/goodsurface/manifest.json", app.mock_server.uri());
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            json!({"url": url, "accepted_capabilities": []}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Reloading the good one onto the bad module is refused the same way and
+    // leaves the installed version in place.
+    let bad_url = format!("{}/badsurface/manifest.json", app.mock_server.uri());
+    let (status, _) = app
+        .post_json_status(
+            "/admin/plugins/goodsurface/reload",
+            json!({"url": bad_url, "accepted_capabilities": []}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(app.state.plugin_registry.get("goodsurface").await.is_some());
+}
+
 // ---------------------------------------------------------------------------
 // `network:request:defined` allowed-hosts endpoints
 // ---------------------------------------------------------------------------

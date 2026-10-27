@@ -197,7 +197,8 @@ macro_rules! auth_plugin {
 }
 
 /// Emit every export an interpreter plugin needs: `alloc`, `dealloc`,
-/// `plugin_info`, `execute` and `validate`.
+/// `plugin_info`, `execute` and `validate`, and optionally
+/// `get_declarations`.
 ///
 /// Each input-taking export decodes its own struct and wraps whatever the
 /// handler returns. Input it cannot parse becomes a `BAD_INPUT` error
@@ -219,8 +220,33 @@ macro_rules! auth_plugin {
 /// fn execute(input: &ExecuteInput) -> Result<ExecuteOutput, PluginError> { todo!() }
 /// fn validate(input: &ValidateInput) -> Result<ValidateOutput, PluginError> { todo!() }
 /// ```
+///
+/// An interpreter that renders editor declarations adds
+/// `declarations: declarations`, a `fn(&DeclarationsInput) ->
+/// Result<Declarations, PluginError>`, which becomes the `get_declarations`
+/// export. The host treats an interpreter without it as having no types to
+/// offer.
 #[macro_export]
 macro_rules! interpreter_plugin {
+    (
+        info: $info:expr,
+        execute: $execute:expr,
+        validate: $validate:expr,
+        declarations: $declarations:expr $(,)?
+    ) => {
+        $crate::interpreter_plugin!(info: $info, execute: $execute, validate: $validate);
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn get_declarations(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::declarations::DeclarationsInput,
+            ) -> core::result::Result<
+                $crate::declarations::Declarations,
+                $crate::PluginError,
+            > = $declarations;
+            $crate::abi::dispatch_declarations(ptr, len, handler)
+        }
+    };
     (info: $info:expr, execute: $execute:expr, validate: $validate:expr $(,)?) => {
         $crate::export_abi!(alloc = system);
 
@@ -285,5 +311,54 @@ mod interpreter_macro {
         assert_eq!(plugin_info(), 0);
         assert_eq!(execute(0, 0), 0);
         assert_eq!(validate(0, 0), 0);
+    }
+}
+
+/// The arm with `declarations`, which adds `get_declarations` to the rest.
+#[cfg(test)]
+mod interpreter_macro_with_declarations {
+    use crate::declarations::{DeclarationFile, Declarations, DeclarationsInput};
+    use crate::{
+        ExecuteInput, ExecuteOutput, PluginError, PluginInfo, ScriptValueKind, ValidateInput,
+        ValidateOutput,
+    };
+
+    crate::interpreter_plugin! {
+        info: PluginInfo::new("fixture", "Fixture", "1.0.0"),
+        execute: execute_script,
+        validate: validate_script,
+        declarations: declarations,
+    }
+
+    fn execute_script(_input: &ExecuteInput) -> Result<ExecuteOutput, PluginError> {
+        Ok(ExecuteOutput::Returned {
+            value: serde_json::Value::Null,
+            value_kind: ScriptValueKind::Other,
+        })
+    }
+
+    fn validate_script(_input: &ValidateInput) -> Result<ValidateOutput, PluginError> {
+        Ok(ValidateOutput::valid())
+    }
+
+    fn declarations(_input: &DeclarationsInput) -> Result<Declarations, PluginError> {
+        Ok(Declarations {
+            files: alloc::vec![DeclarationFile {
+                path: "a.d.ts".into(),
+                contents: String::new(),
+            }],
+        })
+    }
+
+    use alloc::string::String;
+
+    #[test]
+    fn the_macro_adds_get_declarations() {
+        assert_eq!(alloc(16), 0);
+        dealloc(0, 0);
+        assert_eq!(plugin_info(), 0);
+        assert_eq!(execute(0, 0), 0);
+        assert_eq!(validate(0, 0), 0);
+        assert_eq!(get_declarations(0, 0), 0);
     }
 }

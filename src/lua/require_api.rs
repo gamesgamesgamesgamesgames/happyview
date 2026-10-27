@@ -653,8 +653,8 @@ mod tests {
 
         let mut export = ApiExport::constructor("chain").lazy("add");
         export.methods.push(ApiMethod {
-            name: "weird".into(),
             mode: "odd".into(),
+            ..ApiMethod::lazy("weird")
         });
         export.methods.push(ApiMethod::immediate("run_it"));
         let surface = ApiSurface::new("objects").export(export);

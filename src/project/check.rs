@@ -61,21 +61,21 @@ async fn standalone_executor(registry: Arc<PluginRegistry>) -> Result<PluginExec
     ))
 }
 
-/// 0 when the project builds, 1 when it doesn't, 2 when the check can't run.
-pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
-    let dirs = if args.plugin_dirs.is_empty() {
-        default_plugin_dirs(&args.root)
-    } else {
-        args.plugin_dirs.clone()
-    };
+/// The plugins in `dirs`, registered, and an executor over them with no
+/// instance behind it. A plugin that will not load is printed and is 2, the
+/// exit code for a run that cannot start.
+pub(crate) async fn load_standalone(
+    dirs: &[PathBuf],
+    out: &mut dyn Write,
+) -> Result<(Arc<PluginRegistry>, PluginExecutor), u8> {
     let registry = Arc::new(PluginRegistry::new());
     let mut plugins = Vec::new();
-    for dir in &dirs {
+    for dir in dirs {
         match loader::load_from_file(dir).await {
             Ok(plugin) => plugins.push(plugin),
             Err(e) => {
                 let _ = writeln!(out, "{}: could not load the plugin: {e}", dir.display());
-                return 2;
+                return Err(2);
             }
         }
     }
@@ -84,15 +84,44 @@ pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
         for (id, err) in failures {
             let _ = writeln!(out, "plugin {id}: {err}");
         }
-        return 2;
+        return Err(2);
     }
-
-    let executor = match standalone_executor(registry.clone()).await {
-        Ok(executor) => executor,
+    match standalone_executor(registry.clone()).await {
+        Ok(executor) => Ok((registry, executor)),
         Err(message) => {
             let _ = writeln!(out, "{message}");
-            return 2;
+            Err(2)
         }
+    }
+}
+
+/// The plugin directories a run names, else the default ones.
+pub(crate) fn plugin_dirs_or_default(named: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    if named.is_empty() {
+        default_plugin_dirs(root)
+    } else {
+        named.to_vec()
+    }
+}
+
+/// Print a failed build's diagnostics and its error count.
+pub(crate) fn print_failed_build(diagnostics: &[super::Diagnostic], out: &mut dyn Write) {
+    for diagnostic in diagnostics {
+        let _ = writeln!(out, "{diagnostic}");
+    }
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let _ = writeln!(out, "{errors} {}", plural(errors, "error", "errors"));
+}
+
+/// 0 when the project builds, 1 when it doesn't, 2 when the check can't run.
+pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
+    let dirs = plugin_dirs_or_default(&args.plugin_dirs, &args.root);
+    let (registry, executor) = match load_standalone(&dirs, out).await {
+        Ok(loaded) => loaded,
+        Err(code) => return code,
     };
     let env = BuildEnv {
         plugins: registry,
@@ -119,14 +148,7 @@ pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
             0
         }
         Err(diagnostics) => {
-            for diagnostic in &diagnostics {
-                let _ = writeln!(out, "{diagnostic}");
-            }
-            let errors = diagnostics
-                .iter()
-                .filter(|d| d.severity == Severity::Error)
-                .count();
-            let _ = writeln!(out, "{errors} {}", plural(errors, "error", "errors"));
+            print_failed_build(&diagnostics, out);
             1
         }
     }
