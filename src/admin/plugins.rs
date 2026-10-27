@@ -718,7 +718,7 @@ async fn resolve_release(
 }
 
 /// A URL or a registry project, exactly one.
-enum Origin<'a> {
+pub(super) enum Origin<'a> {
     Url(&'a str),
     Registry(&'a super::types::RegistryProjectRef),
 }
@@ -883,8 +883,64 @@ pub(super) async fn add(
 ) -> Result<Json<PluginSummary>, AppError> {
     auth.require(Permission::PluginsCreate).await?;
 
-    let origin = origin(&body.url, &body.registry)?;
-    if matches!(origin, Origin::Registry(_)) && body.sha256.is_some() {
+    let installed = install(
+        &state,
+        Install {
+            origin: origin(&body.url, &body.registry)?,
+            sha256: body.sha256.as_deref(),
+            consent: Consent::Accepted(body.accepted_capabilities.as_deref()),
+            actor_did: Some(&auth.did),
+            if_absent: false,
+        },
+    )
+    .await?;
+    match installed {
+        Installed::Added(summary) => Ok(Json(*summary)),
+        Installed::AlreadyInstalled(id) => Err(AppError::Internal(format!(
+            "'{id}' was left as it was, which only a default plugin install asks for"
+        ))),
+    }
+}
+
+/// Who consented to the capabilities an install grants.
+pub(super) enum Consent<'a> {
+    /// The installer listed what they accept, or (`None`) didn't check.
+    Accepted(Option<&'a [String]>),
+    /// The operator, by naming the plugin in configuration: every capability
+    /// its manifest declares is accepted, as an admin accepting all of them
+    /// in the install dialog would.
+    Operator,
+}
+
+/// One plugin install, from `POST /admin/plugins` or from the instance's
+/// default plugins.
+pub(super) struct Install<'a> {
+    pub(super) origin: Origin<'a>,
+    pub(super) sha256: Option<&'a str>,
+    pub(super) consent: Consent<'a>,
+    /// Who the event log names; `None` for the instance itself.
+    pub(super) actor_did: Option<&'a str>,
+    /// Leave a plugin already installed under the same id alone, rather
+    /// than replacing it.
+    pub(super) if_absent: bool,
+}
+
+pub(super) enum Installed {
+    Added(Box<PluginSummary>),
+    /// `if_absent` was set and a plugin with this id was installed.
+    AlreadyInstalled(String),
+}
+
+/// Fetch, check and install a plugin, record its publisher, and log it.
+pub(super) async fn install(state: &AppState, req: Install<'_>) -> Result<Installed, AppError> {
+    let Install {
+        origin,
+        sha256,
+        consent,
+        actor_did,
+        if_absent,
+    } = req;
+    if matches!(origin, Origin::Registry(_)) && sha256.is_some() {
         return Err(AppError::BadRequest(
             "sha256 checks a plugin added from a url; a registry plugin is checked against \
              the CIDs its version names"
@@ -896,14 +952,14 @@ pub(super) async fn add(
             let preview = loader::fetch_manifest(&state.http, url)
                 .await
                 .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
-            let plugin = loader::load_from_manifest(&state.http, &preview, body.sha256.as_deref())
+            let plugin = loader::load_from_manifest(&state.http, &preview, sha256)
                 .await
                 .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
             (plugin, serde_json::json!({ "url": url }))
         }
         Origin::Registry(project) => {
             let resolved =
-                resolve_release(&state, &project.did, &project.name, &project.selector()).await?;
+                resolve_release(state, &project.did, &project.name, &project.selector()).await?;
             let plugin = loader::load_from_manifest(&state.http, &resolved.preview, None)
                 .await
                 .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
@@ -915,14 +971,36 @@ pub(super) async fn add(
         }
     };
 
+    if if_absent && state.plugin_registry.get(&plugin.info.id).await.is_some() {
+        return Ok(Installed::AlreadyInstalled(plugin.info.id.clone()));
+    }
+
     // If the caller told us which capabilities they consent to, every
-    // capability the plugin would actually be granted must be covered.
-    let consented_capabilities = check_capability_consent(&plugin, &body.accepted_capabilities)?;
+    // capability the plugin would actually be granted must be covered. The
+    // operator's consent is to everything the manifest declares.
+    let accepted = match consent {
+        Consent::Accepted(accepted) => accepted.map(<[String]>::to_vec),
+        Consent::Operator => Some(
+            capabilities::effective_set(&plugin)
+                .map_err(AppError::BadRequest)?
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+        ),
+    };
+    let consented_capabilities = check_capability_consent(&plugin, &accepted)?;
+    if let Consent::Operator = consent {
+        tracing::info!(
+            plugin = %plugin.info.id,
+            capabilities = %consented_capabilities.as_deref().unwrap_or_default().join(", "),
+            "granting a default plugin every capability its manifest declares"
+        );
+    }
 
     let plugin_id = plugin.info.id.clone();
     let registry_publisher = registry_install_of(&plugin).map(|r| r.did.clone());
 
-    refuse_a_bad_surface(&state, &plugin).await?;
+    refuse_a_bad_surface(state, &plugin).await?;
     // Validate against the dependency graph and register (this also
     // persists to DB).
     state
@@ -933,24 +1011,24 @@ pub(super) async fn add(
 
     match origin {
         Origin::Url(_) => {
-            if let Err(e) = forget_registry_project(&state, &plugin_id).await {
+            if let Err(e) = forget_registry_project(state, &plugin_id).await {
                 tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed from a url still names its registry project");
             }
             // A URL is no publisher's offer, so nothing is recorded: the
             // plugin is matched to the official project of its name at the
             // next refresh, or to none. The plugin is installed whatever
             // happens here.
-            if let Err(e) = set_publisher(&state, &plugin_id, None).await {
+            if let Err(e) = set_publisher(state, &plugin_id, None).await {
                 tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed from a url keeps an earlier publisher");
             }
         }
         Origin::Registry(_) => {
             // The registry's answer, checked against the request in
             // `resolve_release`, is whose project this is.
-            if let Err(e) = set_publisher(&state, &plugin_id, registry_publisher.as_deref()).await {
+            if let Err(e) = set_publisher(state, &plugin_id, registry_publisher.as_deref()).await {
                 tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
             }
-            track_installed_project(&state, &plugin_id, registry_publisher.as_deref()).await;
+            track_installed_project(state, &plugin_id, registry_publisher.as_deref()).await;
         }
     }
 
@@ -958,10 +1036,10 @@ pub(super) async fn add(
         state.plugin_registry.get(&plugin_id).await.ok_or_else(|| {
             AppError::Internal(format!("'{plugin_id}' vanished as it was installed"))
         })?;
-    let mut summary = summary_of(&state, &installed, Some(now_rfc3339())).await?;
+    let mut summary = summary_of(state, &installed, Some(now_rfc3339())).await?;
     if let Origin::Url(url) = origin {
         summary.url = Some(url.to_string());
-        summary.sha256 = body.sha256.clone();
+        summary.sha256 = sha256.map(String::from);
     }
 
     if let Some(caps) = consented_capabilities {
@@ -973,7 +1051,7 @@ pub(super) async fn add(
         EventLog {
             event_type: "plugin.added".to_string(),
             severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
+            actor_did: actor_did.map(String::from),
             subject: Some(plugin_id),
             detail,
         },
@@ -981,7 +1059,7 @@ pub(super) async fn add(
     )
     .await;
 
-    Ok(Json(summary))
+    Ok(Installed::Added(Box::new(summary)))
 }
 
 /// DELETE /admin/plugins/{id} - remove a plugin

@@ -202,3 +202,65 @@ async fn boot_routes_claimed_collections_to_the_given_storage() {
     .await;
     assert!(state.records.external().is_some());
 }
+
+/// Boot installs `HAPPYVIEW_DEFAULT_PLUGINS` in the background, after the
+/// plugin runtime is up, and records what it applied.
+#[tokio::test]
+async fn boot_installs_the_default_plugins() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lua/manifest.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "lua", "name": "lua", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "capabilities": [], "wasm_file": "plugin.wasm",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lua/plugin.wasm"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+            "application/wasm",
+        ))
+        .mount(&server)
+        .await;
+    let source = format!("{}/lua/manifest.json", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.default_plugins = vec![source.clone()];
+    let state = happyview::run::boot_for_test(
+        config,
+        Providers {
+            source: Arc::new(Double::default()),
+            storage: None,
+        },
+    )
+    .await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let applied = loop {
+        let applied = happyview::admin::settings::get_setting(
+            &state.db,
+            happyview::admin::default_plugins::APPLIED_KEY,
+            state.db_backend,
+        )
+        .await;
+        if let Some(applied) = applied {
+            break applied;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the default plugin was not applied"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&applied).unwrap(),
+        [source]
+    );
+    assert!(state.plugin_registry.get("lua").await.is_some());
+}
