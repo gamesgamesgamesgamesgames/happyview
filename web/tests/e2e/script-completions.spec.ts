@@ -35,6 +35,24 @@ async function typeAtEnd(page: Page, text: string) {
   await page.keyboard.type(text);
 }
 
+/** Type `text` at the end of the script and expect the suggestions to
+ * include `expected`. Typed at machine speed, the `.` can land while Monaco is
+ * still answering the quick suggestions the name before it opened, and that
+ * session filters its own list by the `.` rather than asking the providers
+ * again. Asking explicitly (Ctrl+Space) is a fresh request, so a provider that
+ * offers nothing still fails. */
+async function completes(page: Page, text: string, expected: string) {
+  await typeAtEnd(page, text);
+  const suggestions = page.locator(".suggest-widget");
+  await expect(async () => {
+    if (!((await suggestions.textContent()) ?? "").includes(expected)) {
+      await page.keyboard.press("Escape");
+      await page.keyboard.press("Control+Space");
+    }
+    await expect(suggestions).toContainText(expected, { timeout: 2000 });
+  }).toPass({ timeout: 15000 });
+}
+
 test.describe("Script editor completions", () => {
   test.beforeEach(async ({ page }) => {
     await loginAsTestAdmin(page);
@@ -64,17 +82,14 @@ test.describe("Script editor completions", () => {
     await page.goto(`/dashboard/settings/scripts/${encodeURIComponent(ID)}`);
     const suggestions = page.locator(".suggest-widget");
 
-    await typeAtEnd(page, "db.");
-    await expect(suggestions).toContainText("records", { timeout: 10000 });
+    await completes(page, "db.", "records");
     await expect(suggestions).toContainText("search");
     await page.keyboard.press("Escape");
 
     // `input` is the query's Params, `ctx` a QueryCtx.
-    await typeAtEnd(page, "input.");
-    await expect(suggestions).toContainText("actor", { timeout: 10000 });
+    await completes(page, "input.", "actor");
     await page.keyboard.press("Escape");
 
-    await typeAtEnd(page, "ctx.");
-    await expect(suggestions).toContainText("caller_did", { timeout: 10000 });
+    await completes(page, "ctx.", "caller_did");
   });
 });
