@@ -86,6 +86,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             post(lexicon_publishing::unpublish),
         )
         .route("/stats", get(stats::stats))
+        .route("/stats/counts", get(stats::counts))
         .route(
             "/spaces/migration-status",
             get(spaces_migration::migration_status),

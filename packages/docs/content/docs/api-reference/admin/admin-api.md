@@ -46,7 +46,7 @@ AUTH="Authorization: Bearer $TOKEN"
 | ----- | ----------- |
 | [Lexicons](lexicons.md) | Upload, list, get, and delete lexicons and network lexicons |
 | [Lexicon Publishing](lexicon-publishing.md) | Publish lexicons to the network and manage publishing rules |
-| [Stats](stats.md) | Record counts by collection |
+| [Stats](stats.md) | Record counts by collection, admin and client counts |
 | [Backfill](backfill.md) | Create and monitor historical backfill jobs |
 | [Event Logs](events.md) | Query the audit trail of system events |
 | [API Keys](api-keys.md) | Create, list, and revoke API keys |
@@ -89,6 +89,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `POST /admin/lexicon-publishing/publish` | `lexicons:publish`         |
 | `POST /admin/lexicon-publishing/unpublish` | `lexicons:publish`       |
 | `GET /admin/stats`                       | `stats:read`               |
+| `GET /admin/stats/counts`                | `stats:read`               |
 | `GET /admin/jetstream/status`            | `stats:read`               |
 | `POST /admin/backfill`                   | `backfill:create`          |
 | `GET /admin/backfill/status`             | `backfill:read`            |

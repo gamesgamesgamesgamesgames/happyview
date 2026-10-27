@@ -322,6 +322,130 @@ async fn platform_key_can_read_stats() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+async fn counts(app: &TestApp, token: &str) -> (StatusCode, Value) {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, "/admin/stats/counts", token, None))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_counts() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let (status, before) = counts(&app, PLATFORM_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    let users = before["users"].as_i64().expect("users is a number");
+    let clients = before["api_clients"]
+        .as_i64()
+        .expect("api_clients is a number");
+
+    let now = happyview::db::now_rfc3339();
+    let user_sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, 0, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&user_sql)
+        .bind("counts-extra-user")
+        .bind("did:plc:countsextra")
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let client_sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    // One active and one inactive: both count.
+    for (n, active) in [(1, 1i32), (2, 0i32)] {
+        happyview::db::query(&client_sql)
+            .bind(format!("counts-client-{n}"))
+            .bind(format!("hvc_counts{n}"))
+            .bind("hash")
+            .bind(format!("Counts {n}"))
+            .bind(format!("https://counts{n}.example.com/metadata.json"))
+            .bind(format!("https://counts{n}.example.com"))
+            .bind("[]")
+            .bind("atproto")
+            .bind("confidential")
+            .bind(active)
+            .bind("did:plc:countsextra")
+            .bind(&now)
+            .bind(&now)
+            .bind("did:plc:countsextra")
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let (status, after) = counts(&app, PLATFORM_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after,
+        json!({ "users": users + 1, "api_clients": clients + 2 })
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn counts_refuses_a_caller_without_stats_read() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let create = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method(Method::POST)
+                .uri("/admin/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "no-stats", "permissions": ["lexicons:create"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let key = json_body(create).await["key"]
+        .as_str()
+        .expect("api key returned")
+        .to_string();
+
+    let (status, _) = counts(&app, &key).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[serial]
+async fn counts_refuses_an_unauthenticated_caller() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/admin/stats/counts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 async fn supers(app: &TestApp) -> Vec<String> {
     let sql = happyview::db::adapt_sql(
         "SELECT did FROM happyview_users WHERE is_super = 1 ORDER BY did",
