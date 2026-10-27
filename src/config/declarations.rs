@@ -29,6 +29,7 @@ pub async fn apply_at_boot(
             &nsid,
             None,
             false,
+            None,
         )
         .await
     })
@@ -174,6 +175,7 @@ mod tests {
                         authority_did: "did:plc:x".into(),
                         revision: 1,
                         is_record: true,
+                        indexed: true,
                     })
                 }
             },

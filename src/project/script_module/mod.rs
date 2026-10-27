@@ -425,6 +425,7 @@ mod tests {
                 parsed,
                 path,
                 backfill: false,
+                indexed: true,
             },
         )
     }

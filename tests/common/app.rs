@@ -780,6 +780,7 @@ impl TestApp {
             source: PluginSource::Url {
                 url: url.to_string(),
                 sha256: None,
+                registry: None,
             },
             // Valid, trivial WASM — not `vec![]`, which `analyze_imports`
             // (and so `capabilities::report`) rejects as unparseable,

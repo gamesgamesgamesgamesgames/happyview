@@ -112,8 +112,36 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 urlencoding = "2.1.3"
 webpki-roots = "1.0"
-zstd = "0.13"
-wasmtime = { version = ">=49.0.4, <50", features = ["async"] }
+zstd = "0.14.3"
+# Wasmtime's defaults less `cache`, which pulls a zstd with open advisories and
+# which nothing uses: compiled modules are cached by `WasmRuntime::module_for`.
+wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 wasmtime-wasi = { version = ">=49.0.4, <50", default-features = false, features = ["p1"] }
 regex = "1.12.3"
 semver = "1.0"

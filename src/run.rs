@@ -1060,13 +1060,14 @@ async fn boot(
         std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::plugin::official_registry::OfficialRegistryState::default(),
         ));
-    let official_registry_config = crate::plugin::official_registry::RegistryConfig::production()
-        .with_github_base_from_env()
-        .with_registry_from_env();
+    let official_registry_config =
+        crate::plugin::official_registry::RegistryConfig::production().with_registry_from_env();
     crate::plugin::official_registry::spawn_refresh_task(
         http.clone(),
         official_registry_config.clone(),
         official_registry.clone(),
+        db_pool.clone(),
+        db_backend,
     );
 
     let proxy_config = {

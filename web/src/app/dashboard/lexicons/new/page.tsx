@@ -50,6 +50,12 @@ export default function AddLexiconPage() {
   const [json, setJson] = useState(LEXICON_TEMPLATE);
   const [localTargetCollection, setLocalTargetCollection] = useState("");
   const [backfill, setBackfill] = useState(true);
+  const [indexed, setIndexed] = useState(true);
+
+  function handleIndexedChange(value: boolean) {
+    setIndexed(value);
+    if (!value) setBackfill(false);
+  }
 
   // Network state
   const [nsid, setNsid] = useState("");
@@ -185,7 +191,8 @@ export default function AddLexiconPage() {
       const lexiconJson = JSON.parse(json);
       const { id } = await uploadLexicon({
         lexicon_json: lexiconJson,
-        backfill: localMainType === "record" && backfill,
+        backfill: localMainType === "record" && indexed && backfill,
+        indexed: localMainType === "record" ? indexed : undefined,
       });
       router.push(`/dashboard/lexicons/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
@@ -200,7 +207,8 @@ export default function AddLexiconPage() {
     try {
       const added = await addNetworkLexicon({
         nsid,
-        backfill: mainType === "record" && backfill,
+        backfill: mainType === "record" && indexed && backfill,
+        indexed: mainType === "record" ? indexed : undefined,
         target_collection: showNetworkTargetCollection
           ? networkTargetCollection || undefined
           : undefined,
@@ -263,14 +271,29 @@ export default function AddLexiconPage() {
 
             <footer className="bg-sidebar-accent flex justify-end gap-6 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
               {localMainType === "record" && (
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="backfill">Enable backfill for lexicon</Label>
-                  <Switch
-                    id="backfill"
-                    checked={backfill}
-                    onCheckedChange={setBackfill}
-                  />
-                </div>
+                <>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="indexed">
+                      Index records from the network
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      checked={indexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="backfill">
+                      Enable backfill for lexicon
+                    </Label>
+                    <Switch
+                      id="backfill"
+                      checked={indexed && backfill}
+                      disabled={!indexed}
+                      onCheckedChange={setBackfill}
+                    />
+                  </div>
+                </>
               )}
 
               {localIdError && (
@@ -379,14 +402,29 @@ export default function AddLexiconPage() {
 
             <footer className="bg-sidebar-accent flex justify-end gap-6 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
               {mainType === "record" && (
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="backfill">Enable backfill for lexicon</Label>
-                  <Switch
-                    id="backfill"
-                    checked={backfill}
-                    onCheckedChange={setBackfill}
-                  />
-                </div>
+                <>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="indexed">
+                      Index records from the network
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      checked={indexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="backfill">
+                      Enable backfill for lexicon
+                    </Label>
+                    <Switch
+                      id="backfill"
+                      checked={indexed && backfill}
+                      disabled={!indexed}
+                      onCheckedChange={setBackfill}
+                    />
+                  </div>
+                </>
               )}
               <Button
                 onClick={handleAddNetwork}

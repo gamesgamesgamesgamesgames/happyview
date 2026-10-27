@@ -1261,6 +1261,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some(AUTHORITY.to_string()),
+                    indexed: true,
                 },
             )
             .await
@@ -1348,6 +1349,7 @@ mod tests {
                 .unwrap(),
                 path: "src/lexicons/com/example/net.json".into(),
                 backfill: false,
+                indexed: true,
             },
         );
         state.project.store(std::sync::Arc::new(snap));
@@ -1390,6 +1392,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some("did:plc:abc".to_string()),
+                    indexed: true,
                 },
             )
             .await

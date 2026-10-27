@@ -30,5 +30,12 @@ export function useOfficialPlugins() {
     return map;
   }, [plugins]);
 
-  return { plugins, byId, loading, refresh };
+  // A retired project is still looked up by id, so an installed plugin can
+  // show what became of it, but it is no longer offered to add.
+  const listed = useMemo(
+    () => plugins.filter((p) => p.lifecycle_state !== "retired"),
+    [plugins],
+  );
+
+  return { plugins, listed, byId, loading, refresh };
 }
