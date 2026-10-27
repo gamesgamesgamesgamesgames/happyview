@@ -112,7 +112,8 @@ pub async fn generate(
     out_dir: &Path,
 ) -> Generated {
     let mut generated = Generated::default();
-    let input = describe(registry, executor, snapshot, &mut generated.notes).await;
+    let lexicons = snapshot.lexicons.values().map(|l| &l.parsed.raw);
+    let input = describe(registry, executor, lexicons, &mut generated.notes).await;
     let input_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&input).unwrap_or_default(),
     ));
@@ -179,10 +180,12 @@ async fn render(
 }
 
 /// The input every interpreter renders: computed once, so each gets the same.
-async fn describe(
+/// `lexicons` are raw documents: a project's for `happyview types`, every one
+/// the instance holds for the dashboard.
+pub async fn describe<'a>(
     registry: &PluginRegistry,
     executor: &PluginExecutor,
-    snapshot: &ProjectSnapshot,
+    lexicons: impl IntoIterator<Item = &'a Value>,
     notes: &mut Vec<String>,
 ) -> DeclarationsInput {
     let mut libraries = Vec::new();
@@ -201,16 +204,16 @@ async fn describe(
     }
     libraries.sort_by(|a, b| a.namespace.cmp(&b.namespace));
 
-    let mut lexicons = Vec::new();
-    for lexicon in snapshot.lexicons.values() {
-        let (declaration, warnings) = lexicon_declaration(&lexicon.parsed.raw);
+    let mut declarations = Vec::new();
+    for raw in lexicons {
+        let (declaration, warnings) = lexicon_declaration(raw);
         notes.extend(warnings);
-        lexicons.push(declaration);
+        declarations.push(declaration);
     }
 
     DeclarationsInput {
         libraries,
-        lexicons,
+        lexicons: declarations,
         ctx: ctx_shapes(),
         events: event_shapes(),
     }

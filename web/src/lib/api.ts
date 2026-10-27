@@ -42,6 +42,7 @@ import type {
   CodemodRequestBody,
 } from "@/types/scripts";
 import type { LabelerSummary } from "@/types/labelers";
+import type { EditorDeclarations } from "@/types/editor";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
@@ -1492,6 +1493,12 @@ export function getScripts(opts?: { suffix?: string }) {
   if (opts?.suffix) params.set("suffix", opts.suffix);
   const qs = params.toString();
   return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`);
+}
+
+export function getEditorDeclarations(language: string) {
+  return apiFetch<EditorDeclarations>(
+    `/admin/editor/declarations?language=${encodeURIComponent(language)}`,
+  );
 }
 
 export function getScript(id: string) {

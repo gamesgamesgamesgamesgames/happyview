@@ -353,6 +353,12 @@ impl LexiconCatalog {
         self.effective().len()
     }
 
+    /// Every lexicon the instance answers for, by id, each from the layer a
+    /// read would take it from.
+    pub fn all(&self) -> Vec<ParsedLexicon> {
+        self.effective().into_values().map(|e| e.value).collect()
+    }
+
     pub async fn get_space_declaration(&self, id: &str) -> Option<ParsedLexicon> {
         self.get(id)
             .await
@@ -858,6 +864,29 @@ mod tests {
             reg.get_space_declaration("games.gamesgamesgamesgames.game")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_lexicon_is_listed_once_from_the_layer_a_read_takes() {
+        let project = shared_empty();
+        let catalog = LexiconCatalog::new(project.clone());
+        catalog.upsert(parse(record_lexicon_json(), 3)).await;
+        catalog.upsert(parse(query_lexicon_json(), 1)).await;
+        project.store(Arc::new(snapshot_with(&[(
+            record_lexicon_json(),
+            "src/lexicons/games/gamesgamesgamesgames/game.json",
+        )])));
+
+        let all = catalog.all();
+        let ids: Vec<(&str, i32)> = all.iter().map(|l| (l.id.as_str(), l.revision)).collect();
+        // The project's copy (revision 0) answers for the id both layers hold.
+        assert_eq!(
+            ids,
+            [
+                ("games.gamesgamesgamesgames.game", 0),
+                ("games.gamesgamesgamesgames.listGames", 1),
+            ]
         );
     }
 

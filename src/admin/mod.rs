@@ -4,6 +4,7 @@ pub(crate) mod auth;
 mod database;
 mod dead_letters;
 mod domains;
+mod editor;
 mod events;
 mod feature_flags;
 mod identity;
@@ -169,6 +170,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             post(script_variables::upsert).get(script_variables::list),
         )
         .route("/script-variables/{key}", delete(script_variables::delete))
+        .route("/editor/declarations", get(editor::declarations))
         .route("/scripts", get(scripts::list).post(scripts::upsert))
         .route(
             "/scripts/{id}",
