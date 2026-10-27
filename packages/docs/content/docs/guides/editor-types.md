@@ -14,6 +14,8 @@ It builds the project the way `happyview check` does, with no database and no ne
 
 Interpreters come from `--plugin`, else `$PLUGIN_DIR`, else `<root>/.happyview/plugins`, as for `check`. Libraries are loaded from the same places.
 
+`happyview dev` keeps `.happyview/types/` current on its own: it writes the types once it starts watching, and again after every build that changes what a script can see, printing a `types:` line only when it wrote something or failed. A failed build leaves the last good types in place.
+
 ## What it prints
 
 One line per interpreter:

@@ -131,6 +131,37 @@ pub async fn rebuild(state: &AppState, root: &Path) -> String {
     }
 }
 
+/// Editor declarations for the snapshot now serving, under
+/// `.happyview/types/`. A failed build left the previous snapshot in place,
+/// whose types are already current, so a pass after one writes nothing.
+/// Only what changed is reported, except on the first pass, which also says
+/// which interpreters offer no types and what the input could not describe.
+pub async fn refresh_types(state: &AppState, root: &Path, first: bool) -> Vec<String> {
+    use crate::project::declarations::command::{Outcome, default_out, generate};
+    let generated = generate(
+        &state.plugin_registry,
+        &state.plugin_executor(),
+        &state.project.load_full(),
+        &default_out(root),
+    )
+    .await;
+    let mut lines = Vec::new();
+    if first || generated.wrote() || generated.failed() {
+        lines.extend(generated.notes.iter().map(|note| format!("types: {note}")));
+    }
+    for (language_id, outcome) in &generated.languages {
+        let shown = match outcome {
+            Outcome::Wrote(_) | Outcome::Failed(_) => true,
+            Outcome::Skipped(_) => first,
+            Outcome::UpToDate => false,
+        };
+        if shown {
+            lines.push(format!("types: {language_id}: {outcome}"));
+        }
+    }
+    lines
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchMode {
     Native,
@@ -277,9 +308,17 @@ pub fn spawn_with(
     let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
     tokio::spawn(async move {
+        // The boot build is already installed; its types come first, in the
+        // same task as every later pass so two never write at once.
+        for line in refresh_types(&state, &root, true).await {
+            out(line);
+        }
         while let Some(batch) = next_batch(&mut rx).await {
             let line = handle_batch(&state, &session, &rewatch, &mut declared, batch).await;
             out(line);
+            for line in refresh_types(&state, &root, false).await {
+                out(line);
+            }
         }
     });
     Ok(WatchHandle {

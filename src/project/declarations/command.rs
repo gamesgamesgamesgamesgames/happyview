@@ -3,7 +3,7 @@
 //! that into `.happyview/types/<language_id>/`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use happyview_plugin_sdk::declarations::{DeclarationsInput, LibraryDeclaration};
@@ -20,6 +20,51 @@ use crate::project::snapshot::ProjectSnapshot;
 use super::ctx::{ctx_shapes, event_shapes};
 use super::lexicon::lexicon_declaration;
 use super::output::{check_path, sweep, up_to_date, write_language};
+
+/// What became of one interpreter's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Wrote(usize),
+    UpToDate,
+    /// The interpreter has no types to offer, and why.
+    Skipped(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Wrote(1) => f.write_str("wrote 1 file"),
+            Outcome::Wrote(n) => write!(f, "wrote {n} files"),
+            Outcome::UpToDate => f.write_str("up to date"),
+            Outcome::Skipped(why) => write!(f, "skipped: {why}"),
+            Outcome::Failed(why) => write!(f, "failed: {why}"),
+        }
+    }
+}
+
+/// One pass over every interpreter: what each did, and what the input could
+/// not describe (a library whose surface does not parse, a lexicon field
+/// type with no word in the model).
+#[derive(Debug, Default)]
+pub struct Generated {
+    pub notes: Vec<String>,
+    pub languages: Vec<(String, Outcome)>,
+}
+
+impl Generated {
+    pub fn failed(&self) -> bool {
+        self.languages
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, Outcome::Failed(_)))
+    }
+
+    pub fn wrote(&self) -> bool {
+        self.languages
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, Outcome::Wrote(_)))
+    }
+}
 
 /// 0 when every interpreter wrote, was up to date or had no types to offer;
 /// 1 when the build failed or an interpreter did; 2 when the run can't start.
@@ -46,7 +91,28 @@ pub async fn run(args: &TypesArgs, out: &mut dyn Write) -> u8 {
         let _ = writeln!(out, "{warning}");
     }
 
-    let input = describe(&registry, &executor, &report.snapshot, out).await;
+    let out_dir = args.out.clone().unwrap_or_else(|| default_out(&args.root));
+    let generated = generate(&registry, &executor, &report.snapshot, &out_dir).await;
+    for note in &generated.notes {
+        let _ = writeln!(out, "types: {note}");
+    }
+    for (language_id, outcome) in &generated.languages {
+        let _ = writeln!(out, "types: {language_id}: {outcome}");
+    }
+    u8::from(generated.failed())
+}
+
+/// Bring every interpreter's directory under `out_dir` up to date with
+/// `snapshot` and the installed libraries. Shared by `happyview types` and
+/// the dev server, which runs it after every build.
+pub async fn generate(
+    registry: &PluginRegistry,
+    executor: &PluginExecutor,
+    snapshot: &ProjectSnapshot,
+    out_dir: &Path,
+) -> Generated {
+    let mut generated = Generated::default();
+    let input = describe(registry, executor, snapshot, &mut generated.notes).await;
     let input_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&input).unwrap_or_default(),
     ));
@@ -55,8 +121,6 @@ pub async fn run(args: &TypesArgs, out: &mut dyn Write) -> u8 {
         .map(|plugin| json!({"id": plugin.info.id, "version": plugin.info.version}))
         .collect();
 
-    let out_dir = args.out.clone().unwrap_or_else(|| default_out(&args.root));
-    let mut code = 0;
     for plugin in sorted(registry.list_by_type(PluginType::Interpreter).await) {
         let Some(language_id) = plugin.language_id().map(str::to_string) else {
             continue;
@@ -70,62 +134,48 @@ pub async fn run(args: &TypesArgs, out: &mut dyn Write) -> u8 {
             "libraries": libraries,
             "input_sha256": input_sha256,
         });
-        let line = match render(
-            &executor,
-            &plugin,
-            &input,
-            &out_dir,
-            &language_id,
-            &manifest,
-        )
-        .await
-        {
-            Ok(line) => line,
-            Err(reason) => {
-                code = 1;
-                format!("failed: {reason}")
-            }
-        };
-        let _ = writeln!(out, "types: {language_id}: {line}");
+        let outcome = render(executor, &plugin, &input, out_dir, &language_id, &manifest).await;
+        generated.languages.push((language_id, outcome));
     }
-    code
+    generated
 }
 
-/// One interpreter's directory brought up to date. `Ok` is what happened,
-/// `Err` why it could not.
+/// One interpreter's directory brought up to date.
 async fn render(
     executor: &PluginExecutor,
     plugin: &Arc<LoadedPlugin>,
     input: &DeclarationsInput,
-    out_dir: &std::path::Path,
+    out_dir: &Path,
     language_id: &str,
     manifest: &Value,
-) -> Result<String, String> {
-    let io = |e: std::io::Error| format!("could not write {}: {e}", out_dir.display());
-    std::fs::create_dir_all(out_dir).map_err(io)?;
-    sweep(out_dir, language_id).map_err(io)?;
+) -> Outcome {
+    let io =
+        |e: std::io::Error| Outcome::Failed(format!("could not write {}: {e}", out_dir.display()));
+    if let Err(e) = std::fs::create_dir_all(out_dir).and_then(|()| sweep(out_dir, language_id)) {
+        return io(e);
+    }
     if up_to_date(out_dir, language_id, manifest) {
-        return Ok("up to date".into());
+        return Outcome::UpToDate;
     }
     let declarations = match executor.declarations_for(plugin, input).await {
         Ok(Some(declarations)) => declarations,
         Ok(None) => {
-            return Ok(format!(
-                "skipped: {} needs happyview-plugin-sdk 0.4.0 or later for types",
+            return Outcome::Skipped(format!(
+                "{} needs happyview-plugin-sdk 0.4.0 or later for types",
                 plugin.info.id
             ));
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Outcome::Failed(e.to_string()),
     };
     for file in &declarations.files {
-        check_path(&file.path)?;
+        if let Err(why) = check_path(&file.path) {
+            return Outcome::Failed(why);
+        }
     }
-    write_language(out_dir, language_id, &declarations.files, manifest).map_err(io)?;
-    let n = declarations.files.len();
-    Ok(format!(
-        "wrote {n} {}",
-        if n == 1 { "file" } else { "files" }
-    ))
+    match write_language(out_dir, language_id, &declarations.files, manifest) {
+        Ok(()) => Outcome::Wrote(declarations.files.len()),
+        Err(e) => io(e),
+    }
 }
 
 /// The input every interpreter renders: computed once, so each gets the same.
@@ -133,7 +183,7 @@ async fn describe(
     registry: &PluginRegistry,
     executor: &PluginExecutor,
     snapshot: &ProjectSnapshot,
-    out: &mut dyn Write,
+    notes: &mut Vec<String>,
 ) -> DeclarationsInput {
     let mut libraries = Vec::new();
     for plugin in registry.list_by_type(PluginType::Library).await {
@@ -145,12 +195,8 @@ async fn describe(
                 namespace: namespace.to_string(),
                 surface,
             }),
-            Err(e @ ExecutionError::BadSurface { .. }) => {
-                let _ = writeln!(out, "types: {e}");
-            }
-            Err(e) => {
-                let _ = writeln!(out, "types: library {}: {e}", plugin.info.id);
-            }
+            Err(e @ ExecutionError::BadSurface { .. }) => notes.push(e.to_string()),
+            Err(e) => notes.push(format!("library {}: {e}", plugin.info.id)),
         }
     }
     libraries.sort_by(|a, b| a.namespace.cmp(&b.namespace));
@@ -158,9 +204,7 @@ async fn describe(
     let mut lexicons = Vec::new();
     for lexicon in snapshot.lexicons.values() {
         let (declaration, warnings) = lexicon_declaration(&lexicon.parsed.raw);
-        for warning in warnings {
-            let _ = writeln!(out, "types: {warning}");
-        }
+        notes.extend(warnings);
         lexicons.push(declaration);
     }
 
@@ -177,7 +221,8 @@ fn sorted(mut plugins: Vec<Arc<LoadedPlugin>>) -> Vec<Arc<LoadedPlugin>> {
     plugins
 }
 
-/// Where `types` writes when `--out` is not given.
-pub fn default_out(root: &std::path::Path) -> PathBuf {
+/// Where `types` writes when `--out` is not given, and where the dev server
+/// always does.
+pub fn default_out(root: &Path) -> PathBuf {
     root.join(".happyview").join("types")
 }
