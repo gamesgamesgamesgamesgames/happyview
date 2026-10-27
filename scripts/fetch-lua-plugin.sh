@@ -15,8 +15,8 @@
 #   $1   destination directory (default: tests/fixtures/lua-plugin)
 set -euo pipefail
 
-LUA_PLUGIN_VERSION="1.0.0-alpha.4"
-LUA_PLUGIN_SHA256="0690ca277ec9a04115084c9ae0231cd47d85fda871665eecf656c3a84a6ff38e"
+LUA_PLUGIN_VERSION="1.0.0-alpha.5"
+LUA_PLUGIN_SHA256="c3151287cd3b22fd0adf0a238d15e8e131f284ca21fb5148e9994380223efbbb"
 
 REPO="happyproto/plugins"
 BASE="https://github.com/$REPO/releases/download/happyview-lua-v$LUA_PLUGIN_VERSION"
