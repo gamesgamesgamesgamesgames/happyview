@@ -42,6 +42,7 @@
 extern crate alloc;
 
 pub mod abi;
+pub mod declarations;
 pub mod envelope;
 pub mod host;
 mod macros;

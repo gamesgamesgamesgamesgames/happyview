@@ -73,6 +73,11 @@ pub enum ExecutionError {
     #[error("Missing export: {0}")]
     MissingExport(String),
 
+    /// A library's `get_api_surface` answered something the type grammar
+    /// does not read. The message says where.
+    #[error("library {plugin_id} describes itself wrongly: {message}")]
+    BadSurface { plugin_id: String, message: String },
+
     #[error("Plugin is not a library: {0}")]
     NotALibrary(String),
 
@@ -228,6 +233,25 @@ impl PluginInstance {
         let input = serde_json::to_value(input)
             .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
         self.call_plugin_function("validate", &input).await
+    }
+
+    /// Call an interpreter's optional `get_declarations`. `Ok(None)` when the
+    /// module has no such export: an interpreter built before it existed.
+    pub async fn call_declarations(
+        &mut self,
+        input: &happyview_plugin_sdk::declarations::DeclarationsInput,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::Declarations>, ExecutionError> {
+        const EXPORT: &str = "get_declarations";
+        if self
+            .instance
+            .get_typed_func::<(u32, u32), i64>(&mut self.store, EXPORT)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let input = serde_json::to_value(input)
+            .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
+        self.call_plugin_function(EXPORT, &input).await.map(Some)
     }
 
     /// Call `call` on a library plugin with `{function, args, context}`.
@@ -470,6 +494,21 @@ fn settle_artifact(input: &mut ScriptExecuteInput, stamp: Option<&ArtifactStamp>
 /// guest's reaction to it is an ordinary trap; an interrupt is read first,
 /// because a guest that survived a refusal and then ran out of time timed
 /// out.
+/// How long an interpreter may spend rendering declarations.
+const DECLARATIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn typed(
+    plugin_id: &str,
+    surface: &ApiSurface,
+) -> Result<happyview_plugin_sdk::declarations::TypedSurface, ExecutionError> {
+    happyview_plugin_sdk::declarations::parse_surface(surface).map_err(|e| {
+        ExecutionError::BadSurface {
+            plugin_id: plugin_id.to_string(),
+            message: e.to_string(),
+        }
+    })
+}
+
 fn classify_error(state: &PluginState, e: wasmtime::Error) -> ExecutionError {
     match e.downcast_ref::<wasmtime::Trap>() {
         Some(wasmtime::Trap::Interrupt) | Some(wasmtime::Trap::OutOfFuel) => {
@@ -865,6 +904,21 @@ impl PluginExecutor {
         .await
     }
 
+    /// Ask interpreter `plugin` to render `input` as editor declarations.
+    /// Rendering reads no run, so it gets no context and no session, and a
+    /// fixed deadline of its own rather than a script's.
+    pub async fn declarations_for(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: &happyview_plugin_sdk::declarations::DeclarationsInput,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::Declarations>, ExecutionError> {
+        let mut inst = self
+            .instantiate_interpreter(plugin, None, None, ModuleScope::Dashboard)
+            .await?;
+        inst.arm_guest_deadline(DECLARATIONS_DEADLINE);
+        inst.call_declarations(input).await
+    }
+
     /// Validate `source` as `chunk_name` and keep what the interpreter
     /// prepared from it. The artifact comes back stamped with this
     /// interpreter's build, and is dropped when the script is not valid: an
@@ -966,11 +1020,40 @@ impl PluginExecutor {
         let mut inst = self
             .instantiate_library(lib_id, &LibraryCallContext::default(), None, 0)
             .await?;
-        let surface = Arc::new(inst.call_get_api_surface().await?);
+        let surface = inst.call_get_api_surface().await?;
+        typed(lib_id, &surface)?;
+        let surface = Arc::new(surface);
         self.registry
             .cache_api_surface(lib_id, surface.clone())
             .await;
         Ok(surface)
+    }
+
+    /// A library's surface read into the type model. Only a surface that
+    /// parses is ever cached, so this parse is the cheap second one.
+    pub async fn typed_surface(
+        &self,
+        lib_id: &str,
+    ) -> Result<happyview_plugin_sdk::declarations::TypedSurface, ExecutionError> {
+        typed(lib_id, &*self.api_surface(lib_id).await?)
+    }
+
+    /// Read the surface of a library that is not installed yet, so an install
+    /// can refuse one that does not parse. A module without
+    /// `get_api_surface` is `Ok(None)`: it has nothing to describe, and
+    /// refusing it is not this check's business.
+    pub async fn surface_of(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Result<Option<happyview_plugin_sdk::declarations::TypedSurface>, ExecutionError> {
+        let mut inst = self
+            .instantiate_loaded(plugin, "library", HashMap::new(), serde_json::Value::Null)
+            .await?;
+        match inst.call_get_api_surface().await {
+            Ok(surface) => typed(&plugin.info.id, &surface).map(Some),
+            Err(ExecutionError::MissingExport(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Every installed library with its surface. Libraries whose surface

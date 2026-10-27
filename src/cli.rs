@@ -11,7 +11,9 @@ usage:
   happyview check <root> [--plugin <dir>]...  build the project at <root> without serving it
   happyview dev <root>                        serve the project at <root> locally, rebuilding on save
   happyview test <root> [--watch] [--plugin <dir>]... [filter]
-                                              run the project's *.test.* files";
+                                              run the project's *.test.* files
+  happyview types <root> [--plugin <dir>]... [--out <dir>]
+                                              write editor declarations for the project";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -19,6 +21,7 @@ pub enum Command {
     Check(CheckArgs),
     Dev { root: PathBuf },
     Test(TestArgs),
+    Types(TypesArgs),
     Help,
 }
 
@@ -28,6 +31,16 @@ pub struct CheckArgs {
     /// Plugin directories to load interpreters from, each holding a
     /// `manifest.json`. Empty means `$PLUGIN_DIR`, then the project's own.
     pub plugin_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TypesArgs {
+    pub root: PathBuf,
+    /// As `check`'s: empty means `$PLUGIN_DIR`, then the project's own.
+    pub plugin_dirs: Vec<PathBuf>,
+    /// Where each language's directory goes. `None` means
+    /// `<root>/.happyview/types`.
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -103,6 +116,34 @@ fn parse_inner(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
             test.root = root.ok_or("test needs a project root: happyview test <root>")?;
             Ok(Command::Test(test))
         }
+        "types" => {
+            let mut types = TypesArgs::default();
+            let mut root = None;
+            while let Some(arg) = args.next() {
+                let text = arg.to_string_lossy().into_owned();
+                match text.as_str() {
+                    "--plugin" => {
+                        let dir = args.next().ok_or("--plugin needs a directory")?;
+                        types.plugin_dirs.push(dir.into());
+                    }
+                    "--out" => {
+                        let dir = args.next().ok_or("--out needs a directory")?;
+                        types.out = Some(dir.into());
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for types"));
+                    }
+                    _ if root.is_none() => root = Some(PathBuf::from(arg)),
+                    _ => {
+                        return Err(format!(
+                            "types takes one project root; '{text}' is a second"
+                        ));
+                    }
+                }
+            }
+            types.root = root.ok_or("types needs a project root: happyview types <root>")?;
+            Ok(Command::Types(types))
+        }
         "dev" => {
             let root = args
                 .next()
@@ -132,6 +173,33 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().copied())
+    }
+
+    #[test]
+    fn types_takes_a_root_plugins_and_an_output() {
+        assert_eq!(
+            parse_args(&["types", "app", "--plugin", "p/lua", "--out", "o"]),
+            Ok(Command::Types(TypesArgs {
+                root: "app".into(),
+                plugin_dirs: vec!["p/lua".into()],
+                out: Some("o".into()),
+            }))
+        );
+        assert!(
+            parse_args(&["types"])
+                .unwrap_err()
+                .contains("happyview types <root>")
+        );
+        assert!(
+            parse_args(&["types", "a", "b"])
+                .unwrap_err()
+                .contains("'b' is a second")
+        );
+        assert!(
+            parse_args(&["types", "a", "--out"])
+                .unwrap_err()
+                .contains("--out needs a directory")
+        );
     }
 
     #[test]

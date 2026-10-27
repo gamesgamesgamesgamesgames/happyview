@@ -290,7 +290,7 @@ pub struct ApiSurface {
     pub description: Option<String>,
     #[serde(default)]
     pub exports: Vec<ApiExport>,
-    /// Named types the exports refer to. Opaque to the host.
+    /// Named types the exports refer to, each `{name, description?, type}`.
     #[serde(default)]
     pub types: Vec<Value>,
 }
@@ -328,6 +328,17 @@ impl ApiSurface {
 
     pub fn types<I: IntoIterator<Item = Value>>(mut self, types: I) -> Self {
         self.types.extend(types);
+        self
+    }
+
+    /// A named type the exports can refer to by `name`. `ty` is a type
+    /// string or an inline `{"type": "object", "properties": [...]}`.
+    pub fn named_type(mut self, name: &str, description: &str, ty: Value) -> Self {
+        self.types.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "type": ty,
+        }));
         self
     }
 }
@@ -425,6 +436,13 @@ impl ApiExport {
         self
     }
 
+    /// A method with its own signature, for when `lazy`/`immediate` by name
+    /// alone say too little.
+    pub fn method(mut self, method: ApiMethod) -> Self {
+        self.methods.push(method);
+        self
+    }
+
     pub fn is_function(&self) -> bool {
         self.kind == "function"
     }
@@ -440,21 +458,57 @@ pub struct ApiMethod {
     pub name: String,
     /// `"lazy"` or `"immediate"`.
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<Value>,
+    /// What the method returns. A lazy method that leaves this out returns
+    /// the object it was called on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<Value>,
 }
 
 impl ApiMethod {
-    pub fn lazy(name: impl Into<String>) -> Self {
+    fn with_mode(name: impl Into<String>, mode: &str) -> Self {
         Self {
             name: name.into(),
-            mode: String::from("lazy"),
+            mode: String::from(mode),
+            description: None,
+            params: Vec::new(),
+            returns: None,
         }
     }
 
+    pub fn lazy(name: impl Into<String>) -> Self {
+        Self::with_mode(name, "lazy")
+    }
+
     pub fn immediate(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            mode: String::from("immediate"),
-        }
+        Self::with_mode(name, "immediate")
+    }
+
+    pub fn describe(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// A plain `{name, type, description}` parameter.
+    pub fn param(self, name: &str, ty: &str, description: &str) -> Self {
+        self.param_json(serde_json::json!({
+            "name": name,
+            "type": ty,
+            "description": description,
+        }))
+    }
+
+    pub fn param_json(mut self, param: Value) -> Self {
+        self.params.push(param);
+        self
+    }
+
+    pub fn returns(mut self, returns: Value) -> Self {
+        self.returns = Some(returns);
+        self
     }
 
     pub fn is_lazy(&self) -> bool {
