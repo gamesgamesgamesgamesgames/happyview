@@ -66,6 +66,7 @@ async fn put_lexicon(app: &TestApp, id: &str) {
                 action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await
