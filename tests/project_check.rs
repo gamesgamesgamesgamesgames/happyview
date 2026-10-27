@@ -109,3 +109,136 @@ fn a_check_does_not_load_the_projects_env() {
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.starts_with("ok: 0 lexicons"), "{stdout}");
 }
+
+fn check_json(args: &[&str]) -> (i32, serde_json::Value) {
+    let mut all = args.to_vec();
+    all.push("--json");
+    let (code, stdout, stderr) = check(&all);
+    let report = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{e}: stdout:\n{stdout}\nstderr:\n{stderr}"));
+    (code, report)
+}
+
+fn file<'a>(report: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+    report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == path)
+        .unwrap_or_else(|| panic!("no entry for {path}: {report:#}"))
+}
+
+#[test]
+fn json_outlines_a_project_that_builds() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let (code, report) = check_json(&["tests/fixtures/projects/basic", "--plugin", ECHO]);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["diagnostics"], serde_json::json!([]));
+    assert_eq!(
+        file(&report, "src/lexicons/com/example/project/thing.index.echo"),
+        &serde_json::json!({
+            "path": "src/lexicons/com/example/project/thing.index.echo",
+            "role": "handler",
+            "trigger": "record.index:com.example.project.thing",
+            "lexicon": "com.example.project.thing",
+            "language": "echo",
+        })
+    );
+    // A job is not a lexicon's handler, even when its type reads like one.
+    let job = file(&report, "src/jobs/thing.reindex.echo");
+    assert_eq!(job["trigger"], "job.run:thing.reindex");
+    assert!(job.get("lexicon").is_none(), "{job}");
+    assert_eq!(file(&report, "src/lib/format.echo")["role"], "module");
+    assert_eq!(
+        file(&report, "src/jobs/thing.reindex.test.echo")["role"],
+        "test"
+    );
+    assert_eq!(
+        file(&report, "src/lexicons/com/example/project/thing.json")["role"],
+        "lexicon"
+    );
+    // Prose beside the lexicons is nobody's handler.
+    assert!(
+        !report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"].as_str().unwrap().ends_with("README.md")),
+        "{report:#}"
+    );
+    assert!(
+        report["lexicons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({
+                "nsid": "com.example.project.getThing",
+                "path": "src/lexicons/com/example/project/getThing.json",
+                "kind": "query",
+            })),
+        "{report:#}"
+    );
+    assert_eq!(
+        report["languages"],
+        serde_json::json!([{"language_id": "echo", "extensions": ["echo"]}])
+    );
+}
+
+#[test]
+fn json_still_outlines_a_project_that_does_not_build() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let (code, report) = check_json(&["tests/fixtures/projects/broken", "--plugin", ECHO]);
+    assert_eq!(code, 1, "{report:#}");
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({
+                "path": "src/lexicons/com/example/broken/listThings.echo",
+                "line": 1,
+                "severity": "error",
+                "message": "echo: the source says it is invalid",
+            })),
+        "{report:#}"
+    );
+    // The handler whose body fails is still the lexicon's handler.
+    assert_eq!(
+        file(&report, "src/lexicons/com/example/broken/listThings.echo")["lexicon"],
+        "com.example.broken.listThings"
+    );
+    // A lexicon that does not load is still a lexicon file, but names no NSID.
+    assert_eq!(
+        file(&report, "src/lexicons/com/example/broken/getThing.json")["role"],
+        "lexicon"
+    );
+    assert_eq!(
+        report["lexicons"].as_array().unwrap().len(),
+        1,
+        "{report:#}"
+    );
+}
+
+#[test]
+fn json_says_why_a_check_cannot_start() {
+    let (code, report) = check_json(&[
+        "tests/fixtures/projects/basic",
+        "--plugin",
+        "tests/fixtures/projects",
+    ]);
+    assert_eq!(code, 2);
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("tests/fixtures/projects: could not load the plugin"),
+        "{report:#}"
+    );
+}

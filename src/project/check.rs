@@ -10,6 +10,7 @@ use crate::plugin::{PluginExecutor, PluginRegistry, WasmRuntime, loader};
 
 use super::build::{BuildEnv, BuildOptions, build_snapshot_with};
 use super::diagnostic::Severity;
+use super::outline::JsonDiagnostic;
 use super::snapshot::ProjectSnapshot;
 
 /// The interpreters a check or a test run loads when none are named:
@@ -118,18 +119,15 @@ pub(crate) fn print_failed_build(diagnostics: &[super::Diagnostic], out: &mut dy
 
 /// 0 when the project builds, 1 when it doesn't, 2 when the check can't run.
 pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
+    if args.json {
+        return run_json(args, out).await;
+    }
     let dirs = plugin_dirs_or_default(&args.plugin_dirs, &args.root);
     let (registry, executor) = match load_standalone(&dirs, out).await {
         Ok(loaded) => loaded,
         Err(code) => return code,
     };
-    let env = BuildEnv {
-        plugins: registry,
-        executor,
-        current: Arc::new(ProjectSnapshot::empty()),
-        catalog: None,
-    };
-    match build_snapshot_with(&env, &args.root, BuildOptions::default()).await {
+    match build(&args.root, registry, executor).await {
         Ok(report) => {
             for warning in &report.warnings {
                 let _ = writeln!(out, "{warning}");
@@ -152,6 +150,58 @@ pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
             1
         }
     }
+}
+
+async fn build(
+    root: &Path,
+    registry: Arc<PluginRegistry>,
+    executor: PluginExecutor,
+) -> Result<super::BuildReport, Vec<super::Diagnostic>> {
+    let env = BuildEnv {
+        plugins: registry,
+        executor,
+        current: Arc::new(ProjectSnapshot::empty()),
+        catalog: None,
+    };
+    build_snapshot_with(&env, root, BuildOptions::default()).await
+}
+
+/// The same check as one JSON object: the build's diagnostics, warnings
+/// included, and the project's outline, which is drawn whether or not it
+/// builds. A check that cannot start says why under `error`.
+async fn run_json(args: &CheckArgs, out: &mut dyn Write) -> u8 {
+    let dirs = plugin_dirs_or_default(&args.plugin_dirs, &args.root);
+    let mut why = Vec::new();
+    let (registry, executor) = match load_standalone(&dirs, &mut why).await {
+        Ok(loaded) => loaded,
+        Err(code) => {
+            let error = String::from_utf8_lossy(&why).trim().to_string();
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::json!({ "ok": false, "error": error })
+            );
+            return code;
+        }
+    };
+    let (code, diagnostics) = match build(&args.root, registry.clone(), executor).await {
+        Ok(report) => (0, report.warnings),
+        Err(diagnostics) => (1, diagnostics),
+    };
+    let outline = super::outline::outline(&registry, &args.root).await;
+    let diagnostics: Vec<JsonDiagnostic> = diagnostics.iter().map(JsonDiagnostic::from).collect();
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::json!({
+            "ok": code == 0,
+            "diagnostics": diagnostics,
+            "files": outline.files,
+            "lexicons": outline.lexicons,
+            "languages": outline.languages,
+        })
+    );
+    code
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
