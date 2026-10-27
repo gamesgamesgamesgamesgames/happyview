@@ -151,7 +151,9 @@ async fn lists_each_writer_with_its_revisions_and_hash() {
     let repo = &body["repos"][0];
     assert_eq!(repo["did"], json!("did:plc:alice"));
     assert!(repo["repoRev"].is_string());
-    assert!(repo["hash"]["$bytes"].is_string());
+    assert!(repo["data"]["$bytes"].is_string());
+    // Syncers that predate proposal 0016 read `hash`.
+    assert_eq!(repo["hash"], repo["data"]);
     assert_eq!(repo["spaceRev"], json!(space_rev));
     // Syncers on the alpha lexicon read `rev`. Sent until v3.
     assert_eq!(repo["rev"], repo["repoRev"]);

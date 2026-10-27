@@ -308,6 +308,11 @@ async fn notify_write_rejects_a_notification_for_someone_elses_repo() {
 
 /// `did:plc:writer`'s repo host reporting a fixed repo state.
 fn repo_host_notification(auth: &str, space: &str) -> Request<Body> {
+    repo_host_notification_naming(auth, space, "hash")
+}
+
+/// `repo_host_notification`, naming the field that carries the repo's digest.
+fn repo_host_notification_naming(auth: &str, space: &str, digest_field: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.notifyWrite")
@@ -319,7 +324,7 @@ fn repo_host_notification(auth: &str, space: &str) -> Request<Body> {
                 "space": space,
                 "repo": "did:plc:writer",
                 "repoRev": "3lzq2b3k4c22a",
-                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+                digest_field: { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
             })
             .to_string(),
         ))
@@ -386,7 +391,10 @@ async fn notify_write_forwards_to_registered_syncers() {
     assert_eq!(body["repoRev"], json!("3lzq2b3k4c22a"));
     // Syncers on the alpha lexicon read `rev`. Sent until v3.
     assert_eq!(body["rev"], json!("3lzq2b3k4c22a"));
-    assert!(body["hash"]["$bytes"].is_string());
+    assert!(body["data"]["$bytes"].is_string());
+    // Syncers that predate proposal 0016 read `hash`. Sent until every
+    // syncer reads `data`.
+    assert_eq!(body["hash"], body["data"]);
     assert!(
         body["spaceRev"].is_string(),
         "forwarded notifications carry the space revision"
@@ -409,6 +417,73 @@ async fn notify_write_forwards_to_registered_syncers() {
         .to_str()
         .unwrap();
     assert!(authorization.starts_with("Bearer "));
+}
+
+/// A repo host on proposal 0016 reports the digest as `data`, and the writer
+/// set advances on it as it does on `hash`.
+#[tokio::test]
+#[serial]
+async fn notify_write_records_a_digest_reported_as_data() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &instance_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // Only an update that advanced the writer set is forwarded, so a syncer
+    // hearing of it is the proof that `data` was recorded.
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            "did:plc:writer",
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification_naming(&auth, &space, "data"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = common::syncer::received(&syncer, 1).await;
+    assert_eq!(
+        received.len(),
+        1,
+        "a digest sent as data should be recorded"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        body["data"]["$bytes"],
+        json!("q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80")
+    );
 }
 
 /// A managing app is named by a service identifier, and is asked at the
