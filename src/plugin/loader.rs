@@ -66,6 +66,8 @@ pub enum LoadError {
     WasmValidation(String),
     #[error("Manifest not found at {0}")]
     ManifestNotFound(String),
+    #[error("the plugin's module URL is not a URL: {0}")]
+    InvalidUrl(String),
     #[error("Capability mismatch: {0}")]
     CapabilityMismatch(String),
     #[error("Unknown host import: {0}")]
@@ -96,46 +98,96 @@ pub struct PluginPreview {
     pub registry: Option<RegistryInstall>,
 }
 
-/// Fetch plugin manifest from a URL (or derive manifest URL from WASM URL)
+/// Fetch a plugin's manifest. `url` is the module (`.wasm`, whose manifest
+/// is the `manifest.json` beside it), the manifest itself, or a directory
+/// holding `manifest.json`. A URL that is neither a module nor a
+/// `manifest.json` is fetched as it is first, so a URL whose response is a
+/// manifest (a registry artifact URL, say) is used whatever its path ends
+/// in; only when that answers with something else does the directory's
+/// `manifest.json` get fetched.
 pub async fn fetch_manifest(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<PluginPreview, LoadError> {
-    // If URL ends with .wasm, derive manifest URL from same directory
-    let (manifest_url, base_url) = if url.ends_with(".wasm") {
+    if url.ends_with(".wasm") {
         let base = url.rsplit_once('/').map(|(b, _)| b).unwrap_or("");
-        (format!("{}/manifest.json", base), base.to_string())
-    } else if url.ends_with("manifest.json") {
-        let base = url.rsplit_once('/').map(|(b, _)| b).unwrap_or("");
-        (url.to_string(), base.to_string())
-    } else {
-        // Assume it's a base directory URL
-        (
-            format!("{}/manifest.json", url.trim_end_matches('/')),
-            url.trim_end_matches('/').to_string(),
-        )
-    };
+        let manifest_url = format!("{}/manifest.json", base);
+        let manifest = fetch_required_manifest(client, &manifest_url).await?;
+        let wasm_url = format!("{}/{}", base, manifest.wasm_file);
+        return Ok(preview_of(manifest, manifest_url, wasm_url));
+    }
 
-    let response = client
-        .get(&manifest_url)
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|_| LoadError::ManifestNotFound(manifest_url.clone()))?;
+    if url.ends_with("manifest.json") {
+        let manifest = fetch_required_manifest(client, url).await?;
+        let wasm_url = module_url(url, &manifest.wasm_file)?;
+        return Ok(preview_of(manifest, url.to_string(), wasm_url));
+    }
 
-    let manifest: PluginManifest =
-        serde_json::from_slice(&read_artifact(response, "manifest", MAX_MANIFEST_BYTES).await?)?;
+    if let Some(manifest) = fetch_manifest_if_one(client, url).await? {
+        let wasm_url = module_url(url, &manifest.wasm_file)?;
+        return Ok(preview_of(manifest, url.to_string(), wasm_url));
+    }
 
-    // Derive WASM URL from manifest
-    let wasm_url = format!("{}/{}", base_url, manifest.wasm_file);
+    // A directory.
+    let base = url.trim_end_matches('/');
+    let manifest_url = format!("{}/manifest.json", base);
+    let manifest = fetch_required_manifest(client, &manifest_url).await?;
+    let wasm_url = format!("{}/{}", base, manifest.wasm_file);
+    Ok(preview_of(manifest, manifest_url, wasm_url))
+}
 
-    Ok(PluginPreview {
+fn preview_of(manifest: PluginManifest, manifest_url: String, wasm_url: String) -> PluginPreview {
+    PluginPreview {
         manifest,
         manifest_url,
         wasm_url,
         wasm_bytes: None,
         registry: None,
-    })
+    }
+}
+
+/// The manifest at `manifest_url`, which must be one.
+async fn fetch_required_manifest(
+    client: &reqwest::Client,
+    manifest_url: &str,
+) -> Result<PluginManifest, LoadError> {
+    let response = client
+        .get(manifest_url)
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|_| LoadError::ManifestNotFound(manifest_url.to_string()))?;
+    Ok(serde_json::from_slice(
+        &read_artifact(response, "manifest", MAX_MANIFEST_BYTES).await?,
+    )?)
+}
+
+/// The manifest `url` answers with, or `None` when it answers with an error
+/// status or with something that isn't a manifest. A URL that can't be
+/// reached at all is an error: no other URL under it would answer either.
+async fn fetch_manifest_if_one(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Option<PluginManifest>, LoadError> {
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    match read_artifact(response, "manifest", MAX_MANIFEST_BYTES).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(LoadError::TooLarge { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `wasm_file` resolved against the manifest's URL, as a browser resolves a
+/// link: a bare name is a sibling of the manifest, and an absolute URL is
+/// itself.
+fn module_url(manifest_url: &str, wasm_file: &str) -> Result<String, LoadError> {
+    reqwest::Url::parse(manifest_url)
+        .and_then(|base| base.join(wasm_file))
+        .map(String::from)
+        .map_err(|e| LoadError::InvalidUrl(format!("{wasm_file} from {manifest_url}: {e}")))
 }
 
 /// Fetch a registry release's manifest and module from the URLs it names,

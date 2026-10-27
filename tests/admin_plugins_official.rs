@@ -1719,3 +1719,104 @@ async fn a_recorded_publisher_decides_whose_project_a_url_install_joins() {
     );
     assert_eq!(unresolved_flag(&app, "gone").await, 1);
 }
+
+// ---------------------------------------------------------------------------
+// A manifest URL that doesn't end in `manifest.json`.
+// ---------------------------------------------------------------------------
+
+/// Serve a manifest naming `wasm_file` at `/xrpc/reg.getArtifact?…&type=manifest`,
+/// the shape of a registry artifact URL, and answer that URL.
+async fn serve_query_manifest(app: &TestApp, id: &str, wasm_file: &str) -> String {
+    Mock::given(method("GET"))
+        .and(path("/xrpc/reg.getArtifact"))
+        .and(query_param("type", "manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "capabilities": [], "wasm_file": wasm_file,
+        })))
+        .mount(&app.mock_server)
+        .await;
+    format!(
+        "{}/xrpc/reg.getArtifact?name={id}&type=manifest",
+        app.mock_server.uri()
+    )
+}
+
+/// A URL whose response is a manifest is the manifest, whatever its path
+/// ends in, and its module is found relative to it.
+#[tokio::test]
+#[serial]
+async fn a_url_that_answers_with_a_manifest_installs() {
+    common::require_db!();
+    let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
+    let url = serve_query_manifest(&app, "queried", "queried.wasm").await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/queried.wasm"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(module_bytes("queried", "1.0.0"), "application/wasm"),
+        )
+        .mount(&app.mock_server)
+        .await;
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins", json!({ "url": url }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], "queried");
+}
+
+/// A manifest may name its module by an absolute URL, query string and all,
+/// which is fetched as it is.
+#[tokio::test]
+#[serial]
+async fn a_manifest_naming_its_module_by_absolute_url_installs() {
+    common::require_db!();
+    let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
+    let wasm_url = format!(
+        "{}/xrpc/reg.getArtifact?name=absolute&type=wasm",
+        app.mock_server.uri()
+    );
+    let url = serve_query_manifest(&app, "absolute", &wasm_url).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/reg.getArtifact"))
+        .and(query_param("type", "wasm"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(module_bytes("absolute", "1.0.0"), "application/wasm"),
+        )
+        .mount(&app.mock_server)
+        .await;
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins", json!({ "url": url }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], "absolute");
+}
+
+/// A directory URL still finds `manifest.json` inside it, even when the
+/// directory itself answers with something that isn't a manifest.
+#[tokio::test]
+#[serial]
+async fn a_directory_url_still_finds_its_manifest() {
+    common::require_db!();
+    let app = TestApp::new_with_persisted_plugins(RegistryConfig::production()).await;
+    serve_module(&app, "dir-plugin", "dirred", "1.0.0").await;
+    Mock::given(method("GET"))
+        .and(path("/dir-plugin"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>index</html>"))
+        .mount(&app.mock_server)
+        .await;
+
+    for url in [
+        format!("{}/dir-plugin", app.mock_server.uri()),
+        format!("{}/dir-plugin/", app.mock_server.uri()),
+    ] {
+        let (status, body) = app
+            .post_json_status("/admin/plugins", json!({ "url": url }))
+            .await;
+        assert_eq!(status, 200, "{url}: {body}");
+        assert_eq!(body["id"], "dirred");
+    }
+}
