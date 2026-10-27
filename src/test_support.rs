@@ -261,6 +261,7 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         plugin_dir: std::path::PathBuf::from("./plugins"),
         auto_backfill: true,
         script_env_file: None,
+        default_plugins: Vec::new(),
     }
 }
 

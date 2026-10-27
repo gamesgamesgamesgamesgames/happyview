@@ -3,6 +3,7 @@ mod api_keys;
 pub(crate) mod auth;
 mod database;
 mod dead_letters;
+pub mod default_plugins;
 mod domains;
 mod editor;
 mod events;

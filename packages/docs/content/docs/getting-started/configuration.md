@@ -30,6 +30,7 @@ HappyView is configured via environment variables. Serving with a plain `happyvi
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | _(embedded)_ | Directory to serve the dashboard from instead of the copy built into release binaries. Set but empty is the same as unset. A binary built from source without the `embedded-dashboard` feature falls back to `./web/out` |
 | `PLUGIN_DIR` | no | `./plugins` | Directory whose subdirectories (`<id>/manifest.json` beside the `.wasm`) are loaded as plugins at boot. `happyview dev` sets it to `<project>/.happyview/plugins` |
+| `HAPPYVIEW_DEFAULT_PLUGINS` | no | _(none)_ | Comma-separated plugin sources to install once, on the first boot that lists them: anything **Add plugin** takes as a URL (a `manifest.json`, a `.wasm`, or another URL that answers with a manifest). Listing a source consents to every capability its manifest declares. Each applied source is recorded, so a plugin the owner uninstalls isn't installed again; one that fails to install is retried at the next boot. Installs run in the background and never delay or stop boot. See [Plugins](../guides/plugins.md#default-plugins) |
 | `HAPPYVIEW_SCRIPT_ENV_FILE` | no | _(none)_ | A dotenv file whose variables reach scripts as `ctx.env`, over the ones stored in the dashboard. Read on every run. `happyview dev` sets it to the project's `.env`, and `happyview test` to the project's `.env.test` |
 | `HAPPYVIEW_DEV_BACKFILL` | no | `[dev] backfill`, else `false` | Under `happyview dev` only: whether a backfill may start on its own when a record lexicon with `backfill` is added or declared. Exactly `true` or `false`; any other value stops `happyview dev` with an error. A backfill created from the dashboard's Backfill page always runs; the backfill option on a lexicon upload follows this setting |
 | `HAPPYVIEW_NETWORK` | no | _(none)_ | Under `happyview dev` only: `local` suppresses the warning that writes reach the real network. `hpy happyview dev --network local` sets it |
@@ -116,6 +117,7 @@ SESSION_SECRET=change-me-in-production
 # BACKFILL_RETENTION_DAYS=28
 # BACKFILL_DISCOVERY_WINDOW=50000
 # VERBOSE_EVENT_LOGGING=false
+# HAPPYVIEW_DEFAULT_PLUGINS=https://example.com/plugins/lua/manifest.json
 # RUST_LOG=happyview=debug,tower_http=debug,sqlx=warn
 # APP_NAME=My App
 # LOGO_URI=https://example.com/logo.png

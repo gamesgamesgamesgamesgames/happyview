@@ -58,7 +58,7 @@ Turning the catalogue off doesn't cut a plugin installed from the registry off f
 
 ### From a URL
 
-**Add plugin** also takes the URL of a plugin's `manifest.json` or `.wasm` file, for a plugin you host yourself or one that isn't in the registry. A URL install is checked against the `sha256` you give it, if any. A URL names no project, so it is offered no updates until it is matched to one.
+**Add plugin** also takes the URL of a plugin's `manifest.json` or `.wasm` file, or any other URL that answers with a manifest, for a plugin you host yourself or one that isn't in the registry. A URL install is checked against the `sha256` you give it, if any. A URL names no project, so it is offered no updates until it is matched to one.
 
 A plugin installed from a URL, by the dashboard or `PLUGIN_URLS`, is matched to the official publisher's registry project with the plugin's id at each catalogue refresh. A matched plugin follows that project's channel from then on: the prerelease channel its version was published on (`alpha` for `1.1.0-alpha.2`) when the project has one, and `latest` otherwise. Until its first update installs it from the registry by CID, it is offered only versions newer than the one installed. One no project matches is marked **Unresolved**, keeps working as a URL install, and is offered no updates; it is matched again at every refresh, so it attaches if its project is published later. To get updates sooner, remove it and add it from the registry.
 
@@ -73,6 +73,16 @@ PLUGIN_URLS=steam|https://example.com/plugins/steam/manifest.json
 Format: `id|url` or `id|url|sha256:hash` (comma-separated for multiple).
 
 A `PLUGIN_URLS` plugin is registered from its environment URL at every boot. It is matched to its registry project like any URL install, but an update installed through the registry lasts only until the next restart, which loads the environment URL again. Install plugins that are in the registry through the registry instead, and keep `PLUGIN_URLS` for plugins you host yourself.
+
+### Default Plugins
+
+Set `HAPPYVIEW_DEFAULT_PLUGINS` to give a new instance plugins it starts with, such as an interpreter:
+
+```
+HAPPYVIEW_DEFAULT_PLUGINS=https://example.com/plugins/lua/manifest.json
+```
+
+Each comma-separated source is installed once, as if an admin added it from that URL and accepted every capability its manifest declares; listing it is the operator's consent. The sources applied are recorded in the instance settings under `default_plugins.applied`, so a default plugin the owner uninstalls stays uninstalled, and one the owner had already installed under the same id is left as it is. A source that can't be fetched or installed is logged as a warning and tried again at the next boot. The installs run in the background after boot, each given up on after two minutes, so they never hold up the server.
 
 ### Via File System
 

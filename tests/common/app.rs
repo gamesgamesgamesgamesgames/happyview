@@ -120,6 +120,7 @@ impl TestApp {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
 
         let sql = adapt_sql(

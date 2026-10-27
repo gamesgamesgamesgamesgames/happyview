@@ -142,6 +142,20 @@ pub fn parse_job_worker_concurrency(raw: Option<&str>) -> usize {
         .unwrap_or(1)
 }
 
+/// Parse `HAPPYVIEW_DEFAULT_PLUGINS`: plugin sources separated by commas,
+/// each anything `POST /admin/plugins` takes as a `url`. Blank entries are
+/// dropped and a repeated source is kept once, in its first place. Unset or
+/// blank lists none.
+pub fn parse_default_plugins(raw: Option<&str>) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    for source in raw.unwrap_or_default().split(',').map(str::trim) {
+        if !source.is_empty() && !sources.iter().any(|s| s == source) {
+            sources.push(source.to_string());
+        }
+    }
+    sources
+}
+
 /// Parse `SUPERADMIN_DID`, the account seeded as a super user at boot.
 /// Unset or blank seeds nobody and leaves the first-login bootstrap in
 /// charge.
@@ -213,6 +227,9 @@ pub struct Config {
     /// A dotenv file whose variables reach scripts as `ctx.env`, over the
     /// database's. Read on every run, so an edit needs no restart.
     pub script_env_file: Option<PathBuf>,
+    /// Plugin sources from `HAPPYVIEW_DEFAULT_PLUGINS`, each installed once
+    /// on the first boot that sees it (see `admin::default_plugins`).
+    pub default_plugins: Vec<String>,
 }
 
 /// `PLUGIN_CACHE_DIR` when set; otherwise a `plugin-cache` directory beside
@@ -422,6 +439,7 @@ impl Config {
             script_env_file: var("HAPPYVIEW_SCRIPT_ENV_FILE")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
+            default_plugins: parse_default_plugins(var("HAPPYVIEW_DEFAULT_PLUGINS").as_deref()),
         }
     }
 
@@ -509,12 +527,29 @@ mod tests {
             "PLUGIN_DIR",
             "HAPPYVIEW_SCRIPT_ENV_FILE",
             "HAPPYVIEW_DEV_BACKFILL",
+            "HAPPYVIEW_DEFAULT_PLUGINS",
         ] {
             unsafe {
                 env::remove_var(key);
             }
         }
         vars::set_project_layer(std::collections::BTreeMap::new());
+    }
+
+    #[test]
+    fn default_plugins_are_a_comma_separated_list() {
+        assert!(parse_default_plugins(None).is_empty());
+        assert!(parse_default_plugins(Some("")).is_empty());
+        assert!(parse_default_plugins(Some(" , ,")).is_empty());
+        assert_eq!(
+            parse_default_plugins(Some(
+                " https://a.example/manifest.json ,https://b.example/x.wasm,,https://a.example/manifest.json"
+            )),
+            [
+                "https://a.example/manifest.json",
+                "https://b.example/x.wasm"
+            ]
+        );
     }
 
     /// Exactly the two values every writer of this variable uses; a typo
@@ -677,6 +712,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(
             config.listen_addr(),
@@ -1167,6 +1203,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -1205,6 +1242,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1243,6 +1281,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1281,6 +1320,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -1349,6 +1389,7 @@ mod tests {
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
             script_env_file: None,
+            default_plugins: Vec::new(),
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),

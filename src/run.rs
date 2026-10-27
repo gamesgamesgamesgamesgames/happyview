@@ -1228,6 +1228,9 @@ async fn boot(
     if state.config.project_root.is_some() {
         crate::project::boot::start_declared_backfills(&state).await;
     }
+    // `HAPPYVIEW_DEFAULT_PLUGINS`, in a task of its own: its sources are
+    // fetched over the network, and none of them may hold up serving.
+    crate::admin::default_plugins::spawn(&state);
     drop(collections_rx);
 
     Ok(Booted {
