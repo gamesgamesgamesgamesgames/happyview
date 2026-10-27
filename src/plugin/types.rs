@@ -208,8 +208,42 @@ impl TokenSetExt for TokenSet {
 /// Plugin source - file or URL
 #[derive(Debug, Clone)]
 pub enum PluginSource {
-    File { path: std::path::PathBuf },
-    Url { url: String, sha256: Option<String> },
+    File {
+        path: std::path::PathBuf,
+    },
+    Url {
+        url: String,
+        sha256: Option<String>,
+        /// Set when the bytes came from a registry by CID. `url` is then the
+        /// module's `getArtifact` URL, and a reload fetches both artifacts
+        /// again and checks them against these CIDs.
+        registry: Option<Box<RegistryInstall>>,
+    },
+}
+
+/// A plugin version installed from a registry: which project and version it
+/// is, and the CIDs its manifest and module were verified against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryInstall {
+    /// The publisher's DID.
+    pub did: String,
+    /// The project name, which is the plugin's id.
+    pub name: String,
+    /// The channel the install follows, or `None` when it was pinned to a
+    /// version.
+    pub channel: Option<String>,
+    pub version: String,
+    /// The `software.release.version` record. `None` for a row stored
+    /// without it; a reload does not need it, so it is not invented.
+    pub version_uri: Option<String>,
+    /// The `software.release.manifest` record's CID, `None` as above.
+    pub manifest_cid: Option<String>,
+    /// Where the registry serves the manifest file, by its blob CID.
+    pub manifest_url: String,
+    pub manifest_blob_cid: String,
+    /// Where the registry serves the module, by its blob CID.
+    pub package_url: String,
+    pub package_cid: String,
 }
 
 /// Loaded plugin with runtime state

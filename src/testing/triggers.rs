@@ -185,6 +185,12 @@ async fn record(
             spec.target
         )));
     }
+    if !state.lexicons.is_indexed(&spec.target) {
+        return Err(TestHostError::BadInput(format!(
+            "{} is not indexed (indexed = false), so no record event reaches it",
+            spec.target
+        )));
+    }
     let did = spec
         .did
         .clone()
@@ -350,6 +356,41 @@ mod tests {
         assert_eq!(query_string(&json!(null)).unwrap(), "");
         assert!(query_string(&json!([1])).is_err());
         assert!(query_string(&json!({"nested": {"a": 1}})).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_record_trigger_on_an_unindexed_collection_is_refused() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            json!({
+                "lexicon": 1,
+                "id": "app.test.quiet",
+                "defs": {"main": {"type": "record", "key": "tid"}},
+            }),
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        state.lexicons.upsert_unindexed(parsed).await;
+        let harness = TestHarness::new("a.test.lua");
+        let spec = TestTrigger {
+            kind: TestTriggerKind::RecordCreate,
+            target: "app.test.quiet".into(),
+            input: json!({}),
+            did: None,
+            rkey: None,
+            as_did: None,
+        };
+        let err = fire(&state, &harness, spec).await.unwrap_err();
+        assert!(
+            matches!(&err, TestHostError::BadInput(m)
+                if m == "app.test.quiet is not indexed (indexed = false), so no record event reaches it"),
+            "{err:?}"
+        );
     }
 
     #[test]
