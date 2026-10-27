@@ -75,3 +75,24 @@ curl http://127.0.0.1:3000/admin/stats -H "$AUTH"
   "collections": [{ "collection": "xyz.statusphere.status", "count": 500 }]
 }
 ```
+
+## Admin and client counts
+
+```
+GET /admin/stats/counts
+```
+
+Returns the number of admin users (seats, including the super user) and registered API clients. It is cheap to call often, unlike the record counts above. Requires `stats:read`.
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/stats/counts -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+```json
+{
+  "users": 3,
+  "api_clients": 2
+}
+```

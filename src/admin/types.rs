@@ -107,6 +107,14 @@ pub(super) struct StatsResponse {
 }
 
 #[derive(Serialize)]
+pub(super) struct CountsResponse {
+    /// Admin users (seats), including the super user.
+    pub users: i64,
+    /// Registered API clients, active or not.
+    pub api_clients: i64,
+}
+
+#[derive(Serialize)]
 pub(super) struct CollectionStat {
     pub(super) collection: String,
     pub(super) count: i64,
