@@ -21,7 +21,7 @@ pub async fn run_worker(state: AppState) {
         match db::claim_next_job(&state).await {
             Ok(Some(job)) => {
                 tracing::info!(job_id = %job.id, job_type = %job.job_type, "executing job");
-                execute_job(&state, &job).await;
+                run_on_its_own_thread(&state, job).await;
             }
             Ok(None) => {
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -31,6 +31,21 @@ pub async fn run_worker(state: AppState) {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
         }
+    }
+}
+
+/// Run one job on the blocking pool. A job has no deadline, so its guest
+/// never yields and holds whichever thread runs it until it finishes. On a
+/// runtime worker that starves every task queued behind it there, another
+/// job worker included, so two workers would run their jobs one after the
+/// other.
+async fn run_on_its_own_thread(state: &AppState, job: super::Job) {
+    let state = state.clone();
+    let id = job.id.clone();
+    let handle = tokio::runtime::Handle::current();
+    let run = tokio::task::spawn_blocking(move || handle.block_on(execute_job(&state, &job)));
+    if let Err(e) = run.await {
+        tracing::error!(job_id = %id, error = %e, "job worker: the job's thread ended abnormally");
     }
 }
 

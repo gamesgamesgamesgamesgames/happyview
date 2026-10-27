@@ -503,8 +503,18 @@ mod tests {
         .unwrap();
         assert!(matches!(&*watcher.lock().unwrap(), AnyWatcher::Poll(_)));
 
+        // Writing the file also changes `src/`'s own mtime, which the poller
+        // may report first as `SrcDir`; the scan order decides.
         std::fs::write(root.join("src/a.json"), "{}").unwrap();
-        let change = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let change = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(Change::SrcDir) => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await;
         assert_eq!(
             change.expect("the poll watcher saw nothing"),
             Some(Change::Source)
