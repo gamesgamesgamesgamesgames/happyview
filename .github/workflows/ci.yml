@@ -590,6 +590,10 @@ jobs:
         working-directory: web
         run: npm run format:check
 
+      - name: Unit tests
+        working-directory: web
+        run: npm test
+
       - name: Build frontend
         working-directory: web
         env:

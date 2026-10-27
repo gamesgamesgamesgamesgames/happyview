@@ -430,6 +430,34 @@ curl -X DELETE "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphe
 
 **Response**: `204 No Content`
 
+## Editor declarations
+
+```
+GET /admin/editor/declarations?language={language_id}
+```
+
+The declarations an interpreter renders for editors, the same files [`happyview types`](../../guides/editor-types.md) writes into `.happyview/types/<language_id>/`, but rendered from everything this instance holds: its installed libraries, and every lexicon it serves, whether from a project, the dashboard or the network. The dashboard's script editor completes from them. Requires `scripts:read`.
+
+```sh tab="cURL" tab-group="language"
+curl "http://127.0.0.1:3000/admin/editor/declarations?language=lua" \
+  -H "$AUTH"
+```
+
+```ts
+interface EditorDeclarations {
+  language_id: string;
+  files: { path: string; contents: string }[];
+  /** What the input could not describe, such as a library whose surface does not parse. */
+  notes: string[];
+}
+```
+
+**Response**: `200 OK`, with an `ETag`.
+- **Revalidation:** the rendering is kept until a library, a lexicon or the interpreter changes. Send the tag back as `If-None-Match` and get `304 Not Modified` while nothing has.
+- **An interpreter that renders no declarations** answers an empty `files` and a note saying why.
+- **`404 Not Found`** when no installed interpreter claims the language.
+- **`502 Bad Gateway`** when the interpreter fails to render.
+
 ## Scripts a project file defines
 
 When the instance runs a project, a script defined by a file under `src/` answers its trigger ahead of any dashboard script with the same id. Creating, patching, deleting or applying the codemod to it is refused with `409 Conflict`, naming the file. A dashboard script the file shadows is kept as it is and runs again when the file is removed.
