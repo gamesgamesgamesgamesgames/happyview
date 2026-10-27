@@ -198,6 +198,39 @@ Scripts are checked by the interpreter that claims their file extension, so `che
 2. otherwise every plugin directory inside `$PLUGIN_DIR`;
 3. otherwise every plugin directory inside `<root>/.happyview/plugins`.
 
+### For editors (`--json`)
+
+`happyview check <root> --json` runs the same check and prints one JSON object instead of lines, for an editor to read. The exit codes are the same.
+
+```json
+{
+  "ok": false,
+  "diagnostics": [
+    { "path": "src/lexicons/com/example/getThing.lua", "line": 3,
+      "severity": "error", "message": "..." }
+  ],
+  "files": [
+    { "path": "src/lexicons/com/example/getThing.lua", "role": "handler",
+      "trigger": "xrpc.query:com.example.getThing",
+      "lexicon": "com.example.getThing", "language": "lua" }
+  ],
+  "lexicons": [
+    { "nsid": "com.example.getThing",
+      "path": "src/lexicons/com/example/getThing.json", "kind": "query" }
+  ],
+  "languages": [ { "language_id": "lua", "extensions": ["lua"] } ]
+}
+```
+
+- **`diagnostics`** holds a successful build's warnings, or a failed build's errors and warnings. `line` is `null` for a problem with the whole file.
+- **`files`** gives every file under `src/` a role: `lexicon`, `handler`, `module` or `test`.
+  - Files HappyView ignores, and files it refuses, are left out. A refused file's reason is in `diagnostics`.
+  - A handler carries its `trigger`, plus `lexicon` when the trigger names one of the project's lexicons.
+  - `language` is the interpreter that runs the file.
+- **`lexicons`** lists the lexicon files that load, with their `kind`: `record`, `query`, `procedure`, `space` or `definitions`.
+- **`files` and `lexicons` are filled in even when the project does not build.**
+- **A check that cannot start** prints `{"ok": false, "error": "..."}` and exits `2`.
+
 ## Running locally (`happyview dev`)
 
 `happyview dev` serves a project from its own directory with nothing to configure. It listens on `127.0.0.1` at `[dev] port` (default `3000`) and skips the setup wizard, so the dashboard is usable on first start. An unfinished wizard is left alone, not overwritten.

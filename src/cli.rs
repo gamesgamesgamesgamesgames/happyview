@@ -8,7 +8,8 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 usage:
   happyview                                   serve; HAPPYVIEW_PROJECT names a project to serve
-  happyview check <root> [--plugin <dir>]...  build the project at <root> without serving it
+  happyview check <root> [--plugin <dir>]... [--json]
+                                              build the project at <root> without serving it
   happyview dev <root>                        serve the project at <root> locally, rebuilding on save
   happyview test <root> [--watch] [--plugin <dir>]... [filter]
                                               run the project's *.test.* files
@@ -31,6 +32,8 @@ pub struct CheckArgs {
     /// Plugin directories to load interpreters from, each holding a
     /// `manifest.json`. Empty means `$PLUGIN_DIR`, then the project's own.
     pub plugin_dirs: Vec<PathBuf>,
+    /// Print one JSON object, for an editor, instead of lines.
+    pub json: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -78,6 +81,7 @@ fn parse_inner(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
                         let dir = args.next().ok_or("--plugin needs a directory")?;
                         check.plugin_dirs.push(dir.into());
                     }
+                    "--json" => check.json = true,
                     flag if flag.starts_with('-') => {
                         return Err(format!("unknown option '{flag}' for check"));
                     }
@@ -214,6 +218,15 @@ mod tests {
             Ok(Command::Check(CheckArgs {
                 root: "app".into(),
                 plugin_dirs: vec!["p/lua".into(), "p/ts".into()],
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&["check", "--json", "app"]),
+            Ok(Command::Check(CheckArgs {
+                root: "app".into(),
+                plugin_dirs: vec![],
+                json: true,
             }))
         );
     }
