@@ -211,6 +211,7 @@ export function ScriptForm({
   lexicons,
   lexiconsLoading,
   readOnly,
+  language = "lua",
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
@@ -221,6 +222,8 @@ export function ScriptForm({
   lexiconsLoading?: boolean;
   /** For a script a project file owns: everything shows, nothing edits. */
   readOnly?: boolean;
+  /** The script's `script_type`: the language its interpreter runs. */
+  language?: string;
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -259,7 +262,8 @@ export function ScriptForm({
           <MonacoEditor
             value={state.body}
             onChange={(v) => onChange({ ...state, body: v })}
-            language="lua"
+            language={language}
+            trigger={state.suffix ? composeTriggerId(state) : undefined}
             readOnly={readOnly}
             className="h-full"
           />

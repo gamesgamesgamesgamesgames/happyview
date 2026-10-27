@@ -280,6 +280,7 @@ export default function ScriptDetail() {
             onChange={setState}
             idLocked
             readOnly={projectPath !== null}
+            language={script?.script_type}
           />
         </div>
 
