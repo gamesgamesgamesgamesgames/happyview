@@ -825,7 +825,7 @@ mod tests {
     }
 
     fn version_uri(did: &str, name: &str, version: &str) -> String {
-        format!("at://{did}/software.release.version/{name}:{version}")
+        format!("at://{did}/software.release.version/{name}.{version}")
     }
 
     fn channel(

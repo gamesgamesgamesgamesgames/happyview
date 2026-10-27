@@ -1291,7 +1291,7 @@ pub(crate) mod registry_fixture {
             channel: Some("latest".into()),
             version: "1.2.0".into(),
             version_uri: Some(format!(
-                "at://did:plc:publisher/software.release.version/{id}:1.2.0"
+                "at://did:plc:publisher/software.release.version/{id}.1.2.0"
             )),
             manifest_cid: Some("bafyreimanifestrecord".into()),
             manifest_url: source.artifact_url(&manifest_blob_cid),

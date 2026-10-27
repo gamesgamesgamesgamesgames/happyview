@@ -685,7 +685,7 @@ mod tests {
             "pluginType": "interpreter",
             "channels": { "latest": {
                 "version": latest,
-                "uri": format!("at://{did}/software.release.version/{name}:{latest}"),
+                "uri": format!("at://{did}/software.release.version/{name}.{latest}"),
                 "cid": "bafyversion",
                 "state": "active",
                 "availability": "available",
@@ -696,7 +696,7 @@ mod tests {
 
     fn registry_release(did: &str, name: &str, version: &str) -> serde_json::Value {
         serde_json::json!({
-            "uri": format!("at://{did}/software.release.version/{name}:{version}"),
+            "uri": format!("at://{did}/software.release.version/{name}.{version}"),
             "did": did,
             "name": name,
             "version": version,

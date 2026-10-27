@@ -1651,7 +1651,7 @@ mod tests {
             suspect: false,
             installable: true,
             availability: "available".into(),
-            version_uri: format!("at://did:plc:x/software.release.version/steam:{version}"),
+            version_uri: format!("at://did:plc:x/software.release.version/steam.{version}"),
             manifest_cid: String::new(),
             package_cid: String::new(),
             manifest_blob_cid: String::new(),
@@ -1930,7 +1930,7 @@ mod tests {
             registry_did: Some(OFFICIAL_PUBLISHER_DID.into()),
             registry_name: Some("steam".into()),
             registry_channel: channel.map(str::to_owned),
-            version_uri: Some("at://did:plc:x/software.release.version/steam:1.0.0".into()),
+            version_uri: Some("at://did:plc:x/software.release.version/steam.1.0.0".into()),
             unresolved: false,
             installed_by_cid: true,
         }
