@@ -34,11 +34,12 @@ pub(super) async fn stats(
         .collect();
     let collections: Vec<CollectionStat> = state
         .lexicons
-        .get_record_collections()
+        .get_record_lexicon_ids()
         .await
         .into_iter()
         .map(|collection| CollectionStat {
             count: counts.get(&collection).copied().unwrap_or(0),
+            indexed: state.lexicons.is_indexed(&collection),
             collection,
         })
         .collect();

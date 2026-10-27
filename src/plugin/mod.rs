@@ -53,6 +53,57 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// One `happyview_plugins` row, as boot reads it.
+#[derive(sqlx::FromRow)]
+struct StoredPlugin {
+    id: String,
+    source: String,
+    url: Option<String>,
+    sha256: Option<String>,
+    manifest_url: Option<String>,
+    manifest_blob_cid: Option<String>,
+    package_cid: Option<String>,
+    manifest_cid: Option<String>,
+    registry_did: Option<String>,
+    registry_name: Option<String>,
+    registry_channel: Option<String>,
+    version_uri: Option<String>,
+}
+
+impl StoredPlugin {
+    /// The registry release this row was installed from, when it was
+    /// fetched by CID. A row matched to a registry project but installed
+    /// from a plain URL has no artifact CIDs and reloads from its URL.
+    fn registry_install(&self) -> Option<RegistryInstall> {
+        Some(RegistryInstall {
+            did: self.registry_did.clone()?,
+            name: self.registry_name.clone()?,
+            channel: self.registry_channel.clone(),
+            // Not stored: the verified manifest names it.
+            version: String::new(),
+            version_uri: self.version_uri.clone(),
+            manifest_cid: self.manifest_cid.clone(),
+            manifest_url: self.manifest_url.clone()?,
+            manifest_blob_cid: self.manifest_blob_cid.clone()?,
+            package_url: self.url.clone()?,
+            package_cid: self.package_cid.clone()?,
+        })
+    }
+}
+
+/// Fetch and verify a stored registry install, taking its version from the
+/// manifest whose CID was just checked.
+async fn load_registry_install(
+    http: &reqwest::Client,
+    mut install: RegistryInstall,
+    sha256: Option<&str>,
+) -> Result<LoadedPlugin, loader::LoadError> {
+    let mut preview = loader::fetch_registry_artifacts(http, &install).await?;
+    install.version = preview.manifest.version.clone();
+    preview.registry = Some(install);
+    loader::load_from_manifest(http, &preview, sha256).await
+}
+
 /// Registry of loaded plugins
 pub struct PluginRegistry {
     plugins: RwLock<HashMap<String, Arc<LoadedPlugin>>>,
@@ -261,9 +312,18 @@ impl PluginRegistry {
         db: &sqlx::AnyPool,
         plugin: &LoadedPlugin,
     ) -> Result<(), sqlx::Error> {
-        let (source, url, sha256) = match &plugin.source {
-            PluginSource::File { path } => ("file", Some(path.display().to_string()), None),
-            PluginSource::Url { url, sha256 } => ("url", Some(url.clone()), sha256.clone()),
+        let (source, url, sha256, registry) = match &plugin.source {
+            PluginSource::File { path } => ("file", Some(path.display().to_string()), None, None),
+            PluginSource::Url {
+                url,
+                sha256,
+                registry,
+            } => (
+                "url",
+                Some(url.clone()),
+                sha256.clone(),
+                registry.as_deref(),
+            ),
         };
 
         // Serialize manifest to JSON if present
@@ -272,17 +332,38 @@ impl PluginRegistry {
             .as_ref()
             .and_then(|m| serde_json::to_string(m).ok());
 
+        // The artifact columns describe the bytes now installed, so anything
+        // not fetched by CID clears them; otherwise a boot reload would
+        // verify these bytes against an earlier release. The project the
+        // plugin belongs to is kept across a plain reinstall, which is how a
+        // URL install matched to its registry project stays matched.
         let now = now_rfc3339();
         let sql = adapt_sql(
-            "INSERT INTO happyview_plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest)
-             VALUES (?, ?, ?, ?, TRUE, ?, ?, ?)
+            "INSERT INTO happyview_plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest,
+                 manifest_url, manifest_blob_cid, package_cid, manifest_cid,
+                 registry_did, registry_name, registry_channel, version_uri)
+             VALUES (?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 source = excluded.source,
                 url = excluded.url,
                 sha256 = excluded.sha256,
                 loaded_at = excluded.loaded_at,
                 api_version = excluded.api_version,
-                manifest = excluded.manifest",
+                manifest = excluded.manifest,
+                manifest_url = excluded.manifest_url,
+                manifest_blob_cid = excluded.manifest_blob_cid,
+                package_cid = excluded.package_cid,
+                manifest_cid = excluded.manifest_cid,
+                registry_did = CASE WHEN excluded.registry_did IS NULL
+                    THEN happyview_plugins.registry_did ELSE excluded.registry_did END,
+                registry_name = CASE WHEN excluded.registry_did IS NULL
+                    THEN happyview_plugins.registry_name ELSE excluded.registry_name END,
+                registry_channel = CASE WHEN excluded.registry_did IS NULL
+                    THEN happyview_plugins.registry_channel ELSE excluded.registry_channel END,
+                version_uri = CASE WHEN excluded.registry_did IS NULL
+                    THEN happyview_plugins.version_uri ELSE excluded.version_uri END,
+                registry_unresolved = CASE WHEN excluded.registry_did IS NULL
+                    THEN happyview_plugins.registry_unresolved ELSE 0 END",
             self.db_backend,
         );
 
@@ -294,6 +375,14 @@ impl PluginRegistry {
             .bind(&now)
             .bind(&plugin.info.api_version)
             .bind(manifest_json)
+            .bind(registry.map(|r| r.manifest_url.clone()))
+            .bind(registry.map(|r| r.manifest_blob_cid.clone()))
+            .bind(registry.map(|r| r.package_cid.clone()))
+            .bind(registry.and_then(|r| r.manifest_cid.clone()))
+            .bind(registry.map(|r| r.did.clone()))
+            .bind(registry.map(|r| r.name.clone()))
+            .bind(registry.and_then(|r| r.channel.clone()))
+            .bind(registry.and_then(|r| r.version_uri.clone()))
             .execute(db)
             .await?;
 
@@ -329,25 +418,46 @@ impl PluginRegistry {
         };
 
         let sql = adapt_sql(
-            "SELECT id, source, url, sha256 FROM happyview_plugins WHERE enabled = true",
+            "SELECT id, source, url, sha256, manifest_url, manifest_blob_cid, package_cid,
+                    manifest_cid, registry_did, registry_name, registry_channel, version_uri
+             FROM happyview_plugins WHERE enabled = true",
             self.db_backend,
         );
 
-        let rows: Vec<(String, String, Option<String>, Option<String>)> = crate::db::query_as(&sql)
+        let rows: Vec<StoredPlugin> = crate::db::query_as(&sql)
             .fetch_all(db)
             .await
             .map_err(|e| format!("Failed to load plugins from DB: {}", e))?;
 
         let mut plugins = Vec::new();
 
-        for (id, source, url, sha256) in rows {
+        for row in rows {
+            let registry = row.registry_install();
+            let StoredPlugin {
+                id,
+                source,
+                url,
+                sha256,
+                ..
+            } = row;
             // Skip if already loaded
             if self.plugins.read().await.contains_key(&id) {
                 continue;
             }
 
-            match source.as_str() {
-                "url" => {
+            match (source.as_str(), registry) {
+                ("url", Some(install)) => {
+                    match load_registry_install(http, install, sha256.as_deref()).await {
+                        Ok(plugin) => {
+                            tracing::info!(plugin_id = %id, "Loaded plugin from DB (registry)");
+                            plugins.push(plugin);
+                        }
+                        Err(e) => {
+                            tracing::error!(plugin_id = %id, error = %e, "Failed to load plugin from the registry");
+                        }
+                    }
+                }
+                ("url", None) => {
                     if let Some(url) = url {
                         // Load via manifest
                         match loader::fetch_manifest(http, &url).await {
@@ -370,7 +480,7 @@ impl PluginRegistry {
                         }
                     }
                 }
-                "file" => {
+                ("file", _) => {
                     if let Some(path) = url {
                         let path = std::path::Path::new(&path);
                         match loader::load_from_file(path).await {
@@ -584,7 +694,35 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::memory_pool;
+
+    #[test]
+    fn a_row_missing_its_record_columns_reloads_without_inventing_them() {
+        let row = StoredPlugin {
+            id: "p".into(),
+            source: "url".into(),
+            url: Some("https://r.test/module".into()),
+            sha256: None,
+            manifest_url: Some("https://r.test/manifest".into()),
+            manifest_blob_cid: Some("bafkreimanifest".into()),
+            package_cid: Some("bafkreipackage".into()),
+            manifest_cid: None,
+            registry_did: Some("did:plc:publisher".into()),
+            registry_name: Some("p".into()),
+            registry_channel: None,
+            version_uri: None,
+        };
+        let install = row.registry_install().expect("still reloadable by CID");
+        assert_eq!(install.version_uri, None);
+        assert_eq!(install.manifest_cid, None);
+
+        // A column the fetch needs is another matter.
+        let row = StoredPlugin {
+            package_cid: None,
+            ..row
+        };
+        assert!(row.registry_install().is_none());
+    }
+    use crate::test_support::migrated_memory_pool;
 
     fn echo_like_interpreter(version: &str) -> LoadedPlugin {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -813,17 +951,7 @@ mod tests {
     /// statement has to use a literal both backends accept.
     #[tokio::test]
     async fn register_persists_an_enabled_row() {
-        let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_plugins (
-                id TEXT PRIMARY KEY, source TEXT NOT NULL, url TEXT, sha256 TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1, loaded_at TEXT,
-                api_version TEXT NOT NULL, manifest TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = migrated_memory_pool().await;
 
         let registry = PluginRegistry::with_db(pool.clone(), DatabaseBackend::Sqlite);
         registry
@@ -841,6 +969,7 @@ mod tests {
                 source: PluginSource::Url {
                     url: "https://example.test/p.wasm".into(),
                     sha256: None,
+                    registry: None,
                 },
                 wasm_bytes: vec![],
                 manifest: None,
@@ -853,6 +982,157 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(enabled, 1);
+    }
+
+    /// A registry install is stored with the URLs and CIDs it was verified
+    /// against, and boot reloads it from those URLs, verifying again: bytes
+    /// the registry later serves differently leave the plugin unloaded.
+    #[tokio::test]
+    async fn a_registry_install_reloads_from_its_stored_urls_and_cids() {
+        use loader::registry_fixture::*;
+        let http = reqwest::Client::new();
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let server = wiremock::MockServer::start().await;
+            let id = format!("reg-{}", uuid::Uuid::new_v4().simple());
+            let install = serve_release(&server, &id).await;
+
+            let preview = loader::fetch_registry_artifacts(&http, &install)
+                .await
+                .unwrap();
+            let plugin = loader::load_from_manifest(&http, &preview, None)
+                .await
+                .unwrap();
+            PluginRegistry::with_db(pool.clone(), backend)
+                .register(plugin)
+                .await;
+
+            let sql = adapt_sql(
+                "SELECT source, url, manifest_url, manifest_blob_cid, package_cid,
+                        registry_did, registry_name, registry_channel, version_uri,
+                        manifest_cid, CAST(registry_unresolved AS BIGINT)
+                 FROM happyview_plugins WHERE id = ?",
+                backend,
+            );
+            #[allow(clippy::type_complexity)]
+            let row: (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+            ) = crate::db::query_as(&sql)
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "url".to_string(),
+                    Some(install.package_url.clone()),
+                    Some(install.manifest_url.clone()),
+                    Some(install.manifest_blob_cid.clone()),
+                    Some(install.package_cid.clone()),
+                    Some(install.did.clone()),
+                    Some(install.name.clone()),
+                    install.channel.clone(),
+                    install.version_uri.clone(),
+                    install.manifest_cid.clone(),
+                    0,
+                ),
+                "{backend:?}"
+            );
+
+            // Boot: a fresh registry reads the row and fetches by CID.
+            let booted = PluginRegistry::with_db(pool.clone(), backend);
+            booted.load_from_db(&http).await.unwrap();
+            let reloaded = booted.get(&id).await.expect("reloaded from the registry");
+            assert_eq!(reloaded.wasm_bytes, wasm_bytes());
+            match &reloaded.source {
+                PluginSource::Url { registry, .. } => {
+                    assert_eq!(registry.as_deref(), Some(&install), "{backend:?}")
+                }
+                other => panic!("expected a url source, got {other:?}"),
+            }
+
+            // The registry now answers the module's CID with other bytes.
+            server.reset().await;
+            serve(&server, &install.manifest_blob_cid, manifest_bytes(&id)).await;
+            serve(
+                &server,
+                &install.package_cid,
+                wat::parse_str(r#"(module (func (export "x")))"#).unwrap(),
+            )
+            .await;
+            let booted = PluginRegistry::with_db(pool.clone(), backend);
+            booted.load_from_db(&http).await.unwrap();
+            assert!(booted.get(&id).await.is_none(), "{backend:?}");
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_plugins WHERE id = ?",
+                backend,
+            ))
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Re-registering a plugin from a plain URL clears the artifact CIDs a
+    /// registry install stored, so boot never verifies the new bytes against
+    /// the old release.
+    #[tokio::test]
+    async fn a_url_reinstall_clears_the_registry_artifacts() {
+        use loader::registry_fixture::*;
+        let http = reqwest::Client::new();
+        let pool = migrated_memory_pool().await;
+        let server = wiremock::MockServer::start().await;
+        let install = serve_release(&server, "p").await;
+        let preview = loader::fetch_registry_artifacts(&http, &install)
+            .await
+            .unwrap();
+        let registry = PluginRegistry::with_db(pool.clone(), DatabaseBackend::Sqlite);
+        registry
+            .register(
+                loader::load_from_manifest(&http, &preview, None)
+                    .await
+                    .unwrap(),
+            )
+            .await;
+
+        let mut plain = loader::load_from_manifest(&http, &preview, None)
+            .await
+            .unwrap();
+        plain.source = PluginSource::Url {
+            url: "https://example.test/p.wasm".into(),
+            sha256: None,
+            registry: None,
+        };
+        registry.register(plain).await;
+
+        let (manifest_url, package_cid, manifest_blob_cid, manifest_cid): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = crate::db::query_as(
+            "SELECT manifest_url, package_cid, manifest_blob_cid, manifest_cid
+             FROM happyview_plugins WHERE id = 'p'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (manifest_url, package_cid, manifest_blob_cid, manifest_cid),
+            (None, None, None, None)
+        );
     }
 
     /// A language resolves to one interpreter, so a second one claiming an

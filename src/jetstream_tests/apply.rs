@@ -211,6 +211,88 @@ async fn clean_up(state: &AppState, did: &str) {
     }
 }
 
+/// Swaps `NSID` for an unindexed registration. It lives in this state's
+/// memory only, so a failing test leaves nothing in a shared database.
+async fn register_unindexed(state: &AppState) {
+    let parsed = ParsedLexicon::parse(
+        serde_json::json!({
+            "lexicon": 1,
+            "id": NSID,
+            "defs": {"main": {"type": "record", "key": "tid"}},
+        }),
+        1,
+        Some(NSID.to_string()),
+        ProcedureAction::Upsert,
+        None,
+    )
+    .expect("parse lexicon");
+    state.lexicons.upsert_unindexed(parsed).await;
+}
+
+/// What the record pipeline answers for a `NSID` event.
+async fn ingest(
+    state: &AppState,
+    collection: &str,
+    did: &str,
+    rkey: &str,
+    action: happyview_provider::Action,
+) -> happyview_provider::IngestOutcome {
+    let body =
+        (action != happyview_provider::Action::Delete).then(|| serde_json::json!({"text": rkey}));
+    host(state)
+        .ingest(happyview_provider::SourceEvent::Record(
+            happyview_provider::RecordEvent {
+                key: happyview_provider::RecordKey {
+                    did: did.into(),
+                    collection: collection.into(),
+                    rkey: rkey.into(),
+                },
+                action,
+                cid: None,
+                rev: None,
+                body,
+                time_us: None,
+                origin: happyview_provider::Origin::Live,
+                stored: false,
+            },
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn a_commit_to_an_unindexed_collection_is_skipped_like_an_unknown_one() {
+    use happyview_provider::{Action, IngestOutcome};
+    for state in states().await {
+        let did = unique_did();
+        let unknown = ingest(&state, "app.test.unknown", &did, "a", Action::Create).await;
+        assert_eq!(unknown, IngestOutcome::Skipped);
+
+        register_unindexed(&state).await;
+        let outcome = ingest(&state, NSID, &did, "a", Action::Create).await;
+        assert_eq!(outcome, unknown);
+        assert!(rkeys(&state, &did).await.is_empty());
+        clean_up(&state, &did).await;
+    }
+}
+
+#[tokio::test]
+async fn a_delete_in_an_unindexed_collection_is_skipped_and_the_row_stays() {
+    use happyview_provider::{Action, IngestOutcome};
+    for state in states().await {
+        let did = unique_did();
+        apply(&state, commit(&did, 1, "a", "create")).await;
+        assert_eq!(rkeys(&state, &did).await, vec!["a"]);
+
+        // Nothing ingests an unindexed collection, deletes included, so
+        // the row written while it was indexed is left as it is.
+        register_unindexed(&state).await;
+        let outcome = ingest(&state, NSID, &did, "a", Action::Delete).await;
+        assert_eq!(outcome, IngestOutcome::Skipped);
+        assert_eq!(rkeys(&state, &did).await, vec!["a"]);
+        clean_up(&state, &did).await;
+    }
+}
+
 #[tokio::test]
 async fn commits_go_through_the_record_pipeline_with_their_rev() {
     for state in states().await {

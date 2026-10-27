@@ -18,11 +18,19 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   previewPlugin,
+  previewedVersion,
   reloadPlugin,
   type PluginPreview,
   type PluginSummary,
+  type RegistryProjectRef,
   type SecretDefinition,
 } from "@/lib/api";
+import { ReleaseStateBadge } from "@/components/plugin-lifecycle";
+import {
+  CapabilityConsent,
+  newCapabilities,
+  visibleCapabilities,
+} from "@/components/plugin-capabilities";
 
 interface PluginUpdateDialogProps {
   plugin: PluginSummary | null;
@@ -31,42 +39,65 @@ interface PluginUpdateDialogProps {
   onUpdated: (updated: PluginSummary) => void;
 }
 
+/**
+ * The registry project an update comes from: the one the install follows,
+ * moving along its channel, whose version the server resolves itself. A
+ * plugin with no registry project is offered no update; it is added from the
+ * registry to follow one.
+ */
+function updateSource(plugin: PluginSummary | null): RegistryProjectRef | null {
+  const registry = plugin?.registry;
+  if (!registry?.did || !registry.name) return null;
+  return {
+    did: registry.did,
+    name: registry.name,
+    ...(registry.channel ? { channel: registry.channel } : {}),
+  };
+}
+
 export function PluginUpdateDialog({
   plugin,
   open,
   onOpenChange,
   onUpdated,
 }: PluginUpdateDialogProps) {
-  // The entry the server's update gate approved for this install. The
-  // catalogue listing is not consulted: it is one entry per id from any
-  // publisher, and may have moved on since the gate ran.
-  const manifestUrl = plugin?.latest_manifest_url ?? null;
+  const source = updateSource(plugin);
+  // Serialized so the preview effect runs when the source changes, not when
+  // a poll hands back an equal one.
+  const sourceKey = source ? JSON.stringify(source) : null;
 
   const [newManifestPreview, setNewManifestPreview] =
     useState<PluginPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [accepted, setAccepted] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setAccepted(false);
+    setPreviewError(null);
     if (!open || !plugin) {
       setNewManifestPreview(null);
       setError(null);
       return;
     }
-    if (!manifestUrl) {
+    if (!sourceKey) {
       setNewManifestPreview(null);
       return;
     }
 
+    const source = JSON.parse(sourceKey) as RegistryProjectRef;
     let cancelled = false;
     setPreviewLoading(true);
-    previewPlugin(manifestUrl)
+    previewPlugin({ registry: source })
       .then((preview) => {
         if (!cancelled) setNewManifestPreview(preview);
       })
-      .catch(() => {
-        if (!cancelled) setNewManifestPreview(null);
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setNewManifestPreview(null);
+        setPreviewError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
         if (!cancelled) setPreviewLoading(false);
@@ -75,7 +106,7 @@ export function PluginUpdateDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, plugin, manifestUrl]);
+  }, [open, plugin, sourceKey]);
 
   if (!plugin) return null;
 
@@ -87,19 +118,33 @@ export function PluginUpdateDialog({
       (secret) => !installedKeys.has(secret.key),
     ) ?? [];
 
+  // What the update adds is asked for; what it keeps was granted already.
+  const addedCapabilities = newManifestPreview
+    ? newCapabilities(plugin.capabilities, newManifestPreview.capabilities)
+    : [];
+  const consented = addedCapabilities.length === 0 || accepted;
+
   const pendingReleases = [...(plugin.pending_releases ?? [])];
   const hasReleaseNotes = pendingReleases.length > 0;
   const hasLatestVersion = Boolean(plugin.latest_version);
 
   const handleUpdate = async () => {
-    if (!manifestUrl) {
-      setError("No manifest URL available for this plugin.");
-      return;
-    }
+    if (!source || !newManifestPreview || !consented) return;
     setUpdating(true);
     setError(null);
+    // Everything the new version declares, so the server refuses a version
+    // that would be granted more than this dialog showed.
+    const accepted_capabilities = visibleCapabilities(
+      newManifestPreview.capabilities,
+    ).map((c) => c.name);
     try {
-      const updated = await reloadPlugin(plugin.id, { url: manifestUrl });
+      // An empty selector keeps the channel the install follows.
+      // The previewed version is named, so a channel that moved since is
+      // refused rather than installing a version this dialog didn't show.
+      const updated = await reloadPlugin(plugin.id, {
+        registry: { expected_version: previewedVersion(newManifestPreview) },
+        accepted_capabilities,
+      });
       if (plugin.latest_version) {
         try {
           window.localStorage.setItem(
@@ -124,7 +169,8 @@ export function PluginUpdateDialog({
     }
   };
 
-  const updateDisabled = updating || previewLoading || !manifestUrl;
+  const updateDisabled =
+    updating || previewLoading || !source || !newManifestPreview || !consented;
 
   return (
     <ResponsiveDialog open={open} onOpenChange={onOpenChange}>
@@ -132,10 +178,15 @@ export function PluginUpdateDialog({
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Update {plugin.name}</ResponsiveDialogTitle>
           <ResponsiveDialogDescription asChild>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline">v{plugin.version}</Badge>
               <span aria-hidden>→</span>
               <Badge>v{plugin.latest_version ?? "unknown"}</Badge>
+              {plugin.registry?.channel ? (
+                <span className="text-muted-foreground">
+                  on the {plugin.registry.channel} channel
+                </span>
+              ) : null}
             </div>
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
@@ -174,15 +225,36 @@ export function PluginUpdateDialog({
                     key={release.version}
                     className="flex flex-col gap-2"
                   >
-                    <h3 className="text-sm font-semibold">
-                      v{release.version} ·{" "}
-                      {new Date(release.published_at).toLocaleDateString()}
-                    </h3>
-                    <div className="prose prose-sm dark:prose-invert max-w-none">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {release.body}
-                      </ReactMarkdown>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold">
+                        v{release.version}
+                        {release.published_at
+                          ? ` · ${new Date(release.published_at).toLocaleDateString()}`
+                          : null}
+                      </h3>
+                      <ReleaseStateBadge
+                        state={release.state}
+                        installable={release.installable}
+                      />
                     </div>
+                    {release.state === "deprecated" ? (
+                      <p className="text-sm text-muted-foreground">
+                        {release.reason
+                          ? `Deprecated: ${release.reason}`
+                          : "This version is deprecated by its publisher"}
+                      </p>
+                    ) : null}
+                    {release.body ? (
+                      <div className="prose prose-sm dark:prose-invert max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {release.body}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        No release notes.
+                      </p>
+                    )}
                   </section>
                 ))}
               </div>
@@ -192,6 +264,34 @@ export function PluginUpdateDialog({
               No release notes available.
             </p>
           )}
+
+          {newManifestPreview ? (
+            <CapabilityConsent
+              id="update-capabilities-consent"
+              entries={addedCapabilities}
+              allowedHosts={newManifestPreview.allowed_hosts}
+              accepted={accepted}
+              onAcceptedChange={setAccepted}
+              disabled={updating}
+            />
+          ) : null}
+
+          {previewError ? (
+            <p
+              role="alert"
+              className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+            >
+              Couldn&apos;t read the new version, so its permissions can&apos;t
+              be shown: {previewError}
+            </p>
+          ) : null}
+
+          {!source ? (
+            <p className="text-sm text-muted-foreground">
+              This plugin doesn&apos;t follow a registry project, so it
+              isn&apos;t offered updates. Add it from the registry to get them.
+            </p>
+          ) : null}
 
           {error && (
             <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">

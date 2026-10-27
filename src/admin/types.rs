@@ -34,6 +34,8 @@ pub(super) struct LexiconSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) record_schema: Option<Value>,
     pub(super) token_cost: Option<i32>,
+    /// Whether the ingest watches this record lexicon's collection.
+    pub(super) indexed: bool,
 }
 
 impl From<crate::catalog::LexiconListing> for LexiconSummary {
@@ -72,6 +74,7 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             updated_at: l.updated_at,
             record_schema,
             token_cost: l.token_cost,
+            indexed: l.indexed,
         }
     }
 }
@@ -84,6 +87,9 @@ pub(super) struct UploadLexiconBody {
     pub(super) target_collection: Option<String>,
     pub(super) action: Option<String>,
     pub(super) token_cost: Option<i32>,
+    /// Left out, an update keeps the stored setting and a new lexicon is
+    /// indexed, so a client that predates the field never flips it.
+    pub(super) indexed: Option<bool>,
 }
 
 fn default_backfill() -> bool {
@@ -104,6 +110,9 @@ pub(super) struct StatsResponse {
 pub(super) struct CollectionStat {
     pub(super) collection: String,
     pub(super) count: i64,
+    /// Whether the ingest watches this collection; rows in an unindexed one
+    /// were written locally.
+    pub(super) indexed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +125,8 @@ pub(super) struct AddNetworkLexiconBody {
     #[serde(default)]
     pub(super) backfill: bool,
     pub(super) target_collection: Option<String>,
+    /// Left out, an existing lexicon keeps its setting and a new one is indexed.
+    pub(super) indexed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -126,6 +137,7 @@ pub(super) struct NetworkLexiconSummary {
     pub(super) last_fetched_at: Option<String>,
     pub(super) created_at: String,
     pub(super) declared: bool,
+    pub(super) indexed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,11 +302,16 @@ pub(super) struct PluginSummary {
     pub(super) latest_version: Option<String>,
     #[serde(default)]
     pub(super) pending_releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
-    /// The manifest of the catalogue entry the update gate approved for this
-    /// install, which is what an update installs. Absent when no entry is
-    /// offered to it.
+    /// Whether `latest_version` may be installed. An operator sees a channel
+    /// that moved to a version they can't take, rather than no offer at all.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) latest_manifest_url: Option<String>,
+    pub(super) latest_version_installable: Option<bool>,
+    /// The lifecycle state of `latest_version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) latest_state: Option<String>,
+    /// The registry project the plugin is installed from. `None` for a
+    /// plugin installed from a URL or a file and not matched to one.
+    pub(super) registry: Option<PluginRegistryStatus>,
     pub(super) plugin_type: String,
     pub(super) namespace: Option<String>,
     #[serde(default)]
@@ -302,6 +319,26 @@ pub(super) struct PluginSummary {
     #[serde(default)]
     pub(super) allowed_hosts: Vec<String>,
     pub(super) capabilities: crate::plugin::capabilities::CapabilityReport,
+}
+
+/// Where an installed plugin stands in the registry.
+#[derive(Serialize)]
+pub(super) struct PluginRegistryStatus {
+    /// The publisher's DID and the project name. `None` for a URL install
+    /// that could not be matched to a project.
+    pub(super) did: Option<String>,
+    pub(super) name: Option<String>,
+    /// The channel the install follows; `None` when pinned to a version.
+    pub(super) channel: Option<String>,
+    pub(super) version_uri: Option<String>,
+    /// The installed version's lifecycle state, and the publisher's reason
+    /// for it. `None` when the catalogue doesn't hold the project.
+    pub(super) installed_state: Option<String>,
+    pub(super) installed_reason: Option<String>,
+    /// The lifecycle state of the version the followed channel points at.
+    pub(super) channel_state: Option<String>,
+    /// A URL install that no registry project matched.
+    pub(super) unresolved: bool,
 }
 
 /// GET /admin/plugins query params.
@@ -321,11 +358,19 @@ pub(super) struct RemovePluginQuery {
 #[derive(Serialize)]
 pub(super) struct OfficialPluginSummary {
     pub(super) id: String,
+    /// The registry account that published the project. With `id`, the
+    /// project's identity, which is what an install names.
+    pub(super) publisher_did: Option<String>,
     pub(super) name: String,
     pub(super) description: Option<String>,
     pub(super) icon_url: Option<String>,
-    pub(super) latest_version: String,
-    pub(super) manifest_url: String,
+    pub(super) plugin_type: String,
+    /// The version `latest` points at; `None` when it points nowhere.
+    pub(super) latest_version: Option<String>,
+    pub(super) channels:
+        std::collections::BTreeMap<String, crate::plugin::official_registry::ChannelEntry>,
+    /// The project's own lifecycle state.
+    pub(super) lifecycle_state: String,
     pub(super) official: bool,
     pub(super) banner_url: Option<String>,
     /// Every release the catalogue knows, newest first. A detail page lists
@@ -347,13 +392,62 @@ pub(super) struct OfficialPluginsListResponse {
 pub(super) struct ReloadPluginBody {
     #[serde(default)]
     pub(super) url: Option<String>,
+    /// Move a registry install to its channel's current version, another
+    /// channel's, or a pinned version.
+    #[serde(default)]
+    pub(super) registry: Option<RegistrySelector>,
     #[serde(default)]
     pub(super) accepted_capabilities: Option<Vec<String>>,
 }
 
+/// Which version of a project: a channel to follow or a version to pin. At
+/// most one; neither means the channel already followed, or `latest`.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RegistrySelector {
+    #[serde(default)]
+    pub(super) channel: Option<String>,
+    #[serde(default)]
+    pub(super) version: Option<String>,
+    /// The version the caller previewed. When the selector resolves to
+    /// another, the channel moved since, and the request is refused rather
+    /// than installing something nobody reviewed.
+    #[serde(default)]
+    pub(super) expected_version: Option<String>,
+}
+
+/// A registry project, and which of its versions.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RegistryProjectRef {
+    pub(super) did: String,
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) channel: Option<String>,
+    #[serde(default)]
+    pub(super) version: Option<String>,
+    /// See [`RegistrySelector::expected_version`].
+    #[serde(default)]
+    pub(super) expected_version: Option<String>,
+}
+
+impl RegistryProjectRef {
+    pub(super) fn selector(&self) -> RegistrySelector {
+        RegistrySelector {
+            channel: self.channel.clone(),
+            version: self.version.clone(),
+            expected_version: self.expected_version.clone(),
+        }
+    }
+}
+
+/// A plugin is added from a URL or a registry project, never both.
 #[derive(Deserialize)]
 pub(super) struct AddPluginBody {
-    pub(super) url: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) registry: Option<RegistryProjectRef>,
     pub(super) sha256: Option<String>,
     #[serde(default)]
     pub(super) accepted_capabilities: Option<Vec<String>>,
@@ -361,7 +455,21 @@ pub(super) struct AddPluginBody {
 
 #[derive(Deserialize)]
 pub(super) struct PreviewPluginBody {
-    pub(super) url: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) registry: Option<RegistryProjectRef>,
+}
+
+/// The registry version a preview resolved to.
+#[derive(Serialize)]
+pub(super) struct PreviewRegistry {
+    pub(super) did: String,
+    pub(super) name: String,
+    pub(super) channel: Option<String>,
+    pub(super) version: String,
+    pub(super) version_uri: String,
+    pub(super) state: String,
 }
 
 #[derive(Serialize)]
@@ -392,6 +500,8 @@ pub(super) struct PluginPreviewResponse {
     pub(super) allowed_hosts: Vec<String>,
     pub(super) capabilities: crate::plugin::capabilities::CapabilityReport,
     pub(super) sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) registry: Option<PreviewRegistry>,
 }
 
 #[derive(Serialize)]
