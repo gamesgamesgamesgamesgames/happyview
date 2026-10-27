@@ -58,6 +58,9 @@ pub(crate) struct TrackedNetworkLexicon {
     pub authority_did: String,
     pub revision: i32,
     pub is_record: bool,
+    /// What was stored, after an omitted setting fell back to the existing
+    /// row's or to indexed.
+    pub indexed: bool,
 }
 
 /// Resolve an NSID's authority, fetch its lexicon and store it as a network
@@ -73,9 +76,18 @@ pub(crate) async fn track_network_lexicon(
     nsid: &str,
     target_collection: Option<String>,
     backfill: bool,
+    indexed: Option<bool>,
 ) -> Result<TrackedNetworkLexicon, AppError> {
     // Ahead of resolution: a file the project owns is never the network's.
     lexicons.check_writable(nsid)?;
+
+    let indexed = match indexed {
+        Some(v) => v,
+        None => lexicons
+            .get_listing(db, backend, nsid)
+            .await?
+            .is_none_or(|l| l.indexed),
+    };
 
     let (authority_did, pds_endpoint) = resolve_nsid_authority(http, plc_url, nsid).await?;
     let lexicon_json = fetch_lexicon_from_pds(http, &pds_endpoint, &authority_did, nsid).await?;
@@ -91,6 +103,7 @@ pub(crate) async fn track_network_lexicon(
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some(authority_did.clone()),
+                indexed,
             },
         )
         .await?;
@@ -103,6 +116,7 @@ pub(crate) async fn track_network_lexicon(
         authority_did,
         revision,
         is_record,
+        indexed,
     })
 }
 
@@ -124,6 +138,7 @@ pub(super) async fn add(
         nsid,
         body.target_collection.clone(),
         body.backfill,
+        body.indexed,
     )
     .await?;
 
@@ -133,6 +148,7 @@ pub(super) async fn add(
 
     let backfill_job_id: Option<String> = if tracked.is_record
         && body.backfill
+        && tracked.indexed
         && tracked.revision == 1
         && auth.has(Permission::BackfillCreate)
     {
@@ -183,6 +199,7 @@ pub(super) async fn list(
             target_collection: l.target_collection,
             last_fetched_at: l.last_fetched_at,
             created_at: l.created_at.unwrap_or_default(),
+            indexed: l.indexed,
         })
         .collect();
 
@@ -356,6 +373,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await
@@ -374,6 +392,7 @@ mod tests {
             authority_did: "did:plc:x".into(),
             revision: 1,
             is_record: true,
+            indexed: true,
         }
     }
 
@@ -392,6 +411,7 @@ mod tests {
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await

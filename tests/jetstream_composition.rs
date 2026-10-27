@@ -88,6 +88,7 @@ async fn app(collections: &[&str]) -> Option<(TestApp, watch::Sender<Vec<String>
                     action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
+                    indexed: true,
                 },
             )
             .await

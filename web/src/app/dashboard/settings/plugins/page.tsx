@@ -42,18 +42,29 @@ const TYPE_ORDER: PluginType[] = ["library", "interpreter", "auth"];
  * state worth colour, so a healthy instance reads calm rather than as a wall
  * of green ticks.
  */
+type Flag = { kind: "config" | "update" | "retired"; label: string };
+
 function attention(plugin: PluginSummary): {
   needs: boolean;
   label: string | null;
-  kind: "config" | "update" | null;
+  flags: Flag[];
 } {
+  const flags: Flag[] = [];
+  // A retired version keeps running, so the row is the operator's cue. It
+  // sits beside the update that would move off it, not instead of it.
+  if (plugin.registry?.installed_state === "retired") {
+    flags.push({ kind: "retired", label: "Retired version" });
+  }
   if (!plugin.secrets_configured) {
-    return { needs: true, label: "Needs configuration", kind: "config" };
+    flags.push({ kind: "config", label: "Needs configuration" });
+  } else if (plugin.update_available) {
+    flags.push({ kind: "update", label: "Update available" });
   }
-  if (plugin.update_available) {
-    return { needs: true, label: "Update available", kind: "update" };
-  }
-  return { needs: false, label: null, kind: null };
+  return {
+    needs: flags.length > 0,
+    label: flags.length > 0 ? flags.map((f) => f.label).join(", ") : null,
+    flags,
+  };
 }
 
 export default function PluginsPage() {
@@ -321,18 +332,22 @@ export default function PluginsPage() {
                               {TYPE_LABEL[plugin.plugin_type]}
                             </Badge>
                           ) : null}
-                          {state.needs ? (
-                            <Badge variant="destructive" className="shrink-0">
-                              {state.kind === "update" ? (
+                          {state.flags.map((flag) => (
+                            <Badge
+                              key={flag.kind}
+                              variant="destructive"
+                              className="shrink-0"
+                            >
+                              {flag.kind === "update" ? (
                                 <ArrowUpCircle />
                               ) : (
                                 <AlertTriangle />
                               )}
                               <span className="hidden sm:inline">
-                                {state.label}
+                                {flag.label}
                               </span>
                             </Badge>
-                          ) : null}
+                          ))}
                           <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
                             {plugin.version}
                           </span>

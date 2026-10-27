@@ -621,7 +621,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
     let collections: Vec<String> = if let Some(ref col) = collection {
         let lexicon_exists: bool = state.host.tracked_collections().borrow().contains(col);
         if !lexicon_exists {
-            let error = format!("no record-type lexicon registered for collection '{col}'");
+            let error = format!("no indexed record lexicon for collection '{col}'");
             fail_job(&state, &job_id, &error).await;
             return;
         }

@@ -72,6 +72,7 @@ async fn app() -> Option<TestApp> {
                 action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
+                indexed: true,
             },
         )
         .await

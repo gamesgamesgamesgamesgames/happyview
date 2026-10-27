@@ -9,6 +9,7 @@ import { useOfficialPlugins } from "@/hooks/use-official-plugins";
 import { getPlugins } from "@/lib/api";
 import { cataloguePluginHref, urlPluginHref } from "@/lib/plugin-routes";
 import { PluginMark } from "@/components/plugin-identity";
+import { ReleaseStateBadge } from "@/components/plugin-lifecycle";
 import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
@@ -36,8 +37,13 @@ function isHttpUrl(value: string): boolean {
 
 export default function AddPluginPage() {
   const router = useRouter();
-  const { plugins: catalogue, loading: catalogueLoading } =
-    useOfficialPlugins();
+  // `plugins` says whether the registry answered; `listed` leaves out the
+  // retired projects, which can no longer be installed.
+  const {
+    plugins: everything,
+    listed: catalogue,
+    loading: catalogueLoading,
+  } = useOfficialPlugins();
 
   const [query, setQuery] = useState("");
   const [urlOpen, setUrlOpen] = useState(false);
@@ -135,7 +141,7 @@ export default function AddPluginPage() {
               <Skeleton key={i} className="h-28 rounded-lg" />
             ))}
           </div>
-        ) : catalogue.length === 0 ? (
+        ) : everything.length === 0 ? (
           <div className="flex max-w-xl flex-col items-start gap-3 rounded-lg border border-dashed p-8">
             <p className="text-sm font-medium">Can&apos;t reach the registry</p>
             <p className="text-sm text-muted-foreground">
@@ -153,11 +159,17 @@ export default function AddPluginPage() {
         ) : results.length === 0 ? (
           <div className="flex max-w-xl flex-col items-start gap-3 rounded-lg border border-dashed p-8">
             <p className="text-sm text-muted-foreground">
-              No plugin matches{" "}
-              <span className="font-medium text-foreground">
-                {query.trim()}
-              </span>
-              .
+              {query.trim() ? (
+                <>
+                  No plugin matches{" "}
+                  <span className="font-medium text-foreground">
+                    {query.trim()}
+                  </span>
+                  .
+                </>
+              ) : (
+                "No plugin to add."
+              )}
             </p>
             <Button
               variant="outline"
@@ -179,19 +191,22 @@ export default function AddPluginPage() {
                   <div className="flex items-start gap-3">
                     <PluginMark
                       name={entry.name}
-                      // The catalogue does not report a kind, so the mark falls
-                      // back to the neutral library glyph rather than claiming
-                      // one.
-                      type="library"
+                      type={entry.plugin_type}
                       iconUrl={entry.icon_url}
                     />
                     <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                       <span className="truncate text-sm font-medium">
                         {entry.name}
                       </span>
-                      <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                        {entry.latest_version}
-                      </span>
+                      {entry.latest_version ? (
+                        <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                          {entry.latest_version}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">
+                          No latest release
+                        </span>
+                      )}
                     </div>
                     <div className="flex shrink-0 flex-col items-end gap-1">
                       {/* Anyone can publish any slug to the registry, so
@@ -199,6 +214,9 @@ export default function AddPluginPage() {
                           not the catalogue it arrived in. */}
                       {entry.official ? (
                         <Badge variant="secondary">Official</Badge>
+                      ) : null}
+                      {entry.lifecycle_state === "deprecated" ? (
+                        <ReleaseStateBadge state="deprecated" />
                       ) : null}
                       {installed.has(entry.id) ? (
                         <span className="text-xs text-muted-foreground">
