@@ -181,29 +181,32 @@ pub async fn start_authorization(
 
     let guard = state.oauth_state_store.authorize_lock.lock().await;
 
-    let url = client
-        .authorize(
-            identifier,
-            AuthorizeOptions {
-                scopes,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| {
-            let msg = format!("{e}");
-            if msg.contains("invalid_scope") {
-                AppError::BadRequest(format!(
-                    "the authorization server rejected the requested scopes ({msg}). \
+    let url = crate::auth::atrium_panic::catch(client.authorize(
+        identifier,
+        AuthorizeOptions {
+            scopes,
+            ..Default::default()
+        },
+    ))
+    .await
+    .map_err(|panic| {
+        tracing::warn!(grant_id = %grant.id, panic = %panic, "linked repo authorize panicked");
+        AppError::BadGateway(crate::auth::atrium_panic::NO_PAR_ENDPOINT.into())
+    })?
+    .map_err(|e| {
+        let msg = format!("{e}");
+        if msg.contains("invalid_scope") {
+            AppError::BadRequest(format!(
+                "the authorization server rejected the requested scopes ({msg}). \
                      Either it does not accept one of this grant's scopes — in which \
                      case the grant must be recreated with scopes it does accept — or \
                      it is serving a cached copy of our client metadata, which a retry \
                      in a minute will clear."
-                ))
-            } else {
-                AppError::Internal(format!("authorize failed: {msg}"))
-            }
-        })?;
+            ))
+        } else {
+            AppError::Internal(format!("authorize failed: {msg}"))
+        }
+    })?;
 
     let oauth_state = state
         .oauth_state_store
