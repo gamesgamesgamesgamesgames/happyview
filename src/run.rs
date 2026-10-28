@@ -627,62 +627,9 @@ async fn boot(
     // Seed and load domain cache
     let domain_cache = crate::domain::DomainCache::new();
     {
-        let count_sql = crate::db::adapt_sql("SELECT COUNT(*) FROM happyview_domains", db_backend);
-        let row = crate::db::query(&count_sql)
-            .fetch_one(&db_pool)
+        crate::domain::sync_primary(&db_pool, db_backend, &config.public_url)
             .await
-            .expect("Failed to count domains");
-        let count: i64 = row.try_get(0).unwrap_or(0);
-
-        if count == 0 {
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = crate::db::now_rfc3339();
-            let insert_sql = crate::db::adapt_sql(
-                "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
-                db_backend,
-            );
-            crate::db::query(&insert_sql)
-                .bind(&id)
-                .bind(&config.public_url)
-                .bind(&now)
-                .bind(&now)
-                .execute(&db_pool)
-                .await
-                .expect("Failed to insert primary domain");
-            info!("Seeded primary domain: {}", config.public_url);
-        } else {
-            // Sync the primary domain URL with PUBLIC_URL if it changed
-            let primary_sql = crate::db::adapt_sql(
-                "SELECT id, url FROM happyview_domains WHERE is_primary = 1",
-                db_backend,
-            );
-            if let Some(row) = crate::db::query(&primary_sql)
-                .fetch_optional(&db_pool)
-                .await
-                .expect("Failed to check primary domain")
-            {
-                let primary_url: String = row.try_get("url").unwrap_or_default();
-                if primary_url != config.public_url {
-                    let primary_id: String = row.try_get("id").unwrap_or_default();
-                    let now = crate::db::now_rfc3339();
-                    let update_sql = crate::db::adapt_sql(
-                        "UPDATE happyview_domains SET url = ?, updated_at = ? WHERE id = ?",
-                        db_backend,
-                    );
-                    crate::db::query(&update_sql)
-                        .bind(&config.public_url)
-                        .bind(&now)
-                        .bind(&primary_id)
-                        .execute(&db_pool)
-                        .await
-                        .expect("Failed to update primary domain URL");
-                    info!(
-                        "Updated primary domain URL from {} to {}",
-                        primary_url, config.public_url
-                    );
-                }
-            }
-        }
+            .expect("Failed to sync the primary domain with PUBLIC_URL");
 
         let select_sql = crate::db::adapt_sql(
             "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains",
