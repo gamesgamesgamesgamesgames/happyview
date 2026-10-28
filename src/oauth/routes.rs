@@ -565,6 +565,19 @@ async fn register_session(
         );
     }
 
+    // A re-registration replaces the tokens and the issuer with the app's, so
+    // a scope verified for the previous ones no longer describes this session.
+    // Not best-effort: a stale grant left behind would reach the admin API.
+    sessions::set_granted_scope(
+        &state.db,
+        state.db_backend,
+        &client.id,
+        &dpop_key_id,
+        &body.did,
+        None,
+    )
+    .await?;
+
     // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT
     // USED TO REGISTER IN COMPLETE SILENCE. Everything works until the access
     // token expires; from then on every PDS write fails in `pds_write.rs` with

@@ -6,11 +6,16 @@ The admin API lets you manage lexicons, monitor records, run backfill jobs, and 
 
 ## Auth
 
-The admin API supports three authentication methods:
+The admin API supports four authentication methods:
 
 1. **API keys** — read/write tokens starting with `hv_`, passed as `Authorization: Bearer hv_...`. See the [API Keys guide](../../guides/api-keys.md) for details.
-2. **Service auth JWT** — atproto inter-service authentication via signed JWTs.
+2. **Service auth JWT** — atproto inter-service authentication via signed JWTs. The token must be bound to the method `dev.happyview.admin.manage` (its `lxm` claim). A PDS mints such a token for an OAuth app only when the user granted it that method, which is what the next method's permission set does.
 3. **Cookie-based session auth** — signed session cookies set during the dashboard OAuth login flow. The [web dashboard](../../getting-started/dashboard.md) uses this method.
+4. **App sessions granted `dev.happyview.adminFull`** — an API client's [DPoP session](../oauth/api-clients.md), when the user approved the permission set `dev.happyview.adminFull` at sign-in. The app asks for it with the scope `include:dev.happyview.adminFull`. The session then acts with the user's own permissions.
+
+HappyView decides whether a session was granted the set by what the user's authorization server says, never by the scope the app registered. On the session's first admin request it refreshes the session itself, after checking that the user's PDS names the session's authorization server, and reads the granted scope from the token response. It reads it again once that access token expires, so revoking the grant at the PDS ends admin access within one token lifetime. Any other API client session is refused with `403 Forbidden`, because those sessions belong to apps built on the instance, and an admin signing in to one must not hand it the instance.
+
+hpy, the HappyView CLI, signs in this way through a client every instance has built in: `hvc_hpy`, which `GET /config` publishes as `cli_client_key`. An operator who wants another app to manage the instance registers it with `include:dev.happyview.adminFull` among its scopes.
 
 In all cases the resolved DID is checked against the `happyview_users` table, and the user's permissions are loaded to authorize the request.
 

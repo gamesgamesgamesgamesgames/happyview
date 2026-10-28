@@ -5,6 +5,7 @@ use axum::http::request::Parts;
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
+use crate::auth::admin_scope;
 use crate::auth::middleware::Claims;
 use crate::constant_time::ct_eq_str;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -139,6 +140,9 @@ impl UserAuth {
         }
 
         let claims = Claims::from_request_parts(parts, state).await?;
+        // Ahead of the bootstrap below, so an app without the grant cannot
+        // become the first admin either.
+        require_admin_grant(state, &claims).await?;
         let did = claims.did().to_string();
         let backend = state.db_backend;
 
@@ -245,6 +249,52 @@ impl UserAuth {
             db_backend: backend,
         })
     }
+}
+
+/// An app's DPoP session, or a service-auth JWT, reaches the admin API only
+/// with the grant `auth::admin_scope` describes. A cookie is the dashboard's
+/// and needs none.
+async fn require_admin_grant(state: &AppState, claims: &Claims) -> Result<(), AppError> {
+    if let Some(lxm) = claims.service_auth_lxm() {
+        if lxm != Some(admin_scope::ADMIN_LXM) {
+            return Err(AppError::Forbidden(format!(
+                "a service-auth token must be bound to {} to use the admin API",
+                admin_scope::ADMIN_LXM
+            )));
+        }
+        return Ok(());
+    }
+
+    let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {
+        return Ok(());
+    };
+    let encryption_key = state
+        .config
+        .token_encryption_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
+    let client =
+        crate::oauth::client_auth::resolve_client_by_key(&state.db, state.db_backend, client_key)
+            .await?;
+    let granted = crate::oauth::pds_write::verified_granted_scope(
+        &state.http,
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.oauth,
+        &state.config.plc_url,
+        &client.id,
+        claims.did(),
+        dpop_key_id,
+    )
+    .await?;
+    if !admin_scope::grants_admin(&granted) {
+        return Err(AppError::Forbidden(format!(
+            "this sign-in did not grant {}; sign in again and approve managing your HappyView instances",
+            admin_scope::PERMISSION_SET
+        )));
+    }
+    Ok(())
 }
 
 /// Deny by default: every handler that takes `UserAuth` refuses the managed-

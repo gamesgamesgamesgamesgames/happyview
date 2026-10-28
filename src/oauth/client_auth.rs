@@ -218,13 +218,20 @@ async fn expand_permission_set(
         return;
     };
 
-    let Some(lexicon) = lexicons.get(&include.nsid).await else {
-        tracing::warn!(nsid = %include.nsid, "permission set lexicon not found in registry");
-        return;
+    // HappyView's own set is built in, so every instance can expand it
+    // without holding the lexicon, and no stored copy can widen it.
+    let raw = match crate::auth::admin_scope::builtin_permission_set(&include.nsid) {
+        Some(raw) => raw,
+        None => match lexicons.get(&include.nsid).await {
+            Some(lexicon) => lexicon.raw.clone(),
+            None => {
+                tracing::warn!(nsid = %include.nsid, "permission set lexicon not found in registry");
+                return;
+            }
+        },
     };
 
-    let Some(permissions) = lexicon
-        .raw
+    let Some(permissions) = raw
         .get("defs")
         .and_then(|d| d.get("main"))
         .and_then(|m| m.get("permissions"))
@@ -285,7 +292,7 @@ async fn expand_permission_set(
 /// Convert one lexicon `permission` entry into the crate's representation,
 /// preserving scalar/list arity — the reference treats a scalar supplied where
 /// a list belongs as invalidating the permission rather than coercing it.
-fn lex_permission(value: &serde_json::Value) -> Option<happyview_scopes::LexPermission> {
+pub(crate) fn lex_permission(value: &serde_json::Value) -> Option<happyview_scopes::LexPermission> {
     use happyview_scopes::LexValue;
 
     let obj = value.as_object()?;

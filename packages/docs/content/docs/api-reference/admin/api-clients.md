@@ -39,6 +39,8 @@ GET /admin/api-clients
 
 Requires `api-clients:view`. Returns clients ordered by `created_at` descending. Secrets are never returned.
 
+The list includes `builtin-hpy`, the public client hpy signs in with (`client_key` `hvc_hpy`). HappyView writes it at every boot, and updating it, deleting it, or provisioning or rotating an authentication key for it answers `409 Conflict`.
+
 ```ts tab="TypeScript" tab-group="language"
 interface ApiClient {
   id: string;

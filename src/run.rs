@@ -568,6 +568,11 @@ async fn boot(
         );
     }
 
+    // Before the API clients are loaded below, so hpy is among them.
+    if let Err(e) = crate::auth::cli_client::seed(&db_pool, db_backend).await {
+        tracing::error!(error = %e, "hpy cannot sign in to this instance");
+    }
+
     // Seed and load per-instance default token costs from instance_settings.
     let defaults = seed_and_load_rate_limit_defaults(&db_pool, db_backend).await;
     let rate_limiter = RateLimiter::new(defaults);
