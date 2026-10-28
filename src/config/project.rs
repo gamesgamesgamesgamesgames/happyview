@@ -688,9 +688,9 @@ protocol = "v1"
 compression = false
 
 [lexicons."at.happyproto.registry.getArtifact"]
-target_collection = "at.happyproto.registry.artifact"
+target_collection = "software.release.manifest"
 
-[lexicons."at.happyproto.registry.artifact"]
+[lexicons."software.release.manifest"]
 backfill = true
 indexed = false
 
@@ -761,15 +761,15 @@ capabilities = ["library:call"]
         let get = &config.lexicons["at.happyproto.registry.getArtifact"];
         assert_eq!(
             get.target_collection.as_deref(),
-            Some("at.happyproto.registry.artifact")
+            Some("software.release.manifest")
         );
         assert_eq!(get.backfill, None, "an unset override stays unset");
         assert_eq!(
-            config.lexicons["at.happyproto.registry.artifact"].backfill,
+            config.lexicons["software.release.manifest"].backfill,
             Some(true)
         );
         assert_eq!(
-            config.lexicons["at.happyproto.registry.artifact"].indexed,
+            config.lexicons["software.release.manifest"].indexed,
             Some(false)
         );
         assert_eq!(get.indexed, None, "an unset override stays unset");

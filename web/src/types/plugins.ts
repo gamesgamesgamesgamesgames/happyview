@@ -145,9 +145,11 @@ export interface OfficialPluginSummary {
   sections: PluginSections;
 }
 
-/** The four long-form fields of `at.happyproto.plugin.profile`. CommonMark
- * from a publisher, so a renderer strips embedded HTML and refuses a link
- * scheme it does not recognise. */
+/** A plugin's four long-form fields: `description`, `installation` and
+ * `security` from its `at.happyproto.plugin.v1` artifact's `sections`, and
+ * `changelog` from the registry's copy of the version's release notes.
+ * CommonMark from a publisher, so a renderer strips embedded HTML and refuses
+ * a link scheme it does not recognise. */
 export interface PluginSections {
   description?: string;
   installation?: string;

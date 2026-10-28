@@ -65,9 +65,10 @@ function Pre({ children }: ComponentProps<"pre">) {
 /**
  * CommonMark written by a plugin's publisher and shown to an operator.
  *
- * `at.happyproto.plugin.profile` states the handling as a requirement: raw
- * HTML is not rendered, and a link scheme the renderer does not recognise is
- * refused. Both hold here by construction — no `rehype-raw`, so embedded HTML
+ * The registry's lexicons require it to be rendered as untrusted input
+ * (`at.happyproto.plugin.v1`'s `sections`, `at.happyproto.registry.defs`'s
+ * `changelogView`): raw HTML is not rendered, and a link scheme the renderer
+ * does not recognise is refused. Both hold here by construction — no `rehype-raw`, so embedded HTML
  * stays text, and react-markdown's default URL transform passes only the safe
  * schemes — so this component exists to keep that true in one place rather
  * than at each call site. Highlighting does not widen that surface: Shiki is
