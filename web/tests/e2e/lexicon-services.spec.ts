@@ -103,7 +103,9 @@ test.describe("Lexicon Services", () => {
     await expect(addButton).toBeEnabled({ timeout: 3000 });
     await addButton.click();
 
-    await expect(page.getByText("#lextest")).toBeVisible({ timeout: 5000 });
+    // Exact, because the toast and the delete dialog name the fragment too.
+    const entry = page.getByText("#lextest", { exact: true });
+    await expect(entry).toBeVisible({ timeout: 5000 });
 
     // Navigate to the query lexicon's detail page
     await page.goto("/dashboard/lexicons");
@@ -137,14 +139,11 @@ test.describe("Lexicon Services", () => {
     // Clean up the service entry
     await page.goto("/dashboard/settings/service-identity");
     const deleteButton = page.getByRole("button", { name: /delete #lextest/i });
-    if (await deleteButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await deleteButton.click();
-      const dialog = page.getByRole("alertdialog");
-      await expect(dialog).toBeVisible({ timeout: 3000 });
-      await dialog.getByRole("button", { name: "Delete" }).click();
-      await expect(page.getByText("#lextest")).not.toBeVisible({
-        timeout: 5000,
-      });
-    }
+    await expect(deleteButton).toBeVisible({ timeout: 5000 });
+    await deleteButton.click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toBeVisible({ timeout: 3000 });
+    await dialog.getByRole("button", { name: "Delete" }).click();
+    await expect(entry).toHaveCount(0, { timeout: 5000 });
   });
 });
