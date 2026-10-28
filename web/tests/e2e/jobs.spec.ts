@@ -121,7 +121,9 @@ test.describe("Jobs Dashboard", () => {
   });
 
   test("opens detail sheet when clicking a job row", async ({ page }) => {
-    const id = await seedJob("pending", "test.e2e.detail");
+    // Not "pending": the job worker would claim it and fail it for having
+    // no script, and the failure message repeats the job type.
+    const id = await seedJob("completed", "test.e2e.detail");
 
     await page.goto("/dashboard/jobs");
 
@@ -136,8 +138,10 @@ test.describe("Jobs Dashboard", () => {
 
     await expect(sheet.getByText("Job Details")).toBeVisible();
     await expect(sheet.getByText(id)).toBeVisible();
-    await expect(sheet.getByText("test.e2e.detail")).toBeVisible();
-    await expect(sheet.getByText("pending")).toBeVisible();
+    await expect(
+      sheet.getByText("test.e2e.detail", { exact: true }),
+    ).toBeVisible();
+    await expect(sheet.getByText("completed", { exact: true })).toBeVisible();
   });
 
   test("shows cancel button for running job and cancels it", async ({
