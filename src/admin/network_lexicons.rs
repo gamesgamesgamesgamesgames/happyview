@@ -187,13 +187,14 @@ pub(super) async fn list(
 ) -> Result<Json<Vec<NetworkLexiconSummary>>, AppError> {
     auth.require(Permission::LexiconsRead).await?;
 
+    let declared = crate::project::deploy::declared_network_lexicons(&state);
     let summaries: Vec<NetworkLexiconSummary> = state
         .lexicons
         .list_network(&state.db, state.db_backend)
         .await?
         .into_iter()
         .map(|l| NetworkLexiconSummary {
-            declared: state.config.declares_network_lexicon(&l.id),
+            declared: declared.contains(&l.id),
             nsid: l.id,
             authority_did: l.authority_did.unwrap_or_default(),
             target_collection: l.target_collection,
@@ -216,7 +217,7 @@ pub(super) async fn remove(
 
     // The dashboard's error toast rewrites any message containing "network"
     // into a connection failure, so this one names the file instead.
-    if state.config.declares_network_lexicon(&nsid) {
+    if crate::project::deploy::declares_network_lexicon(&state, &nsid) {
         return Err(AppError::Conflict(format!(
             "'{nsid}' is declared in happyview.toml; remove it from the file instead"
         )));

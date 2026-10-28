@@ -1138,6 +1138,18 @@ async fn boot(
                 return Err(std::process::ExitCode::from(1));
             }
         }
+    } else {
+        // A deployed project, if one was. Its build failing is logged and
+        // reported by `GET /admin/project`, never fatal: the fix is a deploy,
+        // and that needs a running instance.
+        if let Some(installed) = crate::project::deploy::serve_stored(&state).await {
+            for warning in &installed.warnings {
+                eprintln!("{warning}");
+            }
+        }
+        // A deploy can arrive at any time, so the listener runs whether or
+        // not one has; it rebuilds whatever the snapshot names as its root.
+        crate::project::prepare::spawn_rebuild_on_interpreter_change(state.clone());
     }
 
     // Every plugin and project module this boot will run is known by now, so
@@ -1172,7 +1184,7 @@ async fn boot(
     }
     // After the source resumed the jobs that were running, which would
     // otherwise run one started here twice.
-    if state.config.project_root.is_some() {
+    if state.project.load().root.is_some() {
         crate::project::boot::start_declared_backfills(&state).await;
     }
     // `HAPPYVIEW_DEFAULT_PLUGINS`, in a task of its own: its sources are

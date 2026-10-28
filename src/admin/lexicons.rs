@@ -140,9 +140,9 @@ pub(super) async fn upload_lexicon(
 
 /// The refusal `delete_lexicon` answers is the one `declared` reports, so the
 /// dashboard can leave out a Delete that could only fail.
-fn summarize(state: &AppState, listing: crate::catalog::LexiconListing) -> LexiconSummary {
+fn summarize(declared: &[String], listing: crate::catalog::LexiconListing) -> LexiconSummary {
     let mut summary = LexiconSummary::from(listing);
-    summary.declared = state.config.declares_network_lexicon(&summary.id);
+    summary.declared = declared.contains(&summary.id);
     summary
 }
 
@@ -153,8 +153,12 @@ pub(super) async fn list_lexicons(
 ) -> Result<Json<Vec<LexiconSummary>>, AppError> {
     auth.require(Permission::LexiconsRead).await?;
     let listings = state.lexicons.list(&state.db, state.db_backend).await?;
+    let declared = crate::project::deploy::declared_network_lexicons(&state);
     Ok(Json(
-        listings.into_iter().map(|l| summarize(&state, l)).collect(),
+        listings
+            .into_iter()
+            .map(|l| summarize(&declared, l))
+            .collect(),
     ))
 }
 
@@ -171,7 +175,10 @@ pub(super) async fn get_lexicon(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("lexicon '{id}' not found")))?;
     let lexicon_json = listing.lexicon_json.clone();
-    let summary = summarize(&state, listing);
+    let summary = summarize(
+        &crate::project::deploy::declared_network_lexicons(&state),
+        listing,
+    );
     let mut out = serde_json::to_value(&summary)
         .map_err(|e| AppError::Internal(format!("failed to encode lexicon: {e}")))?;
     out["lexicon_json"] = lexicon_json;
@@ -191,7 +198,7 @@ pub(super) async fn delete_lexicon(
     let backend = state.db_backend;
     // The same message as the network-lexicon route: the file is the source of
     // truth, so a delete here would be undone at the next boot.
-    if state.config.declares_network_lexicon(&id) {
+    if crate::project::deploy::declares_network_lexicon(&state, &id) {
         return Err(AppError::Conflict(format!(
             "'{id}' is declared in happyview.toml; remove it from the file instead"
         )));

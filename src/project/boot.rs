@@ -6,6 +6,7 @@ use crate::AppState;
 
 use super::build::{BuildOptions, build_snapshot, install};
 use super::diagnostic::{self, Diagnostic};
+use super::snapshot::ProjectSnapshot;
 
 /// What a boot-time build installed.
 pub struct Installed {
@@ -44,6 +45,12 @@ pub async fn start(
         super::prepare::spawn_rebuild_on_interpreter_change(state.clone());
     }
     built
+}
+
+/// The install lock, for a caller that has to do more between building and
+/// installing than `build_and_install` does: a deploy also stores the bundle.
+pub(crate) async fn install_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    INSTALL.lock().await
 }
 
 /// Build the project at `root` and serve it. On failure nothing is installed
@@ -126,6 +133,27 @@ pub async fn shadow_warnings(state: &AppState) -> Vec<Diagnostic> {
 pub async fn start_declared_backfills(state: &AppState) -> Vec<String> {
     let snapshot = state.project.load_full();
     let mut started = Vec::new();
+    for collection in declared_backfills(state, &snapshot).await {
+        match state
+            .start_automatic_backfill(collection.clone(), "happyview.toml")
+            .await
+        {
+            Ok(Some(_)) => started.push(collection),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                collection = %collection,
+                error = %e,
+                "failed to start the declared backfill"
+            ),
+        }
+    }
+    started
+}
+
+/// The collections `snapshot` declares a backfill for that would start one:
+/// what `start_declared_backfills` acts on, and what a dry-run deploy reports.
+pub async fn declared_backfills(state: &AppState, snapshot: &ProjectSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
     for lexicon in snapshot.lexicons.values() {
         // An unindexed collection is never ingested, so a backfill would
         // fill a table nothing reads.
@@ -136,23 +164,11 @@ pub async fn start_declared_backfills(state: &AppState) -> Vec<String> {
             continue;
         }
         let collection = &lexicon.parsed.id;
-        if state.source.has_backfill(collection).await {
-            continue;
-        }
-        match state
-            .start_automatic_backfill(collection.clone(), "happyview.toml")
-            .await
-        {
-            Ok(Some(_)) => started.push(collection.clone()),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                collection = %collection,
-                error = %e,
-                "failed to start the declared backfill"
-            ),
+        if !state.source.has_backfill(collection).await {
+            out.push(collection.clone());
         }
     }
-    started
+    out
 }
 
 #[cfg(test)]
