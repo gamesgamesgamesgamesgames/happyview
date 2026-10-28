@@ -19,7 +19,7 @@ use super::permissions::Permission;
 pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
-/// (`require_domain_access`, `is_platform`). Deliberately tiny.
+/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately tiny.
 const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
 
 #[derive(Clone)]
@@ -40,13 +40,31 @@ impl UserAuth {
         self.is_super || self.permissions.contains(&permission)
     }
 
-    /// Domain management: the platform principal, or anyone holding
+    /// Reading domains: the platform principal, or anyone holding
     /// `settings:manage`. Kept separate from `require` so the platform principal
     /// can manage domains without receiving `settings:manage`, which covers far
     /// more than domains.
-    pub async fn require_domain_access(&self) -> Result<(), AppError> {
+    pub async fn require_domain_read(&self) -> Result<(), AppError> {
         if self.is_platform {
             return Ok(());
+        }
+        self.require(Permission::SettingsManage).await
+    }
+
+    /// Adding, removing or promoting a domain. On a platform-managed instance
+    /// the platform decides which hostnames reach it and which one is its
+    /// public URL, so only the platform principal may: a domain added here
+    /// would be one the platform never routes, and a primary set here one it
+    /// never adopts. Anywhere else, the same as reading.
+    pub async fn require_domain_write(&self, platform_managed: bool) -> Result<(), AppError> {
+        if self.is_platform {
+            return Ok(());
+        }
+        if platform_managed {
+            self.log_permission_denied("platform").await;
+            return Err(AppError::Forbidden(
+                "this instance's domains are managed by its hosting platform".into(),
+            ));
         }
         self.require(Permission::SettingsManage).await
     }

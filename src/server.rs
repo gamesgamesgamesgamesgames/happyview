@@ -316,7 +316,7 @@ async fn config_endpoint(
         "app_name": app_name,
         // Whether a managed-hosting platform administers this instance, so the
         // dashboard can say so.
-        "platform_managed": state.config.platform_api_key_hash.is_some(),
+        "platform_managed": state.config.platform_managed(),
         "logo_url": logo_url,
         // The key hpy signs in with; see `auth::cli_client`.
         "cli_client_key": crate::auth::cli_client::CLIENT_KEY,

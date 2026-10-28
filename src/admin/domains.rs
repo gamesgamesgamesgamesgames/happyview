@@ -26,7 +26,7 @@ pub(super) async fn list(
     State(state): State<AppState>,
     AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<Vec<DomainResponse>>, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_read().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains ORDER BY created_at",
@@ -59,7 +59,8 @@ pub(super) async fn create(
     AllowPlatform(auth): AllowPlatform,
     Json(body): Json<CreateDomainBody>,
 ) -> Result<(StatusCode, Json<DomainResponse>), AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
     let url = body.url.trim_end_matches('/').to_string();
 
@@ -231,7 +232,8 @@ pub(super) async fn delete(
     AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
@@ -307,7 +309,8 @@ pub(super) async fn set_primary(
     AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
