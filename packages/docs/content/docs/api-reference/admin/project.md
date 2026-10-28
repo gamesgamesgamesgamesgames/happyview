@@ -79,7 +79,7 @@ curl -X PUT "http://localhost:3000/admin/project?dry_run=true" \
 
 A backfill starts only for a record lexicon declared with `[lexicons."<nsid>"] backfill = true`, only if it is indexed, and only if its collection has never been backfilled on this instance, which is the rule `HAPPYVIEW_PROJECT` follows at boot. `project:deploy` is enough to start it.
 
-`[instance]`, `[dev]`, `[jetstream]`, `[interpreters]`, `[libraries]` and `[happyview] version` configure the instance rather than the project. A deploy ignores them and says so in `warnings`.
+`[instance]`, `[dev]` and `[jetstream]` configure the instance rather than the project. A deploy ignores them and says so in `warnings`. `[interpreters]`, `[libraries]` and `[happyview] version` are ignored without a warning: the plugins have to be installed before the deploy, and the deploying client checks the version.
 
 ### Errors
 

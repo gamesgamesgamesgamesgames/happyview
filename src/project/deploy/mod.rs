@@ -101,7 +101,6 @@ pub async fn deploy(
         return Err(DeployError::TooLarge);
     }
     let sha256 = hex::encode(Sha256::digest(&request.bundle));
-    let staged = unpack(request.bundle.clone()).await?;
 
     let turn = boot::install_turn().await;
     let current = store::current(&state.db, state.db_backend)
@@ -113,6 +112,7 @@ pub async fn deploy(
             return Err(DeployError::PreconditionFailed(current.map(|d| d.sha256)));
         }
     }
+    let staged = unpack(request.bundle.clone()).await?;
 
     let report = build_snapshot(state, staged.path(), BuildOptions::default())
         .await
@@ -320,6 +320,9 @@ fn etag_value(header: &str) -> &str {
 
 /// The tables a deployed project may not set: they configure the instance
 /// rather than the project, and on a hosted one belong to its operator.
+/// `[interpreters]`, `[libraries]` and `[happyview] version` are ignored
+/// too, silently: the deploying client installs the plugins and checks the
+/// version itself, and every project names them.
 fn ignored_sections(config: &ProjectConfig) -> Vec<Diagnostic> {
     let mut ignored = Vec::new();
     if config.instance != Default::default() {
@@ -330,15 +333,6 @@ fn ignored_sections(config: &ProjectConfig) -> Vec<Diagnostic> {
     }
     if config.jetstream != Default::default() {
         ignored.push("[jetstream]");
-    }
-    if config.happyview.version.is_some() {
-        ignored.push("[happyview] version");
-    }
-    if !config.interpreters.is_empty() {
-        ignored.push("[interpreters]");
-    }
-    if !config.libraries.is_empty() {
-        ignored.push("[libraries]");
     }
     ignored
         .into_iter()
@@ -379,7 +373,7 @@ mod tests {
     #[test]
     fn instance_tables_are_named_as_ignored() {
         let config: ProjectConfig = toml::from_str(
-            "[happyview]\nversion = \"3.0.0\"\n[instance]\napp_name = \"x\"\n[lexicons.\"com.example.thing\"]\nbackfill = true\n",
+            "[happyview]\nversion = \"3.0.0\"\n[instance]\napp_name = \"x\"\n[jetstream]\ncompression = true\n[lexicons.\"com.example.thing\"]\nbackfill = true\n",
         )
         .unwrap();
         let found: Vec<String> = ignored_sections(&config)
@@ -393,7 +387,7 @@ mod tests {
                 .all(|w| w.starts_with("happyview.toml: warning: "))
         );
         assert!(found.iter().any(|w| w.contains("[instance]")));
-        assert!(found.iter().any(|w| w.contains("[happyview] version")));
+        assert!(found.iter().any(|w| w.contains("[jetstream]")));
     }
 
     #[test]
