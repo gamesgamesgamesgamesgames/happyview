@@ -38,8 +38,30 @@ pub fn attach<S: Clone + Send + Sync + 'static>(router: Router<S>, config: &Conf
 /// file of its own, best first: the parent's `_/index.html` (the shell Next.js
 /// exports for a dynamic route), then the root `index.html`. Both sources call
 /// this so they cannot disagree about the order.
+///
+/// A route's payload (`index.txt` and the `__next.*.txt` segment files beside
+/// its `index.html`) stands in only for the same file under the parent's `_`.
+/// The client router fetches it on every client-side navigation and reloads
+/// the whole page when the answer is not a payload, so an HTML fallback here
+/// turns every link to an id the export never saw into a full reload. For an
+/// id with a dot in it, an NSID, the router asks for `<id>.txt` rather than
+/// `<id>/index.txt`, since it reads the last segment as a file name.
 fn spa_fallbacks(path: &str) -> Vec<String> {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if let Some((file, dirs)) = segments.split_last()
+        && let Some(route) = file.strip_suffix(".txt")
+    {
+        if route == "index" || route.starts_with("__next.") {
+            return match dirs.split_last() {
+                Some((_, parent)) => vec![[parent, &["_", file]].concat().join("/")],
+                None => Vec::new(),
+            };
+        }
+        return vec![
+            [dirs, &[route, "index.txt"]].concat().join("/"),
+            [dirs, &["_", "index.txt"]].concat().join("/"),
+        ];
+    }
     let mut candidates = Vec::with_capacity(2);
     if segments.len() >= 2 {
         candidates.push(format!(
@@ -64,21 +86,22 @@ fn dir_fallback<S: Clone + Send + Sync + 'static>(
         async move {
             for rel in spa_fallbacks(req.uri().path()) {
                 if let Ok(body) = tokio::fs::read(format!("{dir}/{rel}")).await {
+                    let mime = mime_guess::from_path(&rel).first_or_octet_stream();
                     return Ok::<_, Infallible>(
                         axum::http::Response::builder()
-                            .header("content-type", "text/html; charset=utf-8")
+                            .header("content-type", mime.as_ref())
                             .body(Full::new(Bytes::from(body)))
                             .unwrap(),
                     );
                 }
             }
             Ok(axum::http::Response::builder()
-                .header("content-type", "text/html; charset=utf-8")
+                .status(axum::http::StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::new()))
                 .unwrap())
         }
     });
-    router.fallback_service(ServeDir::new(&static_dir).not_found_service(spa_fallback))
+    router.fallback_service(ServeDir::new(&static_dir).fallback(spa_fallback))
 }
 
 /// What the release build exports `NEXT_PUBLIC_BASE_PATH` as. The served copy
@@ -288,6 +311,44 @@ mod tests {
         assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "root");
     }
 
+    /// The same as the embedded copy: a payload under an unknown id is the
+    /// shell's payload, and a payload with no shell is a 404, never HTML.
+    #[tokio::test]
+    async fn dir_source_serves_the_dynamic_route_payload() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "root").unwrap();
+        std::fs::create_dir_all(dir.path().join("dashboard/records/_")).unwrap();
+        std::fs::write(dir.path().join("dashboard/records/_/index.txt"), "payload").unwrap();
+
+        let app = dir_fallback(
+            axum::Router::<()>::new(),
+            dir.path().to_str().unwrap().to_string(),
+        );
+        let get = |uri: &'static str| {
+            app.clone()
+                .oneshot(axum::http::Request::get(uri).body(Body::empty()).unwrap())
+        };
+        let res = get("/dashboard/records/abc/index.txt").await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(
+            res.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes(),
+            "payload"
+        );
+
+        let res = get("/nowhere/at/all/index.txt").await.unwrap();
+        assert_eq!(res.status(), 404);
+    }
+
     use std::borrow::Cow;
     use std::collections::HashMap;
 
@@ -307,6 +368,7 @@ mod tests {
             ),
             ("dashboard/index.html", b"dash".as_slice()),
             ("dashboard/records/_/index.html", b"shell".as_slice()),
+            ("dashboard/records/_/index.txt", b"payload".as_slice()),
             (
                 "_next/static/app.js",
                 b"fetch(\"/__HAPPYVIEW_BP__/admin\")".as_slice(),
@@ -367,6 +429,54 @@ mod tests {
         );
         assert_eq!(spa_fallbacks("/nowhere"), ["index.html"]);
         assert_eq!(spa_fallbacks("/"), ["index.html"]);
+    }
+
+    /// A client-side navigation reads the route's payload, never its HTML, so
+    /// an id the export never saw has to get the shell's payload under the
+    /// same file name, and nothing that is HTML.
+    #[test]
+    fn a_payload_under_an_unknown_id_falls_back_to_the_shell_payload() {
+        assert_eq!(
+            spa_fallbacks("/dashboard/settings/plugins/happyview.jobs/index.txt"),
+            ["dashboard/settings/plugins/_/index.txt"]
+        );
+        assert_eq!(
+            spa_fallbacks(
+                "/dashboard/settings/plugins/happyview.jobs/__next.dashboard.settings.plugins.$d$id.__PAGE__.txt"
+            ),
+            ["dashboard/settings/plugins/_/__next.dashboard.settings.plugins.$d$id.__PAGE__.txt"]
+        );
+        assert!(spa_fallbacks("/index.txt").is_empty());
+    }
+
+    /// The router asks for `<id>.txt` instead of `<id>/index.txt` when the id
+    /// has a dot in it, as an NSID does, because it reads the last segment as
+    /// a file name and adds no trailing slash.
+    #[test]
+    fn a_dotted_ids_payload_falls_back_to_the_shell_payload() {
+        assert_eq!(
+            spa_fallbacks("/dashboard/lexicons/app.bsky.feed.post.txt"),
+            [
+                "dashboard/lexicons/app.bsky.feed.post/index.txt",
+                "dashboard/lexicons/_/index.txt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_the_shell_payload_as_a_payload() {
+        let d = EmbeddedDashboard::new(export(), None);
+        let res = d.respond("/dashboard/records/abc/index.txt");
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/plain");
+        assert_eq!(body(res).await, "payload");
+
+        let res = d.respond("/dashboard/records/app.bsky.feed.post.txt");
+        assert_eq!(res.status(), 200);
+        assert_eq!(body(res).await, "payload");
+
+        let res = d.respond("/nowhere/at/all/index.txt");
+        assert_eq!(res.status(), 404);
     }
 
     #[tokio::test]
