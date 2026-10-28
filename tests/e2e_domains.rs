@@ -203,6 +203,59 @@ async fn domains_duplicate_url_returns_400() {
 
 #[tokio::test]
 #[serial]
+async fn domains_create_stores_the_host_lowercased() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": "HTTP://App.Example.COM:9999/" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["url"], "http://app.example.com:9999");
+    assert!(
+        domain_rows(&app)
+            .await
+            .iter()
+            .any(|(_, url, _)| url == "http://app.example.com:9999"),
+        "the stored row is lowercased"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn domains_create_refuses_a_case_variant_of_an_existing_domain() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+    seed_domain(&app, "other-id", "http://app.example.com:9999", false).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": "http://APP.example.com:9999" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
 async fn domains_cannot_delete_primary() {
     common::require_db!();
     let app = TestApp::new().await;
