@@ -60,6 +60,7 @@ export default defineConfig({
         "plugin-registry-lifecycle.spec.ts",
         "lexicon-publishing.spec.ts",
         "plugin-readme-highlighting.spec.ts",
+        "dynamic-route-navigation.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
