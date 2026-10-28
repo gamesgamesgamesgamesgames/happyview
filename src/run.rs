@@ -632,9 +632,12 @@ async fn boot(
     // Seed and load domain cache
     let domain_cache = crate::domain::DomainCache::new();
     {
-        crate::domain::sync_primary(&db_pool, db_backend, &config.public_url)
-            .await
-            .expect("Failed to sync the primary domain with PUBLIC_URL");
+        // Not fatal: booting with the domains as they are beats a crash loop,
+        // and they can be fixed through the admin API once the instance is up.
+        if let Err(e) = crate::domain::sync_primary(&db_pool, db_backend, &config.public_url).await
+        {
+            tracing::error!(error = %e, public_url = %config.public_url, "failed to sync the primary domain with PUBLIC_URL");
+        }
 
         let select_sql = crate::db::adapt_sql(
             "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains",
