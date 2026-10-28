@@ -8,6 +8,7 @@ use sqlx::AnyPool;
 use tracing::{error, info};
 
 use super::Config;
+use super::project::ProjectConfig;
 use crate::admin::auth::{SuperadminSeed, ensure_configured_superadmin};
 use crate::catalog::LexiconCatalog;
 use crate::db::DatabaseBackend;
@@ -68,7 +69,43 @@ async fn apply_with<T, Fut>(
     let Some(project) = config.project.as_deref() else {
         return;
     };
+    declare_with(project, db, backend, lexicons, track).await;
+}
 
+/// The project's `[labels]` and `[network_lexicons]` as rows, for a project
+/// that arrives after boot: a deployed one. Same steps, same idempotence.
+pub async fn apply_project_declarations(
+    project: &ProjectConfig,
+    plc_url: &str,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    http: &reqwest::Client,
+    lexicons: &LexiconCatalog,
+) {
+    declare_with(project, db, backend, lexicons, |nsid| async move {
+        crate::admin::network_lexicons::track_network_lexicon(
+            http, plc_url, db, backend, lexicons, &nsid, None, false, None,
+        )
+        .await
+    })
+    .await;
+}
+
+async fn declare_with<T, Fut>(
+    project: &ProjectConfig,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    lexicons: &LexiconCatalog,
+    track: T,
+) where
+    T: Fn(String) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::admin::network_lexicons::TrackedNetworkLexicon,
+                crate::error::AppError,
+            >,
+        >,
+{
     match crate::labeler::ensure_declared_subscriptions(db, backend, &project.labels.subscribe)
         .await
     {

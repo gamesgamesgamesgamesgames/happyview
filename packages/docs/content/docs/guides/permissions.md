@@ -133,6 +133,14 @@ HappyView defines 51 permissions organized by category:
 
 Revoking an invite uses `linked-repos:create` rather than `linked-repos:delete`, because minting and revoking are one lifecycle. `linked-repos:delete` is reserved for destroying a grant and the OAuth session behind it. See [Linked Repos](./linked-repos.md).
 
+### Project
+
+| Permission       | Description                                                                                     |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| `project:deploy` | Replace the instance's project with a deployed bundle and start the backfills it declares       |
+
+It also covers reading what is deployed. A deploy can add, change and remove every lexicon and script the project owns, so it is as strong as `lexicons:create`, `lexicons:delete` and `scripts:manage` together, plus `backfill:create` for the backfills a project declares. See [Project](../api-reference/admin/project.md).
+
 ### System
 
 | Permission   | Description                              |
@@ -159,13 +167,13 @@ Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`, `dead-letters:man
 
 ### Manager
 
-Everything in Operator, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces.
+Everything in Operator, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces, and to deploy the project.
 
-Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
+Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`, `project:deploy`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
 
 ### Full Access
 
-All 51 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 52 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 

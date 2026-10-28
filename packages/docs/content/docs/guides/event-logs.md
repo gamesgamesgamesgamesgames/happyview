@@ -18,6 +18,14 @@ Events follow a `category.action` naming convention. Each event has a severity l
 
 Logged when lexicons are uploaded, updated, or deleted via the [admin API](../api-reference/admin/lexicons.md). The `actor_did` is the user who performed the action.
 
+### Project events
+
+| Event Type         | Severity | Subject               | Detail                   |
+| ------------------ | -------- | --------------------- | ------------------------ |
+| `project.deployed` | info     | The bundle's sha256   | `changes`, `backfills`   |
+
+Logged when a project is deployed through [`PUT /admin/project`](../api-reference/admin/project.md). A dry run logs nothing. `changes` and `backfills` are the ones the deploy answered with.
+
 ### Record events
 
 | Event Type       | Severity | Subject       | Detail                                |

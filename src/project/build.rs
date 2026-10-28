@@ -466,28 +466,42 @@ fn body_text(body: &ScriptBody) -> &str {
 /// rebuild prints.
 pub fn changes(old: &ProjectSnapshot, new: &ProjectSnapshot) -> Vec<String> {
     let mut out = Vec::new();
-    diff(&mut out, "lexicon", &old.lexicons, &new.lexicons, |a, b| {
-        a.path == b.path
-            && a.backfill == b.backfill
-            && a.parsed.raw == b.parsed.raw
-            && a.parsed.target_collection == b.parsed.target_collection
-            && a.parsed.action == b.parsed.action
-            && a.parsed.token_cost == b.parsed.token_cost
-    });
-    diff(&mut out, "script", &old.scripts, &new.scripts, |a, b| {
-        a.path == b.path
-            && a.language_id == b.language_id
-            && body_text(&a.body) == body_text(&b.body)
-            && a.description == b.description
-            && a.outbound_xrpcs == b.outbound_xrpcs
-    });
-    diff(&mut out, "module", &old.modules, &new.modules, |a, b| {
-        a.path == b.path && a.source == b.source
-    });
+    diff(
+        &mut out,
+        "lexicon",
+        &old.lexicons,
+        &new.lexicons,
+        same_lexicon,
+    );
+    diff(&mut out, "script", &old.scripts, &new.scripts, same_script);
+    diff(&mut out, "module", &old.modules, &new.modules, same_module);
     diff(&mut out, "test", &old.tests, &new.tests, |a, b| {
         body_text(&a.body) == body_text(&b.body)
     });
     out
+}
+
+/// Whether a lexicon would serve the same in two builds. Shared with the
+/// deploy report, so the two cannot disagree about what changed.
+pub(crate) fn same_lexicon(a: &ProjectLexicon, b: &ProjectLexicon) -> bool {
+    a.path == b.path
+        && a.backfill == b.backfill
+        && a.parsed.raw == b.parsed.raw
+        && a.parsed.target_collection == b.parsed.target_collection
+        && a.parsed.action == b.parsed.action
+        && a.parsed.token_cost == b.parsed.token_cost
+}
+
+pub(crate) fn same_script(a: &ProjectScript, b: &ProjectScript) -> bool {
+    a.path == b.path
+        && a.language_id == b.language_id
+        && body_text(&a.body) == body_text(&b.body)
+        && a.description == b.description
+        && a.outbound_xrpcs == b.outbound_xrpcs
+}
+
+pub(crate) fn same_module(a: &ProjectModule, b: &ProjectModule) -> bool {
+    a.path == b.path && a.source == b.source
 }
 
 fn diff<V>(

@@ -18,6 +18,7 @@ pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
 mod plugins;
+mod project;
 mod proxy_config;
 mod records;
 mod script_variables;
@@ -85,6 +86,14 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route(
             "/lexicon-publishing/unpublish",
             post(lexicon_publishing::unpublish),
+        )
+        .route(
+            "/project",
+            put(project::put_project).get(project::get_project).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::project::deploy::bundle::MAX_COMPRESSED_BYTES,
+                ),
+            ),
         )
         .route("/stats", get(stats::stats))
         .route("/stats/counts", get(stats::counts))
