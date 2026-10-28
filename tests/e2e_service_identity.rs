@@ -2343,7 +2343,8 @@ async fn seed_super_user(app: &TestApp, did: &str) {
         .expect("seed super user");
 }
 
-/// A service-auth JWT addressed to THIS instance authenticates on an admin route.
+/// A service-auth JWT addressed to THIS instance and bound to the admin method
+/// authenticates on an admin route.
 #[tokio::test]
 #[serial]
 async fn service_auth_correct_aud_accepted_on_admin_route() {
@@ -2355,9 +2356,18 @@ async fn service_auth_correct_aud_accepted_on_admin_route() {
     let issuer = "did:plc:h6-good-issuer";
     seed_super_user(&app, issuer).await;
 
-    let exp = chrono::Utc::now().timestamp() as u64 + 60;
     let auth = app
-        .raw_service_auth_jwt(&plc_store, issuer, &format!("{instance_did}#appview"), exp)
+        .custom_service_auth_jwt(
+            &plc_store,
+            issuer,
+            json!({"alg": "ES256"}),
+            json!({
+                "iss": issuer,
+                "aud": format!("{instance_did}#appview"),
+                "exp": chrono::Utc::now().timestamp() as u64 + 60,
+                "lxm": happyview::auth::admin_scope::ADMIN_LXM,
+            }),
+        )
         .await;
 
     let resp = app

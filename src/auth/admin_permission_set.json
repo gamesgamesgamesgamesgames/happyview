@@ -1,0 +1,19 @@
+{
+  "lexicon": 1,
+  "id": "dev.happyview.adminFull",
+  "defs": {
+    "main": {
+      "type": "permission-set",
+      "title": "Manage your HappyView instances",
+      "detail": "Deploy projects, install plugins and change settings on any HappyView instance where you are an admin, with the permissions you hold there.",
+      "permissions": [
+        {
+          "type": "permission",
+          "resource": "rpc",
+          "lxm": ["dev.happyview.admin.manage"],
+          "aud": "*"
+        }
+      ]
+    }
+  }
+}

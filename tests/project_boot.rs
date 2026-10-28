@@ -134,13 +134,22 @@ async fn a_project_that_builds_is_applied_at_boot() {
             .fetch_one(db)
             .await
             .ok();
-            if jobs == Some((1,)) && labelers == Some((1,)) {
+            // Seeded by the same boot, which no TestApp runs.
+            let hpy: Option<(i64,)> =
+                sqlx::query_as("SELECT COUNT(*) FROM happyview_api_clients WHERE client_key = ?")
+                    .bind(happyview::auth::cli_client::CLIENT_KEY)
+                    .fetch_one(db)
+                    .await
+                    .ok();
+            if jobs == Some((1,)) && labelers == Some((1,)) && hpy == Some((1,)) {
                 return;
             }
         }
         if Instant::now() > deadline {
             let stderr = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
-            panic!("the declared backfill and labeler never appeared; the server said:\n{stderr}");
+            panic!(
+                "the declared backfill, the labeler or the hpy client never appeared; the server said:\n{stderr}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

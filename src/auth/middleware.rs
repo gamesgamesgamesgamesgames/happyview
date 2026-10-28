@@ -19,6 +19,9 @@ pub struct Claims {
     client_key: Option<String>,
     /// The DPoP key ID identifying the specific device session.
     dpop_key_id: Option<String>,
+    /// Set when the request authenticated with a service-auth JWT, to the
+    /// method the token is bound to (`None` inside when it names none).
+    service_auth_lxm: Option<Option<String>>,
 }
 
 /// Separator used to encode `did` and `client_key` in a single cookie value.
@@ -34,6 +37,7 @@ impl Claims {
             did: did.to_string(),
             client_key: client_key.map(str::to_string),
             dpop_key_id: dpop_key_id.map(str::to_string),
+            service_auth_lxm: None,
         }
     }
 
@@ -52,12 +56,19 @@ impl Claims {
         self.dpop_key_id.as_deref()
     }
 
+    /// For a request authenticated with a service-auth JWT, the method the
+    /// token is bound to (`Some(None)` when it names none); `None` otherwise.
+    pub fn service_auth_lxm(&self) -> Option<Option<&str>> {
+        self.service_auth_lxm.as_ref().map(Option::as_deref)
+    }
+
     /// Create claims for an internal call (e.g. Lua xrpc lib) with no client key.
     pub fn internal(did: String) -> Self {
         Self {
             did,
             client_key: None,
             dpop_key_id: None,
+            service_auth_lxm: None,
         }
     }
 
@@ -73,6 +84,7 @@ impl Claims {
             did,
             client_key: Some(client_key),
             dpop_key_id: None,
+            service_auth_lxm: None,
         }
     }
 }
@@ -108,6 +120,7 @@ impl FromRequestParts<AppState> for Claims {
                 did,
                 client_key,
                 dpop_key_id: None,
+                service_auth_lxm: None,
             });
         }
 
@@ -131,6 +144,7 @@ impl FromRequestParts<AppState> for Claims {
                     did,
                     client_key: None,
                     dpop_key_id: None,
+                    service_auth_lxm: None,
                 });
             }
 
@@ -149,6 +163,7 @@ impl FromRequestParts<AppState> for Claims {
                 did: service_claims.did,
                 client_key: None,
                 dpop_key_id: None,
+                service_auth_lxm: Some(service_claims.lxm),
             });
         }
 
@@ -245,7 +260,14 @@ pub async fn resolve_dpop_claims(
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
-    let request_url = format!("{}://{}{}", scheme, host, parts.uri.path());
+    // The client signed the path it sent. Inside a nested router such as
+    // `/admin`, `parts.uri` has the prefix stripped, so read the original.
+    let path = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path())
+        .unwrap_or_else(|| parts.uri.path());
+    let request_url = format!("{}://{}{}", scheme, host, path);
     let method = parts.method.as_str();
 
     // Validate the DPoP proof
@@ -261,6 +283,7 @@ pub async fn resolve_dpop_claims(
         did: session.user_did,
         client_key: Some(client_key.to_string()),
         dpop_key_id: Some(dpop_key_id),
+        service_auth_lxm: None,
     })
 }
 
@@ -298,6 +321,8 @@ fn is_space_route(path: &str) -> bool {
 pub struct ServiceAuthClaims {
     pub did: String,
     pub aud_fragment: String,
+    /// The method the token is bound to, if it names one.
+    pub lxm: Option<String>,
 }
 
 impl FromRequestParts<AppState> for XrpcClaims {
@@ -417,6 +442,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                             did,
                             client_key,
                             dpop_key_id: None,
+                            service_auth_lxm: None,
                         }),
                         space_credential: None,
                         space_audience: None,
@@ -504,5 +530,6 @@ async fn try_parse_service_auth(
     Ok(ServiceAuthClaims {
         did: service_auth.did,
         aud_fragment: fragment,
+        lxm: payload.lxm,
     })
 }

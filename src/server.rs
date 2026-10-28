@@ -318,6 +318,8 @@ async fn config_endpoint(
         // dashboard can say so.
         "platform_managed": state.config.platform_api_key_hash.is_some(),
         "logo_url": logo_url,
+        // The key hpy signs in with; see `auth::cli_client`.
+        "cli_client_key": crate::auth::cli_client::CLIENT_KEY,
         "features": {
             "spaces": spaces_enabled,
         },
