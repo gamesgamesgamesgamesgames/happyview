@@ -23,6 +23,83 @@ impl Domain {
     }
 }
 
+/// Makes `public_url` the primary domain at startup.
+///
+/// With no domains, `public_url` is seeded as the primary. When the primary
+/// differs from `public_url` and a domain with that URL already exists, that
+/// domain becomes the primary; renaming the old primary to it instead would
+/// break the URL's uniqueness. Only when no such domain exists is the primary
+/// renamed to `public_url`.
+pub async fn sync_primary(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    public_url: &str,
+) -> Result<(), sqlx::Error> {
+    use crate::db::{adapt_sql, now_rfc3339, query, query_as};
+
+    let now = now_rfc3339();
+    let mut tx = crate::db::begin_write(db, backend).await?;
+    let rows: Vec<(String, String, i32)> = query_as(&adapt_sql(
+        "SELECT id, url, is_primary FROM happyview_domains",
+        backend,
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if rows.is_empty() {
+        query(&adapt_sql(
+            "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+            backend,
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(public_url)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tracing::info!("Seeded primary domain: {public_url}");
+        return tx.commit().await;
+    }
+
+    let Some((primary_id, primary_url, _)) = rows.iter().find(|(_, _, p)| *p != 0) else {
+        return tx.commit().await;
+    };
+    if primary_url == public_url {
+        return tx.commit().await;
+    }
+
+    if let Some((id, _, _)) = rows.iter().find(|(_, url, _)| url == public_url) {
+        query(&adapt_sql(
+            "UPDATE happyview_domains SET is_primary = 0, updated_at = ? WHERE is_primary = 1",
+            backend,
+        ))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        query(&adapt_sql(
+            "UPDATE happyview_domains SET is_primary = 1, updated_at = ? WHERE id = ?",
+            backend,
+        ))
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tracing::info!("Made {public_url} the primary domain in place of {primary_url}");
+    } else {
+        query(&adapt_sql(
+            "UPDATE happyview_domains SET url = ?, updated_at = ? WHERE id = ?",
+            backend,
+        ))
+        .bind(public_url)
+        .bind(&now)
+        .bind(primary_id)
+        .execute(&mut *tx)
+        .await?;
+        tracing::info!("Updated primary domain URL from {primary_url} to {public_url}");
+    }
+    tx.commit().await
+}
+
 #[derive(Clone)]
 pub struct DomainCache {
     by_host: Arc<RwLock<HashMap<String, Arc<Domain>>>>,

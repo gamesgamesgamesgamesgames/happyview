@@ -710,3 +710,104 @@ async fn domains_set_primary_leaves_exactly_one_primary() {
             .unwrap();
     assert_eq!(rows, vec![("b".to_string(),)]);
 }
+
+// ---------------------------------------------------------------------------
+// Startup sync with PUBLIC_URL
+// ---------------------------------------------------------------------------
+
+async fn domain_rows(app: &TestApp) -> Vec<(String, String, bool)> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT id, url, is_primary FROM happyview_domains ORDER BY url",
+        app.state.db_backend,
+    );
+    let rows: Vec<(String, String, i32)> = happyview::db::query_as(&sql)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap();
+    rows.into_iter()
+        .map(|(id, url, primary)| (id, url, primary != 0))
+        .collect()
+}
+
+async fn sync(app: &TestApp, public_url: &str) {
+    happyview::domain::sync_primary(&app.state.db, app.state.db_backend, public_url)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_seeds_public_url_when_there_are_no_domains() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    sync(&app, "https://a.example.com").await;
+
+    let rows = domain_rows(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "https://a.example.com");
+    assert!(rows[0].2);
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_makes_an_existing_public_url_domain_primary() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    // The primary was moved to app.example.com, but PUBLIC_URL still names
+    // the old domain, which is still listed. Renaming the primary to it would
+    // break the URL's uniqueness and stop the instance from starting.
+    seed_domain(&app, "old", "https://a.example.com", false).await;
+    seed_domain(&app, "new", "https://app.example.com", true).await;
+
+    sync(&app, "https://a.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("old".into(), "https://a.example.com".into(), true),
+            ("new".into(), "https://app.example.com".into(), false),
+        ]
+    );
+    // A second start changes nothing.
+    sync(&app, "https://a.example.com").await;
+    assert_eq!(domain_rows(&app).await.iter().filter(|r| r.2).count(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_renames_the_primary_when_public_url_is_not_listed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    seed_domain(&app, "primary", "https://a.example.com", true).await;
+    seed_domain(&app, "other", "https://b.example.com", false).await;
+
+    sync(&app, "https://c.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("other".into(), "https://b.example.com".into(), false),
+            ("primary".into(), "https://c.example.com".into(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_leaves_a_matching_primary_alone() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    seed_domain(&app, "primary", "https://a.example.com", true).await;
+    seed_domain(&app, "other", "https://b.example.com", false).await;
+
+    sync(&app, "https://a.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("primary".into(), "https://a.example.com".into(), true),
+            ("other".into(), "https://b.example.com".into(), false),
+        ]
+    );
+}
