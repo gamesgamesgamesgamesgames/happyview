@@ -83,6 +83,10 @@ async fn status_reports_backend_and_vacuum_state() {
         body["checkpoint_interval_secs"].is_u64(),
         "checkpoint_interval_secs missing: {body}"
     );
+    assert!(
+        body["wal_checkpoint_bytes"].is_u64(),
+        "wal_checkpoint_bytes missing: {body}"
+    );
 
     // `disk`/`feasibility` are only meaningful for a file-backed SQLite
     // database (`disk::report` returns `None` for any other backend, which

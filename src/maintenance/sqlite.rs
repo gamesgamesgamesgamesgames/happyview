@@ -20,6 +20,21 @@ use crate::db::DatabaseBackend;
 /// `SQLITE_CHECKPOINT_INTERVAL_SECS` says otherwise.
 pub const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 
+/// WAL size past which the task checkpoints without waiting for the timer,
+/// unless `SQLITE_WAL_CHECKPOINT_BYTES` says otherwise. The timer bounds the
+/// WAL by time only: a backfill writing tens of megabytes a second fills it
+/// by gigabytes between two ticks.
+pub const DEFAULT_WAL_CHECKPOINT_BYTES: u64 = 64 << 20;
+
+/// How often the task reads the WAL's size. A `stat`, so cheap.
+pub const WAL_SIZE_POLL: Duration = Duration::from_secs(1);
+
+/// The longest the size check waits after busy checkpoints, in polls. Each
+/// busy wait can hold off writers for [`CHECKPOINT_BUSY_TIMEOUT_MS`], so this
+/// trades at most a tenth of ingest, only while the WAL is over its limit,
+/// against the WAL growing for a whole timed interval.
+pub const SIZE_BACKOFF_MAX_POLLS: u32 = 10;
+
 /// Consecutive busy checkpoints after which the task warns, once per streak.
 pub const BUSY_WARN_AFTER: u32 = 10;
 
@@ -32,9 +47,11 @@ pub const CHECKPOINT_BUSY_TIMEOUT_MS: u64 = 1000;
 /// Quick retries for a checkpoint that came back busy without waiting.
 /// SQLite never waits on the checkpoint lock, so a TRUNCATE that collides
 /// with a writer's own PASSIVE autocheckpoint reports busy at once. That
-/// collision clears in milliseconds, and without a retry it costs a whole
-/// interval of WAL growth.
-pub const LOCK_COLLISION_RETRIES: u32 = 5;
+/// collision clears once the autocheckpoint has copied its frames, and
+/// without a retry it costs a whole interval of WAL growth. Under sustained
+/// writes a collision was seen to outlast ten retries, so this allows half a
+/// second.
+pub const LOCK_COLLISION_RETRIES: u32 = 25;
 
 /// Pause between those retries.
 pub const LOCK_COLLISION_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -73,6 +90,36 @@ pub fn checkpoint_interval_secs() -> u64 {
     parse_checkpoint_interval_secs(
         crate::config::vars::var("SQLITE_CHECKPOINT_INTERVAL_SECS").as_deref(),
     )
+}
+
+/// Checkpoint whenever the WAL file at `path` passes `max_bytes`, checking
+/// every `poll`.
+#[derive(Debug, Clone)]
+pub struct WalLimit {
+    pub path: std::path::PathBuf,
+    pub max_bytes: u64,
+    pub poll: Duration,
+}
+
+/// Parse `SQLITE_WAL_CHECKPOINT_BYTES`. `0` turns the size check off;
+/// anything unparseable falls back to the default.
+pub fn parse_wal_checkpoint_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WAL_CHECKPOINT_BYTES)
+}
+
+/// The size check for the database at `database_url`, or `None` when it is
+/// turned off or the database has no file (Postgres, in-memory SQLite).
+pub fn wal_limit(database_url: &str) -> Option<WalLimit> {
+    let max_bytes = parse_wal_checkpoint_bytes(
+        crate::config::vars::var("SQLITE_WAL_CHECKPOINT_BYTES").as_deref(),
+    );
+    let path = crate::db::sqlite_path_from_url(database_url)?;
+    (max_bytes > 0).then(|| WalLimit {
+        path: crate::maintenance::disk::wal_path_for(&path),
+        max_bytes,
+        poll: WAL_SIZE_POLL,
+    })
 }
 
 /// Run one `PRAGMA wal_checkpoint(TRUNCATE)` on a pooled connection.
@@ -317,7 +364,8 @@ where
     }
 }
 
-async fn run_checkpoint(pool: &AnyPool, busy: &mut BusyTracker) {
+/// Returns whether the checkpoint came back busy; an error counts as busy.
+async fn run_checkpoint(pool: &AnyPool, busy: &mut BusyTracker) -> bool {
     match retry_lock_collisions(|| checkpoint_truncate(pool)).await {
         Ok(outcome) => {
             if outcome.busy {
@@ -333,8 +381,51 @@ async fn run_checkpoint(pool: &AnyPool, busy: &mut BusyTracker) {
                      long-running readers are keeping the write-ahead log from shrinking"
                 );
             }
+            outcome.busy
         }
-        Err(e) => tracing::warn!(error = %e, "WAL checkpoint failed"),
+        Err(e) => {
+            tracing::warn!(error = %e, "WAL checkpoint failed");
+            true
+        }
+    }
+}
+
+/// When the size check may next checkpoint. A busy TRUNCATE holds off writers
+/// for up to [`CHECKPOINT_BUSY_TIMEOUT_MS`], so against a reader that keeps
+/// it busy, retrying every poll would stall ingest; each busy result doubles
+/// the wait instead, up to `cap`, and a checkpoint that empties the WAL
+/// resets it. A sustained writer alone makes many checkpoints busy, so the
+/// cap stays short: a long one lets the WAL grow by time again.
+#[derive(Debug)]
+struct SizeBackoff {
+    poll: Duration,
+    cap: Duration,
+    wait: Duration,
+    not_before: Option<tokio::time::Instant>,
+}
+
+impl SizeBackoff {
+    fn new(poll: Duration, cap: Duration) -> Self {
+        Self {
+            poll,
+            cap: cap.max(poll),
+            wait: poll,
+            not_before: None,
+        }
+    }
+
+    fn ready(&self, now: tokio::time::Instant) -> bool {
+        self.not_before.is_none_or(|at| now >= at)
+    }
+
+    fn observe(&mut self, busy: bool, now: tokio::time::Instant) {
+        if busy {
+            self.not_before = Some(now + self.wait);
+            self.wait = (self.wait * 2).min(self.cap);
+        } else {
+            self.wait = self.poll;
+            self.not_before = None;
+        }
     }
 }
 
@@ -349,12 +440,30 @@ async fn next_tick(tick: Option<&mut tokio::time::Interval>) {
 }
 
 /// The maintenance loop. A no-op on Postgres. `checkpoint_every` of `None`
-/// disables checkpoints but keeps the daily optimize.
-pub async fn run(pool: AnyPool, backend: DatabaseBackend, checkpoint_every: Option<Duration>) {
+/// disables the timed checkpoint and `wal_limit` of `None` the size check;
+/// the daily optimize runs either way.
+pub async fn run(
+    pool: AnyPool,
+    backend: DatabaseBackend,
+    checkpoint_every: Option<Duration>,
+    wal_limit: Option<WalLimit>,
+) {
     if backend != DatabaseBackend::Sqlite {
         return;
     }
     let mut busy = BusyTracker::default();
+    let mut size_tick = wal_limit.as_ref().map(|limit| {
+        let mut tick = tokio::time::interval(limit.poll);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick
+    });
+    let mut backoff = wal_limit.as_ref().map(|limit| {
+        let cap = limit.poll * SIZE_BACKOFF_MAX_POLLS;
+        SizeBackoff::new(
+            limit.poll,
+            checkpoint_every.map_or(cap, |every| cap.min(every)),
+        )
+    });
     let mut checkpoint_tick = checkpoint_every.map(|every| {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -370,7 +479,21 @@ pub async fn run(pool: AnyPool, backend: DatabaseBackend, checkpoint_every: Opti
 
     loop {
         tokio::select! {
-            _ = next_tick(checkpoint_tick.as_mut()) => run_checkpoint(&pool, &mut busy).await,
+            _ = next_tick(checkpoint_tick.as_mut()) => {
+                let was_busy = run_checkpoint(&pool, &mut busy).await;
+                if let Some(backoff) = backoff.as_mut() {
+                    backoff.observe(was_busy, tokio::time::Instant::now());
+                }
+            }
+            _ = next_tick(size_tick.as_mut()) => {
+                if let (Some(limit), Some(backoff)) = (wal_limit.as_ref(), backoff.as_mut())
+                    && backoff.ready(tokio::time::Instant::now())
+                    && std::fs::metadata(&limit.path).is_ok_and(|m| m.len() > limit.max_bytes)
+                {
+                    let was_busy = run_checkpoint(&pool, &mut busy).await;
+                    backoff.observe(was_busy, tokio::time::Instant::now());
+                }
+            }
             _ = optimize_tick.tick() => {
                 if let Err(e) = crate::db::sqlite_optimize(&pool).await {
                     tracing::warn!(error = %e, "daily PRAGMA optimize failed");
@@ -399,6 +522,51 @@ mod tests {
         assert_eq!(parse_checkpoint_interval_secs(Some("banana")), 60);
         assert_eq!(parse_checkpoint_interval_secs(Some("15")), 15);
         assert_eq!(parse_checkpoint_interval_secs(Some("0")), 0, "0 disables");
+    }
+
+    #[test]
+    fn wal_checkpoint_bytes_defaults_to_64_mib() {
+        assert_eq!(parse_wal_checkpoint_bytes(None), 64 * MIB);
+        assert_eq!(parse_wal_checkpoint_bytes(Some("banana")), 64 * MIB);
+        assert_eq!(parse_wal_checkpoint_bytes(Some(" 1048576 ")), MIB);
+        assert_eq!(parse_wal_checkpoint_bytes(Some("0")), 0, "0 disables");
+    }
+
+    #[test]
+    fn a_database_without_a_file_has_no_size_check() {
+        assert!(wal_limit("sqlite::memory:").is_none());
+        assert!(wal_limit("postgres://localhost/happyview").is_none());
+        let limit = wal_limit("sqlite:///data/happyview.db?mode=rwc").expect("a file");
+        assert_eq!(limit.path, PathBuf::from("/data/happyview.db-wal"));
+    }
+
+    #[test]
+    fn a_busy_size_checkpoint_backs_off_to_the_cap_and_a_success_resets_it() {
+        let poll = Duration::from_secs(1);
+        let mut backoff = SizeBackoff::new(poll, Duration::from_secs(5));
+        let start = tokio::time::Instant::now();
+        assert!(backoff.ready(start));
+
+        let mut waits = Vec::new();
+        let mut now = start;
+        for _ in 0..5 {
+            backoff.observe(true, now);
+            let at = backoff.not_before.expect("busy sets a wait");
+            assert!(!backoff.ready(at - Duration::from_millis(1)));
+            assert!(backoff.ready(at));
+            waits.push((at - now).as_secs());
+            now = at;
+        }
+        assert_eq!(waits, [1, 2, 4, 5, 5]);
+
+        backoff.observe(false, now);
+        assert!(backoff.ready(now));
+        backoff.observe(true, now);
+        assert_eq!(
+            backoff.not_before,
+            Some(now + poll),
+            "a success resets the wait"
+        );
     }
 
     #[test]
@@ -514,7 +682,10 @@ mod tests {
     /// Overlapping readers are what stopped the WAL on the managed tenant
     /// from ever rewinding: SQLite's own PASSIVE checkpoints can copy frames
     /// back but cannot restart the log while a reader holds a snapshot in it.
-    async fn wal_peak_under_load(checkpoint_every: Option<Duration>) -> (u64, u32) {
+    async fn wal_peak_under_load(
+        checkpoint_every: Option<Duration>,
+        wal_limit: Option<(u64, Duration)>,
+    ) -> (u64, u32) {
         let path = std::env::temp_dir().join(format!("hv-wal-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = crate::db::connect(&url, DatabaseBackend::Sqlite).await;
@@ -523,8 +694,19 @@ mod tests {
             .await
             .expect("create table");
 
-        let maintenance = checkpoint_every
-            .map(|every| tokio::spawn(run(pool.clone(), DatabaseBackend::Sqlite, Some(every))));
+        let wal_limit = wal_limit.map(|(max_bytes, poll)| WalLimit {
+            path: crate::maintenance::disk::wal_path_for(&path),
+            max_bytes,
+            poll,
+        });
+        let maintenance = (checkpoint_every.is_some() || wal_limit.is_some()).then(|| {
+            tokio::spawn(run(
+                pool.clone(),
+                DatabaseBackend::Sqlite,
+                checkpoint_every,
+                wal_limit,
+            ))
+        });
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut readers = Vec::new();
@@ -582,9 +764,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn the_checkpoint_task_bounds_the_wal_under_concurrent_readers() {
-        let (unchecked, unchecked_truncations) = wal_peak_under_load(None).await;
+        let (unchecked, unchecked_truncations) = wal_peak_under_load(None, None).await;
         let (checked, checked_truncations) =
-            wal_peak_under_load(Some(Duration::from_millis(50))).await;
+            wal_peak_under_load(Some(Duration::from_millis(50)), None).await;
         assert!(
             unchecked > 16 * MIB,
             "without the task the WAL should grow with the writes (peak {unchecked} bytes)"
@@ -601,6 +783,29 @@ mod tests {
             checked < unchecked / 2,
             "with the task the WAL should stay well under the unchecked peak \
              (checked {checked}, unchecked {unchecked} bytes)"
+        );
+    }
+
+    /// The timed checkpoint bounds the WAL by time, so a fast writer fills it
+    /// by gigabytes between two ticks. The size check bounds it by bytes:
+    /// here the timed checkpoint is the production minute away and never
+    /// fires. The load puts about 100 MiB through the WAL, all of which it
+    /// holds without the check. With it the WAL overshoots the 2 MiB limit by what
+    /// is written while a checkpoint waits (up to a second), so the bound is
+    /// a quarter of the load rather than the limit itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn the_size_check_bounds_the_wal_between_timed_checkpoints() {
+        let minute = Some(Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS));
+        let (peak, truncations) =
+            wal_peak_under_load(minute, Some((2 * MIB, Duration::from_millis(10)))).await;
+        assert!(
+            truncations >= 5,
+            "the size check should truncate the WAL repeatedly ({truncations} times, peak {peak} bytes)"
+        );
+        assert!(
+            peak < 24 * MIB,
+            "the WAL should stay near the 2 MiB limit, not grow with the writes (peak {peak} bytes)"
         );
     }
 
