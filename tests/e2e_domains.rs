@@ -864,3 +864,100 @@ async fn sync_primary_leaves_a_matching_primary_alone() {
         ]
     );
 }
+
+/// What a hosting platform does to move an instance to a new public URL:
+/// promote a listed domain with its key, then restart the instance with that
+/// domain as `PUBLIC_URL`. The promotion carries the domain's own client and
+/// signing kid to the primary, and the restart's sync finds the primary
+/// already matching: nothing is renamed and both domains are kept.
+#[tokio::test]
+#[serial]
+async fn a_platform_promotion_survives_the_restart_that_follows_it() {
+    common::require_db!();
+    const PLATFORM_KEY: &str = "hv_0123456789abcdef0123456789abcdef";
+    let mut app = TestApp::new().await;
+    app.state.config.platform_api_key_hash = Some(hex::encode(
+        <sha2::Sha256 as sha2::Digest>::digest(PLATFORM_KEY.as_bytes()),
+    ));
+    let instance_key = happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        None,
+    )
+    .await
+    .expect("ensure instance key");
+    app.state.client_jwks =
+        vec![happyview::oauth::client_keys::to_atrium_jwk(&instance_key).expect("atrium jwk")];
+    app.rebuild_router();
+
+    let old_url = "http://127.0.0.1:0";
+    seed_domain(&app, "slug", old_url, true).await;
+
+    let platform = |method: Method, uri: String, body: Option<Value>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {PLATFORM_KEY}"));
+        match body {
+            Some(b) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    };
+
+    let new_url = "https://custom.e2e-domains-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(platform(
+            Method::POST,
+            "/admin/domains".into(),
+            Some(json!({ "url": new_url })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let new_id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let domain_client = app.state.oauth.get_for_domain(new_url);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(platform(
+            Method::POST,
+            format!("/admin/domains/{new_id}/primary"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (primary_client, kid) = app.state.oauth.primary_client_and_kid();
+    assert!(
+        std::sync::Arc::ptr_eq(&primary_client, &domain_client),
+        "the promoted domain's own client must become the primary one"
+    );
+    assert_eq!(kid.as_deref(), Some(instance_key.kid.as_str()));
+
+    let promoted = vec![
+        ("slug".to_string(), old_url.to_string(), false),
+        (new_id.clone(), new_url.to_string(), true),
+    ];
+    assert_eq!(domain_rows(&app).await, promoted);
+
+    // The restart, with PUBLIC_URL now naming the promoted domain.
+    sync(&app, new_url).await;
+    assert_eq!(
+        domain_rows(&app).await,
+        promoted,
+        "the boot sync after a promotion must change nothing"
+    );
+}
