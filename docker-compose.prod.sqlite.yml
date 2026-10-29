@@ -66,6 +66,9 @@ services:
       # Seconds between wal_checkpoint(TRUNCATE) runs, which empty the WAL.
       # 0 disables them.
       SQLITE_CHECKPOINT_INTERVAL_SECS: ${SQLITE_CHECKPOINT_INTERVAL_SECS:-60}
+      # Checkpoint as soon as the WAL passes this many bytes, without waiting
+      # for the interval. 0 disables it. Default 64 MiB.
+      SQLITE_WAL_CHECKPOINT_BYTES: ${SQLITE_WAL_CHECKPOINT_BYTES:-67108864}
 
       # --- Identity / networking ----------------------------------------
       PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL to the public HTTPS URL, e.g. https://happyview.example.com}
