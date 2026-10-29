@@ -668,3 +668,124 @@ async fn the_jetstream_status_needs_stats_read() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// A `settings:manage` key, made by the seeded super admin.
+async fn settings_key(app: &TestApp) -> String {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method(Method::POST)
+                .uri("/admin/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "name": "settings",
+                        "permissions": ["settings:manage"],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    json_body(resp).await["key"].as_str().unwrap().to_string()
+}
+
+/// On a platform-managed instance the platform's list of domains is the one
+/// that counts, so nobody else may change it: not a `settings:manage` key and
+/// not the super user. Reading is unchanged.
+#[tokio::test]
+#[serial]
+async fn only_the_platform_changes_domains_on_a_platform_managed_instance() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    seed_domain(&app, "d1", "http://127.0.0.1:0", true).await;
+    seed_domain(&app, "d2", "https://two.example.com", false).await;
+    let key = settings_key(&app).await;
+
+    let send = |request: Request<Body>| {
+        let router = app.router.clone();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    let cookie_request = |method: Method, uri: &str, body: Option<Value>| {
+        let builder = app.authed_request().method(method).uri(uri);
+        match body {
+            Some(b) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    };
+
+    assert_eq!(
+        send(bearer(Method::GET, "/admin/domains", &key, None)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(cookie_request(Method::GET, "/admin/domains", None)).await,
+        StatusCode::OK
+    );
+
+    let add = json!({ "url": "https://three.example.com" });
+    for (label, status) in [
+        (
+            "key add",
+            send(bearer(Method::POST, "/admin/domains", &key, Some(&add))).await,
+        ),
+        (
+            "key primary",
+            send(bearer(
+                Method::POST,
+                "/admin/domains/d2/primary",
+                &key,
+                None,
+            ))
+            .await,
+        ),
+        (
+            "key delete",
+            send(bearer(Method::DELETE, "/admin/domains/d2", &key, None)).await,
+        ),
+        (
+            "super add",
+            send(cookie_request(
+                Method::POST,
+                "/admin/domains",
+                Some(add.clone()),
+            ))
+            .await,
+        ),
+        (
+            "super primary",
+            send(cookie_request(
+                Method::POST,
+                "/admin/domains/d2/primary",
+                None,
+            ))
+            .await,
+        ),
+        (
+            "super delete",
+            send(cookie_request(Method::DELETE, "/admin/domains/d2", None)).await,
+        ),
+    ] {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+    }
+
+    let rows: Vec<(String, i32)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT id, is_primary FROM happyview_domains ORDER BY id",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [("d1".to_string(), 1), ("d2".to_string(), 0)],
+        "a refused write changed the domains"
+    );
+}

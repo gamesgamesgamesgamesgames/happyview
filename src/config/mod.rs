@@ -343,6 +343,12 @@ impl Config {
             .is_some_and(|p| p.declares_network_lexicon(nsid))
     }
 
+    /// Whether a managed-hosting platform administers this instance, which
+    /// is what configuring its key means.
+    pub fn platform_managed(&self) -> bool {
+        self.platform_api_key_hash.is_some()
+    }
+
     pub fn from_env() -> Self {
         let database_url = var("DATABASE_URL").expect("DATABASE_URL must be set");
         let database_backend = var("DATABASE_BACKEND")
