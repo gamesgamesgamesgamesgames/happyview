@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   dismissTelemetryPrompt,
+  getTelemetry,
   updateTelemetry,
   type TelemetrySettings,
 } from "@/lib/api";
@@ -39,6 +40,36 @@ const OPTIONS = [
 export function SetupTelemetry({ onNext }: { onNext: () => void }) {
   const [mode, setMode] = useState<TelemetrySettings["mode"]>("off");
   const [saving, setSaving] = useState(false);
+  const [managed, setManaged] = useState(false);
+
+  useEffect(() => {
+    getTelemetry()
+      .then((settings) => setManaged(settings.managed))
+      .catch(() => {
+        // Unknown reads as unmanaged: the question is then asked, and a
+        // managed instance refuses the answer without blocking setup.
+      });
+  }, []);
+
+  if (managed) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Daily reports are on</CardTitle>
+          <CardDescription>
+            This instance&apos;s hosting platform requires a daily report about
+            how the instance is doing: how much data it holds, which features
+            are used, and where it is struggling. It never includes records,
+            handles, DIDs, contact details, or the contents of anything you have
+            indexed. You can read the exact payload under Settings → Telemetry.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex justify-end">
+          <Button onClick={onNext}>Continue</Button>
+        </CardContent>
+      </Card>
+    );
+  }
 
   async function submit() {
     setSaving(true);

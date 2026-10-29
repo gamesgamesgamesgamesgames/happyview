@@ -172,6 +172,9 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertSettingBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
 
     put_setting(&state.db, &key, &body.value, state.db_backend)
@@ -202,6 +205,9 @@ pub(super) async fn delete(
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
 
     let backend = state.db_backend;
     let sql = adapt_sql(
