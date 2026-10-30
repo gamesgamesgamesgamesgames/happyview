@@ -621,6 +621,26 @@ pub struct PluginExecutor {
     /// tests under `tests/`) have no full `AppState` to give it and don't
     /// exercise that import.
     app_state: Option<crate::AppState>,
+    /// The linkers every instance is made with, built once: host functions
+    /// reach a run's state only through the store's data, so one linker
+    /// serves every store. Shared by the executor's clones.
+    linkers: Arc<SharedLinkers>,
+}
+
+/// One linker without WASI preview 1 and one with it, each built on first
+/// use. Building one registers every host function, which profiled at about
+/// a fifth of a record hook's CPU when it was done per instance.
+#[derive(Default)]
+struct SharedLinkers {
+    env: std::sync::OnceLock<Arc<Linker<PluginState>>>,
+    wasi: std::sync::OnceLock<Arc<Linker<PluginState>>>,
+}
+
+/// Whether `module` imports WASI preview 1.
+fn imports_wasi(module: &wasmtime::Module) -> bool {
+    module
+        .imports()
+        .any(|import| import.module() == capabilities::WASI_MODULE)
 }
 
 /// Guest time a test file may spend outside the triggers it fires. Each
@@ -670,6 +690,7 @@ impl PluginExecutor {
             lexicons,
             encryption_key: None,
             app_state: None,
+            linkers: Arc::default(),
         }
     }
 
@@ -1227,22 +1248,45 @@ impl PluginExecutor {
 
     /// The host functions, plus preview 1 only when the module's import
     /// section names it, so a `wasm32-unknown-unknown` plugin's linker
-    /// defines nothing but `env`.
+    /// defines nothing but `env`. A test that adds to its own linker builds
+    /// one; instances share [`Self::linker_for`]'s.
+    #[cfg(test)]
     fn build_linker(
         &self,
         module: &wasmtime::Module,
     ) -> Result<Linker<PluginState>, ExecutionError> {
+        self.new_linker(imports_wasi(module))
+    }
+
+    fn new_linker(&self, wasi: bool) -> Result<Linker<PluginState>, ExecutionError> {
         let mut linker = Linker::new(self.runtime.engine());
         register_host_functions(&mut linker)
             .map_err(|e| ExecutionError::Instantiation(e.into()))?;
-        if module
-            .imports()
-            .any(|import| import.module() == capabilities::WASI_MODULE)
-        {
+        if wasi {
             wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state| &mut state.wasi)
                 .map_err(|e| ExecutionError::Instantiation(e.into()))?;
         }
         Ok(linker)
+    }
+
+    /// [`Self::build_linker`]'s linker for `module`, built once per kind and
+    /// shared by every instance after.
+    fn linker_for(
+        &self,
+        module: &wasmtime::Module,
+    ) -> Result<Arc<Linker<PluginState>>, ExecutionError> {
+        let wasi = imports_wasi(module);
+        let cell = if wasi {
+            &self.linkers.wasi
+        } else {
+            &self.linkers.env
+        };
+        if let Some(linker) = cell.get() {
+            return Ok(Arc::clone(linker));
+        }
+        let built = Arc::new(self.new_linker(wasi)?);
+        // A racing first use may have set it meanwhile; either is the same.
+        Ok(Arc::clone(cell.get_or_init(|| built)))
     }
 
     /// The store state for one instance of `plugin`.
@@ -1335,7 +1379,7 @@ impl PluginExecutor {
             .await
             .map_err(ExecutionError::Instantiation)?;
 
-        let linker = self.build_linker(&module)?;
+        let linker = self.linker_for(&module)?;
         let state = self.build_state(plugin, scope, secrets, config).await?;
 
         let mut store = Store::new(self.runtime.engine(), state);
@@ -2453,6 +2497,56 @@ mod interpreter {
 
     fn run_input(source: &str) -> ScriptExecuteInput {
         serde_json::from_value(directive(source)).unwrap()
+    }
+
+    /// Instances share one linker, and each still sees only its own store:
+    /// two runs in flight at once, through the same linker, each get back
+    /// the input written into their own instance.
+    #[tokio::test]
+    async fn runs_sharing_a_linker_each_see_only_their_own_store() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, _, current) = superseded().await;
+        let module = executor.runtime.module_for(&current).await.unwrap();
+        assert!(
+            Arc::ptr_eq(
+                &executor.linker_for(&module).unwrap(),
+                &executor.linker_for(&module).unwrap()
+            ),
+            "the linker is built once"
+        );
+        let mut first = run_input("echo the first run");
+        first.input = serde_json::json!({"run": "first"});
+        let mut second = run_input("echo the second run");
+        second.input = serde_json::json!({"run": "second"});
+
+        let run = |input| {
+            let executor = executor.clone();
+            let current = Arc::clone(&current);
+            async move {
+                match executor
+                    .execute_loaded(
+                        &current,
+                        &input,
+                        None,
+                        ModuleScope::Dashboard,
+                        RunOptions::default(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    ScriptExecuteOutput::Returned { value, .. } => value,
+                    other => panic!("expected the input echoed, got {other:?}"),
+                }
+            }
+        };
+        let (a, b) = tokio::join!(run(first), run(second));
+
+        assert_eq!(a["input"], serde_json::json!({"run": "first"}));
+        assert_eq!(a["source"], "echo the first run");
+        assert_eq!(b["input"], serde_json::json!({"run": "second"}));
+        assert_eq!(b["source"], "echo the second run");
     }
 
     /// The same bytes registered twice stamp alike, so only identity tells
