@@ -920,3 +920,194 @@ async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
     assert_eq!(row["cid"], body["cid"]);
     assert_eq!(row["record"]["name"], "Tetris");
 }
+
+// ---------------------------------------------------------------------------
+// Lexicon validation of a script's own XRPC calls
+// ---------------------------------------------------------------------------
+
+const VALIDATED_QUERY: &str = "com.example.validate.localProbe";
+const VALIDATED_PROCEDURE: &str = "com.example.validate.localSubmit";
+
+/// A query and a procedure with constraints to break, each bound to the echo
+/// fixture so a call that gets through answers with what reached the script.
+/// The routes' checks are pinned constraint by constraint in
+/// `xrpc_validation.rs`; these pin that a script calling them meets the same.
+async fn seed_validated_methods(app: &TestApp) {
+    for lexicon in [
+        json!({
+            "lexicon": 1,
+            "id": VALIDATED_QUERY,
+            "defs": { "main": {
+                "type": "query",
+                "parameters": {
+                    "type": "params",
+                    "required": ["q"],
+                    "properties": {
+                        "q": { "type": "string", "maxLength": 5 },
+                        "tags": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "output": { "encoding": "application/json" }
+            } }
+        }),
+        json!({
+            "lexicon": 1,
+            "id": VALIDATED_PROCEDURE,
+            "defs": { "main": {
+                "type": "procedure",
+                "parameters": {
+                    "type": "params",
+                    "properties": { "limit": { "type": "integer", "maximum": 10 } }
+                },
+                "input": {
+                    "encoding": "application/json",
+                    "schema": {
+                        "type": "object",
+                        "required": ["text"],
+                        "properties": { "text": { "type": "string", "maxLength": 5 } }
+                    }
+                },
+                "output": { "encoding": "application/json" }
+            } }
+        }),
+    ] {
+        let (status, body) = app
+            .post_json_status("/admin/lexicons", json!({ "lexicon_json": lexicon }))
+            .await;
+        assert!(status < 300, "failed to seed a lexicon: {status} {body}");
+    }
+    seed_script(app, &format!("xrpc.query:{VALIDATED_QUERY}"), "echo").await;
+    seed_script(
+        app,
+        &format!("xrpc.procedure:{VALIDATED_PROCEDURE}"),
+        "echo",
+    )
+    .await;
+}
+
+async fn local_query(app: &TestApp, params: Value) -> Result<Value, String> {
+    app.state
+        .plugin_executor()
+        .call_library(
+            "sdk_caller",
+            "xrpc_query",
+            &[json!({ "method": VALIDATED_QUERY, "params": params })],
+            &LibraryCallContext::default(),
+            0,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_query_breaking_its_lexicon_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_validated_methods(&app).await;
+
+    let err = local_query(&app, json!({ "tags": ["a"] }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("InvalidRequest: Params must have the property \"q\""),
+        "{err}"
+    );
+    let err = local_query(&app, json!({ "q": "toolong" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("InvalidRequest: Params/q must not be longer than 5 characters"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_query_keeping_to_its_lexicon_reaches_the_script() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_validated_methods(&app).await;
+
+    let echoed = local_query(&app, json!({ "q": "hi", "tags": "solo" }))
+        .await
+        .unwrap();
+    assert_eq!(echoed["input"]["q"], "hi");
+    assert_eq!(echoed["input"]["tags"], json!(["solo"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_procedure_breaking_its_lexicon_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    seed_validated_methods(&app).await;
+
+    const DID: &str = "did:plc:sdkcallervalidator";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+
+    for (spec, expected) in [
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "note": "no text" } }),
+            "InvalidRequest: Input must have the property",
+        ),
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "toolong" } }),
+            "InvalidRequest: Input/text must not be longer than 5 characters",
+        ),
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "hi" }, "params": { "limit": 11 } }),
+            "InvalidRequest: Params/limit can not be greater than 10",
+        ),
+    ] {
+        let resp = dpop_post(
+            &app,
+            &format!("/xrpc/{CREATE_GAME}"),
+            &call("xrpc_procedure", spec),
+            &client_key,
+            &dpop_key,
+            &access_token,
+        )
+        .await;
+        let body = response_json(resp).await;
+        let message = body["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("XRPC_ERROR"), "{message}");
+        assert!(message.contains(expected), "{expected} in {message}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_procedure_keeping_to_its_lexicon_reaches_the_script() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    seed_validated_methods(&app).await;
+
+    const DID: &str = "did:plc:sdkcallervalidated";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &call(
+            "xrpc_procedure",
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "hi" }, "params": { "limit": 3 } }),
+        ),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["input"]["text"], "hi");
+}
