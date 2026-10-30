@@ -16,7 +16,7 @@ use crate::auth::Claims;
 use crate::error::AppError;
 
 use happyview_plugin_sdk::wire::{
-    CallerAccount, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
+    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
     CallerXrpcProcedure, CallerXrpcQuery, RecordRef,
 };
 
@@ -31,6 +31,9 @@ pub enum CallerError {
     Auth(String),
     #[error("{0}")]
     WritableRepo(String),
+    /// There is a session, but not one this call may act with.
+    #[error("{0}")]
+    NoSession(String),
     #[error("PDS returned {status}: {body}")]
     Pds { status: u16, body: String },
     #[error("XRPC returned {status}: {body}")]
@@ -49,6 +52,7 @@ impl CallerError {
         match self {
             Self::Auth(_) => "AUTH_REQUIRED",
             Self::WritableRepo(_) => "WRITABLE_REPO",
+            Self::NoSession(_) => "NO_SESSION",
             Self::Pds { .. } => "PDS_ERROR",
             Self::Xrpc { .. } => "XRPC_ERROR",
             Self::Validation(_) => "BAD_INPUT",
@@ -311,14 +315,45 @@ pub async fn upload_blob(
     .map_err(pds_failure)
 }
 
-/// The caller's account as their PDS reports it. Only the DID, handle and
-/// email fields are passed on, so whatever else a PDS adds to `getSession`
-/// never reaches a plugin. A PDS that names a different account is refused
-/// rather than believed.
+/// The caller's account as their PDS reports it: the DID and handle, and
+/// nothing else `getSession` returns. The email address has its own import
+/// and capability, [`get_email`].
 pub async fn get_session(
     caller: &CallerSession,
     _spec: Value,
 ) -> Result<CallerAccount, CallerError> {
+    let body = own_session(caller).await?;
+    Ok(CallerAccount {
+        did: caller.did.clone(),
+        handle: session_text(&body, "handle"),
+    })
+}
+
+/// The caller's email address and whether it is confirmed, as their PDS
+/// reports it. Behind `caller:email` rather than `caller:read`, so a plugin
+/// that starts reading it has a capability to declare and a new consent to
+/// ask for.
+pub async fn get_email(caller: &CallerSession, _spec: Value) -> Result<CallerEmail, CallerError> {
+    let body = own_session(caller).await?;
+    Ok(email_from_session(&body))
+}
+
+/// `com.atproto.server.getSession` as the caller, checked against the account
+/// the session belongs to.
+///
+/// A service-auth caller is refused. Its token proves who it is acting for,
+/// but it carries no credentials of its own, so the runner lends it the
+/// user's own sign-in to this instance. Writes have long worked that way, but
+/// the user never handed that sign-in to the calling service, and their
+/// account details aren't the service's to read through it.
+async fn own_session(caller: &CallerSession) -> Result<Value, CallerError> {
+    if caller.claims.service_auth_lxm().is_some() {
+        return Err(CallerError::NoSession(
+            "a service-auth caller's account can't be read: the session it runs with is \
+             the user's own sign-in to this instance, not one the calling service holds"
+                .into(),
+        ));
+    }
     let response = caller
         .pds_auth
         .get_with_headers(
@@ -345,39 +380,41 @@ pub async fn get_session(
         status: status.as_u16(),
         body: format!("getSession answered with something that isn't JSON: {e}"),
     })?;
-    account_from_session(&caller.did, &body)
+    check_session_did(&caller.did, &body)?;
+    Ok(body)
 }
 
-/// The fields of a `getSession` body a plugin may see, checked against the
-/// account the session belongs to.
-fn account_from_session(did: &str, body: &Value) -> Result<CallerAccount, CallerError> {
-    let text = |key: &str| {
-        body.get(key)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    match text("did") {
-        Some(reported) if reported == did => {}
-        other => {
-            return Err(CallerError::Pds {
-                status: 200,
-                body: format!(
-                    "getSession named {} rather than the caller, {did}",
-                    other.as_deref().unwrap_or("no account")
-                ),
-            });
-        }
+/// A `getSession` body naming a different account, or none, is refused rather
+/// than believed.
+fn check_session_did(did: &str, body: &Value) -> Result<(), CallerError> {
+    match session_text(body, "did") {
+        Some(reported) if reported == did => Ok(()),
+        other => Err(CallerError::Pds {
+            status: 200,
+            body: format!(
+                "getSession named {} rather than the caller, {did}",
+                other.as_deref().unwrap_or("no account")
+            ),
+        }),
     }
-    let email = text("email");
-    Ok(CallerAccount {
-        did: did.to_string(),
-        handle: text("handle"),
+}
+
+fn session_text(body: &Value, key: &str) -> Option<String> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The address, and its confirmation only alongside one.
+fn email_from_session(body: &Value) -> CallerEmail {
+    let email = session_text(body, "email");
+    CallerEmail {
         email_confirmed: email
             .as_ref()
             .and_then(|_| body.get("emailConfirmed").and_then(Value::as_bool)),
         email,
-    })
+    }
 }
 
 /// Unlike every other `host_caller_*` import, this one runs with no
@@ -726,47 +763,175 @@ mod tests {
         assert_eq!(CallerError::Other("boom".into()).code(), "HOST_ERROR");
     }
 
-    /// Only the account fields pass, the email only with its address, and a
-    /// session naming another account is refused.
+    /// The account and the address are read from the same body but handed
+    /// out separately, the confirmation only alongside an address, and a body
+    /// naming another account, or none, is refused.
     #[test]
-    fn a_session_is_trimmed_to_the_account_fields() {
+    fn a_session_is_split_into_the_account_and_its_email() {
         let full = json!({
             "did": "did:plc:me", "handle": "me.test", "email": "me@example.com",
             "emailConfirmed": true, "emailAuthFactor": false, "active": true,
             "didDoc": {"id": "did:plc:me"},
         });
-        let account = account_from_session("did:plc:me", &full).unwrap();
+        check_session_did("did:plc:me", &full).unwrap();
         assert_eq!(
-            serde_json::to_value(&account).unwrap(),
-            json!({"did": "did:plc:me", "handle": "me.test", "email": "me@example.com", "email_confirmed": true})
+            serde_json::to_value(email_from_session(&full)).unwrap(),
+            json!({"email": "me@example.com", "email_confirmed": true})
         );
 
-        // No transition:email: the PDS leaves the address out.
-        let bare = account_from_session(
-            "did:plc:me",
-            &json!({"did": "did:plc:me", "handle": "me.test"}),
-        )
-        .unwrap();
+        // Neither transition:email nor account:email: the PDS leaves the
+        // address out.
+        let bare = json!({"did": "did:plc:me", "handle": "me.test"});
         assert_eq!(
-            serde_json::to_value(&bare).unwrap(),
-            json!({"did": "did:plc:me", "handle": "me.test"})
+            serde_json::to_value(email_from_session(&bare)).unwrap(),
+            json!({})
         );
         // A confirmation flag with no address means nothing.
-        let flag_only = account_from_session(
-            "did:plc:me",
-            &json!({"did": "did:plc:me", "email": "", "emailConfirmed": true}),
-        )
-        .unwrap();
-        assert_eq!(flag_only.email, None);
-        assert_eq!(flag_only.email_confirmed, None);
+        let flag_only = json!({"did": "did:plc:me", "email": "", "emailConfirmed": true});
+        assert_eq!(email_from_session(&flag_only), CallerEmail::default());
 
-        for body in [
-            json!({"did": "did:plc:other"}),
-            json!({"handle": "me.test"}),
-        ] {
-            let err = account_from_session("did:plc:me", &body).unwrap_err();
+        for body in [json!({"did": "did:plc:other"}), json!({"handle": "me.test"})] {
+            let err = check_session_did("did:plc:me", &body).unwrap_err();
             assert_eq!(err.code(), "PDS_ERROR", "{body}");
         }
+    }
+
+    /// A service-auth caller runs with the user's own sign-in to this
+    /// instance, lent by the runner, so neither its account nor its address is
+    /// read: both are refused before anything reaches a PDS. (The in-process
+    /// PDS would answer `not_served`, a `PDS_ERROR`, had the call got there.)
+    #[tokio::test]
+    async fn a_service_auth_caller_reads_no_account() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "a.test.lua",
+        )));
+        for lxm in [None, Some("app.test.doThing".to_string())] {
+            let caller = CallerSession {
+                did: "did:plc:alice".into(),
+                delegate_did: None,
+                claims: std::sync::Arc::new(Claims::service_auth_for_test(
+                    "did:plc:alice".into(),
+                    lxm,
+                )),
+                pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
+                app_state: state.clone(),
+            };
+            let err = get_session(&caller, json!({})).await.unwrap_err();
+            assert_eq!(err.code(), "NO_SESSION", "{err}");
+            let err = get_email(&caller, json!({})).await.unwrap_err();
+            assert_eq!(err.code(), "NO_SESSION", "{err}");
+        }
+    }
+
+    /// A stub `atrium_oauth` session, as `plugin::host::jobs`'s tests build
+    /// one, whose PDS is the returned mock server: the dashboard's cookie
+    /// path, which acts with `PdsAuth::OAuth` rather than DPoP.
+    async fn cookie_caller(did: &str) -> (CallerSession, wiremock::MockServer) {
+        use atrium_common::store::Store;
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let pds = wiremock::MockServer::start().await;
+        let pds_url = pds.uri();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/oauth-authorization-server",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": pds_url,
+                "authorization_endpoint": format!("{pds_url}/authorize"),
+                "token_endpoint": format!("{pds_url}/token"),
+                "scopes_supported": ["atproto"],
+                "response_types_supported": ["code"],
+            })))
+            .mount(&pds)
+            .await;
+        let dpop_key = crate::oauth::client_keys::generate_client_key("test")
+            .unwrap()
+            .private_jwk;
+        let session: atrium_oauth::store::session::Session = serde_json::from_value(json!({
+            "dpop_key": dpop_key,
+            "token_set": {
+                "iss": pds_url, "sub": did, "aud": pds_url, "scope": null,
+                "refresh_token": null, "access_token": "cookie-access-token",
+                "token_type": "DPoP", "expires_at": null,
+            },
+        }))
+        .unwrap();
+        let store = crate::auth::oauth_store::DbSessionStore::new_with_table(
+            state.db.clone(),
+            state.db_backend,
+            crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+        );
+        let did_value = atrium_api::types::string::Did::new(did.to_string()).unwrap();
+        Store::set(&store, did_value.clone(), session).await.unwrap();
+        let session = state.linked_repos_client.restore(&did_value).await.unwrap();
+        let caller = CallerSession {
+            did: did.to_string(),
+            delegate_did: None,
+            claims: std::sync::Arc::new(Claims::internal(did.to_string())),
+            pds_auth: std::sync::Arc::new(crate::repo::PdsAuth::OAuth(std::sync::Arc::new(
+                session,
+            ))),
+            app_state: state,
+        };
+        (caller, pds)
+    }
+
+    fn get_session_mock(body: Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/xrpc/com.atproto.server.getSession",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+    }
+
+    /// The cookie path reads the same account, and the address only through
+    /// its own call.
+    #[tokio::test]
+    async fn a_cookie_caller_reads_their_account_and_email_apart() {
+        let did = "did:plc:cookiecaller";
+        let (caller, pds) = cookie_caller(did).await;
+        get_session_mock(json!({
+            "did": did, "handle": "cookie.test", "email": "cookie@example.com",
+            "emailConfirmed": true,
+        }))
+        .expect(2)
+        .mount(&pds)
+        .await;
+
+        let account = get_session(&caller, json!({})).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&account).unwrap(),
+            json!({"did": did, "handle": "cookie.test"})
+        );
+        let email = get_email(&caller, json!({})).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&email).unwrap(),
+            json!({"email": "cookie@example.com", "email_confirmed": true})
+        );
+    }
+
+    /// Whatever path the session came by, a reply about someone else hands
+    /// out neither their account nor their address.
+    #[tokio::test]
+    async fn a_session_naming_another_account_is_refused_on_the_cookie_path() {
+        let did = "did:plc:cookiecaller2";
+        let (caller, pds) = cookie_caller(did).await;
+        get_session_mock(json!({
+            "did": "did:plc:someoneelse", "handle": "else.test", "email": "else@example.com",
+        }))
+        .mount(&pds)
+        .await;
+
+        let err = get_session(&caller, json!({})).await.unwrap_err();
+        assert_eq!(err.code(), "PDS_ERROR", "{err}");
+        let err = get_email(&caller, json!({})).await.unwrap_err();
+        assert_eq!(err.code(), "PDS_ERROR", "{err}");
+        assert!(!err.to_string().contains("else@example.com"), "{err}");
     }
 
     /// The refusal message reaches the guest verbatim, so it has to survive

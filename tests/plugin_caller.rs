@@ -43,6 +43,17 @@ fn post_json_with_headers(uri: &str, body: &Value, headers: Vec<(&str, &str)>) -
 
 /// Set up a full DPoP session and return `(client_key, dpop_key, access_token)`.
 async fn setup_dpop_session(app: &TestApp, user_did: &str) -> (String, Value, String) {
+    let (client_key, _secret, dpop_key, access_token) =
+        setup_dpop_session_with_secret(app, user_did).await;
+    (client_key, dpop_key, access_token)
+}
+
+/// [`setup_dpop_session`], also returning the API client's secret, which
+/// registering a second account's session under the same client needs.
+async fn setup_dpop_session_with_secret(
+    app: &TestApp,
+    user_did: &str,
+) -> (String, String, Value, String) {
     let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
 
     let key_req = post_json_with_headers(
@@ -78,7 +89,7 @@ async fn setup_dpop_session(app: &TestApp, user_did: &str) -> (String, Value, St
     let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
     assert_eq!(session_resp.status(), StatusCode::CREATED);
 
-    (client_key, dpop_key, access_token)
+    (client_key, client_secret, dpop_key, access_token)
 }
 
 /// Build DPoP auth headers for a request.
@@ -358,63 +369,342 @@ async fn blob_upload_errors_carry_the_pds_status() {
     assert!(message.contains("413"), "{message}");
 }
 
-/// The caller's account comes from their own PDS's getSession, as them, and
-/// only the account fields reach the plugin.
-#[tokio::test]
-#[serial]
-async fn get_session_reads_the_callers_pds_account() {
-    common::require_db!();
-    let app = TestApp::new_with_encryption().await;
-    install_caller_fixture(&app).await;
-    seed_procedure_lexicon(&app).await;
-    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
-
-    const DID: &str = "did:plc:sdkcallersession";
-    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
-    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
-    // Ahead of the getSession mock `setup_dpop_session` mounted for session
-    // verification, which answers with the DID alone.
+/// Answer `getSession` at `did`'s mocked PDS, only for the session holding
+/// `access_token`. Mounted ahead of the mock `setup_dpop_session` mounts for
+/// session verification, which answers with the DID alone.
+async fn mount_get_session(
+    app: &TestApp,
+    did: &str,
+    access_token: &str,
+    response: ResponseTemplate,
+    times: u64,
+) {
     Mock::given(method("GET"))
         .and(path(format!(
-            "/pds/{DID}/xrpc/com.atproto.server.getSession"
+            "/pds/{did}/xrpc/com.atproto.server.getSession"
         )))
         .and(header(
             "authorization",
             format!("DPoP {access_token}").as_str(),
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "did": DID,
-            "handle": "session.test",
-            "email": "session@example.com",
-            "emailConfirmed": false,
-            "active": true,
-        })))
+        .respond_with(response)
         .with_priority(1)
-        .expect(1)
+        .expect(times)
         .mount(&app.mock_server)
         .await;
+}
 
+/// A DPoP caller with a procedure script that calls the fixture, whose PDS
+/// is mocked at `/pds/{did}`.
+async fn session_caller(app: &TestApp, did: &str) -> (String, Value, String) {
+    install_caller_fixture(app).await;
+    seed_procedure_lexicon(app).await;
+    seed_script(app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    let session = setup_dpop_session(app, did).await;
+    update_session_pds_url(app, did, &format!("{}/pds/{did}", app.mock_server.uri())).await;
+    session
+}
+
+async fn call_as(
+    app: &TestApp,
+    (client_key, dpop_key, access_token): &(String, Value, String),
+    function: &str,
+) -> (StatusCode, Value) {
     let resp = dpop_post(
-        &app,
+        app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &call("get_session", json!({})),
-        &client_key,
-        &dpop_key,
-        &access_token,
+        &call(function, json!({})),
+        client_key,
+        dpop_key,
+        access_token,
     )
     .await;
     let status = resp.status();
-    let body = response_json(resp).await;
+    (status, response_json(resp).await)
+}
+
+fn full_session(did: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "did": did,
+        "handle": "session.test",
+        "email": "session@example.com",
+        "emailConfirmed": false,
+        "active": true,
+    }))
+}
+
+/// The caller's account comes from their own PDS's getSession, as them, and
+/// only the DID and handle reach a plugin through `caller:read`, even when the
+/// PDS reports the address too.
+#[tokio::test]
+#[serial]
+async fn get_session_reads_the_callers_pds_account() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallersession";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(&app, DID, &session.2, full_session(DID), 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"did": DID, "handle": "session.test"}));
+}
+
+/// The address comes only through `host_caller_get_email`, behind
+/// `caller:email`.
+#[tokio::test]
+#[serial]
+async fn get_email_reads_the_callers_address() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcalleremail";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(&app, DID, &session.2, full_session(DID), 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_email").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({
-            "did": DID,
-            "handle": "session.test",
-            "email": "session@example.com",
-            "email_confirmed": false,
-        })
+        json!({"email": "session@example.com", "email_confirmed": false})
     );
+}
+
+/// A sign-in granted neither `transition:email` nor `account:email` gets no
+/// address from the PDS, and that is an empty answer, not an error.
+#[tokio::test]
+#[serial]
+async fn get_email_is_empty_when_the_pds_withholds_it() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallernoemail";
+    let session = session_caller(&app, DID).await;
+    let withheld = ResponseTemplate::new(200)
+        .set_body_json(json!({"did": DID, "handle": "session.test", "active": true}));
+    mount_get_session(&app, DID, &session.2, withheld, 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({}));
+}
+
+/// A PDS answering about another account is refused by both calls, and
+/// nothing it said reaches the guest.
+#[tokio::test]
+#[serial]
+async fn a_session_naming_another_account_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallerimpostor";
+    let session = session_caller(&app, DID).await;
+    let other = ResponseTemplate::new(200).set_body_json(json!({
+        "did": "did:plc:someoneelse", "handle": "else.test", "email": "else@example.com",
+    }));
+    mount_get_session(&app, DID, &session.2, other, 2).await;
+
+    for function in ["get_session", "get_email"] {
+        let (status, body) = call_as(&app, &session, function).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{function}: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("PDS_ERROR"), "{function}: {message}");
+        assert!(!message.contains("else@example.com"), "{function}: {message}");
+        assert!(!message.contains("else.test"), "{function}: {message}");
+    }
+}
+
+/// A PDS's refusal reaches the guest with its status.
+#[tokio::test]
+#[serial]
+async fn get_session_errors_carry_the_pds_status() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallerpdsdown";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(
+        &app,
+        DID,
+        &session.2,
+        ResponseTemplate::new(503).set_body_string("Unavailable"),
+        2,
+    )
+    .await;
+
+    for function in ["get_session", "get_email"] {
+        let (status, body) = call_as(&app, &session, function).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{function}: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("PDS_ERROR"), "{function}: {message}");
+        assert!(message.contains("503"), "{function}: {message}");
+    }
+}
+
+/// No caller, as for a query, record-event or label script or a job without
+/// `auth`: nothing to read the account with.
+#[tokio::test]
+#[serial]
+async fn account_calls_with_no_session_are_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+
+    for function in ["get_session", "get_email"] {
+        let err = app
+            .state
+            .plugin_executor()
+            .call_library(
+                "sdk_caller",
+                function,
+                &[json!({})],
+                &LibraryCallContext::default(),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("NO_SESSION"), "{function}: {err}");
+    }
+}
+
+/// A plugin that imports the email call without declaring `caller:email`
+/// is refused at load, so an update can't start reading addresses under the
+/// consent an operator gave to `caller:read`.
+#[tokio::test]
+async fn the_email_call_needs_caller_email_declared() {
+    let fixture = std::path::Path::new("tests/fixtures/sdk_caller");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.join("manifest.json")).unwrap())
+            .unwrap();
+    let wasm = std::fs::canonicalize(fixture.join(manifest["wasm_file"].as_str().unwrap()))
+        .expect(
+            "sdk_caller fixture not built. Run: cargo build --manifest-path \
+             tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release",
+        );
+    manifest["wasm_file"] = json!(wasm.to_str().unwrap());
+    manifest["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c != "caller:email");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = loader::load_from_file(dir.path())
+        .await
+        .err()
+        .expect("loading an undeclared email import must fail")
+        .to_string();
+    assert!(err.contains("host_caller_get_email"), "{err}");
+    assert!(err.contains("caller:email"), "{err}");
+}
+
+/// A delegated request acts for another account, but the session it reads is
+/// still the actor's own: the account and address handed out are theirs, and
+/// the delegated account's PDS is never asked.
+#[tokio::test]
+#[serial]
+async fn a_delegated_request_reads_the_actors_account() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const OWNER: &str = "did:plc:sdkcallerowner";
+    const STUDIO: &str = "did:plc:sdkcallerstudio";
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    let (client_key, client_secret, dpop_key, access_token) =
+        setup_dpop_session_with_secret(&app, OWNER).await;
+    update_session_pds_url(&app, OWNER, &format!("{}/pds/{OWNER}", app.mock_server.uri())).await;
+    let (client_key, dpop_key, access_token) = (&client_key, &dpop_key, &access_token);
+    link_account(&app, client_key, &client_secret, dpop_key, access_token, STUDIO).await;
+    update_session_pds_url(&app, STUDIO, &format!("{}/pds/{STUDIO}", app.mock_server.uri())).await;
+    mount_get_session(&app, OWNER, access_token, full_session(OWNER), 2).await;
+    Mock::given(path(format!(
+        "/pds/{STUDIO}/xrpc/com.atproto.server.getSession"
+    )))
+    .respond_with(full_session(STUDIO))
+    .with_priority(1)
+    .expect(0)
+    .mount(&app.mock_server)
+    .await;
+
+    for (function, expected) in [
+        ("get_session", json!({"did": OWNER, "handle": "session.test"})),
+        (
+            "get_email",
+            json!({"email": "session@example.com", "email_confirmed": false}),
+        ),
+    ] {
+        let mut body = call(function, json!({}));
+        body["delegateDid"] = json!(STUDIO);
+        let resp = dpop_post(
+            &app,
+            &format!("/xrpc/{CREATE_GAME}"),
+            &body,
+            client_key,
+            dpop_key,
+            access_token,
+        )
+        .await;
+        let status = resp.status();
+        let body = response_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "{function}: {body}");
+        assert_eq!(body, expected, "{function}");
+    }
+}
+
+/// Register a session for `target_did` under the caller's API client and link
+/// it to the caller, as `tests/e2e_delegation.rs`'s `setup_linked_account`
+/// does.
+async fn link_account(
+    app: &TestApp,
+    client_key: &str,
+    client_secret: &str,
+    dpop_key: &Value,
+    access_token: &str,
+    target_did: &str,
+) {
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", client_key),
+            ("x-client-secret", client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let provision_id = response_json(key_resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.mock_session_verification(target_did, target_did).await;
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": target_did,
+            "access_token": format!("test-target-access-{}", uuid::Uuid::new_v4()),
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![
+            ("x-client-key", client_key),
+            ("x-client-secret", client_secret),
+        ],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    let resp = dpop_post(
+        app,
+        "/xrpc/dev.happyview.delegation.linkAccount",
+        &json!({ "did": target_did }),
+        client_key,
+        dpop_key,
+        access_token,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "linkAccount failed");
 }
 
 #[tokio::test]

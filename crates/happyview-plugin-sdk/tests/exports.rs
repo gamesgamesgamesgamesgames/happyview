@@ -86,6 +86,7 @@ const EXPECTED_CALLER_EXPORTS: &[&str] = &[
 const EXPECTED_CALLER_IMPORTS: &[&str] = &[
     "env::host_caller_create_record",
     "env::host_caller_delete_record",
+    "env::host_caller_get_email",
     "env::host_caller_get_session",
     "env::host_caller_put_record",
     "env::host_caller_upload_blob",

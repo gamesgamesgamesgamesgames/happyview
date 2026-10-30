@@ -55,7 +55,7 @@ pub use envelope::{PluginError, Response};
 pub use types::{
     ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
     AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, Bytes, CallContext, CallInput,
-    CallbackInput, CallerAccount, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete,
+    CallbackInput, CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
     CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, ChunkRole, Condition, ExecuteContext,
     ExecuteInput, ExecuteLimits, ExecuteOutput, ExternalProfile, Filter, ImportRef, IndexDelete,
     IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest, JobShouldStopRequest, JobView,

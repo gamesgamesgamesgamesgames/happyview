@@ -44,6 +44,8 @@ pub enum PluginCapability {
     DatabaseWrite,
     #[serde(rename = "caller:read")]
     CallerRead,
+    #[serde(rename = "caller:email")]
+    CallerEmail,
     #[serde(rename = "caller:write")]
     CallerWrite,
     #[serde(rename = "caller:call")]
@@ -97,6 +99,7 @@ impl PluginCapability {
             DatabaseRead,
             DatabaseWrite,
             CallerRead,
+            CallerEmail,
             CallerWrite,
             CallerCall,
             RecordsWrite,
@@ -132,6 +135,7 @@ impl PluginCapability {
             DatabaseRead => "database:read",
             DatabaseWrite => "database:write",
             CallerRead => "caller:read",
+            CallerEmail => "caller:email",
             CallerWrite => "caller:write",
             CallerCall => "caller:call",
             RecordsWrite => "records:write",
@@ -174,6 +178,7 @@ impl PluginCapability {
             | WasiStdio => Risk::Medium,
             NetworkRequestUnrestricted
             | DatabaseRead
+            | CallerEmail
             | CallerWrite
             | RecordsWrite
             | AttestSign
@@ -217,6 +222,9 @@ impl PluginCapability {
                 "Run arbitrary SQL, including INSERT, UPDATE, DELETE and DROP, against indexed records, labels, lexicons, jobs and space data. This can destroy your index."
             }
             CallerRead => "Read from the AT Protocol network as the user who ran the script.",
+            CallerEmail => {
+                "Read the email address of the user who ran the script, and whether it is confirmed, from their PDS, whenever their sign-in granted this instance access to it."
+            }
             CallerWrite => {
                 "Create, update and delete records in the user's own repository and upload blobs to it."
             }
@@ -366,6 +374,10 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_caller_get_session",
         any_of: &[PluginCapability::CallerRead],
+    },
+    Requirement {
+        import: "host_caller_get_email",
+        any_of: &[PluginCapability::CallerEmail],
     },
     Requirement {
         import: "host_caller_create_record",
@@ -837,6 +849,7 @@ mod tests {
             "host_caller_upload_blob",
             "host_caller_xrpc_query",
             "host_caller_get_session",
+            "host_caller_get_email",
             "host_caller_xrpc_procedure",
             "host_blob_put",
             "host_blob_get",
@@ -927,6 +940,7 @@ mod tests {
         for (import, expected) in [
             ("host_caller_xrpc_query", PluginCapability::CallerRead),
             ("host_caller_get_session", PluginCapability::CallerRead),
+            ("host_caller_get_email", PluginCapability::CallerEmail),
             ("host_caller_create_record", PluginCapability::CallerWrite),
             ("host_caller_put_record", PluginCapability::CallerWrite),
             ("host_caller_delete_record", PluginCapability::CallerWrite),
@@ -1103,6 +1117,27 @@ mod tests {
         assert_eq!(PluginCapability::RecordsWrite.risk(), Risk::High);
         assert!(PluginCapability::CallerRead.risk() < PluginCapability::CallerWrite.risk());
         assert!(PluginCapability::CallerWrite.risk() < PluginCapability::CallerCall.risk());
+    }
+
+    /// The account's email address is personal data `caller:read` never
+    /// covered, so it sits behind its own capability, rated above reading as
+    /// the user, whose consent sentence names it. A plugin that starts reading
+    /// it has a new capability to declare, and so a new consent to ask for.
+    #[test]
+    fn the_callers_email_needs_its_own_consent() {
+        let email = PluginCapability::CallerEmail;
+        assert_eq!(email.risk(), Risk::High);
+        assert!(PluginCapability::CallerRead.risk() < email.risk());
+        assert!(email.description().contains("email address"));
+        assert!(!PluginCapability::CallerRead.description().contains("email"));
+        assert_eq!(
+            requirement_for_import("host_caller_get_email").map(|r| r.any_of),
+            Some(&[PluginCapability::CallerEmail][..])
+        );
+        assert_eq!(
+            requirement_for_import("host_caller_get_session").map(|r| r.any_of),
+            Some(&[PluginCapability::CallerRead][..])
+        );
     }
 
     /// The six AT Protocol/attestation imports: all but signing read the
@@ -1441,6 +1476,7 @@ mod tests {
     fn caller_capabilities_parse_by_their_wire_names() {
         for (name, cap) in [
             ("caller:read", PluginCapability::CallerRead),
+            ("caller:email", PluginCapability::CallerEmail),
             ("caller:write", PluginCapability::CallerWrite),
             ("caller:call", PluginCapability::CallerCall),
             ("records:write", PluginCapability::RecordsWrite),
