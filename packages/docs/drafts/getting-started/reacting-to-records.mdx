@@ -1,0 +1,288 @@
+---
+title: Reacting to records
+description: Run a script whenever a record in one of your collections is created, updated or deleted, and when a labeler labels it.
+type: how-to
+prerequisites:
+  - /docs/getting-started/scripts
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page shows you how to run your own code each time a record in one of your collections changes, or a labeler applies a label to it.
+
+You'll write a record script, watch it run, extend it to handle updates and deletes, and then add a label script. The examples use the `xyz.statusphere.status` collection. Use any record collection your instance indexes.
+
+:::note[You need an interpreter]
+Scripts run in an interpreter plugin. Self-hosted instances ship with no interpreter (install one from the alpha channel); HappyProto-managed instances have Lua preinstalled. See [Languages](/docs/reference/scripts/languages#install-an-interpreter).
+:::
+
+## Pick a collection
+
+A record script is tied to one collection. HappyView only runs record scripts for collections it indexes, so the collection needs a record lexicon on your instance. Check the **Lexicons** page in the dashboard. If the collection isn't there, add its lexicon first.
+
+## Write a create script
+
+1. Open **Scripts** in the dashboard and click **New script**.
+2. Set **Trigger source** to your collection, for example `xyz.statusphere.status`.
+3. Set **Action** to **Record create**. The **Resolved trigger id** shows `record.create:xyz.statusphere.status`.
+4. If more than one interpreter is installed, pick a **Language**.
+5. Replace the body with the script below and click **Create script**.
+
+You can also start from the collection's own page under **Lexicons**, which links to a new script with the trigger filled in.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  log.info("new status", { uri = input.uri, did = input.did })
+
+  -- Return the record so it is indexed as it arrived.
+  return input.record
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import log from "internal.logging";
+
+export default function handle(input, ctx) {
+  log.info("new status", { uri: input.uri, did: input.did });
+
+  // Return the record so it is indexed as it arrived.
+  return input.record;
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import log from "internal.logging";
+
+interface RecordEvent {
+  action: "create" | "update" | "delete";
+  uri: string;
+  did: string;
+  collection: string;
+  rkey: string;
+  record?: Record<string, unknown>;
+}
+
+export default function handle(input: RecordEvent) {
+  log.info("new status", { uri: input.uri, did: input.did });
+
+  // Return the record so it is indexed as it arrived.
+  return input.record;
+}
+```
+
+</TabItem>
+</Tabs>
+
+`input` is the event: `action`, `uri`, `did`, `collection`, `rkey` and `record`. The script runs before the record is indexed, and what it returns decides what gets stored. Returning the record stores it unchanged.
+
+:::caution[Always return something]
+A script that returns nothing tells HappyView to skip the record, so it is never indexed. If your script only has side effects, end it by returning the record.
+:::
+
+## See it run
+
+Create a record in the collection, for example by posting a status from a Statusphere client, or wait for one to arrive from the network.
+
+Then open **Event Logs** in the dashboard and set **Category** to **Script**. Each `log.info` call appears as a `script.log` event whose subject is the script's trigger, `record.create:xyz.statusphere.status`. `info`, `warn` and `error` lines are recorded here. `debug` lines go to the server log only.
+
+To see every script run, not just the lines your script logs, turn on **Verbose Event Logging** under **Settings > General**. It logs a `script.executed` event for each run. It writes a lot, so turn it off again when you're done.
+
+If the script fails, HappyView retries it and then moves the event to **Dead Letters**. The record is still indexed, so a broken script never stops indexing.
+
+## Handle updates and deletes
+
+A `record.create` script only sees creates. To handle every action in one script, change the trigger to `record.index:xyz.statusphere.status`. HappyView uses a `record.create`, `record.update` or `record.delete` script when one exists for the action, and falls back to `record.index` otherwise.
+
+A delete carries no record, so returning `input.record` on a delete returns nothing and skips the delete. Return `true` to let it through.
+
+This version also filters: it skips any record whose `status` field is empty, so those records never reach the index.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  if input.action == "delete" then
+    log.info("status deleted", { uri = input.uri })
+    return true
+  end
+
+  if not input.record.status or input.record.status == "" then
+    return nil -- skip: not indexed
+  end
+
+  log.info("status " .. input.action, { uri = input.uri })
+  return input.record
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import log from "internal.logging";
+
+export default function handle(input, ctx) {
+  if (input.action === "delete") {
+    log.info("status deleted", { uri: input.uri });
+    return true;
+  }
+
+  if (!input.record.status) {
+    return undefined; // skip: not indexed
+  }
+
+  log.info(`status ${input.action}`, { uri: input.uri });
+  return input.record;
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import log from "internal.logging";
+
+interface RecordEvent {
+  action: "create" | "update" | "delete";
+  uri: string;
+  record?: { status?: string } & Record<string, unknown>;
+}
+
+export default function handle(input: RecordEvent) {
+  if (input.action === "delete") {
+    log.info("status deleted", { uri: input.uri });
+    return true;
+  }
+
+  if (!input.record?.status) {
+    return undefined; // skip: not indexed
+  }
+
+  log.info(`status ${input.action}`, { uri: input.uri });
+  return input.record;
+}
+```
+
+</TabItem>
+</Tabs>
+
+To change what is stored instead, return a different object. It replaces the record in the index. The full table of return values is in [Script types and triggers](/docs/reference/scripts/types-and-triggers#record-scripts).
+
+:::tip[Create scripts may run more than once]
+The same record can reach a create script more than once, for example when a backfill runs or a failed script is retried. Write create scripts so that running twice does no harm: write by key and replace, avoid counters that add one per run, and check before one-time side effects. See [Create scripts may run more than once](/docs/reference/scripts/idempotency).
+:::
+
+## React to labels
+
+Labelers are services that apply labels such as `spam` or `!hide` to records and accounts. HappyView can subscribe to a labeler and run a script on each label it sends, before the label is stored.
+
+### Subscribe to a labeler
+
+Open **Labelers** in the dashboard, click **Add Labeler**, and enter the labeler's DID. Or use the admin API:
+
+```sh
+curl -X POST "http://127.0.0.1:3000/admin/labelers" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{ "did": "did:plc:ar7c4by46qjdydhdevvrndac" }'
+```
+
+### Write a label script
+
+Create a script with **Action** set to **Label arrival**. The trigger depends on the label's subject:
+
+- `labeler.apply:xyz.statusphere.status` runs for labels on records in that collection.
+- `labeler.apply:_actor` runs for labels on accounts. Pick **Actor** as the **Trigger source**.
+
+`input` carries the label: `src` (the labeler's DID), `uri` (the subject), `val` (the label value), `neg` (`true` when the label is being removed), `cts` (when it was created) and, if it expires, `exp`.
+
+This script keeps only the label values you care about. Returning nothing drops a label. Returning an object merges its fields over the label, so `return input` keeps it unchanged.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local log = require("internal.logging")
+
+local ALLOWED = { ["!hide"] = true, ["spam"] = true }
+
+function handle(input, ctx)
+  if not ALLOWED[input.val] then
+    return nil -- drop the label
+  end
+
+  log.info("label kept", { val = input.val, uri = input.uri, neg = input.neg })
+  return input
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import log from "internal.logging";
+
+const ALLOWED = new Set(["!hide", "spam"]);
+
+export default function handle(input, ctx) {
+  if (!ALLOWED.has(input.val)) {
+    return undefined; // drop the label
+  }
+
+  log.info("label kept", { val: input.val, uri: input.uri, neg: input.neg });
+  return input;
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import log from "internal.logging";
+
+interface LabelEvent {
+  src: string;
+  uri: string;
+  val: string;
+  neg: boolean;
+  cts: string;
+  exp?: string;
+}
+
+const ALLOWED = new Set(["!hide", "spam"]);
+
+export default function handle(input: LabelEvent) {
+  if (!ALLOWED.has(input.val)) {
+    return undefined; // drop the label
+  }
+
+  log.info("label kept", { val: input.val, uri: input.uri, neg: input.neg });
+  return input;
+}
+```
+
+</TabItem>
+</Tabs>
+
+A label script has no caller, so `ctx.caller_did` is absent and it can't write to a PDS or create a job. See [Script types and triggers](/docs/reference/scripts/types-and-triggers#label-scripts).
+
+## Next steps
+
+- [Background jobs](/docs/getting-started/background-jobs): move slow work out of record scripts
+- [Script types and triggers](/docs/reference/scripts/types-and-triggers): every trigger and return value
+- [The script contract](/docs/reference/scripts/contract): what `input` and `ctx` carry
+- [Create scripts may run more than once](/docs/reference/scripts/idempotency)
+- [Limits](/docs/reference/scripts/limits)

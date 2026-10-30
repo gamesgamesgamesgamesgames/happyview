@@ -1,0 +1,225 @@
+---
+title: Background jobs
+description: Move slow or long-running work out of requests and record scripts into a job that runs in the background.
+type: how-to
+prerequisites:
+  - /docs/getting-started/scripts
+  - /docs/getting-started/reacting-to-records
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page shows you how to queue work from a script and run it in the background, where it isn't held to the time limits that requests and record scripts have.
+
+A background job has two halves. A script queues the job with a type and an input. A **job script**, bound to the trigger `job.run:<type>`, picks it up and does the work. Use jobs for exports, migrations, batch writes, syncs with external services, and anything else too slow for a request.
+
+:::note[You need an interpreter and the jobs library]
+Self-hosted instances ship with no interpreter (install one from the alpha channel); HappyProto-managed instances have Lua preinstalled. Queuing a job also needs the `happyview-jobs` library plugin. See [Languages](/docs/reference/scripts/languages#install-an-interpreter).
+:::
+
+## Write the job script
+
+1. Open **Scripts** in the dashboard and click **New script**.
+2. Set **Trigger source** to **Job**, and enter a **Job type**, for example `export`. The **Resolved trigger id** shows `job.run:export`.
+3. Replace the body with the script below and click **Create script**.
+
+A job type is 1 to 128 characters of lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit. Types starting with `happyview.` are reserved for HappyView's built-in jobs.
+
+This script works through a list of items, saves its progress as it goes, and stops early if someone cancels or pauses it.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  local total = #input.items
+
+  for i, item in ipairs(input.items) do
+    if ctx.job.should_stop() then
+      return { partial = true, processed = i - 1 }
+    end
+
+    log.info("processing item", { index = i })
+    ctx.job.progress({ processed = i, total = total })
+  end
+
+  return { processed = total }
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import log from "internal.logging";
+
+export default async function handle(input, ctx) {
+  const total = input.items.length;
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.job.should_stop()) {
+      return { partial: true, processed: i };
+    }
+
+    log.info("processing item", { index: i });
+    ctx.job.progress({ processed: i + 1, total });
+  }
+
+  return { processed: total };
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import log from "internal.logging";
+
+interface Job {
+  id: string;
+  progress(data: unknown): void;
+  should_stop(): boolean;
+  wait(seconds: number): Promise<void>;
+}
+
+export default async function handle(input: { items: unknown[] }, ctx: { job: Job }) {
+  const total = input.items.length;
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.job.should_stop()) {
+      return { partial: true, processed: i };
+    }
+
+    log.info("processing item", { index: i });
+    ctx.job.progress({ processed: i + 1, total });
+  }
+
+  return { processed: total };
+}
+```
+
+</TabItem>
+</Tabs>
+
+`input` is whatever the job was queued with. What `handle` returns is stored as the job's result. An uncaught error marks the job `failed`, with the error message as its error.
+
+## Queue a job
+
+Jobs are queued from scripts, with `create(job_type, input)` from the `happyview.jobs` library. It returns the new job's id. There is no admin API endpoint for queuing your own jobs.
+
+This procedure queues an `export` job and answers straight away with its id:
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local jobs = require("happyview.jobs")
+
+function handle(input, ctx)
+  local id = jobs.create("export", { items = input.items })
+  return { job_id = id }
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import jobs from "happyview.jobs";
+
+export default async function handle(input, ctx) {
+  const id = await jobs.create("export", { items: input.items });
+  return { job_id: id };
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import jobs from "happyview.jobs";
+
+export default async function handle(input: { items: unknown[] }) {
+  const id = await jobs.create("export", { items: input.items });
+  return { job_id: id };
+}
+```
+
+</TabItem>
+</Tabs>
+
+A job runs as whoever queued it, so `create` needs a caller. It works from a procedure, a query with a signed-in caller, a record script (which acts as the record's author), and another job. It fails from a label script and from an anonymous request.
+
+Queuing a job whose type has no `job.run` script doesn't fail. The job fails when the worker picks it up.
+
+### Writing to the caller's PDS
+
+By default a job can't write to anyone's PDS: `ctx.has_pds_auth` is `false`, and library calls that write as the caller, such as `record.create`, fail with `NO_SESSION`. Reads, HTTP and local index writes all work.
+
+To let the job write as the user who queued it, pass `{ auth = true }` (Lua) or `{ auth: true }` (JavaScript and TypeScript) as the third argument. The queuing script must itself have a session to pass on, such as a procedure called by an authenticated client. If the session is no longer usable when the job runs, the job fails.
+
+## What `ctx.job` carries
+
+Inside a job script, `ctx.job` has the job's id and three functions that act on the running job:
+
+| Member | What it does |
+| --- | --- |
+| `ctx.job.id` | The job's id |
+| `ctx.job.progress(data)` | Saves a progress snapshot, shown in the dashboard. Each call replaces the last |
+| `ctx.job.should_stop()` | Returns `true` once the job is being cancelled or paused. Checking it is up to your script |
+| `ctx.job.wait(seconds)` | Sleeps. The value is clamped to between 0 and 3600 seconds. In JavaScript and TypeScript it returns a promise, so write `await ctx.job.wait(5)` |
+
+`ctx.caller_did` is the user who queued the job, and `ctx.env` has your script variables, as in every script.
+
+## Watch a job
+
+Open **Jobs** in the dashboard. The table lists every job with its status, and you can filter by status. Click a job to see its input, progress, result or error, its timestamps, and its log. Lines your job script writes with `log.info`, `log.warn` and `log.error` appear in that job's log as well as in **Event Logs**.
+
+You can also read jobs with the admin API:
+
+```sh
+# List jobs, optionally by status
+curl "http://127.0.0.1:3000/admin/jobs?status=running" -H "$AUTH"
+
+# One job, and its log
+curl "http://127.0.0.1:3000/admin/jobs/$JOB_ID" -H "$AUTH"
+curl "http://127.0.0.1:3000/admin/jobs/$JOB_ID/logs" -H "$AUTH"
+```
+
+A script can read back a job it queued with `get(id)` from `happyview.jobs`. It returns nothing for a job someone else queued.
+
+### Statuses
+
+A job moves from `pending` to `running`, then ends as `completed` or `failed`.
+
+Cancelling or pausing is cooperative. **Cancel** or **Pause** in the dashboard, or `POST /admin/jobs/{id}/cancel` and `/pause`, set the job to `cancelling` or `pausing`. The next time the script calls `ctx.job.should_stop()` it gets `true`, and when the script returns the job becomes `cancelled` or `paused`. A pending or paused job is cancelled at once. A script that never checks `should_stop` runs to the end.
+
+:::caution[A job can run from the start more than once]
+**Resume** (`POST /admin/jobs/{id}/resume`) puts a paused job back to `pending`, and the script runs again **from the beginning** with the same input. A job that was running when the server restarted is also queued again and starts over. Save enough in `ctx.job.progress` to skip finished work, read it back with `get(ctx.job.id)`, and make each step safe to repeat.
+:::
+
+Cancelling, pausing and resuming need the `jobs:manage` permission. Viewing jobs needs `jobs:read`.
+
+## Limits
+
+Jobs aren't held to the instruction limit or the wall clock that apply to requests and record scripts. Running long is what a job is for, so your script should check `ctx.job.should_stop()` regularly.
+
+A job still has the 64 MiB memory limit that every script has. See [Limits](/docs/reference/scripts/limits).
+
+The worker checks for pending jobs every 5 seconds and takes the oldest first. By default one job runs at a time. Set `JOB_WORKER_CONCURRENCY` to run more at once, up to 32.
+
+## Not supported yet
+
+These are not available in this version of HappyView:
+
+- **Delayed or scheduled runs.** A job is picked up as soon as a worker is free. There is no way to say "run this at a later time". Inside a job, `ctx.job.wait` can pause for up to an hour.
+- **Automatic retries.** A job that fails stays `failed`. Nothing runs it again. To retry, queue a new job.
+- **Recurring schedules.** There is no cron-style schedule. A job can queue a follow-up job before it returns, but nothing repeats a job on its own.
+
+## Next steps
+
+- [Plugins and libraries](/docs/getting-started/plugins-and-libraries): install `happyview-jobs` and the other libraries your scripts use
+- [Script types and triggers](/docs/reference/scripts/types-and-triggers#job-scripts)
+- [The script contract](/docs/reference/scripts/contract)
+- [Limits](/docs/reference/scripts/limits)

@@ -17,11 +17,13 @@ HappyView does not run scripts itself. A script runs inside an **interpreter plu
 | JavaScript (QuickJS-ng) | `javascript` | `happyview-javascript` |
 | TypeScript (SWC, then QuickJS-ng) | `typescript` | `happyview-typescript` |
 
-HappyView ships with no interpreter installed. Until you install one, no script can be saved or run, and the server logs this at boot:
+A self-hosted instance starts with no interpreter. Until one is installed, no script can be saved or run, and the server logs this at boot:
 
 ```
 no interpreter plugin is installed, so no script can be saved or run; install one from the plugins page in the dashboard
 ```
+
+Hosts can preinstall interpreters with `HAPPYVIEW_DEFAULT_PLUGINS`, which installs them in the background on the instance's first boot. On HappyProto, Lua is preinstalled this way.
 
 You can install more than one interpreter and mix languages on the same instance. Each script stores the language it is written in as its `script_type`. See [Languages](./languages.mdx) for installing interpreters and choosing a language.
 
