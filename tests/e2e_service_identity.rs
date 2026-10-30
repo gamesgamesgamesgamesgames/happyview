@@ -2343,11 +2343,12 @@ async fn seed_super_user(app: &TestApp, did: &str) {
         .expect("seed super user");
 }
 
-/// A service-auth JWT addressed to THIS instance and bound to the admin method
-/// authenticates on an admin route.
+/// A service-auth JWT addressed to THIS instance, bound to the admin method and
+/// signed by a super user, is still refused on an admin route: the admin API
+/// accepts no service-auth JWT, whatever it names.
 #[tokio::test]
 #[serial]
-async fn service_auth_correct_aud_accepted_on_admin_route() {
+async fn service_auth_correct_aud_refused_on_admin_route() {
     common::require_db!();
     let mut app = TestApp::new().await;
     let plc_store = plc::setup_mock_plc(&app.mock_server).await;
@@ -2383,7 +2384,7 @@ async fn service_auth_correct_aud_accepted_on_admin_route() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// A service-auth JWT the user minted for a DIFFERENT audience must NOT
@@ -2396,8 +2397,9 @@ async fn service_auth_wrong_aud_rejected_on_admin_route() {
     let plc_store = plc::setup_mock_plc(&app.mock_server).await;
     let _instance_did = app.setup_did_plc().await;
 
-    // The issuer is even a super user — so if the token authenticated, it would
-    // return 200. The point is that the wrong audience blocks it entirely.
+    // The issuer is even a super user. An authenticated service-auth token is
+    // refused on admin routes with 403; the wrong audience stops it earlier,
+    // at authentication.
     let issuer = "did:plc:h6-bad-issuer";
     seed_super_user(&app, issuer).await;
 
