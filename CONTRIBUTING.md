@@ -139,7 +139,7 @@ on Linux, the bytes the server wrote (`write_bytes` reads `unavailable` on other
 systems, which have no `/proc/<pid>/io`). It reaches the real PLC directory and
 PDSes, so run it on your branch and on `alpha` back to back, and put both
 summaries in the pull request. The storage settings it exercises
-(`SQLITE_SYNCHRONOUS`, `SQLITE_CHECKPOINT_INTERVAL_SECS`,
+(`SQLITE_SYNCHRONOUS`, `SQLITE_CHECKPOINT_INTERVAL_SECS`, `SQLITE_WAL_CHECKPOINT_BYTES`,
 `BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
 `packages/docs/content/docs/getting-started/configuration.md`.
 

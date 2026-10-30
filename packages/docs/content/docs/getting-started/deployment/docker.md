@@ -181,6 +181,7 @@ SQLite stack only:
 | `SQLITE_JOURNAL_SIZE_LIMIT`       | `67108864` (64 MiB) | Caps the `-wal` file after a checkpoint. Deleting rows grows the WAL for the duration of the delete, so this bounds a delete's peak disk usage                |
 | `SQLITE_SYNCHRONOUS`              | `NORMAL`            | `NORMAL` or `FULL`. `NORMAL` cannot corrupt the database in WAL mode, but a crash or power loss can lose the last few transactions; `FULL` syncs every commit |
 | `SQLITE_CHECKPOINT_INTERVAL_SECS` | `60`                | Seconds between `wal_checkpoint(TRUNCATE)` runs, which empty the write-ahead log. `0` disables them                                                           |
+| `SQLITE_WAL_CHECKPOINT_BYTES`     | `67108864` (64 MiB) | Checkpoints as soon as the write-ahead log passes this size, without waiting for the interval. `0` disables it                                                |
 
 Postgres stack only:
 

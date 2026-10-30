@@ -123,7 +123,7 @@ fn containing_dir(path: &Path) -> &Path {
 /// appending `-wal` to the *entire* main file name, not by replacing its
 /// extension — `/data/happyview.db` becomes `/data/happyview.db-wal`, and the
 /// extensionless `/data/hv` becomes `/data/hv-wal`.
-fn wal_path_for(db_path: &Path) -> PathBuf {
+pub(crate) fn wal_path_for(db_path: &Path) -> PathBuf {
     let mut name = db_path.as_os_str().to_os_string();
     name.push("-wal");
     PathBuf::from(name)

@@ -189,6 +189,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             state.db.clone(),
             state.db_backend,
             checkpoint_every,
+            crate::maintenance::sqlite::wal_limit(&state.config.database_url),
         ));
     }
 
