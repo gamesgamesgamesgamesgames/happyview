@@ -10,11 +10,11 @@ use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::now_rfc3339;
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
 use crate::spaces::{db, notifications, oplog};
+use crate::tid::generate_tid;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -767,11 +767,7 @@ async fn apply_writes(
     // transaction is open deadlocks on SQLite.
     let signing_key = service::service_signing_key(&state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = service::begin_space_write(&state, &space.id).await?;
 
     for op in input.writes {
         match op {
@@ -1768,11 +1764,7 @@ async fn notify_write(
         input.data.as_ref().or(input.hash.as_ref()),
     ) {
         let hash = hash.decode()?;
-        let mut conn = state
-            .db
-            .begin()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+        let mut conn = service::begin_space_write(&state, &space.id).await?;
         let recorded = crate::spaces::writers::record(
             &mut conn,
             state.db_backend,

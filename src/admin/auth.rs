@@ -5,6 +5,7 @@ use axum::http::request::Parts;
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
+use crate::auth::admin_scope;
 use crate::auth::middleware::Claims;
 use crate::constant_time::ct_eq_str;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -18,9 +19,10 @@ use super::permissions::Permission;
 pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
-/// (`require_domain_access`, `is_platform`). Deliberately tiny.
+/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately tiny.
 const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
 
+#[derive(Clone)]
 pub struct UserAuth {
     pub did: String,
     pub user_id: String,
@@ -38,13 +40,31 @@ impl UserAuth {
         self.is_super || self.permissions.contains(&permission)
     }
 
-    /// Domain management: the platform principal, or anyone holding
+    /// Reading domains: the platform principal, or anyone holding
     /// `settings:manage`. Kept separate from `require` so the platform principal
     /// can manage domains without receiving `settings:manage`, which covers far
     /// more than domains.
-    pub async fn require_domain_access(&self) -> Result<(), AppError> {
+    pub async fn require_domain_read(&self) -> Result<(), AppError> {
         if self.is_platform {
             return Ok(());
+        }
+        self.require(Permission::SettingsManage).await
+    }
+
+    /// Adding, removing or promoting a domain. On a platform-managed instance
+    /// the platform decides which hostnames reach it and which one is its
+    /// public URL, so only the platform principal may: a domain added here
+    /// would be one the platform never routes, and a primary set here one it
+    /// never adopts. Anywhere else, the same as reading.
+    pub async fn require_domain_write(&self, platform_managed: bool) -> Result<(), AppError> {
+        if self.is_platform {
+            return Ok(());
+        }
+        if platform_managed {
+            self.log_permission_denied("platform").await;
+            return Err(AppError::Forbidden(
+                "this instance's domains are managed by its hosting platform".into(),
+            ));
         }
         self.require(Permission::SettingsManage).await
     }
@@ -53,26 +73,32 @@ impl UserAuth {
         if self.has(permission) {
             Ok(())
         } else {
-            log_event(
-                &self.db,
-                EventLog {
-                    event_type: "auth.permission_denied".to_string(),
-                    severity: Severity::Warn,
-                    actor_did: Some(self.did.clone()),
-                    subject: Some(permission.as_str().to_string()),
-                    detail: serde_json::json!({
-                        "user_id": self.user_id,
-                        "required_permission": permission.as_str(),
-                    }),
-                },
-                self.db_backend,
-            )
-            .await;
+            self.log_permission_denied(permission.as_str()).await;
 
             Err(AppError::InsufficientPermissions(
                 permission.as_str().to_string(),
             ))
         }
+    }
+
+    /// The `auth.permission_denied` event for a refusal for want of
+    /// `permission`.
+    pub(crate) async fn log_permission_denied(&self, permission: &str) {
+        log_event(
+            &self.db,
+            EventLog {
+                event_type: "auth.permission_denied".to_string(),
+                severity: Severity::Warn,
+                actor_did: Some(self.did.clone()),
+                subject: Some(permission.to_string()),
+                detail: serde_json::json!({
+                    "user_id": self.user_id,
+                    "required_permission": permission,
+                }),
+            },
+            self.db_backend,
+        )
+        .await;
     }
 
     async fn load_permissions(
@@ -132,6 +158,9 @@ impl UserAuth {
         }
 
         let claims = Claims::from_request_parts(parts, state).await?;
+        // Ahead of the bootstrap below, so an app without the grant cannot
+        // become the first admin either.
+        require_admin_grant(state, &claims).await?;
         let did = claims.did().to_string();
         let backend = state.db_backend;
 
@@ -140,7 +169,10 @@ impl UserAuth {
             .await
             .map_err(|e| AppError::Internal(format!("user count query failed: {e}")))?;
 
-        if count.0 == 0 {
+        // A configured superadmin is seeded at boot. If that seeding failed the
+        // table is still empty, and promoting whoever signs in first would hand
+        // the instance to a stranger instead of the account the file names.
+        if count.0 == 0 && state.config.superadmin_did.is_none() {
             // Bootstrap first user
             let id = uuid::Uuid::new_v4().to_string();
             let now = now_rfc3339();
@@ -237,6 +269,52 @@ impl UserAuth {
     }
 }
 
+/// An app's DPoP session, or a service-auth JWT, reaches the admin API only
+/// with the grant `auth::admin_scope` describes. A cookie is the dashboard's
+/// and needs none.
+async fn require_admin_grant(state: &AppState, claims: &Claims) -> Result<(), AppError> {
+    if let Some(lxm) = claims.service_auth_lxm() {
+        if lxm != Some(admin_scope::ADMIN_LXM) {
+            return Err(AppError::Forbidden(format!(
+                "a service-auth token must be bound to {} to use the admin API",
+                admin_scope::ADMIN_LXM
+            )));
+        }
+        return Ok(());
+    }
+
+    let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {
+        return Ok(());
+    };
+    let encryption_key = state
+        .config
+        .token_encryption_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
+    let client =
+        crate::oauth::client_auth::resolve_client_by_key(&state.db, state.db_backend, client_key)
+            .await?;
+    let granted = crate::oauth::pds_write::verified_granted_scope(
+        &state.http,
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.oauth,
+        &state.config.plc_url,
+        &client.id,
+        claims.did(),
+        dpop_key_id,
+    )
+    .await?;
+    if !admin_scope::grants_admin(&granted) {
+        return Err(AppError::Forbidden(format!(
+            "this sign-in did not grant {}; sign in again and approve managing your HappyView instances",
+            admin_scope::PERMISSION_SET
+        )));
+    }
+    Ok(())
+}
+
 /// Deny by default: every handler that takes `UserAuth` refuses the managed-
 /// hosting platform principal, so a new route can never be reachable with the
 /// platform key by accident. Routes it may call opt in with `AllowPlatform`.
@@ -255,6 +333,52 @@ impl FromRequestParts<AppState> for UserAuth {
         }
         Ok(auth)
     }
+}
+
+/// In front of a record source's admin routes: authenticate the request as
+/// `AllowPlatform` does, refuse it as a handler would when that fails, and
+/// hand the source an [`AdminCaller`](happyview_provider::AdminCaller). The
+/// source checks the caller's permissions itself (and refuses the platform
+/// principal through `AdminUser`); a refusal it marks with
+/// [`PermissionDenied`](happyview_provider::PermissionDenied) is logged here
+/// as `UserAuth::require` logs one.
+pub(crate) async fn require_admin_caller(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let (mut parts, body) = request.into_parts();
+    let auth = match UserAuth::authenticate(&mut parts, &state).await {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    let permissions = if auth.is_super {
+        Permission::all()
+    } else {
+        auth.permissions.clone()
+    };
+    let mut permissions: Vec<String> = permissions.iter().map(|p| p.as_str().to_string()).collect();
+    permissions.sort();
+    parts.extensions.insert(happyview_provider::AdminCaller {
+        did: auth.did.clone(),
+        permissions,
+        platform: auth.is_platform,
+    });
+    let response = next
+        .run(axum::extract::Request::from_parts(parts, body))
+        .await;
+    // A source refused the caller for a permission: log it as `require`
+    // logs a refusal by HappyView's own routes.
+    if let Some(happyview_provider::PermissionDenied(permission)) =
+        response
+            .extensions()
+            .get::<happyview_provider::PermissionDenied>()
+    {
+        auth.log_permission_denied(permission).await;
+    }
+    response
 }
 
 /// Explicit opt-in for routes the managed-hosting platform may call. Behaves
@@ -380,4 +504,226 @@ fn parse_permissions(key_permissions: &[String]) -> HashSet<Permission> {
             serde_json::from_value::<Permission>(serde_json::Value::String(s.clone())).ok()
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuperadminSeed {
+    Created,
+    Promoted,
+    Unchanged,
+}
+
+/// Make the configured account a super user. Additive only: other super
+/// users keep their role, because the configuration names who must be an
+/// admin, not who must not be.
+pub(crate) async fn ensure_configured_superadmin(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+) -> Result<SuperadminSeed, sqlx::Error> {
+    let now = now_rfc3339();
+    let mut tx = db.begin().await?;
+
+    let existing: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
+        "SELECT id, is_super FROM happyview_users WHERE did = ?",
+        backend,
+    ))
+    .bind(did)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (user_id, seed) = match existing {
+        Some((_, is_super)) if is_super != 0 => return Ok(SuperadminSeed::Unchanged),
+        Some((id, _)) => {
+            crate::db::query(&adapt_sql(
+                "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+                backend,
+            ))
+            .bind(1_i32)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            (id, SuperadminSeed::Promoted)
+        }
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+                backend,
+            ))
+            .bind(&id)
+            .bind(did)
+            .bind(1_i32)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            (id, SuperadminSeed::Created)
+        }
+    };
+
+    let perm_sql = adapt_sql(
+        "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        backend,
+    );
+    for perm in Permission::all() {
+        crate::db::query(&perm_sql)
+            .bind(&user_id)
+            .bind(perm.as_str())
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    log_event(
+        db,
+        EventLog {
+            event_type: "user.bootstrapped".to_string(),
+            severity: Severity::Info,
+            actor_did: None,
+            subject: Some(did.to_string()),
+            detail: serde_json::json!({ "source": "config" }),
+        },
+        backend,
+    )
+    .await;
+
+    Ok(seed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::migrated_memory_pool;
+
+    async fn user(db: &sqlx::AnyPool, did: &str) -> Option<(String, i32)> {
+        crate::db::query_as("SELECT id, is_super FROM happyview_users WHERE did = ?")
+            .bind(did)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_user(db: &sqlx::AnyPool, did: &str, is_super: i32) {
+        crate::db::query(
+            "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(did)
+        .bind(is_super)
+        .bind(now_rfc3339())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_absent_superadmin_is_created_with_every_permission() {
+        let db = migrated_memory_pool().await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Created);
+        let (id, is_super) = user(&db, "did:plc:boss").await.unwrap();
+        assert_eq!(is_super, 1);
+        let (granted,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_user_permissions WHERE user_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(granted as usize, Permission::all().len());
+    }
+
+    #[tokio::test]
+    async fn an_existing_user_is_promoted_and_others_keep_their_role() {
+        let db = migrated_memory_pool().await;
+        insert_user(&db, "did:plc:boss", 0).await;
+        insert_user(&db, "did:plc:other-super", 1).await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Promoted);
+        assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
+        assert_eq!(user(&db, "did:plc:other-super").await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn seeding_twice_creates_one_row() {
+        let db = migrated_memory_pool().await;
+        let first = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        let second = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(first, SuperadminSeed::Created);
+        assert_eq!(second, SuperadminSeed::Unchanged);
+        let (rows,): (i64,) =
+            crate::db::query_as("SELECT COUNT(*) FROM happyview_users WHERE did = ?")
+                .bind("did:plc:boss")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Run `UserAuth::authenticate` for `did` over a signed session cookie,
+    /// against an empty users table.
+    async fn sign_in_to_empty_instance(
+        configured: Option<&str>,
+        did: &str,
+    ) -> (Result<UserAuth, AppError>, sqlx::AnyPool) {
+        use axum::response::IntoResponse;
+        use axum_extra::extract::cookie::{Cookie, SignedCookieJar};
+
+        let db = migrated_memory_pool().await;
+        let mut state =
+            crate::test_support::test_state_with_pool_on(db.clone(), DatabaseBackend::Sqlite);
+        state.config.session_secret = "a-securely-generated-32plus-byte-secret!!".into();
+        state.config.superadmin_did = configured.map(str::to_string);
+
+        let jar = SignedCookieJar::new(state.cookie_key.clone())
+            .add(Cookie::new(crate::auth::COOKIE_NAME, did.to_string()));
+        let set_cookie = jar.into_response();
+        let cookie = set_cookie.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let (mut parts, _) = axum::http::Request::builder()
+            .header("cookie", cookie)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        (UserAuth::authenticate(&mut parts, &state).await, db)
+    }
+
+    #[tokio::test]
+    async fn a_configured_superadmin_stops_the_first_sign_in_becoming_admin() {
+        let (auth, db) = sign_in_to_empty_instance(Some("did:plc:boss"), "did:plc:stranger").await;
+        assert!(auth.is_err());
+        assert!(user(&db, "did:plc:stranger").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_superadmin_the_first_sign_in_becomes_admin() {
+        let (auth, db) = sign_in_to_empty_instance(None, "did:plc:first").await;
+        assert!(auth.is_ok());
+        assert_eq!(user(&db, "did:plc:first").await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn a_superadmin_already_in_place_is_left_alone() {
+        let db = migrated_memory_pool().await;
+        insert_user(&db, "did:plc:boss", 1).await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Unchanged);
+    }
 }

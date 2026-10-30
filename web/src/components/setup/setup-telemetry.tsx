@@ -1,14 +1,21 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   dismissTelemetryPrompt,
+  getTelemetry,
   updateTelemetry,
   type TelemetrySettings,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 
@@ -33,6 +40,36 @@ const OPTIONS = [
 export function SetupTelemetry({ onNext }: { onNext: () => void }) {
   const [mode, setMode] = useState<TelemetrySettings["mode"]>("off");
   const [saving, setSaving] = useState(false);
+  const [managed, setManaged] = useState(false);
+
+  useEffect(() => {
+    getTelemetry()
+      .then((settings) => setManaged(settings.managed))
+      .catch(() => {
+        // Unknown reads as unmanaged: the question is then asked, and a
+        // managed instance refuses the answer without blocking setup.
+      });
+  }, []);
+
+  if (managed) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Daily reports are on</CardTitle>
+          <CardDescription>
+            This instance&apos;s hosting platform requires a daily report about
+            how the instance is doing: how much data it holds, which features
+            are used, and where it is struggling. It never includes records,
+            handles, DIDs, contact details, or the contents of anything you have
+            indexed. You can read the exact payload under Settings → Telemetry.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex justify-end">
+          <Button onClick={onNext}>Continue</Button>
+        </CardContent>
+      </Card>
+    );
+  }
 
   async function submit() {
     setSaving(true);
@@ -62,12 +99,11 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
       <CardHeader>
         <CardTitle>Help us build the right things</CardTitle>
         <CardDescription>
-          HappyView can send us a daily report about how this instance is
-          doing: how much data it holds, which features you use, and where it
-          is struggling. It never includes records, handles, DIDs, or the
-          contents of anything you have indexed. You can read the exact
-          payload — and change your mind — any time under Settings →
-          Telemetry.
+          HappyView can send us a daily report about how this instance is doing:
+          how much data it holds, which features you use, and where it is
+          struggling. It never includes records, handles, DIDs, or the contents
+          of anything you have indexed. You can read the exact payload — and
+          change your mind — any time under Settings → Telemetry.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -82,9 +118,7 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
                 id={`setup-telemetry-${o.value}`}
               />
               <div className="grid gap-1">
-                <Label htmlFor={`setup-telemetry-${o.value}`}>
-                  {o.label}
-                </Label>
+                <Label htmlFor={`setup-telemetry-${o.value}`}>{o.label}</Label>
                 <p className="text-muted-foreground text-sm">{o.hint}</p>
               </div>
             </div>

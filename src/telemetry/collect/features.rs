@@ -4,30 +4,22 @@ use std::collections::BTreeMap;
 
 use sqlx::AnyPool;
 
-use crate::db::{DatabaseBackend, adapt_sql};
+use crate::db::DatabaseBackend;
 use crate::telemetry::payload::FeatureUsage;
-
-const ACTIVE_WINDOW_DAYS: i64 = 7;
 
 type Probe = (&'static str, &'static str, &'static str, i64);
 
 const PROBES: &[Probe] = &[
     (
         "lexicons",
-        "SELECT COUNT(*) FROM happyview_lexicons",
-        "SELECT COUNT(*) FROM happyview_lexicons WHERE created_at >= ?",
-        1,
-    ),
-    (
-        "backfill",
-        "SELECT COUNT(*) FROM happyview_backfill_jobs",
-        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE created_at >= ?",
+        crate::catalog::lexicon_rows::COUNT_ALL_SQL,
+        crate::catalog::lexicon_rows::COUNT_CREATED_SINCE_SQL,
         1,
     ),
     (
         "scripts",
-        "SELECT COUNT(*) FROM happyview_scripts",
-        "SELECT COUNT(*) FROM happyview_scripts WHERE updated_at >= ?",
+        crate::catalog::script_rows::COUNT_ALL_SQL,
+        crate::catalog::script_rows::COUNT_UPDATED_SINCE_SQL,
         1,
     ),
     (
@@ -74,27 +66,7 @@ const PROBES: &[Probe] = &[
     ),
 ];
 
-/// Run a count, treating any failure as zero.
-async fn count(pool: &AnyPool, backend: DatabaseBackend, sql: &str, bind: Option<&str>) -> i64 {
-    let adapted = adapt_sql(sql, backend);
-    let q = crate::db::query_as::<(i64,)>(&adapted);
-    let q = match bind {
-        Some(v) => q.bind(v),
-        None => q,
-    };
-    match q.fetch_one(pool).await {
-        Ok((n,)) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "telemetry feature probe failed, reporting unused");
-            0
-        }
-    }
-}
-
-fn window_start() -> String {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(ACTIVE_WINDOW_DAYS);
-    cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-}
+pub(crate) use happyview_provider::telemetry::{count, window_start};
 
 pub async fn usage(pool: &AnyPool, backend: DatabaseBackend) -> BTreeMap<String, FeatureUsage> {
     let since = window_start();
@@ -121,34 +93,12 @@ mod tests {
 
     async fn pool_with_lexicons() -> sqlx::AnyPool {
         let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_lexicons (
-                id TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL DEFAULT 1,
-                lexicon_json TEXT NOT NULL,
-                backfill INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create lexicons");
+        crate::catalog::testing::create_bare_lexicons_table(&pool).await;
         pool
     }
 
     async fn add_lexicon(pool: &sqlx::AnyPool, nsid: &str, created_at: &str) {
-        let sql = crate::db::adapt_sql(
-            "INSERT INTO happyview_lexicons (id, lexicon_json, backfill, created_at)
-             VALUES (?, '{}', 0, ?)",
-            DatabaseBackend::Sqlite,
-        );
-        crate::db::query(&sql)
-            .bind(nsid)
-            .bind(created_at)
-            .execute(pool)
-            .await
-            .unwrap();
+        crate::catalog::testing::insert_bare_lexicon(pool, nsid, created_at).await;
     }
 
     #[tokio::test]

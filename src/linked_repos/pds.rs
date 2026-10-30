@@ -85,10 +85,17 @@ fn require_blob_scope(grant: &LinkedRepo, mime: &str) -> Result<(), AppError> {
     )))
 }
 
-pub async fn session_for(
-    state: &AppState,
-    grant: &LinkedRepo,
-) -> Result<HappyViewOAuthSession, AppError> {
+/// What a linked-repo call acts with. A test run answers every call from the
+/// in-process PDS, so no grant needs a live OAuth session.
+pub enum LinkedSession {
+    OAuth(Box<HappyViewOAuthSession>),
+    Test {
+        pds: std::sync::Arc<crate::testing::FakePds>,
+        did: String,
+    },
+}
+
+pub async fn session_for(state: &AppState, grant: &LinkedRepo) -> Result<LinkedSession, AppError> {
     let did_str = require_did(grant)?;
 
     if grant.status == STATUS_NEEDS_REAUTH {
@@ -97,13 +104,20 @@ pub async fn session_for(
         )));
     }
 
+    if let Some(test) = &state.test {
+        return Ok(LinkedSession::Test {
+            pds: test.pds().clone(),
+            did: did_str.to_string(),
+        });
+    }
+
     let did = Did::new(did_str.to_string())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
     let client = flow::client_for_grant(state, grant).await?;
 
     match client.restore(&did).await {
-        Ok(session) => Ok(session),
+        Ok(session) => Ok(LinkedSession::OAuth(Box::new(session))),
         Err(e) => {
             let message = format!("{e}");
             super::db::mark_needs_reauth(state, &grant.id, &message).await?;
@@ -114,7 +128,16 @@ pub async fn session_for(
     }
 }
 
-async fn post_json(
+async fn post_json(session: &LinkedSession, nsid: &str, body: &Value) -> Result<Value, AppError> {
+    match session {
+        LinkedSession::OAuth(session) => post_json_oauth(session, nsid, body).await,
+        LinkedSession::Test { pds, did } => pds
+            .post(did, nsid, body)
+            .map_err(|e| AppError::Internal(format!("{nsid} failed: {e}"))),
+    }
+}
+
+pub(crate) async fn post_json_oauth(
     session: &HappyViewOAuthSession,
     nsid: &str,
     body: &Value,
@@ -141,18 +164,14 @@ async fn post_json(
 /// Mirror a successful linked-repo write into the local record index.
 ///
 /// This matches what `Record:save()` does after its own PDS write
-/// (`lua/record.rs`): a best-effort upsert plus a `sync_refs` pass, with no
-/// filter on whether the collection is a tracked record lexicon. Failures are
-/// swallowed deliberately — the PDS write has already landed, so the caller's
-/// operation succeeded whether or not we managed to index it, and the record
-/// will be indexed anyway when Jetstream echoes it back.
+/// (`lua/record.rs`): an upsert plus a `sync_refs` pass, with no filter on
+/// whether the collection is a tracked record lexicon. The PDS write has
+/// already landed, so callers report a failure here rather than fail the
+/// operation; the record is indexed anyway when Jetstream echoes it back.
 ///
-/// `indexed_at` is left alone: it is network-arrival provenance, and this
-/// record has not come back over the firehose yet. See [`crate::db::NO_INDEXED_AT`].
-///
-/// Public so tests can exercise the statement directly. They need to: the
-/// errors are swallowed here, so a column/bind mismatch would be invisible in
-/// production rather than loud.
+/// `indexed_at` is cleared (NULL on insert and on update): it is
+/// network-arrival provenance, and this write has not come back over the
+/// firehose yet, so the echo re-stamps it. See [`crate::record_store::WriteKind::Echoed`].
 pub async fn index_write(
     state: &AppState,
     did: &str,
@@ -160,50 +179,47 @@ pub async fn index_write(
     uri: &str,
     cid: &str,
     record: &Value,
-) {
-    let backend = state.db_backend;
-    let rkey = uri.split('/').next_back().unwrap_or_default();
-    let record_str = serde_json::to_string(record).unwrap_or_default();
-    let now = crate::db::now_rfc3339();
-
-    let sql = crate::db::adapt_sql(
-        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid"#,
-        backend,
-    );
-    let _ = crate::db::query(&sql)
-        .bind(uri)
-        .bind(did)
-        .bind(collection)
-        .bind(rkey)
-        .bind(&record_str)
-        .bind(cid)
-        .bind(crate::db::NO_INDEXED_AT)
-        .bind(&now)
-        .execute(&state.db)
-        .await;
-
-    let _ = crate::record_refs::sync_refs(&state.db, uri, collection, record, backend).await;
+) -> Result<(), crate::record_store::LocalWriteError> {
+    state
+        .records
+        .write_local(
+            crate::record_store::WriteKind::Echoed,
+            &prepared_write(did, collection, uri, cid, record),
+        )
+        .await
 }
 
-/// Remove a record from the local index after a successful linked-repo delete.
+/// The row `index_write` stores: keyed by `did`, `collection` and the record
+/// key at the end of the PDS's `uri`.
+fn prepared_write(
+    did: &str,
+    collection: &str,
+    uri: &str,
+    cid: &str,
+    record: &Value,
+) -> crate::record_store::PreparedRecord {
+    crate::record_store::PreparedRecord {
+        did: did.to_string(),
+        collection: collection.to_string(),
+        rkey: uri.split('/').next_back().unwrap_or_default().to_string(),
+        record_json: serde_json::to_string(record).unwrap_or_default(),
+        cid: cid.to_string(),
+        rev: None,
+    }
+}
+
+/// Remove a record and its refs from the local index after a successful
+/// linked-repo delete. Says whether a row was there.
 ///
 /// Unlike `Record:delete()`, which drops the local row even when the PDS call
 /// fails, this only runs once the PDS has actually accepted the delete —
 /// `delete_record` propagates PDS errors to its caller rather than logging and
 /// continuing.
-pub async fn unindex_write(state: &AppState, uri: &str) {
-    let sql = crate::db::adapt_sql(
-        "DELETE FROM happyview_records WHERE uri = ?",
-        state.db_backend,
-    );
-    let _ = crate::db::query(&sql).bind(uri).execute(&state.db).await;
+pub async fn unindex_write(state: &AppState, uri: &str) -> Result<bool, sqlx::Error> {
+    state.records.delete(uri).await
 }
 
-fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
+pub(crate) fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
     let uri = value
         .get("uri")
         .and_then(|v| v.as_str())
@@ -237,7 +253,10 @@ pub async fn create_record(
 
     let out = post_json(&session, "com.atproto.repo.createRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "createRecord")?;
-    index_write(state, did, collection, &uri, &cid, &body["record"]).await;
+    if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
+        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
+        state.records.report_index_failure(&indexed, &e).await;
+    }
     Ok((uri, cid))
 }
 
@@ -265,7 +284,10 @@ pub async fn put_record(
 
     let out = post_json(&session, "com.atproto.repo.putRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "putRecord")?;
-    index_write(state, did, collection, &uri, &cid, &body["record"]).await;
+    if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
+        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
+        state.records.report_index_failure(&indexed, &e).await;
+    }
     Ok((uri, cid))
 }
 
@@ -286,7 +308,10 @@ pub async fn delete_record(
     });
 
     post_json(&session, "com.atproto.repo.deleteRecord", &body).await?;
-    unindex_write(state, &format!("at://{did}/{collection}/{rkey}")).await;
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    if let Err(e) = unindex_write(state, &uri).await {
+        state.records.report_index_failure(&uri, &e).await;
+    }
     Ok(())
 }
 
@@ -297,7 +322,14 @@ pub async fn upload_blob(
     bytes: Vec<u8>,
 ) -> Result<Value, AppError> {
     require_blob_scope(grant, mime)?;
-    let session = session_for(state, grant).await?;
+    let session = match session_for(state, grant).await? {
+        LinkedSession::OAuth(session) => session,
+        LinkedSession::Test { pds, .. } => {
+            return pds
+                .upload_blob(mime, &bytes)
+                .map_err(|e| AppError::Internal(format!("uploadBlob failed: {e}")));
+        }
+    };
 
     let request = XrpcRequest {
         method: Method::POST,
@@ -330,6 +362,15 @@ pub async fn call(
     if let Some(input) = input {
         return post_json(&session, nsid, &input).await;
     }
+    let session = match session {
+        LinkedSession::OAuth(session) => session,
+        LinkedSession::Test { .. } => {
+            return Err(AppError::Internal(format!(
+                "{nsid} failed: {}",
+                crate::testing::FakePdsError::not_served(nsid)
+            )));
+        }
+    };
 
     let request = XrpcRequest {
         method: Method::GET,
@@ -347,5 +388,64 @@ pub async fn call(
         Ok(OutputDataOrBytes::Bytes(b)) => serde_json::from_slice(&b)
             .map_err(|e| AppError::Internal(format!("{nsid} returned non-JSON: {e}"))),
         Err(e) => Err(AppError::Internal(format!("{nsid} failed: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn bound_grant(state: &AppState) -> LinkedRepo {
+        let grant = super::super::db::create(
+            state,
+            None,
+            None,
+            None,
+            "atproto repo:app.test.rec",
+            "did:plc:admin",
+        )
+        .await
+        .unwrap();
+        super::super::db::bind_did(state, &grant.id, "did:plc:linked", None)
+            .await
+            .unwrap();
+        super::super::db::get(state, &grant.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_test_runs_linked_repo_write_reaches_the_fake() {
+        let harness = std::sync::Arc::new(crate::testing::TestHarness::new("a.test.lua"));
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(harness.clone());
+        let grant = bound_grant(&state).await;
+        let (uri, _cid) = create_record(&state, &grant, "app.test.rec", Some("1"), json!({"a": 1}))
+            .await
+            .unwrap();
+        assert_eq!(uri, "at://did:plc:linked/app.test.rec/1");
+        assert_eq!(harness.pds().writes()[0].repo, "did:plc:linked");
+    }
+
+    /// Outside a test run a grant acts through its stored OAuth session, and
+    /// one that has none is marked for reauthorization.
+    #[tokio::test]
+    async fn a_served_linked_repo_call_restores_the_grants_session() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let grant = bound_grant(&state).await;
+        let Err(err) = session_for(&state, &grant).await else {
+            panic!("a grant with no stored session restored one");
+        };
+        assert!(err.to_string().contains("needs reauthorization"), "{err}");
+        let grant = super::super::db::get(&state, &grant.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.status, STATUS_NEEDS_REAUTH);
     }
 }

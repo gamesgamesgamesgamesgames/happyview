@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { MonacoEditor } from "@/components/monaco-editor";
-import type { LuaCompletions } from "@/lib/lua-completions";
 
 interface CodePanelsProps {
   jsonValue: string;
@@ -12,8 +11,6 @@ interface CodePanelsProps {
   luaValue?: string | null;
   onLuaChange?: (value: string) => void;
   luaReadOnly?: boolean;
-  luaCompletions?: LuaCompletions;
-  collections?: string[];
   className?: string;
 }
 
@@ -24,8 +21,6 @@ function Panel({
   onChange,
   readOnly,
   lang,
-  completions,
-  collections,
 }: {
   className?: string;
   label: string;
@@ -33,8 +28,6 @@ function Panel({
   onChange?: (value: string) => void;
   readOnly?: boolean;
   lang: string;
-  completions?: LuaCompletions;
-  collections?: string[];
 }) {
   return (
     <div className={cn("flex flex-col min-h-0 flex-1", className)}>
@@ -45,8 +38,6 @@ function Panel({
         onChange={onChange}
         language={lang}
         readOnly={readOnly || !onChange}
-        completions={completions}
-        collections={collections}
       />
     </div>
   );
@@ -59,8 +50,6 @@ export function CodePanels({
   luaValue,
   onLuaChange,
   luaReadOnly,
-  luaCompletions,
-  collections,
   className,
 }: CodePanelsProps) {
   const hasLua = luaValue != null || !!onLuaChange;
@@ -109,7 +98,9 @@ export function CodePanels({
             /* Narrow: hide when Lua tab is active */
             hasLua && activeTab !== "json" ? "hidden lg:flex" : "",
             /* Wide: dim inactive panel */
-            hasLua ? "lg:border-e lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity" : "",
+            hasLua
+              ? "lg:border-e lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity"
+              : "",
           )}
           label="Lexicon JSON"
           value={jsonValue}
@@ -118,11 +109,17 @@ export function CodePanels({
           lang="json"
         />
         {/* Wrapper stays in the DOM so the grid column can animate closed */}
-        <div className={cn(
-          "overflow-hidden min-w-0 flex flex-col min-h-0",
-          /* Narrow: hide when JSON tab is active */
-          hasLua && activeTab !== "lua" ? "hidden lg:flex" : hasLua ? "" : "hidden lg:flex",
-        )}>
+        <div
+          className={cn(
+            "overflow-hidden min-w-0 flex flex-col min-h-0",
+            /* Narrow: hide when JSON tab is active */
+            hasLua && activeTab !== "lua"
+              ? "hidden lg:flex"
+              : hasLua
+                ? ""
+                : "hidden lg:flex",
+          )}
+        >
           {hasLua && (
             <Panel
               className="lg:opacity-50 lg:focus-within:opacity-100 lg:transition-opacity min-w-[300px]"
@@ -131,8 +128,6 @@ export function CodePanels({
               onChange={onLuaChange}
               readOnly={luaReadOnly}
               lang="lua"
-              completions={luaCompletions}
-              collections={collections}
             />
           )}
         </div>

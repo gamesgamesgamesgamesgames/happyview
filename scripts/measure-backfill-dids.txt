@@ -1,0 +1,9 @@
+# Fixed repos for scripts/measure-backfill-storage.sh. Long-lived, public
+# Bluesky accounts with plenty of posts. Change the list to measure something
+# else, but compare runs only against the same list.
+did:plc:z72i7hdynmk6r22z27h6tvur
+did:plc:ewvi7nxzyoun6zhxrhs64oiz
+did:plc:oky5czdrnfjpqslsw2a5iclo
+did:plc:ragtjsm2j2vknwkz3zp4oxrd
+did:plc:vpkhqolt662uhesyj6nxm7ys
+did:plc:44ybard66vv44zksje25o7dz

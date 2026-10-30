@@ -1,18 +1,18 @@
-"use client"
+"use client";
 
-import { useTheme } from "next-themes"
-import { IconSun, IconMoon, IconDeviceDesktop } from "@tabler/icons-react"
+import { useTheme } from "next-themes";
+import { IconSun, IconMoon, IconDeviceDesktop } from "@tabler/icons-react";
 
-import { Button } from "@/components/ui/button"
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
+} from "@/components/ui/dropdown-menu";
 
 export function ThemeToggle() {
-  const { setTheme } = useTheme()
+  const { setTheme } = useTheme();
 
   return (
     <DropdownMenu>
@@ -38,5 +38,5 @@ export function ThemeToggle() {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-  )
+  );
 }

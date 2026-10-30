@@ -174,6 +174,7 @@ curl -X POST http://127.0.0.1:3000/admin/lexicons \
 | `backfill`          | boolean | no       | Whether the first upload triggers a historical backfill (default `true`) |
 | `target_collection` | string  | no       | For query/procedure lexicons, the record collection they operate on   |
 | `token_cost`        | integer | no       | Token cost for query/procedure endpoints (overrides instance default) |
+| `indexed`           | boolean | no       | For record lexicons, whether HappyView ingests the collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept. An unindexed lexicon starts no backfill |
 
 The `id` must be a valid [NSID](https://atproto.com/specs/nsid) — it is the
 lexicon's primary key, the XRPC method it is served at, and, for record
@@ -208,8 +209,17 @@ interface Lexicon {
   revision: number;
   lexicon_type: string;
   backfill: boolean;
-  created_at: string;
-  updated_at: string;
+  // "project" when a file in the instance's project defines this lexicon,
+  // otherwise "manual" or "network". `source` carries the same value.
+  layer: "project" | "manual" | "network";
+  // Project-relative path of the file, for a project lexicon only.
+  path: string | null;
+  // A dashboard or network row sits under this project file. It is kept and
+  // answers again if the file is removed.
+  shadows_stored: boolean;
+  // null for a project lexicon, which has no stored row.
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/lexicons", {
@@ -249,6 +259,7 @@ curl http://127.0.0.1:3000/admin/lexicons -H "$AUTH"
     "revision": 1,
     "lexicon_type": "record",
     "backfill": true,
+    "indexed": true,
     "created_at": "2025-01-01T00:00:00Z",
     "updated_at": "2025-01-01T00:00:00Z"
   }
@@ -294,6 +305,8 @@ curl http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status -H "$AUTH"
 
 **Response**: `200 OK` with full lexicon details including raw JSON.
 
+The response carries the same `indexed` boolean as the list (`true` for every lexicon that is not an unindexed record type).
+
 ## Delete a lexicon
 
 ```
@@ -335,6 +348,14 @@ curl -X DELETE http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status -H "$
 ```
 
 **Response**: `204 No Content`
+
+## Lexicons a project file defines
+
+When the instance runs a project, a lexicon defined by a file under `src/` answers ahead of any stored row with the same id. Uploading, deleting, adding as a network lexicon or removing as one is refused with `409 Conflict`:
+
+    { "error": "defined by the project file src/lexicons/com/example/thing.json; change that file instead" }
+
+A stored row the file shadows is kept as it is and answers again when the file is removed.
 
 ## Network Lexicons
 
@@ -416,6 +437,7 @@ curl -X POST http://127.0.0.1:3000/admin/network-lexicons \
 | ------------------- | ------ | -------- | ------------------------------------------------------------------- |
 | `nsid`              | string | yes      | The NSID of the lexicon to watch                                    |
 | `target_collection` | string | no       | For query/procedure lexicons, the record collection they operate on |
+| `indexed`           | boolean | no     | Whether HappyView ingests the record collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept |
 
 HappyView resolves the NSID authority via DNS TXT, fetches the lexicon from the authority's PDS, parses it, and stores it.
 
@@ -442,6 +464,7 @@ interface NetworkLexicon {
   target_collection: string | null;
   last_fetched_at: string;
   created_at: string;
+  declared: boolean;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/network-lexicons", {
@@ -528,5 +551,7 @@ curl -X DELETE http://127.0.0.1:3000/admin/network-lexicons/xyz.statusphere.stat
 ```
 
 Removes the network lexicon tracking and also deletes the lexicon from the `happyview_lexicons` table and in-memory registry.
+
+A network lexicon listed under `[network_lexicons] include` in the project's `happyview.toml` reports `declared: true`, and removing it returns `409 Conflict`; remove it from the file instead.
 
 **Response**: `204 No Content`

@@ -8,7 +8,7 @@
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid;
+use crate::tid;
 
 /// How far into the future a repo revision may point before it is refused.
 pub const MAX_REV_CLOCK_SKEW_MICROS: i64 = 5 * 60 * 1_000_000;

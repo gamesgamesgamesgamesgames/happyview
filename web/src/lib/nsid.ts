@@ -54,8 +54,7 @@ export async function resolveNsid(
     if (resp.ok) {
       const doc = await resp.json();
       const services = doc.service as
-        | { id: string; serviceEndpoint: string }[]
-        | undefined;
+        { id: string; serviceEndpoint: string }[] | undefined;
       pdsEndpoint = services?.find(
         (s) => s.id === "#atproto_pds",
       )?.serviceEndpoint;
@@ -74,8 +73,9 @@ export async function resolveNsid(
     if (resp.ok) {
       const data = await resp.json();
       const value = data.value as Record<string, unknown> | undefined;
-      const mainType = (value?.defs as Record<string, Record<string, unknown>> | undefined)
-        ?.main?.type as string | undefined;
+      const mainType = (
+        value?.defs as Record<string, Record<string, unknown>> | undefined
+      )?.main?.type as string | undefined;
       return { type: mainType, lexiconJson: value };
     }
   } catch {

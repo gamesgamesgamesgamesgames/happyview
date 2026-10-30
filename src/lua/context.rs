@@ -1,5 +1,8 @@
+#[cfg(feature = "lua-reference")]
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
+#[cfg(feature = "lua-reference")]
 use serde_json::Value;
+#[cfg(feature = "lua-reference")]
 use std::collections::HashMap;
 
 /// Optional space context passed to Lua scripts when the request is space-scoped.
@@ -13,263 +16,254 @@ pub struct SpaceContext {
     pub skey: String,
 }
 
-fn set_space_context(lua: &Lua, space: Option<&SpaceContext>) -> LuaResult<()> {
-    let globals = lua.globals();
-    match space {
-        Some(ctx) => {
-            let table = lua.create_table()?;
-            table.set("space", ctx.space.as_str())?;
-            table.set("space_id", ctx.space_id.as_str())?;
-            table.set("did", ctx.did.as_str())?;
-            table.set("authority_did", ctx.authority_did.as_str())?;
-            table.set("type_nsid", ctx.type_nsid.as_str())?;
-            table.set("skey", ctx.skey.as_str())?;
-            globals.set("space", table)?;
-        }
-        None => {
-            globals.set("space", mlua::Value::Nil)?;
+impl From<&SpaceContext> for crate::plugin::ScriptSpace {
+    fn from(space: &SpaceContext) -> Self {
+        Self {
+            uri: space.space.clone(),
+            id: space.space_id.clone(),
+            did: space.did.clone(),
+            authority_did: space.authority_did.clone(),
+            type_nsid: space.type_nsid.clone(),
+            skey: space.skey.clone(),
         }
     }
-    Ok(())
 }
 
-/// Set global context variables for a procedure script.
-#[allow(clippy::too_many_arguments)]
-pub fn set_procedure_context(
-    lua: &Lua,
-    method: &str,
-    input: &Value,
-    params: &HashMap<String, Value>,
-    caller_did: &str,
-    collection: &str,
-    space: Option<&SpaceContext>,
-    delegate_did: Option<&str>,
-) -> LuaResult<()> {
-    let globals = lua.globals();
-    globals.set("method", method.to_string())?;
-    globals.set("input", lua.to_value(input)?)?;
-    globals.set("params", lua.to_value(params)?)?;
-    globals.set("caller_did", caller_did.to_string())?;
-    globals.set("collection", collection.to_string())?;
-    match delegate_did {
-        Some(did) => globals.set("delegate_did", did.to_string())?,
-        None => globals.set("delegate_did", mlua::Value::Nil)?,
+/// Everything the runtime knows about one script invocation, built into the
+/// `ctx` argument of `handle(input, ctx)`. Keys are snake_case, the same
+/// convention as everything else a Lua script sees.
+#[cfg(feature = "lua-reference")]
+pub struct Invocation<'a> {
+    pub trigger_id: &'a str,
+    pub caller_did: Option<&'a str>,
+    pub has_pds_auth: bool,
+    pub env: &'a HashMap<String, String>,
+    pub method: Option<&'a str>,
+    pub collection: Option<&'a str>,
+    pub params: Option<&'a HashMap<String, Value>>,
+    pub delegate_did: Option<&'a str>,
+    pub space: Option<&'a SpaceContext>,
+    pub job: Option<mlua::Table>,
+}
+
+/// Build the `ctx` table passed as the second argument to `handle`.
+#[cfg(feature = "lua-reference")]
+pub fn build_ctx(lua: &Lua, inv: &Invocation<'_>) -> LuaResult<mlua::Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("trigger", inv.trigger_id)?;
+    ctx.set("caller_did", inv.caller_did.map(str::to_string))?;
+    ctx.set("has_pds_auth", inv.has_pds_auth)?;
+    ctx.set("env", lua.to_value(inv.env)?)?;
+    ctx.set("method", inv.method.map(str::to_string))?;
+    ctx.set("collection", inv.collection.map(str::to_string))?;
+    ctx.set(
+        "params",
+        match inv.params {
+            Some(p) => lua.to_value(p)?,
+            None => mlua::Value::Nil,
+        },
+    )?;
+    ctx.set("delegate_did", inv.delegate_did.map(str::to_string))?;
+    if let Some(s) = inv.space {
+        let t = lua.create_table()?;
+        t.set("uri", s.space.as_str())?;
+        t.set("id", s.space_id.as_str())?;
+        t.set("did", s.did.as_str())?;
+        t.set("authority_did", s.authority_did.as_str())?;
+        t.set("spaceType", s.type_nsid.as_str())?;
+        t.set("skey", s.skey.as_str())?;
+        ctx.set("space", t)?;
     }
-    set_space_context(lua, space)?;
-    Ok(())
-}
-
-/// Set global context variables for a query script.
-pub fn set_query_context(
-    lua: &Lua,
-    method: &str,
-    params: &HashMap<String, Value>,
-    collection: &str,
-    caller_did: Option<&str>,
-    space: Option<&SpaceContext>,
-) -> LuaResult<()> {
-    let globals = lua.globals();
-    globals.set("method", method.to_string())?;
-    globals.set("params", lua.to_value(params)?)?;
-    globals.set("collection", collection.to_string())?;
-    match caller_did {
-        Some(did) => globals.set("caller_did", did.to_string())?,
-        None => globals.set("caller_did", mlua::Value::Nil)?,
+    if let Some(job) = &inv.job {
+        let t = lua.create_table()?;
+        for canonical in ["id", "progress", "should_stop", "wait"] {
+            t.set(canonical, job.get::<mlua::Value>(canonical)?)?;
+        }
+        ctx.set("job", t)?;
     }
-    set_space_context(lua, space)?;
-    Ok(())
+    Ok(ctx)
 }
 
-/// Set the `env` global table from script variables.
-pub fn set_env_context(lua: &Lua, vars: &HashMap<String, String>) -> LuaResult<()> {
-    let globals = lua.globals();
-    globals.set("env", lua.to_value(vars)?)?;
-    Ok(())
-}
-
-/// Set global context variables for an index hook script.
-pub fn set_hook_context(
+/// The `ctx.job` table a job script receives from a VM in this process: the
+/// job's id, progress reporting, cooperative cancellation and sleep.
+///
+/// An interpreter reaches the same three controls through its `script:host`
+/// imports, which act on the run the host is holding rather than on a job
+/// named here, so this builds the surface only where there is no such run.
+#[cfg(feature = "lua-reference")]
+pub fn job_ctx(
     lua: &Lua,
-    action: &str,
-    uri: &str,
-    did: &str,
-    collection: &str,
-    rkey: &str,
-    record: Option<&Value>,
-) -> LuaResult<()> {
-    let globals = lua.globals();
-    globals.set("action", action.to_string())?;
-    globals.set("uri", uri.to_string())?;
-    globals.set("did", did.to_string())?;
-    globals.set("collection", collection.to_string())?;
-    globals.set("rkey", rkey.to_string())?;
-    match record {
-        Some(r) => globals.set("record", lua.to_value(r)?)?,
-        None => globals.set("record", mlua::Value::Nil)?,
+    state: std::sync::Arc<crate::AppState>,
+    job_id: String,
+) -> LuaResult<mlua::Table> {
+    let job_table = lua.create_table()?;
+    job_table.set("id", job_id.clone())?;
+
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let progress_fn = lua.create_async_function(move |lua, data: mlua::Value| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            let json_data: serde_json::Value =
+                lua.from_value(data).unwrap_or(serde_json::json!({}));
+            async move {
+                crate::jobs::db::update_progress(&state, &job_id, &json_data)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(format!("job.progress failed: {e}")))?;
+                Ok(())
+            }
+        })?;
+        job_table.set("progress", progress_fn)?;
     }
-    Ok(())
+
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let should_stop_fn = lua.create_async_function(move |_lua, ()| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            async move {
+                let result = crate::jobs::db::should_stop(&state, &job_id).await;
+                Ok(result.is_some())
+            }
+        })?;
+        job_table.set("should_stop", should_stop_fn)?;
+    }
+
+    {
+        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
+            let state = state.clone();
+            async move {
+                let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
+                tokio::time::sleep(duration).await;
+                let elapsed_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                crate::telemetry::counters::add_saturating(
+                    &state.telemetry_counters.job_wait_ms,
+                    elapsed_ms,
+                );
+                Ok(())
+            }
+        })?;
+        job_table.set("wait", wait_fn)?;
+    }
+
+    Ok(job_table)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Six same-typed strings, where `space`/`space_id` and `uri`/`id` are the
+    /// pair that do not share a name: a swap would compile and surface only as
+    /// a space a script cannot find.
+    #[test]
+    fn a_space_context_maps_field_for_field_onto_the_wire_shape() {
+        let sent = crate::plugin::ScriptSpace::from(&SpaceContext {
+            space: "at://did:plc:a/space/com.example.type/sk".into(),
+            space_id: "sid".into(),
+            did: "did:plc:a".into(),
+            authority_did: "did:plc:auth".into(),
+            type_nsid: "com.example.type".into(),
+            skey: "sk".into(),
+        });
+        assert_eq!(
+            sent,
+            crate::plugin::ScriptSpace {
+                uri: "at://did:plc:a/space/com.example.type/sk".into(),
+                id: "sid".into(),
+                did: "did:plc:a".into(),
+                authority_did: "did:plc:auth".into(),
+                type_nsid: "com.example.type".into(),
+                skey: "sk".into(),
+            }
+        );
+    }
+}
+
+#[cfg(all(test, feature = "lua-reference"))]
+mod reference_tests {
+    use super::*;
     use crate::lua::sandbox::create_sandbox;
     use serde_json::json;
 
-    #[test]
-    fn hook_context_sets_all_globals() {
+    #[tokio::test]
+    async fn ctx_carries_snake_case_keys_and_nils() {
         let lua = create_sandbox().unwrap();
-        let record = json!({"name": "Test Game"});
-        set_hook_context(
+        let env = HashMap::from([("API".to_string(), "k".to_string())]);
+        let params = HashMap::from([("q".to_string(), json!("x"))]);
+        let space = SpaceContext {
+            space: "at://s".into(),
+            space_id: "sid".into(),
+            did: "did:plc:a".into(),
+            authority_did: "did:plc:auth".into(),
+            type_nsid: "t".into(),
+            skey: "k".into(),
+        };
+        let ctx = build_ctx(
             &lua,
-            "create",
-            "at://did:plc:abc/col/rkey",
-            "did:plc:abc",
-            "col",
-            "rkey",
-            Some(&record),
+            &Invocation {
+                trigger_id: "xrpc.procedure:app.test.p",
+                caller_did: Some("did:plc:me"),
+                has_pds_auth: true,
+                env: &env,
+                method: Some("app.test.p"),
+                collection: Some("app.test.rec"),
+                params: Some(&params),
+                delegate_did: None,
+                space: Some(&space),
+                job: None,
+            },
         )
         .unwrap();
-
-        let globals = lua.globals();
-        assert_eq!(globals.get::<String>("action").unwrap(), "create");
+        lua.globals().set("ctx", ctx).unwrap();
+        let s: String = lua
+            .load(
+                r#"return ctx.caller_did .. "|" .. tostring(ctx.has_pds_auth) .. "|" .. ctx.env.API .. "|" .. ctx.trigger .. "|" .. ctx.method .. "|" .. ctx.collection .. "|" .. ctx.params.q .. "|" .. tostring(ctx.delegate_did) .. "|" .. ctx.space.authority_did .. "|" .. tostring(ctx.job)"#,
+            )
+            .eval()
+            .unwrap();
         assert_eq!(
-            globals.get::<String>("uri").unwrap(),
-            "at://did:plc:abc/col/rkey"
+            s,
+            "did:plc:me|true|k|xrpc.procedure:app.test.p|app.test.p|app.test.rec|x|nil|did:plc:auth|nil"
         );
-        assert_eq!(globals.get::<String>("did").unwrap(), "did:plc:abc");
-        assert_eq!(globals.get::<String>("collection").unwrap(), "col");
-        assert_eq!(globals.get::<String>("rkey").unwrap(), "rkey");
-
-        let rec: mlua::Table = globals.get("record").unwrap();
-        assert_eq!(rec.get::<String>("name").unwrap(), "Test Game");
     }
 
-    #[test]
-    fn procedure_context_sets_all_globals() {
+    #[tokio::test]
+    async fn ctx_for_anonymous_query_has_nil_caller() {
         let lua = create_sandbox().unwrap();
-        let input = json!({"key": "val"});
-        let mut params = HashMap::new();
-        params.insert("limit".to_string(), json!(10));
-        set_procedure_context(
+        let env = HashMap::new();
+        let ctx = build_ctx(
             &lua,
-            "com.example.doThing",
-            &input,
-            &params,
-            "did:plc:test",
-            "com.example.thing",
-            None,
-            None,
+            &Invocation {
+                trigger_id: "xrpc.query:app.test.q",
+                caller_did: None,
+                has_pds_auth: false,
+                env: &env,
+                method: Some("app.test.q"),
+                collection: None,
+                params: None,
+                delegate_did: None,
+                space: None,
+                job: None,
+            },
         )
         .unwrap();
-
-        let globals = lua.globals();
-        assert_eq!(
-            globals.get::<String>("method").unwrap(),
-            "com.example.doThing"
-        );
-        assert_eq!(globals.get::<String>("caller_did").unwrap(), "did:plc:test");
-        assert_eq!(
-            globals.get::<String>("collection").unwrap(),
-            "com.example.thing"
-        );
-        assert!(globals.get::<mlua::Value>("delegate_did").unwrap().is_nil());
-
-        let input_table: mlua::Table = globals.get("input").unwrap();
-        assert_eq!(input_table.get::<String>("key").unwrap(), "val");
-
-        let params_table: mlua::Table = globals.get("params").unwrap();
-        assert_eq!(params_table.get::<i64>("limit").unwrap(), 10);
+        lua.globals().set("ctx", ctx).unwrap();
+        let s: String = lua
+            .load(
+                r#"return tostring(ctx.caller_did) .. "|" .. tostring(ctx.space) .. "|" .. tostring(ctx.collection)"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(s, "nil|nil|nil");
     }
 
-    #[test]
-    fn query_context_sets_all_globals() {
+    #[tokio::test]
+    async fn ctx_carries_a_delegate_and_the_space_fields() {
         let lua = create_sandbox().unwrap();
-        let mut params = HashMap::new();
-        params.insert("limit".to_string(), json!("10"));
-        params.insert("cursor".to_string(), json!("abc"));
-        set_query_context(
-            &lua,
-            "com.example.listThings",
-            &params,
-            "com.example.thing",
-            Some("did:plc:test"),
-            None,
-        )
-        .unwrap();
-
-        let globals = lua.globals();
-        assert_eq!(
-            globals.get::<String>("method").unwrap(),
-            "com.example.listThings"
-        );
-        assert_eq!(
-            globals.get::<String>("collection").unwrap(),
-            "com.example.thing"
-        );
-
-        let params_table: mlua::Table = globals.get("params").unwrap();
-        assert_eq!(params_table.get::<String>("limit").unwrap(), "10");
-        assert_eq!(params_table.get::<String>("cursor").unwrap(), "abc");
-    }
-
-    #[test]
-    fn procedure_context_with_delegate_did() {
-        let lua = create_sandbox().unwrap();
-        let input = json!({"key": "val"});
-        let params = HashMap::new();
-        set_procedure_context(
-            &lua,
-            "com.example.doThing",
-            &input,
-            &params,
-            "did:plc:caller",
-            "com.example.thing",
-            None,
-            Some("did:plc:delegate"),
-        )
-        .unwrap();
-
-        let globals = lua.globals();
-        assert_eq!(
-            globals.get::<String>("delegate_did").unwrap(),
-            "did:plc:delegate"
-        );
-        assert_eq!(
-            globals.get::<String>("caller_did").unwrap(),
-            "did:plc:caller"
-        );
-    }
-
-    #[test]
-    fn env_context_sets_table() {
-        let lua = create_sandbox().unwrap();
-        let mut vars = HashMap::new();
-        vars.insert("API_KEY".to_string(), "secret123".to_string());
-        vars.insert("OTHER".to_string(), "value".to_string());
-        set_env_context(&lua, &vars).unwrap();
-
-        let globals = lua.globals();
-        let env: mlua::Table = globals.get("env").unwrap();
-        assert_eq!(env.get::<String>("API_KEY").unwrap(), "secret123");
-        assert_eq!(env.get::<String>("OTHER").unwrap(), "value");
-    }
-
-    #[test]
-    fn env_context_empty_map() {
-        let lua = create_sandbox().unwrap();
-        let vars = HashMap::new();
-        set_env_context(&lua, &vars).unwrap();
-
-        let globals = lua.globals();
-        let env: mlua::Table = globals.get("env").unwrap();
-        assert!(env.get::<mlua::Value>("anything").unwrap().is_nil());
-    }
-
-    #[test]
-    fn query_context_with_space() {
-        let lua = create_sandbox().unwrap();
-        let params = HashMap::new();
+        let env = HashMap::new();
         let space = SpaceContext {
             space: "at://did:plc:owner/space/com.example.forum/main".into(),
             space_id: "space-123".into(),
@@ -278,60 +272,115 @@ mod tests {
             type_nsid: "com.example.forum".into(),
             skey: "main".into(),
         };
-        set_query_context(
+        let ctx = build_ctx(
             &lua,
-            "com.example.listPosts",
-            &params,
-            "com.example.forum.post",
-            Some("did:plc:test"),
-            Some(&space),
+            &Invocation {
+                trigger_id: "xrpc.procedure:com.example.post",
+                caller_did: Some("did:plc:caller"),
+                has_pds_auth: true,
+                env: &env,
+                method: Some("com.example.post"),
+                collection: Some("com.example.forum.post"),
+                params: None,
+                delegate_did: Some("did:plc:delegate"),
+                space: Some(&space),
+                job: None,
+            },
         )
         .unwrap();
-
-        let globals = lua.globals();
-        let space_table: mlua::Table = globals.get("space").unwrap();
+        lua.globals().set("ctx", ctx).unwrap();
+        let s: String = lua
+            .load(
+                r#"return ctx.delegate_did .. "|" .. ctx.space.uri .. "|" .. ctx.space.id .. "|" .. ctx.space.did .. "|" .. ctx.space.spaceType .. "|" .. ctx.space.skey"#,
+            )
+            .eval()
+            .unwrap();
         assert_eq!(
-            space_table.get::<String>("space").unwrap(),
-            "at://did:plc:owner/space/com.example.forum/main"
+            s,
+            "did:plc:delegate|at://did:plc:owner/space/com.example.forum/main|space-123|did:plc:owner|com.example.forum|main"
         );
-        assert_eq!(space_table.get::<String>("space_id").unwrap(), "space-123");
-        assert_eq!(space_table.get::<String>("did").unwrap(), "did:plc:owner");
     }
 
-    #[test]
-    fn query_context_without_space() {
+    #[tokio::test]
+    async fn job_ctx_carries_the_id_and_the_three_functions() {
         let lua = create_sandbox().unwrap();
-        let params = HashMap::new();
-        set_query_context(
-            &lua,
-            "com.example.listThings",
-            &params,
-            "com.example.thing",
-            None,
-            None,
-        )
-        .unwrap();
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let job = job_ctx(&lua, std::sync::Arc::new(state), "test-id".into()).unwrap();
+        lua.globals().set("job", job).unwrap();
 
-        let globals = lua.globals();
-        assert!(globals.get::<mlua::Value>("space").unwrap().is_nil());
+        let ok: bool = lua
+            .load(
+                r#"
+                return job.id == 'test-id'
+                    and type(job.progress) == 'function'
+                    and type(job.should_stop) == 'function'
+                    and type(job.wait) == 'function'
+                "#,
+            )
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(ok);
     }
 
-    #[test]
-    fn hook_context_record_nil_on_delete() {
+    #[tokio::test]
+    async fn job_wait_clamps_to_the_allowed_range_and_counts_the_time() {
         let lua = create_sandbox().unwrap();
-        set_hook_context(
-            &lua,
-            "delete",
-            "at://did:plc:abc/col/rkey",
-            "did:plc:abc",
-            "col",
-            "rkey",
-            None,
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let counters = state.telemetry_counters.clone();
+        let job = job_ctx(&lua, std::sync::Arc::new(state), "test-id".into()).unwrap();
+        lua.globals().set("job", job).unwrap();
+
+        lua.load("job.wait(-5)").exec_async().await.unwrap();
+        assert_eq!(
+            counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ctx_job_carries_only_the_canonical_keys() {
+        let lua = create_sandbox().unwrap();
+        let env = HashMap::new();
+        let job = lua.create_table().unwrap();
+        job.set("id", "job-1").unwrap();
+        job.set("progress", lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        job.set(
+            "should_stop",
+            lua.create_function(|_, ()| Ok(false)).unwrap(),
         )
         .unwrap();
-
-        let globals = lua.globals();
-        assert_eq!(globals.get::<String>("action").unwrap(), "delete");
-        assert!(globals.get::<mlua::Value>("record").unwrap().is_nil());
+        job.set("wait", lua.create_function(|_, _s: f64| Ok(())).unwrap())
+            .unwrap();
+        job.set("extra", "dropped").unwrap();
+        let ctx = build_ctx(
+            &lua,
+            &Invocation {
+                trigger_id: "job.run:test.export",
+                caller_did: Some("did:plc:me"),
+                has_pds_auth: false,
+                env: &env,
+                method: None,
+                collection: None,
+                params: None,
+                delegate_did: None,
+                space: None,
+                job: Some(job),
+            },
+        )
+        .unwrap();
+        lua.globals().set("ctx", ctx).unwrap();
+        let s: String = lua
+            .load(
+                r#"return ctx.job.id .. "|" .. type(ctx.job.progress) .. "|" .. tostring(ctx.job.should_stop()) .. "|" .. type(ctx.job.wait) .. "|" .. tostring(ctx.job.extra)"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(s, "job-1|function|false|function|nil");
     }
 }

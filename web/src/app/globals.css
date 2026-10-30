@@ -29,6 +29,8 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -67,6 +69,8 @@
   --accent: oklch(0.97 0 0);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
+  --warning: oklch(0.44 0.1 60);
+  --success: oklch(0.45 0.11 155);
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
@@ -101,6 +105,8 @@
   --accent: oklch(0.269 0 0);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
+  --warning: oklch(0.8 0.14 78);
+  --success: oklch(0.78 0.15 160);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
@@ -144,4 +150,20 @@ html.dark .shiki span {
   font-style: var(--shiki-dark-font-style) !important;
   font-weight: var(--shiki-dark-font-weight) !important;
   text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+/* The rules above set `background-color` with `!important`, which an inline
+   style cannot beat: a highlighted block therefore paints the theme's own
+   background inside whatever padding its container has, which reads as a
+   second box. A block that wants the surface behind it to show through opts
+   out here rather than fighting specificity at the call site.
+
+   Both themes need naming. `html.dark .shiki` is two classes and an element,
+   so it outranks a two-class opt-out and only the light rule would have been
+   overridden — which looks fixed in light mode and unchanged in dark. */
+html .shiki-on-surface .shiki,
+html .shiki-on-surface .shiki span,
+html.dark .shiki-on-surface .shiki,
+html.dark .shiki-on-surface .shiki span {
+  background-color: transparent !important;
 }

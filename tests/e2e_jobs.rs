@@ -10,6 +10,19 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::app::TestApp;
+use common::{burn, echo_interpreter};
+
+/// Skips the caller when the echo fixture's module is absent, naming the build
+/// that produces it. Every fixture's `target/` is gitignored, so that is a step
+/// nobody ran; panicking on it would report it as a failure of the worker.
+macro_rules! require_echo {
+    () => {
+        if !echo_interpreter::is_built() {
+            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            return;
+        }
+    };
+}
 
 async fn json_body(resp: axum::response::Response) -> Value {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -416,7 +429,14 @@ async fn resume_running_job_returns_409() {
 // API so a failure here points at the worker rather than the read path.
 // ---------------------------------------------------------------------------
 
+/// Seed a job script row and install the interpreter that will run it. The
+/// bodies below are directives for the echo fixture rather than source in the
+/// language the row names, and `POST /admin/scripts` validates what it stores.
 async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
     // created_at/updated_at have no default on Postgres — bind them explicitly.
     let now = happyview::db::now_rfc3339();
     let sql = adapt_sql(
@@ -445,12 +465,31 @@ async fn job_row(app: &TestApp, id: &str) -> (String, Option<String>, Option<Str
         .expect("job_row: select failed")
 }
 
+/// When a job ran, as the worker recorded it. Both columns are written with
+/// the same `now_rfc3339()`, so they are UTC at a fixed offset and compare
+/// lexicographically.
+async fn job_window(app: &TestApp, id: &str) -> (String, String) {
+    let sql = adapt_sql(
+        "SELECT started_at, completed_at FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let row = happyview::db::query_as::<(Option<String>, Option<String>)>(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("job_window: select failed");
+    (
+        row.0.expect("a job that ran records a start"),
+        row.1.expect("a job that finished records an end"),
+    )
+}
+
 /// Poll until the job leaves the pending/running states, or time out.
 async fn await_terminal_status(
     app: &TestApp,
     id: &str,
 ) -> (String, Option<String>, Option<String>) {
-    for _ in 0..100 {
+    for _ in 0..600 {
         let row = job_row(app, id).await;
         if !matches!(row.0.as_str(), "pending" | "running") {
             return row;
@@ -464,14 +503,10 @@ async fn await_terminal_status(
 #[serial]
 async fn worker_runs_pending_job_to_completion() {
     common::require_db!();
+    require_echo!();
     let app = TestApp::new().await;
 
-    seed_script(
-        &app,
-        "job.run:test.worker",
-        "function handle() return { ok = true } end",
-    )
-    .await;
+    seed_script(&app, "job.run:test.worker", r#"returns:{"ok":true}"#).await;
     let id = seed_job(&app, "test.worker", "pending").await;
 
     let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
@@ -483,44 +518,102 @@ async fn worker_runs_pending_job_to_completion() {
     assert_eq!(result["ok"], true);
 }
 
+/// Running long is what a job is for, so the wall clock every other kind of
+/// run is bounded by is lifted for one — and the worker is what has to reach
+/// that branch. Only guest CPU that outlasts the budget *and then returns*
+/// can tell the two arms apart: a host wait stops the guest's clock for its
+/// whole duration and so costs nothing either way. The burn is sized to this
+/// machine, since no one count outlasts a one-second budget on every machine
+/// without costing seconds on some.
 #[tokio::test]
+#[serial]
+async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
+    common::require_db!();
+    require_echo!();
+    let app = TestApp::new().await;
+    app.state.script_limits.set_wall_clock_seconds(1);
+
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    let burn = burn::calibrate(&app.state, "interpreter_echo").await;
+    seed_script(&app, "job.run:test.long", &burn.source()).await;
+    let id = seed_job(&app, "test.long", "pending").await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let started = std::time::Instant::now();
+    let (status, _result, error) = await_terminal_status(&app, &id).await;
+    let burned = started.elapsed();
+    worker.abort();
+
+    assert_eq!(status, "completed", "job error: {error:?}");
+    burn.assert_outlasted(burned);
+}
+
+// Multi-threaded, because a burning guest holds its thread for the whole run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn two_workers_run_two_jobs_at_once() {
     common::require_db!();
+    require_echo!();
     let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
 
-    // Each job sleeps long enough that a single worker could never have both
-    // running at the same moment.
-    seed_script(
-        &app,
-        "job.run:test.slow",
-        "function handle() job.wait(3) return { ok = true } end",
-    )
-    .await;
+    // Each job burns guest CPU for about three seconds, so two jobs whose
+    // recorded intervals overlap can only have been running at once.
+    let burn = burn::calibrate(&app.state, "interpreter_echo").await;
+    seed_script(&app, "job.run:test.slow", &burn.source()).await;
     let a = seed_job(&app, "test.slow", "pending").await;
     let b = seed_job(&app, "test.slow", "pending").await;
 
     let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 2);
-
-    let mut both_running = false;
-    for _ in 0..20 {
-        let (sa, _, _) = job_row(&app, &a).await;
-        let (sb, _, _) = job_row(&app, &b).await;
-        if sa == "running" && sb == "running" {
-            both_running = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let (status_a, _, error_a) = await_terminal_status(&app, &a).await;
+    let (status_b, _, error_b) = await_terminal_status(&app, &b).await;
     for w in &workers {
         w.abort();
     }
 
     assert_eq!(workers.len(), 2);
+    assert_eq!(status_a, "completed", "job a: {error_a:?}");
+    assert_eq!(status_b, "completed", "job b: {error_b:?}");
+
+    // Concurrency is read off the two recorded intervals rather than caught in
+    // the act. Polling for both rows to say `running` has to be scheduled
+    // during the overlap, and it competes for threads and pool connections
+    // with the two burning guests it is watching -- so a runner slow enough
+    // wakes it after both jobs are done and it reports a concurrency failure
+    // that never happened.
+    let (a_start, a_end) = job_window(&app, &a).await;
+    let (b_start, b_end) = job_window(&app, &b).await;
     assert!(
-        both_running,
-        "expected both jobs to be running concurrently"
+        a_start < b_end && b_start < a_end,
+        "the jobs ran one after the other, not at once: \
+         a {a_start}..{a_end}, b {b_start}..{b_end}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_records_the_line_of_a_failing_job() {
+    common::require_db!();
+    require_echo!();
+    let app = TestApp::new().await;
+
+    seed_script(&app, "job.run:test.failing", "error:runtime").await;
+    let id = seed_job(&app, "test.failing", "pending").await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let (status, _result, error) = await_terminal_status(&app, &id).await;
+    worker.abort();
+
+    assert_eq!(status, "failed");
+    let error = error.expect("no error persisted");
+    assert!(error.starts_with("runtime: "), "{error}");
+    assert!(error.contains("[string \"script\"]:7:"), "{error}");
 }
 
 #[tokio::test]
@@ -944,11 +1037,12 @@ async fn seed_record(app: &TestApp, uri: &str, collection: &str) {
         app.state.db_backend,
     );
     let now = happyview::db::now_rfc3339();
+    let rkey = uri.rsplit('/').next().expect("a uri has an rkey");
     happyview::db::query(&sql)
         .bind(uri)
         .bind("did:plc:seed")
         .bind(collection)
-        .bind("rkey1")
+        .bind(rkey)
         .bind(r#"{"text":"hi"}"#)
         .bind("bafyseed")
         .bind(&now)
@@ -1044,7 +1138,7 @@ async fn seed_records_bulk(app: &TestApp, collection: &str, count: usize) {
         for j in 0..n {
             let idx = i + j;
             q = q
-                .bind(format!("at://did:plc:bulk/{collection}/{idx}"))
+                .bind(format!("at://did:plc:bulk/{collection}/rkey{idx}"))
                 .bind("did:plc:bulk".to_string())
                 .bind(collection.to_string())
                 .bind(format!("rkey{idx}"))

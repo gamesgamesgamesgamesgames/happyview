@@ -202,6 +202,7 @@ pub struct LinkedAccountSummary {
     pub account_id: String,
     pub created_at: String,
     pub updated_at: String,
+    pub expires_at: Option<String>,
 }
 
 /// List all linked external accounts for a user
@@ -211,24 +212,23 @@ pub async fn list_linked_accounts(
     did: &str,
 ) -> Result<Vec<LinkedAccountSummary>, TokenError> {
     let sql = adapt_sql(
-        "SELECT plugin_id, account_id, created_at, updated_at FROM happyview_external_account_tokens WHERE did = ? ORDER BY created_at DESC",
+        "SELECT plugin_id, account_id, created_at, updated_at, expires_at FROM happyview_external_account_tokens WHERE did = ? ORDER BY created_at DESC",
         backend,
     );
 
-    let rows: Vec<(String, String, String, String)> =
+    let rows: Vec<(String, String, String, String, Option<String>)> =
         crate::db::query_as(&sql).bind(did).fetch_all(db).await?;
 
     Ok(rows
         .into_iter()
         .map(
-            |(plugin_id, account_id, created_at, updated_at)| LinkedAccountSummary {
+            |(plugin_id, account_id, created_at, updated_at, expires_at)| LinkedAccountSummary {
                 plugin_id,
                 account_id,
                 created_at,
                 updated_at,
+                expires_at,
             },
         )
         .collect())
 }
-
-// Integration tests for token storage are in tests/e2e_external_auth.rs

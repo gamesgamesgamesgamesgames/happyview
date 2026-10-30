@@ -1,0 +1,12 @@
+{
+  "id": "sdk_atproto",
+  "name": "SDK atproto fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "atproto_fixture",
+  "capabilities": ["atproto:read", "attest:sign"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "wasm_file": "target/wasm32-unknown-unknown/release/sdk_atproto.wasm"
+}

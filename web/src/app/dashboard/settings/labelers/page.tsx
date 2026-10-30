@@ -66,7 +66,9 @@ export default function LabelersPage() {
 
   // Resolve DIDs to handles via PLC directory
   useEffect(() => {
-    const newDids = labelers.map((l) => l.did).filter((did) => !(did in handles));
+    const newDids = labelers
+      .map((l) => l.did)
+      .filter((did) => !(did in handles));
     if (newDids.length === 0) return;
     for (const did of newDids) {
       fetch(`https://plc.directory/${encodeURIComponent(did)}`)
@@ -88,7 +90,9 @@ export default function LabelersPage() {
     try {
       const newStatus = labeler.status === "active" ? "paused" : "active";
       await updateLabeler(labeler.did, { status: newStatus });
-      toast.success(labeler.status === "active" ? "Labeler paused" : "Labeler resumed");
+      toast.success(
+        labeler.status === "active" ? "Labeler paused" : "Labeler resumed",
+      );
       load();
     } catch (e: unknown) {
       toastError("Failed to update labeler status", e);
@@ -144,7 +148,8 @@ export default function LabelersPage() {
                     colSpan={6}
                     className="text-muted-foreground text-center"
                   >
-                    No labeler subscriptions yet. Add a labeler to subscribe to external content labeling services.
+                    No labeler subscriptions yet. Add a labeler to subscribe to
+                    external content labeling services.
                   </TableCell>
                 </TableRow>
               )}
@@ -161,15 +166,25 @@ export default function LabelersPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <Badge
-                      className={
-                        l.status === "active"
-                          ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
-                          : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200"
-                      }
-                    >
-                      {l.status}
-                    </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge
+                        className={
+                          l.status === "active"
+                            ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                            : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200"
+                        }
+                      >
+                        {l.status}
+                      </Badge>
+                      {l.declared && (
+                        <Badge
+                          variant="outline"
+                          title="Declared in happyview.toml. Remove it from the file to unsubscribe."
+                        >
+                          happyview.toml
+                        </Badge>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="font-mono text-sm">
                     {l.cursor ?? "—"}
@@ -187,8 +202,16 @@ export default function LabelersPage() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
-                          title={l.status === "active" ? "Pause labeler" : "Resume labeler"}
-                          aria-label={l.status === "active" ? "Pause labeler" : "Resume labeler"}
+                          title={
+                            l.status === "active"
+                              ? "Pause labeler"
+                              : "Resume labeler"
+                          }
+                          aria-label={
+                            l.status === "active"
+                              ? "Pause labeler"
+                              : "Resume labeler"
+                          }
                           onClick={() => handleToggleStatus(l)}
                         >
                           {l.status === "active" ? (
@@ -198,7 +221,7 @@ export default function LabelersPage() {
                           )}
                         </Button>
                       )}
-                      {hasPermission("labelers:delete") && (
+                      {hasPermission("labelers:delete") && !l.declared && (
                         <Button
                           variant="destructive"
                           size="icon"
@@ -219,7 +242,12 @@ export default function LabelersPage() {
         </div>
       </div>
 
-      <AlertDialog open={!!deleteDid} onOpenChange={(open) => { if (!open) setDeleteDid(null); }}>
+      <AlertDialog
+        open={!!deleteDid}
+        onOpenChange={(open) => {
+          if (!open) setDeleteDid(null);
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete labeler?</AlertDialogTitle>
@@ -238,7 +266,9 @@ export default function LabelersPage() {
             <AlertDialogAction
               variant="destructive"
               disabled={deleting}
-              onClick={() => { if (deleteDid) handleDelete(deleteDid); }}
+              onClick={() => {
+                if (deleteDid) handleDelete(deleteDid);
+              }}
             >
               {deleting ? "Deleting..." : "Delete"}
             </AlertDialogAction>
@@ -249,11 +279,7 @@ export default function LabelersPage() {
   );
 }
 
-function AddLabelerDialog({
-  onSuccess,
-}: {
-  onSuccess: () => void;
-}) {
+function AddLabelerDialog({ onSuccess }: { onSuccess: () => void }) {
   const [did, setDid] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);

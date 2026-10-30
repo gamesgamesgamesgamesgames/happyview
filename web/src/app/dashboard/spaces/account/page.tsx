@@ -21,7 +21,11 @@ import {
   getAccountSpaces,
   getInspectorStatus,
 } from "@/lib/api";
-import type { AdminAccountRecord, AdminAccountSpace, InspectorStatus } from "@/types/spaces";
+import type {
+  AdminAccountRecord,
+  AdminAccountSpace,
+  InspectorStatus,
+} from "@/types/spaces";
 import { AccessGrantBanner } from "@/components/spaces/access-grant-banner";
 import { AccessGrantDialog } from "@/components/spaces/access-grant-dialog";
 import { CodeBlock } from "@/components/code-block";
@@ -35,7 +39,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import {
   Table,
   TableBody,
@@ -86,7 +95,9 @@ function AccountView() {
       .catch((e) => {
         if (!cancelled) toastError("Failed to load spaces", e);
       });
-    getInspectorStatus().then(setInspector).catch(() => setInspector(null));
+    getInspectorStatus()
+      .then(setInspector)
+      .catch(() => setInspector(null));
     return () => {
       cancelled = true;
     };
@@ -97,13 +108,19 @@ function AccountView() {
       const request = ++recordsRequest.current;
       setLoading(true);
       try {
-        const data = await getAccountSpaceRecords(did, { limit: PAGE_SIZE, cursor });
+        const data = await getAccountSpaceRecords(did, {
+          limit: PAGE_SIZE,
+          cursor,
+        });
         if (request !== recordsRequest.current) return;
         setRecords(data.records);
         setNextCursor(data.cursor);
       } catch (e: unknown) {
         if (request !== recordsRequest.current) return;
-        if (e instanceof ApiError && e.message === SPACE_ACCESS_GRANT_REQUIRED) {
+        if (
+          e instanceof ApiError &&
+          e.message === SPACE_ACCESS_GRANT_REQUIRED
+        ) {
           access.drop();
           return;
         }
@@ -131,7 +148,9 @@ function AccountView() {
     return (
       <>
         <SiteHeader title="Account" />
-        <p className="text-muted-foreground p-4 text-sm md:p-6">No account selected.</p>
+        <p className="text-muted-foreground p-4 text-sm md:p-6">
+          No account selected.
+        </p>
       </>
     );
   }
@@ -147,7 +166,9 @@ function AccountView() {
             <CardTitle>
               <AccountName did={did} />
             </CardTitle>
-            <CardDescription>Spaces this account belongs to or has written in.</CardDescription>
+            <CardDescription>
+              Spaces this account belongs to or has written in.
+            </CardDescription>
           </CardHeader>
           <CardContent>
             {spaces === null ? null : spaces.length === 0 ? (
@@ -164,11 +185,16 @@ function AccountView() {
                   {spaces.map(({ space, record_count }) => (
                     <TableRow key={space.id}>
                       <TableCell className="font-mono text-xs break-all">
-                        <Link href={`/dashboard/spaces/${encodeURIComponent(space.id)}/`} className="underline underline-offset-2">
+                        <Link
+                          href={`/dashboard/spaces/${encodeURIComponent(space.id)}/`}
+                          className="underline underline-offset-2"
+                        >
                           {space.uri}
                         </Link>
                       </TableCell>
-                      <TableCell className="text-right tabular-nums">{record_count}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {record_count}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -190,7 +216,10 @@ function AccountView() {
               </CardDescription>
               {inspector?.enabled && !access.grant && (
                 <CardAction>
-                  <Button variant="outline" onClick={() => setRequestOpen(true)}>
+                  <Button
+                    variant="outline"
+                    onClick={() => setRequestOpen(true)}
+                  >
                     Request access
                   </Button>
                 </CardAction>
@@ -201,10 +230,16 @@ function AccountView() {
                 <AccessGrantBanner
                   grant={access.grant}
                   remainingMs={access.remainingMs}
-                  onEnd={() => access.end().catch((e) => toastError("Couldn't end access", e))}
+                  onEnd={() =>
+                    access
+                      .end()
+                      .catch((e) => toastError("Couldn't end access", e))
+                  }
                 />
                 {records.length === 0 ? (
-                  <p className="text-muted-foreground text-sm">{loading ? "Loading…" : "No records."}</p>
+                  <p className="text-muted-foreground text-sm">
+                    {loading ? "Loading…" : "No records."}
+                  </p>
                 ) : (
                   <Table>
                     <TableHeader>
@@ -217,9 +252,17 @@ function AccountView() {
                     </TableHeader>
                     <TableBody>
                       {records.map((r) => (
-                        <TableRow key={r.uri} className="cursor-pointer" onClick={() => setViewRecord(r)}>
-                          <TableCell className="font-mono text-xs break-all">{r.space_uri}</TableCell>
-                          <TableCell className="font-mono text-xs">{r.collection}</TableCell>
+                        <TableRow
+                          key={r.uri}
+                          className="cursor-pointer"
+                          onClick={() => setViewRecord(r)}
+                        >
+                          <TableCell className="font-mono text-xs break-all">
+                            {r.space_uri}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {r.collection}
+                          </TableCell>
                           <TableCell className="font-mono text-xs">
                             <button
                               type="button"
@@ -281,12 +324,25 @@ function AccountView() {
             onOpenChange={setRequestOpen}
             maxMinutes={inspector.max_grant_minutes}
             defaultMinutes={inspector.default_grant_minutes}
-            scopeOptions={[{ scope: "account", target: did, label: <>This account, in every space: <AccountName did={did} /></> }]}
+            scopeOptions={[
+              {
+                scope: "account",
+                target: did,
+                label: (
+                  <>
+                    This account, in every space: <AccountName did={did} />
+                  </>
+                ),
+              },
+            ]}
             onGranted={(g) => access.setGrant(g)}
           />
         )}
 
-        <Sheet open={viewRecord != null} onOpenChange={(open) => !open && setViewRecord(null)}>
+        <Sheet
+          open={viewRecord != null}
+          onOpenChange={(open) => !open && setViewRecord(null)}
+        >
           <SheetContent className="flex flex-col overflow-hidden">
             {viewRecord && (
               <>
@@ -294,7 +350,9 @@ function AccountView() {
                   <SheetTitle className="sr-only">Record detail</SheetTitle>
                 </SheetHeader>
                 <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
-                  <p className="font-mono text-xs break-all">{viewRecord.uri}</p>
+                  <p className="font-mono text-xs break-all">
+                    {viewRecord.uri}
+                  </p>
                   {blobs.length > 0 && (
                     <ul className="flex flex-col gap-1">
                       {blobs.map((cid) => (
@@ -312,7 +370,9 @@ function AccountView() {
                       ))}
                     </ul>
                   )}
-                  <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                  <CodeBlock
+                    code={JSON.stringify(viewRecord.record, null, 2)}
+                  />
                 </div>
               </>
             )}

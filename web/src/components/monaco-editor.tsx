@@ -1,26 +1,42 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import dynamic from "next/dynamic";
 import { useTheme } from "next-themes";
-import type { editor, Position } from "monaco-editor";
-import {
-  LUA_KEYWORDS,
-  LUA_BUILTINS,
-  LUA_SNIPPETS,
-  type LuaCompletions,
-} from "@/lib/lua-completions";
+import type { editor, IDisposable, Position } from "monaco-editor";
+import type { Monaco } from "@monaco-editor/react";
+import { LUA_KEYWORDS, LUA_BUILTINS, LUA_SNIPPETS } from "@/lib/lua-language";
 import { lexiconJsonSchema, LEXICON_SCHEMA_URI } from "@/lib/lexicon-schema";
 import { resolveCssColor } from "@/lib/css-utils";
-import {
-  parseLuaIdentifiers,
-  parseRecordVariables,
-  parseDbQueryVariables,
-  parseDbQueryRecordIterators,
-} from "@/lib/lua-parser";
+import { parseLuaIdentifiers } from "@/lib/lua-parser";
 import { HOVER_DOCS } from "@/lib/lua-hover";
+import { readDeclarations } from "@/lib/luals/read";
+import { registerLuaProviders, type LuaEditorState } from "@/lib/luals/monaco";
+import { useDeclarations } from "@/hooks/use-declarations";
 
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
+const DiffEditor = dynamic(
+  () => import("@monaco-editor/react").then((m) => m.DiffEditor),
+  { ssr: false },
+);
+
+/**
+ * Registers the dark theme both `MonacoEditor` and `MonacoDiffEditor` use,
+ * reading the sidebar background so the editor's chrome matches the shell.
+ * Idempotent — `defineTheme` overwrites, so re-registering per mount is fine.
+ */
+function defineHappyViewDarkTheme(monaco: Monaco) {
+  const bg = resolveCssColor("var(--sidebar)");
+  monaco.editor.defineTheme("happyview-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: { "editor.background": bg },
+  });
+}
+
+/** Languages whose interpreter renders declarations an editor can use. */
+const TYPED_LANGUAGES = new Set(["lua", "typescript", "javascript"]);
 
 interface MonacoEditorProps {
   value: string;
@@ -28,8 +44,8 @@ interface MonacoEditorProps {
   language: string;
   readOnly?: boolean;
   className?: string;
-  completions?: LuaCompletions;
-  collections?: string[];
+  /** The script's trigger id, which types a handler's `input` and `ctx`. */
+  trigger?: string;
   tabSize?: number;
 }
 
@@ -39,19 +55,24 @@ export function MonacoEditor({
   language,
   readOnly,
   className,
-  completions,
-  collections,
+  trigger,
   tabSize = 2,
 }: MonacoEditorProps) {
   const { resolvedTheme } = useTheme();
-  const completionsRef = useRef(completions);
-  const collectionsRef = useRef(collections);
-  const disposablesRef = useRef<{ dispose(): void }[]>([]);
+  const files = useDeclarations(
+    TYPED_LANGUAGES.has(language) ? language : undefined,
+  );
+  const decls = useMemo(() => readDeclarations(files), [files]);
+  const luaState = useRef<LuaEditorState>({ decls, trigger });
+  const monacoRef = useRef<Monaco | null>(null);
+  const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const disposablesRef = useRef<IDisposable[]>([]);
 
-  // eslint-disable-next-line react-hooks/refs -- see comment above
-  completionsRef.current = completions;
-  // eslint-disable-next-line react-hooks/refs -- see comment above
-  collectionsRef.current = collections;
+  // Providers read the latest declarations and trigger through the ref, so
+  // they are registered once per mount.
+  useEffect(() => {
+    luaState.current = { decls, trigger };
+  }, [decls, trigger]);
 
   useEffect(() => {
     return () => {
@@ -59,6 +80,27 @@ export function MonacoEditor({
       disposablesRef.current = [];
     };
   }, []);
+
+  // TypeScript and JavaScript read the files as ambient modules, so
+  // `import type { QueryCtx } from "happyview:ctx"` resolves.
+  useEffect(() => {
+    const monaco = monacoRef.current;
+    if (!monaco || (language !== "typescript" && language !== "javascript"))
+      return;
+    const defaults =
+      language === "typescript"
+        ? monaco.typescript.typescriptDefaults
+        : monaco.typescript.javascriptDefaults;
+    const libs = files
+      .filter((f) => f.path.endsWith(".d.ts"))
+      .map((f) =>
+        defaults.addExtraLib(f.contents, `file:///happyview-types/${f.path}`),
+      );
+    return () => libs.forEach((l) => l.dispose());
+  }, [files, language]);
+
+  const owns = (model: editor.ITextModel) =>
+    model === editorRef.current?.getModel();
 
   return (
     <div className={`relative ${className ?? ""}`}>
@@ -72,13 +114,7 @@ export function MonacoEditor({
           loading="Loading editor..."
           path={language === "json" ? "lexicon.json" : undefined}
           beforeMount={(monaco) => {
-            const bg = resolveCssColor("var(--sidebar)");
-            monaco.editor.defineTheme("happyview-dark", {
-              base: "vs-dark",
-              inherit: true,
-              rules: [],
-              colors: { "editor.background": bg },
-            });
+            defineHappyViewDarkTheme(monaco);
 
             // Configure JSON language service with Lexicon schema
             if (language === "json") {
@@ -96,16 +132,24 @@ export function MonacoEditor({
               });
             }
           }}
-          onMount={(_editor, monaco) => {
+          onMount={(mounted, monaco) => {
+            monacoRef.current = monaco;
+            editorRef.current = mounted;
             if (language !== "lua") return;
 
-            // Provider 1: Lua keywords, builtins, and snippets
+            // What HappyView's libraries, lexicons and ctx offer.
+            disposablesRef.current.push(
+              ...registerLuaProviders(monaco, owns, () => luaState.current),
+            );
+
+            // Lua keywords, builtins, snippets and the script's own names.
             disposablesRef.current.push(
               monaco.languages.registerCompletionItemProvider("lua", {
                 provideCompletionItems(
                   model: editor.ITextModel,
                   position: Position,
                 ) {
+                  if (!owns(model)) return { suggestions: [] };
                   const word = model.getWordUntilPosition(position);
                   const range = {
                     startLineNumber: position.lineNumber,
@@ -120,21 +164,25 @@ export function MonacoEditor({
                     position.column - 1,
                   );
 
-                  // Don't suggest keywords after . or : (those are member access)
-                  if (/[.:]$/.test(textBeforeCursor.trimEnd())) {
+                  // Member access and strings are the other provider's.
+                  if (/[.:]\s*\w*$/.test(textBeforeCursor)) {
+                    return { suggestions: [] };
+                  }
+                  if (/["'][\w.]*$/.test(textBeforeCursor)) {
                     return { suggestions: [] };
                   }
 
-                  // Extract identifiers from the current document
                   const staticLabels = new Set([
                     ...LUA_KEYWORDS,
                     ...LUA_BUILTINS,
                     ...LUA_SNIPPETS.map((s) => s.label),
                   ]);
-                  const fullSource = model.getValue();
-                  const identifiers = parseLuaIdentifiers(fullSource);
+                  const identifiers = parseLuaIdentifiers(model.getValue());
                   // Remove the word currently being typed
                   if (word.word) identifiers.delete(word.word);
+                  for (const name of ["input", "ctx"]) {
+                    if (luaState.current.trigger) identifiers.add(name);
+                  }
 
                   const suggestions = [
                     ...LUA_KEYWORDS.map((kw) => ({
@@ -178,10 +226,11 @@ export function MonacoEditor({
               }),
             );
 
-            // Provider 3: Hover documentation
+            // Lua's own builtins: `string.format`, `table.insert`, ...
             disposablesRef.current.push(
               monaco.languages.registerHoverProvider("lua", {
                 provideHover(model: editor.ITextModel, position: Position) {
+                  if (!owns(model)) return null;
                   const word = model.getWordAtPosition(position);
                   if (!word) return null;
 
@@ -223,7 +272,6 @@ export function MonacoEditor({
               }),
             );
 
-            // Provider 4: Signature help
             disposablesRef.current.push(
               monaco.languages.registerSignatureHelpProvider("lua", {
                 signatureHelpTriggerCharacters: ["(", ","],
@@ -231,6 +279,7 @@ export function MonacoEditor({
                   model: editor.ITextModel,
                   position: Position,
                 ) {
+                  if (!owns(model)) return null;
                   const lineContent = model.getLineContent(position.lineNumber);
                   const textBeforeCursor = lineContent.substring(
                     0,
@@ -268,10 +317,10 @@ export function MonacoEditor({
                   if (!fnMatch) return null;
 
                   const fnName = fnMatch[1];
-                  // Normalize colon to look up both Record:save and Record.save
+                  // `s:format(...)` is `string.format`.
                   const entry =
                     HOVER_DOCS.get(fnName) ??
-                    HOVER_DOCS.get(fnName.replace(":", "."));
+                    HOVER_DOCS.get(fnName.replace(/^\w+:/, "string."));
                   if (!entry) return null;
 
                   // Parse parameters from the signature: extract content inside parens
@@ -318,209 +367,6 @@ export function MonacoEditor({
                 },
               }),
             );
-
-            // Provider 2: HappyView-specific completions (Record, db, collections)
-            if (!completions) return;
-            disposablesRef.current.push(
-              monaco.languages.registerCompletionItemProvider("lua", {
-                triggerCharacters: [".", ":", '"'],
-                provideCompletionItems(
-                  model: editor.ITextModel,
-                  position: Position,
-                ) {
-                  const lineContent = model.getLineContent(position.lineNumber);
-                  const textBeforeCursor = lineContent.substring(
-                    0,
-                    position.column - 1,
-                  );
-
-                  // Inside db.query/search/backlinks({ ... }) — suggest option keys
-                  const dbOptionsMatch = textBeforeCursor.match(
-                    /db\.(query|search|backlinks)\(\s*\{[^}]*$/,
-                  );
-                  if (dbOptionsMatch) {
-                    const optionEntries =
-                      completionsRef.current?.[`db.${dbOptionsMatch[1]}`] ?? [];
-                    if (optionEntries.length) {
-                      // Check for collection = " inside db.query — offer NSID completions
-                      const collectionQuoteMatch = textBeforeCursor.match(
-                        /collection\s*=\s*"([^"]*)$/,
-                      );
-                      if (collectionQuoteMatch) {
-                        const cols = collectionsRef.current;
-                        if (!cols?.length) return { suggestions: [] };
-                        const quoteCol = textBeforeCursor.lastIndexOf('"');
-                        const range = {
-                          startLineNumber: position.lineNumber,
-                          endLineNumber: position.lineNumber,
-                          startColumn: quoteCol + 2,
-                          endColumn: position.column,
-                        };
-                        return {
-                          suggestions: cols.map((col) => ({
-                            label: col,
-                            kind: monaco.languages.CompletionItemKind.Value,
-                            insertText: col,
-                            range,
-                          })),
-                        };
-                      }
-
-                      const word = model.getWordUntilPosition(position);
-                      const range = {
-                        startLineNumber: position.lineNumber,
-                        endLineNumber: position.lineNumber,
-                        startColumn: word.startColumn,
-                        endColumn: word.endColumn,
-                      };
-                      return {
-                        suggestions: optionEntries.map((entry) => ({
-                          label: entry.label,
-                          kind: monaco.languages.CompletionItemKind.Property,
-                          detail: entry.detail,
-                          documentation: entry.description,
-                          insertText: entry.label,
-                          range,
-                        })),
-                      };
-                    }
-                  }
-
-                  // Collection NSID completions for collection = " (outside db options) and db.count
-                  const collectionAssignMatch = textBeforeCursor.match(
-                    /(?:db\.count\(\s*"([^"]*)$|collection\s*=\s*"([^"]*)$)/,
-                  );
-
-                  // Record("...") collection completions
-                  const recordMatch =
-                    textBeforeCursor.match(/Record\(\s*"([^"]*)$/);
-                  if (recordMatch || collectionAssignMatch) {
-                    const cols = collectionsRef.current;
-                    if (!cols?.length) return { suggestions: [] };
-                    const quoteCol = textBeforeCursor.lastIndexOf('"');
-                    const range = {
-                      startLineNumber: position.lineNumber,
-                      endLineNumber: position.lineNumber,
-                      startColumn: quoteCol + 2, // after the opening "
-                      endColumn: position.column,
-                    };
-                    return {
-                      suggestions: cols.map((col) => ({
-                        label: col,
-                        kind: monaco.languages.CompletionItemKind.Value,
-                        insertText: col,
-                        range,
-                      })),
-                    };
-                  }
-
-                  // Dot or colon-triggered completions (Record., r:, db., etc.)
-                  const dotMatch = textBeforeCursor.match(/(\w+)\.\w*$/);
-                  const colonMatch = textBeforeCursor.match(/(\w+):\w*$/);
-                  const match = dotMatch || colonMatch;
-                  const isColon = !!colonMatch;
-                  if (!match) return { suggestions: [] };
-
-                  const prefix = match[1];
-
-                  // Build entries based on context
-                  let entries = completionsRef.current?.[prefix];
-
-                  if (!entries && prefix !== "Record" && prefix !== "db") {
-                    const fullSource = model.getValue();
-
-                    // Check if it's a db.query() result variable
-                    const dbQueryVars = parseDbQueryVariables(fullSource);
-                    if (prefix in dbQueryVars) {
-                      entries =
-                        completionsRef.current?.["db.query_result"] ?? [];
-                    }
-
-                    // Check if it's an iterator over db.query().records
-                    if (!entries) {
-                      const iterMap = parseDbQueryRecordIterators(
-                        fullSource,
-                        dbQueryVars,
-                      );
-                      const iterCollection = iterMap[prefix];
-                      if (iterCollection) {
-                        const schemaEntries =
-                          completionsRef.current?.[iterCollection] ?? [];
-                        const uriEntry = {
-                          label: "uri",
-                          detail: "string",
-                          description: "AT URI of the record",
-                        };
-                        entries = [uriEntry, ...schemaEntries];
-                      }
-                    }
-
-                    if (!entries) {
-                      // Variable access — check if it's a Record variable
-                      const varMap = parseRecordVariables(fullSource);
-                      const collection = varMap[prefix];
-
-                      if (collection) {
-                        // Record instance methods/fields
-                        const instanceEntries =
-                          completionsRef.current?.["Record"]?.filter(
-                            (e) =>
-                              e.detail === "method" || e.detail?.endsWith("?"),
-                          ) ?? [];
-
-                        // Collection-specific record properties (merged into completions by parent)
-                        const schemaEntries =
-                          completionsRef.current?.[collection] ?? [];
-
-                        entries = [...instanceEntries, ...schemaEntries];
-                      }
-                    }
-                  }
-
-                  if (isColon && !entries) {
-                    // Colon on unknown variable — show Record instance methods + string methods
-                    const recordMethods =
-                      completionsRef.current?.["Record"]?.filter(
-                        (e) => e.detail === "method",
-                      ) ?? [];
-                    const stringMethods =
-                      completionsRef.current?.["string"] ?? [];
-                    entries = [...recordMethods, ...stringMethods];
-                  }
-
-                  if (!entries?.length) return { suggestions: [] };
-
-                  const word = model.getWordUntilPosition(position);
-                  const range = {
-                    startLineNumber: position.lineNumber,
-                    endLineNumber: position.lineNumber,
-                    startColumn: word.startColumn,
-                    endColumn: word.endColumn,
-                  };
-
-                  return {
-                    suggestions: entries.map((entry) => ({
-                      label: entry.label,
-                      kind:
-                        entry.detail === "method" || entry.detail === "function"
-                          ? monaco.languages.CompletionItemKind.Method
-                          : monaco.languages.CompletionItemKind.Field,
-                      detail: entry.detail,
-                      documentation: entry.description,
-                      insertText: entry.insertText ?? entry.label,
-                      ...(entry.insertText
-                        ? {
-                            insertTextRules:
-                              monaco.languages.CompletionItemInsertTextRule
-                                .InsertAsSnippet,
-                          }
-                        : {}),
-                      range,
-                    })),
-                  };
-                },
-              }),
-            );
           }}
           options={{
             readOnly,
@@ -535,6 +381,50 @@ export function MonacoEditor({
             hideCursorInOverviewRuler: readOnly,
             overviewRulerLanes: readOnly ? 0 : 3,
             quickSuggestions: true,
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+interface MonacoDiffEditorProps {
+  /** Left ("before") side. */
+  original: string;
+  /** Right ("after") side. */
+  modified: string;
+  language: string;
+  className?: string;
+}
+
+/** Read-only side-by-side diff, styled to match {@link MonacoEditor}. */
+export function MonacoDiffEditor({
+  original,
+  modified,
+  language,
+  className,
+}: MonacoDiffEditorProps) {
+  const { resolvedTheme } = useTheme();
+
+  return (
+    <div className={`relative ${className ?? ""}`}>
+      <div className="absolute inset-0">
+        <DiffEditor
+          height="100%"
+          language={language}
+          original={original}
+          modified={modified}
+          theme={resolvedTheme === "dark" ? "happyview-dark" : "vs"}
+          loading="Loading diff..."
+          beforeMount={defineHappyViewDarkTheme}
+          options={{
+            readOnly: true,
+            minimap: { enabled: false },
+            automaticLayout: true,
+            scrollBeyondLastLine: false,
+            wordWrap: "on",
+            fontSize: 12,
+            renderSideBySide: true,
           }}
         />
       </div>

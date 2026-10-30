@@ -1,8 +1,8 @@
+pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -18,6 +18,23 @@ use crate::lexicon::LexiconType;
 use crate::rate_limit::CheckResult;
 use crate::resolve::resolve_nsid_authority;
 
+/// Decode one query-string component.
+///
+/// A query string is form-urlencoded, which the URL standard requires of the
+/// query and which `URLSearchParams`, a browser `fetch` and most HTTP clients
+/// all produce -- so a space arrives as `+`, not `%20`. Percent-decoding alone
+/// left it as a literal plus, and a search for `Integration Demo` therefore
+/// looked for `Integration+Demo` and matched nothing.
+///
+/// The replacement runs first and a real plus survives it: `a+b` is read as
+/// `a b`, while an encoded one is `a%2Bb`, carries no plus to replace, and
+/// percent-decodes to `a+b` afterwards.
+fn decode_component(raw: &str) -> String {
+    urlencoding::decode(&raw.replace('+', " "))
+        .unwrap_or_default()
+        .into_owned()
+}
+
 /// Parse a raw query string into a map where repeated keys become JSON arrays.
 /// Single-value keys remain as JSON strings for backward compatibility.
 pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
@@ -27,14 +44,8 @@ pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
             continue;
         }
         let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (
-                urlencoding::decode(k).unwrap_or_default().into_owned(),
-                urlencoding::decode(v).unwrap_or_default().into_owned(),
-            ),
-            None => (
-                urlencoding::decode(pair).unwrap_or_default().into_owned(),
-                String::new(),
-            ),
+            Some((k, v)) => (decode_component(k), decode_component(v)),
+            None => (decode_component(pair), String::new()),
         };
         multi.entry(key).or_default().push(value);
     }
@@ -565,13 +576,72 @@ pub async fn xrpc_get(
 }
 
 /// Catch-all POST handler for XRPC procedures.
+/// A JSON body, read as strictly as the `Json` extractor did: the media type
+/// has to say JSON, and the bytes have to parse.
+fn json_body(parts: &Parts, raw: &axum::body::Bytes) -> Result<serde_json::Value, AppError> {
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mime = declared.split(';').next().unwrap_or("").trim();
+    if !(mime.eq_ignore_ascii_case("application/json")
+        || mime.to_ascii_lowercase().ends_with("+json"))
+    {
+        return Err(AppError::BadRequest(
+            "this method expects a JSON body; set content-type: application/json".into(),
+        ));
+    }
+
+    serde_json::from_slice(raw)
+        .map_err(|e| AppError::BadRequest(format!("request body is not valid JSON: {e}")))
+}
+
+/// Store a byte body and describe it to the script as a blob ref.
+///
+/// The media type recorded is the caller's, since `*/*` means the caller
+/// decides; a lexicon that pins one supplies it when the caller does not.
+async fn ingest_body(
+    state: &AppState,
+    parts: &Parts,
+    lexicon: &crate::lexicon::ParsedLexicon,
+    raw: &axum::body::Bytes,
+) -> Result<serde_json::Value, AppError> {
+    if raw.is_empty() {
+        return Err(AppError::BadRequest(
+            "this method expects a body of bytes, and none was sent".into(),
+        ));
+    }
+
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mime = match (declared, crate::script::encoding::of_input(lexicon)) {
+        (Some(sent), _) => sent,
+        (None, crate::script::Encoding::Fixed(pinned)) => pinned,
+        (None, _) => "application/octet-stream".to_string(),
+    };
+
+    let cid = crate::blobs::put(&state.db, state.db_backend, raw, &mime).await?;
+    serde_json::to_value(crate::blobs::BlobRef::new(cid, mime, raw.len() as i64))
+        .map_err(|e| AppError::Internal(format!("failed to describe a stored blob: {e}")))
+}
+
 pub async fn xrpc_post(
     State(state): State<AppState>,
     Path(method): Path<String>,
     RawQuery(raw_query): RawQuery,
     xrpc_claims: XrpcClaims,
     parts: Parts,
-    Json(body): Json<serde_json::Value>,
+    // Bytes rather than `Json`, because whether this body is JSON at all is
+    // the lexicon's to declare: `uploadBlob` takes `*/*`, and an extractor
+    // chosen before the method is known cannot honour that. A method whose
+    // lexicon says JSON is parsed exactly as strictly as before.
+    raw_body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let raw_query = raw_query.unwrap_or_default();
     let mut params = parse_query_params(&raw_query);
@@ -641,10 +711,23 @@ pub async fn xrpc_post(
                     let claims = claims.as_ref().ok_or_else(|| {
                         AppError::Auth("XRPC procedures require DPoP authentication".into())
                     })?;
-                    forward_to_caller_pds(&state, claims, &method, &body, &parts).await?
+                    forward_to_caller_pds(
+                        &state,
+                        claims,
+                        &method,
+                        &json_body(&parts, &raw_body)?,
+                        &parts,
+                    )
+                    .await?
                 }
                 crate::proxy_config::ProxyRouting::Authority => {
-                    proxy_to_authority(&state, &method, &raw_query, Some(&body)).await?
+                    proxy_to_authority(
+                        &state,
+                        &method,
+                        &raw_query,
+                        Some(&json_body(&parts, &raw_body)?),
+                    )
+                    .await?
                 }
             };
 
@@ -682,6 +765,16 @@ pub async fn xrpc_post(
         // Re-bind to a reference with matching lifetime
         service_auth_claims_owned = c;
         (&service_auth_claims_owned, None)
+    };
+
+    // `input.encoding` decides what the script receives. Bytes are stored
+    // before the script runs and reach it as an ordinary blob ref, so a script
+    // authorizes and records a body without ever carrying it — which is the
+    // same two-step `uploadBlob` and `createRecord` already describe.
+    let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
+        ingest_body(&state, &parts, &lexicon, &raw_body).await?
+    } else {
+        json_body(&parts, &raw_body)?
     };
 
     let mut response =
@@ -722,6 +815,26 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert_eq!(arr[1], "b");
         assert_eq!(arr[2], "c");
+    }
+
+    /// A space reaches us as `+`, because that is what form-urlencoding --
+    /// and therefore `URLSearchParams` and every browser `fetch` -- sends. A
+    /// plus that was meant literally arrives as `%2B` and must survive.
+    #[test]
+    fn parse_query_params_reads_plus_as_a_space() {
+        let params = parse_query_params("q=Integration+Demo&tag=c%2B%2B&both=a+b%2Bc");
+
+        assert_eq!(params["q"], json!("Integration Demo"));
+        assert_eq!(params["tag"], json!("c++"));
+        assert_eq!(params["both"], json!("a b+c"));
+    }
+
+    /// Keys are form-urlencoded too.
+    #[test]
+    fn parse_query_params_reads_plus_in_a_key() {
+        let params = parse_query_params("a+key=value");
+
+        assert_eq!(params["a key"], json!("value"));
     }
 
     #[test]

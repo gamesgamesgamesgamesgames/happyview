@@ -1,0 +1,15 @@
+[package]
+name = "sdk-auth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sdk_auth"
+crate-type = ["cdylib"]
+
+[dependencies]
+happyview-plugin-sdk = { path = "../../../crates/happyview-plugin-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -28,27 +28,36 @@
 //!   label). The firehose has no caller to surface errors to.
 //! - **XRPC procedures / queries**: fail-CLOSED, single-shot — a script
 //!   error becomes a 5xx response. The XRPC dispatchers in
-//!   [`crate::xrpc`] resolve the script via [`resolve`] and call
+//!   [`crate::xrpc`] resolve the script via [`crate::catalog::ScriptCatalog::resolve_in`] and call
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock};
-
-static JOB_TYPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use crate::catalog::Layer;
+use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
-
-use super::{atproto_api, context, db_api, http_api, record, sandbox, xrpc_api};
+use crate::plugin::{ScriptExecuteOutput, ScriptValueKind};
+use crate::project::ProjectSnapshot;
+use crate::script::{Invocation, ScriptOrigin, Trigger, dispatch};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
 const MAX_ATTEMPTS: u32 = 4;
+
+/// A test run reports a script's failure rather than waiting out seven
+/// seconds of backoff for a failure retrying cannot change.
+fn attempts(state: &AppState) -> u32 {
+    if state.test.is_some() {
+        1
+    } else {
+        MAX_ATTEMPTS
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Trigger grammar
@@ -78,6 +87,18 @@ pub struct ParsedTrigger {
 }
 
 impl ParsedTrigger {
+    /// A trigger the host builds from an event it is handling, rather than
+    /// reads out of text. It validates nothing: [`parse`](Self::parse)
+    /// answers whether text names a trigger, while a suffix taken from a
+    /// firehose event or a lexicon id is looked up as it stands, and one the
+    /// grammar would refuse simply matches no row.
+    pub fn new(kind: TriggerKind, suffix: impl Into<String>) -> Self {
+        Self {
+            kind,
+            suffix: suffix.into(),
+        }
+    }
+
     /// Reconstruct the canonical trigger id from `(kind, suffix)`.
     pub fn id(&self) -> String {
         match self.kind {
@@ -129,7 +150,19 @@ impl ParsedTrigger {
         // Suffix validation: NSID for most triggers, but `labeler.apply:_actor`
         // and `job.run:<type>` have their own formats.
         match kind {
-            TriggerKind::JobRun => validate_job_type(suffix)?,
+            TriggerKind::JobRun => {
+                crate::jobs::validate_job_type(suffix)?;
+                // A project names a job by its file, and `*.test.<ext>` is a
+                // test file before it is anything else. Only the grammar
+                // refuses: a job already saved under such a type is still
+                // enqueued and resolved by exact id, so it keeps running.
+                if suffix.ends_with(".test") {
+                    return Err(format!(
+                        "invalid job type '{suffix}': a final '.test' segment is reserved, \
+                         because src/jobs/{suffix}.<ext> would be read as a test file"
+                    ));
+                }
+            }
             TriggerKind::LabelerApply if suffix == "_actor" => {}
             _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
@@ -141,135 +174,42 @@ impl ParsedTrigger {
     }
 }
 
-fn validate_job_type(job_type: &str) -> Result<(), String> {
-    if job_type.is_empty() || job_type.len() > 128 {
-        return Err(format!(
-            "invalid job type '{job_type}': must be 1–128 characters"
-        ));
-    }
-    if !JOB_TYPE_RE.is_match(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
-        ));
-    }
-    if crate::jobs::native::is_reserved(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
-            crate::jobs::native::RESERVED_PREFIX
-        ));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// ScriptLanguage
-// ---------------------------------------------------------------------------
-
-/// Runtime a script is written for. Today only [`ScriptLanguage::Lua`] ships;
-/// the column is stamped per row so a future runtime (e.g. TypeScript) can
-/// land without a schema migration.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScriptLanguage {
-    #[default]
-    Lua,
-}
-
-impl ScriptLanguage {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Lua => "lua",
-        }
-    }
-
-    pub fn parse_str(s: &str) -> Option<Self> {
-        match s {
-            "lua" => Some(Self::Lua),
-            _ => None,
-        }
-    }
-
-    pub fn supported() -> &'static [&'static str] {
-        &["lua"]
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Script row + resolution
 // ---------------------------------------------------------------------------
 
-/// A row from the `scripts` table — the wire shape the admin API returns.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScriptRow {
-    pub id: String,
-    pub body: String,
-    pub description: Option<String>,
-    pub script_type: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
+/// The language the reference implementation in this crate reads, which is
+/// what the codemod and the save-time compile check are written against.
+/// Which other languages a script may be written in is a question about
+/// installed interpreters, so only this one is a constant.
+pub const NATIVE_LANGUAGE: &str = "lua";
 
 /// A script ready to execute.
 #[derive(Clone, Debug)]
 pub struct ResolvedScript {
     pub id: String,
-    pub language: ScriptLanguage,
+    /// The grammar kind of the trigger this row was looked up by, which is
+    /// what decides the contract its result is read under. It comes from the
+    /// lookup rather than from re-reading `id`, because a stored id the
+    /// grammar refuses still resolves by exact match and still has to run.
+    pub trigger: TriggerKind,
+    /// Which interpreter runs `body`, as the row stamped it.
+    pub script_type: String,
     pub body: String,
-}
-
-/// Look up a single trigger id. Returns `None` when no row matches OR when
-/// the row's `script_type` is unknown to this binary (logged at warn).
-pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
-    let sql = adapt_sql(
-        "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
-        state.db_backend,
-    );
-    let row: Option<(String, String, String)> = match crate::db::query_as(&sql)
-        .bind(trigger_id)
-        .fetch_optional(&state.db)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(trigger_id, "scripts lookup failed: {e}");
-            return None;
-        }
-    };
-    let (id, body, script_type) = row?;
-    let language = match ScriptLanguage::parse_str(&script_type) {
-        Some(l) => l,
-        None => {
-            tracing::warn!(
-                id,
-                script_type,
-                "unknown script_type; this binary supports: {}",
-                ScriptLanguage::supported().join(", ")
-            );
-            return None;
-        }
-    };
-    Some(ResolvedScript { id, language, body })
-}
-
-/// Resolve a record-event trigger with the cascade rule:
-/// `record.<action>:<nsid>` first, then `record.index:<nsid>`.
-pub async fn resolve_record_event(
-    state: &AppState,
-    nsid: &str,
-    action: &str,
-) -> Option<ResolvedScript> {
-    let action_trigger = match action {
-        "create" => Some(format!("record.create:{nsid}")),
-        "update" => Some(format!("record.update:{nsid}")),
-        "delete" => Some(format!("record.delete:{nsid}")),
-        _ => None,
-    };
-    if let Some(t) = action_trigger
-        && let Some(s) = resolve(state, &t).await
-    {
-        return Some(s);
-    }
-    resolve(state, &format!("record.index:{nsid}")).await
+    /// The layer the script came from.
+    pub layer: Layer,
+    /// Project-relative file path, for a project script only.
+    pub path: Option<PathBuf>,
+    /// What the interpreter names the chunk, so an error points at the file a
+    /// project script lives in. Dashboard scripts use `DASHBOARD_CHUNK_NAME`.
+    pub chunk_name: String,
+    /// XRPC methods the script calls, checked against a service-auth token's
+    /// scope before a procedure runs.
+    pub outbound_xrpcs: Vec<String>,
+    /// The snapshot this script was resolved in, whichever layer answered.
+    /// The run carries it so everything it resolves later, such as a local
+    /// module, comes from the same build.
+    pub snapshot: Arc<ProjectSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +244,7 @@ pub enum RecordHookOutcome {
     /// Index this body in place of the one that arrived. Only meaningful for
     /// create/update — a delete has no body to replace.
     Replace(Value),
-    /// Skip the event entirely — the script returned `nil`. Only ever
+    /// Skip the event entirely — the script returned nothing. Only ever
     /// produced by a script that actually ran.
     Skip,
 }
@@ -317,7 +257,12 @@ pub async fn run_record_event_script(
     state: &AppState,
     payload: RecordEventPayload<'_>,
 ) -> RecordHookOutcome {
-    let resolved = match resolve_record_event(state, payload.nsid, payload.action).await {
+    let project = state.project.load_full();
+    let resolved = match state
+        .scripts
+        .resolve_record_event_in(&project, payload.nsid, payload.action)
+        .await
+    {
         Some(s) => s,
         // No script for this trigger → index the event unchanged.
         None => return RecordHookOutcome::Proceed,
@@ -334,8 +279,26 @@ pub async fn run_record_event_script(
         "record": payload.record,
     });
 
+    if no_interpreter_for(state, &resolved).await {
+        dead_letter(
+            state,
+            &DeadLetterEntry {
+                script: &resolved,
+                host_kind: "record",
+                host_id: &host_id,
+                payload: &event_payload,
+                error: &crate::script::no_interpreter_message(&resolved.script_type),
+                attempts: 1,
+                collection: Some(payload.nsid),
+            },
+            payload.uri,
+        )
+        .await;
+        return RecordHookOutcome::Proceed;
+    }
+
     let mut last_error = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..attempts(state) {
         if attempt > 0 {
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
@@ -375,7 +338,7 @@ pub async fn run_record_event_script(
         }
     }
 
-    write_dead_letter(
+    dead_letter(
         state,
         &DeadLetterEntry {
             script: &resolved,
@@ -383,26 +346,10 @@ pub async fn run_record_event_script(
             host_id: &host_id,
             payload: &event_payload,
             error: &last_error,
-            attempts: MAX_ATTEMPTS,
+            attempts: attempts(state),
             collection: Some(payload.nsid),
         },
-    )
-    .await;
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.dead_lettered".to_string(),
-            severity: Severity::Error,
-            actor_did: None,
-            subject: Some(payload.uri.to_string()),
-            detail: serde_json::json!({
-                "host_kind": "record",
-                "host_id": host_id,
-                "trigger": resolved.id,
-                "error": last_error,
-            }),
-        },
-        state.db_backend,
+        payload.uri,
     )
     .await;
 
@@ -412,45 +359,18 @@ pub async fn run_record_event_script(
     RecordHookOutcome::Proceed
 }
 
-/// Single attempt at the record-event Lua script. Used internally by the
-/// retry loop and externally by admin retry endpoints.
+/// Single attempt at the record-event script. Used internally by the retry
+/// loop and externally by admin retry endpoints.
 ///
 /// Returns `Ok(Replace(value))` to continue indexing with `value`,
-/// `Ok(Skip)` when the script returned `nil`, `Ok(Proceed)` when it waved
+/// `Ok(Skip)` when the script returned nothing, `Ok(Proceed)` when it waved
 /// the event through, or `Err(msg)` on any execution failure.
 pub async fn run_record_event_once(
     state: &AppState,
     script: &ResolvedScript,
     payload: RecordEventPayload<'_>,
 ) -> Result<RecordHookOutcome, String> {
-    if script.language != ScriptLanguage::Lua {
-        return Err(format!(
-            "this binary cannot run {} scripts",
-            script.language.as_str()
-        ));
-    }
-    let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
-    let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did))?;
-
-    // Legacy globals (action, uri, did, collection, rkey, record) for
-    // convenience / backwards compatibility.
-    context::set_hook_context(
-        &lua,
-        payload.action,
-        payload.uri,
-        payload.did,
-        payload.nsid,
-        payload.rkey,
-        payload.record,
-    )
-    .map_err(|e| format!("set hook context: {e}"))?;
-
-    // Also expose an `event` table — same fields, different idiom. New
-    // scripts can read `event.action` / `event.record.title` instead of
-    // the bare globals; both styles work.
-    use mlua::LuaSerdeExt;
-    let event_value = serde_json::json!({
+    let event = serde_json::json!({
         "action": payload.action,
         "uri": payload.uri,
         "did": payload.did,
@@ -458,39 +378,43 @@ pub async fn run_record_event_once(
         "rkey": payload.rkey,
         "record": payload.record,
     });
-    lua.globals()
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
-        .map_err(|e| format!("set event global: {e}"))?;
+    let trigger = trigger_of(script, None)?;
+    let outcome = dispatch(
+        state,
+        &Invocation {
+            trigger_id: &script.id,
+            trigger,
+            language: &script.script_type,
+            source: &script.body,
+            input: &event,
+            // The record's author is who a library reads as the caller, and a
+            // firehose event carries none of their credentials.
+            caller_did: Some(payload.did),
+            has_pds_auth: false,
+            method: None,
+            collection: Some(payload.nsid),
+            params: None,
+            delegate_did: None,
+            space: None,
+            origin: ScriptOrigin::of(script),
+        },
+        None,
+    )
+    .await;
 
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
-
-    lua.load(script.body.as_str())
-        .exec()
-        .map_err(|e| format!("script load: {e}"))?;
-    let handle: mlua::Function = lua
-        .globals()
-        .get("handle")
-        .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    match result {
-        mlua::Value::Nil => Ok(RecordHookOutcome::Skip),
-        mlua::Value::Table(_) => {
-            let v: Value = lua
-                .from_value(result)
-                .map_err(|e| format!("convert lua return to JSON: {e}"))?;
-            Ok(RecordHookOutcome::Replace(v))
-        }
-        // Non-nil, non-table return (`return true`) — pass-through.
-        _ => Ok(RecordHookOutcome::Proceed),
+    match outcome.map_err(|e| e.to_string())? {
+        ScriptExecuteOutput::Returned { value, value_kind } => Ok(match value_kind {
+            ScriptValueKind::None => RecordHookOutcome::Skip,
+            ScriptValueKind::Object => RecordHookOutcome::Replace(value),
+            ScriptValueKind::Other => RecordHookOutcome::Proceed,
+        }),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
 }
 
@@ -517,22 +441,24 @@ pub struct LabelAppliedEvent {
 pub enum LabelHookOutcome {
     /// Persist the (possibly rewritten) label.
     Continue(LabelAppliedEvent),
-    /// Skip persistence — the script returned `nil`.
+    /// Skip persistence — the script returned nothing.
     Skip,
 }
 
-/// Compute the trigger string for a given label. `at://` URIs route to
+/// Compute the trigger for a given label. `at://` URIs route to
 /// `labeler.apply:<nsid>` (using the second path segment); everything else
 /// (bare DIDs, malformed) routes to `labeler.apply:_actor`.
-pub fn trigger_for_label_uri(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("at://") {
-        match rest.split('/').nth(1) {
-            Some(nsid) if !nsid.is_empty() => format!("labeler.apply:{nsid}"),
-            _ => "labeler.apply:_actor".to_string(),
-        }
-    } else {
-        "labeler.apply:_actor".to_string()
-    }
+pub fn trigger_for_label_uri(uri: &str) -> ParsedTrigger {
+    let suffix = match uri.strip_prefix("at://").and_then(|rest| {
+        rest.split('/')
+            .nth(1)
+            .filter(|nsid| !nsid.is_empty())
+            .map(str::to_string)
+    }) {
+        Some(nsid) => nsid,
+        None => "_actor".to_string(),
+    };
+    ParsedTrigger::new(TriggerKind::LabelerApply, suffix)
 }
 
 /// Run the label-applied script (if any) for an inbound label. Fail-open:
@@ -542,7 +468,8 @@ pub async fn run_label_applied_script(
     event: LabelAppliedEvent,
 ) -> LabelHookOutcome {
     let trigger = trigger_for_label_uri(&event.uri);
-    let resolved = match resolve(state, &trigger).await {
+    let project = state.project.load_full();
+    let resolved = match state.scripts.resolve_in(&project, &trigger).await {
         Some(s) => s,
         None => return LabelHookOutcome::Continue(event),
     };
@@ -550,15 +477,43 @@ pub async fn run_label_applied_script(
     let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
     let host_id = event.src.clone();
     let original = event.clone();
+    // `_actor` names a bare DID rather than a collection, so it is the one
+    // suffix with nothing to record here.
+    let collection = Some(trigger.suffix.as_str()).filter(|s| *s != "_actor");
+
+    if no_interpreter_for(state, &resolved).await {
+        dead_letter(
+            state,
+            &DeadLetterEntry {
+                script: &resolved,
+                host_kind: "label",
+                host_id: &host_id,
+                payload: &payload,
+                error: &crate::script::no_interpreter_message(&resolved.script_type),
+                attempts: 1,
+                collection,
+            },
+            &event.uri,
+        )
+        .await;
+        return LabelHookOutcome::Continue(original);
+    }
 
     let mut last_error = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..attempts(state) {
         if attempt > 0 {
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
         }
-        match run_label_lua_once(state, &resolved, &event).await {
+        match run_label_once(state, &resolved, &event).await {
             Ok(outcome) => {
+                if matches!(outcome, LabelHookOutcome::Skip) {
+                    tracing::debug!(
+                        target: "happyview::labeler",
+                        src = %event.src, uri = %event.uri, val = %event.val,
+                        "label.applied script skipped persistence"
+                    );
+                }
                 if state.verbose_event_logging.load(Ordering::Relaxed) {
                     log_event(
                         &state.db,
@@ -591,12 +546,7 @@ pub async fn run_label_applied_script(
             }
         }
     }
-    let collection = resolved
-        .id
-        .split_once(':')
-        .map(|(_, suf)| suf)
-        .filter(|s| *s != "_actor");
-    write_dead_letter(
+    dead_letter(
         state,
         &DeadLetterEntry {
             script: &resolved,
@@ -604,112 +554,88 @@ pub async fn run_label_applied_script(
             host_id: &host_id,
             payload: &payload,
             error: &last_error,
-            attempts: MAX_ATTEMPTS,
+            attempts: attempts(state),
             collection,
         },
-    )
-    .await;
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.dead_lettered".to_string(),
-            severity: Severity::Error,
-            actor_did: None,
-            subject: Some(event.uri.clone()),
-            detail: serde_json::json!({
-                "host_kind": "label",
-                "host_id": host_id,
-                "trigger": resolved.id,
-                "error": last_error,
-            }),
-        },
-        state.db_backend,
+        &event.uri,
     )
     .await;
     LabelHookOutcome::Continue(original)
 }
 
-async fn run_label_lua_once(
+async fn run_label_once(
     state: &AppState,
     script: &ResolvedScript,
     event: &LabelAppliedEvent,
 ) -> Result<LabelHookOutcome, String> {
-    if script.language != ScriptLanguage::Lua {
-        return Err(format!(
-            "this binary cannot run {} scripts",
-            script.language.as_str()
-        ));
+    let input = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
+    let trigger = trigger_of(script, None)?;
+    let outcome = dispatch(
+        state,
+        &Invocation {
+            trigger_id: &script.id,
+            trigger,
+            language: &script.script_type,
+            source: &script.body,
+            input: &input,
+            // A label arrives from a subscription, so there is nobody for the
+            // run to act as and no collection of its own to read.
+            caller_did: None,
+            has_pds_auth: false,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            origin: ScriptOrigin::of(script),
+        },
+        None,
+    )
+    .await;
+
+    match outcome.map_err(|e| e.to_string())? {
+        ScriptExecuteOutput::Returned { value, value_kind } => Ok(match value_kind {
+            ScriptValueKind::None => LabelHookOutcome::Skip,
+            // Any field the script omitted falls back to the original. This
+            // makes "filter only" scripts (return `event`) and "rewrite val"
+            // scripts (return `{ val = "..." }`) both ergonomic.
+            ScriptValueKind::Object => LabelHookOutcome::Continue(LabelAppliedEvent {
+                src: extract_string(&value, "src").unwrap_or_else(|| event.src.clone()),
+                uri: extract_string(&value, "uri").unwrap_or_else(|| event.uri.clone()),
+                val: extract_string(&value, "val").unwrap_or_else(|| event.val.clone()),
+                neg: extract_bool(&value, "neg").unwrap_or(event.neg),
+                cts: extract_string(&value, "cts").unwrap_or_else(|| event.cts.clone()),
+                exp: extract_string(&value, "exp").or_else(|| event.exp.clone()),
+            }),
+            ScriptValueKind::Other => LabelHookOutcome::Continue(event.clone()),
+        }),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
-    let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
-    let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, None)?;
+}
 
-    use mlua::LuaSerdeExt;
-    let globals = lua.globals();
-    globals
-        .set("src", event.src.clone())
-        .map_err(|e| format!("set src: {e}"))?;
-    globals
-        .set("uri", event.uri.clone())
-        .map_err(|e| format!("set uri: {e}"))?;
-    globals
-        .set("val", event.val.clone())
-        .map_err(|e| format!("set val: {e}"))?;
-    globals
-        .set("neg", event.neg)
-        .map_err(|e| format!("set neg: {e}"))?;
-    globals
-        .set("cts", event.cts.clone())
-        .map_err(|e| format!("set cts: {e}"))?;
-    match &event.exp {
-        Some(exp) => globals.set("exp", exp.clone()),
-        None => globals.set("exp", mlua::Value::Nil),
-    }
-    .map_err(|e| format!("set exp: {e}"))?;
-    let event_value = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
-    globals
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
-        .map_err(|e| format!("set event: {e}"))?;
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
-
-    lua.load(script.body.as_str())
-        .exec()
-        .map_err(|e| format!("script load: {e}"))?;
-    let handle: mlua::Function = lua
-        .globals()
-        .get("handle")
-        .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    match result {
-        mlua::Value::Nil => Ok(LabelHookOutcome::Skip),
-        mlua::Value::Table(_) => {
-            let v: Value = lua
-                .from_value(result)
-                .map_err(|e| format!("convert lua return: {e}"))?;
-            // Merge: any field the script omitted falls back to the
-            // original. This makes "filter only" scripts (return `event`)
-            // and "rewrite val" scripts (return `{ val = "..." }`) both
-            // ergonomic.
-            let next = LabelAppliedEvent {
-                src: extract_string(&v, "src").unwrap_or_else(|| event.src.clone()),
-                uri: extract_string(&v, "uri").unwrap_or_else(|| event.uri.clone()),
-                val: extract_string(&v, "val").unwrap_or_else(|| event.val.clone()),
-                neg: extract_bool(&v, "neg").unwrap_or(event.neg),
-                cts: extract_string(&v, "cts").unwrap_or_else(|| event.cts.clone()),
-                exp: extract_string(&v, "exp").or_else(|| event.exp.clone()),
-            };
-            Ok(LabelHookOutcome::Continue(next))
-        }
-        _ => Ok(LabelHookOutcome::Continue(event.clone())),
+/// How a failed run reads to an operator: the category it arrived with, then
+/// the interpreter's unparsed text.
+///
+/// Every reader of this is an operator — the retry's warn, the dead-letter
+/// row's only error column, a job row's `error` column, the
+/// `script.dead_lettered` row — and neither half is recoverable from the
+/// other. The text carries the line that points at the script and no category;
+/// a spent budget and an exhausted heap describe themselves in no text at all,
+/// so without the category they read as any other runtime failure.
+pub(crate) fn failure_text(
+    kind: crate::plugin::ScriptErrorKind,
+    file: Option<&str>,
+    raw: &str,
+) -> String {
+    match file {
+        Some(file) => format!("{} in {file}: {raw}", kind.as_str()),
+        None => format!("{}: {raw}", kind.as_str()),
     }
 }
 
@@ -725,129 +651,73 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Register the default API surface on a fresh sandbox: db / http / xrpc /
-/// atproto / linked_repos / jobs / Record. `caller_did` flows into xrpc so
-/// authenticated calls work; pass `None` for unauthenticated contexts.
-///
-/// `linked_repos` needs no caller: a grant carries its own PDS session, so a
-/// record-event script can mirror into a linked repo with no credentials of its
-/// own. It is registered here for the same reason the spaces write surface is —
-/// every script context is meant to have it.
-///
-/// The Record API is registered in **no-auth mode** here — fine for
-/// record-event and label scripts which have no caller credentials.
-/// Calling `:save()` / `:delete()` (the PDS-touching variants) errors
-/// clearly with the no-PDS-auth message; the local-only variants
-/// (`:save_local`, `:delete_local`, `Record.delete_local`) work.
-fn register_default_apis(
-    lua: &mlua::Lua,
-    state: &Arc<AppState>,
-    trigger_id: &str,
-    caller_did: Option<&str>,
-) -> Result<(), String> {
-    db_api::register_db_api(lua, state.clone()).map_err(|e| format!("db api: {e}"))?;
-    http_api::register_http_api(lua, state.clone()).map_err(|e| format!("http api: {e}"))?;
-    xrpc_api::register_xrpc_api(lua, state.clone(), caller_did.map(String::from))
-        .map_err(|e| format!("xrpc api: {e}"))?;
-    atproto_api::register_atproto_api(lua, state.clone(), None)
-        .map_err(|e| format!("atproto api: {e}"))?;
-    crate::lua::spaces_api::register_spaces_write_api(lua, state.clone(), caller_did)
-        .map_err(|e| format!("spaces write api: {e}"))?;
-    crate::lua::linked_repos_api::register_linked_repos_api(lua, state.clone())
-        .map_err(|e| format!("linked repos api: {e}"))?;
-    super::jobs_api::register_jobs_api(
-        lua,
-        state.clone(),
-        caller_did.map(|d| super::jobs_api::JobsCaller {
-            did: d.to_string(),
-            api_client_id: None,
-            dpop_key_id: None,
-        }),
-    )
-    .map_err(|e| format!("jobs api: {e}"))?;
-    record::register_record_api_no_auth(lua, state.clone())
-        .map_err(|e| format!("record api: {e}"))?;
-    register_log_event_api(lua, state, trigger_id, caller_did)?;
-    Ok(())
-}
-
-/// Register `log(msg)` as a Lua global that writes a `script.log` row to
-/// `event_logs` (so operators can inspect script output from
-/// `/dashboard/events` without tailing stderr) AND emits a
-/// `tracing::debug!` for ops who do tail.
-///
-/// `trigger_id` is recorded as the row's `subject` so events for a
-/// specific script can be filtered by trigger. `caller_did` is recorded
-/// as `actor_did` when the runner has one (XRPC handlers); record /
-/// label runners pass `None`.
-///
-/// This intentionally **overrides** the basic `log()` helper that
-/// `sandbox::create_sandbox()` registers (which only writes to
-/// `tracing::debug!`). All script runners call this helper so every
-/// trigger family lands its `log()` calls in the event log.
-pub(crate) fn register_log_event_api(
-    lua: &mlua::Lua,
-    state: &Arc<AppState>,
-    trigger_id: &str,
-    caller_did: Option<&str>,
-) -> Result<(), String> {
-    let state = state.clone();
-    let trigger_id = trigger_id.to_string();
-    let caller_did = caller_did.map(String::from);
-    let log_fn = lua
-        .create_async_function(move |_, msg: String| {
-            let state = state.clone();
-            let trigger_id = trigger_id.clone();
-            let caller_did = caller_did.clone();
-            async move {
-                tracing::debug!(lua_log = %msg, trigger = %trigger_id, "lua script log");
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.log".to_string(),
-                        severity: Severity::Info,
-                        actor_did: caller_did,
-                        subject: Some(trigger_id.clone()),
-                        detail: serde_json::json!({
-                            "trigger": trigger_id,
-                            "message": msg,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
-                Ok(())
-            }
-        })
-        .map_err(|e| format!("log api: {e}"))?;
-    lua.globals()
-        .set("log", log_fn)
-        .map_err(|e| format!("set log global: {e}"))?;
-    Ok(())
-}
-
-/// Load `script_variables` as a flat key→value map for the `env` global.
-async fn load_env_vars(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
-}
-
 struct DeadLetterEntry<'a> {
     script: &'a ResolvedScript,
     host_kind: &'a str,
     host_id: &'a str,
     payload: &'a Value,
     error: &'a str,
+    /// How many runs it took to get here. A retry budget that was spent
+    /// reports the whole budget; a failure no retry could have changed
+    /// reports the one attempt it was worth.
     attempts: u32,
     collection: Option<&'a str>,
+}
+
+/// The trigger a resolved row's run carries, read from the kind the row was
+/// looked up by. A kind and a job that cannot describe one run end the
+/// attempt, rather than running the script under a contract it was not
+/// written against.
+pub(crate) fn trigger_of<'a>(
+    script: &'a ResolvedScript,
+    job: Option<&'a str>,
+) -> Result<Trigger<'a>, String> {
+    Trigger::for_trigger_kind(script.trigger, job)
+        .ok_or_else(|| format!("no run can be built for trigger '{}'", script.id))
+}
+
+/// Whether nothing installed claims this row's language.
+///
+/// The runners ask before spending a retry budget, because a missing plugin
+/// is not a transient failure: four attempts and seven seconds of backoff
+/// cannot install one, and on a busy collection that is ingest held up behind
+/// a wait nothing can satisfy. [`DispatchError`] would say the same thing
+/// from inside the loop, but by then the budget is already being spent.
+///
+/// [`DispatchError`]: crate::script::DispatchError
+async fn no_interpreter_for(state: &AppState, script: &ResolvedScript) -> bool {
+    state
+        .plugin_registry
+        .get_interpreter_by_language(&script.script_type)
+        .await
+        .is_none()
+}
+
+/// Record a failed run where an operator reads it: the row they retry from
+/// and the event their feed shows. One call because they describe one failure
+/// and a run that wrote only one of them would be a half-told story.
+async fn dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>, subject: &str) {
+    if let Some(test) = &state.test {
+        test.note_script_failure(entry.error);
+    }
+    write_dead_letter(state, entry).await;
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "script.dead_lettered".to_string(),
+            severity: Severity::Error,
+            actor_did: None,
+            subject: Some(subject.to_string()),
+            detail: serde_json::json!({
+                "host_kind": entry.host_kind,
+                "host_id": entry.host_id,
+                "trigger": entry.script.id,
+                "error": entry.error,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
 }
 
 async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
@@ -885,175 +755,42 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failure_text_leads_with_its_file() {
+        assert_eq!(
+            failure_text(
+                crate::plugin::ScriptErrorKind::Runtime,
+                Some("src/jobs/tick.lua"),
+                "src/jobs/tick.lua:4: boom"
+            ),
+            "runtime in src/jobs/tick.lua: src/jobs/tick.lua:4: boom"
+        );
+        assert_eq!(
+            failure_text(crate::plugin::ScriptErrorKind::Runtime, None, "x"),
+            "runtime: x"
+        );
+    }
+
     use super::*;
 
-    use crate::AppState;
-    use crate::config::Config;
-    use crate::lexicon::LexiconRegistry;
-    use std::sync::Arc;
-    use tokio::sync::watch;
+    #[test]
+    fn the_job_trigger_grammar_refuses_a_final_test_segment() {
+        let err = ParsedTrigger::parse("job.run:instance.operation.test").unwrap_err();
+        assert!(err.contains(".test"), "{err}");
+        assert!(err.contains("test file"), "{err}");
 
-    fn registration_test_state() -> AppState {
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 3000,
-            database_url: String::new(),
-            database_backend: crate::db::DatabaseBackend::Sqlite,
-            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
-            public_url: String::new(),
-            user_agent: String::new(),
-            session_secret: "test-secret".into(),
-            jetstream_url: String::new(),
-            relay_url: String::new(),
-            plc_url: String::new(),
-            static_dir: String::new(),
-            base_path: None,
-            event_log_retention_days: 30,
-            app_name: None,
-            logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
-            token_encryption_key: None,
-            default_rate_limit_capacity: 100,
-            default_rate_limit_refill_rate: 2.0,
-            telemetry_collector_url: String::new(),
-            platform_api_key_hash: None,
-            job_worker_concurrency: 1,
-        };
-        let (tx, _) = watch::channel(vec![]);
-        let (labeler_tx, _) = watch::channel(());
-        sqlx::any::install_default_drivers();
-        let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let backend = crate::db::DatabaseBackend::Sqlite;
-        let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
-        let did_resolver = atrium_identity::did::CommonDidResolver::new(
-            atrium_identity::did::CommonDidResolverConfig {
-                plc_directory_url: "https://plc.directory".into(),
-                http_client: Arc::clone(&atrium_http),
-            },
-        );
-        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
-            atrium_identity::handle::AtprotoHandleResolverConfig {
-                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
-                http_client: atrium_http,
-            },
-        );
-        let scopes = vec![atrium_oauth::Scope::Known(
-            atrium_oauth::KnownScope::Atproto,
-        )];
-        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
-            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(scopes.clone()),
-            },
-            keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(test_db.clone(), backend),
-            resolver: atrium_oauth::OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-            http_client: crate::http_retry::HappyViewHttpClient::default(),
-        })
-        .expect("test OAuth client");
-        AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: test_db.clone(),
-            backfill_db: test_db.clone(),
-            db_backend: backend,
-            domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
-            collections_tx: tx,
-            labeler_subscriptions_tx: labeler_tx,
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
-                test_db.clone(),
-                backend,
-            ),
-            linked_repos_client: Arc::new(
-                crate::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    scopes,
-                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-                    test_db.clone(),
-                    backend,
-                    None,
-                )
-                .expect("test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-that-is-at-least-32-bytes-long",
-            ),
-            plugin_registry: Arc::new(crate::plugin::PluginRegistry::new()),
-            wasm_runtime: Arc::new(crate::plugin::WasmRuntime::new().expect("wasm runtime")),
-            attestation_signer: None,
-            official_registry: Arc::new(tokio::sync::RwLock::new(
-                crate::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
-            ),
-            proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                crate::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+        for fine in [
+            "test",
+            "test.export",
+            "instance.testing",
+            "contest",
+            "a.tests",
+        ] {
+            assert!(
+                ParsedTrigger::parse(&format!("job.run:{fine}")).is_ok(),
+                "{fine}"
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn default_apis_include_linked_repos() {
-        let state = Arc::new(registration_test_state());
-        let lua = mlua::Lua::new();
-
-        register_default_apis(&lua, &state, "record.create:com.example.thing", None)
-            .expect("default APIs should register");
-
-        let (kind, get_kind, list_kind): (String, String, String) = lua
-            .load("return type(linked_repos), type(linked_repos.get), type(linked_repos.list)")
-            .eval_async()
-            .await
-            .expect("linked_repos should be present for record-event and label scripts");
-
-        assert_eq!(kind, "table");
-        assert_eq!(get_kind, "function");
-        assert_eq!(list_kind, "function");
-    }
-
-    #[tokio::test]
-    async fn default_apis_still_include_the_existing_globals() {
-        let state = Arc::new(registration_test_state());
-        let lua = mlua::Lua::new();
-
-        register_default_apis(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
-            .expect("default APIs should register");
-
-        let ok: bool = lua
-            .load(
-                "return type(db) == 'table' and type(http) == 'table' \
-                    and type(xrpc) == 'table' and type(atproto) == 'table' \
-                    and type(atproto.spaces) == 'table' and type(jobs) == 'table'",
-            )
-            .eval_async()
-            .await
-            .unwrap();
-        assert!(ok, "existing script globals must survive the addition");
     }
 
     #[test]
@@ -1145,39 +882,55 @@ mod tests {
         assert!(ParsedTrigger::parse("record.index:_actor").is_err());
     }
 
+    /// A lookup's kind and the kind its id names are the same kind, for every
+    /// kind. A resolved row is found by exact id match, so this is what makes
+    /// [`ResolvedScript::trigger`] the kind the stored id names rather than a
+    /// guess about it — and what fails if the two prefix tables drift.
+    #[test]
+    fn a_lookup_id_names_the_kind_it_was_built_from() {
+        for (kind, suffix) in [
+            (TriggerKind::RecordIndex, "com.example.thing"),
+            (TriggerKind::RecordCreate, "com.example.thing"),
+            (TriggerKind::RecordUpdate, "com.example.thing"),
+            (TriggerKind::RecordDelete, "com.example.thing"),
+            (TriggerKind::XrpcQuery, "com.example.list"),
+            (TriggerKind::XrpcProcedure, "com.example.post"),
+            (TriggerKind::LabelerApply, "app.bsky.feed.post"),
+            (TriggerKind::JobRun, "test.export"),
+        ] {
+            let id = ParsedTrigger::new(kind, suffix).id();
+            assert_eq!(ParsedTrigger::parse(&id).expect(&id).kind, kind, "{id}");
+        }
+    }
+
     #[test]
     fn label_uri_routes_at_uri_to_nsid() {
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc/app.bsky.feed.post/rkey1"),
+            trigger_for_label_uri("at://did:plc:abc/app.bsky.feed.post/rkey1").id(),
             "labeler.apply:app.bsky.feed.post"
         );
     }
 
     #[test]
     fn label_uri_routes_bare_did_to_actor() {
-        assert_eq!(trigger_for_label_uri("did:plc:abc"), "labeler.apply:_actor");
+        assert_eq!(
+            trigger_for_label_uri("did:plc:abc").id(),
+            "labeler.apply:_actor"
+        );
     }
 
     #[test]
     fn label_uri_routes_malformed_at_uri_to_actor() {
         // `at://` with no path → no second segment → actor.
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc"),
+            trigger_for_label_uri("at://did:plc:abc").id(),
             "labeler.apply:_actor"
         );
         // `at://<did>/` → second segment exists but is empty → actor.
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc/"),
+            trigger_for_label_uri("at://did:plc:abc/").id(),
             "labeler.apply:_actor"
         );
-    }
-
-    #[test]
-    fn script_language_round_trip() {
-        assert_eq!(ScriptLanguage::Lua.as_str(), "lua");
-        assert_eq!(ScriptLanguage::parse_str("lua"), Some(ScriptLanguage::Lua));
-        assert_eq!(ScriptLanguage::parse_str("typescript"), None);
-        assert_eq!(ScriptLanguage::default(), ScriptLanguage::Lua);
     }
 
     #[test]

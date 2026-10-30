@@ -61,6 +61,33 @@ pub struct Consent {
     /// reach instances predating that wizard step, and it needs the two kept
     /// apart or it would nag every operator who has already said no.
     pub prompted: bool,
+    /// The hosting platform that has made reporting mandatory, from
+    /// `TELEMETRY_MANAGED_BY`. See [`Consent::managed_by`].
+    pub managed_by: Option<String>,
+}
+
+impl Consent {
+    /// The consent that applies once `platform` has made reporting
+    /// mandatory: automatic, whatever is stored, and limited to data about
+    /// the instance. The operator's contact address and the lexicon toggles
+    /// are dropped, because a tenant never chose to share them with the
+    /// platform. The stored settings are left as they are, so they apply
+    /// again if the platform lets go.
+    pub fn managed_by(self, platform: Option<&str>) -> Self {
+        let Some(platform) = platform else {
+            return self;
+        };
+        Self {
+            mode: TelemetryMode::Auto,
+            contact: None,
+            lexicon_names: false,
+            lexicon_structure: false,
+            lexicon_documents: false,
+            prompted: true,
+            managed_by: Some(platform.to_string()),
+            ..self
+        }
+    }
 }
 
 async fn flag(pool: &AnyPool, backend: DatabaseBackend, key: &str) -> bool {
@@ -92,7 +119,18 @@ pub async fn load(pool: &AnyPool, backend: DatabaseBackend) -> Consent {
         // enabled telemetry before this marker existed carry no marker row,
         // and prompting them to switch on what is already on would be absurd.
         prompted: mode.reports() || get_setting(pool, KEY_PROMPTED_AT, backend).await.is_some(),
+        managed_by: None,
     }
+}
+
+/// The consent in force: what is stored, under `managed_by` when a platform
+/// has made reporting mandatory.
+pub async fn load_effective(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    managed_by: Option<&str>,
+) -> Consent {
+    load(pool, backend).await.managed_by(managed_by)
 }
 
 /// Record that the telemetry question has been answered, whatever the answer.
@@ -116,14 +154,14 @@ pub async fn mark_prompted(pool: &AnyPool, backend: DatabaseBackend) -> Result<(
         .map(|_| ())
 }
 
-/// Return the instance identifier, minting one if reporting is enabled and
-/// none exists yet.
-pub async fn ensure_instance_id(pool: &AnyPool, backend: DatabaseBackend) -> Option<String> {
-    let mode = get_setting(pool, KEY_MODE, backend)
-        .await
-        .map(|v| TelemetryMode::parse(&v))
-        .unwrap_or(TelemetryMode::Off);
-
+/// Return the instance identifier, minting one if `mode` reports and none
+/// exists yet. `mode` is the effective one, since a managed instance reports
+/// whatever its stored mode says.
+pub async fn ensure_instance_id(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    mode: TelemetryMode,
+) -> Option<String> {
     if !mode.reports() {
         return None;
     }
@@ -185,6 +223,11 @@ mod tests {
             .unwrap();
     }
 
+    async fn ensure(pool: &sqlx::AnyPool) -> Option<String> {
+        let mode = load(pool, DatabaseBackend::Sqlite).await.mode;
+        ensure_instance_id(pool, DatabaseBackend::Sqlite, mode).await
+    }
+
     #[tokio::test]
     async fn defaults_to_off_with_everything_disabled() {
         let pool = pool_with_settings().await;
@@ -213,11 +256,7 @@ mod tests {
     async fn no_instance_id_is_generated_while_off() {
         let pool = pool_with_settings().await;
 
-        assert!(
-            ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-                .await
-                .is_none()
-        );
+        assert!(ensure(&pool).await.is_none());
 
         let stored = crate::admin::settings::get_setting(
             &pool,
@@ -236,12 +275,8 @@ mod tests {
         let pool = pool_with_settings().await;
         set(&pool, "telemetry.mode", "auto").await;
 
-        let first = ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-            .await
-            .unwrap();
-        let second = ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-            .await
-            .unwrap();
+        let first = ensure(&pool).await.unwrap();
+        let second = ensure(&pool).await.unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 36, "expected a hyphenated UUID");
     }
@@ -250,9 +285,7 @@ mod tests {
     async fn instance_id_survives_a_disable_reenable_cycle() {
         let pool = pool_with_settings().await;
         set(&pool, "telemetry.mode", "auto").await;
-        let original = ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-            .await
-            .unwrap();
+        let original = ensure(&pool).await.unwrap();
 
         let sql = crate::db::adapt_sql(
             "UPDATE happyview_instance_settings SET value = ? WHERE key = 'telemetry.mode'",
@@ -263,20 +296,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(
-            ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-                .await
-                .is_none()
-        );
+        assert!(ensure(&pool).await.is_none());
 
         crate::db::query(&sql)
             .bind("auto")
             .execute(&pool)
             .await
             .unwrap();
-        let after = ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-            .await
-            .unwrap();
+        let after = ensure(&pool).await.unwrap();
 
         assert_eq!(original, after);
     }
@@ -351,6 +378,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_platform_forces_automatic_reporting_and_drops_what_the_tenant_shared() {
+        let pool = pool_with_settings().await;
+        set(&pool, "telemetry.mode", "off").await;
+        set(&pool, "telemetry.contact", "operator@example.com").await;
+        set(&pool, "telemetry.lexicon_names", "true").await;
+        set(&pool, "telemetry.lexicon_structure", "true").await;
+        set(&pool, "telemetry.lexicon_documents", "true").await;
+
+        let consent = load_effective(&pool, DatabaseBackend::Sqlite, Some("acme")).await;
+
+        assert_eq!(consent.mode, TelemetryMode::Auto);
+        assert_eq!(consent.managed_by.as_deref(), Some("acme"));
+        assert!(consent.contact.is_none());
+        assert!(!consent.lexicon_names);
+        assert!(!consent.lexicon_structure);
+        assert!(!consent.lexicon_documents);
+        assert!(consent.prompted, "a managed instance has nothing to ask");
+    }
+
+    #[tokio::test]
+    async fn without_a_platform_the_stored_consent_stands() {
+        let pool = pool_with_settings().await;
+        set(&pool, "telemetry.mode", "manual").await;
+        set(&pool, "telemetry.contact", "operator@example.com").await;
+        set(&pool, "telemetry.lexicon_names", "true").await;
+
+        let consent = load_effective(&pool, DatabaseBackend::Sqlite, None).await;
+
+        assert_eq!(consent.mode, TelemetryMode::Manual);
+        assert!(consent.managed_by.is_none());
+        assert_eq!(consent.contact.as_deref(), Some("operator@example.com"));
+        assert!(consent.lexicon_names);
+    }
+
+    #[tokio::test]
+    async fn a_managed_instance_gets_an_id_whatever_its_stored_mode() {
+        let pool = pool_with_settings().await;
+        set(&pool, "telemetry.mode", "off").await;
+
+        let mode = load_effective(&pool, DatabaseBackend::Sqlite, Some("acme"))
+            .await
+            .mode;
+        assert!(
+            ensure_instance_id(&pool, DatabaseBackend::Sqlite, mode)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn ensure_instance_id_does_not_regenerate_a_preexisting_id() {
         let pool = pool_with_settings().await;
         set(&pool, "telemetry.mode", "auto").await;
@@ -361,9 +438,7 @@ mod tests {
         )
         .await;
 
-        let id = ensure_instance_id(&pool, DatabaseBackend::Sqlite)
-            .await
-            .unwrap();
+        let id = ensure(&pool).await.unwrap();
 
         assert_eq!(id, "00000000-0000-0000-0000-000000000000");
     }

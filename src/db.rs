@@ -1,64 +1,14 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use regex::Regex;
-use serde::Deserialize;
-use sqlx::AnyPool;
-use sqlx::any::{AnyArguments, AnyRow};
 use sqlx::migrate::Migrator;
 use sqlx::pool::PoolOptions;
-use sqlx::query::{Query, QueryAs, QueryScalar};
-use sqlx::{Any, AssertSqlSafe, FromRow};
-use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_query_scalar};
-use std::path::Path;
-use std::sync::LazyLock;
+use sqlx::{Any, AnyPool};
 
-/// Bind value for `happyview_records.indexed_at` on **local** write paths.
-///
-/// `indexed_at` records when a record arrived *from the network*, so only the
-/// Jetstream consumer (`record_handler`) and backfill may write it. Everything
-/// else — `Record:save()`, `save_local()`, the built-in XRPC procedure
-/// handlers, linked-repo writes — binds this on insert and omits the column
-/// from its `ON CONFLICT` branch, so a real arrival time survives an
-/// AppView-side edit.
-///
-/// It has to be an explicit NULL rather than an omitted column: SQLite still
-/// declares `indexed_at TEXT DEFAULT (datetime('now'))` while Postgres dropped
-/// its default in `20260213000000_add_created_at.sql`, so leaving the column out
-/// would fabricate an arrival time on one backend and not the other.
-pub const NO_INDEXED_AT: Option<&str> = None;
-
-// ---------------------------------------------------------------------------
-// SQL query helpers (sqlx 0.9 `SqlSafeStr`)
-// ---------------------------------------------------------------------------
-//
-// sqlx 0.9 requires the SQL passed to `query*` to implement `SqlSafeStr`, which
-// only `&'static str` satisfies directly — runtime strings must be wrapped in
-// `AssertSqlSafe`. HappyView builds every query from a static SQLite template
-// run through `adapt_sql` (only bound `?` placeholders vary; no user input is
-// concatenated into the SQL), so the strings are safe to assert. Routing all
-// dynamic queries through these three helpers keeps that assertion in one
-// audited place instead of at ~460 call sites. Backend is always `Any`.
-
-/// `sqlx::query` for a runtime-built (adapted) SQL string.
-pub fn query<'q>(sql: &str) -> Query<'q, Any, AnyArguments> {
-    sqlx_query(AssertSqlSafe(sql.to_owned()))
-}
-
-/// `sqlx::query_as` for a runtime-built (adapted) SQL string.
-pub fn query_as<'q, O>(sql: &str) -> QueryAs<'q, Any, O, AnyArguments>
-where
-    O: for<'r> FromRow<'r, AnyRow>,
-{
-    sqlx_query_as(AssertSqlSafe(sql.to_owned()))
-}
-
-/// `sqlx::query_scalar` for a runtime-built (adapted) SQL string.
-pub fn query_scalar<'q, O>(sql: &str) -> QueryScalar<'q, Any, O, AnyArguments>
-where
-    (O,): for<'r> FromRow<'r, AnyRow>,
-{
-    sqlx_query_scalar(AssertSqlSafe(sql.to_owned()))
-}
+pub use happyview_provider::db::{
+    BUSY_RETRY_ATTEMPTS, DatabaseBackend, MAX_FIELD_PATH_LEN, adapt_sql, is_invalid_data,
+    is_retryable_write_error, is_unavailable, is_valid_json_field_path, now_rfc3339,
+    postgres_json_chain, query, query_as, query_scalar, retry_on_busy, rev_compare,
+};
 
 /// Escape the `LIKE` wildcard metacharacters (`%`, `_`) and the escape character
 /// (`\`) in a value that will be embedded as a *literal* inside a `LIKE` pattern.
@@ -71,214 +21,55 @@ pub fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Database backend type, auto-detected from DATABASE_URL or set via DATABASE_BACKEND.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DatabaseBackend {
-    Sqlite,
-    Postgres,
-}
-
-impl DatabaseBackend {
-    /// Detect backend from DATABASE_URL prefix.
-    pub fn from_url(url: &str) -> Self {
-        if url.starts_with("sqlite://") || url.starts_with("sqlite:") {
-            DatabaseBackend::Sqlite
-        } else {
-            DatabaseBackend::Postgres
-        }
-    }
-
-    /// Parse from string (e.g., from DATABASE_BACKEND env var).
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "sqlite" => Some(DatabaseBackend::Sqlite),
-            "postgres" | "postgresql" => Some(DatabaseBackend::Postgres),
-            _ => None,
-        }
-    }
-}
-
-/// Regex matching `json_extract(col, '$.path.to.leaf')`
-/// Captures: (1) column name, (2) the JSON path after `$.`
-static JSON_EXTRACT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"json_extract\((\w+(?:\.\w+)*),\s*'\$\.([^']+)'\)").unwrap());
-
-/// Regex matching `datetime('now', '±N unit')`
-/// Captures: (1) sign (+/-), (2) the interval value e.g. "7 days"
-static DATETIME_INTERVAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"datetime\('now',\s*'([+-])(\d+\s+[^']+)'\)").unwrap());
-
-/// Regex matching bare `datetime('now')`
-static DATETIME_NOW_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"datetime\('now'\)").unwrap());
-
-/// Convert SQL written in SQLite dialect to work on the target backend.
+/// Begin a transaction that reads and then writes on what it read, holding
+/// the write lock from the start.
 ///
-/// Source SQL uses SQLite syntax:
-/// - `?` placeholders
-/// - `json_extract(col, '$.path')` for JSON access
-/// - `datetime('now')` / `datetime('now', '±N unit')` for timestamps
-/// - `LIKE` for case-insensitive matching
-/// - `0`/`1` for booleans
+/// SQLite's default `BEGIN` is deferred: it takes the write lock only at the
+/// first write, and if another writer committed since this transaction's
+/// first read, that upgrade fails with `SQLITE_BUSY` at once instead of
+/// waiting out the busy timeout. `BEGIN IMMEDIATE` takes the write lock up
+/// front, so a check (a tombstone lookup, a stored rev) cannot go stale
+/// before the write it guards. Postgres gets a plain `BEGIN`; serialize its
+/// writers on the rows concerned with `tombstones::lock_uris` and
+/// `tombstones::lock_did`.
 ///
-/// For Postgres, converts to:
-/// - `$1, $2, $3...` numbered placeholders
-/// - `col::jsonb->'seg1'->'seg2'->>'leaf'` JSON chains
-/// - `NOW()` / `NOW() ± INTERVAL 'N unit'`
-/// - `LIKE` stays as-is (works on both)
-/// - `0`/`1` stays as-is (works on both)
-pub fn adapt_sql(sql: &str, backend: DatabaseBackend) -> String {
+/// Run the whole transaction inside `retry_on_busy`, so a write lock held
+/// past the busy timeout retries the transaction rather than failing it.
+///
+/// Inside [`with_change_reason`] on Postgres, the transaction starts by
+/// setting `happyview.change_reason` (transaction-local) for triggers to read.
+pub async fn begin_write(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
     match backend {
-        DatabaseBackend::Sqlite => {
-            // Source is already SQLite — no-op
-            sql.to_string()
-        }
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
         DatabaseBackend::Postgres => {
-            let mut result = sql.to_string();
-
-            // 1. json_extract → Postgres JSON chain
-            result = adapt_json_extract_to_postgres(&result);
-
-            // 2. datetime('now', '±N unit') → NOW() ± INTERVAL 'N unit'
-            //    Must run before bare datetime('now') replacement.
-            result = DATETIME_INTERVAL_RE
-                .replace_all(&result, |caps: &regex::Captures| {
-                    let sign = &caps[1];
-                    let interval = &caps[2];
-                    format!("NOW() {sign} INTERVAL '{interval}'")
-                })
-                .to_string();
-
-            // 3. datetime('now') → NOW()
-            result = DATETIME_NOW_RE.replace_all(&result, "NOW()").to_string();
-
-            // 4. ? → $1, $2, $3... (quote-aware)
-            result = adapt_placeholders_to_postgres(&result);
-
-            result
+            let mut tx = pool.begin().await?;
+            if let Ok(reason) = CHANGE_REASON.try_with(Clone::clone) {
+                query("SELECT set_config('happyview.change_reason', $1, true)")
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Ok(tx)
         }
     }
 }
 
-/// Whether a JSON field path is one `adapt_json_extract_to_postgres` can
-/// rewrite: dot-separated identifiers of ASCII alphanumerics and underscores,
-/// each optionally subscripted by decimal indices.
-///
-/// The charset is what makes such a path safe to interpolate into a statement
-/// rather than bind. Binding is not an option: the rewriter reads the path out
-/// of the SQL text to build the Postgres arrow chain, so a bound path leaves
-/// `json_extract` in a statement Postgres has no such function for.
-pub fn is_valid_json_field_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return false;
-        }
-        let bracket_start = segment.find('[').unwrap_or(segment.len());
-        let ident = &segment[..bracket_start];
-        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        let mut rest = &segment[bracket_start..];
-        while !rest.is_empty() {
-            if !rest.starts_with('[') {
-                return false;
-            }
-            let close = match rest.find(']') {
-                Some(i) => i,
-                None => return false,
-            };
-            let idx = &rest[1..close];
-            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-    true
+tokio::task_local! {
+    static CHANGE_REASON: String;
 }
 
-/// Convert `json_extract(col, '$.seg1.seg2.leaf')` to Postgres `col::jsonb->'seg1'->'seg2'->>'leaf'`.
-/// Handles array indices: `seg[0].leaf` becomes `->seg->0->>'leaf'`.
-fn adapt_json_extract_to_postgres(sql: &str) -> String {
-    JSON_EXTRACT_RE
-        .replace_all(sql, |caps: &regex::Captures| {
-            let col = &caps[1];
-            let path = &caps[2];
-
-            let mut parts: Vec<(String, bool)> = Vec::new();
-            for segment in path.split('.') {
-                let bracket_start = segment.find('[').unwrap_or(segment.len());
-                let field_name = &segment[..bracket_start];
-                if !field_name.is_empty() {
-                    parts.push((field_name.to_string(), false));
-                }
-                let mut rest = &segment[bracket_start..];
-                while rest.starts_with('[') {
-                    if let Some(close) = rest.find(']') {
-                        parts.push((rest[1..close].to_string(), true));
-                        rest = &rest[close + 1..];
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            let mut chain = format!("{col}::jsonb");
-            let last = parts.len().saturating_sub(1);
-            for (i, (text, is_index)) in parts.iter().enumerate() {
-                let arrow = if i == last { "->>" } else { "->" };
-                if *is_index {
-                    chain.push_str(&format!("{arrow}{text}"));
-                } else {
-                    chain.push_str(&format!("{arrow}'{text}'"));
-                }
-            }
-
-            chain
-        })
-        .to_string()
-}
-
-/// Convert `?` placeholders to `$1, $2, $3...` for Postgres, skipping `?` inside single-quoted strings.
-fn adapt_placeholders_to_postgres(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut counter = 0u32;
-    let mut in_string = false;
-
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            if in_string {
-                // Check for escaped quote ''
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    result.push('\'');
-                    result.push('\'');
-                    i += 2;
-                    continue;
-                }
-                in_string = false;
-            } else {
-                in_string = true;
-            }
-            result.push(c);
-        } else if c == '?' && !in_string {
-            counter += 1;
-            result.push('$');
-            result.push_str(&counter.to_string());
-        } else {
-            result.push(c);
-        }
-        i += 1;
+/// Run `f` with every [`begin_write`] transaction it opens on Postgres tagged
+/// with `reason` in the transaction-local setting `happyview.change_reason`
+/// (`purge:<status>`, `backfill`). HappyView never reads it; a trigger on the
+/// records table can, to label its change feed. `None` runs `f` untagged.
+pub async fn with_change_reason<F: std::future::Future>(reason: Option<String>, f: F) -> F::Output {
+    match reason {
+        Some(reason) => CHANGE_REASON.scope(reason, f).await,
+        None => f.await,
     }
-
-    result
 }
 
 /// Parse a database timestamp string to DateTime<Utc>.
@@ -301,11 +92,6 @@ pub fn parse_dt(s: &str) -> DateTime<Utc> {
     DateTime::UNIX_EPOCH
 }
 
-/// Get current UTC time as RFC 3339 string for database binding.
-pub fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
-}
-
 /// Encode a pagination cursor from a timestamp and URI.
 pub fn encode_cursor(timestamp: &str, uri: &str) -> String {
     BASE64.encode(format!("{timestamp}|{uri}"))
@@ -324,6 +110,11 @@ pub fn decode_cursor(cursor: &str) -> Option<(String, String)> {
 /// so a single large delete permanently inflates disk usage.
 pub const DEFAULT_JOURNAL_SIZE_LIMIT: u64 = 67_108_864;
 
+/// Milliseconds a SQLite connection waits on a lock before `SQLITE_BUSY`.
+/// sqlx sets the same 5 s on every connection it opens; this names it so a
+/// caller that changes it temporarily can put it back.
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
+
 /// Parse `SQLITE_JOURNAL_SIZE_LIMIT`. `-1` means "no limit" and is represented
 /// as `u64::MAX`; anything unparseable falls back to the default rather than
 /// failing boot over a maintenance knob.
@@ -340,14 +131,63 @@ pub fn parse_journal_size_limit(raw: Option<&str>) -> u64 {
 
 /// Resolve the configured journal size limit from the environment.
 pub fn journal_size_limit_bytes() -> u64 {
-    parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
+    parse_journal_size_limit(crate::config::vars::var("SQLITE_JOURNAL_SIZE_LIMIT").as_deref())
+}
+
+/// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
+/// can lose the last transactions but cannot corrupt the database, and it
+/// drops the fsync SQLite's compiled-in `FULL` issues on every commit. `FULL`
+/// is there for operators who want the old durability. Anything else falls
+/// back to `NORMAL` rather than failing boot over a tuning knob.
+pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        None | Some("") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("NORMAL") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("FULL") => "FULL",
+        Some(v) => {
+            tracing::warn!(
+                value = v,
+                "SQLITE_SYNCHRONOUS must be NORMAL or FULL; using NORMAL"
+            );
+            "NORMAL"
+        }
+    }
+}
+
+/// Resolve the configured `synchronous` level from the environment.
+pub fn sqlite_synchronous() -> &'static str {
+    parse_sqlite_synchronous(crate::config::vars::var("SQLITE_SYNCHRONOUS").as_deref())
+}
+
+/// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
+/// Without a limit the first optimize after an upgrade reads every index of a
+/// multi-gigabyte database in full.
+pub const SQLITE_ANALYSIS_LIMIT: u32 = 1000;
+
+/// Refresh planner statistics on the tables SQLite judges to need them.
+///
+/// `0x10002` is `0x02` (run ANALYZE where useful) plus `0x10000` (consider
+/// every table, not only those this connection has queried). The startup
+/// connection has queried nothing, so without the high bit this is a no-op.
+/// Both pragmas must share one connection: `analysis_limit` is per connection.
+pub async fn sqlite_optimize(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let limit_sql = adapt_sql(
+        &format!("PRAGMA analysis_limit = {SQLITE_ANALYSIS_LIMIT}"),
+        DatabaseBackend::Sqlite,
+    );
+    crate::db::query(&limit_sql).execute(&mut *conn).await?;
+    let optimize_sql = adapt_sql("PRAGMA optimize = 0x10002", DatabaseBackend::Sqlite);
+    crate::db::query(&optimize_sql).execute(&mut *conn).await?;
+    Ok(())
 }
 
 /// Apply per-connection SQLite pragmas to every pooled connection.
 ///
-/// `journal_size_limit` is per-connection and not persisted in the database
-/// file, so unlike `journal_mode` it cannot be set once against the pool — that
-/// would reach only whichever single connection served the statement.
+/// `journal_size_limit`, `synchronous` and `foreign_keys` are per-connection
+/// and not persisted in the database file, so unlike `journal_mode` they
+/// cannot be set once against the pool — that would reach only whichever
+/// single connection served the statement.
 fn with_sqlite_pragmas(
     opts: PoolOptions<sqlx::Any>,
     backend: DatabaseBackend,
@@ -356,6 +196,7 @@ fn with_sqlite_pragmas(
         return opts;
     }
     let limit = journal_size_limit_bytes();
+    let synchronous = sqlite_synchronous();
     opts.after_connect(move |conn, _meta| {
         Box::pin(async move {
             let sql = if limit == u64::MAX {
@@ -363,15 +204,87 @@ fn with_sqlite_pragmas(
             } else {
                 format!("PRAGMA journal_size_limit = {limit}")
             };
+            let sql = adapt_sql(&sql, DatabaseBackend::Sqlite);
             crate::db::query(&sql).execute(&mut *conn).await?;
+            let sync_sql = adapt_sql(
+                &format!("PRAGMA synchronous = {synchronous}"),
+                DatabaseBackend::Sqlite,
+            );
+            crate::db::query(&sync_sql).execute(&mut *conn).await?;
+            // sqlx's SQLite driver already turns foreign keys on for every
+            // connection it opens; set here as well, so `ON DELETE CASCADE`
+            // from a record to its refs never rests on that default alone.
+            crate::db::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *conn)
+                .await?;
             Ok(())
         })
     })
 }
 
-/// Connect to the configured database and run migrations.
-pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
+/// Compiled in rather than read from `./migrations` at boot, so the binary
+/// migrates the same wherever it is run from. `build.rs` makes cargo rebuild
+/// when a migration file is added.
+pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+
+/// Install sqlx's `Any` drivers and register the record store's SQLite
+/// functions (`record_store::sqlite_functions`), which must happen before
+/// the first SQLite connection opens. Call this, not
+/// `sqlx::any::install_default_drivers`, before building any pool.
+pub fn install_drivers() {
     sqlx::any::install_default_drivers();
+    crate::record_store::sqlite_functions::register();
+}
+
+/// Why startup could not bring the schema up to date.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateFailure {
+    #[error(transparent)]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error(transparent)]
+    Upgrade(#[from] crate::record_store::upgrade::UpgradeError),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// The pool size from `DATABASE_MAX_CONNECTIONS`, else the backend's default.
+fn max_connections_from_env(backend: DatabaseBackend) -> u32 {
+    crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(match backend {
+            DatabaseBackend::Sqlite => 16,
+            DatabaseBackend::Postgres => 32,
+        })
+}
+
+/// Connect to the configured database, run migrations, and move the record
+/// tables into the compact format if they are not yet
+/// (`record_store::upgrade::run`).
+pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
+    connect_with(url, backend, max_connections_from_env(backend)).await
+}
+
+/// [`connect`] with the pool size given rather than read from
+/// `DATABASE_MAX_CONNECTIONS`.
+pub(crate) async fn connect_with(
+    url: &str,
+    backend: DatabaseBackend,
+    max_connections: u32,
+) -> AnyPool {
+    let pool = open_with(url, backend, max_connections).await;
+    migrate(&pool, backend).await;
+    pool
+}
+
+/// Connect and apply the per-connection settings without migrating, for a
+/// caller whose database is a copy of one that already is.
+pub async fn open(url: &str, backend: DatabaseBackend) -> AnyPool {
+    open_with(url, backend, max_connections_from_env(backend)).await
+}
+
+async fn open_with(url: &str, backend: DatabaseBackend, max_connections: u32) -> AnyPool {
+    install_drivers();
 
     // For SQLite, ensure the parent directory exists
     if backend == DatabaseBackend::Sqlite
@@ -387,14 +300,6 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
         }
     }
 
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(match backend {
-            DatabaseBackend::Sqlite => 16,
-            DatabaseBackend::Postgres => 32,
-        });
-
     let pool = with_sqlite_pragmas(
         PoolOptions::<sqlx::Any>::new()
             .max_connections(max_connections)
@@ -406,7 +311,7 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     .await
     .expect("Failed to connect to database");
 
-    // Enable foreign keys and WAL mode for SQLite
+    // Incremental vacuum, WAL mode and the busy timeout for SQLite
     if backend == DatabaseBackend::Sqlite {
         // Must run before any table exists: on a populated database this is a
         // silent no-op until a full VACUUM rebuilds the file. New instances get
@@ -417,35 +322,206 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             .await
             .expect("Failed to set auto_vacuum");
 
-        crate::db::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await
-            .expect("Failed to enable foreign keys");
-
         crate::db::query("PRAGMA journal_mode = WAL")
             .execute(&pool)
             .await
             .expect("Failed to enable WAL mode");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout");
     }
 
-    // Run migrations from the appropriate directory
-    let migration_dir = match backend {
-        DatabaseBackend::Sqlite => "./migrations/sqlite",
-        DatabaseBackend::Postgres => "./migrations/postgres",
+    pool
+}
+
+/// Apply every migration this build carries, and for SQLite move the record
+/// tables into the compact format.
+pub async fn migrate(pool: &AnyPool, backend: DatabaseBackend) {
+    let migrator = match backend {
+        DatabaseBackend::Sqlite => &SQLITE_MIGRATIONS,
+        DatabaseBackend::Postgres => &POSTGRES_MIGRATIONS,
     };
 
-    let migrator = Migrator::new(Path::new(migration_dir))
-        .await
-        .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
+    let migrated: Result<(), MigrateFailure> = match backend {
+        DatabaseBackend::Sqlite => {
+            async {
+                renumber_moved_migrations(&mut *pool.acquire().await?, backend).await?;
+                migrator.run(pool).await?;
+                crate::record_store::upgrade::run(pool, backend).await?;
+                Ok(())
+            }
+            .await
+        }
+        DatabaseBackend::Postgres => migrate_postgres(pool, migrator).await,
+    };
+    migrated.unwrap_or_else(|e| panic!("Failed to run migrations: {e}"));
 
-    migrator.run(&pool).await.expect("Failed to run migrations");
+    if backend == DatabaseBackend::Sqlite
+        && let Err(e) = sqlite_optimize(pool).await
+    {
+        tracing::warn!(error = %e, "PRAGMA optimize after migrations failed");
+    }
+}
 
-    pool
+/// The advisory lock HappyView holds over its Postgres migrations.
+///
+/// sqlx's migrator takes its own lock with `pg_advisory_lock`, which blocks
+/// inside a statement, and a blocked statement is a transaction that
+/// `CREATE INDEX CONCURRENTLY` waits out. So a second instance booting while
+/// the first builds an index waits on the builder's lock while the builder
+/// waits on it: Postgres reports a deadlock and one of them fails. Taking this
+/// lock first with `pg_try_advisory_lock`, between short sleeps, means a
+/// waiting instance never holds a statement open, and by the time it reaches
+/// sqlx's lock nobody else holds it.
+const PG_MIGRATION_LOCK_KEY: i64 = 0x6876_6d69_6772_6174;
+
+/// How long a booting instance sleeps between tries at the migration lock.
+const PG_MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a waiting instance says it is still waiting. An index build on
+/// a large table can hold the lock for a long time, and silence would look
+/// like a hang.
+const PG_MIGRATION_LOCK_REPORT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Indexes a `-- no-transaction` migration builds `CONCURRENTLY`.
+///
+/// A concurrent build that fails partway leaves an index of that name marked
+/// invalid: never read, still written. sqlx records nothing for the failed
+/// migration, so it runs again on the next boot, but its `IF NOT EXISTS` would
+/// find the invalid index and skip the build. [`migrate_postgres`] drops each
+/// of these that is invalid before migrating, so the retry builds it afresh.
+const CONCURRENTLY_BUILT_INDEXES: &[&str] = &["idx_records_collection_created_at_uri"];
+
+/// Migrations that shipped under one version and now carry another, as
+/// `(description, shipped version, current version)`.
+///
+/// beta and alpha each added a migration numbered `20261008000000`, so a
+/// database from either recorded that version for a different file, and sqlx
+/// would refuse it as modified once both trees became one. The beta one moved.
+/// The description sqlx records identifies whose the row is, where a checksum
+/// would differ between the SQLite and Postgres files.
+const MOVED_MIGRATIONS: &[(&str, i64, i64)] =
+    &[("space access grant events", 20261008000000, 20261008000001)];
+
+/// Point each [`MOVED_MIGRATIONS`] row at its current version, so sqlx sees the
+/// migration as applied under the number it now has and runs the one that
+/// owns the old number. The file is unchanged, so its checksum still matches.
+async fn renumber_moved_migrations(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error> {
+    let exists_sql = match backend {
+        DatabaseBackend::Sqlite => {
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT COUNT(*) FROM pg_tables WHERE tablename = '_sqlx_migrations' AND schemaname = current_schema()"
+        }
+    };
+    let (tables,): (i64,) = crate::db::query_as(exists_sql)
+        .fetch_one(&mut *conn)
+        .await?;
+    if tables == 0 {
+        return Ok(());
+    }
+    for (description, shipped, current) in MOVED_MIGRATIONS {
+        let sql = adapt_sql(
+            "UPDATE _sqlx_migrations SET version = ? WHERE version = ? AND description = ? \
+             AND NOT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = ?)",
+            backend,
+        );
+        let moved = crate::db::query(&sql)
+            .bind(current)
+            .bind(shipped)
+            .bind(*description)
+            .bind(current)
+            .execute(&mut *conn)
+            .await?;
+        if moved.rows_affected() > 0 {
+            tracing::info!(
+                description,
+                from = shipped,
+                to = current,
+                "renumbered a moved migration"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run `migrator` against Postgres under [`PG_MIGRATION_LOCK_KEY`], after
+/// dropping any invalid leftover of [`CONCURRENTLY_BUILT_INDEXES`], then the
+/// record store upgrade under the same lock: a second instance booting waits
+/// for the copy as it waits for a migration.
+async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), MigrateFailure> {
+    let mut conn = pool.acquire().await?;
+
+    let started = std::time::Instant::now();
+    let mut last_report: Option<std::time::Instant> = None;
+    loop {
+        let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
+        let (locked,): (bool,) = crate::db::query_as(&sql)
+            .bind(PG_MIGRATION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?;
+        if locked {
+            break;
+        }
+        if last_report.is_none_or(|at| at.elapsed() >= PG_MIGRATION_LOCK_REPORT) {
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "another instance is running migrations; waiting for it to finish"
+            );
+            last_report = Some(std::time::Instant::now());
+        }
+        tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
+    }
+
+    let outcome = async {
+        for index in CONCURRENTLY_BUILT_INDEXES {
+            let sql = adapt_sql(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = ? AND pg_table_is_visible(c.oid) AND NOT i.indisvalid",
+                DatabaseBackend::Postgres,
+            );
+            let invalid: Option<(i32,)> = crate::db::query_as(&sql)
+                .bind(*index)
+                .fetch_optional(&mut *conn)
+                .await?;
+            if invalid.is_some() {
+                tracing::warn!(
+                    index,
+                    "dropping an index a failed concurrent build left invalid"
+                );
+                let sql = adapt_sql(
+                    &format!("DROP INDEX CONCURRENTLY IF EXISTS {index}"),
+                    DatabaseBackend::Postgres,
+                );
+                crate::db::query(&sql).execute(&mut *conn).await?;
+            }
+        }
+        // `run` would do, but its `Acquire` bound is not general enough for
+        // the compiler to prove `connect`'s future `Send`. `run_direct` is
+        // what `run` calls once it has the connection.
+        renumber_moved_migrations(&mut conn, DatabaseBackend::Postgres).await?;
+        migrator.run_direct(None, &mut *conn, false).await?;
+        // On the lock's own connection: it stays busy (no idle session the
+        // server could drop mid-copy), and a one-connection pool suffices.
+        crate::record_store::upgrade::run_on(&mut conn, DatabaseBackend::Postgres).await?;
+        Ok::<(), MigrateFailure>(())
+    }
+    .await;
+
+    let sql = adapt_sql("SELECT pg_advisory_unlock(?)", DatabaseBackend::Postgres);
+    let unlocked = crate::db::query(&sql)
+        .bind(PG_MIGRATION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await;
+    outcome?;
+    unlocked?;
+    Ok(())
 }
 
 /// Extract the filesystem path from a `sqlite://` URL, dropping query params.
@@ -461,9 +537,13 @@ pub fn sqlite_path_from_url(url: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(path))
 }
 
+/// Upper bound on the computed backfill pool size. SQLite allows one writer,
+/// and every open connection is another reader that can keep the WAL from
+/// rewinding, so its pool stays small; `BACKFILL_DATABASE_MAX_CONNECTIONS`
+/// still overrides it.
 pub fn backfill_pool_ceiling(backend: DatabaseBackend) -> u32 {
     match backend {
-        DatabaseBackend::Sqlite => 64,
+        DatabaseBackend::Sqlite => 16,
         DatabaseBackend::Postgres => 256,
     }
 }
@@ -478,8 +558,7 @@ pub fn compute_backfill_pool_size(
     dids_per_pds: u32,
     resolution: u32,
 ) -> u32 {
-    std::env::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
-        .ok()
+    crate::config::vars::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or_else(|| {
             needed_backfill_connections(pds, dids_per_pds, resolution)
@@ -489,16 +568,15 @@ pub fn compute_backfill_pool_size(
 }
 
 pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
-    let pds: u32 = std::env::var("BACKFILL_CONCURRENT_PDS")
-        .ok()
+    install_drivers();
+
+    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let dids: u32 = std::env::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .ok()
+    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let resolution: u32 = std::env::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .ok()
+    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);
@@ -517,17 +595,12 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
     .expect("Failed to connect backfill database pool");
 
     if backend == DatabaseBackend::Sqlite {
-        crate::db::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await
-            .expect("Failed to enable foreign keys on backfill pool");
-
         crate::db::query("PRAGMA journal_mode = WAL")
             .execute(&pool)
             .await
             .expect("Failed to enable WAL mode on backfill pool");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout on backfill pool");
@@ -542,6 +615,57 @@ mod tests {
     use chrono::Datelike;
     use serial_test::serial;
 
+    #[tokio::test]
+    async fn open_skips_migrations_and_migrate_applies_them() {
+        let dir = std::env::temp_dir().join(format!("hv-db-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("a.db").display());
+        let jobs_table =
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'happyview_jobs'";
+
+        let pool = open(&url, DatabaseBackend::Sqlite).await;
+        let before: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert!(before.is_empty(), "open must not migrate");
+
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        // A second run is what every boot after the first does.
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        let after: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert_eq!(after.len(), 1);
+
+        let records: (String,) =
+            query_as("SELECT type FROM sqlite_master WHERE name = 'happyview_records'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            records.0, "view",
+            "migrate must run the record store upgrade"
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every migration file in the tree is compiled into the binary, so a
+    /// binary run outside its checkout migrates exactly as one run inside it.
+    #[test]
+    fn embedded_migrations_cover_every_file() {
+        for (dir, migrator) in [
+            ("migrations/sqlite", &super::SQLITE_MIGRATIONS),
+            ("migrations/postgres", &super::POSTGRES_MIGRATIONS),
+        ] {
+            let on_disk =
+                std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+                    .count();
+            assert!(on_disk > 0, "{dir} holds no migrations");
+            assert_eq!(migrator.iter().count(), on_disk, "{dir}");
+        }
+    }
+
     const CAST_ON_READ: &[&str] = &[
         "service_identity.setup_complete",
         "happyview_jobs.inherit_auth",
@@ -549,6 +673,84 @@ mod tests {
 
     const UNMAPPABLE_DECLTYPES: &[&str] =
         &["boolean", "bool", "date", "time", "datetime", "timestamp"];
+
+    /// Every index a Postgres migration builds `CONCURRENTLY` is one
+    /// `migrate_postgres` knows to repair. A failed build leaves the index
+    /// invalid, and one missing from [`CONCURRENTLY_BUILT_INDEXES`] would stay
+    /// that way, skipped by its own `IF NOT EXISTS` on every retry.
+    #[test]
+    fn concurrently_built_indexes_are_all_repairable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut found = 0;
+        for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "sql") {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path).expect("read migration");
+            let code = sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let words: Vec<&str> = code.split_whitespace().collect();
+            for (i, pair) in words.windows(2).enumerate() {
+                if pair != ["index", "concurrently"] || i == 0 {
+                    continue;
+                }
+                if !matches!(words[i - 1], "create" | "unique") {
+                    continue;
+                }
+                let mut rest = words[i + 2..].iter();
+                let mut name = rest.next().copied().unwrap_or("");
+                if name == "if" {
+                    name = rest.nth(2).copied().unwrap_or("");
+                }
+                let name = name.split('(').next().unwrap_or("");
+                assert!(
+                    CONCURRENTLY_BUILT_INDEXES.contains(&name),
+                    "{} builds {name:?} concurrently; list it in CONCURRENTLY_BUILT_INDEXES",
+                    path.display()
+                );
+                found += 1;
+            }
+        }
+        assert!(found > 0, "found no concurrent index builds to check");
+    }
+
+    /// A `-- no-transaction` migration exists to run `CREATE INDEX
+    /// CONCURRENTLY`, which Postgres refuses inside a transaction block — and
+    /// Postgres runs a string of several statements as one implicit
+    /// transaction. So each such file holds exactly one statement.
+    #[test]
+    fn no_transaction_migrations_hold_exactly_one_statement() {
+        for dir in ["migrations/sqlite", "migrations/postgres"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+            for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+                let path = entry.expect("dir entry").path();
+                if path.extension().is_none_or(|e| e != "sql") {
+                    continue;
+                }
+                let sql = std::fs::read_to_string(&path).expect("read migration");
+                if !sql.starts_with("-- no-transaction") {
+                    continue;
+                }
+                let code: String = sql
+                    .lines()
+                    .map(|line| line.split("--").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let statements = code.split(';').filter(|s| !s.trim().is_empty()).count();
+                assert_eq!(
+                    statements,
+                    1,
+                    "{} must hold exactly one statement",
+                    path.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn sqlite_migrations_declare_no_unmappable_column_types() {
@@ -638,281 +840,334 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DatabaseBackend detection
+    // retry_on_busy
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn backend_from_url_detects_sqlite() {
-        assert_eq!(
-            DatabaseBackend::from_url("sqlite://data/happyview.db"),
-            DatabaseBackend::Sqlite
+    #[tokio::test]
+    async fn a_busy_write_is_retried_until_the_lock_clears() {
+        install_drivers();
+        let path = std::env::temp_dir().join(format!("hv-busy-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let holder_pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect holder");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&holder_pool)
+            .await
+            .expect("enable WAL");
+        crate::db::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&holder_pool)
+            .await
+            .expect("create table");
+        // A second pool that never waits on a lock, so a held write lock
+        // surfaces as SQLITE_BUSY at once.
+        let writer = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    crate::db::query("PRAGMA busy_timeout = 0")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect writer");
+
+        let mut holder = holder_pool.acquire().await.expect("acquire holder");
+        crate::db::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .expect("take the write lock");
+
+        let err = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("the write lock is held");
+        assert!(is_retryable_write_error(&err), "{err}");
+        assert!(
+            is_unavailable(&err),
+            "a lock still held is unavailable: {err}"
         );
-        assert_eq!(
-            DatabaseBackend::from_url("sqlite:data/happyview.db?mode=rwc"),
-            DatabaseBackend::Sqlite
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            crate::db::query("COMMIT")
+                .execute(&mut *holder)
+                .await
+                .expect("release the write lock");
+        });
+
+        retry_on_busy(|| crate::db::query("INSERT INTO t (id) VALUES (1)").execute(&writer))
+            .await
+            .expect("the retried write lands once the lock clears");
+        release.await.expect("release task");
+
+        let dup = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("duplicate key");
+        assert!(
+            !is_retryable_write_error(&dup),
+            "a constraint failure is final: {dup}"
         );
+        assert!(!is_unavailable(&dup), "{dup}");
+
+        drop(writer);
+        drop(holder_pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    #[test]
-    fn backend_from_url_detects_postgres() {
-        assert_eq!(
-            DatabaseBackend::from_url("postgres://localhost/happyview"),
-            DatabaseBackend::Postgres
-        );
-        assert_eq!(
-            DatabaseBackend::from_url("postgresql://user:pass@host/db"),
-            DatabaseBackend::Postgres
-        );
+    #[tokio::test]
+    async fn postgres_serialization_and_deadlock_codes_are_retryable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        for code in ["40001", "40P01"] {
+            let sql =
+                format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$");
+            let err = query(&sql)
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_retryable_write_error(&err), "{code}: {err}");
+        }
+        let err = query("SELECT * FROM happyview_no_such_table_t3")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_retryable_write_error(&err), "{err}");
     }
 
-    #[test]
-    fn backend_from_str_parses() {
-        assert_eq!(
-            DatabaseBackend::from_str("sqlite"),
-            Some(DatabaseBackend::Sqlite)
-        );
-        assert_eq!(
-            DatabaseBackend::from_str("POSTGRES"),
-            Some(DatabaseBackend::Postgres)
-        );
-        assert_eq!(
-            DatabaseBackend::from_str("postgresql"),
-            Some(DatabaseBackend::Postgres)
-        );
-        assert_eq!(DatabaseBackend::from_str("invalid"), None);
+    #[tokio::test]
+    async fn a_read_only_sqlite_database_is_unavailable() {
+        install_drivers();
+        let path = std::env::temp_dir().join(format!("hv-readonly-{}.db", uuid::Uuid::new_v4()));
+        let rw = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("create");
+        query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&rw)
+            .await
+            .expect("create table");
+        rw.close().await;
+        let ro = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=ro", path.display()))
+            .await
+            .expect("open read-only");
+        let err = query("INSERT INTO t (id) VALUES (1)")
+            .execute(&ro)
+            .await
+            .expect_err("the database is read-only");
+        assert!(is_unavailable(&err), "{err}");
+        ro.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
-    // -----------------------------------------------------------------------
-    // adapt_sql: placeholder conversion
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_placeholders() {
-        let sql = "SELECT * FROM foo WHERE id = ? AND name = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "SELECT * FROM foo WHERE id = ? AND name = ?"
-        );
+    #[tokio::test]
+    async fn a_failing_sqlite_statement_is_not_unavailable() {
+        let pool = crate::test_support::memory_pool().await;
+        let err = query("SELECT * FROM happyview_no_such_table")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_unavailable(&err), "{err}");
     }
 
-    #[test]
-    fn adapt_sql_postgres_converts_placeholders() {
-        let sql = "SELECT * FROM foo WHERE id = ? AND name = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT * FROM foo WHERE id = $1 AND name = $2"
-        );
-    }
+    #[tokio::test]
+    async fn postgres_connection_and_shutdown_codes_are_unavailable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        let raise = |code: &str| {
+            format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$")
+        };
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "57P01", "57P03", "53300", "25006",
+            "58030", "28P01", "3D000", "40001", "40P01",
+        ] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_unavailable(&err), "{code}: {err}");
+        }
+        for code in ["23505", "22P02", "42P01", "57014", "08P01", "22021"] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(!is_unavailable(&err), "{code}: {err}");
+        }
+        for (code, invalid) in [("22021", true), ("54000", true), ("23505", false)] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert_eq!(is_invalid_data(&err), invalid, "{code}: {err}");
+        }
 
-    #[test]
-    fn adapt_sql_postgres_handles_many_placeholders() {
-        let sql = "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        let result = adapt_sql(sql, DatabaseBackend::Postgres);
-        assert_eq!(
-            result,
-            "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_skips_question_marks_in_strings() {
-        let sql = "SELECT * FROM foo WHERE name = ? AND note LIKE '??%'";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT * FROM foo WHERE name = $1 AND note LIKE '??%'"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // adapt_sql: JSON operator conversion
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_json_extract() {
-        let sql = "SELECT json_extract(record, '$.title') FROM records";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "SELECT json_extract(record, '$.title') FROM records"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_simple_json_extract() {
-        let sql = "SELECT json_extract(record, '$.title') FROM records WHERE collection = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT record::jsonb->>'title' FROM records WHERE collection = $1"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_chained_json_extract() {
-        let sql = "WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "WHERE lexicon_json::jsonb->'defs'->'main'->>'type' = 'record'"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_array_index_json_extract() {
-        let sql = "WHERE json_extract(record, '$.value.websites[0].url') = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "WHERE record::jsonb->'value'->'websites'->0->>'url' = $1"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_array_index_json_extract() {
-        let sql = "WHERE json_extract(record, '$.value.tags[0]') = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "WHERE json_extract(record, '$.value.tags[0]') = ?"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_multiple_json_expressions() {
-        let sql =
-            "SELECT json_extract(record, '$.title'), json_extract(record, '$.year') FROM records";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT record::jsonb->>'title', record::jsonb->>'year' FROM records"
-        );
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "SELECT json_extract(record, '$.title'), json_extract(record, '$.year') FROM records"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // adapt_sql: LIKE stays as-is
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapt_sql_postgres_keeps_like() {
-        let sql = "WHERE name LIKE ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "WHERE name LIKE $1"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_like() {
-        let sql = "WHERE name LIKE ?";
-        assert_eq!(adapt_sql(sql, DatabaseBackend::Sqlite), "WHERE name LIKE ?");
-    }
-
-    // -----------------------------------------------------------------------
-    // adapt_sql: datetime('now') conversion
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_datetime_now() {
-        let sql = "INSERT INTO t (created_at) VALUES (datetime('now'))";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "INSERT INTO t (created_at) VALUES (datetime('now'))"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_datetime_now() {
-        let sql = "INSERT INTO t (created_at) VALUES (datetime('now'))";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "INSERT INTO t (created_at) VALUES (NOW())"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // adapt_sql: datetime('now', '±N unit') conversion
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapt_sql_sqlite_keeps_datetime_interval() {
-        let sql = "WHERE indexed_at > datetime('now', '-7 days')";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "WHERE indexed_at > datetime('now', '-7 days')"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_datetime_minus_interval() {
-        let sql = "WHERE indexed_at > datetime('now', '-7 days')";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "WHERE indexed_at > NOW() - INTERVAL '7 days'"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_converts_datetime_plus_interval() {
-        let sql = "WHERE expires_at < datetime('now', '+30 minutes')";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "WHERE expires_at < NOW() + INTERVAL '30 minutes'"
-        );
-    }
-
-    #[test]
-    fn adapt_sql_postgres_interval_with_json_and_placeholders() {
-        let sql = "SELECT json_extract(record, '$.subject') FROM records WHERE collection = ? AND indexed_at > datetime('now', '-7 days') LIMIT ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT record::jsonb->>'subject' FROM records WHERE collection = $1 AND indexed_at > NOW() - INTERVAL '7 days' LIMIT $2"
-        );
+        // A backend terminated under a live connection, as a restart does.
+        let mut conn = pool.acquire().await.expect("acquire");
+        let err = query("SELECT pg_terminate_backend(pg_backend_pid())")
+            .execute(&mut *conn)
+            .await
+            .expect_err("the backend is terminated");
+        assert!(is_unavailable(&err), "{err:?}");
+        conn.detach();
     }
 
     // -----------------------------------------------------------------------
-    // adapt_sql: boolean literals stay as 0/1
+    // begin_write and the rev-guarded upsert
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn adapt_sql_keeps_integer_booleans() {
-        let sql = "UPDATE t SET active = 1 WHERE id = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "UPDATE t SET active = 1 WHERE id = $1"
-        );
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "UPDATE t SET active = 1 WHERE id = ?"
-        );
+    #[tokio::test]
+    async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
+        install_drivers();
+        let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.
+        let pool = || {
+            PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        crate::db::query("PRAGMA busy_timeout = 0")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+        };
+        let first = pool().await.expect("connect first");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&first)
+            .await
+            .expect("enable WAL");
+        let second = pool().await.expect("connect second");
+
+        let held = begin_write(&first, DatabaseBackend::Sqlite)
+            .await
+            .expect("begin the first write transaction");
+
+        let deferred = second
+            .begin()
+            .await
+            .expect("a deferred BEGIN takes no lock");
+        deferred.rollback().await.expect("roll back");
+        let err = begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect_err("the write lock is already held");
+        assert!(is_retryable_write_error(&err), "{err}");
+
+        held.commit().await.expect("release the write lock");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect("the lock is free again")
+            .commit()
+            .await
+            .expect("commit");
+
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    // -----------------------------------------------------------------------
-    // adapt_sql: combined conversions
-    // -----------------------------------------------------------------------
+    /// `DATABASE_MAX_CONNECTIONS=1` on Postgres: the record store upgrade
+    /// runs on the connection holding the migration lock, so a boot that
+    /// has to copy records needs no second one.
+    #[tokio::test]
+    async fn a_one_connection_postgres_boot_upgrades_the_record_store() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        install_drivers();
+        let admin = AnyPool::connect(&url)
+            .await
+            .expect("connect to the test server");
+        let name = format!("hv_onecon_{}", uuid::Uuid::new_v4().simple());
+        crate::db::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create a scratch database");
+        let (server, _) = url.rsplit_once('/').expect("a database path");
+        let scratch = format!("{server}/{name}");
 
-    #[test]
-    fn adapt_sql_combined_json_like_placeholders() {
-        let sql = "SELECT * FROM records WHERE json_extract(record, '$.title') LIKE ? LIMIT ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT * FROM records WHERE record::jsonb->>'title' LIKE $1 LIMIT $2"
-        );
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Sqlite),
-            "SELECT * FROM records WHERE json_extract(record, '$.title') LIKE ? LIMIT ?"
-        );
+        let pool = AnyPool::connect(&scratch).await.expect("connect");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        Migrator::new(dir)
+            .await
+            .expect("load")
+            .run(&pool)
+            .await
+            .expect("migrate to before the upgrade");
+        let uri = crate::test_support::seed_record(
+            &pool,
+            DatabaseBackend::Postgres,
+            "did:plc:onecon",
+            "app.test.post",
+            "r1",
+            r#"{"n":1}"#,
+            "c1",
+            None,
+        )
+        .await;
+        pool.close().await;
+
+        let booted = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            connect_with(&scratch, DatabaseBackend::Postgres, 1),
+        )
+        .await
+        .expect("the boot finishes");
+        let got = crate::record_store::RecordStore::new(booted.clone(), DatabaseBackend::Postgres)
+            .get(&uri)
+            .await
+            .expect("get")
+            .expect("the record survived the upgrade");
+        assert_eq!(got.record, r#"{"n":1}"#);
+        booted.close().await;
+        let _ = crate::db::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
     }
 
-    #[test]
-    fn adapt_sql_no_json_operators_unchanged() {
-        let sql = "SELECT COUNT(*) FROM records WHERE collection = ?";
-        assert_eq!(
-            adapt_sql(sql, DatabaseBackend::Postgres),
-            "SELECT COUNT(*) FROM records WHERE collection = $1"
-        );
+    #[tokio::test]
+    async fn a_write_transaction_begins_and_commits_on_either_backend() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let mut tx = begin_write(&pool, backend).await.expect("begin");
+            crate::db::query("SELECT 1")
+                .execute(&mut *tx)
+                .await
+                .expect("query inside the transaction");
+            tx.commit().await.expect("commit");
+        }
     }
-
-    // -----------------------------------------------------------------------
-    // parse_dt
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // backfill pool sizing
@@ -927,7 +1182,7 @@ mod tests {
 
     #[test]
     fn backfill_pool_ceiling_values() {
-        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 64);
+        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 16);
         assert_eq!(backfill_pool_ceiling(DatabaseBackend::Postgres), 256);
     }
 
@@ -936,7 +1191,7 @@ mod tests {
         let needed = needed_backfill_connections(10, 3, 100);
         let capped = needed.min(backfill_pool_ceiling(DatabaseBackend::Sqlite));
         assert_eq!(needed, 134);
-        assert_eq!(capped, 64);
+        assert_eq!(capped, 16);
     }
 
     #[test]
@@ -1064,6 +1319,155 @@ mod tests {
                 "journal_size_limit pragma did not reach a pooled connection"
             );
         }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -----------------------------------------------------------------------
+    // synchronous
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sqlite_synchronous_defaults_to_normal() {
+        assert_eq!(parse_sqlite_synchronous(None), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("normal")), "NORMAL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_allows_full() {
+        assert_eq!(parse_sqlite_synchronous(Some("FULL")), "FULL");
+        assert_eq!(parse_sqlite_synchronous(Some(" full ")), "FULL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_rejects_other_levels() {
+        // OFF can corrupt the database on power loss and EXTRA buys nothing
+        // over FULL in WAL mode, so neither is offered.
+        assert_eq!(parse_sqlite_synchronous(Some("OFF")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("banana")), "NORMAL");
+    }
+
+    async fn synchronous_on_every_connection(env_value: Option<&str>) -> Vec<i64> {
+        let path = std::env::temp_dir().join(format!("hv-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            match env_value {
+                Some(v) => std::env::set_var("SQLITE_SYNCHRONOUS", v),
+                None => std::env::remove_var("SQLITE_SYNCHRONOUS"),
+            }
+        }
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        let mut levels = Vec::new();
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            levels.push(level);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        levels
+    }
+
+    /// `PRAGMA synchronous` reads back 1 for NORMAL and 2 for FULL.
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(None).await,
+            vec![1, 1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_full_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(Some("FULL")).await,
+            vec![2, 2, 2, 2]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_backfill_pool_connections() {
+        let path = std::env::temp_dir().join(format!("hv-bf-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite).await;
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            assert_eq!(level, 1);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// `PRAGMA optimize` with the "every table" bit analyzes a table this
+    /// connection never queried, which is the startup case.
+    #[tokio::test]
+    #[serial]
+    async fn optimize_writes_planner_statistics() {
+        let path = std::env::temp_dir().join(format!("hv-optimize-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+
+        for i in 0..200 {
+            crate::db::query(
+                "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+                 VALUES (?, 'did:plc:opt', 'app.test.post', ?, '{}', 'bafyreitestcid', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            )
+            .bind(format!("at://did:plc:opt/app.test.post/{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("seed record");
+        }
+
+        sqlite_optimize(&pool).await.expect("optimize");
+
+        let (rows,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'happyview_records_v2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("sqlite_stat1 should exist after optimize");
+        assert!(rows > 0, "optimize did not analyze happyview_records_v2");
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

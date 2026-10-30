@@ -26,7 +26,7 @@ pub(super) async fn list(
     State(state): State<AppState>,
     AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<Vec<DomainResponse>>, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_read().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains ORDER BY created_at",
@@ -59,12 +59,11 @@ pub(super) async fn create(
     AllowPlatform(auth): AllowPlatform,
     Json(body): Json<CreateDomainBody>,
 ) -> Result<(StatusCode, Json<DomainResponse>), AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
-    let url = body.url.trim_end_matches('/').to_string();
-
-    let parsed =
-        reqwest::Url::parse(&url).map_err(|_| AppError::BadRequest("invalid URL".into()))?;
+    let parsed = reqwest::Url::parse(body.url.trim_end_matches('/'))
+        .map_err(|_| AppError::BadRequest("invalid URL".into()))?;
 
     if parsed.path() != "/" && !parsed.path().is_empty() {
         return Err(AppError::BadRequest("URL must not contain a path".into()));
@@ -73,6 +72,10 @@ pub(super) async fn create(
     if parsed.host_str().is_none() {
         return Err(AppError::BadRequest("URL must contain a host".into()));
     }
+
+    // The parsed origin, so the scheme and host are lowercased and a case
+    // variant of an existing domain is a duplicate. Hosts match lowercased.
+    let url = parsed.origin().ascii_serialization();
 
     let is_loopback = crate::auth::client_registry::is_loopback_url(&state.config.public_url);
 
@@ -231,7 +234,8 @@ pub(super) async fn delete(
     AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
@@ -307,7 +311,8 @@ pub(super) async fn set_primary(
     AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require_domain_access().await?;
+    auth.require_domain_write(state.config.platform_managed())
+        .await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",

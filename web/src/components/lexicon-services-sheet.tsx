@@ -83,9 +83,7 @@ export function LexiconServicesSheet({
         </SheetHeader>
 
         <div className="flex-1 min-h-0 overflow-y-auto px-4">
-          {error && (
-            <p className="text-destructive text-sm mb-3">{error}</p>
-          )}
+          {error && <p className="text-destructive text-sm mb-3">{error}</p>}
 
           {loading ? (
             <p className="text-muted-foreground text-sm">Loading...</p>

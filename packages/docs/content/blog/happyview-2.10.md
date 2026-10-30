@@ -76,7 +76,7 @@ local uploaded = atproto.blob_upload(downloaded.handle, downloaded.mimeType)
 local new_blob_ref = uploaded.blob
 ```
 
-Full docs: [atproto API (`blob_download` / `blob_upload`)](/api-reference/lua/atproto-api#atprotoblob_download).
+Full docs: [atproto API (`blob_download` / `blob_upload`)](/api-reference/lua/libraries).
 
 ## Prefixed database tables
 

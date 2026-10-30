@@ -322,6 +322,130 @@ async fn platform_key_can_read_stats() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+async fn counts(app: &TestApp, token: &str) -> (StatusCode, Value) {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, "/admin/stats/counts", token, None))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_counts() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let (status, before) = counts(&app, PLATFORM_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    let users = before["users"].as_i64().expect("users is a number");
+    let clients = before["api_clients"]
+        .as_i64()
+        .expect("api_clients is a number");
+
+    let now = happyview::db::now_rfc3339();
+    let user_sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, 0, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&user_sql)
+        .bind("counts-extra-user")
+        .bind("did:plc:countsextra")
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let client_sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    // One active and one inactive: both count.
+    for (n, active) in [(1, 1i32), (2, 0i32)] {
+        happyview::db::query(&client_sql)
+            .bind(format!("counts-client-{n}"))
+            .bind(format!("hvc_counts{n}"))
+            .bind("hash")
+            .bind(format!("Counts {n}"))
+            .bind(format!("https://counts{n}.example.com/metadata.json"))
+            .bind(format!("https://counts{n}.example.com"))
+            .bind("[]")
+            .bind("atproto")
+            .bind("confidential")
+            .bind(active)
+            .bind("did:plc:countsextra")
+            .bind(&now)
+            .bind(&now)
+            .bind("did:plc:countsextra")
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let (status, after) = counts(&app, PLATFORM_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after,
+        json!({ "users": users + 1, "api_clients": clients + 2 })
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn counts_refuses_a_caller_without_stats_read() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let create = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method(Method::POST)
+                .uri("/admin/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "no-stats", "permissions": ["lexicons:create"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let key = json_body(create).await["key"]
+        .as_str()
+        .expect("api key returned")
+        .to_string();
+
+    let (status, _) = counts(&app, &key).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[serial]
+async fn counts_refuses_an_unauthenticated_caller() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/admin/stats/counts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 async fn supers(app: &TestApp) -> Vec<String> {
     let sql = happyview::db::adapt_sql(
         "SELECT did FROM happyview_users WHERE is_super = 1 ORDER BY did",
@@ -485,4 +609,183 @@ async fn super_user_requires_platform_principal() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(supers(&app).await, vec!["did:plc:testadmin".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_the_jetstream_status() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::GET,
+            "/admin/jetstream/status",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["worker_queue_depths"].is_array());
+    assert!(body["worker_busy_since_ms"].is_array());
+}
+
+#[tokio::test]
+#[serial]
+async fn the_jetstream_status_needs_stats_read() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (name, value) = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api-keys")
+                .header(name, value)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "no-stats", "permissions": ["spaces:read"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let key = json_body(resp).await["key"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, "/admin/jetstream/status", &key, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// A `settings:manage` key, made by the seeded super admin.
+async fn settings_key(app: &TestApp) -> String {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method(Method::POST)
+                .uri("/admin/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "name": "settings",
+                        "permissions": ["settings:manage"],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    json_body(resp).await["key"].as_str().unwrap().to_string()
+}
+
+/// On a platform-managed instance the platform's list of domains is the one
+/// that counts, so nobody else may change it: not a `settings:manage` key and
+/// not the super user. Reading is unchanged.
+#[tokio::test]
+#[serial]
+async fn only_the_platform_changes_domains_on_a_platform_managed_instance() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    seed_domain(&app, "d1", "http://127.0.0.1:0", true).await;
+    seed_domain(&app, "d2", "https://two.example.com", false).await;
+    let key = settings_key(&app).await;
+
+    let send = |request: Request<Body>| {
+        let router = app.router.clone();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    let cookie_request = |method: Method, uri: &str, body: Option<Value>| {
+        let builder = app.authed_request().method(method).uri(uri);
+        match body {
+            Some(b) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    };
+
+    assert_eq!(
+        send(bearer(Method::GET, "/admin/domains", &key, None)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(cookie_request(Method::GET, "/admin/domains", None)).await,
+        StatusCode::OK
+    );
+
+    let add = json!({ "url": "https://three.example.com" });
+    for (label, status) in [
+        (
+            "key add",
+            send(bearer(Method::POST, "/admin/domains", &key, Some(&add))).await,
+        ),
+        (
+            "key primary",
+            send(bearer(
+                Method::POST,
+                "/admin/domains/d2/primary",
+                &key,
+                None,
+            ))
+            .await,
+        ),
+        (
+            "key delete",
+            send(bearer(Method::DELETE, "/admin/domains/d2", &key, None)).await,
+        ),
+        (
+            "super add",
+            send(cookie_request(
+                Method::POST,
+                "/admin/domains",
+                Some(add.clone()),
+            ))
+            .await,
+        ),
+        (
+            "super primary",
+            send(cookie_request(
+                Method::POST,
+                "/admin/domains/d2/primary",
+                None,
+            ))
+            .await,
+        ),
+        (
+            "super delete",
+            send(cookie_request(Method::DELETE, "/admin/domains/d2", None)).await,
+        ),
+    ] {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+    }
+
+    let rows: Vec<(String, i32)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT id, is_primary FROM happyview_domains ORDER BY id",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [("d1".to_string(), 1), ("d2".to_string(), 0)],
+        "a refused write changed the domains"
+    );
 }

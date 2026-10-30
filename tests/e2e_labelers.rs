@@ -470,7 +470,7 @@ async fn label_gc_removes_orphaned_record_labels_but_keeps_account_labels() {
             .unwrap();
     }
 
-    let orphaned = happyview::labeler::delete_orphaned_labels(db)
+    let orphaned = happyview::labeler::delete_orphaned_labels(&app.state.records)
         .await
         .expect("the orphan sweep should run");
     assert_eq!(orphaned, 1);
@@ -484,4 +484,111 @@ async fn label_gc_removes_orphaned_record_labels_but_keeps_account_labels() {
         remaining,
         vec![(indexed_uri.to_string(),), (account_did.to_string(),)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Declared in happyview.toml
+// ---------------------------------------------------------------------------
+
+fn declaring(toml: &str) -> std::sync::Arc<happyview::config::project::ProjectConfig> {
+    std::sync::Arc::new(
+        happyview::config::project::parse_project_config(
+            toml,
+            std::path::Path::new("happyview.toml"),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn a_declared_labeler_is_flagged_and_cannot_be_deleted() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.project = Some(declaring("[labels]\nsubscribe = [\"did:plc:declared1\"]\n"));
+    app.rebuild_router();
+
+    for did in ["did:plc:declared1", "did:plc:dashboard1"] {
+        app.router
+            .clone()
+            .oneshot(admin_post(
+                "/admin/labelers",
+                app.admin_cookie(),
+                &json!({ "did": did }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/labelers/did:plc:declared1",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("happyview.toml"),
+        "{body}"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/labelers/did:plc:dashboard1",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "the dashboard's own one still goes"
+    );
+
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/labelers", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let labelers = list.as_array().unwrap();
+    assert_eq!(labelers.len(), 1);
+    assert_eq!(labelers[0]["did"], "did:plc:declared1");
+    assert_eq!(labelers[0]["declared"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_labeler_dropped_from_the_file_becomes_deletable() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.project = Some(declaring("[labels]\nsubscribe = []\n"));
+    app.rebuild_router();
+    app.router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/labelers",
+            app.admin_cookie(),
+            &json!({ "did": "did:plc:formerly" }),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/labelers/did:plc:formerly",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }

@@ -5,7 +5,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { toastError } from "@/lib/format";
+import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
@@ -27,11 +27,19 @@ import type {
   BackfillRepoEntry,
   PdsSummaryEntry,
   BackfillEvent,
+  BackfillSource,
+  ReplayProgress,
   BackfillErrorCount,
   BackfillErrorEntry,
   BlueskyProfile,
 } from "@/types/backfill";
-import { CheckCircle2, ChevronRight, Circle, Loader2, PauseCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  ChevronRight,
+  Circle,
+  Loader2,
+  PauseCircle,
+} from "lucide-react";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -72,6 +80,13 @@ import {
 } from "@/components/ui/responsive-dialog";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Sheet,
   SheetContent,
   SheetFooter,
@@ -93,6 +108,20 @@ const PROGRESS_PHASES = [
   "fetching_records",
 ] as const;
 
+// A replay job reads the Jetstream archive instead of crawling PDSes, so it
+// has its own stages and no PDS or repo lists.
+const REPLAY_STAGES = ["replaying", "replaying_accounts", "retrying_blocks"];
+
+function isReplayStage(stage: string): boolean {
+  return REPLAY_STAGES.includes(stage);
+}
+
+const SOURCE_LABELS: Record<BackfillSource, string> = {
+  auto: "Auto",
+  replay: "Replay",
+  crawl: "Crawl",
+};
+
 // Operators read these, not enum names.
 const ERROR_KIND_LABELS: Record<string, string> = {
   dns_failure: "Domain not resolving",
@@ -106,6 +135,7 @@ const ERROR_KIND_LABELS: Record<string, string> = {
   repo_not_found: "Repo deleted or moved",
   repo_deactivated: "Account deactivated",
   repo_takendown: "Account taken down",
+  replay_block: "Archive block failed",
   other: "Other",
 };
 
@@ -142,7 +172,16 @@ function statusBadge(job: BackfillJob) {
         </Badge>
       );
     case "paused":
-      return (
+      // A job only carries an error while paused when HappyView paused it
+      // itself, with work it could not finish.
+      return job.error ? (
+        <Badge
+          title={job.error}
+          className="bg-amber-500/15 text-amber-700 dark:text-amber-400 hover:bg-amber-500/25 border-amber-500/20"
+        >
+          paused automatically
+        </Badge>
+      ) : (
         <Badge className="bg-gray-500/15 text-gray-700 dark:text-gray-400 hover:bg-gray-500/25 border-gray-500/20">
           paused
         </Badge>
@@ -159,6 +198,7 @@ function statusBadge(job: BackfillJob) {
 }
 
 function phaseIndex(stage: string): number {
+  if (isReplayStage(stage)) return REPLAY_STAGES.indexOf(stage);
   if (stage === "resolving_and_fetching") return 1;
   const idx = PROGRESS_PHASES.indexOf(
     stage as (typeof PROGRESS_PHASES)[number],
@@ -204,7 +244,11 @@ function useBackfillSSE(
     });
 
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
-    worker.postMessage({ type: "connect", jobId, baseUrl: `${location.origin}${basePath}` });
+    worker.postMessage({
+      type: "connect",
+      jobId,
+      baseUrl: `${location.origin}${basePath}`,
+    });
 
     return () => {
       worker.postMessage({ type: "disconnect" });
@@ -215,7 +259,9 @@ function useBackfillSSE(
 
 // Batch Bluesky profile resolution hook
 function useBlueskyProfiles(dids: string[]): Map<string, BlueskyProfile> {
-  const [profiles, setProfiles] = useState<Map<string, BlueskyProfile>>(new Map());
+  const [profiles, setProfiles] = useState<Map<string, BlueskyProfile>>(
+    new Map(),
+  );
   const resolvedRef = useRef<Set<string>>(new Set());
   const pendingRef = useRef(false);
 
@@ -237,10 +283,12 @@ function useBlueskyProfiles(dids: string[]): Map<string, BlueskyProfile> {
 
     Promise.all(
       batches.map(async (batch) => {
-        const params = batch.map((d) => `actors=${encodeURIComponent(d)}`).join("&");
+        const params = batch
+          .map((d) => `actors=${encodeURIComponent(d)}`)
+          .join("&");
         try {
           const resp = await fetch(
-            `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?${params}`
+            `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?${params}`,
           );
           if (!resp.ok) return [];
           const data = await resp.json();
@@ -248,7 +296,7 @@ function useBlueskyProfiles(dids: string[]): Map<string, BlueskyProfile> {
         } catch {
           return [];
         }
-      })
+      }),
     ).then((results) => {
       setProfiles((prev) => {
         const newProfiles = new Map(prev);
@@ -273,7 +321,10 @@ const failedFaviconUrls = new Set<string>();
 function isBskyPds(pdsEndpoint: string): boolean {
   try {
     const hostname = new URL(pdsEndpoint).hostname;
-    return BSKY_PDS_HOSTNAMES.includes(hostname) || hostname.endsWith(BSKY_PDS_SUFFIX);
+    return (
+      BSKY_PDS_HOSTNAMES.includes(hostname) ||
+      hostname.endsWith(BSKY_PDS_SUFFIX)
+    );
   } catch {
     return false;
   }
@@ -317,14 +368,24 @@ function PdsFaviconImg({ url }: { url: string }) {
       src={url}
       alt=""
       className="size-4 shrink-0 rounded"
-      onError={() => { failedFaviconUrls.add(url); setFailed(true); }}
+      onError={() => {
+        failedFaviconUrls.add(url);
+        setFailed(true);
+      }}
     />
   );
 }
 
 function PdsPlaceholderIcon() {
   return (
-    <svg viewBox="0 0 16 16" className="size-4 shrink-0 text-muted-foreground" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden>
+    <svg
+      viewBox="0 0 16 16"
+      className="size-4 shrink-0 text-muted-foreground"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      aria-hidden
+    >
       <ellipse cx="8" cy="12" rx="6" ry="2.5" />
       <ellipse cx="8" cy="8" rx="6" ry="2.5" />
       <path d="M2 8v4M14 8v4" />
@@ -368,7 +429,10 @@ function AnimatedNumber({ value }: { value: number }) {
   return <>{Math.round(displayed).toLocaleString()}</>;
 }
 
-function CompactRepoRow({ did, profile }: {
+function CompactRepoRow({
+  did,
+  profile,
+}: {
   did: string;
   profile?: BlueskyProfile;
 }) {
@@ -380,13 +444,21 @@ function CompactRepoRow({ did, profile }: {
         )}
       </div>
       <span className="truncate">
-        {profile?.handle ? `@${profile.handle}` : <span className="font-mono">{did}</span>}
+        {profile?.handle ? (
+          `@${profile.handle}`
+        ) : (
+          <span className="font-mono">{did}</span>
+        )}
       </span>
     </div>
   );
 }
 
-function ProfileRow({ did, profile, suffix }: {
+function ProfileRow({
+  did,
+  profile,
+  suffix,
+}: {
   did: string;
   profile?: BlueskyProfile;
   suffix?: React.ReactNode;
@@ -403,15 +475,85 @@ function ProfileRow({ did, profile, suffix }: {
           {profile?.displayName || profile?.handle || did}
         </p>
         {profile?.handle && (
-          <p className="truncate text-xs text-muted-foreground">@{profile.handle}</p>
+          <p className="truncate text-xs text-muted-foreground">
+            @{profile.handle}
+          </p>
         )}
         {!profile?.handle && (
-          <p className="truncate text-xs text-muted-foreground font-mono">{did}</p>
+          <p className="truncate text-xs text-muted-foreground font-mono">
+            {did}
+          </p>
         )}
       </div>
       {suffix && (
-        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{suffix}</span>
+        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+          {suffix}
+        </span>
       )}
+    </div>
+  );
+}
+
+function ReplayProgressBar({
+  stage,
+  replay,
+  active,
+}: {
+  stage: string;
+  replay: ReplayProgress;
+  active: boolean;
+}) {
+  const { after_seq, through_seq, tip_seq, bytes, blocks_failed } = replay;
+  const known = tip_seq != null && through_seq != null && tip_seq > after_seq;
+  const fraction = known
+    ? Math.min(
+        1,
+        Math.max(0, (through_seq - after_seq) / (tip_seq - after_seq)),
+      )
+    : null;
+  const label =
+    stage === "replaying_accounts"
+      ? "Replaying account events"
+      : "Replaying records";
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span>{label}</span>
+        <span className="text-xs text-muted-foreground tabular-nums">
+          {through_seq != null && tip_seq != null
+            ? `seq ${through_seq.toLocaleString()} of ${tip_seq.toLocaleString()}`
+            : "waiting for the archive plan"}
+        </span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={
+          fraction == null ? undefined : Math.round(fraction * 100)
+        }
+        className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+      >
+        <div
+          className={`h-full rounded-full bg-blue-500 ${
+            fraction == null
+              ? `w-1/3 ${active ? "animate-pulse" : ""}`
+              : "transition-[width]"
+          }`}
+          style={fraction == null ? undefined : { width: `${fraction * 100}%` }}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground tabular-nums">
+        <span>{formatBytes(bytes)} downloaded</span>
+        {blocks_failed > 0 && (
+          <span className="text-destructive">
+            {blocks_failed.toLocaleString()} failed{" "}
+            {blocks_failed === 1 ? "block" : "blocks"}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -462,19 +604,26 @@ function ErrorKindGroup({
       const resp = await getBackfillErrors(jobId, { kind, cursor, limit: 50 });
       setEntries((prev) => [...prev, ...resp.errors]);
       setCursor(resp.cursor);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, [jobId, kind, cursor]);
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <div className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-accent/50">
         <CollapsibleTrigger asChild>
-          <button type="button" className="flex flex-1 items-center gap-2 text-left cursor-pointer">
+          <button
+            type="button"
+            className="flex flex-1 items-center gap-2 text-left cursor-pointer"
+          >
             <ChevronRight
               className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
             />
             <span className="flex-1 truncate">{errorKindLabel(kind)}</span>
-            <span className="tabular-nums text-muted-foreground">{count.toLocaleString()}</span>
+            <span className="tabular-nums text-muted-foreground">
+              {count.toLocaleString()}
+            </span>
           </button>
         </CollapsibleTrigger>
         {retryable && canRetry && (
@@ -505,7 +654,10 @@ function ErrorKindGroup({
               rowHeight={44}
               renderRow={(entry) => (
                 <div className="py-0.5">
-                  <CompactRepoRow did={entry.did} profile={profiles.get(entry.did)} />
+                  <CompactRepoRow
+                    did={entry.did}
+                    profile={profiles.get(entry.did)}
+                  />
                   <p className="truncate px-3 text-[11px] text-muted-foreground">
                     {entry.message}
                   </p>
@@ -513,7 +665,9 @@ function ErrorKindGroup({
               )}
             />
           ) : (
-            <p className="py-3 text-center text-xs text-muted-foreground">No entries.</p>
+            <p className="py-3 text-center text-xs text-muted-foreground">
+              No entries.
+            </p>
           )}
         </div>
       </CollapsibleContent>
@@ -537,7 +691,11 @@ export default function BackfillPage() {
   }, [load]);
 
   const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null;
-  const sseActive = selectedJob != null && (selectedJob.status === "running" || selectedJob.status === "cancelling" || selectedJob.status === "pausing");
+  const sseActive =
+    selectedJob != null &&
+    (selectedJob.status === "running" ||
+      selectedJob.status === "cancelling" ||
+      selectedJob.status === "pausing");
 
   useEffect(() => {
     if (sseActive) return;
@@ -556,23 +714,35 @@ export default function BackfillPage() {
             {canFlush && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
-                  <Button variant="outline" size="sm">Clear all details</Button>
+                  <Button variant="outline" size="sm">
+                    Clear all details
+                  </Button>
                 </AlertDialogTrigger>
                 <AlertDialogContent>
                   <AlertDialogHeader>
                     <AlertDialogTitle>Clear all job details?</AlertDialogTitle>
                     <AlertDialogDescription>
-                      This will permanently delete per-repo detail data for all backfill jobs.
+                      This will permanently delete per-repo detail data for all
+                      completed, cancelled and failed backfill jobs.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction onClick={async () => {
-                      await flushAllBackfillDetails();
-                      toast.success("All job details cleared");
-                      setSelectedJobId(null);
-                      load();
-                    }}>Clear</AlertDialogAction>
+                    <AlertDialogAction
+                      onClick={async () => {
+                        try {
+                          await flushAllBackfillDetails();
+                        } catch (e: unknown) {
+                          toastError("Failed to clear job details", e);
+                          return;
+                        }
+                        toast.success("All job details cleared");
+                        setSelectedJobId(null);
+                        load();
+                      }}
+                    >
+                      Clear
+                    </AlertDialogAction>
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
@@ -601,7 +771,8 @@ export default function BackfillPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No backfill jobs yet. Create a job to import historical records from the AT Protocol network.
+                    No backfill jobs yet. Create a job to import historical
+                    records from the AT Protocol network.
                   </TableCell>
                 </TableRow>
               )}
@@ -658,9 +829,7 @@ export default function BackfillPage() {
                 canRetry={hasPermission("backfill:create")}
                 onJobUpdate={(updater) => {
                   setJobs((prev) =>
-                    prev.map((j) =>
-                      j.id === selectedJob.id ? updater(j) : j,
-                    ),
+                    prev.map((j) => (j.id === selectedJob.id ? updater(j) : j)),
                   );
                 }}
                 onCancel={async () => {
@@ -715,11 +884,34 @@ function JobDetail({
   const [retrying, setRetrying] = useState(false);
   const current = phaseIndex(job.stage);
   const allDone = job.status === "completed";
-  const isActive = job.status === "running" || job.status === "cancelling" || job.status === "pausing";
+  const isActive =
+    job.status === "running" ||
+    job.status === "cancelling" ||
+    job.status === "pausing";
   const isPaused = job.status === "paused" || job.status === "pausing";
+  // A failed replay resumes from its saved sweeps.
+  const resumable =
+    job.status === "paused" ||
+    (job.status === "failed" && job.source === "replay");
+  // Discovery runs alongside resolving and fetching on the bounded queue.
+  const discovering = job.discovery_complete === false;
+  const bounded = job.recent_completions_limit != null;
+  // A bounded job's queue is its work, so the server only clears a finished
+  // one; a legacy job can be cleared whenever it isn't running.
+  const flushable =
+    !isActive &&
+    (!bounded ||
+      job.status === "completed" ||
+      job.status === "cancelled" ||
+      job.status === "failed");
+  // Set only when HappyView paused the job itself; an operator's pause has no
+  // reason, and resuming clears it.
+  const pauseReason = job.status === "paused" ? job.error : null;
 
   // Detail data state
-  const [discoveredRepos, setDiscoveredRepos] = useState<BackfillRepoEntry[]>([]);
+  const [discoveredRepos, setDiscoveredRepos] = useState<BackfillRepoEntry[]>(
+    [],
+  );
   const [discoveredCursor, setDiscoveredCursor] = useState<string | null>(null);
   const [discoveredLoaded, setDiscoveredLoaded] = useState(false);
 
@@ -743,10 +935,15 @@ function JobDetail({
   const [errorsCapped, setErrorsCapped] = useState(false);
   const [errorsCap, setErrorsCap] = useState(0);
   const [errorsOpen, setErrorsOpen] = useState(false);
-  const [visibleErrorDidsByKind, setVisibleErrorDidsByKind] = useState<Record<string, string[]>>({});
+  const [visibleErrorDidsByKind, setVisibleErrorDidsByKind] = useState<
+    Record<string, string[]>
+  >({});
 
   const jobErrorTotal = useMemo(
-    () => (job.error_counts ? Object.values(job.error_counts).reduce((a, b) => a + b, 0) : 0),
+    () =>
+      job.error_counts
+        ? Object.values(job.error_counts).reduce((a, b) => a + b, 0)
+        : 0,
     [job.error_counts],
   );
 
@@ -764,7 +961,10 @@ function JobDetail({
     () => errorSummary.reduce((sum, c) => sum + c.count, 0),
     [errorSummary],
   );
-  const anyRetryable = useMemo(() => errorSummary.some((c) => c.retryable), [errorSummary]);
+  const anyRetryable = useMemo(
+    () => errorSummary.some((c) => c.retryable),
+    [errorSummary],
+  );
 
   // Refs for open state and callbacks so the SSE callback doesn't need to re-bind on toggle
   const onJobUpdateRef = useRef(onJobUpdate);
@@ -773,7 +973,11 @@ function JobDetail({
   function hasReached(phase: (typeof PROGRESS_PHASES)[number]): boolean {
     if (allDone) return true;
     if (job.stage === "resolving_and_fetching") {
-      return phase === "discovering_repos" || phase === "resolving_pds" || phase === "fetching_records";
+      return (
+        phase === "discovering_repos" ||
+        phase === "resolving_pds" ||
+        phase === "fetching_records"
+      );
     }
     return current >= phaseIndex(phase);
   }
@@ -781,7 +985,11 @@ function JobDetail({
   function isPhasePaused(phase: (typeof PROGRESS_PHASES)[number]): boolean {
     if (!isPaused) return false;
     if (job.stage === "resolving_and_fetching") {
-      return phase === "resolving_pds" || phase === "fetching_records";
+      return (
+        phase === "resolving_pds" ||
+        phase === "fetching_records" ||
+        (phase === "discovering_repos" && discovering)
+      );
     }
     if (job.stage === "discovering_repos") {
       return phase === "discovering_repos";
@@ -837,9 +1045,13 @@ function JobDetail({
     }
   }
 
+  // A replay job has no repos or PDSes to list; its progress is a seq range.
+  const replayView = job.source === "replay" || isReplayStage(job.stage);
+
   const discoveredReached = hasReached("discovering_repos");
   const pdsReached = hasReached("resolving_pds");
-  const fetchedReached = hasReached("fetching_records") || job.stage === "resolving_and_fetching";
+  const fetchedReached =
+    hasReached("fetching_records") || job.stage === "resolving_and_fetching";
 
   // Track which sections are expanded
   const [discoveredOpen, setDiscoveredOpen] = useState(false);
@@ -850,7 +1062,11 @@ function JobDetail({
   useEffect(() => {
     if (discoveredOpen && discoveredReached && !discoveredLoaded) {
       getBackfillRepos(job.id, { phase: "discovered", limit: 50 })
-        .then((resp) => { setDiscoveredRepos(resp.repos); setDiscoveredCursor(resp.cursor); setDiscoveredLoaded(true); })
+        .then((resp) => {
+          setDiscoveredRepos(resp.repos);
+          setDiscoveredCursor(resp.cursor);
+          setDiscoveredLoaded(true);
+        })
         .catch(() => {});
     }
   }, [job.id, discoveredOpen, discoveredReached, discoveredLoaded]);
@@ -858,7 +1074,10 @@ function JobDetail({
   useEffect(() => {
     if (pdsOpen && pdsReached && !pdsLoaded) {
       getBackfillPdsSummary(job.id)
-        .then((resp) => { setPdsSummary(resp.pds_endpoints); setPdsLoaded(true); })
+        .then((resp) => {
+          setPdsSummary(resp.pds_endpoints);
+          setPdsLoaded(true);
+        })
         .catch(() => {});
     }
   }, [job.id, pdsOpen, pdsReached, pdsLoaded]);
@@ -866,7 +1085,11 @@ function JobDetail({
   useEffect(() => {
     if (fetchedOpen && fetchedReached && !fetchedLoaded) {
       getBackfillRepos(job.id, { phase: "fetched", limit: 50 })
-        .then((resp) => { setFetchedRepos(resp.repos); setFetchedCursor(resp.cursor); setFetchedLoaded(true); })
+        .then((resp) => {
+          setFetchedRepos(resp.repos);
+          setFetchedCursor(resp.cursor);
+          setFetchedLoaded(true);
+        })
         .catch(() => {});
     }
   }, [job.id, fetchedOpen, fetchedReached, fetchedLoaded]);
@@ -874,19 +1097,31 @@ function JobDetail({
   const loadMoreDiscovered = useCallback(async () => {
     if (!discoveredCursor) return;
     try {
-      const resp = await getBackfillRepos(job.id, { phase: "discovered", cursor: discoveredCursor, limit: 50 });
+      const resp = await getBackfillRepos(job.id, {
+        phase: "discovered",
+        cursor: discoveredCursor,
+        limit: 50,
+      });
       setDiscoveredRepos((prev) => [...prev, ...resp.repos]);
       setDiscoveredCursor(resp.cursor);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, [job.id, discoveredCursor]);
 
   const loadMoreFetched = useCallback(async () => {
     if (!fetchedCursor) return;
     try {
-      const resp = await getBackfillRepos(job.id, { phase: "fetched", cursor: fetchedCursor, limit: 50 });
+      const resp = await getBackfillRepos(job.id, {
+        phase: "fetched",
+        cursor: fetchedCursor,
+        limit: 50,
+      });
       setFetchedRepos((prev) => [...prev, ...resp.repos]);
       setFetchedCursor(resp.cursor);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, [job.id, fetchedCursor]);
 
   // Process batched SSE events from the Web Worker.
@@ -914,14 +1149,28 @@ function JobDetail({
           processed_repos: maxCount(e.processed_repos, j.processed_repos),
           total_records: maxCount(e.total_records, j.total_records),
           error_counts: e.error_counts ?? j.error_counts,
+          discovery_complete: e.discovery_complete ?? j.discovery_complete,
         }));
       } else if (e.type === "job_counters") {
         update((j) => ({
           ...j,
           ...(e.total_repos != null && { total_repos: e.total_repos }),
           ...(e.resolved_repos != null && { resolved_repos: e.resolved_repos }),
-          ...(e.processed_repos != null && { processed_repos: e.processed_repos }),
+          ...(e.processed_repos != null && {
+            processed_repos: e.processed_repos,
+          }),
           ...(e.total_records != null && { total_records: e.total_records }),
+        }));
+      } else if (e.type === "replay_progress") {
+        update((j) => ({
+          ...j,
+          replay: {
+            after_seq: j.replay?.after_seq ?? 0,
+            through_seq: e.through_seq ?? j.replay?.through_seq ?? null,
+            tip_seq: e.tip_seq ?? j.replay?.tip_seq ?? null,
+            bytes: e.bytes ?? j.replay?.bytes ?? 0,
+            blocks_failed: e.blocks_failed ?? j.replay?.blocks_failed ?? 0,
+          },
         }));
       } else if (e.type === "job_stage_changed" && e.stage) {
         update((j) => ({ ...j, stage: e.stage! }));
@@ -934,7 +1183,9 @@ function JobDetail({
   useBackfillSSE(job.id, isActive, handleSSEBatch);
 
   // Track visible DIDs from virtualized lists (only items in viewport)
-  const [visibleDiscoveredDids, setVisibleDiscoveredDids] = useState<string[]>([]);
+  const [visibleDiscoveredDids, setVisibleDiscoveredDids] = useState<string[]>(
+    [],
+  );
   const [visibleFetchedDids, setVisibleFetchedDids] = useState<string[]>([]);
 
   const allVisibleDids = useMemo(() => {
@@ -983,6 +1234,14 @@ function JobDetail({
             </p>
           </div>
           <div>
+            <span className="text-muted-foreground">Source</span>
+            <p className="text-xs">
+              <Badge variant="secondary">
+                {SOURCE_LABELS[job.source] ?? job.source}
+              </Badge>
+            </p>
+          </div>
+          <div>
             <span className="text-muted-foreground">Created</span>
             <p className="text-xs">
               {new Date(job.created_at).toLocaleString()}
@@ -1006,133 +1265,205 @@ function JobDetail({
           )}
         </div>
 
-        {job.error && (
+        {pauseReason ? (
           <div>
-            <span className="text-muted-foreground text-sm">Error</span>
-            <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
-              {job.error}
+            <span className="text-muted-foreground text-sm">
+              Paused automatically
+            </span>
+            <div className="bg-amber-500/10 text-amber-700 dark:text-amber-400 mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+              {pauseReason}
             </div>
           </div>
+        ) : (
+          job.error && (
+            <div>
+              <span className="text-muted-foreground text-sm">Error</span>
+              <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
+                {job.error}
+              </div>
+            </div>
+          )
         )}
 
         <div>
           <span className="text-muted-foreground text-sm">Progress</span>
           <div className="mt-1 rounded-md border divide-y">
-            <ProgressRow
-              label="Discovering repos"
-              active={isActive && job.stage === "discovering_repos"}
-              reached={hasReached("discovering_repos")}
-              paused={isPhasePaused("discovering_repos")}
-              value={job.total_repos != null ? <AnimatedNumber value={job.total_repos} /> : undefined}
-              suffix="repos found"
-              loading={discoveredOpen && discoveredReached && !discoveredLoaded}
-              open={discoveredOpen}
-              onOpenChange={setDiscoveredOpen}
-            >
-              {discoveredRepos.length > 0 ? (
-                <VirtualList
-                  items={discoveredRepos}
-                  getKey={(r) => r.did}
-                  onVisibleKeysChange={setVisibleDiscoveredDids}
-                  hasMore={!!discoveredCursor}
-                  onLoadMore={loadMoreDiscovered}
-                  rowHeight={28}
-                  renderRow={(repo) => (
-                    <CompactRepoRow
-                      did={repo.did}
-                      profile={profiles.get(repo.did)}
+            {replayView && job.replay && (
+              <ReplayProgressBar
+                stage={job.stage}
+                replay={job.replay}
+                active={isActive && !isPaused}
+              />
+            )}
+            {!replayView && (
+              <>
+                <ProgressRow
+                  label="Discovering repos"
+                  active={
+                    isActive &&
+                    (job.stage === "discovering_repos" || discovering)
+                  }
+                  reached={hasReached("discovering_repos")}
+                  paused={isPhasePaused("discovering_repos")}
+                  value={
+                    job.total_repos != null ? (
+                      <AnimatedNumber value={job.total_repos} />
+                    ) : undefined
+                  }
+                  suffix={discovering ? "found so far" : "repos found"}
+                  loading={
+                    discoveredOpen && discoveredReached && !discoveredLoaded
+                  }
+                  open={discoveredOpen}
+                  onOpenChange={setDiscoveredOpen}
+                >
+                  {bounded && discoveredLoaded && (
+                    <p className="px-3 pt-2 text-xs text-muted-foreground">
+                      Repos waiting to be fetched. Finished repos move to
+                      Fetching records.
+                    </p>
+                  )}
+                  {discoveredRepos.length > 0 ? (
+                    <VirtualList
+                      items={discoveredRepos}
+                      getKey={(r) => r.did}
+                      onVisibleKeysChange={setVisibleDiscoveredDids}
+                      hasMore={!!discoveredCursor}
+                      onLoadMore={loadMoreDiscovered}
+                      rowHeight={28}
+                      renderRow={(repo) => (
+                        <CompactRepoRow
+                          did={repo.did}
+                          profile={profiles.get(repo.did)}
+                        />
+                      )}
                     />
-                  )}
-                />
-              ) : discoveredLoaded ? (
-                <p className="py-3 text-center text-xs text-muted-foreground">No repos discovered yet.</p>
-              ) : null}
-            </ProgressRow>
-            <ProgressRow
-              label="Resolving PDS"
-              active={
-                isActive &&
-                (job.stage === "resolving_pds" ||
-                  job.stage === "resolving_and_fetching")
-              }
-              reached={hasReached("resolving_pds")}
-              paused={isPhasePaused("resolving_pds")}
-              value={
-                hasReached("resolving_pds")
-                  ? <><AnimatedNumber value={job.resolved_repos ?? job.processed_repos ?? 0} /> / <AnimatedNumber value={job.total_repos ?? 0} /></>
-                  : undefined
-              }
-              suffix="resolved"
-              loading={pdsOpen && pdsReached && !pdsLoaded}
-              open={pdsOpen}
-              onOpenChange={setPdsOpen}
-            >
-              {sortedPdsSummary.length > 0 ? (
-                <VirtualList
-                  items={sortedPdsSummary}
-                  getKey={(p) => p.pds_endpoint}
-                  hasMore={false}
-                  onLoadMore={() => {}}
-                  rowHeight={32}
-                  renderRow={(pds) => (
-                    <div className="flex items-center gap-2 px-3 py-1.5">
-                      <PdsFavicon pdsEndpoint={pds.pds_endpoint} />
-                      <span className="flex-1 truncate font-mono text-xs">{new URL(pds.pds_endpoint).hostname}</span>
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        <AnimatedNumber value={pds.completed_repos} />/<AnimatedNumber value={pds.total_repos} /> repos · <AnimatedNumber value={pds.total_records} /> records
-                      </span>
-                    </div>
-                  )}
-                />
-              ) : pdsLoaded ? (
-                <p className="py-3 text-center text-xs text-muted-foreground">No PDS data yet.</p>
-              ) : null}
-            </ProgressRow>
-            <ProgressRow
-              label="Fetching records"
-              active={
-                isActive &&
-                (job.stage === "fetching_records" ||
-                  job.stage === "resolving_and_fetching")
-              }
-              reached={hasReached("fetching_records")}
-              paused={isPhasePaused("fetching_records")}
-              value={
-                hasReached("fetching_records") ||
-                job.stage === "resolving_and_fetching"
-                  ? <><AnimatedNumber value={job.processed_repos ?? 0} /> / <AnimatedNumber value={job.total_repos ?? 0} /> repos</>
-                  : undefined
-              }
-              suffix={
-                hasReached("fetching_records") ||
-                job.stage === "resolving_and_fetching"
-                  ? <><AnimatedNumber value={job.total_records ?? 0} /> records</>
-                  : undefined
-              }
-              loading={fetchedOpen && fetchedReached && !fetchedLoaded}
-              open={fetchedOpen}
-              onOpenChange={setFetchedOpen}
-            >
-              {fetchedWithRecords.length > 0 ? (
-                <VirtualList
-                  items={fetchedWithRecords}
-                  getKey={(r) => r.did}
-                  onVisibleKeysChange={setVisibleFetchedDids}
-                  hasMore={!!fetchedCursor}
-                  onLoadMore={loadMoreFetched}
-                  rowHeight={40}
-                  renderRow={(repo) => (
-                    <ProfileRow
-                      did={repo.did}
-                      profile={profiles.get(repo.did)}
-                      suffix={<span className="flex items-center gap-1"><CheckCircle2 className="size-3 text-emerald-500" /><AnimatedNumber value={repo.records_fetched} /> records</span>}
+                  ) : discoveredLoaded ? (
+                    <p className="py-3 text-center text-xs text-muted-foreground">
+                      {bounded
+                        ? "No repos waiting."
+                        : "No repos discovered yet."}
+                    </p>
+                  ) : null}
+                </ProgressRow>
+                <ProgressRow
+                  label="Resolving PDS"
+                  active={
+                    isActive &&
+                    (job.stage === "resolving_pds" ||
+                      job.stage === "resolving_and_fetching")
+                  }
+                  reached={hasReached("resolving_pds")}
+                  paused={isPhasePaused("resolving_pds")}
+                  value={
+                    hasReached("resolving_pds") ? (
+                      <>
+                        <AnimatedNumber
+                          value={job.resolved_repos ?? job.processed_repos ?? 0}
+                        />{" "}
+                        / <AnimatedNumber value={job.total_repos ?? 0} />
+                      </>
+                    ) : undefined
+                  }
+                  suffix="resolved"
+                  loading={pdsOpen && pdsReached && !pdsLoaded}
+                  open={pdsOpen}
+                  onOpenChange={setPdsOpen}
+                >
+                  {sortedPdsSummary.length > 0 ? (
+                    <VirtualList
+                      items={sortedPdsSummary}
+                      getKey={(p) => p.pds_endpoint}
+                      hasMore={false}
+                      onLoadMore={() => {}}
+                      rowHeight={32}
+                      renderRow={(pds) => (
+                        <div className="flex items-center gap-2 px-3 py-1.5">
+                          <PdsFavicon pdsEndpoint={pds.pds_endpoint} />
+                          <span className="flex-1 truncate font-mono text-xs">
+                            {new URL(pds.pds_endpoint).hostname}
+                          </span>
+                          <span className="text-xs text-muted-foreground tabular-nums">
+                            <AnimatedNumber value={pds.completed_repos} />/
+                            <AnimatedNumber value={pds.total_repos} /> repos ·{" "}
+                            <AnimatedNumber value={pds.total_records} /> records
+                          </span>
+                        </div>
+                      )}
                     />
+                  ) : pdsLoaded ? (
+                    <p className="py-3 text-center text-xs text-muted-foreground">
+                      No PDS data yet.
+                    </p>
+                  ) : null}
+                </ProgressRow>
+                <ProgressRow
+                  label="Fetching records"
+                  active={
+                    isActive &&
+                    (job.stage === "fetching_records" ||
+                      job.stage === "resolving_and_fetching")
+                  }
+                  reached={hasReached("fetching_records")}
+                  paused={isPhasePaused("fetching_records")}
+                  value={
+                    hasReached("fetching_records") ||
+                    job.stage === "resolving_and_fetching" ? (
+                      <>
+                        <AnimatedNumber value={job.processed_repos ?? 0} /> /{" "}
+                        <AnimatedNumber value={job.total_repos ?? 0} /> repos
+                      </>
+                    ) : undefined
+                  }
+                  suffix={
+                    hasReached("fetching_records") ||
+                    job.stage === "resolving_and_fetching" ? (
+                      <>
+                        <AnimatedNumber value={job.total_records ?? 0} />{" "}
+                        records
+                      </>
+                    ) : undefined
+                  }
+                  loading={fetchedOpen && fetchedReached && !fetchedLoaded}
+                  open={fetchedOpen}
+                  onOpenChange={setFetchedOpen}
+                >
+                  {job.recent_completions_limit != null && fetchedLoaded && (
+                    <p className="px-3 pt-2 text-xs text-muted-foreground">
+                      The {job.recent_completions_limit.toLocaleString()} most
+                      recently fetched repos.
+                    </p>
                   )}
-                />
-              ) : fetchedLoaded ? (
-                <p className="py-3 text-center text-xs text-muted-foreground">No repos fetched yet.</p>
-              ) : null}
-            </ProgressRow>
+                  {fetchedWithRecords.length > 0 ? (
+                    <VirtualList
+                      items={fetchedWithRecords}
+                      getKey={(r) => r.did}
+                      onVisibleKeysChange={setVisibleFetchedDids}
+                      hasMore={!!fetchedCursor}
+                      onLoadMore={loadMoreFetched}
+                      rowHeight={40}
+                      renderRow={(repo) => (
+                        <ProfileRow
+                          did={repo.did}
+                          profile={profiles.get(repo.did)}
+                          suffix={
+                            <span className="flex items-center gap-1">
+                              <CheckCircle2 className="size-3 text-emerald-500" />
+                              <AnimatedNumber value={repo.records_fetched} />{" "}
+                              records
+                            </span>
+                          }
+                        />
+                      )}
+                    />
+                  ) : fetchedLoaded ? (
+                    <p className="py-3 text-center text-xs text-muted-foreground">
+                      No repos fetched yet.
+                    </p>
+                  ) : null}
+                </ProgressRow>
+              </>
+            )}
             {errorsTotal > 0 && (
               <ProgressRow
                 label="Errors"
@@ -1181,7 +1512,10 @@ function JobDetail({
                       onRetry={handleRetry}
                       profiles={profiles}
                       onVisibleDidsChange={(dids) =>
-                        setVisibleErrorDidsByKind((prev) => ({ ...prev, [c.kind]: dids }))
+                        setVisibleErrorDidsByKind((prev) => ({
+                          ...prev,
+                          [c.kind]: dids,
+                        }))
                       }
                     />
                   ))}
@@ -1192,47 +1526,60 @@ function JobDetail({
         </div>
       </div>
       <SheetFooter className="border-t flex-row justify-end gap-2">
-        {canFlush && !isActive && (
+        {canFlush && flushable && (
           <AlertDialog>
             <AlertDialogTrigger asChild>
-              <Button variant="outline" size="sm">Clear details</Button>
+              <Button variant="outline" size="sm">
+                Clear details
+              </Button>
             </AlertDialogTrigger>
             <AlertDialogContent>
               <AlertDialogHeader>
                 <AlertDialogTitle>Clear job details?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  This will permanently delete per-repo detail data for this backfill job.
+                  This will permanently delete per-repo detail data for this
+                  backfill job.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={async () => {
-                  await flushBackfillDetails(job.id);
-                  toast.success("Job details cleared");
-                  setDiscoveredRepos([]);
-                  setDiscoveredCursor(null);
-                  setDiscoveredLoaded(false);
-                  setPdsSummary([]);
-                  setPdsLoaded(false);
-                  setFetchedRepos([]);
-                  setFetchedCursor(null);
-                  setFetchedLoaded(false);
-                }}>Clear</AlertDialogAction>
+                <AlertDialogAction
+                  onClick={async () => {
+                    try {
+                      await flushBackfillDetails(job.id);
+                    } catch (e: unknown) {
+                      toastError("Failed to clear job details", e);
+                      return;
+                    }
+                    toast.success("Job details cleared");
+                    setDiscoveredRepos([]);
+                    setDiscoveredCursor(null);
+                    setDiscoveredLoaded(false);
+                    setPdsSummary([]);
+                    setPdsLoaded(false);
+                    setFetchedRepos([]);
+                    setFetchedCursor(null);
+                    setFetchedLoaded(false);
+                  }}
+                >
+                  Clear
+                </AlertDialogAction>
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
         )}
-        {canCancel && (job.status === "running" || job.status === "pausing") && (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={pausing || job.status === "pausing"}
-            onClick={handlePause}
-          >
-            {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
-          </Button>
-        )}
-        {canCancel && job.status === "paused" && (
+        {canCancel &&
+          (job.status === "running" || job.status === "pausing") && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={pausing || job.status === "pausing"}
+              onClick={handlePause}
+            >
+              {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
+            </Button>
+          )}
+        {canCancel && resumable && (
           <Button
             variant="default"
             size="sm"
@@ -1296,7 +1643,10 @@ function VirtualList<T>({
 
   const virtualItems = virtualizer.getVirtualItems();
 
-  const visibleKeysStr = virtualItems.map((item) => getKey(items[item.index])).filter(Boolean).join(",");
+  const visibleKeysStr = virtualItems
+    .map((item) => getKey(items[item.index]))
+    .filter(Boolean)
+    .join(",");
   useEffect(() => {
     onVisibleKeysChange?.(visibleKeysStr.split(",").filter(Boolean));
   }, [visibleKeysStr, onVisibleKeysChange]);
@@ -1304,7 +1654,11 @@ function VirtualList<T>({
   useEffect(() => {
     if (!hasMore) return;
     const lastItem = virtualItems[virtualItems.length - 1];
-    if (lastItem && lastItem.index >= items.length - 5 && !loadMoreTriggered.current) {
+    if (
+      lastItem &&
+      lastItem.index >= items.length - 5 &&
+      !loadMoreTriggered.current
+    ) {
       loadMoreTriggered.current = true;
       onLoadMore();
     }
@@ -1316,14 +1670,20 @@ function VirtualList<T>({
   return (
     <div ref={parentRef} className="max-h-64 overflow-y-auto">
       <div
-        style={{ height: virtualizer.getTotalSize(), width: "100%", position: "relative" }}
+        style={{
+          height: virtualizer.getTotalSize(),
+          width: "100%",
+          position: "relative",
+        }}
       >
         {virtualItems.map((virtualRow) => {
           const item = items[virtualRow.index];
           if (!item) return null;
+          // Keyed by position: a repo found under two collections is two
+          // queued units, so a DID is not unique within a list.
           return (
             <div
-              key={getKey(item)}
+              key={virtualRow.index}
               style={{
                 position: "absolute",
                 top: 0,
@@ -1376,7 +1736,11 @@ function ProgressRow({
           className={`flex w-full items-center gap-2 px-3 py-2 text-sm text-left ${
             expandable ? "cursor-pointer hover:bg-accent/50" : ""
           } ${
-            active ? "bg-blue-500/5" : reached ? "" : "text-muted-foreground opacity-50"
+            active
+              ? "bg-blue-500/5"
+              : reached
+                ? ""
+                : "text-muted-foreground opacity-50"
           }`}
         >
           <span className="shrink-0">
@@ -1390,7 +1754,9 @@ function ProgressRow({
               <Circle className="size-4" />
             )}
           </span>
-          <span className={`flex-1 ${active ? "font-medium" : ""}`}>{label}</span>
+          <span className={`flex-1 ${active ? "font-medium" : ""}`}>
+            {label}
+          </span>
           {reached && value && (
             <span className="tabular-nums text-xs text-muted-foreground">
               {value}
@@ -1398,7 +1764,9 @@ function ProgressRow({
             </span>
           )}
           {expandable && (
-            <ChevronRight className={`size-4 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
+            <ChevronRight
+              className={`size-4 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+            />
           )}
         </button>
       </CollapsibleTrigger>
@@ -1409,7 +1777,9 @@ function ProgressRow({
               <div className="flex items-center justify-center py-4">
                 <Loader2 className="size-4 animate-spin text-muted-foreground" />
               </div>
-            ) : children}
+            ) : (
+              children
+            )}
           </div>
         </CollapsibleContent>
       )}
@@ -1421,8 +1791,13 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [collection, setCollection] = useState<string | null>(null);
   const [dids, setDids] = useState<string[]>([]);
   const [accountsBlocked, setAccountsBlocked] = useState(false);
+  // "default" sends no source, so the server's BACKFILL_SOURCE decides.
+  const [source, setSource] = useState<BackfillSource | "default">("default");
   const [open, setOpen] = useState(false);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
+  // Account backfills always crawl; the server refuses replay for them.
+  const accountJob = dids.length > 0;
+  const chosenSource = accountJob && source === "replay" ? "default" : source;
 
   useEffect(() => {
     if (open) {
@@ -1444,10 +1819,12 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       await createBackfillJob({
         collection: collection || undefined,
         dids: dids.length > 0 ? dids : undefined,
+        source: chosenSource === "default" ? undefined : chosenSource,
       });
       toast.success("Backfill job created");
       setCollection(null);
       setDids([]);
+      setSource("default");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
@@ -1476,9 +1853,9 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Create Backfill Job</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Backfill a collection, specific accounts, or both. Without
-            accounts, every repo on the network with matching records is
-            backfilled; without a collection, every record collection is.
+            Backfill a collection, specific accounts, or both. Without accounts,
+            every repo on the network with matching records is backfilled;
+            without a collection, every record collection is.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <ResponsiveDialogBody className="flex flex-col gap-4">
@@ -1513,8 +1890,35 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               onBlockedChange={setAccountsBlocked}
             />
             <p className="text-muted-foreground text-xs">
-              Search by handle, or paste handles and DIDs separated by commas
-              or spaces.
+              Search by handle, or paste handles and DIDs separated by commas or
+              spaces.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="bf-source">Source</Label>
+            <Select
+              value={chosenSource}
+              onValueChange={(v) => setSource(v as BackfillSource | "default")}
+            >
+              <SelectTrigger id="bf-source" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">Default</SelectItem>
+                <SelectItem value="replay" disabled={accountJob}>
+                  Replay from Jetstream
+                </SelectItem>
+                <SelectItem value="crawl">Crawl PDSes</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-xs">
+              {accountJob
+                ? "Account backfills always crawl each account's PDS."
+                : chosenSource === "replay"
+                  ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
+                  : chosenSource === "crawl"
+                    ? "Lists repos from the relay and fetches each PDS."
+                    : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
             </p>
           </div>
         </ResponsiveDialogBody>

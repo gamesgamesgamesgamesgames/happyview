@@ -1,10 +1,29 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tests/fixtures/test_plugin"]
+exclude = [
+    "tests/fixtures/test_plugin",
+    "tests/fixtures/test_library",
+    "tests/fixtures/sdk_http",
+    "tests/fixtures/sdk_auth",
+    "tests/fixtures/sdk_blobs",
+    "tests/fixtures/sdk_objects",
+    "tests/fixtures/sdk_caller",
+    "tests/fixtures/sdk_atproto",
+    "tests/fixtures/sdk_linked_repos",
+    "tests/fixtures/sdk_spaces",
+    "tests/fixtures/wasi_probe",
+    "tests/fixtures/wasi_forbidden",
+    "tests/fixtures/interpreter_echo",
+    "tests/fixtures/differential_library",
+    "tests/fixtures/script_module",
+]
 
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
 happyview-plc = { path = "crates/happyview-plc" }
+happyview-provider = { path = "crates/happyview-provider" }
+happyview-source-jetstream = { path = "crates/happyview-source-jetstream" }
+happyview-plugin-sdk = { path = "crates/happyview-plugin-sdk" }
 happyview-scopes = { path = "crates/happyview-scopes" }
 
 [package]
@@ -13,6 +32,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 default-run = "happyview"
+repository = "https://github.com/gamesgamesgamesgamesgames/happyview"
 
 # Debug info dominates both codegen and link time on this workspace, and full
 # DWARF buys little for day-to-day work: `line-tables-only` still yields file
@@ -22,10 +42,17 @@ default-run = "happyview"
 [profile.dev]
 debug = "line-tables-only"
 
+# The profile cargo-dist builds release archives with.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [dependencies]
 aes-gcm = "0.11"
 anyhow = "1"
 arc-swap = "1"
+async-trait = "0.1"
+wasmparser = "0.258"
 atrium-oauth = { version = "0.1", default-features = false }
 atrium-identity = "0.1"
 atrium-common = "0.1"
@@ -39,8 +66,12 @@ data-encoding = "2"
 dotenvy = "0.15"
 happyview-nsid = { workspace = true }
 happyview-plc = { workspace = true }
+happyview-provider = { workspace = true }
+happyview-source-jetstream = { workspace = true }
+happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
+full_moon = { version = "2", features = ["lua54"] }
 futures-util = "0.3"
 jose-jwk = { version = "0.1", default-features = false, features = ["p256"] }
 jsonwebtoken = "10"
@@ -50,38 +81,71 @@ cid = "0.11"
 ciborium = "0.2"
 ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
+libsqlite3-sys = { version = "0.30", default-features = false }
 multibase = "0.9"
 p256 = { version = "0.14", features = ["pkcs8", "ecdsa", "ecdh"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
-reqwest = { version = "0.12", features = ["json", "gzip"] }
+# rustls rather than the default native-tls: OpenSSL cannot link into a static
+# musl binary and is absent on Windows. Native roots keep the platform's trust
+# store, which is how an operator (and the e2e stack) adds a private CA.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_ipld_dagcbor = "0.6"
 serde_json = "1"
 sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+tempfile = "3"
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "any", "json", "chrono", "migrate"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 thiserror = "2"
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 http-body-util = "0.1"
 hickory-resolver = "0.26"
 ipnet = "2"
-mlua = { version = "0.12", features = ["lua54", "async", "serialize", "vendored", "send"] }
+lru = "0.16"
+mlua = { version = "0.12", optional = true, features = ["lua54", "async", "serialize", "vendored", "send"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 urlencoding = "2.1.3"
 webpki-roots = "1.0"
-# Default features minus `cache`, which HappyView never configures (it keeps
-# its own module cache) and which pulls in zstd.
-wasmtime = { version = ">=36.0.16, <37", default-features = false, features = [
-    "async", "gc", "gc-drc", "gc-null", "wat", "profiling", "parallel-compilation",
-    "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
-    "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std",
+zstd = "0.14.3"
+# Wasmtime's defaults less `cache`, which pulls a zstd with open advisories and
+# which nothing uses: compiled modules are cached by `WasmRuntime::module_for`.
+wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
 ] }
+wasmtime-wasi = { version = ">=49.0.4, <50", default-features = false, features = ["p1"] }
 regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"
@@ -89,9 +153,31 @@ blake3 = "1"
 fs4 = "0.13"
 hkdf = "0.13"
 hmac = "0.13"
-sqlparser = "0.62.0"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 subtle = "2"
+mime_guess = "2"
+rust-embed = { version = "8", optional = true }
 sfv = "0.15"
+notify = "8.2"
+
+[features]
+# The native Lua runtime under `src/lua/`, kept to be compared against the
+# interpreter plugin by `tests/lua_differential.rs`. It is off by default so
+# that a release build carries no Lua interpreter of its own and the plugin is
+# the only path a script run can take.
+lua-reference = ["dep:mlua"]
+# The dashboard compiled into the binary, served when STATIC_DIR is unset.
+# Needs `web/out` (npm run build in web/, with
+# NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__) and refuses to compile without it,
+# which is why it is off by default: the release build turns it on after
+# building the frontend, and nothing else has to.
+embedded-dashboard = ["dep:rust-embed"]
+# `happyview::testkit`'s `ProviderApp` and the provider conformance cases,
+# with the contract crate's `ScriptedSource`, for a record provider's tests.
+testkit = ["happyview-provider/testkit"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[bin]]
 name = "migrate-lua-sql"
@@ -101,7 +187,27 @@ path = "src/bin/migrate_lua_sql.rs"
 name = "migrate-space-cids"
 path = "src/bin/migrate_space_cids.rs"
 
+[[bin]]
+name = "happyview-codemod"
+path = "src/bin/codemod.rs"
+
+# Declared rather than discovered so that running it without the native
+# runtime is an error naming the feature, instead of an empty binary reporting
+# success.
+[[test]]
+name = "lua_differential"
+path = "tests/lua_differential.rs"
+required-features = ["lua-reference"]
+
+# The provider conformance run, which needs the kit.
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["testkit"]
+
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -109,3 +215,5 @@ serial_test = "3"
 urlencoding = "2.1.3"
 futures = "0.3"
 rcgen = "0.14"
+wat = "1"
+tempfile = "3"

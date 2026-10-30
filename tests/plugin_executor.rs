@@ -1,10 +1,10 @@
 // tests/plugin_executor.rs
 
+use happyview::catalog::LexiconCatalog;
 use happyview::db::DatabaseBackend;
-use happyview::lexicon::LexiconRegistry;
 use happyview::plugin::{
-    ExecutionError, LoadedPlugin, PluginExecutor, PluginInfo, PluginRegistry, PluginSource,
-    WasmRuntime,
+    ExecutionError, LoadedPlugin, PluginExecutor, PluginInfo, PluginManifest, PluginRegistry,
+    PluginSource, WasmRuntime,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,14 +13,14 @@ type Secrets = HashMap<String, String>;
 
 async fn create_test_executor() -> (PluginExecutor, Arc<PluginRegistry>) {
     // Create in-memory database
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     let db = sqlx::AnyPool::connect("sqlite::memory:")
         .await
         .expect("Failed to create test database");
 
     let runtime = Arc::new(WasmRuntime::new().expect("Failed to create runtime"));
     let registry = Arc::new(PluginRegistry::new());
-    let lexicons = Arc::new(LexiconRegistry::new());
+    let lexicons = Arc::new(LexiconCatalog::detached());
     let http_client = reqwest::Client::new();
 
     let executor = PluginExecutor::new(
@@ -43,12 +43,18 @@ fn load_test_plugin() -> LoadedPlugin {
         "Test plugin not built. Run: cd tests/fixtures/test_plugin && cargo build --target wasm32-unknown-unknown --release",
     );
 
+    let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+        "id": "test", "name": "Test Plugin", "version": "1.0.0", "api_version": "2",
+        "plugin_type": "auth", "capabilities": [],
+    }))
+    .unwrap();
+
     LoadedPlugin {
         info: PluginInfo {
             id: "test".into(),
             name: "Test Plugin".into(),
             version: "1.0.0".into(),
-            api_version: "1".into(),
+            api_version: "2".into(),
             icon_url: None,
             required_secrets: vec![],
             auth_type: "oauth2".into(),
@@ -58,7 +64,7 @@ fn load_test_plugin() -> LoadedPlugin {
             path: "tests/fixtures/test_plugin".into(),
         },
         wasm_bytes,
-        manifest: None,
+        manifest: Some(manifest),
     }
 }
 
@@ -190,30 +196,6 @@ async fn test_get_profile() {
 }
 
 #[tokio::test]
-async fn test_sync_account() {
-    let (executor, registry) = create_test_executor().await;
-    let plugin = load_test_plugin();
-    registry.register(plugin).await;
-
-    let mut instance = executor
-        .instantiate(
-            "test",
-            "user:did:plc:test",
-            Secrets::new(),
-            serde_json::Value::Null,
-        )
-        .await
-        .expect("Failed to instantiate");
-
-    let records = instance
-        .call_sync_account("test-token", &serde_json::Value::Null)
-        .await
-        .expect("Failed to sync account");
-
-    assert!(records.is_empty()); // Test plugin returns empty array
-}
-
-#[tokio::test]
 async fn test_plugin_not_found() {
     let (executor, _registry) = create_test_executor().await;
 
@@ -243,13 +225,19 @@ async fn test_steam_get_secret_json_envelope() {
 
     let (executor, registry) = create_test_executor().await;
     let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read steam.wasm");
+    let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+        "id": "steam", "name": "Steam", "version": "1.1.0", "api_version": "2",
+        "plugin_type": "auth",
+        "capabilities": ["secrets:read", "network:request:unrestricted"],
+    }))
+    .unwrap();
 
     let plugin = LoadedPlugin {
         info: PluginInfo {
             id: "steam".into(),
             name: "Steam".into(),
             version: "1.1.0".into(),
-            api_version: "1".into(),
+            api_version: "2".into(),
             icon_url: None,
             required_secrets: vec!["API_KEY".into()],
             auth_type: "openid".into(),
@@ -259,7 +247,7 @@ async fn test_steam_get_secret_json_envelope() {
             path: wasm_path.into(),
         },
         wasm_bytes,
-        manifest: None,
+        manifest: Some(manifest),
     };
 
     registry.register(plugin).await;

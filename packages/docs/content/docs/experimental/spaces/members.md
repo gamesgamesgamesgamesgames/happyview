@@ -137,7 +137,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.putMemb
 
 Setting `read` to `false` revokes the member's outstanding space credentials. See [Revocation](./credentials.md#revocation).
 
-Members limited to reading their own records keep that limit when `putMember` updates them. The limit is set with the `read_self` access word, through [legacy addMember](#legacy-addmember) or the [Lua API](../../api-reference/lua/atproto-api.md#atprotospaces).
+Members limited to reading their own records keep that limit when `putMember` updates them. The limit is set with the `read_self` access word, through [legacy addMember](#legacy-addmember) or the [`happyview.spaces` library](../../api-reference/lua/libraries.md).
 
 ## Removing a member
 

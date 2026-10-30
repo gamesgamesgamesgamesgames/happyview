@@ -145,7 +145,11 @@ export default function RecordsPage() {
 
   // Auto-select collection from URL search param on initial load.
   useEffect(() => {
-    if (appliedInitial.current || !initialCollection || collections.length === 0)
+    if (
+      appliedInitial.current ||
+      !initialCollection ||
+      collections.length === 0
+    )
       return;
     if (collections.includes(initialCollection)) {
       appliedInitial.current = true;
@@ -228,18 +232,27 @@ export default function RecordsPage() {
   const handleBulkDelete = useCallback(async () => {
     setDeleting(true);
     const selectedUris = Object.keys(rowSelection);
-    const results = await Promise.allSettled(selectedUris.map((uri) => deleteRecord(uri)));
-    const succeeded = selectedUris.filter((_, i) => results[i].status === "fulfilled");
+    const results = await Promise.allSettled(
+      selectedUris.map((uri) => deleteRecord(uri)),
+    );
+    const succeeded = selectedUris.filter(
+      (_, i) => results[i].status === "fulfilled",
+    );
     const failed = selectedUris.length - succeeded.length;
 
     if (failed === 0) {
-      toast.success(`Deleted ${succeeded.length} ${succeeded.length === 1 ? "record" : "records"}`);
+      toast.success(
+        `Deleted ${succeeded.length} ${succeeded.length === 1 ? "record" : "records"}`,
+      );
     } else if (succeeded.length === 0) {
       toast.error("Failed to delete records");
     } else {
-      toast.warning(`Deleted ${succeeded.length} of ${selectedUris.length} records`, {
-        description: `${failed} ${failed === 1 ? "record" : "records"} failed to delete.`,
-      });
+      toast.warning(
+        `Deleted ${succeeded.length} of ${selectedUris.length} records`,
+        {
+          description: `${failed} ${failed === 1 ? "record" : "records"} failed to delete.`,
+        },
+      );
     }
 
     setRowSelection({});
@@ -496,15 +509,21 @@ export default function RecordsPage() {
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div className="col-span-2">
                       <span className="text-muted-foreground">URI</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.uri}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.uri}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">DID</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.did}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.did}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">Collection</span>
-                      <p className="font-mono text-xs">{viewRecord.collection}</p>
+                      <p className="font-mono text-xs">
+                        {viewRecord.collection}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">Record Key</span>
@@ -512,7 +531,9 @@ export default function RecordsPage() {
                     </div>
                     <div>
                       <span className="text-muted-foreground">CID</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.cid}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.cid}
+                      </p>
                     </div>
                     {viewRecord.indexed_at && (
                       <div>
@@ -540,9 +561,13 @@ export default function RecordsPage() {
                   </div>
 
                   <div className="flex flex-col flex-1 min-h-0">
-                    <span className="text-muted-foreground text-sm">Record</span>
+                    <span className="text-muted-foreground text-sm">
+                      Record
+                    </span>
                     <div className="mt-1">
-                      <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                      <CodeBlock
+                        code={JSON.stringify(viewRecord.record, null, 2)}
+                      />
                     </div>
                   </div>
                 </div>
@@ -562,7 +587,12 @@ export default function RecordsPage() {
           </SheetContent>
         </Sheet>
 
-        <AlertDialog open={!!deleteUri} onOpenChange={(open) => { if (!open) setDeleteUri(null); }}>
+        <AlertDialog
+          open={!!deleteUri}
+          onOpenChange={(open) => {
+            if (!open) setDeleteUri(null);
+          }}
+        >
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>Delete record?</AlertDialogTitle>
@@ -637,7 +667,9 @@ export default function RecordsPage() {
               return (
                 <>
                   <ResponsiveDialogHeader>
-                    <ResponsiveDialogTitle>Delete records?</ResponsiveDialogTitle>
+                    <ResponsiveDialogTitle>
+                      Delete records?
+                    </ResponsiveDialogTitle>
                     <ResponsiveDialogDescription>
                       This action cannot be undone.
                     </ResponsiveDialogDescription>
@@ -696,10 +728,7 @@ export default function RecordsPage() {
                           </Button>
                         </p>
                       )}
-                      <label
-                        className="text-sm"
-                        htmlFor="bulk-delete-confirm"
-                      >
+                      <label className="text-sm" htmlFor="bulk-delete-confirm">
                         Type{" "}
                         <code className="font-semibold">
                           {selectedCollection}
@@ -716,7 +745,10 @@ export default function RecordsPage() {
                   )}
                   <ResponsiveDialogFooter>
                     <ResponsiveDialogClose asChild>
-                      <Button variant="outline" disabled={deleting || deletingAll}>
+                      <Button
+                        variant="outline"
+                        disabled={deleting || deletingAll}
+                      >
                         Cancel
                       </Button>
                     </ResponsiveDialogClose>

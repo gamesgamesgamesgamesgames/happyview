@@ -7,34 +7,34 @@ A single endpoint that handles create, update, and delete based on the input fie
 **Lexicon type:** procedure
 
 ```lua
-function handle()
+local db = require("happyview.db")
+local record = require("happyview.record")
+
+function handle(input, ctx)
   if input.delete and input.uri then
-    local r = Record.load(input.uri)
-    if r then r:delete() end
+    record.delete(input.uri)
     return { success = true }
   end
 
   if input.uri then
     -- Update existing
-    local r = Record.load(input.uri)
-    if not r then error("not found") end
-    r.status = input.status
-    r:save()
-    return { uri = r._uri, cid = r._cid }
+    local existing = db.get(input.uri)
+    if not existing then error("not found") end
+    local body = existing.record
+    body.status = input.status
+    return record.put(input.uri, body)
   end
 
   -- Create new
-  local r = Record(collection, input)
-  r:save()
-  return { uri = r._uri, cid = r._cid }
+  return record.create(ctx.collection, input)
 end
 ```
 
 ## How it works
 
-1. If `input.delete` is truthy and `input.uri` is provided, load the record with [`Record.load`](../../api-reference/lua/record-api.md#static-methods) and delete it.
-2. If only `input.uri` is provided, load the existing record with [`Record.load`](../../api-reference/lua/record-api.md#static-methods), update its fields, and save it back. Since `_uri` is already set, `r:save()` calls `putRecord` instead of `createRecord`.
-3. If neither condition matches, create a new record from the input.
+1. If `input.delete` is truthy and `input.uri` is provided, delete the record with `record.delete`, which removes it from the caller's PDS and the local index.
+2. If only `input.uri` is provided, load the stored body with `db.get`, change its fields, and write it back with `record.put`, which calls `putRecord`.
+3. If neither condition matches, create a new record from the input with `record.create`.
 
 ## Usage
 

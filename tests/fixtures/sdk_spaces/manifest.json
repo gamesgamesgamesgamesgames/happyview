@@ -1,0 +1,12 @@
+{
+  "id": "sdk_spaces",
+  "name": "SDK spaces fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "spaces_fixture",
+  "capabilities": ["spaces:read", "spaces:write"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "wasm_file": "target/wasm32-unknown-unknown/release/sdk_spaces.wasm"
+}

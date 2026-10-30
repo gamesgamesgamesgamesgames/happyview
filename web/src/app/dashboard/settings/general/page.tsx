@@ -15,6 +15,9 @@ import {
   deleteLogo,
   countEvents,
   purgeEvents,
+  SCRIPT_LIMIT_BOUNDS,
+  SCRIPT_LIMIT_DEFAULTS,
+  type ScriptLimitSettings,
   type SettingEntry,
   type DbInfo,
   type EventPurgeFilter,
@@ -25,24 +28,23 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-const SETTING_KEYS = [
-  "app_name",
-  "backfill_concurrent_dids_per_pds",
-  "backfill_concurrent_pds",
-  "backfill_concurrent_resolution",
-  "backfill_retention_days",
-  "client_uri",
-  "event_log_retention_days",
-  "feature.space_inspector_enabled",
-  "logo_uri",
-  "space_access_log_retention_days",
-  "space_inspector_max_grant_minutes",
-  "tos_uri",
-  "policy_uri",
-  "verbose_event_logging",
-] as const;
-
-type FieldKey = (typeof SETTING_KEYS)[number];
+type FieldKey =
+  | "app_name"
+  | "backfill_concurrent_dids_per_pds"
+  | "backfill_concurrent_pds"
+  | "backfill_concurrent_resolution"
+  | "backfill_retention_days"
+  | "client_uri"
+  | "event_log_retention_days"
+  | "logo_uri"
+  | "tos_uri"
+  | "policy_uri"
+  | "script_instruction_limit"
+  | "script_wall_clock_seconds"
+  | "feature.space_inspector_enabled"
+  | "space_access_log_retention_days"
+  | "space_inspector_max_grant_minutes"
+  | "verbose_event_logging";
 
 type FieldConfig = {
   key: FieldKey;
@@ -87,6 +89,65 @@ const FIELDS: FieldConfig[] = [
   },
 ];
 
+const SCRIPT_LIMIT_FIELDS: {
+  key: keyof ScriptLimitSettings;
+  label: string;
+  description: string;
+}[] = [
+  {
+    key: "script_instruction_limit",
+    label: "Instruction limit",
+    description:
+      "Lua instructions a script may execute per run before it fails with a timeout; jobs are exempt.",
+  },
+  {
+    key: "script_wall_clock_seconds",
+    label: "Request wall clock (seconds)",
+    description:
+      "How long a query or procedure's handle may run by the clock, including time spent awaiting the host; jobs are exempt.",
+  },
+];
+
+// Every key the Save button writes, in the order it writes them. An empty
+// value clears the stored setting so the env var or the default applies.
+const SAVED_KEYS: readonly FieldKey[] = [
+  ...FIELDS.map((field) => field.key),
+  "backfill_concurrent_dids_per_pds",
+  "backfill_concurrent_pds",
+  "backfill_concurrent_resolution",
+  "backfill_retention_days",
+  "event_log_retention_days",
+  "script_instruction_limit",
+  "script_wall_clock_seconds",
+  "feature.space_inspector_enabled",
+  "space_access_log_retention_days",
+  "space_inspector_max_grant_minutes",
+  "verbose_event_logging",
+];
+
+// A number input hands over "1e6", "1.5" and "-1" as typed, and the
+// min/max attributes only bite on a form submit this page never makes, so
+// the range is checked here, against the same bounds the server enforces.
+function scriptLimitError(
+  key: keyof ScriptLimitSettings,
+  value: string,
+): string | null {
+  if (value === "") return null;
+  const { min, max } = SCRIPT_LIMIT_BOUNDS[key];
+  const n = /^\d+$/.test(value.trim()) ? Number(value) : NaN;
+  if (n >= min && n <= max) return null;
+  return `Enter a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`;
+}
+
+function SourceLabel({ source }: { source: SettingEntry["source"] | "unset" }) {
+  if (source !== "env" && source !== "project") return null;
+  return (
+    <span className="text-xs text-muted-foreground">
+      {source === "env" ? "from env var" : "from happyview.toml"}
+    </span>
+  );
+}
+
 export default function GeneralSettingsPage() {
   const { hasPermission } = useCurrentUser();
   const { refreshConfig } = useConfig();
@@ -108,10 +169,12 @@ export default function GeneralSettingsPage() {
     space_inspector_max_grant_minutes: "60",
     tos_uri: "",
     policy_uri: "",
+    script_instruction_limit: "",
+    script_wall_clock_seconds: "",
     verbose_event_logging: "",
   });
   const [sources, setSources] = useState<
-    Record<FieldKey, "database" | "env" | "unset">
+    Record<FieldKey, SettingEntry["source"] | "unset">
   >({
     app_name: "unset",
     backfill_concurrent_dids_per_pds: "unset",
@@ -126,6 +189,8 @@ export default function GeneralSettingsPage() {
     space_inspector_max_grant_minutes: "unset",
     tos_uri: "unset",
     policy_uri: "unset",
+    script_instruction_limit: "unset",
+    script_wall_clock_seconds: "unset",
     verbose_event_logging: "unset",
   });
   const [logoUploaded, setLogoUploaded] = useState(false);
@@ -148,8 +213,7 @@ export default function GeneralSettingsPage() {
       );
       const val = (key: string, fallback: string) =>
         byKey.get(key)?.value ?? fallback;
-      const src = (key: string) =>
-        (byKey.get(key)?.source as "database" | "env" | undefined) ?? "unset";
+      const src = (key: string) => byKey.get(key)?.source ?? "unset";
       setValues({
         app_name: val("app_name", ""),
         backfill_concurrent_dids_per_pds: val(
@@ -171,13 +235,18 @@ export default function GeneralSettingsPage() {
         logo_uri: val("logo_uri", ""),
         // Left empty when unset: an empty field isn't saved, so the setting keeps
         // following the event log retention.
-        space_access_log_retention_days: val("space_access_log_retention_days", ""),
+        space_access_log_retention_days: val(
+          "space_access_log_retention_days",
+          "",
+        ),
         space_inspector_max_grant_minutes: val(
           "space_inspector_max_grant_minutes",
           "60",
         ),
         tos_uri: val("tos_uri", ""),
         policy_uri: val("policy_uri", ""),
+        script_instruction_limit: val("script_instruction_limit", ""),
+        script_wall_clock_seconds: val("script_wall_clock_seconds", ""),
         verbose_event_logging: val("verbose_event_logging", ""),
       });
       setSources({
@@ -194,14 +263,14 @@ export default function GeneralSettingsPage() {
           "feature.space_inspector_enabled",
         ),
         logo_uri: src("logo_uri"),
-        space_access_log_retention_days: src(
-          "space_access_log_retention_days",
-        ),
+        space_access_log_retention_days: src("space_access_log_retention_days"),
         space_inspector_max_grant_minutes: src(
           "space_inspector_max_grant_minutes",
         ),
         tos_uri: src("tos_uri"),
         policy_uri: src("policy_uri"),
+        script_instruction_limit: src("script_instruction_limit"),
+        script_wall_clock_seconds: src("script_wall_clock_seconds"),
         verbose_event_logging: src("verbose_event_logging"),
       });
       setLogoUploaded(byKey.has("logo_data"));
@@ -219,47 +288,61 @@ export default function GeneralSettingsPage() {
     load();
   }, [load]);
 
+  const fieldErrors = useMemo(() => {
+    const errors: Partial<Record<keyof ScriptLimitSettings, string>> = {};
+    for (const { key } of SCRIPT_LIMIT_FIELDS) {
+      const message = scriptLimitError(key, values[key]);
+      if (message) errors[key] = message;
+    }
+    return errors;
+  }, [values]);
+  const hasFieldErrors = Object.keys(fieldErrors).length > 0;
+
+  // Each key is its own request, so one rejection must not abandon the rest:
+  // the operator would read the banner as "nothing saved" while half the
+  // form had been. Every key is sent, the failures are named together, and
+  // their typed values survive the reload so they can be corrected and
+  // resent.
   async function handleSave() {
     setError(null);
     setNotice(null);
     setSaving(true);
-    try {
-      for (const field of FIELDS) {
-        const value = values[field.key];
+    const failed: { key: FieldKey; value: string; message: string }[] = [];
+    for (const key of SAVED_KEYS) {
+      const value = values[key];
+      try {
         if (value === "") {
-          if (sources[field.key] === "database") {
-            await deleteSetting(field.key);
-          }
-        } else {
-          await upsertSetting(field.key, value);
-        }
-      }
-      const extraKeys = [
-        "backfill_concurrent_dids_per_pds",
-        "backfill_concurrent_pds",
-        "backfill_concurrent_resolution",
-        "backfill_retention_days",
-        "event_log_retention_days",
-        "feature.space_inspector_enabled",
-        "space_access_log_retention_days",
-        "space_inspector_max_grant_minutes",
-        "verbose_event_logging",
-      ] as const;
-      for (const key of extraKeys) {
-        const value = values[key];
-        if (value === "") {
-          if (sources[key] === "database") {
-            await deleteSetting(key);
-          }
+          if (sources[key] === "database") await deleteSetting(key);
         } else {
           await upsertSetting(key, value);
         }
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        failed.push({ key, value, message });
       }
-      setNotice("Settings saved.");
-      await refreshConfig();
+    }
+    try {
       await load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      // The space inspector switch changes what `/config` reports.
+      const refreshFailure = await refreshConfig().then(
+        () => null,
+        (e: unknown) => (e instanceof Error ? e.message : String(e)),
+      );
+      if (failed.length === 0 && refreshFailure) {
+        setError(
+          `Settings saved, but the dashboard could not reload its configuration (${refreshFailure}). Reload the page.`,
+        );
+      } else if (failed.length === 0) {
+        setNotice("Settings saved.");
+      } else {
+        setValues((v) => ({
+          ...v,
+          ...Object.fromEntries(failed.map((f) => [f.key, f.value])),
+        }));
+        setError(
+          `Could not save ${failed.map((f) => `${f.key} (${f.message})`).join(", ")}. Every other setting was saved.`,
+        );
+      }
     } finally {
       setSaving(false);
     }
@@ -375,11 +458,7 @@ export default function GeneralSettingsPage() {
           <div key={field.key} className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor={field.key}>{field.label}</Label>
-              {sources[field.key] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources[field.key]} />
             </div>
             <Input
               id={field.key}
@@ -449,11 +528,7 @@ export default function GeneralSettingsPage() {
             <Label htmlFor="backfill_retention_days">
               Backfill Detail Retention (days)
             </Label>
-            {sources["backfill_retention_days"] === "env" && (
-              <span className="text-xs text-muted-foreground">
-                from env var
-              </span>
-            )}
+            <SourceLabel source={sources["backfill_retention_days"]} />
           </div>
           <Input
             id="backfill_retention_days"
@@ -523,11 +598,7 @@ export default function GeneralSettingsPage() {
           <div key={field.key} className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor={field.id}>{field.label}</Label>
-              {sources[field.key] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources[field.key]} />
             </div>
             <Input
               id={field.id}
@@ -548,8 +619,7 @@ export default function GeneralSettingsPage() {
         <div>
           <h2 className="text-lg font-semibold">Space Inspector</h2>
           <p className="text-muted-foreground text-sm">
-            Let moderators read private space contents during an
-            investigation.
+            Let moderators read private space contents during an investigation.
           </p>
         </div>
 
@@ -566,24 +636,20 @@ export default function GeneralSettingsPage() {
               )}
             </div>
             <p className="text-muted-foreground text-xs">
-              Users with the Inspect Space Contents permission can read
-              records and blobs in private spaces after they give a reason.
-              Access expires, and every grant and read is logged under their
-              account.
+              Users with the Inspect Space Contents permission can read records
+              and blobs in private spaces after they give a reason. Access
+              expires, and every grant and read is logged under their account.
             </p>
           </div>
           <Switch
             id="feature.space_inspector_enabled"
             checked={
-              values["feature.space_inspector_enabled"].toLowerCase() ===
-              "true"
+              values["feature.space_inspector_enabled"].toLowerCase() === "true"
             }
             onCheckedChange={(checked) =>
               setValues((v) => ({
                 ...v,
-                "feature.space_inspector_enabled": checked
-                  ? "true"
-                  : "false",
+                "feature.space_inspector_enabled": checked ? "true" : "false",
               }))
             }
             disabled={!canManage}
@@ -610,10 +676,55 @@ export default function GeneralSettingsPage() {
             disabled={!canManage}
           />
           <p className="text-muted-foreground text-xs">
-            The longest a moderator can request access for. Requests default
-            to 60 minutes or this value, whichever is shorter.
+            The longest a moderator can request access for. Requests default to
+            60 minutes or this value, whichever is shorter.
           </p>
         </div>
+
+        <div>
+          <h2 className="text-lg font-semibold">Scripts</h2>
+          <p className="text-muted-foreground text-sm">
+            Budgets for query, procedure, record and label scripts. Changes
+            apply to the next run. Jobs are exempt from both.
+          </p>
+        </div>
+
+        {SCRIPT_LIMIT_FIELDS.map((field) => (
+          <div key={field.key} className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <Label htmlFor={field.key}>{field.label}</Label>
+              <SourceLabel source={sources[field.key]} />
+              {sources[field.key] === "unset" && (
+                <span className="text-xs text-muted-foreground">
+                  default {SCRIPT_LIMIT_DEFAULTS[field.key]}
+                </span>
+              )}
+            </div>
+            <Input
+              id={field.key}
+              type="number"
+              min={SCRIPT_LIMIT_BOUNDS[field.key].min}
+              max={SCRIPT_LIMIT_BOUNDS[field.key].max}
+              step={1}
+              value={values[field.key]}
+              onChange={(e) =>
+                setValues((v) => ({ ...v, [field.key]: e.target.value }))
+              }
+              placeholder={SCRIPT_LIMIT_DEFAULTS[field.key]}
+              disabled={!canManage}
+              aria-invalid={fieldErrors[field.key] ? true : undefined}
+              aria-describedby={
+                fieldErrors[field.key] ? `${field.key}-error` : undefined
+              }
+            />
+            {fieldErrors[field.key] && (
+              <p id={`${field.key}-error`} className="text-destructive text-xs">
+                {fieldErrors[field.key]}
+              </p>
+            )}
+            <p className="text-muted-foreground text-xs">{field.description}</p>
+          </div>
+        ))}
 
         <div>
           <h2 className="text-lg font-semibold">Event Logs</h2>
@@ -627,11 +738,7 @@ export default function GeneralSettingsPage() {
             <Label htmlFor="event_log_retention_days">
               Event Log Retention (days)
             </Label>
-            {sources["event_log_retention_days"] === "env" && (
-              <span className="text-xs text-muted-foreground">
-                from env var
-              </span>
-            )}
+            <SourceLabel source={sources["event_log_retention_days"]} />
           </div>
           <Input
             id="event_log_retention_days"
@@ -696,11 +803,7 @@ export default function GeneralSettingsPage() {
               <Label htmlFor="verbose_event_logging">
                 Verbose Event Logging
               </Label>
-              {sources["verbose_event_logging"] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources["verbose_event_logging"]} />
             </div>
             <p className="text-muted-foreground text-xs">
               Log every record index, hook execution, and hook skip to the event
@@ -725,7 +828,9 @@ export default function GeneralSettingsPage() {
         <div className="flex justify-end pt-2">
           <Button
             onClick={handleSave}
-            disabled={!canManage || saving || !!connectionWarning}
+            disabled={
+              !canManage || saving || !!connectionWarning || hasFieldErrors
+            }
           >
             {saving ? "Saving..." : "Save changes"}
           </Button>

@@ -7,26 +7,27 @@ Save a record with an attestation signature attached.
 **Lexicon type:** procedure
 
 ```lua
-function handle()
-  local r = Record(collection, {
-    text = input.text,
-    createdAt = now(),
-  })
-  r:save()
+local time = require("internal.time")
+local record = require("happyview.record")
+local atproto = require("happyview.atproto")
 
-  local sig = nil
-  if atproto.sign then
-    sig = atproto.sign({ text = input.text, createdAt = r.createdAt })
+function handle(input, ctx)
+  local body = { text = input.text, createdAt = time.to_iso8601(time.now()) }
+  local ref = record.create(ctx.collection, body)
+
+  local ok, sig = pcall(atproto.sign, body)
+  if not ok then
+    sig = nil
   end
 
-  return { uri = r._uri, cid = r._cid, signature = sig }
+  return { uri = ref.uri, cid = ref.cid, signature = sig }
 end
 ```
 
 ## How it works
 
 1. Create and save the record.
-2. Sign the record fields with [`atproto.sign()`](../../api-reference/lua/atproto-api.md#atprotosign). The `nil` guard lets the script work without a signer configured.
+2. Sign the same fields with `sign` on [`happyview.atproto`](../../api-reference/lua/libraries.md). The `pcall` lets the script work without a signer configured, where `sign` raises `NO_SIGNER`.
 3. Return the signature alongside the URI.
 
 ## Usage

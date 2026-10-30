@@ -3,12 +3,16 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptErrorType {
     Syntax,
     Runtime,
     Timeout,
+    /// The guest grew its linear memory past the store's ceiling. Distinct
+    /// from `Runtime` because "out of memory" and "the script has a bug"
+    /// call for different fixes.
+    Memory,
     MissingHandle,
 }
 
@@ -18,7 +22,33 @@ impl std::fmt::Display for ScriptErrorType {
             ScriptErrorType::Syntax => write!(f, "syntax"),
             ScriptErrorType::Runtime => write!(f, "runtime"),
             ScriptErrorType::Timeout => write!(f, "timeout"),
+            ScriptErrorType::Memory => write!(f, "memory"),
             ScriptErrorType::MissingHandle => write!(f, "missing_handle"),
+        }
+    }
+}
+
+impl ScriptErrorType {
+    pub const ALL: [ScriptErrorType; 5] = [
+        ScriptErrorType::Syntax,
+        ScriptErrorType::Runtime,
+        ScriptErrorType::Timeout,
+        ScriptErrorType::Memory,
+        ScriptErrorType::MissingHandle,
+    ];
+}
+
+/// An interpreter's `kind` is this type one to one; the wire enum is the
+/// SDK's so a plugin cannot spell one the host does not know.
+impl From<crate::plugin::ScriptErrorKind> for ScriptErrorType {
+    fn from(kind: crate::plugin::ScriptErrorKind) -> Self {
+        use crate::plugin::ScriptErrorKind;
+        match kind {
+            ScriptErrorKind::Syntax => ScriptErrorType::Syntax,
+            ScriptErrorKind::Runtime => ScriptErrorType::Runtime,
+            ScriptErrorKind::Timeout => ScriptErrorType::Timeout,
+            ScriptErrorKind::Memory => ScriptErrorType::Memory,
+            ScriptErrorKind::MissingHandle => ScriptErrorType::MissingHandle,
         }
     }
 }
@@ -31,13 +61,20 @@ impl std::fmt::Display for ScriptErrorType {
 pub const LUA_AUTH_ERROR_PREFIX: &str = "AUTH_ERROR:";
 
 /// mlua errors look like:
-/// - `[string "..."]:42: attempt to index a nil value`
-/// - `runtime error: [string "..."]:10: bad argument`
+/// - `[string "script"]:42: attempt to index a nil value`
+/// - `runtime error: [string "script"]:10: bad argument`
 ///
-/// Returns `(Some(line), cleaned_message)` or `(None, original_message)`.
+/// followed, when the error left a running function, by a `stack traceback:`
+/// block. Returns `(Some(line), message)` or `(None, message)`, where the
+/// message stops before the traceback: the traceback names only chunk lines
+/// and library frames, which is noise to a client, and the raw string reaches
+/// the event log untouched for anyone debugging.
 pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
-    if let Some(bracket_pos) = raw.find("]:") {
-        let after_bracket = &raw[bracket_pos + 2..];
+    let raw = raw.split("\nstack traceback:").next().unwrap_or(raw);
+    if let Some(start) = raw.find("[string \"")
+        && let Some(close) = raw[start..].find("]:")
+    {
+        let after_bracket = &raw[start + close + 2..];
         if let Some(colon_pos) = after_bracket.find(": ") {
             let line_str = &after_bracket[..colon_pos];
             if let Ok(line) = line_str.parse::<u32>() {
@@ -46,31 +83,31 @@ pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
             }
         }
     }
+    // A file chunk: `<path>:<line>: message`, read only at the start of the
+    // message (after a `runtime error: `-style category, if any). A script
+    // can put `x.lua:3:` or `]:2:` anywhere in its own text, and only the
+    // position Lua prepends is the location.
+    let body = match raw.split_once(" error: ") {
+        Some((category, rest)) if !category.contains(' ') => rest,
+        _ => raw,
+    };
+    if let Some(colon) = body.find(':') {
+        let rest = &body[colon + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let location = &body[..colon];
+        if digits > 0
+            && rest[digits..].starts_with(": ")
+            && !location.contains(' ')
+            && location.ends_with(".lua")
+            && let Ok(line) = rest[..digits].parse::<u32>()
+        {
+            return (Some(line), rest[digits + 2..].to_string());
+        }
+    }
     (None, raw.to_string())
 }
 
-/// Render an error together with its full `source()` chain.
-///
-/// `reqwest::Error`'s `Display` deliberately omits its source, so a transport
-/// failure formats as nothing more than `error sending request for url (…)` —
-/// leaving NXDOMAIN, TLS failure, connection refused and timeout completely
-/// indistinguishable in the logs. That is exactly the information needed to
-/// tell "this host is gone" from "we are misconfigured", so walk the chain and
-/// append each cause.
-pub fn describe_error_chain(err: &dyn std::error::Error) -> String {
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        // Chains frequently restate the outer message; don't repeat it.
-        if !out.ends_with(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = cause.source();
-    }
-    out
-}
+pub use happyview_provider::http::describe_error_chain;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -90,6 +127,10 @@ pub enum AppError {
     /// requested auth path is disabled until an operator fixes it. Renders as
     /// 503 so clients and the dashboard can distinguish it from a normal 401.
     ServerMisconfigured(String),
+    /// A script save refused for the removed globals its body still reads.
+    /// The names travel as a field of their own so a client can offer the
+    /// codemod without depending on the message's wording.
+    UnmigratedScript(Vec<String>),
     /// An XRPC error carrying a lexicon-defined code, e.g. `UnsupportedPolicy`.
     ///
     /// Clients switch on `error`, so a generic BadRequest is not
@@ -110,7 +151,45 @@ pub enum AppError {
         message: String,
         method: String,
         line: Option<u32>,
+        file: Option<String>,
     },
+}
+
+/// The envelope code a record import answers with when the storage that
+/// claims the collection could not be reached. A script that passes the
+/// failure on answers [`storage_unavailable`]'s 503.
+pub const STORAGE_UNAVAILABLE: &str = "STORAGE_UNAVAILABLE";
+
+/// A failed record read as the client sees it: `503 ServiceUnavailable` when
+/// the store that holds the record could not be reached (`storage_down`), so
+/// a client knows to retry, otherwise the `Internal` error a failed query
+/// has always been.
+pub fn record_read_error(e: sqlx::Error, storage_down: bool) -> AppError {
+    if storage_down {
+        storage_unavailable()
+    } else {
+        AppError::Internal(format!("DB query failed: {e}"))
+    }
+}
+
+/// `503 ServiceUnavailable`: the store that holds the records could not be
+/// reached, and a client can retry.
+pub fn storage_unavailable() -> AppError {
+    AppError::XrpcError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "ServiceUnavailable",
+        message: "the record store is unavailable".to_string(),
+    }
+}
+
+/// The file a failure happened in, when the chunk names one. A dashboard
+/// script's chunk is `script`, which no one can open.
+pub(crate) fn file_of(chunk: Option<String>) -> Option<String> {
+    chunk.filter(|chunk| chunk != crate::plugin::DEFAULT_CHUNK_NAME)
+}
+
+fn unmigrated_script_message(globals: &[String]) -> String {
+    crate::script::checks::unmigrated_message(globals)
 }
 
 impl std::fmt::Display for AppError {
@@ -129,6 +208,9 @@ impl std::fmt::Display for AppError {
             AppError::NotFound(msg) => write!(f, "not found: {msg}"),
             AppError::PdsError(status, _) => write!(f, "PDS error: {status}"),
             AppError::ServerMisconfigured(msg) => write!(f, "server misconfigured: {msg}"),
+            AppError::UnmigratedScript(globals) => {
+                write!(f, "bad request: {}", unmigrated_script_message(globals))
+            }
             AppError::RateLimited { retry_after, .. } => {
                 write!(f, "rate limited: retry after {retry_after}s")
             }
@@ -137,16 +219,22 @@ impl std::fmt::Display for AppError {
                 message,
                 method,
                 line,
-            } => {
-                if let Some(l) = line {
-                    write!(
-                        f,
-                        "script {error_type} error in {method} at line {l}: {message}"
-                    )
-                } else {
-                    write!(f, "script {error_type} error in {method}: {message}")
-                }
-            }
+                file,
+            } => match (file, line) {
+                (Some(file), Some(l)) => write!(
+                    f,
+                    "script {error_type} error in {method} at {file}:{l}: {message}"
+                ),
+                (Some(file), None) => write!(
+                    f,
+                    "script {error_type} error in {method} in {file}: {message}"
+                ),
+                (None, Some(l)) => write!(
+                    f,
+                    "script {error_type} error in {method} at line {l}: {message}"
+                ),
+                (None, None) => write!(f, "script {error_type} error in {method}: {message}"),
+            },
         }
     }
 }
@@ -173,18 +261,20 @@ impl IntoResponse for AppError {
                 message,
                 method,
                 line,
+                file,
             } => {
                 let status = match &error_type {
                     ScriptErrorType::Timeout => StatusCode::REQUEST_TIMEOUT,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                tracing::error!(%method, ?error_type, ?line, "{message}");
+                tracing::error!(%method, ?error_type, ?file, ?line, "{message}");
                 let body = serde_json::json!({
                     "error": "script_error",
                     "errorType": error_type,
                     "message": message,
                     "method": method,
                     "line": line,
+                    "file": file,
                 });
                 (status, axum::Json(body)).into_response()
             }
@@ -208,6 +298,13 @@ impl IntoResponse for AppError {
                     "message": msg,
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
+            }
+            AppError::UnmigratedScript(globals) => {
+                let body = serde_json::json!({
+                    "error": unmigrated_script_message(&globals),
+                    "removed_globals": globals,
+                });
+                (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
             }
             AppError::XrpcError {
                 status,
@@ -265,6 +362,7 @@ impl IntoResponse for AppError {
                     | AppError::InsufficientPermissions(..)
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
+                    | AppError::UnmigratedScript(..)
                     | AppError::RateLimited { .. }
                     | AppError::XrpcError { .. }
                     | AppError::ScriptError { .. } => unreachable!(),
@@ -289,6 +387,23 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn an_unmigrated_script_names_its_globals_in_the_message_and_as_a_field() {
+        let (status, body) = response_parts(AppError::UnmigratedScript(vec![
+            "db".into(),
+            "params".into(),
+        ]))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "script references removed globals: db, params -- run the codemod first",
+                "removed_globals": ["db", "params"],
+            })
+        );
     }
 
     #[tokio::test]
@@ -343,6 +458,7 @@ mod tests {
             message: "attempt to index a nil value".into(),
             method: "games.gamesgamesgamesgames.search".into(),
             line: Some(42),
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -351,6 +467,7 @@ mod tests {
         assert_eq!(body["message"], "attempt to index a nil value");
         assert_eq!(body["method"], "games.gamesgamesgamesgames.search");
         assert_eq!(body["line"], 42);
+        assert!(body["file"].is_null());
     }
 
     #[tokio::test]
@@ -360,12 +477,30 @@ mod tests {
             message: "script exceeded execution time limit".into(),
             method: "test.method".into(),
             line: None,
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
         assert_eq!(body["error"], "script_error");
         assert_eq!(body["errorType"], "timeout");
         assert!(body["line"].is_null());
+    }
+
+    /// Only a timeout is the caller's 408; exhausting memory is the
+    /// instance's 500, with the type on the body for the client to read.
+    #[tokio::test]
+    async fn script_error_memory_returns_500_with_its_type() {
+        let (status, body) = response_parts(AppError::ScriptError {
+            error_type: ScriptErrorType::Memory,
+            message: "script exceeded its memory limit".into(),
+            method: "test.method".into(),
+            line: None,
+            file: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "script_error");
+        assert_eq!(body["errorType"], "memory");
     }
 
     #[tokio::test]
@@ -375,6 +510,7 @@ mod tests {
             message: "unexpected symbol near ')'".into(),
             method: "test.method".into(),
             line: Some(5),
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -495,6 +631,104 @@ mod tests {
         assert_eq!(msg, "bad argument");
     }
 
+    /// A project chunk is named `@<path>`, which Lua renders as the bare
+    /// path, cut from the front when it is longer than its 60-byte buffer.
+    #[test]
+    fn parse_lua_line_reads_a_chunk_named_by_its_path() {
+        let (line, msg) =
+            parse_lua_line("runtime error: src/lexicons/com/example/getThing.lua:12: boom");
+        assert_eq!(line, Some(12));
+        assert_eq!(msg, "boom");
+
+        let long = "...exicons/at/happyproto/registry/somewhere/quite/deep/getArtifact.lua";
+        assert!(long.len() > 60);
+        let (line, msg) = parse_lua_line(&format!("{long}:3: attempt to call a nil value"));
+        assert_eq!(line, Some(3));
+        assert_eq!(msg, "attempt to call a nil value");
+
+        // A message that merely contains a colon and a number is not a location.
+        let (line, msg) = parse_lua_line("runtime error: expected 2:3 got nothing");
+        assert_eq!(line, None);
+        assert_eq!(msg, "runtime error: expected 2:3 got nothing");
+    }
+
+    #[tokio::test]
+    async fn a_script_error_with_a_file_names_it_in_the_body_and_the_text() {
+        let error = AppError::ScriptError {
+            error_type: ScriptErrorType::Runtime,
+            message: "boom".into(),
+            method: "com.example.getThing".into(),
+            line: Some(12),
+            file: Some("src/lexicons/com/example/getThing.lua".into()),
+        };
+        assert_eq!(
+            error.to_string(),
+            "script runtime error in com.example.getThing at src/lexicons/com/example/getThing.lua:12: boom"
+        );
+        let (_, body) = response_parts(error).await;
+        assert_eq!(body["file"], "src/lexicons/com/example/getThing.lua");
+        assert_eq!(body["line"], 12);
+    }
+
+    /// Only the position Lua prepends is the location: text the script wrote
+    /// into its own message must not be read as one.
+    #[test]
+    fn parse_lua_line_reads_only_the_leading_position() {
+        let (line, msg) = parse_lua_line("src/a.lua:5: bad t[1]:2: x");
+        assert_eq!(line, Some(5));
+        assert_eq!(msg, "bad t[1]:2: x");
+
+        let (line, msg) = parse_lua_line("runtime error: src/a.lua:5: see x.lua:9: y");
+        assert_eq!(line, Some(5));
+        assert_eq!(msg, "see x.lua:9: y");
+
+        // A dashboard script that raises a message shaped like a location.
+        let (line, msg) = parse_lua_line("[string \"script\"]:4: x.lua:3: y");
+        assert_eq!(line, Some(4));
+        assert_eq!(msg, "x.lua:3: y");
+
+        let (line, _) = parse_lua_line("runtime error: oops t[1]:2: x");
+        assert_eq!(line, None);
+    }
+
+    #[test]
+    fn parse_lua_line_drops_the_traceback() {
+        let (line, msg) = parse_lua_line(
+            "runtime error: [string \"script\"]:4: boom\nstack traceback:\n\t[C]: in function 'error'\n\t[string \"script\"]:4: in function 'handle'",
+        );
+        assert_eq!(line, Some(4));
+        assert_eq!(msg, "boom");
+        let (line, msg) =
+            parse_lua_line("runtime error: bare\nstack traceback:\n\t[C]: in function 'error'");
+        assert_eq!(line, None);
+        assert_eq!(msg, "runtime error: bare");
+    }
+
+    /// The hand-written strings above pin the parser's shape; this pins that a
+    /// script run the way the runners run it produces that shape.
+    #[cfg(feature = "lua-reference")]
+    #[tokio::test]
+    async fn parse_lua_line_reads_the_line_of_a_real_script_error() {
+        use crate::lua::sandbox::{call_handle, create_sandbox, load_script};
+
+        let lua = create_sandbox().unwrap();
+        load_script(
+            &lua,
+            "function handle()\n  local t = nil\n  return t.x\nend",
+        )
+        .exec()
+        .unwrap();
+        let handle: mlua::Function = lua.globals().get("handle").unwrap();
+        let raw = call_handle(&lua, &handle, ())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        let (line, message) = parse_lua_line(&raw);
+        assert_eq!(line, Some(3), "{raw}");
+        assert_eq!(message, "attempt to index a nil value (local 't')");
+    }
+
     #[test]
     fn script_error_type_serializes() {
         assert_eq!(
@@ -513,6 +747,35 @@ mod tests {
             serde_json::to_string(&ScriptErrorType::MissingHandle).unwrap(),
             "\"missing_handle\""
         );
+        assert_eq!(
+            serde_json::to_string(&ScriptErrorType::Memory).unwrap(),
+            "\"memory\""
+        );
+        assert_eq!(ScriptErrorType::Memory.to_string(), "memory");
+    }
+
+    #[test]
+    fn every_script_error_kind_has_exactly_one_script_error_type() {
+        use crate::plugin::ScriptErrorKind;
+        assert_eq!(ScriptErrorKind::ALL.len(), ScriptErrorType::ALL.len());
+        for kind in ScriptErrorKind::ALL {
+            let error_type = ScriptErrorType::from(kind);
+            assert_eq!(error_type.to_string(), kind.as_str());
+            assert_eq!(
+                serde_json::to_value(error_type).unwrap(),
+                serde_json::to_value(kind).unwrap()
+            );
+        }
+        for error_type in ScriptErrorType::ALL {
+            let kind: ScriptErrorKind = error_type
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| panic!("{error_type} has no wire kind"));
+            assert_eq!(
+                ScriptErrorType::from(kind).to_string(),
+                error_type.to_string()
+            );
+        }
     }
 
     #[test]
@@ -541,6 +804,7 @@ mod tests {
                 message: "oops".into(),
                 method: "test.method".into(),
                 line: Some(5),
+                file: None,
             }
             .to_string(),
             "script runtime error in test.method at line 5: oops"

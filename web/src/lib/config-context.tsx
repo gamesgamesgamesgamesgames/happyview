@@ -1,27 +1,33 @@
-"use client"
+"use client";
 
-import { createContext, useCallback, useContext, useEffect, useState } from "react"
-import { TriangleAlert } from "lucide-react"
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
+import { TriangleAlert } from "lucide-react";
 
 interface Features {
-  spaces: boolean
-  space_inspector: boolean
+  spaces: boolean;
+  space_inspector: boolean;
 }
 
 interface Config {
-  public_url: string
-  default_rate_limit_capacity: number
-  default_rate_limit_refill_rate: number
-  app_name: string | null
-  logo_url: string | null
-  features: Features
-  platform_managed: boolean
-  configErrors: string[]
+  public_url: string;
+  default_rate_limit_capacity: number;
+  default_rate_limit_refill_rate: number;
+  app_name: string | null;
+  logo_url: string | null;
+  features: Features;
+  platform_managed: boolean;
+  configErrors: string[];
 }
 
 interface ConfigContextType extends Config {
   /** Re-fetch `/config`, e.g. after a setting that changes a feature flag. */
-  refreshConfig: () => Promise<void>
+  refreshConfig: () => Promise<void>;
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -34,7 +40,7 @@ const ConfigContext = createContext<ConfigContextType>({
   platform_managed: false,
   configErrors: [],
   refreshConfig: async () => {},
-})
+});
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
   return (
@@ -58,13 +64,13 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
         </div>
       </div>
     </div>
-  )
+  );
 }
 
 async function loadConfig(): Promise<Config> {
-  const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
-  if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
-  const data = await res.json()
+  const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`);
+  if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
+  const data = await res.json();
   return {
     public_url: data.public_url,
     default_rate_limit_capacity: data.default_rate_limit_capacity,
@@ -77,40 +83,44 @@ async function loadConfig(): Promise<Config> {
     },
     platform_managed: data.platform_managed === true,
     configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
-  }
+  };
 }
 
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<Config | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [config, setConfig] = useState<Config | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // Throws on failure, so a caller such as the settings page can report it;
   // the config already loaded stays in place.
   const refreshConfig = useCallback(async () => {
-    setConfig(await loadConfig())
-  }, [])
+    setConfig(await loadConfig());
+  }, []);
 
   // Only the first load replaces the dashboard with an error screen; there is
   // no config to fall back on yet.
   useEffect(() => {
-    let cancelled = false
+    let cancelled = false;
     loadConfig()
       .then((loaded) => {
-        if (!cancelled) setConfig(loaded)
+        if (!cancelled) setConfig(loaded);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      })
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
     return () => {
-      cancelled = true
-    }
-  }, [])
+      cancelled = true;
+    };
+  }, []);
 
   if (error) {
-    return <div style={{ padding: "2rem", color: "red" }}>Failed to load config: {error}</div>
+    return (
+      <div style={{ padding: "2rem", color: "red" }}>
+        Failed to load config: {error}
+      </div>
+    );
   }
 
-  if (!config) return null
+  if (!config) return null;
 
   return (
     <ConfigContext.Provider value={{ ...config, refreshConfig }}>
@@ -119,9 +129,9 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
       )}
       {children}
     </ConfigContext.Provider>
-  )
+  );
 }
 
 export function useConfig() {
-  return useContext(ConfigContext)
+  return useContext(ConfigContext);
 }

@@ -123,7 +123,7 @@ fn containing_dir(path: &Path) -> &Path {
 /// appending `-wal` to the *entire* main file name, not by replacing its
 /// extension — `/data/happyview.db` becomes `/data/happyview.db-wal`, and the
 /// extensionless `/data/hv` becomes `/data/hv-wal`.
-fn wal_path_for(db_path: &Path) -> PathBuf {
+pub(crate) fn wal_path_for(db_path: &Path) -> PathBuf {
     let mut name = db_path.as_os_str().to_os_string();
     name.push("-wal");
     PathBuf::from(name)
@@ -131,12 +131,20 @@ fn wal_path_for(db_path: &Path) -> PathBuf {
 
 /// Whether `a` and `b` live on the same filesystem, compared by device id.
 /// Conservatively `false` if either path's metadata can't be read.
+#[cfg(unix)]
 fn same_filesystem(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
         _ => false,
     }
+}
+
+/// Windows exposes no stable device id through std. Reporting `false` takes
+/// the larger free-space threshold, which errs toward refusing a vacuum.
+#[cfg(not(unix))]
+fn same_filesystem(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 /// The directory SQLite will use for VACUUM's temporary database.

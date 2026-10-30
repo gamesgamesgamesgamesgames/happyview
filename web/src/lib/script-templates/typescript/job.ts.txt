@@ -1,0 +1,27 @@
+// Job runner: executes as a background job. `input` is the job's input;
+// `ctx.job` exposes the job's id, progress(data), should_stop(), and
+// wait(seconds). The return value becomes the job's result.
+//
+// Imports from "internal.*" and installed libraries provide the rest. Types
+// are erased rather than checked, so declare the shapes the script reads.
+
+import log from "internal.logging";
+
+interface Job {
+  id: string;
+  progress(data: unknown): void;
+  should_stop(): boolean;
+  wait(seconds: number): Promise<void>;
+}
+
+export default async function handle(input: unknown, ctx: { job: Job }) {
+  log.info("job started", { job_id: ctx.job.id });
+
+  ctx.job.progress({ status: "working" });
+
+  if (ctx.job.should_stop()) {
+    return { partial: true };
+  }
+
+  return { done: true };
+}

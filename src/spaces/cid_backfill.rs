@@ -62,8 +62,7 @@ pub async fn run(
 ) -> Result<BackfillReport, AppError> {
     let mut report = BackfillReport::default();
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool, backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 

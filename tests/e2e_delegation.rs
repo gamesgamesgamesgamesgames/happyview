@@ -1061,6 +1061,43 @@ async fn delegated_write_member_rejected() {
 
 #[tokio::test]
 #[serial]
+async fn delegated_write_without_dpop_rejected() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    seed_procedure_lexicon(&app).await;
+
+    let owner_did = "did:plc:dw_owner5";
+    let target_did = "did:plc:dw_studio5";
+    setup_linked_account(&app, owner_did, target_did).await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.createRecord"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&app.mock_server)
+        .await;
+
+    // A session cookie that carries no client key, with the key sent as a
+    // header instead, satisfies client identification but not DPoP.
+    let mut req = admin_post_request(
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        app.admin_cookie(),
+        &json!({ "title": "Cookie Game", "delegateDid": target_did }),
+    );
+    req.headers_mut()
+        .insert("x-client-key", "hvc_cookie_caller".parse().unwrap());
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = response_json(resp).await;
+    assert!(
+        body.to_string()
+            .contains("delegation requires DPoP authentication"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn delegated_write_owner_success() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;

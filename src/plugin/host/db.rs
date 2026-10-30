@@ -1,0 +1,262 @@
+//! Raw SQL for plugins. Same boundary as Lua's `db.raw`: the table guard in
+//! `raw_sql_guard` protects HappyView's internal tables; the capability decides
+//! whether writes are allowed at all.
+
+use serde_json::{Map, Value};
+use sqlx::{Column, Row};
+
+use crate::raw_sql_guard::check_raw_sql_tables;
+
+fn bind_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>,
+    params: &'q [Value],
+) -> Result<sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>, String> {
+    for value in params {
+        query = match value {
+            Value::String(s) => query.bind(s.as_str()),
+            Value::Number(n) if n.is_i64() => query.bind(n.as_i64().unwrap()),
+            Value::Number(n) => query.bind(n.as_f64().unwrap_or(0.0)),
+            // A boolean binds as one: Postgres will not compare its own
+            // `boolean` against an integer, and SQLite stores the bind as the
+            // 0/1 an integer column already holds.
+            Value::Bool(b) => query.bind(*b),
+            Value::Null => query.bind(Option::<String>::None),
+            other => return Err(format!("unsupported parameter type: {other}")),
+        };
+    }
+    Ok(query)
+}
+
+pub(super) fn row_to_json(row: &sqlx::any::AnyRow) -> Map<String, Value> {
+    let mut out = Map::new();
+    for col in row.columns() {
+        let name = col.name();
+        let v = if let Ok(s) = row.try_get::<String, _>(name) {
+            Value::String(s)
+        } else if let Ok(n) = row.try_get::<i64, _>(name) {
+            Value::from(n)
+        } else if let Ok(n) = row.try_get::<i32, _>(name) {
+            Value::from(n)
+        } else if let Ok(n) = row.try_get::<f64, _>(name) {
+            Value::from(n)
+        } else if let Ok(b) = row.try_get::<bool, _>(name) {
+            Value::Bool(b)
+        } else {
+            Value::Null
+        };
+        out.insert(name.to_string(), v);
+    }
+    out
+}
+
+/// Why a raw query did not run: the guard or a parameter refused it, or the
+/// database failed it. Callers that route a query to a database that may be
+/// unavailable need the second apart from the first.
+#[derive(Debug)]
+pub enum QueryError {
+    Refused(String),
+    Database(sqlx::Error),
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::Refused(m) => f.write_str(m),
+            QueryError::Database(e) => write!(f, "query failed: {e}"),
+        }
+    }
+}
+
+/// [`run_query`] with the failure kept typed.
+pub async fn run_query_on(
+    db: &sqlx::AnyPool,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Map<String, Value>>, QueryError> {
+    check_raw_sql_tables(sql).map_err(QueryError::Refused)?;
+    let rows = bind_params(crate::db::query(sql), params)
+        .map_err(QueryError::Refused)?
+        .fetch_all(db)
+        .await
+        .map_err(QueryError::Database)?;
+    Ok(rows.iter().map(row_to_json).collect())
+}
+
+/// [`run_query_on`] for a read routed to a database another owner also
+/// uses. On Postgres it runs in a read-only transaction that is rolled back,
+/// so it can neither write (`nextval`, say) nor leave session state
+/// (`set_config`) on a pooled connection that owner's own work reuses.
+pub async fn run_read_only_query_on(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Map<String, Value>>, QueryError> {
+    if backend == crate::db::DatabaseBackend::Sqlite {
+        return run_query_on(db, sql, params).await;
+    }
+    check_raw_sql_tables(sql).map_err(QueryError::Refused)?;
+    let query = bind_params(crate::db::query(sql), params).map_err(QueryError::Refused)?;
+    let mut tx = db.begin().await.map_err(QueryError::Database)?;
+    crate::db::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(QueryError::Database)?;
+    let rows = query
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(QueryError::Database)?;
+    tx.rollback().await.map_err(QueryError::Database)?;
+    Ok(rows.iter().map(row_to_json).collect())
+}
+
+/// SQL is passed through untranslated; placeholders are backend-native
+/// (`?` on SQLite, `$1`… on Postgres), as for Lua's `db.raw`.
+pub async fn run_query(
+    db: &sqlx::AnyPool,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<Map<String, Value>>, String> {
+    run_query_on(db, sql, params)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// SQL is passed through untranslated; placeholders are backend-native
+/// (`?` on SQLite, `$1`… on Postgres), as for Lua's `db.raw`.
+pub async fn run_execute(db: &sqlx::AnyPool, sql: &str, params: &[Value]) -> Result<u64, String> {
+    check_raw_sql_tables(sql)?;
+    let result = bind_params(crate::db::query(sql), params)?
+        .execute(db)
+        .await
+        .map_err(|e| format!("execute failed: {e}"))?;
+    Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DatabaseBackend;
+    use serde_json::json;
+    use serial_test::serial;
+
+    /// Every backend the suite can reach; the Postgres half needs a database
+    /// to be pointed at and says so when there is none.
+    async fn backends() -> Vec<(sqlx::AnyPool, DatabaseBackend)> {
+        let mut out = vec![(
+            crate::test_support::migrated_memory_pool().await,
+            DatabaseBackend::Sqlite,
+        )];
+        match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => {
+                let backend = DatabaseBackend::from_url(&url);
+                out.push((crate::db::connect(&url, backend).await, backend));
+            }
+            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+        }
+        out
+    }
+
+    /// Raw SQL is passed through untranslated, so a test writes each
+    /// backend's own placeholder exactly as a plugin would.
+    fn placeholder(backend: DatabaseBackend, position: usize) -> String {
+        match backend {
+            DatabaseBackend::Sqlite => "?".to_string(),
+            DatabaseBackend::Postgres => format!("${position}"),
+        }
+    }
+
+    /// A read routed to Postgres runs in a read-only transaction that is
+    /// rolled back: it cannot write, and leaves no session state on the
+    /// pooled connection for the next query to inherit.
+    #[tokio::test]
+    #[serial]
+    async fn a_routed_read_on_postgres_can_neither_write_nor_change_the_session() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL unset: skipped");
+            return;
+        };
+        let backend = DatabaseBackend::from_url(&url);
+        if backend != DatabaseBackend::Postgres {
+            return;
+        }
+        // One connection, so the second query runs where the first did.
+        let db = crate::db::connect_with(&url, backend, 1).await;
+
+        let rows = run_read_only_query_on(
+            &db,
+            backend,
+            "SELECT set_config('application_name', 'changed by a read', false) AS v",
+            &[],
+        )
+        .await
+        .expect("the read runs");
+        assert_eq!(rows[0]["v"], json!("changed by a read"));
+        let rows = run_query(&db, "SELECT current_setting('application_name') AS v", &[])
+            .await
+            .unwrap();
+        assert_ne!(rows[0]["v"], json!("changed by a read"));
+
+        crate::db::query("CREATE SEQUENCE IF NOT EXISTS host_db_read_only_seq")
+            .execute(&db)
+            .await
+            .unwrap();
+        let err = run_read_only_query_on(
+            &db,
+            backend,
+            "SELECT nextval('host_db_read_only_seq') AS v",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("read-only transaction"), "{err}");
+    }
+
+    /// A boolean parameter against a boolean column. Binding it as an integer
+    /// is well-typed on SQLite, which has no boolean of its own, and leaves
+    /// Postgres comparing `boolean = integer`, which it refuses.
+    #[tokio::test]
+    #[serial]
+    async fn a_boolean_parameter_compares_against_a_boolean_column() {
+        for (db, backend) in backends().await {
+            crate::db::query(
+                "CREATE TABLE IF NOT EXISTS host_db_flags (name TEXT, active BOOLEAN)",
+            )
+            .execute(&db)
+            .await
+            .expect("create the table");
+            crate::db::query("DELETE FROM host_db_flags")
+                .execute(&db)
+                .await
+                .expect("clear the table");
+
+            let inserted = run_execute(
+                &db,
+                &format!(
+                    "INSERT INTO host_db_flags (name, active) VALUES ({}, {}), ({}, {})",
+                    placeholder(backend, 1),
+                    placeholder(backend, 2),
+                    placeholder(backend, 3),
+                    placeholder(backend, 4),
+                ),
+                &[json!("on"), json!(true), json!("off"), json!(false)],
+            )
+            .await
+            .expect("the insert should run");
+            assert_eq!(inserted, 2);
+
+            let rows = run_query(
+                &db,
+                &format!(
+                    "SELECT name FROM host_db_flags WHERE active = {}",
+                    placeholder(backend, 1)
+                ),
+                &[json!(true)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the query should run on {backend:?}: {e}"));
+            assert_eq!(rows.len(), 1, "on {backend:?}");
+            assert_eq!(rows[0]["name"], json!("on"));
+        }
+    }
+}

@@ -186,3 +186,126 @@ async fn network_lexicon_no_auth_returns_401() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Declared in happyview.toml
+// ---------------------------------------------------------------------------
+
+fn declaring(toml: &str) -> std::sync::Arc<happyview::config::project::ProjectConfig> {
+    std::sync::Arc::new(
+        happyview::config::project::parse_project_config(
+            toml,
+            std::path::Path::new("happyview.toml"),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn a_declared_network_lexicon_is_flagged_and_cannot_be_removed() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let nsid = "games.gamesgamesgamesgames.game";
+    seed_network_lexicon(&app, nsid, "did:plc:authority").await;
+    app.state.config.project = Some(declaring(&format!(
+        "[network_lexicons]\ninclude = [\"{nsid}\"]\n"
+    )));
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/network-lexicons/{nsid}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("happyview.toml"), "{body}");
+    assert!(
+        !message.to_lowercase().contains("network"),
+        "the dashboard misreads that word: {message}"
+    );
+
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/network-lexicons", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list[0]["nsid"], nsid);
+    assert_eq!(list[0]["declared"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_declared_network_lexicon_cannot_be_deleted_through_the_lexicon_route() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let nsid = "games.gamesgamesgamesgames.game";
+    seed_network_lexicon(&app, nsid, "did:plc:authority").await;
+    let undeclared = "games.gamesgamesgamesgames.platform";
+    seed_network_lexicon(&app, undeclared, "did:plc:authority").await;
+    app.state.config.project = Some(declaring(&format!(
+        "[network_lexicons]\ninclude = [\"{nsid}\"]\n"
+    )));
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/lexicons/{nsid}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("happyview.toml"),
+        "{body}"
+    );
+
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/network-lexicons", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list[0]["nsid"], nsid);
+
+    // The lexicons page reads these, and offers Delete only when it is false.
+    let lexicons = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/lexicons", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(lexicons[0]["id"], nsid);
+    assert_eq!(lexicons[0]["declared"], true);
+    assert_eq!(lexicons[1]["id"], undeclared);
+    assert_eq!(lexicons[1]["declared"], false);
+    let detail = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get(
+                &format!("/admin/lexicons/{nsid}"),
+                app.admin_cookie(),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(detail["declared"], true);
+}
