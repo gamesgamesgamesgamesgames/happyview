@@ -1,9 +1,13 @@
 //! Admin `GET` routes read; they do not write.
 //!
-//! The CSRF guard (`crate::csrf`) exempts safe methods, because a browser
-//! cannot be made to send a cross-site `GET` with a side effect — so a `GET`
-//! that *does* have one is reachable from any site that can make the
-//! operator's browser follow a link, with the session cookie attached.
+//! `csrf::guard` returns early for `GET`, `HEAD` and `OPTIONS`, which
+//! `csrf::is_safe` names: a safe method is one with no side effect, so it has
+//! nothing for a cross-site caller to abuse, and refusing cross-site
+//! navigation would break every ordinary link into the dashboard. A `GET`
+//! that *does* have a side effect is therefore reachable from any site that
+//! can make the operator's browser follow a link, with the session cookie
+//! attached, and the guard will not stop it — by design, on the premise this
+//! file is here to hold up.
 //! Nothing in the type system says a handler behind `get(...)` only reads,
 //! and a name is no guard either: `list`, `status` and `preview` are all what
 //! a mutating handler would be called if someone added one by mistake.
@@ -20,16 +24,16 @@
 //! that an allowlist of those reads runs to sixteen handlers. A checksum over
 //! every table has no allowlist to grow.
 //!
-//! **What it does not cover.** The record source's routes, which
-//! `admin_routes` merges from `state.source.admin_routes()`: they come from
-//! another crate's router and the path parse here cannot see into it. And a
-//! route whose entity this does not seed answers `404` before reaching the
-//! part of the handler that would write — those are reported by name in the
-//! test's output rather than quietly counted as covered.
+//! **What it does not cover: this watches the database and nothing else.** A
+//! `GET` that mutates memory, writes a file, or makes an outbound request that
+//! changes something elsewhere passes this sweep. The database is where the
+//! damage would persist, which is why it is the thing checked, but a handler
+//! that evicts a cache or posts to a PDS is outside what these tests can see.
 
 mod common;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use axum::body::Body;
 use axum::http::Request;
@@ -53,49 +57,86 @@ type Fingerprint = BTreeMap<String, (i64, String)>;
 
 const GAME: &str = "games.gamesgamesgamesgames.game";
 
-/// The admin router's `GET` routes, as `(path, module::handler)`.
+/// Every router whose `GET` routes end up under `/admin`, as
+/// `(file, the function that builds it)`.
 ///
-/// Parsed from the router's source because axum exposes no way to enumerate
-/// what a `Router` holds. The parse only *finds* the routes — every assertion
-/// below is made against a running instance — but it still has to be right,
-/// so a parse that stops working fails rather than reporting an empty sweep.
-fn admin_get_routes() -> Vec<(String, String)> {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/admin/mod.rs"),
-    )
-    .expect("src/admin/mod.rs should be readable");
-    let router = source
-        .split_once("pub fn admin_routes")
-        .expect("admin_routes should be here")
-        .1;
+/// The record source's routes are merged in by `admin_routes` from
+/// `state.source.admin_routes()`, so they are admin `GET`s like any other and
+/// the sweep has to drive them too.
+const ROUTERS: &[(&str, &str)] = &[
+    ("src/admin/mod.rs", "pub fn admin_routes"),
+    (
+        "crates/happyview-source-jetstream/src/admin.rs",
+        "pub(crate) fn router()",
+    ),
+];
 
+/// The admin router's `GET` routes, as `(path, handler)`.
+///
+/// Parsed from the routers' source because axum exposes no way to enumerate
+/// what a `Router` holds. The parse only *finds* the routes — every assertion
+/// below is made against a running instance — but a parse that quietly skipped
+/// one would hand back a sweep that looks complete and is not, so anything it
+/// cannot read fails rather than being passed over.
+fn admin_get_routes() -> Vec<(String, String)> {
     let mut found = Vec::new();
-    for chunk in router.split(".route(").skip(1) {
-        // Whitespace, not a newline: `.route("/stats", get(stats::stats))`
-        // fits on one line while most routes are broken over several.
-        let rest = chunk.trim_start();
-        let Some(path) = rest.strip_prefix('"').and_then(|r| {
-            let end = r.find('"')?;
-            Some(r[..end].to_string())
-        }) else {
-            continue;
-        };
-        // The handler behind this route's `get(...)`, wherever in the chain it
-        // sits: `get(h)`, or `.get(h)` after a `post(...)`.
-        let after_path = &rest[path.len() + 2..];
-        let Some(at) = after_path.find("get(") else {
-            continue;
-        };
-        let handler: String = after_path[at + "get(".len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-            .collect();
-        if handler.contains("::") {
+    for (file, anchor) in ROUTERS {
+        let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+            .unwrap_or_else(|e| panic!("{file} should be readable: {e}"));
+        let body = source
+            .split_once(anchor)
+            .unwrap_or_else(|| panic!("{anchor} should be in {file}"))
+            .1;
+        // To the end of that function, so a later router in the same file
+        // cannot leak in.
+        let body = body.split_once("\n}\n").map_or(body, |(before, _)| before);
+
+        for chunk in body.split(".route(").skip(1) {
+            let rest = chunk.trim_start();
+            let path = rest.strip_prefix('"').and_then(|r| {
+                let end = r.find('"')?;
+                Some(r[..end].to_string())
+            });
+            // The chunk ends where this route's own method list does.
+            let methods = rest.split("\n        .route(").next().unwrap_or(rest);
+            let has_get = methods.contains("get(");
+            let Some(path) = path else {
+                assert!(
+                    !has_get,
+                    "{file}: a GET route's path is not a literal, so the sweep cannot call it. \
+                     Teach this parse to read it:\n{}",
+                    &methods[..methods.len().min(200)]
+                );
+                continue;
+            };
+            assert!(
+                !methods.contains("get_service(") && !methods.contains("MethodFilter::GET"),
+                "{file}: route '{path}' mounts a GET in a form this parse cannot read. Teach it, \
+                 or this route escapes the sweep"
+            );
+            if !has_get {
+                continue;
+            }
+            let after_path = &rest[path.len() + 2..];
+            let at = after_path
+                .find("get(")
+                .expect("the chunk was found to contain get(");
+            // A bare name as well as `module::name`: the record source's
+            // router mounts its handlers unqualified.
+            let handler: String = after_path[at + "get(".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            assert!(
+                !handler.is_empty(),
+                "{file}: route '{path}' mounts something other than a named handler behind get(), \
+                 which this parse cannot follow"
+            );
             found.push((path, handler));
         }
     }
     assert!(
-        found.len() > 40,
+        found.len() > 60,
         "the router parse found only {} GET routes, so it has stopped working",
         found.len()
     );
@@ -242,6 +283,25 @@ async fn fingerprint(app: &TestApp, tables: &BTreeMap<String, Vec<String>>) -> F
     out
 }
 
+/// A fingerprint that has stopped moving: the same twice, 200 ms apart.
+///
+/// A handler can write from a detached `tokio::spawn`, which lands on its own
+/// schedule. Reading once as soon as the response body is drained blames such
+/// a write on whichever route happened to be next, or misses it entirely if it
+/// was the last one — so each read waits for the database to settle.
+async fn settled_fingerprint(app: &TestApp, tables: &BTreeMap<String, Vec<String>>) -> Fingerprint {
+    let mut previous = fingerprint(app, tables).await;
+    for _ in 0..25 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let next = fingerprint(app, tables).await;
+        if differences(&previous, &next).is_empty() {
+            return next;
+        }
+        previous = next;
+    }
+    panic!("the database never stopped changing between two reads 200 ms apart");
+}
+
 /// The tables whose count or contents differ, as `(table, sentence)`.
 fn differences(before: &Fingerprint, after: &Fingerprint) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -274,19 +334,36 @@ fn differences(before: &Fingerprint, after: &Fingerprint) -> Vec<(String, String
     out
 }
 
-/// Writes a `GET` makes on purpose: `(route, table, why)`.
+/// Writes a `GET` makes on purpose: `(route, table, event_type, why)`.
 ///
-/// Narrow by design — a route may move the table named here and nothing else,
-/// so an accidental write alongside a deliberate one still fails. A read that
-/// records having happened is a real pattern and not an accident, but it is
-/// also still reachable cross-site with the session cookie attached, so each
-/// entry is a decision someone made rather than noise to be swept away.
-const AUDITED_READS: &[(&str, &str, &str)] = &[(
+/// Narrow by design. The route may move the table named here and nothing
+/// else, and the change must be exactly one new row carrying `event_type` —
+/// so a second write alongside the deliberate one, or a different kind of row
+/// in the same table, still fails. A read that records having happened is a
+/// real pattern and not an accident, but it is also still reachable cross-site
+/// with the session cookie attached, so each entry is a decision someone made
+/// rather than noise to be swept away.
+const AUDITED_READS: &[(&str, &str, &str, &str)] = &[(
     "/spaces/{id}/records",
     "happyview_event_logs",
+    "space.moderator_read",
     "log_content_read: an operator reading the contents of a permissioned \
      space is itself a privacy-relevant act, and spaces record it",
 )];
+
+/// How many rows of `event_type` the event log holds.
+async fn audit_rows(app: &TestApp, event_type: &str) -> i64 {
+    let sql = adapt_sql(
+        "SELECT count(*) FROM happyview_event_logs WHERE event_type = ?",
+        app.state.db_backend,
+    );
+    let (n,) = happyview::db::query_as::<(i64,)>(&sql)
+        .bind(event_type)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("could not count audit rows");
+    n
+}
 
 /// Query strings for routes that answer `400` without them, so the sweep
 /// reaches what they actually do rather than their parameter parsing.
@@ -294,6 +371,12 @@ const QUERY: &[(&str, &str)] = &[
     ("/records", "collection=games.gamesgamesgamesgames.game"),
     ("/identity/resolve", "identifier=did:plc:testadmin"),
     ("/editor/declarations", "language=sweep"),
+    // So it reaches the blob lookup rather than stopping at query extraction,
+    // which is what its EXEMPT_FROM_SEEDING reason describes.
+    (
+        "/spaces/{id}/blob",
+        "cid=bafyreibsrh5ijw2opbnpyopbnpyopbnpyopbnpyopbnpyopbnpyopbnpyop",
+    ),
 ];
 
 /// Routes the sweep cannot drive to a `2xx`, with the reason, and therefore
@@ -318,6 +401,24 @@ const EXEMPT_FROM_SEEDING: &[(&str, &str)] = &[
      then an outbound fetch",
     ),
 ];
+
+/// Routes whose response body is an open stream rather than a finite document,
+/// and why each one's never ends.
+///
+/// The sweep drains every body, because a handler that streams could write
+/// while the body is still being produced. A stream that stays open until the
+/// client disconnects has no end to drain, so draining one does not answer the
+/// question slowly, it never answers it: the first run of this sweep over the
+/// record source's routes sat on `/backfill/{id}/events` for two and a half
+/// hours. A listed route is still called and its status still recorded; only
+/// the tail of its body goes unread, which costs this sweep whatever the
+/// handler writes after its first flush.
+const STREAMING_BODIES: &[(&str, &str)] = &[(
+    "/backfill/{id}/events",
+    "an SSE stream that sends one job snapshot and then forwards broadcast \
+     events for as long as the client stays connected, so its body ends only \
+     when the client leaves",
+)];
 
 /// A tar.gz project bundle, as `PUT /admin/project` takes.
 fn bundle(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -514,6 +615,23 @@ async fn seed(app: &TestApp) -> BTreeMap<&'static str, String> {
         .expect("could not seed a dead letter");
     ids.insert("dead_letter", "1".to_string());
 
+    // The record source's `/backfill/{id}/*` reads need a job of their own;
+    // `happyview_jobs` below is the script job queue, a different thing.
+    let backfill_id = "33333333-3333-4333-8333-333333333333";
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, collection, status, stage, created_at) \
+         VALUES (?, ?, 'completed', 'done', ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(backfill_id)
+        .bind(GAME)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("could not seed a backfill job");
+    ids.insert("backfill", backfill_id.to_string());
+
     let job_id = "22222222-2222-4222-8222-222222222222";
     let sql = adapt_sql(
         "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at) \
@@ -569,6 +687,7 @@ fn concrete_path(path: &str, ids: &BTreeMap<&'static str, String>) -> String {
     // `/lexicon-publishing/dns/` is not read as `/lexicons/`.
     const BY_PREFIX: &[(&str, &str)] = &[
         ("/lexicon-publishing/dns/", "lexicon"),
+        ("/backfill/", "backfill"),
         ("/network-lexicons/resolve/", "lexicon"),
         ("/lexicons/", "lexicon"),
         ("/linked-repos/", "linked_repo"),
@@ -604,65 +723,106 @@ async fn no_admin_get_route_writes() {
     let tables = table_names(&app, true).await;
     let routes = admin_get_routes();
 
-    let mut previous = fingerprint(&app, &tables).await;
+    let mut previous = settled_fingerprint(&app, &tables).await;
     let mut offenders: Vec<String> = Vec::new();
-    // (route path, what was called and what it answered) so an exemption
-    // matches on the route rather than on a formatted sentence.
     let mut not_reached: Vec<(&str, String)> = Vec::new();
+    let mut streams: Vec<String> = Vec::new();
     let mut reached = 0usize;
-    let mut timed_out: Vec<String> = Vec::new();
     let mut audited_seen: Vec<&str> = Vec::new();
 
-    for (path, handler) in &routes {
-        let mut uri = format!("/admin{}", concrete_path(path, &ids));
-        if let Some((_, query)) = QUERY.iter().find(|(p, _)| p == path) {
-            uri.push('?');
-            uri.push_str(query);
-        }
-        let cookie = app.admin_cookie();
-        let request = Request::builder()
-            .uri(&uri)
-            .header(cookie.0, cookie.1)
-            .body(Body::empty())
-            .unwrap();
-
-        // Several of these resolve identities or look up DNS. A slow one must
-        // not hang the sweep, and a request that never answered still has to
-        // be checked for what it wrote on the way.
-        let call = app.router.clone().oneshot(request);
-        let status = match tokio::time::timeout(std::time::Duration::from_secs(20), call).await {
-            Ok(response) => {
-                let response = response.unwrap();
-                let status = response.status().as_u16();
-                // Drained, because a handler that streams could write while
-                // the body is still being produced.
-                let _ = response.into_body().collect().await;
-                Some(status)
+    // Twice: once on freshly seeded state and once after the whole pass, so a
+    // write that only happens the second time round — a cache filled on first
+    // read, a row written only when one already exists — is still caught, and
+    // each route is called after every other route has run.
+    for pass in 1..=2 {
+        for (path, handler) in &routes {
+            let mut uri = format!("/admin{}", concrete_path(path, &ids));
+            if let Some((_, query)) = QUERY.iter().find(|(p, _)| p == path) {
+                uri.push('?');
+                uri.push_str(query);
             }
-            Err(_) => {
-                timed_out.push(format!("{handler} ({uri})"));
-                None
-            }
-        };
+            let cookie = app.admin_cookie();
+            let request = Request::builder()
+                .uri(&uri)
+                .header(cookie.0, cookie.1)
+                .body(Body::empty())
+                .unwrap();
 
-        match status {
-            Some(code) if (200..300).contains(&code) => reached += 1,
-            Some(code) => not_reached.push((path.as_str(), format!("{handler} ({uri}) → {code}"))),
-            None => {}
-        }
+            // Several of these resolve identities or reach a PDS. A slow one
+            // must not hang the sweep, and a request that never answered is
+            // not a request this sweep has checked.
+            let audit_before = audit_rows(&app, "space.moderator_read").await;
+            let call = app.router.clone().oneshot(request);
+            let (status, body_ended) =
+                match tokio::time::timeout(std::time::Duration::from_secs(20), call).await {
+                    Ok(response) => {
+                        let response = response.unwrap();
+                        let status = response.status().as_u16();
+                        // Drained, because a handler that streams could write
+                        // while the body is still being produced; bounded,
+                        // because a body that never ends would otherwise stop
+                        // the sweep rather than fail it (see STREAMING_BODIES).
+                        let drained = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            response.into_body().collect(),
+                        )
+                        .await;
+                        (Some(status), drained.is_ok())
+                    }
+                    Err(_) => (None, false),
+                };
 
-        let current = fingerprint(&app, &tables).await;
-        for (table, sentence) in differences(&previous, &current) {
-            let audited = AUDITED_READS
-                .iter()
-                .any(|(route, audited_table, _)| route == path && *audited_table == table);
-            if !audited {
-                offenders.push(format!("GET /admin{path} ({handler}) — {sentence}"));
-            } else {
-                audited_seen.push(path.as_str());
+            if pass == 1 && status.is_some() {
+                let listed = STREAMING_BODIES.iter().any(|(p, _)| p == path);
+                if !body_ended && !listed {
+                    streams.push(format!(
+                        "{handler} ({uri}) did not finish its body within 5s; if it is a \
+                         stream that stays open, list it in STREAMING_BODIES with a reason, \
+                         and know that this sweep then sees only what it writes before its \
+                         first flush"
+                    ));
+                } else if body_ended && listed {
+                    streams.push(format!(
+                        "STREAMING_BODIES lists {path}, but its body finished: drop the entry"
+                    ));
+                }
             }
+
+            if pass == 1 {
+                match status {
+                    Some(code) if (200..300).contains(&code) => reached += 1,
+                    Some(code) => {
+                        not_reached.push((path.as_str(), format!("{handler} ({uri}) → {code}")))
+                    }
+                    // A timeout is not coverage: nothing was observed, so it
+                    // has to fail unless the route is exempt.
+                    None => not_reached
+                        .push((path.as_str(), format!("{handler} ({uri}) → did not answer"))),
+                }
+            }
+
+            let current = settled_fingerprint(&app, &tables).await;
+            for (table, sentence) in differences(&previous, &current) {
+                let audited = AUDITED_READS
+                    .iter()
+                    .find(|(route, audited_table, _, _)| route == path && *audited_table == table);
+                match audited {
+                    Some((_, _, event_type, _)) => {
+                        let gained = audit_rows(&app, event_type).await - audit_before;
+                        assert_eq!(
+                            gained, 1,
+                            "GET /admin{path} is allowed exactly one '{event_type}' row and \
+                             added {gained}; {sentence}"
+                        );
+                        audited_seen.push(path.as_str());
+                    }
+                    None => offenders.push(format!(
+                        "pass {pass}: GET /admin{path} ({handler}) — {sentence}"
+                    )),
+                }
+            }
+            previous = current;
         }
-        previous = current;
     }
 
     // Anything but a 2xx means the handler stopped before its own work — at
@@ -701,20 +861,31 @@ async fn no_admin_get_route_writes() {
     // write to that table on that route would be permitted silently.
     let unused: Vec<&str> = AUDITED_READS
         .iter()
-        .filter(|(route, _, _)| {
+        .filter(|(route, _, _, _)| {
             routes.iter().any(|(p, _)| p == route) && !audited_seen.contains(route)
         })
-        .map(|(route, _, _)| *route)
+        .map(|(route, _, _, _)| *route)
         .collect();
     assert!(
         unused.is_empty(),
         "AUDITED_READS lists routes that no longer write: {unused:?}"
     );
-    if !timed_out.is_empty() {
-        eprintln!(
-            "routes that did not answer within 20s:\n  {}",
-            timed_out.join("\n  ")
-        );
+
+    // Nor does STREAMING_BODIES: a route is listed because its body has no
+    // end, and the sweep reads less of a listed route than of any other, so
+    // an entry that stops being true costs coverage silently.
+    assert!(
+        streams.is_empty(),
+        "the sweep could not read these routes' bodies the way STREAMING_BODIES says it \
+         should:\n  {}",
+        streams.join("\n  ")
+    );
+
+    // One more settled read after the loop: the last route's detached write
+    // has nothing following it to notice the change.
+    let after_everything = settled_fingerprint(&app, &tables).await;
+    for (_, sentence) in differences(&previous, &after_everything) {
+        offenders.push(format!("after the whole sweep — {sentence}"));
     }
 
     assert!(
