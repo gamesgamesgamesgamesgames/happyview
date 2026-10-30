@@ -13,6 +13,7 @@ import type {
 } from "@/types/lexicon-publishing";
 import type { ResolvedIdentity } from "@/types/identity";
 import type {
+  BackfillCollection,
   BackfillJob,
   BackfillReposResponse,
   PdsSummaryResponse,
@@ -333,6 +334,12 @@ export function deleteNetworkLexicon(nsid: string) {
 // Backfill
 export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
+}
+
+export function getBackfillCollection(nsid: string) {
+  return apiFetch<BackfillCollection>(
+    `/admin/backfill/collections/${encodeURIComponent(nsid)}`,
+  );
 }
 
 export function createBackfillJob(body: {
@@ -1118,10 +1125,10 @@ export function recheckApiClientAuthKey(id: string) {
   );
 }
 
-export function rotateApiClientAuthKey(id: string) {
+export function rotateApiClientAuthKey(id: string, immediate = false) {
   return apiFetch<KeyRotationResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
-    { method: "POST" },
+    { method: "POST", body: JSON.stringify({ immediate }) },
   );
 }
 
@@ -1145,9 +1152,10 @@ export function revokeAllApiClientAuthKeys(id: string) {
   );
 }
 
-export function rotateInstanceOauthKey() {
+export function rotateInstanceOauthKey(immediate = false) {
   return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
     method: "POST",
+    body: JSON.stringify({ immediate }),
   });
 }
 

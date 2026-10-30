@@ -19,6 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
+use crate::config::Config;
 use crate::config::project::{PROJECT_FILE, ProjectConfig, load_project_config};
 use crate::project::boot::{self, Installed};
 use crate::project::{BuildOptions, Diagnostic, build_snapshot, install};
@@ -135,7 +136,7 @@ pub async fn deploy(
         &config,
     );
     let mut warnings = report.warnings;
-    warnings.extend(ignored_sections(&config));
+    warnings.extend(ignored_sections(&config, &state.config));
 
     if request.dry_run {
         let backfills = boot::declared_backfills(state, &report.snapshot).await;
@@ -320,31 +321,64 @@ fn etag_value(header: &str) -> &str {
 
 /// The tables a deployed project may not set: they configure the instance
 /// rather than the project, and on a hosted one belong to its operator.
-/// `[interpreters]`, `[libraries]` and `[happyview] version` are ignored
-/// too, silently: the deploying client installs the plugins and checks the
-/// version itself, and every project names them.
-fn ignored_sections(config: &ProjectConfig) -> Vec<Diagnostic> {
-    let mut ignored = Vec::new();
-    if config.instance != Default::default() {
-        ignored.push("[instance]");
+/// `[instance]` is only reported for the keys whose value differs from the
+/// instance's own, so a project kept in step with its instance deploys
+/// quietly. `[interpreters]`, `[libraries]` and `[happyview] version` are
+/// ignored too, silently: the deploying client installs the plugins and
+/// checks the version itself, and every project names them.
+fn ignored_sections(config: &ProjectConfig, live: &Config) -> Vec<Diagnostic> {
+    let mut warnings = Vec::new();
+    let differing = instance_differences(config, live);
+    if !differing.is_empty() {
+        let (differ, is) = if differing.len() == 1 {
+            ("differs", "is")
+        } else {
+            ("differ", "are")
+        };
+        warnings.push(Diagnostic::warning(
+            PROJECT_FILE,
+            format!(
+                "[instance] {} {differ} from this instance's and {is} ignored by a deploy; [instance] configures the instance, not the project",
+                differing.join(", ")
+            ),
+        ));
     }
+    let mut ignored = Vec::new();
     if config.dev != Default::default() {
         ignored.push("[dev]");
     }
     if config.jetstream != Default::default() {
         ignored.push("[jetstream]");
     }
-    ignored
-        .into_iter()
-        .map(|section| {
-            Diagnostic::warning(
-                PROJECT_FILE,
-                format!(
-                    "{section} is ignored by a deploy; it configures the instance, not the project"
-                ),
-            )
-        })
-        .collect()
+    warnings.extend(ignored.into_iter().map(|section| {
+        Diagnostic::warning(
+            PROJECT_FILE,
+            format!(
+                "{section} is ignored by a deploy; it configures the instance, not the project"
+            ),
+        )
+    }));
+    warnings
+}
+
+/// The `[instance]` keys the project sets to something other than what the
+/// instance runs with.
+fn instance_differences(config: &ProjectConfig, live: &Config) -> Vec<&'static str> {
+    let mut differing = Vec::new();
+    if let Some(name) = &config.instance.app_name
+        && live.app_name.as_deref() != Some(name.as_str())
+    {
+        differing.push("app_name");
+    }
+    if let Some(did) = &config.instance.superadmin
+        && crate::config::parse_superadmin_did(Some(did))
+            .ok()
+            .flatten()
+            != live.superadmin_did
+    {
+        differing.push("superadmin");
+    }
+    differing
 }
 
 async fn apply_declarations(state: &AppState, config: &ProjectConfig) {
@@ -370,24 +404,78 @@ mod tests {
         assert_eq!(etag_value("abc"), "abc");
     }
 
-    #[test]
-    fn instance_tables_are_named_as_ignored() {
-        let config: ProjectConfig = toml::from_str(
-            "[happyview]\nversion = \"3.0.0\"\n[instance]\napp_name = \"x\"\n[jetstream]\ncompression = true\n[lexicons.\"com.example.thing\"]\nbackfill = true\n",
-        )
-        .unwrap();
-        let found: Vec<String> = ignored_sections(&config)
+    fn live(app_name: Option<&str>, superadmin: Option<&str>) -> Config {
+        let mut config = crate::test_support::test_config(crate::db::DatabaseBackend::Sqlite);
+        config.app_name = app_name.map(str::to_string);
+        config.superadmin_did = superadmin.map(str::to_string);
+        config
+    }
+
+    fn warnings(toml: &str, live: &Config) -> Vec<String> {
+        let config: ProjectConfig = toml::from_str(toml).unwrap();
+        ignored_sections(&config, live)
             .iter()
             .map(|d| d.to_string())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn instance_tables_are_named_as_ignored() {
+        let found = warnings(
+            "[happyview]\nversion = \"3.0.0\"\n[instance]\napp_name = \"x\"\n[jetstream]\ncompression = true\n[lexicons.\"com.example.thing\"]\nbackfill = true\n",
+            &live(None, None),
+        );
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(
             found
                 .iter()
                 .all(|w| w.starts_with("happyview.toml: warning: "))
         );
-        assert!(found.iter().any(|w| w.contains("[instance]")));
+        assert!(
+            found
+                .iter()
+                .any(|w| w.contains("[instance] app_name differs"))
+        );
         assert!(found.iter().any(|w| w.contains("[jetstream]")));
+    }
+
+    #[test]
+    fn an_instance_table_matching_the_instance_is_not_warned_about() {
+        let found = warnings(
+            "[instance]\napp_name = \"Test 4\"\nsuperadmin = \"did:plc:4jrld6fwpnwqehtce56qshzv\"\n",
+            &live(Some("Test 4"), Some("did:plc:4jrld6fwpnwqehtce56qshzv")),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn only_the_instance_keys_that_differ_are_named() {
+        let toml =
+            "[instance]\napp_name = \"Mine\"\nsuperadmin = \"did:plc:4jrld6fwpnwqehtce56qshzv\"\n";
+        let found = warnings(
+            toml,
+            &live(Some("Theirs"), Some("did:plc:4jrld6fwpnwqehtce56qshzv")),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("[instance] app_name differs"),
+            "{found:?}"
+        );
+        assert!(!found[0].contains("superadmin"), "{found:?}");
+
+        let found = warnings(toml, &live(Some("Mine"), None));
+        assert!(
+            found[0].contains("[instance] superadmin differs"),
+            "{found:?}"
+        );
+
+        let found = warnings(toml, &live(None, Some("did:plc:someoneelse")));
+        assert!(
+            found[0].contains(
+                "[instance] app_name, superadmin differ from this instance's and are ignored"
+            ),
+            "{found:?}"
+        );
     }
 
     #[test]

@@ -1,4 +1,3 @@
-import { execSync } from "child_process";
 import { test, expect, type Page } from "@playwright/test";
 import {
   awaitConsentOrCallback,
@@ -15,7 +14,6 @@ import {
 
 const PDS_URL = "http://localhost:3100";
 const PDS_PASSWORD = "Test-password-e2e-123";
-const HAPPYVIEW_CONTAINER = "happyview-e2e-happyview-1";
 
 async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   const suffix =
@@ -131,6 +129,7 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
 
     const rotateResp = await page.request.post(
       "/admin/oauth/instance-key/rotate",
+      { data: { immediate: true } },
     );
     expect(rotateResp.ok(), `rotate: ${await rotateResp.text()}`).toBeTruthy();
     const rotated = (await rotateResp.json()) as {
@@ -154,23 +153,8 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
 
     expect(
       triggerResp.status(),
-      `expected a 500 wrapping the PDS unit-deserialization failure (an authenticated-and-reached-the-PDS signature), got: ${triggerResp.status()} ${triggerBody}`,
-    ).toBe(500);
-    const correlationId = (
-      JSON.parse(triggerBody) as { correlationId?: string }
-    ).correlationId;
-    expect(
-      correlationId,
-      `expected an AppError::Internal body with a correlationId, got: ${triggerBody}`,
-    ).toBeTruthy();
-
-    const logLine = execSync(
-      `docker logs ${HAPPYVIEW_CONTAINER} 2>&1 | grep -F ${JSON.stringify(correlationId)} || true`,
-    ).toString();
-    expect(
-      logLine,
-      `expected the logged internal error for correlationId ${correlationId} to be the PDS unit-deserialization failure, got: ${logLine || "(no matching log line found)"}`,
-    ).toContain("invalid type: map, expected unit");
+      `expected the PDS to accept the signature request through the refreshed session, got: ${triggerResp.status()} ${triggerBody}`,
+    ).toBe(204);
 
     const after = await getOauthSessionTokenState(accountA.did);
     expect(after.accessToken).not.toBe(accessTokenBefore);
@@ -272,12 +256,14 @@ test.describe("OAuth instance key dashboard — list and revoke", () => {
     ).toHaveCount(0);
 
     await page.getByRole("button", { name: /^generate new key$/i }).click();
+    // Switching now is what demotes the current key straight away; a plain
+    // generate only publishes the new one (see the staged test below).
     await page
       .getByRole("alertdialog")
-      .getByRole("button", { name: /^generate new key$/i })
+      .getByRole("button", { name: /^switch now$/i })
       .click();
     await expect(
-      page.getByText(/generated a new instance signing key/i),
+      page.getByText(/switched to a new instance signing key/i),
     ).toBeVisible({ timeout: 10000 });
 
     const retiringRow = rows
@@ -326,7 +312,10 @@ test.describe("OAuth instance key dashboard — list and revoke", () => {
   }) => {
     await loginAsTestAdmin(page);
 
-    const rotate1 = await page.request.post("/admin/oauth/instance-key/rotate");
+    const rotate1 = await page.request.post(
+      "/admin/oauth/instance-key/rotate",
+      { data: { immediate: true } },
+    );
     expect(rotate1.ok(), `rotate: ${await rotate1.text()}`).toBeTruthy();
     const { kid: targetKid } = (await rotate1.json()) as { kid: string };
 
@@ -345,7 +334,10 @@ test.describe("OAuth instance key dashboard — list and revoke", () => {
       ).toBe(targetKid);
     }
 
-    const rotate2 = await page.request.post("/admin/oauth/instance-key/rotate");
+    const rotate2 = await page.request.post(
+      "/admin/oauth/instance-key/rotate",
+      { data: { immediate: true } },
+    );
     expect(rotate2.ok(), `rotate: ${await rotate2.text()}`).toBeTruthy();
 
     const listResp = await page.request.get("/admin/oauth/instance-key");
@@ -411,5 +403,53 @@ test.describe("OAuth instance key dashboard — list and revoke", () => {
       revokedKey?.session_count,
       "session_counts_by_kid does not filter on key status, so this must still read 2 after revoke — it counts rows still pinned to this now-dead kid, not currently-usable sessions",
     ).toBe(2);
+  });
+
+  test("generating a key publishes it as pending while the current key keeps signing", async ({
+    page,
+  }) => {
+    await loginAsTestAdmin(page);
+
+    const before = await page.request.get("/admin/oauth/instance-key");
+    expect(before.ok(), `list: ${await before.text()}`).toBeTruthy();
+    const currentBefore = (
+      (await before.json()) as { keys: { kid: string; status: string }[] }
+    ).keys.find((k) => k.status === "current");
+    expect(currentBefore, "expected a current instance key").toBeTruthy();
+
+    await page.goto("/dashboard/settings/oauth-keys");
+    await page.getByRole("button", { name: /^generate new key$/i }).click();
+    await page
+      .getByRole("alertdialog")
+      .getByRole("button", { name: /^generate new key$/i })
+      .click();
+    await expect(
+      page.getByText(/published a new instance signing key/i),
+    ).toBeVisible({ timeout: 10000 });
+
+    const after = await page.request.get("/admin/oauth/instance-key");
+    const afterKeys = (
+      (await after.json()) as {
+        keys: { kid: string; status: string; activates_at: string | null }[];
+      }
+    ).keys;
+    const pending = afterKeys.find((k) => k.status === "pending");
+    expect(pending, "the new key waits as pending").toBeTruthy();
+    expect(pending!.activates_at).toBeTruthy();
+    expect(afterKeys.find((k) => k.status === "current")?.kid).toBe(
+      currentBefore!.kid,
+    );
+
+    const pendingRow = page
+      .locator("div.rounded-lg.border")
+      .filter({ hasText: pending!.kid })
+      .filter({ hasText: "Pending" });
+    // The key's own row, not the "last rotation" note above the list, which
+    // names the same kid.
+    await expect(pendingRow.getByText(/created .* takes over at/i)).toBeVisible(
+      {
+        timeout: 10000,
+      },
+    );
   });
 });

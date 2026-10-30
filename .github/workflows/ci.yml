@@ -39,12 +39,27 @@ env:
 permissions:
   id-token: write # Required for OIDC
 
+# Concurrency is set per job. A newer run on the same pull request, or the
+# same branch, cancels the older run's checks (`ci-…` groups). The jobs that
+# cut a version (`release`, `release-*`) are never cancelled once started
+# (`release-…` groups, cancel-in-progress false; a newer run can only drop one
+# still pending, which has cut nothing), and the jobs after them (`build`,
+# `dispatch-native-release`, `tag-latest`) have no group. Each job that can be
+# first to cut a version (`release`, `release-oauth-client`, `release-nsid`)
+# needs every cancellable job, so none of those is still running, or
+# cancellable, once a version may have been cut, and refuses to run if any
+# of its needs was cancelled: `always()` alone would let a run whose tests a
+# newer push cancelled cut a version anyway. The event name in the `ci-`
+# group keeps a branch deletion's run from cancelling a push's.
 jobs:
   # ---------------------------------------------------------------------------
   # Path detection — determines which job groups should run.
   # Required because workflow-level `paths` filters can't vary per job.
   # ---------------------------------------------------------------------------
   changes:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-changes
+      cancel-in-progress: true
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: depot-ubuntu-24.04
     outputs:
@@ -104,6 +119,9 @@ jobs:
   # Build server binary — shared by playwright and pr-build (amd64)
   # ---------------------------------------------------------------------------
   build-server:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-build-server
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -129,9 +147,14 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: happyview-server
-          path: target/release/happyview
+          path: |
+            target/release/happyview
+            target/release/happyview-codemod
 
   unit-tests:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-unit-tests
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -171,6 +194,9 @@ jobs:
         run: cargo test --workspace --exclude happyview
 
   e2e-tests:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -316,6 +342,9 @@ jobs:
   # The e2e suite again on SQLite: every database-backed test the job above
   # runs on Postgres, on a SQLite file, since self-hosting supports both.
   e2e-tests-sqlite:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-sqlite
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -430,6 +459,9 @@ jobs:
   # PUC Lua from C to do it, and that build sat at the end of an e2e job
   # already near its timeout.
   lua-differential:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-lua-differential
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -486,6 +518,9 @@ jobs:
   # Runs the unit, crate, and e2e suites once under LLVM source-based
   # instrumentation. Informational for now: no threshold gates the PR.
   coverage:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-coverage
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -567,6 +602,9 @@ jobs:
             target/llvm-cov/html
 
   frontend:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-frontend
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -623,6 +661,9 @@ jobs:
           mv web/out.aside web/out
 
   lint:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-lint
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -663,6 +704,9 @@ jobs:
   # directory, which is what proves it carries its migrations and needs no
   # system OpenSSL.
   portability:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-portability-${{ matrix.target }}
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     strategy:
@@ -713,6 +757,9 @@ jobs:
           exit 1
 
   audit:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-audit
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -731,6 +778,9 @@ jobs:
         run: cargo audit
 
   playwright:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-playwright
+      cancel-in-progress: true
     needs: [changes, frontend, build-server]
     if: >-
       always()
@@ -821,6 +871,9 @@ jobs:
   # of one reviewers can already pull.
   # ---------------------------------------------------------------------------
   pr-build:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-pr-build-${{ matrix.arch }}
+      cancel-in-progress: true
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
@@ -875,7 +928,7 @@ jobs:
       - name: Prepare binary override
         run: |
           mkdir -p .builder-override/app/target/release
-          cp target/release/happyview .builder-override/app/target/release/happyview
+          cp target/release/happyview target/release/happyview-codemod .builder-override/app/target/release/
 
       - name: Extract metadata
         id: meta
@@ -897,6 +950,17 @@ jobs:
           provenance: false
           outputs: type=docker,name=happyview-pr:${{ matrix.arch }},dest=happyview-image-${{ matrix.arch }}.tar
 
+      # The image runs the codemod, not just the server: a v2 query rewritten
+      # through the entrypoint comes back on the v3 contract.
+      - name: Smoke-test the codemod in the image
+        run: |
+          docker load -i happyview-image-${{ matrix.arch }}.tar
+          out=$(printf 'function handle()\n  return { did = caller_did }\nend\n' \
+            | docker run --rm -i happyview-pr:${{ matrix.arch }} happyview-codemod --stdin --kind query)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'function handle(input, ctx)'
+          printf '%s\n' "$out" | grep -q 'did = ctx.caller_did'
+
       - name: Upload image
         uses: actions/upload-artifact@v7
         with:
@@ -905,6 +969,9 @@ jobs:
           retention-days: 7
 
   pr-build-metadata:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-pr-build-metadata
+      cancel-in-progress: true
     needs: pr-build
     runs-on: depot-ubuntu-24.04
     steps:
@@ -924,8 +991,13 @@ jobs:
   # Server release
   # ---------------------------------------------------------------------------
   release:
+    concurrency:
+      group: release-${{ github.ref }}-release
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
@@ -936,7 +1008,7 @@ jobs:
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
       && needs.portability.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability]
+    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability, build-server, coverage, audit, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
@@ -1038,7 +1110,7 @@ jobs:
       - name: Prepare binary override
         run: |
           mkdir -p .builder-override/app/target/release
-          cp target/release/happyview .builder-override/app/target/release/happyview
+          cp target/release/happyview target/release/happyview-codemod .builder-override/app/target/release/
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -1185,6 +1257,9 @@ jobs:
   # SDK — per-package tests + releases
   # ---------------------------------------------------------------------------
   test-oauth-client:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
     runs-on: depot-ubuntu-24.04
@@ -1208,6 +1283,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client' test
 
   test-oauth-client-browser:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client-browser
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
     runs-on: depot-ubuntu-24.04
@@ -1234,6 +1312,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client-browser' test
 
   test-oauth-client-node:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client-node
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
     runs-on: depot-ubuntu-24.04
@@ -1260,6 +1341,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client-node' test
 
   test-lex-agent:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-lex-agent
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
     runs-on: depot-ubuntu-24.04
@@ -1286,6 +1370,9 @@ jobs:
         run: bun run --filter '@happyview/lex-agent' test
 
   test-nsid:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-nsid
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
     runs-on: depot-ubuntu-24.04
@@ -1309,12 +1396,17 @@ jobs:
         run: bun run --filter '@happyview/nsid' test
 
   release-oauth-client:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
-    needs: [changes, test-oauth-client]
+    needs: [changes, test-oauth-client, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1349,8 +1441,13 @@ jobs:
         run: npx semantic-release
 
   release-oauth-client-browser:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client-browser
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
@@ -1393,8 +1490,13 @@ jobs:
         run: npx semantic-release
 
   release-oauth-client-node:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client-node
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
@@ -1437,8 +1539,13 @@ jobs:
         run: npx semantic-release
 
   release-lex-agent:
+    concurrency:
+      group: release-${{ github.ref }}-release-lex-agent
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
@@ -1481,12 +1588,17 @@ jobs:
         run: npx semantic-release
 
   release-nsid:
+    concurrency:
+      group: release-${{ github.ref }}-release-nsid
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
-    needs: [changes, test-nsid]
+    needs: [changes, test-nsid, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, mirror]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1524,6 +1636,9 @@ jobs:
   # Mirror to Tangled
   # ---------------------------------------------------------------------------
   mirror:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-mirror
+      cancel-in-progress: true
     # PRs have nothing to mirror, and fork PRs can't read the SSH key.
     if: github.event_name != 'pull_request'
     runs-on: depot-ubuntu-24.04

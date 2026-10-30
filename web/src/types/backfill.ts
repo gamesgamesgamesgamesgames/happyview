@@ -33,6 +33,21 @@ export interface BackfillJob {
   // Set for jobs on the bounded queue: how many recent completions the
   // `fetched` repo list keeps. Null for jobs created before it.
   recent_completions_limit?: number | null;
+  // What the job's executor said about it, for a collection backfilled by
+  // the record source rather than a crawl or a replay.
+  note?: string | null;
+}
+
+// What `GET /admin/backfill/collections/{nsid}` reports: the executor that
+// backfills the collection, if any, and what it says about it now.
+export interface BackfillCollection {
+  collection: string;
+  executor: string | null;
+  summary: {
+    message: string;
+    records: number | null;
+    state: "running" | "complete" | "failed" | null;
+  } | null;
 }
 
 export interface BackfillRepoEntry {
@@ -78,6 +93,8 @@ export interface BackfillEvent {
   tip_seq?: number | null;
   bytes?: number;
   blocks_failed?: number;
+  // `job_note` events
+  note?: string;
 }
 
 export interface BlueskyProfile {
