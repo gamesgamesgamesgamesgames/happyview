@@ -78,7 +78,7 @@ async fn put_lexicon(app: &TestApp, id: &str) {
 async fn renders_the_instances_lexicons_and_revalidates() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;

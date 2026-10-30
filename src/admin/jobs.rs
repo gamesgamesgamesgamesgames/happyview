@@ -63,20 +63,22 @@ pub async fn cancel_job(
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
 
-    match job.status.as_str() {
-        "running" => {
-            jobs::db::set_status(&state, &id, "cancelling").await?;
-            Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    // Each write lands only on the status it was read against: a job that
+    // finished meanwhile must not be marked as cancelling.
+    let to = match job.status.as_str() {
+        "running" => "cancelling",
+        "pending" | "paused" => "cancelled",
+        _ => {
+            return Err(AppError::Conflict(format!(
+                "cannot cancel job with status: {}",
+                job.status
+            )));
         }
-        "pending" | "paused" => {
-            jobs::db::set_status(&state, &id, "cancelled").await?;
-            Ok(Json(serde_json::json!({ "status": "cancelled" })))
-        }
-        _ => Err(AppError::Conflict(format!(
-            "cannot cancel job with status: {}",
-            job.status
-        ))),
+    };
+    if !jobs::db::change_status(&state, &id, &job.status, to).await? {
+        return Err(moved_on());
     }
+    Ok(Json(serde_json::json!({ "status": to })))
 }
 
 pub async fn pause_job(
@@ -97,7 +99,9 @@ pub async fn pause_job(
         )));
     }
 
-    jobs::db::set_status(&state, &id, "pausing").await?;
+    if !jobs::db::change_status(&state, &id, "running", "pausing").await? {
+        return Err(moved_on());
+    }
     Ok(Json(serde_json::json!({ "status": "pausing" })))
 }
 
@@ -119,8 +123,15 @@ pub async fn resume_job(
         )));
     }
 
-    jobs::db::set_status(&state, &id, "pending").await?;
+    if !jobs::db::change_status(&state, &id, "paused", "pending").await? {
+        return Err(moved_on());
+    }
     Ok(Json(serde_json::json!({ "status": "pending" })))
+}
+
+/// The job's status changed between reading it and acting on it.
+fn moved_on() -> AppError {
+    AppError::Conflict("the job's status changed; reload and try again".into())
 }
 
 #[derive(Deserialize)]

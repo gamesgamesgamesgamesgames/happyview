@@ -25,7 +25,7 @@ use common::echo_interpreter;
 
 async fn env() -> Option<TestEnv> {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return None;
     }
     let registry = Arc::new(PluginRegistry::new());
@@ -180,7 +180,7 @@ async fn a_report_lands_on_the_files_harness() {
 #[tokio::test]
 async fn the_test_imports_refuse_an_interpreter_without_script_test() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let mut plugin = echo_interpreter::plugin("echo");
@@ -960,7 +960,7 @@ async fn a_procedure_fired_with_delegate_did_is_refused_by_name() {
 
 async fn env_with_fixtures(fixtures: &[&str]) -> Option<TestEnv> {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return None;
     }
     let registry = Arc::new(PluginRegistry::new());

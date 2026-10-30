@@ -98,13 +98,23 @@ CI runs a fork's PR without the repository's secrets, and every required check i
 2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
 3. **Check the squash message before merging.** This repository fills it with the PR's commit messages, trailers included. Delete any trailer we don't carry, such as an AI co-author line, in the merge dialog, and keep the contributor's `Signed-off-by`.
 
+### Missing prerequisites fail
+
+A test that needs a database, a built plugin fixture or an interpreter plugin
+fails when it is missing, naming what is missing and how to get it. A skipped
+test reports `ok`, so a fresh worktree used to report hundreds of passes while
+testing far less. Set `HAPPYVIEW_ALLOW_SKIPS=1` when you mean to run without
+them, and those tests skip instead. A test that runs only on the other
+database backend (Postgres-only on SQLite, or the reverse) still skips, since
+nothing is missing.
+
 ### Unit tests
 
 No database, no fixtures:
 
 ```bash
-cargo test --lib
-cargo test --workspace --exclude happyview
+HAPPYVIEW_ALLOW_SKIPS=1 cargo test --lib
+HAPPYVIEW_ALLOW_SKIPS=1 cargo test --workspace --exclude happyview
 ```
 
 That is not the whole suite. `mlua` is an optional dependency behind the
@@ -121,18 +131,18 @@ cargo test --features lua-reference --lib --test codemod_cases
 
 ### End-to-end tests
 
-Needs Postgres and every plugin WASM fixture built:
+Needs Postgres, every plugin WASM fixture built, and the interpreter plugins:
 
 ```bash
+bash scripts/build-plugin-fixtures.sh
+bash scripts/fetch-lua-plugin.sh && export HAPPYVIEW_LUA_PLUGIN=tests/fixtures/lua-plugin
 docker compose -f docker-compose.test.yml up -d
 TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test cargo test --tests
 docker compose -f docker-compose.test.yml down
 ```
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
-file. Leaving the variable unset does not test SQLite: the end-to-end suite
-skips its database-backed tests silently, so point it at a file URL as
-below. Run it this way once when you change SQL,
+file. Run it this way once when you change SQL,
 migrations or anything that touches the write path:
 
 ```bash
@@ -152,15 +162,8 @@ summaries in the pull request. The storage settings it exercises
 `BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
 `packages/docs/content/docs/getting-started/configuration.md`.
 
-A test whose plugin module is missing skips rather than fails, so this job
-asserts the fixtures are there before running them:
-
-```bash
-bash scripts/check-plugin-fixtures.sh --require
-```
-
-It names every artefact it could not find; the `e2e-tests` job in
-`.github/workflows/ci.yml` carries the build command for each one.
+`bash scripts/check-plugin-fixtures.sh --require` names every fixture
+artefact that is missing, before a run rather than test by test.
 
 `scripts/build-plugin-fixtures.sh` can fail in a worktree created inside the
 main checkout (for example under `.worktrees/`) with "current package believes
@@ -171,15 +174,12 @@ your branch added. Create the worktree outside the checkout
 `Cargo.toml` up to date with your branch.
 
 The real Lua interpreter plugin is another repository's artefact and needs a C
-toolchain, so nothing here can build it and the targets that load it skip.
-`bash scripts/check-lua-plugin.sh` reports what a run therefore left out and
-names the two variables, `HAPPYVIEW_LUA_PLUGIN` and `HAPPYVIEW_LUA_SRC`, that
-make those targets run. CI runs it in reporting mode, so absent is not a
-failure there.
-
-The provider conformance kit (`cargo test --features testkit --test
-conformance`) is the exception: it does not skip. It panics when
-`TEST_DATABASE_URL` or `HAPPYVIEW_LUA_PLUGIN` is unset.
+toolchain, so nothing here builds it: `scripts/fetch-lua-plugin.sh` downloads
+the pinned release, and `HAPPYVIEW_LUA_PLUGIN` names where it is.
+`scripts/fetch-quickjs-plugins.sh` does the same for the JavaScript and
+TypeScript interpreters (`HAPPYVIEW_JAVASCRIPT_PLUGIN`,
+`HAPPYVIEW_TYPESCRIPT_PLUGIN`). `bash scripts/check-lua-plugin.sh` reports
+whether the Lua plugin is in place.
 
 The job also runs the SDK crate's tests and the `migration_upgrade` target
 ahead of the full run, for a separately named signal. Both are already

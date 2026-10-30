@@ -597,3 +597,157 @@ async fn config_names_the_cli_client_key() {
     let body = app.get_json("/config").await;
     assert_eq!(body["cli_client_key"], cli_client::CLIENT_KEY);
 }
+
+/// Mint a client assertion for a sign-in in flight, as an app does for its
+/// PAR and its code exchange. Returns the kid it was signed with.
+async fn mint_for_provision(
+    app: &common::app::TestApp,
+    provision_id: &str,
+    verifier: &str,
+) -> String {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/client-assertion",
+            &json!({
+                "issuer": "https://pds.example.com",
+                "provision_id": provision_id,
+                "pkce_verifier": verifier,
+            }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let header = body["client_assertion"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_string();
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+    assert_eq!(
+        header["kid"], body["kid"],
+        "the response names the kid it signed with"
+    );
+    body["kid"].as_str().unwrap().to_string()
+}
+
+async fn provision(app: &common::app::TestApp, verifier: &str) -> String {
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/dpop-keys",
+            &json!({ "pkce_challenge": challenge }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    response_json(resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A sign-in's assertions, and the session it becomes, keep the key its
+/// first assertion used even when a staged key takes over before the code
+/// exchange: the reference provider refuses an exchange signed by another
+/// key than the PAR, and a refresh by another key than the exchange.
+#[tokio::test]
+#[serial]
+async fn a_sign_in_keeps_its_key_across_a_promotion() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let pool = &app.state.db;
+    let backend = app.state.db_backend;
+    let enc = app.state.config.token_encryption_key.as_ref();
+    let did = "did:plc:keepsitskey";
+    let server =
+        authorization_server(&app, did, true, &[token_response(did, ADMIN_GRANT, 3600)]).await;
+
+    // The client signs as a confidential atproto client.
+    let old = happyview::oauth::client_keys::generate_client_key(cli_client::CLIENT_ID).unwrap();
+    happyview::oauth::client_keys::insert_key(pool, backend, enc, &old)
+        .await
+        .unwrap();
+
+    let verifier = "keeps-its-key-verifier-0123456789abcdef0123";
+    let provision_id = provision(&app, verifier).await;
+    assert_eq!(
+        mint_for_provision(&app, &provision_id, verifier).await,
+        old.kid
+    );
+
+    // A staged key takes over while the user is at their PDS.
+    let (new, _) =
+        happyview::oauth::client_keys::stage_key(pool, backend, enc, cli_client::CLIENT_ID)
+            .await
+            .unwrap();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET activates_at = '2000-01-01T00:00:00.000Z' WHERE kid = ?",
+        backend,
+    ))
+    .bind(&new.kid)
+    .execute(pool)
+    .await
+    .unwrap();
+    happyview::oauth::client_keys::promote_due_keys(pool, backend)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mint_for_provision(&app, &provision_id, verifier).await,
+        old.kid,
+        "the code exchange must be signed with the PAR's key"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/sessions",
+            &json!({
+                "provision_id": provision_id,
+                "pkce_verifier": verifier,
+                "did": did,
+                "access_token": "app-token",
+                "refresh_token": "registered-refresh-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "scopes": ADMIN_GRANT,
+                "issuer": server.uri(),
+            }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        response_json(resp).await
+    );
+    let (pinned,): (Option<String>,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT signing_kid FROM happyview_dpop_sessions WHERE user_did = ?",
+        backend,
+    ))
+    .bind(did)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned.as_deref(),
+        Some(old.kid.as_str()),
+        "the session is pinned to the key that signed its exchange, not the one current at registration"
+    );
+
+    // A sign-in started after the promotion uses the new key.
+    let verifier = "after-promotion-verifier-0123456789abcdef01";
+    let later = provision(&app, verifier).await;
+    assert_eq!(mint_for_provision(&app, &later, verifier).await, new.kid);
+}

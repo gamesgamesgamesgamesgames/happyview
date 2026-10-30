@@ -95,7 +95,7 @@ export default function EnvVariablesPage() {
                 <TableHead>Key</TableHead>
                 <TableHead>Preview</TableHead>
                 <TableHead>Updated</TableHead>
-                <TableHead className="w-20 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -119,7 +119,7 @@ export default function EnvVariablesPage() {
                   <TableCell>
                     {new Date(v.updated_at).toLocaleString()}
                   </TableCell>
-                  <TableCell className="w-20 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     <div className="flex gap-1">
                       <UpsertVariableDialog onSuccess={load} editKey={v.key} />
                       {hasPermission("script-variables:delete") && (

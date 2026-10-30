@@ -221,8 +221,12 @@ async fn login(
             .map(|du| format!("{}/oauth-client-metadata.json", du.trim_end_matches('/')))
     };
 
-    // Select the appropriate OAuth client based on client_id
-    let oauth_client = state.oauth.get_or_default(effective_client_id.as_deref());
+    // Select the appropriate OAuth client based on client_id. Its kid is
+    // kept for the callback: a key promotion while the user is at their PDS
+    // must not change the key that finishes this authorization.
+    let (oauth_client, authorize_kid) = state
+        .oauth
+        .get_or_default_with_kid(effective_client_id.as_deref());
 
     // Hold the authorize lock so that authorize() + take_last_state_key() are atomic.
     // This prevents concurrent logins from swapping each other's state keys.
@@ -253,7 +257,7 @@ async fn login(
     // Store the redirect URI in the database, keyed by the OAuth state parameter.
     // This avoids third-party cookie issues when Pentaract (cross-origin) calls this endpoint.
     // Store redirect URI and client_id for the callback to use
-    if query.redirect_uri.is_some() || effective_client_id.is_some() {
+    if query.redirect_uri.is_some() || effective_client_id.is_some() || authorize_kid.is_some() {
         let redirect_uri = query.redirect_uri.as_deref().unwrap_or("");
         tracing::debug!(oauth_state = ?oauth_state, redirect_uri = %redirect_uri, client_id = ?effective_client_id, "storing redirect for state");
 
@@ -261,13 +265,14 @@ async fn login(
             let now = now_rfc3339();
             let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
             let sql = adapt_sql(
-                "INSERT INTO happyview_auth_login_redirects (state, redirect_uri, client_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO happyview_auth_login_redirects (state, redirect_uri, client_id, kid, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
                 state.db_backend,
             );
             let _ = crate::db::query(&sql)
                 .bind(&oauth_state)
                 .bind(redirect_uri)
                 .bind(effective_client_id.as_deref())
+                .bind(authorize_kid.as_deref())
                 .bind(&now)
                 .bind(&expires_at)
                 .execute(&state.db)
@@ -298,8 +303,13 @@ async fn callback(
     if let Some(ref oauth_state) = query.state {
         use crate::linked_repos::flow::PendingGrant;
         match crate::linked_repos::flow::take_pending_grant(&state, oauth_state).await? {
-            PendingGrant::Grant { grant_id, origin } => {
-                return linked_repo_callback(&state, &grant_id, origin, query).await;
+            PendingGrant::Grant {
+                grant_id,
+                origin,
+                kid,
+            } => {
+                return linked_repo_callback(&state, &grant_id, origin, kid.as_deref(), query)
+                    .await;
             }
             PendingGrant::Expired => {
                 tracing::warn!(
@@ -315,13 +325,13 @@ async fn callback(
     }
 
     // Look up the redirect URI and client_id from the database before the OAuth library consumes the state
-    let (redirect_url, client_id) = if let Some(oauth_state) = &query.state {
+    let (redirect_url, client_id, authorize_kid) = if let Some(oauth_state) = &query.state {
         let sql = adapt_sql(
-            "SELECT redirect_uri, client_id FROM happyview_auth_login_redirects WHERE state = ? AND expires_at > ?",
+            "SELECT redirect_uri, client_id, kid FROM happyview_auth_login_redirects WHERE state = ? AND expires_at > ?",
             state.db_backend,
         );
         let now = now_rfc3339();
-        let row: Option<(String, Option<String>)> = crate::db::query_as(&sql)
+        let row: Option<(String, Option<String>, Option<String>)> = crate::db::query_as(&sql)
             .bind(oauth_state)
             .bind(&now)
             .fetch_optional(&state.db)
@@ -342,19 +352,32 @@ async fn callback(
 
         tracing::debug!(found_redirect = ?row, "redirect lookup result");
         match row {
-            Some((uri, cid)) => {
+            Some((uri, cid, kid)) => {
                 let uri = if uri.is_empty() { None } else { Some(uri) };
-                (uri, cid)
+                (uri, cid, kid)
             }
-            None => (None, None),
+            None => (None, None, None),
         }
     } else {
         tracing::debug!("no state in callback query");
-        (None, None)
+        (None, None, None)
     };
 
-    // Use the same OAuth client that was used for authorize
-    let (oauth_client, exchange_kid) = state.oauth.get_or_default_with_kid(client_id.as_deref());
+    // Use the same OAuth client that was used for authorize, and the same
+    // key: the reference provider refuses a code exchange signed by another
+    // key than the request was, so a promotion in between must not show.
+    let (oauth_client, exchange_kid) = authorize_kid
+        .as_deref()
+        .and_then(|kid| {
+            let url = client_id
+                .clone()
+                .unwrap_or_else(|| state.config.instance_client_id_url());
+            state
+                .oauth
+                .get_for_kid(&url, kid)
+                .map(|client| (client, Some(kid.to_string())))
+        })
+        .unwrap_or_else(|| state.oauth.get_or_default_with_kid(client_id.as_deref()));
 
     let params = atrium_oauth::CallbackParams {
         code: query.code,
@@ -463,33 +486,22 @@ async fn callback(
     let redirect_url = redirect_url.unwrap_or(default_redirect);
     tracing::debug!(redirect_url = %redirect_url, "redirecting after callback");
 
-    // Set the session cookie
-    // Must use SameSite=None for cross-origin requests (e.g., Pentaract calling HappyView)
-    // Encode did and optional client_key separated by newline.
+    // Set the session cookie. Encode did and optional client_key separated by
+    // newline.
     let did_str = did.as_ref();
     let cookie_value = if let Some(ref ck) = client_key {
         format!("{did_str}\n{ck}")
     } else {
         did_str.to_string()
     };
-    let secure = is_https(&state.config.public_url);
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut session_cookie = Cookie::new(COOKIE_NAME, cookie_value);
-    session_cookie.set_path("/");
-    session_cookie.set_http_only(true);
-    session_cookie.set_same_site(same_site);
-    session_cookie.set_secure(secure);
+    let session_cookie = crate::auth::session_cookie(cookie_value, &state.config.public_url);
 
     // Remove the legacy redirect cookie if present (old cookie-based approach)
     let jar = if jar.get(LEGACY_REDIRECT_COOKIE).is_some() {
         let mut removal = Cookie::from(LEGACY_REDIRECT_COOKIE);
         removal.set_path("/");
-        removal.set_same_site(same_site);
-        removal.set_secure(secure);
+        removal.set_same_site(axum_extra::extract::cookie::SameSite::Lax);
+        removal.set_secure(is_https(&state.config.public_url));
         jar.add(session_cookie).remove(removal)
     } else {
         jar.add(session_cookie)
@@ -502,6 +514,7 @@ async fn linked_repo_callback(
     state: &AppState,
     grant_id: &str,
     origin: crate::linked_repos::flow::AuthOrigin,
+    authorize_kid: Option<&str>,
     query: CallbackQuery,
 ) -> Result<Response, AppError> {
     use crate::linked_repos::flow;
@@ -525,7 +538,8 @@ async fn linked_repo_callback(
         None => return Ok(finish("gone", None)),
     };
 
-    let (client, exchange_kid) = flow::client_and_kid_for_grant(state, &grant).await?;
+    let (client, exchange_kid) =
+        flow::client_and_kid_for_callback(state, &grant, authorize_kid).await?;
 
     let params = atrium_oauth::CallbackParams {
         code: query.code,
@@ -612,17 +626,10 @@ async fn logout(
         }
     }
 
-    let secure = is_https(&state.config.public_url);
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut removal = Cookie::from(COOKIE_NAME);
-    removal.set_path("/");
-    removal.set_same_site(same_site);
-    removal.set_secure(secure);
-    let jar = jar.remove(removal);
+    let jar = jar.remove(crate::auth::session_cookie(
+        String::new(),
+        &state.config.public_url,
+    ));
     Ok(jar)
 }
 

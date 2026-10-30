@@ -600,6 +600,7 @@ mod tests {
     #[tokio::test]
     async fn the_wipe_guard_refuses_a_pool_off_the_test_database() {
         if std::env::var("TEST_DATABASE_URL").is_err() {
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         }
         let on = test_pool().await;

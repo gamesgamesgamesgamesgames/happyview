@@ -26,10 +26,11 @@
 //! # Panics
 //!
 //! A module must panic by aborting. HappyView refuses at load any module that
-//! defines or imports an exception tag, because a frame that catches its own
-//! `throw` can erase the fuel it spent. Stable Rust on `wasm32-wasip1` already
-//! aborts and emits no exception handling; keep it that way by stating it in
-//! the module crate's profile, and never build it with `panic = "unwind"`:
+//! defines or imports an exception tag: a module's budget is fuel, and
+//! HappyView does not yet rely on fuel being charged across a caught `throw`.
+//! Stable Rust on `wasm32-wasip1` already aborts and emits no exception
+//! handling; keep it that way by stating it in the module crate's profile, and
+//! never build it with `panic = "unwind"`:
 //!
 //! ```toml
 //! [profile.release]

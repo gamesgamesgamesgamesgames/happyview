@@ -18,7 +18,7 @@ use common::{burn, echo_interpreter};
 macro_rules! require_echo {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };
@@ -1268,6 +1268,7 @@ async fn native_delete_collection_stops_on_cancelling_without_failing() {
         inherit_auth: false,
         api_client_id: None,
         dpop_key_id: None,
+        attempt: 1,
     };
 
     let outcome = happyview::jobs::native::delete_collection::run(&app.state, &job).await;
@@ -1316,6 +1317,7 @@ async fn native_delete_collection_stops_on_pausing_without_failing() {
         inherit_auth: false,
         api_client_id: None,
         dpop_key_id: None,
+        attempt: 1,
     };
 
     let outcome = happyview::jobs::native::delete_collection::run(&app.state, &job).await;

@@ -159,6 +159,11 @@ jobs:
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
+    env:
+      # A test whose database, fixture or interpreter is missing fails unless
+      # this is set. This job builds none of them on purpose, and e2e-tests
+      # and coverage run those tests with everything present, without it.
+      HAPPYVIEW_ALLOW_SKIPS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -169,10 +174,11 @@ jobs:
           shared-key: test
 
       # This job is deliberately database-free and fixture-free, so every test
-      # that loads a plugin module skips here and runs for real under
-      # `cargo test --tests` in e2e-tests. libtest captures the skip line of a
-      # passing test, so without this the log would not say which coverage the
-      # run left out. Reporting only: absent is the expected state here.
+      # that loads a plugin module skips here (HAPPYVIEW_ALLOW_SKIPS above) and
+      # runs for real under `cargo test --tests` in e2e-tests. libtest captures
+      # the skip line of a passing test, so without this the log would not say
+      # which coverage the run left out. Reporting only: absent is the
+      # expected state here.
       - name: Report unbuilt plugin fixtures
         run: bash scripts/check-plugin-fixtures.sh
 
@@ -292,17 +298,15 @@ jobs:
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
 
-      # This is the job where the fixture-loading tests are supposed to run,
-      # so here a missing module is a failure and not a skip. Without it a
-      # build that stopped producing one would leave those tests skipping
-      # inside a green run — quieter than the panic it replaced.
+      # This is the job where the fixture-loading tests are supposed to run.
+      # They fail on a missing module themselves; this names every missing
+      # one up front, before the suite fails on them test by test.
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
 
-      # Same reasoning for the interpreter: the targets that load it skip when
-      # it is absent, so a fetch that produced nothing would leave them
-      # skipping inside a green run — among them the three refusal messages an
-      # operator reads when a script will not save.
+      # The same for the interpreter, which the targets that load it need:
+      # among them the three refusal messages an operator reads when a script
+      # will not save.
       - name: Verify the Lua interpreter is present
         run: bash scripts/check-lua-plugin.sh --require
 
@@ -424,17 +428,15 @@ jobs:
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
 
-      # This is the job where the fixture-loading tests are supposed to run,
-      # so here a missing module is a failure and not a skip. Without it a
-      # build that stopped producing one would leave those tests skipping
-      # inside a green run — quieter than the panic it replaced.
+      # This is the job where the fixture-loading tests are supposed to run.
+      # They fail on a missing module themselves; this names every missing
+      # one up front, before the suite fails on them test by test.
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
 
-      # Same reasoning for the interpreter: the targets that load it skip when
-      # it is absent, so a fetch that produced nothing would leave them
-      # skipping inside a green run — among them the three refusal messages an
-      # operator reads when a script will not save.
+      # The same for the interpreter, which the targets that load it need:
+      # among them the three refusal messages an operator reads when a script
+      # will not save.
       - name: Verify the Lua interpreter is present
         run: bash scripts/check-lua-plugin.sh --require
 
@@ -497,8 +499,8 @@ jobs:
       - name: Build the library fixture
         run: bash scripts/build-plugin-fixtures.sh differential_library
 
-      # The target skips when either module is absent, and a skip here would
-      # read as the two runners agreeing.
+      # The target needs both modules, and a run without them would read as
+      # the two runners agreeing.
       - name: Verify the fixture and the interpreter are present
         run: |
           bash scripts/check-plugin-fixtures.sh --require differential_library
@@ -525,6 +527,12 @@ jobs:
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 45
+    # The interpreters, as in e2e-tests: a test that loads one fails without
+    # it, and this job runs every test.
+    env:
+      HAPPYVIEW_LUA_PLUGIN: ${{ github.workspace }}/lua-plugin
+      HAPPYVIEW_JAVASCRIPT_PLUGIN: ${{ github.workspace }}/quickjs-plugins/javascript-plugin
+      HAPPYVIEW_TYPESCRIPT_PLUGIN: ${{ github.workspace }}/quickjs-plugins/typescript-plugin
     services:
       postgres:
         image: postgres:16-alpine
@@ -569,6 +577,18 @@ jobs:
 
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
+
+      - name: Fetch the interpreter plugins
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-lua-plugin.sh lua-plugin
+          bash scripts/fetch-quickjs-plugins.sh quickjs-plugins
+
+      - name: Verify the interpreter plugins are present
+        run: |
+          set -euo pipefail
+          bash scripts/check-lua-plugin.sh --require
+          bash scripts/check-quickjs-plugins.sh --require
 
       - name: Run tests with coverage
         env:

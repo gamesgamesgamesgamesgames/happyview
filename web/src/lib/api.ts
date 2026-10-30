@@ -156,6 +156,14 @@ export type {
 
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
+/** One thing wrong with an uploaded lexicon, and where in the document. */
+export type LexiconIssue = {
+  /** A dotted path, e.g. `defs.main.record.properties.title`. */
+  path: string;
+  message: string;
+  severity: "error" | "warning";
+};
+
 export class ApiError extends Error {
   status: number;
   /**
@@ -163,10 +171,21 @@ export class ApiError extends Error {
    * `removed_globals`. Absent on every other error.
    */
   removedGlobals?: string[];
-  constructor(status: number, message: string, removedGlobals?: string[]) {
+  /**
+   * Per-field problems a refused lexicon upload named, from the response's
+   * `issues`. Absent on every other error.
+   */
+  lexiconIssues?: LexiconIssue[];
+  constructor(
+    status: number,
+    message: string,
+    removedGlobals?: string[],
+    lexiconIssues?: LexiconIssue[],
+  ) {
     super(message);
     this.status = status;
     this.removedGlobals = removedGlobals;
+    this.lexiconIssues = lexiconIssues;
   }
 }
 
@@ -193,16 +212,20 @@ async function apiFetch<T = unknown>(
     const text = await res.text().catch(() => res.statusText);
     let message = text;
     let removedGlobals: string[] | undefined;
+    let lexiconIssues: LexiconIssue[] | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
       if (Array.isArray(parsed.removed_globals)) {
         removedGlobals = parsed.removed_globals;
       }
+      if (Array.isArray(parsed.issues)) {
+        lexiconIssues = parsed.issues;
+      }
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message, removedGlobals);
+    throw new ApiError(res.status, message, removedGlobals, lexiconIssues);
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
@@ -236,7 +259,16 @@ export function uploadLexicon(body: {
   action?: string;
   token_cost?: number | null;
 }) {
-  return apiFetch<{ id: string; revision: number }>("/admin/lexicons", {
+  return apiFetch<{
+    id: string;
+    revision: number;
+    /**
+     * Warnings about a lexicon that was accepted anyway — a `subscription`,
+     * which stores and generates no endpoint, is the one that matters.
+     * Errors never reach here; they are an `ApiError`.
+     */
+    issues?: LexiconIssue[];
+  }>("/admin/lexicons", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -708,6 +740,16 @@ export function adminSpaceBlobUrl(id: string, cid: string) {
   return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
 }
 
+// Checks a collection's stored records against its accounts' PDSes. A dry
+// run only reports; otherwise the records the PDSes no longer hold are
+// deleted, through the delete hook.
+export function reconcileCollection(collection: string, dryRun: boolean) {
+  return apiFetch<{ job_id: string }>("/admin/records/collection/reconcile", {
+    method: "POST",
+    body: JSON.stringify({ collection, dry_run: dryRun }),
+  });
+}
+
 export function deleteCollectionRecords(collection: string) {
   return apiFetch<{ job_id: string }>(
     `/admin/records/collection?${new URLSearchParams({ collection })}`,
@@ -1125,10 +1167,10 @@ export function recheckApiClientAuthKey(id: string) {
   );
 }
 
-export function rotateApiClientAuthKey(id: string) {
+export function rotateApiClientAuthKey(id: string, immediate = false) {
   return apiFetch<KeyRotationResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
-    { method: "POST" },
+    { method: "POST", body: JSON.stringify({ immediate }) },
   );
 }
 
@@ -1152,9 +1194,10 @@ export function revokeAllApiClientAuthKeys(id: string) {
   );
 }
 
-export function rotateInstanceOauthKey() {
+export function rotateInstanceOauthKey(immediate = false) {
   return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
     method: "POST",
+    body: JSON.stringify({ immediate }),
   });
 }
 

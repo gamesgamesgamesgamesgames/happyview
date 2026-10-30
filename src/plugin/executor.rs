@@ -1168,6 +1168,12 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            lease_lost: input
+                .context
+                .job
+                .as_ref()
+                .and_then(|job| crate::jobs::held::current(&job.id))
+                .map(|held| held.lost),
             test: input.kind == ScriptKind::Test,
             language_id,
             extensions,
@@ -2058,9 +2064,11 @@ mod deadline {
         }
     }
 
-    /// Wasmtime 49 accepts exception handling, and a frame that catches a
-    /// `throw` resumes with a stale fuel counter, so fuel cannot stop a
-    /// guest that loops inside a catching frame; the epoch deadline can.
+    /// Wasmtime 49 accepts exception handling, and the epoch deadline stops
+    /// a guest that loops inside a frame catching its own throws. Fuel is
+    /// charged for that loop too (wasmtime 49.0.0 dropped it; 49.0.1 fixed
+    /// that), about 9 per iteration; a throw is slow enough that the deadline
+    /// arrives well before the fuel runs out.
     /// `cargo test --lib plugin::executor::deadline::a_guest -- --nocapture`
     /// prints the fuel the loop was charged.
     #[tokio::test]
@@ -2565,6 +2573,92 @@ mod interpreter {
             .expect_err("a spinning guest was allowed to run");
         assert!(matches!(err, ExecutionError::Timeout), "{err}");
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// An executor over the echo interpreter, and the state its runs write to.
+    async fn job_executor() -> (PluginExecutor, crate::AppState) {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register(fixture("interpreter")).await;
+        let executor = PluginExecutor::new(
+            Arc::new(WasmRuntime::new().unwrap()),
+            registry,
+            state.db.clone(),
+            DatabaseBackend::Sqlite,
+            reqwest::Client::new(),
+            Arc::new(LexiconCatalog::detached()),
+        )
+        .with_app_state(state.clone());
+        (executor, state)
+    }
+
+    /// A run of job `id`'s script `source` on `payload`.
+    fn job_input(id: &str, source: &str, payload: serde_json::Value) -> ScriptExecuteInput {
+        let mut input = directive(source);
+        input["kind"] = serde_json::json!("job");
+        input["context"]["job"] = serde_json::json!({ "id": id });
+        input["input"] = payload;
+        serde_json::from_value(input).unwrap()
+    }
+
+    fn a_lease(id: &str) -> crate::jobs::held::Held {
+        crate::jobs::held::Held::new(
+            id,
+            crate::jobs::db::Lease {
+                owner: "here".into(),
+                attempt: 1,
+            },
+        )
+    }
+
+    /// A run whose worker has already lost the job stops at its next host
+    /// import before the import acts: its log line is never written.
+    #[tokio::test]
+    async fn a_run_that_lost_its_lease_stops_before_its_next_import_acts() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, state) = job_executor().await;
+        let held = a_lease("job-1");
+        held.mark_lost();
+        let input = job_input("job-1", "host:script_log", serde_json::json!({}));
+        let out = crate::jobs::held::run_under(held, executor.execute_script("echo", &input)).await;
+
+        assert!(out.is_err(), "the run went on: {out:?}");
+        let (logged,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'script.log'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(logged, 0, "the import acted for a run that lost its job");
+    }
+
+    /// A lease lost during a host import stops the guest as soon as it
+    /// resumes, rather than letting it run on. The import is a progress write
+    /// whose fence fails (no row holds this lease), which is where the run
+    /// finds out: it passed the check on entry, and the guest is entered
+    /// again only to take the import's answer.
+    #[tokio::test]
+    async fn a_run_whose_lease_is_lost_during_an_import_stops_when_it_resumes() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, _state) = job_executor().await;
+        let held = a_lease("job-2");
+        let input = job_input(
+            "job-2",
+            "host:job_progress",
+            serde_json::json!({ "step": 1 }),
+        );
+        let out =
+            crate::jobs::held::run_under(held.clone(), executor.execute_script("echo", &input))
+                .await;
+
+        assert!(held.is_lost(), "the progress write did not find the loss");
+        assert!(out.is_err(), "the run went on to its end: {out:?}");
     }
 
     /// The same five imports on an instance with no run refuse rather than
