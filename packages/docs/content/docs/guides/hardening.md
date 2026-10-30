@@ -124,28 +124,28 @@ There is no destination allowlist in HappyView for this, and that is deliberate 
 
 ## Cross-site requests with the session cookie
 
-On an https instance the dashboard session cookie is `SameSite=None`, so that integrations on other sites can call the instance as the signed-in user. A browser therefore attaches it to a request any site starts, including a form another page submits. CORS stops that page from reading the answer, but not the request from running.
+The session cookie belongs to the instance's own dashboard. It is `SameSite=Lax`, `HttpOnly`, and `Secure` on https, so a browser sends it with requests the instance's pages make and with a top-level navigation to the instance (the OAuth sign-in callbacks arrive that way), and not with a request another site starts in the background. A navigation still carries it, so HappyView also checks where each request came from.
 
-So HappyView refuses a request that changes something (`POST`, `PUT`, `PATCH` or `DELETE`), carries the session cookie, and comes from another site. It answers `403`. A request is allowed when:
+**Outside `/admin`** (XRPC, `/external-auth`, `/api/setup`), the cookie counts only on a request from the instance's own pages: the browser marks it `Sec-Fetch-Site: same-origin`, or, from a browser too old to send that, its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md). Any other request carrying the cookie, including one with neither header, runs as anonymous. A link on another site can therefore never make a query script run as the signed-in admin. A third-party app calls these routes with DPoP or an API key instead.
+
+**On `/admin`**, a request that changes something (`POST`, `PUT`, `PATCH` or `DELETE`), carries the cookie and comes from another site is refused with `403`. It is allowed when:
 
 - the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
-- its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md);
+- its `Origin` is one of the instance's domains;
 - its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
 - or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
 
-A request that only reads (`GET`) is not refused, but on XRPC routes the same rule decides whether the cookie counts. A cross-site `GET` that carries the cookie runs as anonymous, so a query script never runs as the signed-in admin for a page on another site.
-
 Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
 
-If an integration calls the instance from another site with the cookie, list its origin once, as the scheme, host and port only:
+Because the cookie is `SameSite=Lax`, a browser on another site does not send it with a `fetch`. A listed origin is therefore useful only for a sibling on the same site (`app.example.com` beside `happyview.example.com`), and only on `/admin`. Set it as the scheme, host and port only:
 
 ```sh
 curl -X PUT "http://127.0.0.1:3000/admin/settings/cookie_integration_origins" \
   -H "$AUTH" -H "content-type: application/json" \
-  -d '{"value": "https://pentaract.example"}'
+  -d '{"value": "https://app.example.com"}'
 ```
 
-A value that is not a list of origins is refused with `400`. A listed origin is also allowed credentials by CORS, so it can send JSON requests and read the answers. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
+A value that is not a list of origins is refused with `400`. A listed origin is also allowed credentials by CORS. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
 
 ## A checklist
 

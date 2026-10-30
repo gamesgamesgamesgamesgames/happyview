@@ -7,13 +7,13 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use axum_extra::extract::cookie::{Cookie, Key, SignedCookieJar};
+use axum_extra::extract::cookie::{Key, SignedCookieJar};
 use rand::Rng;
 use serde::Deserialize;
 
 use crate::admin::auth::UserAuth;
 use crate::auth::COOKIE_NAME;
-use crate::auth::middleware::Claims;
+use crate::auth::middleware::PageClaims;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
@@ -53,7 +53,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn status(
-    _auth: Claims,
+    _auth: PageClaims,
     State(state): State<AppState>,
 ) -> Result<Json<service_identity::SetupStatus>, AppError> {
     let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;
@@ -530,19 +530,10 @@ async fn attach_auth_confirm(
         return Err(AppError::Auth("original_did is not a known user".into()));
     }
 
-    let secure = state.config.public_url.starts_with("https://");
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut session_cookie = Cookie::new(COOKIE_NAME, original_did);
-    session_cookie.set_path("/");
-    session_cookie.set_http_only(true);
-    session_cookie.set_same_site(same_site);
-    session_cookie.set_secure(secure);
-
-    let jar = jar.add(session_cookie);
+    let jar = jar.add(crate::auth::session_cookie(
+        original_did,
+        &state.config.public_url,
+    ));
 
     Ok((jar, StatusCode::NO_CONTENT))
 }

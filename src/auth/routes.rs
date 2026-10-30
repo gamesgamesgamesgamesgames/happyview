@@ -457,33 +457,22 @@ async fn callback(
     let redirect_url = redirect_url.unwrap_or(default_redirect);
     tracing::debug!(redirect_url = %redirect_url, "redirecting after callback");
 
-    // Set the session cookie
-    // Must use SameSite=None for cross-origin requests (e.g., Pentaract calling HappyView)
-    // Encode did and optional client_key separated by newline.
+    // Set the session cookie. Encode did and optional client_key separated by
+    // newline.
     let did_str = did.as_ref();
     let cookie_value = if let Some(ref ck) = client_key {
         format!("{did_str}\n{ck}")
     } else {
         did_str.to_string()
     };
-    let secure = is_https(&state.config.public_url);
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut session_cookie = Cookie::new(COOKIE_NAME, cookie_value);
-    session_cookie.set_path("/");
-    session_cookie.set_http_only(true);
-    session_cookie.set_same_site(same_site);
-    session_cookie.set_secure(secure);
+    let session_cookie = crate::auth::session_cookie(cookie_value, &state.config.public_url);
 
     // Remove the legacy redirect cookie if present (old cookie-based approach)
     let jar = if jar.get(LEGACY_REDIRECT_COOKIE).is_some() {
         let mut removal = Cookie::from(LEGACY_REDIRECT_COOKIE);
         removal.set_path("/");
-        removal.set_same_site(same_site);
-        removal.set_secure(secure);
+        removal.set_same_site(axum_extra::extract::cookie::SameSite::Lax);
+        removal.set_secure(is_https(&state.config.public_url));
         jar.add(session_cookie).remove(removal)
     } else {
         jar.add(session_cookie)
@@ -600,17 +589,10 @@ async fn logout(
         }
     }
 
-    let secure = is_https(&state.config.public_url);
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut removal = Cookie::from(COOKIE_NAME);
-    removal.set_path("/");
-    removal.set_same_site(same_site);
-    removal.set_secure(secure);
-    let jar = jar.remove(removal);
+    let jar = jar.remove(crate::auth::session_cookie(
+        String::new(),
+        &state.config.public_url,
+    ));
     Ok(jar)
 }
 
