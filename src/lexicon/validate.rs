@@ -28,16 +28,35 @@ const FIELD_TYPES: &[&str] = &[
     "params", "token", "ref", "union", "unknown",
 ];
 
-/// The types that define an endpoint or a collection. The spec allows these
-/// only as the `main` def.
-const PRIMARY_TYPES: &[&str] = &["record", "query", "procedure", "subscription"];
+/// The types that define an endpoint, a collection or a declaration. The
+/// spec allows these only as the `main` def.
+///
+/// `space` and `permission-set` belong here as much as the other four.
+/// `LexiconType::Space` is a first-class type HappyView serves, and
+/// `permission-set` is what `dev.happyview.adminFull` is — HappyView ships
+/// one in `src/auth/admin_permission_set.json` and expands them in
+/// `oauth::client_auth`. Leaving either out refused documents HappyView
+/// itself depends on.
+const PRIMARY_TYPES: &[&str] = &[
+    "record",
+    "query",
+    "procedure",
+    "subscription",
+    "space",
+    "permission-set",
+];
 
-/// The primary types HappyView actually does something with. A `subscription`
-/// is a valid lexicon the spec defines and `LexiconType` has no variant for,
-/// so one uploads, is stored, and generates nothing. Accepting it silently
-/// reads as support; the warning says what will happen instead. Remove it
-/// from here when subscriptions are served (GH #7).
-const SERVED_PRIMARY_TYPES: &[&str] = &["record", "query", "procedure"];
+/// The primary types HappyView stores and then does nothing with.
+///
+/// A `subscription` is a valid lexicon the spec defines and `LexiconType` has
+/// no variant for, so one uploads, is stored, and generates nothing.
+/// Accepting it silently reads as support; the warning says what will happen
+/// instead. Empty this when subscriptions are served (GH #7).
+///
+/// `permission-set` is deliberately *not* here: it generates no endpoint by
+/// design and HappyView reads it for scope expansion, so there is nothing to
+/// warn about.
+const UNSERVED_PRIMARY_TYPES: &[&str] = &["subscription"];
 
 /// How a record's rkey is chosen.
 const RECORD_KEYS: &[&str] = &["tid", "nsid", "any"];
@@ -186,7 +205,7 @@ pub fn validate(raw: &Value) -> Vec<Issue> {
                     format!("a '{kind}' may only be the 'main' def, not '{name}'"),
                 ));
             }
-            if !SERVED_PRIMARY_TYPES.contains(&kind) {
+            if UNSERVED_PRIMARY_TYPES.contains(&kind) {
                 issues.push(Issue::warning(
                     format!("{path}.type"),
                     format!(
@@ -315,10 +334,13 @@ fn primary(
             }
             for body in ["input", "output"] {
                 if kind == "query" && body == "input" {
+                    // The reference validator allows it, so this cannot be a
+                    // refusal without refusing published documents; it is
+                    // still worth saying, because the body is ignored.
                     if def.contains_key("input") {
-                        issues.push(Issue::error(
+                        issues.push(Issue::warning(
                             format!("{path}.input"),
-                            "a query takes no input body; use 'parameters'",
+                            "a query takes no input body, so this one is ignored;                              parameters go in 'parameters'",
                         ));
                     }
                     continue;
@@ -421,10 +443,19 @@ fn field(
                         continue;
                     };
                     if properties.is_some_and(|p| !p.contains_key(name)) {
-                        issues.push(Issue::error(
-                            format!("{list_path}[{i}]"),
-                            format!("'{name}' is not a property of this object"),
-                        ));
+                        let message = format!("'{name}' is not a property of this object");
+                        let path = format!("{list_path}[{i}]");
+                        // `required` naming a property that is not there
+                        // describes an object nothing can satisfy, so it is an
+                        // error. `nullable` naming one is merely redundant,
+                        // and the reference validator allows it, so refusing
+                        // it would refuse documents that are already
+                        // published.
+                        issues.push(if list == "required" {
+                            Issue::error(path, message)
+                        } else {
+                            Issue::warning(path, message)
+                        });
                     }
                 }
             }
@@ -460,10 +491,16 @@ fn field(
                 "a union must list the refs it accepts",
             )),
             Some(Value::Array(list)) => {
-                if list.is_empty() {
+                // An *open* union with no refs is deliberate and common:
+                // it means any `$type`, and upstream's own canonical
+                // lexicons use it (`tools.ozone.moderation.defs`,
+                // `tools.ozone.verification.defs`). Only a closed one
+                // accepting nothing describes nothing.
+                let closed = map.get("closed").and_then(Value::as_bool).unwrap_or(false);
+                if list.is_empty() && closed {
                     issues.push(Issue::warning(
                         format!("{path}.refs"),
-                        "a union accepting nothing matches nothing",
+                        "a closed union with no refs matches nothing",
                     ));
                 }
                 for (i, reference) in list.iter().enumerate() {
@@ -748,14 +785,6 @@ mod tests {
                 "defs.main.properties.a.properties.b.type: unknown lexicon type 'flote'",
             ),
             (
-                "a query with an input body",
-                json!({
-                    "lexicon": 1, "id": "com.example.thing",
-                    "defs": { "main": { "type": "query", "input": { "encoding": "application/json" } } }
-                }),
-                "defs.main.input: a query takes no input body; use 'parameters'",
-            ),
-            (
                 "parameters that are not params",
                 json!({
                     "lexicon": 1, "id": "com.example.thing",
@@ -923,5 +952,127 @@ mod tests {
                 "{kind} should not warn"
             );
         }
+    }
+
+    /// `space` and `permission-set` are primary types HappyView depends on:
+    /// `LexiconType::Space` is served, and `dev.happyview.adminFull` is a
+    /// permission set this repo ships. Refusing either refused documents
+    /// HappyView itself needs — including its own, and the `basic` project
+    /// fixture.
+    #[test]
+    fn space_and_permission_set_are_accepted_as_main() {
+        let space = json!({
+            "lexicon": 1,
+            "id": "com.example.project.space",
+            "defs": { "main": {
+                "type": "space",
+                "key": "any",
+                "name": "Project room",
+                "collections": ["com.example.project.thing"]
+            } }
+        });
+        assert_eq!(
+            errors(&space),
+            Vec::<String>::new(),
+            "{:?}",
+            validate(&space)
+        );
+        assert_eq!(
+            warnings(&space),
+            Vec::<String>::new(),
+            "{:?}",
+            validate(&space)
+        );
+
+        let set = json!({
+            "lexicon": 1,
+            "id": "dev.happyview.adminFull",
+            "defs": { "main": {
+                "type": "permission-set",
+                "title": "Admin",
+                "permissions": [{ "type": "rpc", "lxm": ["dev.happyview.admin.manage"], "aud": "*" }]
+            } }
+        });
+        assert_eq!(errors(&set), Vec::<String>::new(), "{:?}", validate(&set));
+        assert_eq!(
+            warnings(&set),
+            Vec::<String>::new(),
+            "a permission set generates no endpoint by design, so there is nothing to warn about"
+        );
+    }
+
+    /// They are primary types, so the main-only rule applies to them too.
+    #[test]
+    fn space_and_permission_set_may_only_be_main() {
+        for kind in ["space", "permission-set"] {
+            let raw = json!({
+                "lexicon": 1,
+                "id": "com.example.thing",
+                "defs": {
+                    "main": { "type": "object" },
+                    "other": { "type": kind }
+                }
+            });
+            let found = errors(&raw);
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.contains("may only be the 'main' def")),
+                "{kind}: {found:?}"
+            );
+        }
+    }
+
+    /// Two things the reference validator allows. Refusing them would refuse
+    /// documents already published, so they warn instead.
+    #[test]
+    fn what_the_reference_allows_warns_rather_than_refuses() {
+        let query_input = json!({
+            "lexicon": 1, "id": "com.example.thing",
+            "defs": { "main": { "type": "query", "input": { "encoding": "application/json" } } }
+        });
+        assert_eq!(errors(&query_input), Vec::<String>::new());
+        assert!(
+            warnings(&query_input)
+                .iter()
+                .any(|w| w.contains("a query takes no input body")),
+            "{:?}",
+            warnings(&query_input)
+        );
+
+        let nullable = json!({
+            "lexicon": 1, "id": "com.example.thing",
+            "defs": { "main": {
+                "type": "object",
+                "nullable": ["absent"],
+                "properties": { "present": { "type": "string" } }
+            } }
+        });
+        assert_eq!(errors(&nullable), Vec::<String>::new());
+        assert!(
+            warnings(&nullable)
+                .iter()
+                .any(|w| w.contains("'absent' is not a property")),
+            "{:?}",
+            warnings(&nullable)
+        );
+
+        // `required` stays an error: it describes an object nothing can
+        // satisfy, rather than a redundant line.
+        let required = json!({
+            "lexicon": 1, "id": "com.example.thing",
+            "defs": { "main": {
+                "type": "object",
+                "required": ["absent"],
+                "properties": { "present": { "type": "string" } }
+            } }
+        });
+        assert!(
+            errors(&required)
+                .iter()
+                .any(|e| e.contains("'absent' is not a property")),
+            "{:?}",
+            errors(&required)
+        );
     }
 }
