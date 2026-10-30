@@ -51,8 +51,9 @@ test.describe("Confidential OAuth client (domain)", () => {
     // The key set is served by reference, so an authorization server that
     // meets an unfamiliar kid can fetch it again (HAP-238).
     expect(domainMetadata.jwks).toBeUndefined();
+    // Next to the document it is named in, on whichever origin served it.
     expect(domainMetadata.jwks_uri).toBe(
-      `${DOMAIN_URL}/oauth/clients/instance/jwks.json`,
+      `${new URL(domainMetadata.client_id).origin}/oauth/clients/instance/jwks.json`,
     );
     const domainJwksResp = await page.request.get(
       new URL(domainMetadata.jwks_uri).pathname,
