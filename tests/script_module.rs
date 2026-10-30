@@ -27,7 +27,7 @@ const SOURCE: &str = "tests/fixtures/script_module/src/lib.rs";
 macro_rules! require_fixture {
     ($path:expr, $build:literal) => {
         if !std::path::Path::new($path).exists() {
-            eprintln!(concat!("skipping: fixture not built. Run: ", $build));
+            happyview::test_support::unavailable(concat!("fixture not built. Run: ", $build));
             return;
         }
     };
@@ -504,6 +504,7 @@ async fn a_query_reaches_the_module_through_the_xrpc_router() {
         root,
         happyview::project::build::BuildOptions {
             include_tests: false,
+            ..Default::default()
         },
     )
     .await

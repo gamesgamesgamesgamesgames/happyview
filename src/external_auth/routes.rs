@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::auth::Claims;
+use crate::auth::middleware::PageClaims;
 use crate::error::AppError;
 use crate::external_auth::refresh::{RefreshError, RefreshOutcome, ensure_fresh_tokens};
 use crate::external_auth::{state, tokens};
@@ -58,7 +58,7 @@ async fn list_providers(
 
 async fn list_accounts(
     State(app_state): State<AppState>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<Vec<tokens::LinkedAccountSummary>>, AppError> {
     let accounts = tokens::list_linked_accounts(&app_state.db, app_state.db_backend, claims.did())
         .await
@@ -77,7 +77,7 @@ async fn authorize(
     Path(plugin_id): Path<String>,
     Query(query): Query<AuthorizeQuery>,
     domain: Option<axum::extract::Extension<std::sync::Arc<crate::domain::Domain>>>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let _plugin = app_state
         .plugin_registry
@@ -280,7 +280,7 @@ struct ConnectConfigBody {
 async fn connect_with_config(
     State(app_state): State<AppState>,
     Path(plugin_id): Path<String>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
     Json(body): Json<ConnectConfigBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_did = claims.did();
@@ -368,7 +368,7 @@ async fn connect_with_config(
 async fn unlink(
     State(app_state): State<AppState>,
     Path(plugin_id): Path<String>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_did = claims.did();
 
@@ -391,7 +391,7 @@ async fn unlink(
 async fn refresh(
     State(app_state): State<AppState>,
     Path(plugin_id): Path<String>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let outcome = ensure_fresh_tokens(&app_state, claims.did(), &plugin_id)
         .await

@@ -18,11 +18,11 @@ use happyview::project::snapshot::{ProjectModule, ProjectScript, ProjectSnapshot
 
 async fn app() -> Option<TestApp> {
     if std::env::var("TEST_DATABASE_URL").is_err() {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
         return None;
     }
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return None;
     }
     let app = TestApp::new().await;

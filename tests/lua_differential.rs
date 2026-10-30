@@ -3,7 +3,7 @@
 //! it is what lets the native `validate_script` retire with evidence rather
 //! than with hope. It stays until `src/lua/` is deleted.
 //!
-//! `#[ignore]`-gated because it runs 118 scripts through two interpreters. The
+//! `#[ignore]`-gated because it runs 119 scripts through two interpreters. The
 //! separate claim that the plugin loads and runs at all lives in
 //! `tests/lua_interpreter_plugin.rs`, which is not ignored.
 //!
@@ -626,7 +626,7 @@ async fn the_transcript_keeps_an_integer_apart_from_a_float() {
 }
 
 #[tokio::test]
-#[ignore = "runs 118 scripts through two interpreters; needs HAPPYVIEW_LUA_PLUGIN"]
+#[ignore = "runs 119 scripts through two interpreters; needs HAPPYVIEW_LUA_PLUGIN"]
 async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     common::require_db!();
     let Some(dir) = plugin_dir() else { return };

@@ -269,18 +269,16 @@ impl UserAuth {
     }
 }
 
-/// An app's DPoP session, or a service-auth JWT, reaches the admin API only
-/// with the grant `auth::admin_scope` describes. A cookie is the dashboard's
-/// and needs none.
+/// An app's DPoP session reaches the admin API only with the grant
+/// `auth::admin_scope` describes, and a service-auth JWT never does. A cookie
+/// is the dashboard's and needs none.
 async fn require_admin_grant(state: &AppState, claims: &Claims) -> Result<(), AppError> {
-    if let Some(lxm) = claims.service_auth_lxm() {
-        if lxm != Some(admin_scope::ADMIN_LXM) {
-            return Err(AppError::Forbidden(format!(
-                "a service-auth token must be bound to {} to use the admin API",
-                admin_scope::ADMIN_LXM
-            )));
-        }
-        return Ok(());
+    if claims.service_auth_lxm().is_some() {
+        return Err(AppError::Forbidden(
+            "the admin API does not accept service-auth tokens; sign in with an app granted \
+             dev.happyview.adminFull, or use an API key"
+                .into(),
+        ));
     }
 
     let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {

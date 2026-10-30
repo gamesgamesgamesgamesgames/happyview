@@ -122,6 +122,31 @@ The consequence worth internalising: **the PDS will mint an identity-bearing ass
 
 There is no destination allowlist in HappyView for this, and that is deliberate — the decision of whether to sign for a given audience belongs to the party holding the key, which is the PDS. What *is* in your hands is who gets to make such a request at all: registering a third-party API client is the act that grants it. Register clients deliberately, and scope them as above.
 
+## Cross-site requests with the session cookie
+
+The session cookie belongs to the instance's own dashboard. It is `SameSite=Lax`, `HttpOnly`, and `Secure` on https, so a browser sends it with requests the instance's pages make and with a top-level navigation to the instance (the OAuth sign-in callbacks arrive that way), and not with a request another site starts in the background. A navigation still carries it, so HappyView also checks where each request came from.
+
+**Outside `/admin`** (XRPC, `/external-auth`, `/api/setup`), the cookie counts only on a request from the instance's own pages: the browser marks it `Sec-Fetch-Site: same-origin`, or, from a browser too old to send that, its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md). Any other request carrying the cookie, including one with neither header, runs as anonymous. A link on another site can therefore never make a query script run as the signed-in admin. A third-party app calls these routes with DPoP or an API key instead.
+
+**On `/admin`**, a request that changes something (`POST`, `PUT`, `PATCH` or `DELETE`), carries the cookie and comes from another site is refused with `403`. It is allowed when:
+
+- the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
+- its `Origin` is one of the instance's domains;
+- its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
+- or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
+
+Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
+
+Because the cookie is `SameSite=Lax`, a browser on another site does not send it with a `fetch`. A listed origin is therefore useful only for a sibling on the same site (`app.example.com` beside `happyview.example.com`), and only on `/admin`. Set it as the scheme, host and port only:
+
+```sh
+curl -X PUT "http://127.0.0.1:3000/admin/settings/cookie_integration_origins" \
+  -H "$AUTH" -H "content-type: application/json" \
+  -d '{"value": "https://app.example.com"}'
+```
+
+A value that is not a list of origins is refused with `400`. A listed origin is also allowed credentials by CORS. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
+
 ## A checklist
 
 - [ ] Every API client registered with granular scopes, or a permission set, rather than `transition:generic`
@@ -130,6 +155,7 @@ There is no destination allowlist in HappyView for this, and that is deliberate 
 - [ ] XRPC proxy set explicitly — allowlist if you can enumerate your NSIDs, disabled if you serve only your own
 - [ ] Linked-repo grants scoped before the invite goes out, not after
 - [ ] Third-party API clients reviewed: each one can ask the PDS to sign for an audience of its choosing
+- [ ] `cookie_integration_origins` lists only sites you control
 - [ ] Database backups cover `happyview_oauth_client_keys` — losing a row there permanently destroys every session pinned to it
 
 ## Related

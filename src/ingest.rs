@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -694,6 +694,71 @@ async fn delete_hook(
     }
 }
 
+/// How often an ignored keep-on-delete is reported per collection, unless
+/// verbose event logging reports each one.
+const IGNORED_KEEP_EVERY: Duration = Duration::from_secs(3600);
+
+/// When each collection last reported an ignored keep-on-delete, and how many
+/// it has ignored since.
+#[derive(Default)]
+pub struct IgnoredKeeps(std::sync::Mutex<HashMap<String, (Instant, u64)>>);
+
+impl IgnoredKeeps {
+    /// Counts one ignored keep of `collection` at `now`. Answers how many to
+    /// report, this one included, when a report is due.
+    pub fn note(&self, collection: &str, now: Instant) -> Option<u64> {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((last, since)) = seen.get_mut(collection)
+            && now.duration_since(*last) < IGNORED_KEEP_EVERY
+        {
+            *since += 1;
+            return None;
+        }
+        let ignored = seen.get(collection).map_or(0, |(_, since)| *since) + 1;
+        seen.insert(collection.to_string(), (now, 0));
+        Some(ignored)
+    }
+}
+
+/// A delete hook returned nil, asking to keep a record the storage that
+/// claims it has deleted. It can't be kept, and a script written to keep
+/// deleted records would otherwise lose them silently, so this warns: each
+/// time under verbose event logging, else once an hour per collection with
+/// how many were ignored.
+async fn report_ignored_keep(state: &AppState, ev: &RecordEvent, uri: &str) {
+    let ignored = if state.verbose_event_logging.load(Ordering::Relaxed) {
+        1
+    } else {
+        match state.ignored_keeps.note(&ev.key.collection, Instant::now()) {
+            Some(ignored) => ignored,
+            None => return,
+        }
+    };
+    tracing::warn!(
+        collection = %ev.key.collection,
+        ignored,
+        "a delete hook asked to keep a record its storage deleted; it is gone"
+    );
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "record.skip_ignored".to_string(),
+            severity: Severity::Warn,
+            actor_did: None,
+            subject: Some(uri.to_string()),
+            detail: serde_json::json!({
+                "collection": ev.key.collection,
+                "did": ev.key.did,
+                "rkey": ev.key.rkey,
+                "ignored": ignored,
+                "reason": "script returned nil for a record deleted from the store that holds it",
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+}
+
 /// A record event for a collection an external storage claims. Its body is
 /// already in that storage (`stored`); the hook runs as for a local record
 /// and only its result is written, as a delta on this instance's view:
@@ -753,26 +818,8 @@ async fn apply_claimed(
             }
         }
         Action::Delete => {
-            if delete_hook(state, ev, &uri, hook).await == RecordHookOutcome::Skip
-                && state.verbose_event_logging.load(Ordering::Relaxed)
-            {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "record.skip_ignored".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(uri.clone()),
-                        detail: serde_json::json!({
-                            "collection": ev.key.collection,
-                            "did": ev.key.did,
-                            "rkey": ev.key.rkey,
-                            "reason": "script returned nil for a record deleted from the store that holds it",
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+            if delete_hook(state, ev, &uri, hook).await == RecordHookOutcome::Skip {
+                report_ignored_keep(state, ev, &uri).await;
             }
             (Delta::Proceed, IngestOutcome::Matched)
         }
@@ -1318,5 +1365,28 @@ async fn repo_resynced(
             tracing::warn!(did, error = %e, "failed to purge a resynced repo");
             Applied::failed(&e)
         }
+    }
+}
+
+#[cfg(test)]
+mod ignored_keep_tests {
+    use std::time::{Duration, Instant};
+
+    use super::IgnoredKeeps;
+
+    #[test]
+    fn an_ignored_keep_is_reported_once_an_hour_per_collection_with_a_count() {
+        let keeps = IgnoredKeeps::default();
+        let start = Instant::now();
+        assert_eq!(keeps.note("app.a", start), Some(1));
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(60)), None);
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(3599)), None);
+        assert_eq!(keeps.note("app.b", start), Some(1), "each collection apart");
+        assert_eq!(
+            keeps.note("app.a", start + Duration::from_secs(3600)),
+            Some(3),
+            "the two held back, and this one"
+        );
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(3601)), None);
     }
 }

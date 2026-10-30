@@ -201,6 +201,27 @@ pub(crate) async fn set_stage(state: &JobState, job_id: &str, stage: &str) {
     );
 }
 
+pub(crate) async fn set_note(state: &JobState, job_id: &str, note: &str) {
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET note = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "note", || {
+        happyview_provider::db::query(&sql)
+            .bind(note)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        types::BackfillEvent::JobNote {
+            job_id: job_id.to_string(),
+            note: note.to_string(),
+        },
+    );
+}
+
 pub(crate) async fn update_job_counter(state: &JobState, job_id: &str, column: &str, value: i32) {
     let query = match column {
         "total_repos" => "UPDATE happyview_backfill_jobs SET total_repos = ? WHERE id = ?",

@@ -29,7 +29,7 @@ const TYPE: &str = "test.probe";
 macro_rules! require_echo {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };
@@ -568,9 +568,9 @@ async fn install_caller_library(app: &TestApp) -> bool {
     ))
     .await
     else {
-        eprintln!(
-            "skipping: sdk_caller fixture not built. Run: cargo build --manifest-path \
-             tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release"
+        happyview::test_support::unavailable(
+            "sdk_caller fixture not built. Run: cargo build --manifest-path \
+             tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release",
         );
         return false;
     };

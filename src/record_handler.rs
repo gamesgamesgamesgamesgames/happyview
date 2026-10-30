@@ -374,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn identical_redelivery_is_a_no_op_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -431,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_edit_is_restamped_by_the_identical_echo_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn an_older_rev_never_overwrites_a_newer_one_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -945,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_leaves_a_tombstone_that_blocks_resurrection_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1053,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_with_no_row_still_tombstones_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1127,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn an_unversioned_delete_tombstones_the_stored_rev_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1158,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_waits_for_a_concurrent_tombstone_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1464,7 +1464,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_postgres_cannot_store_is_invalid() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if state.db_backend != crate::db::DatabaseBackend::Postgres {

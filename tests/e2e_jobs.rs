@@ -18,7 +18,7 @@ use common::{burn, echo_interpreter};
 macro_rules! require_echo {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };

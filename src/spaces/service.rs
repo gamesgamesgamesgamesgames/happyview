@@ -1184,7 +1184,7 @@ mod tests {
     macro_rules! require_test_db {
         () => {
             if std::env::var("TEST_DATABASE_URL").is_err() {
-                eprintln!("skipped (TEST_DATABASE_URL not set)");
+                crate::test_support::unavailable(crate::test_support::NO_DATABASE);
                 return;
             }
         };
