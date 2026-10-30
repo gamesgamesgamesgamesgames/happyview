@@ -654,7 +654,7 @@ export default function DeadLettersPage() {
                       onClick={() => handleDetailAction("retry")}
                     >
                       <RotateCcw className="mr-1 size-3.5" />
-                      Retry Hook
+                      Retry
                     </Button>
                     <Button
                       size="sm"
