@@ -330,6 +330,18 @@ summaries in the pull request. The storage settings it exercises
 `bash scripts/check-plugin-fixtures.sh --require` names every fixture
 artefact that is missing, before a run rather than test by test.
 
+A few targets read a fixture directly rather than through that check,
+`external_storage` among them, where an unbuilt `test_library` panics eleven
+tests at once without naming the fix. If a run fails in a way you cannot
+explain, build the fixtures first:
+
+```bash
+bash scripts/build-plugin-fixtures.sh
+```
+
+That is also what a fresh worktree needs, having no fixture artefacts at all
+until you build them.
+
 `scripts/build-plugin-fixtures.sh` can fail in a worktree created inside the
 main checkout (for example under `.worktrees/`) with "current package believes
 it's in a workspace when it's not". Cargo walks up from a fixture and finds the
