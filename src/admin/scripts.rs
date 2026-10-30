@@ -225,6 +225,20 @@ pub(super) async fn list(
     Ok(Json(scripts))
 }
 
+/// `GET /admin/scripts/languages` — the languages a script can be written
+/// in here: those the installed interpreters claim, sorted. It is what a save
+/// accepts, so the editor offers that and nothing else. No trigger id lacks a
+/// colon, so the path can't shadow a script.
+pub(super) async fn languages(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<Vec<String>>, AppError> {
+    auth.require(Permission::ScriptsRead).await?;
+    let mut languages: Vec<String> = installed_languages(&state).await.into_iter().collect();
+    languages.sort();
+    Ok(Json(languages))
+}
+
 /// `GET /admin/scripts/{id}` — fetch one row.
 pub(super) async fn get(
     State(state): State<AppState>,

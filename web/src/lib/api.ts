@@ -36,6 +36,7 @@ import type { EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
   Script,
+  ScriptLanguage,
   UpsertScriptBody,
   PatchScriptBody,
   CodemodResult,
@@ -1496,6 +1497,11 @@ export function getScripts(opts?: { suffix?: string }) {
   if (opts?.suffix) params.set("suffix", opts.suffix);
   const qs = params.toString();
   return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`);
+}
+
+/** The languages a script can be written in: the installed interpreters'. */
+export function getScriptLanguages() {
+  return apiFetch<ScriptLanguage[]>("/admin/scripts/languages");
 }
 
 export function getEditorDeclarations(language: string) {

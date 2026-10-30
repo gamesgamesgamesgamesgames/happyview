@@ -183,6 +183,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/script-variables/{key}", delete(script_variables::delete))
         .route("/editor/declarations", get(editor::declarations))
         .route("/scripts", get(scripts::list).post(scripts::upsert))
+        .route("/scripts/languages", get(scripts::languages))
         .route(
             "/scripts/{id}",
             get(scripts::get)

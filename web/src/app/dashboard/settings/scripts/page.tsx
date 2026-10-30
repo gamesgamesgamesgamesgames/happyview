@@ -23,6 +23,7 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
 import { deleteScript, getScripts } from "@/lib/api";
+import { languageLabel } from "@/lib/script-templates";
 import type { Script } from "@/types/scripts";
 import {
   TRIGGER_FAMILY_LABELS,
@@ -211,6 +212,17 @@ export default function ScriptsPage() {
               Needs migration
             </Badge>
           ) : null,
+        enableSorting: true,
+      },
+      {
+        id: "language",
+        accessorFn: (row) => languageLabel(row.script_type),
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Language" />
+        ),
+        cell: ({ getValue }) => (
+          <span className="text-sm">{getValue<string>()}</span>
+        ),
         enableSorting: true,
       },
       {

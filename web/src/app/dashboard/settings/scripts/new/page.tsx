@@ -12,10 +12,15 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { getLexicons, isUnmigratedRefusal, upsertScript } from "@/lib/api";
+import {
+  getLexicons,
+  getScriptLanguages,
+  isUnmigratedRefusal,
+  upsertScript,
+} from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
-import { defaultBodyFor } from "@/lib/lua-templates";
-import type { TriggerKind } from "@/types/scripts";
+import { defaultBodyFor, defaultLanguage } from "@/lib/script-templates";
+import type { ScriptLanguage, TriggerKind } from "@/types/scripts";
 import { parseTriggerId } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -39,6 +44,7 @@ import {
   composeTriggerId,
   isValidJobType,
   scriptsReturnHref,
+  withLanguage,
 } from "../script-form";
 
 function NewScriptInner() {
@@ -46,21 +52,27 @@ function NewScriptInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [state, setState] = useState<ScriptFormState>(() =>
-    initialState(searchParams),
+    initialState(searchParams, "lua"),
   );
   // The Lexicon picker is sourced from /admin/lexicons; we render the
   // form even if the call fails (the operator can still pick "Actor"
   // and create a labeler.apply:_actor script).
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
   const [lexiconsLoading, setLexiconsLoading] = useState(true);
+  // What the installed interpreters can run. Until it arrives, or if it
+  // can't be read, the form offers Lua alone, as it did before there was a
+  // choice; the server still refuses a language nothing installed claims.
+  const [languages, setLanguages] = useState<ScriptLanguage[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refused, setRefused] = useState(false);
   const returnHref = scriptsReturnHref(searchParams);
 
   // If the URL changes (e.g. user navigates with new ?id=...), refresh state.
+  // The language carries over: it was picked from what is installed, which
+  // the URL says nothing about.
   useEffect(() => {
-    setState(initialState(searchParams));
+    setState((s) => initialState(searchParams, s.language));
   }, [searchParams]);
 
   useEffect(() => {
@@ -70,11 +82,25 @@ function NewScriptInner() {
       .finally(() => setLexiconsLoading(false));
   }, []);
 
+  useEffect(() => {
+    getScriptLanguages()
+      .then((installed) => {
+        setLanguages(installed);
+        // Lua is the starting language only while it is installed.
+        setState((s) =>
+          installed.length === 0 || installed.includes(s.language)
+            ? s
+            : withLanguage(s, defaultLanguage(installed)),
+        );
+      })
+      .catch(() => setLanguages([]));
+  }, []);
+
   const isDirty = useMemo(() => {
     return (
       state.suffix !== "" ||
       state.description !== "" ||
-      state.body !== defaultBodyFor(state.kind)
+      state.body !== defaultBodyFor(state.kind, state.language)
     );
   }, [state]);
 
@@ -113,6 +139,7 @@ function NewScriptInner() {
       const id = composeTriggerId(state);
       await upsertScript({
         id,
+        script_type: state.language,
         body: state.body,
         description: state.description.trim() || null,
       });
@@ -190,6 +217,7 @@ function NewScriptInner() {
             onChange={setState}
             lexicons={lexicons}
             lexiconsLoading={lexiconsLoading}
+            languages={languages}
           />
         </div>
         <footer className="bg-sidebar-accent flex justify-between gap-2 px-4 py-2 md:px-6 md:py-4 rounded-b-md">
@@ -245,7 +273,10 @@ export default function NewScriptPage() {
   );
 }
 
-function initialState(searchParams: URLSearchParams): ScriptFormState {
+function initialState(
+  searchParams: URLSearchParams,
+  language: ScriptLanguage,
+): ScriptFormState {
   // Optional `?id=record.create:<nsid>` pre-fills the form — the lexicon
   // detail page links here with a candidate trigger id.
   const presetId = searchParams.get("id");
@@ -258,7 +289,8 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
         suffix: parsed.suffix,
         source: isJob ? JOB_SOURCE : parsed.suffix,
         description: "",
-        body: defaultBodyFor(parsed.kind),
+        body: defaultBodyFor(parsed.kind, language),
+        language,
       };
     }
   }
@@ -274,6 +306,7 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
     suffix: isJob ? "" : (searchParams.get("suffix") ?? ""),
     source: isJob ? JOB_SOURCE : source,
     description: "",
-    body: defaultBodyFor(resolvedKind),
+    body: defaultBodyFor(resolvedKind, language),
+    language,
   };
 }

@@ -1,5 +1,3 @@
-import type { TriggerKind } from "@/types/scripts";
-
 import jobBody from "./lua-templates/job.lua";
 import recordEventBody from "./lua-templates/record-event.lua";
 import triggerBody from "./lua-templates/trigger.lua";
@@ -37,19 +35,3 @@ export const DEFAULT_JOB_SCRIPT_BODY: string = jobBody;
  * envelope in place of every record; this body returns the record itself.
  */
 export const DEFAULT_RECORD_SCRIPT_BODY: string = recordEventBody;
-
-/** The body the new-script form prefills for a trigger kind. */
-export function defaultBodyFor(kind: TriggerKind): string {
-  if (kind === "job.run") return DEFAULT_JOB_SCRIPT_BODY;
-  if (kind.startsWith("record.")) return DEFAULT_RECORD_SCRIPT_BODY;
-  return DEFAULT_SCRIPT_BODY;
-}
-
-/** Whether `body` is still one of the prefills, untouched by the operator. */
-export function isDefaultBody(body: string): boolean {
-  return (
-    body === DEFAULT_SCRIPT_BODY ||
-    body === DEFAULT_JOB_SCRIPT_BODY ||
-    body === DEFAULT_RECORD_SCRIPT_BODY
-  );
-}

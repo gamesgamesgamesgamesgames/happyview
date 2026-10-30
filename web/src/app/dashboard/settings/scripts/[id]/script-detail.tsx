@@ -66,6 +66,7 @@ export default function ScriptDetail() {
           id: s.id,
           description: s.description,
           body: s.body,
+          language: s.script_type,
         });
         setState(next);
         setOriginal(next);
@@ -280,7 +281,6 @@ export default function ScriptDetail() {
             onChange={setState}
             idLocked
             readOnly={projectPath !== null}
-            language={script?.script_type}
           />
         </div>
 

@@ -13,6 +13,10 @@ const nextConfig: NextConfig = {
       // Editor templates are kept as Lua files, imported as plain strings,
       // so a Rust test can parse the same source the editor prefills.
       "*.lua": { loaders: ["./scripts/lua-source-loader.js"], as: "*.js" },
+      // The JavaScript and TypeScript starters, kept as `.js.txt` and
+      // `.ts.txt` so neither the bundler nor the type checker reads them as
+      // code of this app's own.
+      "*.txt": { loaders: ["./scripts/lua-source-loader.js"], as: "*.js" },
     },
   },
 };
