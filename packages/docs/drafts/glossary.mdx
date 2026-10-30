@@ -1,0 +1,242 @@
+---
+title: Glossary
+description: The words HappyView v3 uses, and what each one means here.
+---
+
+## Scripts and plugins
+
+### Script
+
+Code that runs on your instance when something happens: an XRPC query or
+procedure is called, a record or label arrives, or a job runs. Every script
+defines `handle(input, ctx)`. `input` is what the trigger passes (a query's
+parameters, a procedure's body, the record event). `ctx` carries the caller
+and the run's context. A script loads what it needs with `require`. Scripts
+are written in a language an installed [interpreter](#interpreter) runs: Lua,
+JavaScript or TypeScript.
+
+v2's script globals (`db`, `Record`, `params` and 29 others) are gone in v3.
+See [Migrating scripts to v3](/guides/migrating-scripts).
+
+### Interpreter
+
+A [plugin](#plugin) that runs scripts in one language. HappyView ships
+without one, so until you install one, no script can be saved or run. The
+official interpreters are `happyview-lua`, `happyview-javascript` and
+`happyview-typescript`. Each claims a language ID (`lua`, `javascript`,
+`typescript`); a script runs on the interpreter that claims its language.
+
+### Library
+
+A [plugin](#plugin) that gives scripts an API, loaded with `require`:
+`require("happyview.db")` for querying records, for example. Libraries are
+installed separately from interpreters, and an interpreter declares which
+libraries it supports. The `internal.` namespace (`internal.json`,
+`internal.logging` and so on) is reserved for modules the
+[interpreter](#interpreter) provides itself.
+
+### Plugin
+
+A WebAssembly module that extends HappyView. There are three types:
+[interpreters](#interpreter), [libraries](#library) and **auth** plugins,
+which link accounts on other platforms. A plugin's manifest must declare
+`api_version` `"2"` and list its [capabilities](#capability); HappyView refuses
+anything else. You install plugins from the [registry](#registry), from a URL,
+or from a file.
+
+### Capability
+
+Something a [plugin](#plugin) is allowed to do, such as `records:read`,
+`network:request` or `secrets:read`. A plugin's manifest lists the
+capabilities it needs. HappyView checks that list against what the plugin's
+code actually imports, refuses a plugin that imports more than it declares, and
+shows you the list to approve when you install it. Each capability carries a
+risk level, from low to critical.
+
+## Getting plugins
+
+### Registry
+
+Where HappyView finds plugins to install. The registry is a set of
+`software.release` atproto records: a **project** per plugin
+(`software.release.project`), with its **versions** (`software.release.version`).
+A project is named by its publisher's DID plus a name, for example `happyview-lua`.
+HappyView reads the registry at `https://api.happyproto.at` and refreshes its
+catalogue every 15 minutes. `PLUGIN_REGISTRY_URL` points it elsewhere, or `off`
+turns the catalogue off.
+
+A registry install is checked by CID: HappyView fetches the plugin's manifest
+and module from the registry, refuses any bytes whose CID doesn't match, and
+fetches them again at every startup and reload. Updates only ever come from
+the publisher you installed from.
+
+### Channel
+
+A line of releases a registry [project](#registry) publishes: `latest` for
+releases, `beta` and `alpha` for prereleases. An install follows a channel,
+and is offered the next version on it, unless you pin it to one version.
+During the v3 alpha, the official interpreters are published on `alpha` only.
+
+### Lifecycle state
+
+What a publisher says about a version: `active` or `deprecated` (both
+installable), or `unavailable` or `retired` (not installable). A plugin whose
+version is retired after you install it keeps running; the dashboard marks it
+with the publisher's reason.
+
+## Building an app
+
+### Project
+
+An app kept as files instead of built in the dashboard: its lexicons and
+scripts under `src/`, its interpreters and libraries in `happyview.toml`, and
+the exact plugin versions in `happyview.lock`. Run a project locally with
+`hpy happyview dev`, check it with `check`, test it with `test`, and deploy it
+to an instance with `hpy happyview deploy`. Deploying needs the
+`project:deploy` permission. HappyView also runs a project directly when
+`HAPPYVIEW_PROJECT` points at its directory.
+
+### hpy
+
+HappyProto's command-line tool.
+
+- `hpy happyview` builds HappyView apps: `create`, `dev`, `add`, `build`,
+  `check`, `test`, `types`, then `login`, `deploy`, `logout` and `whoami` for
+  instances.
+- `hpy registry` signs in to the registry and publishes plugins to it:
+  `plugin init`, `publish`, `status` and `lifecycle`.
+- `hpy update` and `hpy channel` keep hpy itself up to date.
+
+## Access
+
+### Permission
+
+One thing a dashboard user or API key may do, such as `lexicons:publish` or
+`scripts:manage`. A user holds any mix of them, often starting from a
+[template](#template). The full list is under [Permissions](#permissions).
+
+### Template
+
+A starting set of [permissions](#permission) for a new user: **Viewer**,
+**Operator**, **Manager** or **Full Access**. Each includes everything in the
+one before it.
+
+### Super user
+
+The instance's owner. The super user holds every permission and can't be
+restricted, and is the only user who can hand ownership to someone else.
+
+### Permission set
+
+An atproto OAuth permission set that an app asks for at sign-in to use an
+instance's admin API. HappyView's is `dev.happyview.adminFull` ("Manage your
+HappyView instances"), which grants `rpc` on `dev.happyview.admin.manage`. An app
+holding it acts with the permissions the signed-in user already has on that
+instance, never more. `hpy` signs in with it.
+
+## Records
+
+### Record provider
+
+Where an instance's records come from and where they're kept. A provider is a
+**record source**, a **record storage**, or both. Both are traits in the open
+`happyview-provider` crate. A stock instance uses the built-in Jetstream source
+and keeps everything in its own database.
+
+### Record source
+
+What finds records on the network and hands them to HappyView. The built-in one
+is Jetstream, which also runs backfills.
+
+### Record storage
+
+Where the records of the collections it claims are kept, outside the instance's
+own database. HappyView still runs record scripts, serves reads and handles
+writes for those collections. If the storage can't be reached, record reads
+answer `503` "the record store is unavailable" rather than an empty result.
+
+### Network store
+
+HappyProto's hosted instances share one copy of public network records,
+through a record source and storage of HappyProto's own. If you run HappyView
+yourself, it doesn't apply to you.
+
+## Permissions
+
+{/* BEGIN generated: permissions (generate-permissions.mjs) */}
+
+HappyView has **52 permissions**. A user holds any mix of them; the four built-in templates are starting points. Each template includes everything in the one before it: **Viewer** (10), **Operator** (14), **Manager** (41) and **Full Access** (all 52). The super user holds every permission and can't be restricted.
+
+| Permission | What it allows | Lowest template that grants it |
+|---|---|---|
+| **Lexicons** | | |
+| `lexicons:create` | Upload and register new lexicon schemas | Manager |
+| `lexicons:read` | View registered lexicon schemas | Viewer |
+| `lexicons:delete` | Remove lexicon schemas | Manager |
+| `lexicons:publish` | Publish lexicons to the network and manage publishing rules | Manager |
+| **Records** | | |
+| `records:read` | Browse indexed AT Protocol records | Viewer |
+| `records:delete` | Delete individual records from the index | Manager |
+| `records:delete-collection` | Bulk-delete all records in a collection | Full Access |
+| **Script Variables** | | |
+| `script-variables:create` | Add or update environment variables for Lua scripts | Manager |
+| `script-variables:read` | View script environment variable keys and values | Viewer |
+| `script-variables:delete` | Remove script environment variables | Manager |
+| **Users** | | |
+| `users:create` | Add new dashboard users | Full Access |
+| `users:read` | View the user list and their permissions | Viewer |
+| `users:update` | Modify user permissions | Full Access |
+| `users:delete` | Remove dashboard users | Full Access |
+| **API Keys** | | |
+| `api-keys:create` | Generate new API keys for admin access | Operator |
+| `api-keys:read` | View existing API keys | Viewer |
+| `api-keys:delete` | Revoke existing API keys | Operator |
+| **Backfill** | | |
+| `backfill:create` | Trigger historical record backfill jobs | Operator |
+| `backfill:read` | View backfill job status and progress | Viewer |
+| **System** | | |
+| `stats:read` | View collection statistics and record counts | Viewer |
+| `events:read` | View the event log | Viewer |
+| `events:purge` | Bulk-delete event log entries matching a filter | Full Access |
+| **Labelers** | | |
+| `labelers:create` | Subscribe to external labeler services | Manager |
+| `labelers:read` | View subscribed labeler services | Manager |
+| `labelers:delete` | Unsubscribe from labeler services | Manager |
+| **Settings** | | |
+| `settings:manage` | Modify instance settings, logo, and configuration | Manager |
+| **Plugins** | | |
+| `plugins:read` | View installed plugins and their configuration | Manager |
+| `plugins:create` | Install and configure new plugins | Manager |
+| `plugins:delete` | Uninstall plugins | Manager |
+| **API Clients** | | |
+| `api-clients:view` | View registered OAuth API clients | Manager |
+| `api-clients:create` | Register new OAuth API clients | Manager |
+| `api-clients:edit` | Modify API client settings and credentials | Manager |
+| `api-clients:delete` | Remove registered API clients | Manager |
+| **Dead Letters** | | |
+| `dead-letters:read` | View failed hook executions | Viewer |
+| `dead-letters:manage` | Retry, re-index, or dismiss dead letters | Operator |
+| **Spaces** | | |
+| `spaces:create` | Create new permissioned data spaces | Manager |
+| `spaces:read` | View space details, metadata, and members | Manager |
+| `spaces:update` | Modify space settings | Manager |
+| `spaces:delete` | Remove spaces and their data | Manager |
+| `spaces:manage-members` | Add or remove space members and roles | Manager |
+| `spaces:manage-invites` | Create and revoke space invitations | Manager |
+| `spaces:manage-records` | Read and write records within spaces | Manager |
+| `spaces:manage-credentials` | Issue and revoke space access credentials | Manager |
+| **Scripts** | | |
+| `scripts:read` | View trigger-keyed scripts | Viewer |
+| `scripts:manage` | Create, update, and delete trigger-keyed scripts | Manager |
+| **Jobs** | | |
+| `jobs:read` | View background job status and progress | Full Access |
+| `jobs:create` | Queue new background jobs | Full Access |
+| `jobs:manage` | Cancel, pause, and resume background jobs | Full Access |
+| **Linked Repos** | | |
+| `linked-repos:read` | View linked repos, their status, and their scopes | Full Access |
+| `linked-repos:create` | Add linked repos and start authorization flows | Full Access |
+| `linked-repos:delete` | Revoke linked repos and delete their stored sessions | Full Access |
+| **Project** | | |
+| `project:deploy` | Replace the instance's project with a deployed bundle and start the backfills it declares | Manager |
+
+{/* END generated: permissions */}

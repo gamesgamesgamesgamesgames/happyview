@@ -1,0 +1,215 @@
+---
+title: Troubleshooting
+description: What a v3 error means and how to fix it, starting from the message you see.
+---
+
+Each entry starts from what you see: an HTTP response, a dashboard message or a
+log line. The quoted text is what HappyView sends. Where it names something you
+chose (a language, a plugin type, a global), that part is shown as `<…>`.
+
+## Scripts
+
+### No interpreter installed
+
+**You see one of:**
+
+- Saving a script is refused with `400`:
+
+  ```json
+  { "error": "no interpreter installed for '<language>' scripts; install one from the plugins page" }
+  ```
+
+- An XRPC query or procedure backed by a script answers `503`:
+
+  ```json
+  { "error": "ServerMisconfigured", "message": "no interpreter installed for '<language>' scripts; install one from the plugins page" }
+  ```
+
+- A record or label event lands in **Dead Letters** after one attempt, and a
+  job fails, with that same sentence as the error.
+- At startup the log warns: `no interpreter plugin is installed, so no script
+  can be saved or run; install one from the plugins page in the dashboard`.
+
+**Why.** v3 doesn't build a script runtime into HappyView. Scripts run inside an
+interpreter plugin, and a fresh instance has none. The record or label is
+still indexed; only the script didn't run.
+
+**Fix.** Install the interpreter for the script's language from **Integrations →
+Plugins → Add plugin** (`happyview-lua`, `happyview-javascript` or `happyview-typescript`),
+then retry. Replay the dead letters once it is installed.
+
+### A script uses a removed v2 global
+
+**You see one of:**
+
+- Saving is refused with `400`, naming every removed global the script still
+  reads:
+
+  ```json
+  {
+    "error": "script references removed globals: <global>, <global> -- run the codemod first",
+    "removed_globals": ["<global>", "<global>"]
+  }
+  ```
+
+- A script saved before the upgrade fails when it runs, with:
+
+  ```
+  the '<global>' global was removed in v3; run the script codemod (Settings → Scripts → Migrate, or happyview-codemod) -- see the Migrating scripts guide
+  ```
+
+  To an XRPC caller that is a `500` with `"error": "script_error"` and
+  `"errorType": "runtime"`.
+
+**Why.** v3 removed v2's script globals: `db`, `Record`, `params`, `input`,
+`event`, `now()`, `json`, `http` and 24 others. A script is now
+`handle(input, ctx)` and loads what it needs with `require`.
+
+**Fix.** Run the codemod: **Migrate this script** on the script's page,
+`POST /admin/scripts/{id}/codemod` with `{"apply": true}`, or the
+`happyview-codemod` CLI. Then finish any `-- codemod:` markers it leaves by hand.
+See [Migrating scripts to v3](/guides/migrating-scripts).
+
+### A script hits its limits
+
+**You see**, from an XRPC route backed by a script:
+
+- `408` with `"errorType": "timeout"`: the run used up its instruction budget
+  or its wall-clock time.
+- `500` with `"errorType": "memory"`: the run used up its memory.
+
+```json
+{
+  "error": "script_error",
+  "errorType": "timeout",
+  "message": "<the interpreter's message>",
+  "method": "<nsid>",
+  "line": null,
+  "file": null
+}
+```
+
+A record or label script that hits a limit lands in **Dead Letters** with the
+same failure as its error.
+
+**Why.** v3 enforces three limits on every run:
+
+| Limit | Default | Range | Applies to |
+|---|---|---|---|
+| Instructions | 1,000,000 | 1,000 to 1,000,000,000 | Every script kind except jobs |
+| Wall clock | 10 seconds | 1 to 300 | Every script kind except jobs |
+| Memory | 64 MiB | — | Every script kind, jobs included |
+
+The wall clock counts only time the script itself runs, not time spent
+waiting on the host (an HTTP request, a database read). Jobs are exempt from
+the first two; `ctx.job.should_stop()` is how a job stops.
+
+**Fix.** Make the script do less per run: page through results, or move bulk
+work into a job. If the work is legitimate, raise the instruction or wall-clock
+limit with the `script_instruction_limit` / `script_wall_clock_seconds`
+settings (System → General), or the `SCRIPT_INSTRUCTION_LIMIT` /
+`SCRIPT_WALL_CLOCK_SECONDS` environment variables. The settings win over the
+environment.
+
+## Plugins
+
+### A plugin is refused for `api_version` "1"
+
+**You see**, when you install it, `400`:
+
+```json
+{ "error": "Failed to load plugin: <type> plugins need an api_version: \"2\" manifest declaring capabilities (got api_version \"1\"); republish the plugin with a capabilities-declaring manifest" }
+```
+
+For a plugin that was already installed, startup logs an error starting
+`Failed to load plugin` (from the registry, from DB, or WASM, depending on how
+it was installed) with the same text, and the plugin isn't loaded. **The instance still
+starts**, so anything that depended on the plugin (account linking through an
+auth plugin, say) stops working without any other error.
+
+**Why.** v3 loads only plugins whose manifest declares `api_version` `"2"` and
+lists its capabilities. It checks that list against what the plugin's module
+actually imports. There is no fallback for any plugin type.
+
+**Fix.** Install a current release from the catalogue. For your own plugin,
+rebuild it against the v3 SDK and declare its capabilities. After an upgrade,
+search the startup log for `Failed to load plugin` to find every refused plugin.
+
+### The registry is unreachable at startup
+
+**You see**, at startup, for each plugin installed from the registry:
+
+```
+Failed to load plugin from the registry  plugin_id=<id> error=registry request failed: <cause>
+```
+
+The plugin isn't loaded until the next startup or reload that can reach the
+registry. Scripts in that plugin's language then fail as in
+[No interpreter installed](#no-interpreter-installed). The catalogue's own
+refresh logs `official_registry: refresh failed` and retries every 15 minutes.
+
+**Why.** A plugin installed from the registry is stored as a reference with
+CIDs, not as bytes. HappyView fetches its manifest and module from the registry
+at every startup and reload, and refuses any bytes whose CID doesn't match.
+
+**Fix.** Make the registry reachable from the instance (by default
+`https://api.happyproto.at`), then reload the plugin from the dashboard or
+restart. `PLUGIN_REGISTRY_URL=off` turns the catalogue off, but doesn't change
+where an already-installed plugin fetches from.
+
+## Lexicon publishing
+
+### "The attached account hasn't granted permission to write lexicon records"
+
+**You see**, on the Lexicon Publishing page, the instance target marked
+unavailable with:
+
+```
+the attached account hasn't granted permission to write lexicon records. Re-authenticate it from Service Identity
+```
+
+or `the attached account needs to sign in again from Service Identity`.
+
+**Why.** Publishing writes `com.atproto.lexicon.schema` records to the attached
+account's repo, which needs the scope
+`repo:com.atproto.lexicon.schema?action=create&action=update&action=delete`.
+An account attached before publishing existed doesn't hold it. Neither does one
+whose last sign-in was an ordinary dashboard login, because that replaces the
+session.
+
+**Fix.** Go to **System → Service Identity**, press **Re-authenticate**, and
+approve the request.
+
+### "Missing permission: lexicons:publish"
+
+**You see** `403`:
+
+```json
+{ "error": "InsufficientPermissions", "message": "Missing permission: lexicons:publish" }
+```
+
+**Why.** Publishing needs the `lexicons:publish` permission. The Manager
+template includes it, but users created before v3 didn't get it. Super users
+can always publish.
+
+**Fix.** Grant `lexicons:publish` to the user under **Access → Users**.
+
+## Records
+
+### "The record store is unavailable"
+
+**You see** `503`, from record reads, `/admin/records`, `/admin/stats`, or a
+script that reads records:
+
+```json
+{ "error": "ServiceUnavailable", "message": "the record store is unavailable" }
+```
+
+**Why.** The instance keeps some collections in an external
+[record storage](/reference/glossary#record-storage), and that storage couldn't be
+reached. HappyView answers 503 instead of returning an empty or partial
+result, so a client knows to retry. A stock instance has no external storage
+and never sends this.
+
+**Fix.** Retry; the request is safe to repeat. If it persists, check the
+storage's own health. On a HappyProto instance, report it.
