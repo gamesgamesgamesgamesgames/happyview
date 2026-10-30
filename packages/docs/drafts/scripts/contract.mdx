@@ -1,0 +1,213 @@
+---
+title: The script contract
+description: The handle(input, ctx) function every script defines, in Lua, JavaScript and TypeScript, and what input and ctx carry for each script type.
+---
+
+# The script contract
+
+Every script defines one function, `handle(input, ctx)`. HappyView calls it each time the script's trigger fires. `input` is the trigger's payload. `ctx` is what the runtime knows about this invocation. What `handle` returns decides what happens next.
+
+Code at file scope runs while the script loads, before `handle` is called, so neither argument exists there. Put imports, constants and helper functions at file scope, and read `input` and `ctx` inside `handle` or in functions it calls.
+
+## The function in each language
+
+### Lua
+
+A global function named `handle`. Load modules with `require` at the top of the file.
+
+```lua
+local db = require("happyview.db")
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  log.info("looking up", { q = input.q, who = ctx.caller_did })
+  return db.records("app.example.post"):limit(input.limit or 10):run()
+end
+```
+
+A library call blocks until it answers. To run several calls at once, wrap each in a function and pass them to `all` from the built-in `internal.async` module. `all` returns each function's first value in argument order:
+
+```lua
+local async = require("internal.async")
+local db = require("happyview.db")
+local http = require("happyview.http")
+
+function handle(input, ctx)
+  local posts, profile = async.all(
+    function() return db.records("app.example.post"):limit(10):run() end,
+    function() return http.get("https://example.com/" .. input.did) end
+  )
+  return { posts = posts, profile = profile }
+end
+```
+
+### JavaScript
+
+An ES module whose default export is the handler. Load modules with `import`.
+
+```js
+import db from "happyview.db";
+import http from "happyview.http";
+import log from "internal.logging";
+
+export default async function handle(input, ctx) {
+  log.info("looking up", { q: input.q, who: ctx.caller_did });
+  const [posts, profile] = await Promise.all([
+    db.records("app.example.post").limit(input.limit ?? 10).run(),
+    http.get(`https://example.com/${input.did}`),
+  ]);
+  return { posts, profile };
+}
+```
+
+- The handler may be `async`. A returned promise is awaited, and what it settles to is the return value.
+- Every library call that sends a request returns a promise: a library function, and the final method of a chain such as `.run()`. The chain's earlier steps (`.where()`, `.limit()`, ...) are synchronous so they can chain.
+- A call starts as soon as it is made, so `Promise.all` over several calls costs the slowest one, not the sum.
+- File scope may use top-level `await`.
+- There are no timers. `setTimeout` does not exist.
+
+Every module has a default export holding all of its functions, and each function is also a named export. These are equivalent:
+
+```js
+import db from "happyview.db";
+import { records } from "happyview.db";
+```
+
+A named import also lets you reach a function whose name is a reserved word, such as `import { delete as remove } from "happyview.http"`.
+
+### TypeScript
+
+The same as JavaScript, with types. Types are erased before the script runs and are never checked, so declare the shapes you read.
+
+```ts
+import db from "happyview.db";
+import http from "happyview.http";
+import log from "internal.logging";
+
+interface Input {
+  did: string;
+  limit?: number;
+}
+
+export default async function handle(input: Input, ctx: { caller_did?: string }) {
+  log.info("looking up", { did: input.did, who: ctx.caller_did });
+  const [posts, profile] = await Promise.all([
+    db.records("app.example.post").limit(input.limit ?? 10).run(),
+    http.get(`https://example.com/${input.did}`),
+  ]);
+  return { posts, profile };
+}
+```
+
+## `input` by script type
+
+| Trigger | `input` |
+| --- | --- |
+| `xrpc.query:<nsid>` | The query-string parameters |
+| `xrpc.procedure:<nsid>` | The request body |
+| `record.index:<nsid>`, `record.create:<nsid>`, `record.update:<nsid>`, `record.delete:<nsid>` | `{ action, uri, did, collection, rkey, record }`. `action` is `"create"`, `"update"` or `"delete"`. `record` is absent on a delete |
+| `labeler.apply:<nsid>`, `labeler.apply:_actor` | `{ src, uri, val, neg, cts, exp }`. `exp` is absent when the label doesn't expire |
+| `job.run:<type>` | The input the job was created with |
+
+## `ctx`
+
+Every invocation carries these four fields:
+
+| Field | Value |
+| --- | --- |
+| `trigger` | The script's trigger string, such as `xrpc.query:com.example.getThing` |
+| `caller_did` | Query: the caller, or absent when anonymous. Procedure: the authenticated caller. Record event: the DID of the repo the event came from. Job: the DID that created the job. Label: absent |
+| `has_pds_auth` | `true` when the script can write to a PDS as `caller_did`: a procedure whose caller has a session, or a job created with `{ auth: true }`. `false` for queries, record events and labels |
+| `env` | The instance's script variables, keyed by name |
+
+Some script types carry more:
+
+| Script type | Extra `ctx` fields |
+| --- | --- |
+| Query | `method`, `collection` |
+| Procedure | `method`, `collection`, `params`, `delegate_did` |
+| Record event | `collection` |
+| Label | none |
+| Job | `job` |
+
+- `method` is the XRPC method NSID.
+- `collection` is the lexicon's target collection for a query or procedure, and the record's collection for a record event.
+- `params` is a procedure's query-string parameters. Its body is `input`.
+- `delegate_did` is the account the caller is delegated to write for, when there is one.
+- A query or procedure on a space-scoped request also carries `space`: `{ uri, id, did, authority_did, spaceType, skey }`.
+- `job` is `{ id, progress(data), should_stop(), wait(seconds) }`. `progress` saves a progress snapshot that the dashboard shows. `should_stop` returns `true` once the job is being cancelled or paused; checking it is up to the script. `wait` sleeps for up to 3600 seconds. In JavaScript and TypeScript `wait` returns a promise, so write `await ctx.job.wait(5)`.
+
+A field that doesn't apply is absent rather than set to an empty value. In JavaScript, `"method" in ctx` is `false` for a record event.
+
+## Return values
+
+| Script type | What `handle` returns |
+| --- | --- |
+| Query, procedure | The response body, serialized as JSON |
+| Record event | Nothing to skip indexing. An object to store in place of the record. Anything else, such as `true`, to store the record as it arrived |
+| Label | Nothing to drop the label. An object whose fields are merged over the label. Anything else, such as `true`, to keep the label as it arrived |
+| Job | The job's result |
+
+"Nothing" is `nil` in Lua and `undefined` or `null` in JavaScript and TypeScript. A function that ends without a `return` returns nothing, which for a record script means the record is not indexed. If a record script only has side effects, end it with `return input.record or true` (Lua) or `return input.record ?? true` (JavaScript and TypeScript).
+
+## Errors
+
+An uncaught error fails the invocation. For a query or procedure the client gets the error back:
+
+```json
+{
+  "error": "script_error",
+  "errorType": "runtime",
+  "message": "boom",
+  "method": "com.example.getThing",
+  "line": 12,
+  "file": null
+}
+```
+
+`errorType` is one of `syntax`, `runtime`, `timeout`, `memory` or `missing_handle`. The status is `408` for `timeout` and `500` for the rest. `line` is the script line that raised the error. For TypeScript it is the line in your TypeScript source.
+
+A message beginning `AUTH_ERROR:` is answered as `401`. Because `message` reaches the client, never put a secret or a caller's data in an error. For an expected condition, such as a missing record, return a structured body like `{ error: "not found" }` instead.
+
+`missing_handle` means the script defines no handler: no global `handle` function in Lua, or no default export in JavaScript and TypeScript ("script must export a default function").
+
+In JavaScript and TypeScript, a failed library call rejects with an `Error` that also has `code` and `retryable` properties. In Lua a library failure is a Lua error, prefixed with the library and function that failed. Catch expected failures with `try`/`catch` or `pcall`.
+
+Record and label scripts are retried on failure and then dead-lettered. A failed job is marked `failed` with the message as its error. See [Script types and triggers](./types-and-triggers.mdx#failures-and-retries).
+
+## Built-in modules
+
+These come with every interpreter and need nothing installed. A published plugin can't take a name under `internal.`.
+
+| Module | Functions |
+| --- | --- |
+| `internal.logging` | `debug`, `info`, `warn`, `error`, each `(message[, fields])` |
+| `internal.time` | `now()` in Unix milliseconds, `to_iso8601(ms)`, `from_iso8601(text)` |
+| `internal.tids` | `create()`, `to_tid(ms)`, `from_tid(tid)` |
+| `internal.json` | `encode(value)`, `decode(text)`, and in Lua only `to_array(table)` |
+| `internal.async` | Lua only: `all(f1, f2, ...)` |
+
+`info`, `warn` and `error` log lines are recorded in the event log with the trigger and caller. `debug` goes to the process log only. In JavaScript and TypeScript, `console.log`, `info`, `debug`, `warn` and `error` write through `internal.logging` at the matching level, with `console.log` at `info`.
+
+`internal.json.to_array` exists only in Lua because a Lua table can't say on its own whether an empty table is an empty array or an empty object. JavaScript has no such ambiguity, and runs calls at once with `Promise.all` instead of `internal.async`.
+
+## Sandbox
+
+### Lua
+
+Available: `print`, `string`, `table`, `math`, `utf8`, the coroutine library, the base library, and `os.time`, `os.date` and `os.difftime`. Not available: `io`, `package`, `debug`, `load`, `dofile`, `loadfile`, `collectgarbage`, and every other `os` function, including `os.clock`. Lua's own `require` is replaced by HappyView's. Use `internal.time.now()` to measure elapsed time.
+
+### JavaScript and TypeScript
+
+Available: the ECMAScript standard library QuickJS-ng implements (`JSON`, `Promise`, `Map`, `Set`, `RegExp`, `Date`, typed arrays, `Proxy` and the rest) and `console`. Not available: `eval`, the `Function` constructor and its async and generator variants, timers, and any file or process access. An import from an absolute path, a URL, or any specifier containing `:` is refused.
+
+### Both
+
+The guest has no timezone, so dates are read and written as UTC.
+
+A script saved from the dashboard has no project around it, so a relative import such as `./helpers` fails there. Relative imports work in scripts that belong to a project.
+
+## Next steps
+
+- [Script types and triggers](./types-and-triggers.mdx)
+- [Limits](./limits.mdx)

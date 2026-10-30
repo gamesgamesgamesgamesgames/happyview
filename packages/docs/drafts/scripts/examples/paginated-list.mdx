@@ -1,0 +1,78 @@
+---
+title: Paginated list
+description: A query script that lists a collection's records with cursor pagination and an optional DID filter, in Lua, JavaScript and TypeScript.
+---
+
+# Paginated list
+
+List records from the lexicon's target collection, with cursor pagination and an optional DID filter.
+
+**Trigger:** `xrpc.query:<nsid>`. **Needs:** `happyview-db`.
+
+## Lua
+
+```lua
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  local limit = tonumber(input.limit) or 20
+  if limit > 100 then limit = 100 end
+
+  return db.records(ctx.collection)
+    :did(input.did)
+    :limit(limit)
+    :cursor(input.cursor)
+    :run()
+end
+```
+
+## JavaScript
+
+```js
+import db from "happyview.db";
+
+export default function handle(input, ctx) {
+  const limit = Math.min(Number(input.limit) || 20, 100);
+
+  return db.records(ctx.collection)
+    .did(input.did)
+    .limit(limit)
+    .cursor(input.cursor)
+    .run();
+}
+```
+
+## TypeScript
+
+```ts
+import db from "happyview.db";
+
+interface Input {
+  did?: string;
+  limit?: string | number;
+  cursor?: string;
+}
+
+export default function handle(input: Input, ctx: { collection: string }) {
+  const limit = Math.min(Number(input.limit) || 20, 100);
+
+  return db.records(ctx.collection)
+    .did(input.did)
+    .limit(limit)
+    .cursor(input.cursor)
+    .run();
+}
+```
+
+## How it works
+
+1. Read `limit` from the query string, defaulting to 20 and capping at 100. Query parameters can arrive as strings, so the script converts it to a number.
+2. Build a `db.records` chain on the target collection. A step given no value is skipped, so a request without `did` or `cursor` needs no branching. In JavaScript the argument list ends at the first `undefined`, which has the same effect.
+3. `run()` returns `{ records, cursor }`. Each record is an envelope, and `cursor` is present when there are more records. In JavaScript and TypeScript, `run()` returns a promise; `handle` returns it and HappyView awaits it.
+
+## Usage
+
+```
+GET /xrpc/xyz.statusphere.listStatuses?limit=10&did=did:plc:abc
+GET /xrpc/xyz.statusphere.listStatuses?limit=10&cursor=<cursor from the previous page>
+```

@@ -1,0 +1,45 @@
+---
+title: Scripts
+description: What HappyView scripts are, where they run, and how the pieces fit together.
+---
+
+# Scripts
+
+A script is a small program HappyView runs when something happens: an XRPC request arrives, a record is created, a label is applied, or a background job is picked up. Without scripts, query endpoints return raw records and procedures proxy simple creates and updates. With them, you decide what an endpoint returns and what happens to each record before it is indexed.
+
+## Scripts run in interpreter plugins
+
+HappyView does not run scripts itself. A script runs inside an **interpreter plugin**, a WASM plugin that knows one language. Three are published:
+
+| Language | `script_type` | Plugin |
+| --- | --- | --- |
+| Lua 5.4 | `lua` | `happyview-lua` |
+| JavaScript (QuickJS-ng) | `javascript` | `happyview-javascript` |
+| TypeScript (SWC, then QuickJS-ng) | `typescript` | `happyview-typescript` |
+
+HappyView ships with no interpreter installed. Until you install one, no script can be saved or run, and the server logs this at boot:
+
+```
+no interpreter plugin is installed, so no script can be saved or run; install one from the plugins page in the dashboard
+```
+
+You can install more than one interpreter and mix languages on the same instance. Each script stores the language it is written in as its `script_type`. See [Languages](./languages.mdx) for installing interpreters and choosing a language.
+
+## Everything else is a module
+
+A script reaches HappyView only through its two arguments, `input` and `ctx`, and through modules it loads:
+
+- **Built-in modules** under `internal.`: logging, time, TIDs and JSON. They come with the interpreter, so nothing extra needs installing.
+- **Library plugins** under `happyview.`: records, SQL, HTTP, XRPC, jobs, spaces and more. Each one is a separate plugin you install. A script that loads a library that isn't installed fails when it loads.
+
+Lua loads modules with `require`. JavaScript and TypeScript use `import`.
+
+## The pieces
+
+- [The script contract](./contract.mdx): `handle(input, ctx)` in each language, and what `input` and `ctx` carry.
+- [Script types and triggers](./types-and-triggers.mdx): the trigger string that binds a script to an event, and what each type's return value does.
+- [Languages](./languages.mdx): installing interpreters, the dashboard language picker, and the starter scripts.
+- [Limits](./limits.mdx): the instruction, time and memory budgets a script runs under.
+- [Create scripts may run more than once](./idempotency.mdx): why record scripts must be idempotent.
+- [Migrating from v2](./migrating-from-v2.mdx): the removed Lua globals and the codemod that rewrites them.
+- Examples: [get a record](./examples/get-record.mdx), [paginated list](./examples/paginated-list.mdx), [create a record](./examples/create-record.mdx), [upsert a record](./examples/upsert-record.mdx), [sync records to a webhook](./examples/record-webhook.mdx), and [a background job](./examples/job.mdx).

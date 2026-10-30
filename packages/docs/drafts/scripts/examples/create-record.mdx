@@ -1,0 +1,58 @@
+---
+title: Create a record
+description: A procedure script that saves the request body as a record on the caller's PDS, in Lua, JavaScript and TypeScript.
+---
+
+# Create a record
+
+The simplest write: save the request body as a record and return its URI.
+
+**Trigger:** `xrpc.procedure:<nsid>`. **Needs:** `happyview-record`.
+
+## Lua
+
+```lua
+local record = require("happyview.record")
+
+function handle(input, ctx)
+  return record.create(ctx.collection, input)
+end
+```
+
+## JavaScript
+
+```js
+import record from "happyview.record";
+
+export default function handle(input, ctx) {
+  return record.create(ctx.collection, input);
+}
+```
+
+## TypeScript
+
+```ts
+import record from "happyview.record";
+
+export default function handle(input: Record<string, unknown>, ctx: { collection: string }) {
+  return record.create(ctx.collection, input);
+}
+```
+
+## How it works
+
+1. `record.create` writes the record to the caller's PDS in the lexicon's target collection.
+2. The write is also put into HappyView's index straight away, without waiting for the network to echo it.
+3. `create` returns `{ uri, cid }`, which becomes the response.
+
+Writing as the caller needs a PDS session, which a procedure has when its caller is signed in. Check `ctx.has_pds_auth` if you need to handle the case where it isn't.
+
+## Usage
+
+```sh
+curl -X POST http://127.0.0.1:3000/xrpc/xyz.statusphere.createRecord \
+  -H "X-Client-Key: $CLIENT_KEY" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "text": "Hello world", "createdAt": "2025-01-01T00:00:00Z" }'
+```

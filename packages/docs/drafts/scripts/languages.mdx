@@ -1,0 +1,298 @@
+---
+title: Languages
+description: Install the Lua, JavaScript and TypeScript interpreter plugins, pick a language for a new script, and start from the built-in starter scripts.
+---
+
+# Languages
+
+Each language is an interpreter plugin. Install the ones you want to write scripts in. You can install all three at once.
+
+| Language | `script_type` | Plugin | File extensions |
+| --- | --- | --- | --- |
+| Lua | `lua` | `happyview-lua` | `.lua` |
+| JavaScript | `javascript` | `happyview-javascript` | `.js`, `.mjs` |
+| TypeScript | `typescript` | `happyview-typescript` | `.ts`, `.mts` |
+
+## Which interpreter a new instance has
+
+None. HappyView does not bundle an interpreter, so a new instance can't save or run a script until you install one. Lua is still the default language in two places:
+
+- The admin API stores a script as `lua` when a create request leaves `script_type` out.
+- The dashboard starts a new script in Lua when the Lua interpreter is installed.
+
+## Install an interpreter
+
+### From the dashboard
+
+1. Open **Plugins** in the dashboard and click **Add plugin**.
+2. Pick `happyview-lua`, `happyview-javascript` or `happyview-typescript` from the catalog.
+3. Choose a **Channel**. The dashboard selects `latest` when the project publishes it, and otherwise the first channel the project has. While v3 is in alpha, the interpreters are published on the `alpha` channel only, so that is the channel to pick.
+4. Review the capabilities the plugin asks for, then install it.
+
+The JavaScript and TypeScript interpreters ask for the same capabilities: `library:call`, `script:host`, `script:test`, `wasi:clock`, `wasi:random` and `wasi:stdio`.
+
+### On first boot
+
+`HAPPYVIEW_DEFAULT_PLUGINS` installs a comma-separated list of plugin sources on the first boot that names them. Each source is a URL, such as a release's `manifest.json`. Listing a source consents to every capability its manifest declares. Installs run in the background and never delay boot. A source that installs is recorded and never installed again, so a plugin you later uninstall stays uninstalled. A source that fails is retried on the next boot.
+
+```sh
+HAPPYVIEW_DEFAULT_PLUGINS=https://example.com/plugins/happyview-lua/manifest.json
+```
+
+### Check what is installed
+
+```sh
+curl "http://127.0.0.1:3000/admin/scripts/languages" -H "$AUTH"
+# ["javascript","lua","typescript"]
+```
+
+`GET /admin/scripts/languages` returns the `script_type` of every installed interpreter, sorted. The scripts list marks a script as not runnable when no installed interpreter claims its language.
+
+## Pick a language in the dashboard
+
+When you create a script from **Scripts > New script**, the form shows a **Language** picker if more than one interpreter is installed. With only one installed, there is nothing to pick and the form uses that language.
+
+- The picker lists only installed languages.
+- A new script starts in Lua when Lua is installed, and otherwise in the first installed language.
+- The editor label and syntax highlighting follow the language, for example "TypeScript body".
+- Switching language replaces the body with the new language's starter, but only while the body is still an untouched starter. Once you edit it, switching keeps your text.
+- A saved script keeps its language. The script's detail page has no picker.
+
+The scripts list has a **Language** column so you can see what each script is written in.
+
+## Starter scripts
+
+The new-script form fills the body with a starter for the chosen language and trigger. There are three starters per language:
+
+- **Job** for `job.run:<type>`.
+- **Record event** for `record.index`, `record.create`, `record.update` and `record.delete`.
+- **Trigger** for everything else: `xrpc.query`, `xrpc.procedure` and `labeler.apply`.
+
+HappyView's test suite saves and runs each JavaScript and TypeScript starter against the real interpreters, so they are known to work as written.
+
+### Trigger starter
+
+Logs the invocation and returns `input`. For a query, that echoes the query parameters back.
+
+#### Lua
+
+```lua
+-- Trigger script: `input` is the trigger's payload; `ctx` describes
+-- this invocation (caller, environment, trigger id, and more). Return
+-- a transformed value, or `nil` to skip the operation.
+--
+-- require("internal.*") and installed libraries provide the rest.
+
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  log.info("script fired", { trigger = ctx.trigger, caller = ctx.caller_did })
+  return input
+end
+```
+
+#### JavaScript
+
+```js
+// Trigger script: `input` is the trigger's payload; `ctx` describes this
+// invocation (caller, environment, trigger id, and more). Return a value, or
+// nothing to skip the operation.
+//
+// Imports from "internal.*" and installed libraries provide the rest.
+
+import log from "internal.logging";
+
+export default function handle(input, ctx) {
+  log.info("script fired", { trigger: ctx.trigger, caller: ctx.caller_did });
+  return input;
+}
+```
+
+#### TypeScript
+
+```ts
+// Trigger script: `input` is the trigger's payload; `ctx` describes this
+// invocation (caller, environment, trigger id, and more). Return a value, or
+// nothing to skip the operation.
+//
+// Imports from "internal.*" and installed libraries provide the rest. Types
+// are erased rather than checked, so declare the shapes the script reads.
+
+import log from "internal.logging";
+
+interface Context {
+  trigger: string;
+  caller_did?: string;
+}
+
+export default function handle(input: unknown, ctx: Context) {
+  log.info("script fired", { trigger: ctx.trigger, caller: ctx.caller_did });
+  return input;
+}
+```
+
+### Record event starter
+
+Logs the event and lets it through. It returns the record rather than `input`, because a returned object replaces the stored record. A delete carries no record, so it returns `true` there to let the delete proceed.
+
+#### Lua
+
+```lua
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  if input.action == "delete" then
+    log.info("record deleted", { uri = input.uri })
+  else
+    log.info("record " .. input.action, { uri = input.uri, did = input.did })
+  end
+
+  -- A nil return skips the operation, and a delete carries no record,
+  -- so `true` is what lets a delete through.
+  return input.record or true
+end
+```
+
+#### JavaScript
+
+```js
+import log from "internal.logging";
+
+export default function handle(input, ctx) {
+  if (input.action === "delete") {
+    log.info("record deleted", { uri: input.uri });
+  } else {
+    log.info(`record ${input.action}`, { uri: input.uri, did: input.did });
+  }
+
+  // Returning nothing skips the operation, and a delete carries no record,
+  // so `true` is what lets a delete through.
+  return input.record ?? true;
+}
+```
+
+#### TypeScript
+
+```ts
+import log from "internal.logging";
+
+interface RecordEvent {
+  action: "create" | "update" | "delete";
+  uri: string;
+  did: string;
+  collection: string;
+  rkey: string;
+  record?: Record<string, unknown>;
+}
+
+export default function handle(input: RecordEvent) {
+  if (input.action === "delete") {
+    log.info("record deleted", { uri: input.uri });
+  } else {
+    log.info(`record ${input.action}`, { uri: input.uri, did: input.did });
+  }
+
+  // Returning nothing skips the operation, and a delete carries no record,
+  // so `true` is what lets a delete through.
+  return input.record ?? true;
+}
+```
+
+### Job starter
+
+Reports progress, checks for a stop request, and returns a result. The JavaScript and TypeScript versions are `async`, because `ctx.job.wait` returns a promise there.
+
+#### Lua
+
+```lua
+-- Job runner: executes as a background job. `input` is the job's
+-- input table; `ctx.job` exposes the job's id, progress(data),
+-- should_stop(), and wait(seconds). Return value becomes the job's result.
+--
+-- require("internal.*") and installed libraries provide the rest.
+
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  log.info("job started", { job_id = ctx.job.id })
+
+  ctx.job.progress({ status = "working" })
+
+  if ctx.job.should_stop() then
+    return { partial = true }
+  end
+
+  return { done = true }
+end
+```
+
+#### JavaScript
+
+```js
+// Job runner: executes as a background job. `input` is the job's input;
+// `ctx.job` exposes the job's id, progress(data), should_stop(), and
+// wait(seconds). The return value becomes the job's result.
+//
+// Imports from "internal.*" and installed libraries provide the rest.
+
+import log from "internal.logging";
+
+export default async function handle(input, ctx) {
+  log.info("job started", { job_id: ctx.job.id });
+
+  ctx.job.progress({ status: "working" });
+
+  if (ctx.job.should_stop()) {
+    return { partial: true };
+  }
+
+  return { done: true };
+}
+```
+
+#### TypeScript
+
+```ts
+// Job runner: executes as a background job. `input` is the job's input;
+// `ctx.job` exposes the job's id, progress(data), should_stop(), and
+// wait(seconds). The return value becomes the job's result.
+//
+// Imports from "internal.*" and installed libraries provide the rest. Types
+// are erased rather than checked, so declare the shapes the script reads.
+
+import log from "internal.logging";
+
+interface Job {
+  id: string;
+  progress(data: unknown): void;
+  should_stop(): boolean;
+  wait(seconds: number): Promise<void>;
+}
+
+export default async function handle(input: unknown, ctx: { job: Job }) {
+  log.info("job started", { job_id: ctx.job.id });
+
+  ctx.job.progress({ status: "working" });
+
+  if (ctx.job.should_stop()) {
+    return { partial: true };
+  }
+
+  return { done: true };
+}
+```
+
+## TypeScript specifics
+
+TypeScript is compiled to JavaScript and then run by the same engine as JavaScript, so everything in the [contract](./contract.mdx) applies unchanged. What TypeScript adds:
+
+- **Types are erased, not checked.** A type error never stops a save or a run. Declare the shapes your script reads, as the starters do, or use `any`.
+- **Runtime TypeScript works.** `enum`, `namespace` with values, and parameter properties are compiled, not just stripped.
+- **Some syntax is refused** with a `syntax` error on its line: decorators and `accessor` fields, `import x = require("...")` and `export =`, and JSX.
+- **Errors point at your TypeScript.** Line numbers in errors are mapped back through a source map to the line you wrote.
+- **Type-only imports are removed.** A library you import only for its types doesn't need to be installed.
+
+## Next steps
+
+- [The script contract](./contract.mdx)
+- [Script types and triggers](./types-and-triggers.mdx)

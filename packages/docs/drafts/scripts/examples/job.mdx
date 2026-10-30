@@ -1,0 +1,133 @@
+---
+title: A background job
+description: A procedure that queues a job and the job script that processes it, reporting progress and stopping when asked, in Lua, JavaScript and TypeScript.
+---
+
+# A background job
+
+A procedure that queues a job, and the job script that does the work in the background.
+
+**Triggers:** `xrpc.procedure:<nsid>` and `job.run:app.example.process`. **Needs:** `happyview-jobs`.
+
+## Queue the job
+
+The procedure returns straight away with the job's id.
+
+### Lua
+
+```lua
+local jobs = require("happyview.jobs")
+
+function handle(input, ctx)
+  local id = jobs.create("app.example.process", { items = input.items })
+  return { job_id = id }
+end
+```
+
+### JavaScript
+
+```js
+import jobs from "happyview.jobs";
+
+export default async function handle(input, ctx) {
+  const id = await jobs.create("app.example.process", { items: input.items });
+  return { job_id: id };
+}
+```
+
+### TypeScript
+
+```ts
+import jobs from "happyview.jobs";
+
+export default async function handle(input: { items: unknown[] }) {
+  const id = await jobs.create("app.example.process", { items: input.items });
+  return { job_id: id };
+}
+```
+
+## Run the job
+
+The job script works through `input.items`, saves progress as it goes, and stops early if the job is cancelled or paused.
+
+### Lua
+
+```lua
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  local total = #input.items
+
+  for i, item in ipairs(input.items) do
+    if ctx.job.should_stop() then
+      return { partial = true, processed = i - 1 }
+    end
+
+    log.info("processing", { job_id = ctx.job.id, index = i })
+    ctx.job.progress({ processed = i, total = total })
+  end
+
+  return { processed = total }
+end
+```
+
+### JavaScript
+
+```js
+import log from "internal.logging";
+
+export default async function handle(input, ctx) {
+  const total = input.items.length;
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.job.should_stop()) {
+      return { partial: true, processed: i };
+    }
+
+    log.info("processing", { job_id: ctx.job.id, index: i });
+    ctx.job.progress({ processed: i + 1, total });
+  }
+
+  return { processed: total };
+}
+```
+
+### TypeScript
+
+```ts
+import log from "internal.logging";
+
+interface Job {
+  id: string;
+  progress(data: unknown): void;
+  should_stop(): boolean;
+  wait(seconds: number): Promise<void>;
+}
+
+export default async function handle(input: { items: unknown[] }, ctx: { job: Job }) {
+  const total = input.items.length;
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.job.should_stop()) {
+      return { partial: true, processed: i };
+    }
+
+    log.info("processing", { job_id: ctx.job.id, index: i });
+    ctx.job.progress({ processed: i + 1, total });
+  }
+
+  return { processed: total };
+}
+```
+
+## How it works
+
+1. `jobs.create(job_type, input)` adds a pending job and returns its id. It needs a caller to queue the job as, so it works from a procedure, a query with a signed-in caller, a record script or another job, but not from a label script.
+2. The background worker picks the job up and runs the `job.run:app.example.process` script with the job's input as `input`.
+3. `ctx.job.progress` saves a snapshot that the dashboard's **Jobs** page shows. Each call replaces the last one.
+4. `ctx.job.should_stop()` turns `true` when someone cancels or pauses the job. The script has to check it and return.
+5. The return value is stored as the job's result.
+
+Jobs aren't held to the instruction limit or the wall clock, so they can run long. They still have the 64 MiB memory limit. See [Limits](../limits.mdx).
+
+To let the job write to the caller's PDS, queue it with `{ auth = true }` (Lua) or `{ auth: true }` (JavaScript and TypeScript) as the third argument. The job script then has `ctx.has_pds_auth` set to `true`.

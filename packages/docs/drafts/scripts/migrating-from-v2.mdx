@@ -1,0 +1,217 @@
+---
+title: Migrating from v2
+description: The Lua globals v3 removed, what replaces them, and how to run the codemod that rewrites v2 scripts.
+---
+
+# Migrating from v2
+
+In v2, a Lua script reached HappyView through globals such as `params`, `caller_did`, `db`, `Record` and `now()`. v3 removes them. Everything moves onto the [`handle(input, ctx)` contract](./contract.mdx) and modules loaded with `require`.
+
+Only Lua scripts need migrating. Every v2 script was Lua, and JavaScript and TypeScript scripts are new in v3.
+
+A codemod does most of the rewrite. Anything it can't rewrite mechanically, it leaves in place under a `-- codemod:` comment for you to finish by hand.
+
+## The removed globals
+
+These 32 names are removed:
+
+| Group | Names |
+| --- | --- |
+| Libraries | `db`, `Record`, `xrpc`, `atproto`, `linked_repos`, `jobs`, `job`, `http` |
+| Built-ins | `log`, `now`, `TID`, `json`, `toarray` |
+| Inputs | `input`, `params`, `event` |
+| Record event fields | `record`, `action`, `uri`, `did`, `rkey` |
+| Label event fields | `src`, `val`, `neg`, `cts`, `exp` |
+| Context | `method`, `collection`, `caller_did`, `delegate_did`, `env`, `space` |
+
+Reading one of them raises an error that names it:
+
+```
+the 'params' global was removed in v3; run the script codemod (Settings → Scripts → Migrate, or happyview-codemod) -- see the Migrating scripts guide
+```
+
+Only these names raise. Any other undefined name is `nil`, as in plain Lua, and a script may still assign its own globals, including one that reuses a removed name.
+
+Saving is stricter than running. Creating or editing a Lua script whose body still reads a removed global is refused with a `400`:
+
+```json
+{
+  "error": "script references removed globals: db, params -- run the codemod first",
+  "removed_globals": ["db", "params"]
+}
+```
+
+The scripts list reports the globals each stored Lua script still reads in its `needs_migration` field.
+
+## What replaces them
+
+### Context
+
+| v2 | v3 |
+| --- | --- |
+| `caller_did` | `ctx.caller_did` |
+| `delegate_did` | `ctx.delegate_did` |
+| `method` | `ctx.method` |
+| `env`, `env.X` | `ctx.env`, `ctx.env.X` |
+| `space.space` | `ctx.space.uri` |
+| `space.space_id` | `ctx.space.id` |
+| `space.type_nsid` | `ctx.space.spaceType` |
+
+### Inputs, by script type
+
+The same v2 name meant different things in different script types, so the rewrite depends on the trigger:
+
+| Script type | v2 | v3 |
+| --- | --- | --- |
+| Procedure | `input` | `input`, now `handle`'s first parameter |
+| Procedure | `params` | `ctx.params` |
+| Query, procedure | `collection` | `ctx.collection` |
+| Query | `params` | `input` |
+| Record event | `event` | `input` |
+| Record event | `record`, `action`, `uri`, `did`, `collection`, `rkey` | `input.record`, `input.action`, and so on |
+| Label | `event` | `input` |
+| Label | `src`, `uri`, `val`, `neg`, `cts`, `exp` | `input.src`, `input.uri`, and so on |
+| Job | `job.input` | `input` |
+| Job | `job.id`, `job.progress`, `job.should_stop`, `job.wait` | `ctx.job.id`, `ctx.job.progress`, and so on |
+| Job | `job.log(x)`, `job.warn(x)` | `log.info(x)`, `log.warn(x)` |
+
+### Built-ins
+
+| v2 | v3 |
+| --- | --- |
+| `log(x)` | `log.info(x)` with `local log = require("internal.logging")` |
+| `now()` | `time.to_iso8601(time.now())` with `local time = require("internal.time")` |
+| `TID()` | `tids.create()` with `local tids = require("internal.tids")` |
+| `json.encode`, `json.decode` | The same, with `local json = require("internal.json")` |
+| `toarray(x)` | `json.to_array(x)` |
+
+`now()` returns the same instant in a different format. v2 wrote nanoseconds with a `+00:00` offset (`2026-09-16T15:04:05.123456789+00:00`). v3 writes milliseconds with a `Z` (`2026-09-16T15:04:05.123Z`). If anything compares stored timestamps as strings, check it.
+
+### Libraries
+
+Each v2 library global is now a library plugin you install and `require`. Every `happyview.*` module a migrated script loads must be installed, or the script fails when it loads.
+
+| v2 | v3 |
+| --- | --- |
+| `db.get`, `db.query`, `db.search`, `db.count` | `require("happyview.db")` |
+| `db.raw` | `require("happyview.sql").raw` |
+| `db.backlinks` | `require("happyview.backlinks")` |
+| `Record` | `require("happyview.record")` |
+| `xrpc` | `require("happyview.xrpc")` |
+| `atproto` | `require("happyview.atproto")` |
+| `atproto.spaces` | `require("happyview.spaces")` |
+| `atproto.blob_upload` | `require("happyview.record").upload_blob` |
+| `linked_repos` | `require("happyview.linked_repos")` |
+| `jobs` | `require("happyview.jobs")` |
+| `http` | `require("happyview.http")` |
+
+Two shape changes matter most:
+
+- **Reads return an envelope.** A v3 record read returns `{ uri, did, collection, rkey, cid, indexed_at, record }`, with the stored body under `record`. v2 returned the body with `uri` added to it.
+- **`db.query` is a chain.** `db.query{ collection = c, limit = n }` becomes `db.records(c):limit(n):run()`. A chain step given `nil` is skipped.
+
+Where a rename alone would change behavior, the codemod inlines a small shim, called a polyfill, at the top of the script that keeps the v2 behavior on top of the v3 library. There are three: the v2 row shape over `happyview.db`, the v2 `Record` API over `happyview.record`, and v2's `xrpc` return shape over `happyview.xrpc`. Each one is marked with a comment such as:
+
+```lua
+-- codemod polyfill: v2 Record over happyview.record; replace with the library API when convenient
+```
+
+Replace them with direct library calls when you can.
+
+## Run the codemod
+
+The codemod only rewrites source, so it works before any interpreter is installed. It only touches Lua scripts.
+
+### From the dashboard
+
+Open a Lua script and click **Migrate**. You get a diff of the stored body against the rewrite, with notes listed below it. Nothing is saved until you click **Apply**. If the rewrite still has markers, you have to confirm before applying.
+
+When a save is refused because the body reads a removed global, the error has a **Migrate this script** button. It rewrites what is in the editor, not the stored script, so unsaved edits survive.
+
+Previewing needs permission to read scripts. Applying needs permission to manage them.
+
+### From the admin API
+
+```sh
+# Preview the rewrite of a stored script
+curl -X POST "http://127.0.0.1:3000/admin/scripts/xrpc.query:com.example.list/codemod" -H "$AUTH"
+
+# Store the rewrite
+curl -X POST "http://127.0.0.1:3000/admin/scripts/xrpc.query:com.example.list/codemod" \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"apply": true}'
+```
+
+Applying a rewrite that still has markers is refused with a `409` unless you also send `"allow_markers": true`. Sending `"source"` previews the rewrite of that text instead of the stored body; it can't be combined with `apply`.
+
+### From the command line
+
+`happyview-codemod` is a separate binary in the HappyView repository. It is not in the published Docker image, so run it from a source checkout:
+
+```sh
+cargo run --release --bin happyview-codemod -- --help
+```
+
+It has two modes:
+
+```sh
+# One script, from a file or stdin. KIND is procedure, query, record, label or job.
+happyview-codemod --file path/to/script.lua --kind procedure
+cat script.lua | happyview-codemod --stdin --kind query
+
+# Stored scripts in a database: all of them, or one by id. A dry run by default.
+happyview-codemod --database-url "$DATABASE_URL"
+happyview-codemod --database-url "$DATABASE_URL" --script "xrpc.procedure:com.example.create"
+
+# Write the rewrites back. A script that still has markers is skipped unless
+# --allow-markers is also given.
+happyview-codemod --database-url "$DATABASE_URL" --apply
+happyview-codemod --database-url "$DATABASE_URL" --apply --allow-markers
+```
+
+File and stdin mode print the rewritten script to stdout and notes to stderr. Database mode skips scripts that aren't Lua.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Clean |
+| `1` | Error |
+| `2` | At least one script still has markers |
+
+Running the codemod on a script it already migrated changes nothing. A re-run doesn't report markers it already placed, so search the source for `-- codemod:` to find what is still open.
+
+## Markers
+
+A marker is a `-- codemod:` comment above a line the codemod couldn't rewrite. It reads `-- codemod: <what changed> -- <what to do>`. A script with markers isn't finished: rewrite the marked lines by hand and remove the comments. Common causes:
+
+- A `db.query`, `db.search` or `db.backlinks` call with options the chain can't express.
+- Reading `input` or a context value at file scope, such as `local BASE = env.API_URL`. File scope runs before `handle` gets its arguments, so move the read into `handle`.
+- A local variable that already uses a name the rewrite needs, such as `db` or `time`.
+- `TID` conversions other than `TID()`, which `internal.tids` can't reproduce exactly.
+
+## Before and after
+
+```lua
+-- before (a query)
+function handle()
+  local dl = atproto.blob_download(params.did, params.cid)
+  return atproto.blob_upload(dl.handle, dl.mimeType)
+end
+```
+
+```lua
+-- after
+local record = require("happyview.record")
+local atproto = require("happyview.atproto")
+
+function handle(input, ctx)
+  local dl = atproto.blob_download(input.did, input.cid)
+  return record.upload_blob(dl.bytes, dl.mime_type)
+end
+```
+
+`handle` gains its parameters, the query's `params` becomes `input`, the modules it uses are required, `atproto.blob_upload` moves to `record.upload_blob`, and the downloaded blob's fields are renamed (`.handle` to `.bytes`, `.mimeType` to `.mime_type`).
+
+## Next steps
+
+- [The script contract](./contract.mdx)
+- [Languages](./languages.mdx)

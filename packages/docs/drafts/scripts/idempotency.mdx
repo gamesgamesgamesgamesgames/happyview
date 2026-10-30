@@ -1,0 +1,86 @@
+---
+title: Create scripts may run more than once
+description: The same record can reach a record-created script more than once, so write create scripts to be idempotent.
+---
+
+# Create scripts may run more than once
+
+HappyView doesn't yet track which records a script has already handled. The same record can reach a create script more than once, so treat every create event as "this record exists now", not "this record is new".
+
+This applies to any script that handles creates: a `record.create:<nsid>` script, and a `record.index:<nsid>` script when `input.action` is `"create"`.
+
+## When it happens
+
+- **Backfills.** A backfill reads each repo's existing records and sends every one through the record script as a create, whether HappyView has seen it before or not. Running a backfill again, or backfilling a collection that is already indexed, delivers those creates again.
+- **Retries.** A record script that fails is run again, up to 4 attempts in total. Anything the script did before it failed, such as an HTTP call or a write, happens again on the next attempt.
+- **Dead-letter retries.** Retrying a dead-lettered event from the dashboard runs the script for that event again.
+
+## Write create scripts to be idempotent
+
+Running a create script twice for the same record should leave things the same as running it once.
+
+- **Write by key, and replace.** Key anything you store on the record's URI, or on its DID and rkey, and overwrite it. A search index document whose ID is the record's URI is safe to write twice. A `POST` that adds a new row every time is not.
+- **Don't keep per-call counters.** Adding one to a count each time the script runs will overcount. Count the records instead, for example with `db.records(collection):count()` in Lua, or store a set keyed by URI.
+- **Check before one-time side effects.** Before sending a notification, a welcome email or a payment, check whether it has already happened for this record, and record that it did, keyed by the record's URI.
+- **Keep the return value deterministic.** If the script rewrites the record, compute the result from the record alone, not from the time of the run or a random value, so a second run stores the same thing.
+
+## Example
+
+A create script that mirrors records into an external index. It uses `PUT` to a URL built from the record's URI, so a second delivery overwrites the same document instead of adding another.
+
+### Lua
+
+```lua
+local json = require("internal.json")
+local http = require("happyview.http")
+
+function handle(input, ctx)
+  local id = input.uri:gsub("[^%w]", "_")
+  http.put(ctx.env.INDEX_URL .. "/documents/" .. id, {
+    headers = { ["Content-Type"] = "application/json" },
+    body = json.encode({ uri = input.uri, did = input.did, record = input.record }),
+  })
+  return input.record or true
+end
+```
+
+### JavaScript
+
+```js
+import http from "happyview.http";
+
+export default async function handle(input, ctx) {
+  const id = encodeURIComponent(input.uri);
+  await http.put(`${ctx.env.INDEX_URL}/documents/${id}`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uri: input.uri, did: input.did, record: input.record }),
+  });
+  return input.record ?? true;
+}
+```
+
+### TypeScript
+
+```ts
+import http from "happyview.http";
+
+interface RecordEvent {
+  uri: string;
+  did: string;
+  record?: Record<string, unknown>;
+}
+
+export default async function handle(input: RecordEvent, ctx: { env: Record<string, string> }) {
+  const id = encodeURIComponent(input.uri);
+  await http.put(`${ctx.env.INDEX_URL}/documents/${id}`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uri: input.uri, did: input.did, record: input.record }),
+  });
+  return input.record ?? true;
+}
+```
+
+## Next steps
+
+- [Script types and triggers](./types-and-triggers.mdx#record-scripts)
+- [Sync records to a webhook](./examples/record-webhook.mdx)

@@ -1,0 +1,97 @@
+---
+title: Sync records to a webhook
+description: A record script that sends every create, update and delete in a collection to an external service, written to be safe when it runs more than once.
+---
+
+# Sync records to a webhook
+
+Send every create, update and delete in a collection to an external service, and let the record be indexed as normal.
+
+**Trigger:** `record.index:<nsid>`. **Needs:** `happyview-http`. **Script variables:** `WEBHOOK_URL`.
+
+The receiving service should treat each request as "set the state of this URI", keyed by `uri`. The same record can reach this script more than once, so a service that appends a row per request will see duplicates. See [Create scripts may run more than once](../idempotency.mdx).
+
+## Lua
+
+```lua
+local json = require("internal.json")
+local http = require("happyview.http")
+
+function handle(input, ctx)
+  http.post(ctx.env.WEBHOOK_URL, {
+    headers = { ["Content-Type"] = "application/json" },
+    body = json.encode({
+      action = input.action,
+      uri = input.uri,
+      did = input.did,
+      record = input.record,
+    }),
+  })
+
+  -- `record` is absent on delete; `true` lets the delete proceed.
+  return input.record or true
+end
+```
+
+## JavaScript
+
+```js
+import http from "happyview.http";
+
+export default async function handle(input, ctx) {
+  await http.post(ctx.env.WEBHOOK_URL, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: input.action,
+      uri: input.uri,
+      did: input.did,
+      record: input.record,
+    }),
+  });
+
+  // `record` is absent on delete; `true` lets the delete proceed.
+  return input.record ?? true;
+}
+```
+
+## TypeScript
+
+```ts
+import http from "happyview.http";
+
+interface RecordEvent {
+  action: "create" | "update" | "delete";
+  uri: string;
+  did: string;
+  record?: Record<string, unknown>;
+}
+
+interface Context {
+  env: Record<string, string>;
+}
+
+export default async function handle(input: RecordEvent, ctx: Context) {
+  await http.post(ctx.env.WEBHOOK_URL, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: input.action,
+      uri: input.uri,
+      did: input.did,
+      record: input.record,
+    }),
+  });
+
+  // `record` is absent on delete; `true` lets the delete proceed.
+  return input.record ?? true;
+}
+```
+
+## How it works
+
+1. `record.index` catches creates, updates and deletes for the collection, unless a more specific `record.create`, `record.update` or `record.delete` script exists for an action.
+2. The script posts the event to the URL in the `WEBHOOK_URL` script variable.
+3. It returns the record so indexing goes ahead unchanged. A script that returns nothing would stop the record from being indexed.
+
+If the webhook call fails, the error fails the script. A record script is retried up to 4 times in total and then dead-lettered, and the record is indexed anyway. Wrap the call in `pcall` (Lua) or `try`/`catch` (JavaScript and TypeScript) if you would rather log the failure and carry on.
+
+Record scripts run before indexing, so a slow webhook slows down indexing for everything behind it. Keep the endpoint fast, or have the script create a background job and do the call from there.

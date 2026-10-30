@@ -1,0 +1,85 @@
+---
+title: Get a record
+description: A query script that fetches one record by its AT URI, in Lua, JavaScript and TypeScript.
+---
+
+# Get a record
+
+Fetch a single record by its AT URI.
+
+**Trigger:** `xrpc.query:<nsid>`. **Needs:** `happyview-db`.
+
+## Lua
+
+```lua
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  if not input.uri then
+    return { error = "uri parameter is required" }
+  end
+
+  local row = db.get(input.uri)
+  if not row then
+    return { error = "not found" }
+  end
+
+  return { record = row }
+end
+```
+
+## JavaScript
+
+```js
+import db from "happyview.db";
+
+export default async function handle(input, ctx) {
+  if (!input.uri) {
+    return { error: "uri parameter is required" };
+  }
+
+  const row = await db.get(input.uri);
+  if (!row) {
+    return { error: "not found" };
+  }
+
+  return { record: row };
+}
+```
+
+## TypeScript
+
+```ts
+import db from "happyview.db";
+
+interface Input {
+  uri?: string;
+}
+
+export default async function handle(input: Input) {
+  if (!input.uri) {
+    return { error: "uri parameter is required" };
+  }
+
+  const row = await db.get(input.uri);
+  if (!row) {
+    return { error: "not found" };
+  }
+
+  return { record: row };
+}
+```
+
+## How it works
+
+1. Check that the `uri` query parameter is present, and return a structured error if not.
+2. Look the record up with `db.get`. It returns an envelope, `{ uri, did, collection, rkey, cid, indexed_at, record }`, or nothing. The record body is the envelope's `record` field. In JavaScript and TypeScript, `db.get` returns a promise, so it is awaited.
+3. Return the envelope wrapped in an object.
+
+The script returns structured errors instead of throwing, so the client gets a body it can handle rather than a `500`.
+
+## Usage
+
+```
+GET /xrpc/xyz.statusphere.getRecord?uri=at://did:plc:abc/xyz.statusphere.status/3k2a
+```

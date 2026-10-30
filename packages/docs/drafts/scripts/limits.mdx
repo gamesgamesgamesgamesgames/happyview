@@ -1,0 +1,76 @@
+---
+title: Limits
+description: The instruction, wall-clock, memory and stack budgets a script runs under, and how to change the ones you can.
+---
+
+# Limits
+
+Every script run has a budget. Running out fails the run with an error a script can't catch.
+
+| Limit | Default | Applies to | Configurable |
+| --- | --- | --- | --- |
+| Instructions | 1,000,000 per run | Queries, procedures, record and label scripts | Yes, 1,000 to 1,000,000,000 |
+| Wall clock | 10 seconds per run | Queries, procedures, record and label scripts | Yes, 1 to 300 seconds |
+| Memory | 64 MiB per run | Every script type, jobs included | No |
+| Stack (JavaScript and TypeScript) | 384 KiB | Every script type | No |
+
+Jobs have no instruction limit and no wall clock, because running long is what a job is for. A job should check `ctx.job.should_stop()` and return when it is asked to stop.
+
+## Instructions
+
+The instruction limit stops runaway loops. What counts as one instruction depends on the language:
+
+- **Lua** counts Lua VM instructions.
+- **JavaScript and TypeScript** count the engine's interrupt checks, which happen at every loop back-edge and function call.
+
+So the same setting allows a different amount of work in each language.
+
+Once the budget is spent it stays spent. In Lua, `pcall`, `xpcall` and `coroutine.resume` re-raise it. In JavaScript and TypeScript the interrupt skips `catch` and `finally`. A run that spends its budget fails with `timeout`.
+
+For TypeScript, the compile step that turns your script into JavaScript runs before the engine starts, so the instruction budget doesn't count it. The wall clock and the host's memory ceiling still do.
+
+## Wall clock
+
+The wall clock counts only time the script itself is running. Time spent waiting on the host, such as an HTTP request or a database read, is not charged. A run that hits the wall clock fails with `timeout`. In a JavaScript or TypeScript script, library calls still in flight when the run is cut short are dropped with it.
+
+## Memory
+
+Each run may allocate up to 64 MiB. The interpreter enforces this, so running out is a normal script error with `errorType` `memory`. Above that, the host holds the plugin to twice that amount as a backstop for anything the interpreter can't see.
+
+## Stack
+
+In JavaScript and TypeScript, runaway recursion throws `RangeError: Maximum call stack size exceeded`, which a script can catch.
+
+## What a client sees
+
+For a query or procedure:
+
+| Cause | `errorType` | Status |
+| --- | --- | --- |
+| Instruction limit or wall clock | `timeout` | 408 |
+| Memory | `memory` | 500 |
+
+For a record or label script, the failure is retried and then dead-lettered. For a job, the job fails. See [failures and retries](./types-and-triggers.mdx#failures-and-retries).
+
+## Change the limits
+
+Set the instruction limit and wall clock in the dashboard under **Settings > General**, in the **Instruction limit** and **Request wall clock (seconds)** fields. You can also set them with environment variables:
+
+```sh
+SCRIPT_INSTRUCTION_LIMIT=5000000
+SCRIPT_WALL_CLOCK_SECONDS=30
+```
+
+Each value is read from the dashboard setting first, then the environment variable, then the default. A value outside the allowed range is refused when you save it in the dashboard. An environment value outside the range is logged as a warning and the default is used. A change reaches other instances that share the database within 10 seconds.
+
+## Other caps
+
+- A `job.wait(seconds)` call is clamped to between 0 and 3600 seconds.
+- A record query through `happyview.db` returns 20 records by default and at most 100 per page. Paginate with the cursor for more.
+- A script description can be up to 300 characters.
+- A test file run by `happyview test` may spend up to 60 seconds of its own time, outside the triggers it fires.
+
+## Next steps
+
+- [Script types and triggers](./types-and-triggers.mdx)
+- [The script contract](./contract.mdx)

@@ -1,0 +1,103 @@
+---
+title: Script types and triggers
+description: The trigger strings that bind a script to XRPC requests, record events, label events and background jobs, and how each type behaves.
+---
+
+# Script types and triggers
+
+A script is identified by its **trigger string**. The trigger is the script's `id`: there is no separate name. It has the form `<prefix>:<suffix>`, and the prefix decides which events the script receives.
+
+| Trigger | Fires when | Suffix |
+| --- | --- | --- |
+| `xrpc.query:<nsid>` | The XRPC query `<nsid>` is called | An NSID |
+| `xrpc.procedure:<nsid>` | The XRPC procedure `<nsid>` is called | An NSID |
+| `record.index:<nsid>` | Any record in collection `<nsid>` is created, updated or deleted | An NSID |
+| `record.create:<nsid>` | A record in `<nsid>` is created | An NSID |
+| `record.update:<nsid>` | A record in `<nsid>` is updated | An NSID |
+| `record.delete:<nsid>` | A record in `<nsid>` is deleted | An NSID |
+| `labeler.apply:<nsid>` | A label arrives whose subject is `at://<did>/<nsid>/<rkey>` | An NSID |
+| `labeler.apply:_actor` | A label arrives whose subject is a bare DID | The literal `_actor` |
+| `job.run:<type>` | A background job of type `<type>` is picked up by the worker | A job type |
+
+Any other prefix is refused when you save. The suffix can't be empty. A job type may not end in `.test`, because in a project `src/jobs/<type>.test.<ext>` is a test file.
+
+## Record triggers fall back to `record.index`
+
+For a record event, HappyView first looks for a script on the action's own trigger, such as `record.create:<nsid>`. If there is none, it uses `record.index:<nsid>`. So `record.index` works as a catch-all, and you can override single actions next to it.
+
+No other trigger falls back. XRPC, label and job triggers must match exactly.
+
+## XRPC scripts
+
+A query or procedure script handles the request and its return value is the response body. Without a script, HappyView uses its default query and procedure behavior.
+
+An XRPC script fails closed and runs once. An error becomes an error response to the caller. See [errors](./contract.mdx#errors).
+
+## Record scripts
+
+A record script runs before the record is indexed, so it can skip the record, rewrite it, or trigger side effects. It reacts to events from the network, including the echo of writes HappyView itself made to a PDS. It does not run on an XRPC request.
+
+| `handle` returns | Effect |
+| --- | --- |
+| Nothing (`nil`, `undefined`, `null`) | The record is not indexed. On a delete, the delete is skipped and the record stays |
+| An object | That object is stored in place of the record |
+| Anything else, such as `true` | The record is stored as it arrived |
+| (no script) | The record is stored as it arrived |
+
+A delete event carries no record, so returning `input.record` on a delete returns nothing and skips the delete. Return `true` to let a delete through.
+
+There is no caller session in a record script, so a library call that writes to a PDS as the caller fails. Reads, HTTP, and local index writes work. Record scripts can also run more than once for the same record; see [Create scripts may run more than once](./idempotency.mdx).
+
+## Label scripts
+
+A label script runs when a label arrives from a subscribed labeler, before the label is stored.
+
+| `handle` returns | Effect |
+| --- | --- |
+| Nothing | The label is not stored |
+| An object | Its fields are merged over the label. Fields it leaves out keep their original values |
+| Anything else, such as `true` | The label is stored as it arrived |
+| (no script) | The label is stored as it arrived |
+
+`ctx.caller_did` is absent in a label script, because no repo is acting.
+
+## Job scripts
+
+A job script runs when the background worker picks up a job of its type. Any script can create a job with `create(job_type, input[, opts])` from the `happyview.jobs` library. Passing `{ auth: true }` (`{ auth = true }` in Lua) carries the caller's PDS session into the job.
+
+The return value becomes the job's result. A job is not held to the instruction limit or the wall clock; it should check `ctx.job.should_stop()` and return when asked. See [Limits](./limits.mdx).
+
+## Failures and retries
+
+| Script type | On failure |
+| --- | --- |
+| Query, procedure | One attempt. The caller gets the error |
+| Record, label | Up to 4 attempts in total, with 1, 2 and 4 second delays between them. After the last one, the event is written to the dead-letter table and the record or label is stored as it arrived |
+| Job | The job's status becomes `failed`, with the error message as its error |
+
+Record and label scripts fail open so a broken script can't stop indexing. They run before indexing, so a slow or failing script holds up the events behind it: a script that fails every time spends about 7 seconds per event on backoff.
+
+## Create a script
+
+From the dashboard, open **Scripts** and click **New script**. Pick the trigger, the target, and, if more than one interpreter is installed, the [language](./languages.mdx#pick-a-language-in-the-dashboard).
+
+With the admin API, `POST /admin/scripts` with the trigger as `id`:
+
+```sh
+curl -X POST "http://127.0.0.1:3000/admin/scripts" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "record.create:xyz.statusphere.status",
+    "script_type": "javascript",
+    "body": "export default (input) => input.record ?? true;",
+    "description": "Pass statuses through"
+  }'
+```
+
+`script_type` defaults to `lua` when left out. The body is checked by the interpreter for that language when you save, and a language no installed interpreter claims is refused with a `400`. A `description` can be up to 300 characters.
+
+## Next steps
+
+- [The script contract](./contract.mdx)
+- [Create scripts may run more than once](./idempotency.mdx)
