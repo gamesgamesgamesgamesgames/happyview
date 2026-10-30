@@ -23,16 +23,15 @@ pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub fn fuel_for(plugin_type: PluginType) -> u64 {
     match plugin_type {
         PluginType::Library | PluginType::Auth => DEFAULT_FUEL,
-        // Fuel cannot bound an interpreter: wasmtime 49's Cranelift does not
-        // reload the fuel counter in a frame that catches a `throw`, so a
-        // guest that catches an error erases the fuel its body spent, and
-        // every Lua error on the wasi route is such a throw (reproduction:
-        // `.superpowers/spikes/lua-wasm/candidates/eh-probe/fuel_loss.wat`).
-        // Epoch interruption is the boundary that holds, which is why the
-        // engine keeps exceptions enabled: `executor::deadline`'s catching
-        // guest test shows the deadline stopping a `try_table` loop that
-        // fuel does not. Fuel stays enabled engine-wide because it is what
-        // bounds libraries. The whole range also covers the per-byte
+        // An interpreter is bounded by the operator's wall clock, an epoch
+        // deadline armed per run, rather than by fuel: nothing has calibrated
+        // a fuel budget against a script's instruction budget. Fuel is still
+        // charged, including across a caught `throw` (every Lua error on the
+        // wasi route is one): on wasmtime 49.0.5 and 50.0.1, a frame that
+        // catches a throw keeps the fuel its callees spent, whether they were
+        // reached by `call`, `call_indirect` or `call_ref`, and runs out of
+        // fuel when it should. Fuel stays enabled engine-wide because it is
+        // what bounds libraries. The whole range also covers the per-byte
         // instantiation charge a megabytes-sized interpreter image draws on
         // a host without copy-on-write memory.
         PluginType::Interpreter => u64::MAX,
@@ -90,10 +89,11 @@ pub const FUEL_PER_INSTRUCTION: u64 = 4_000;
 /// The fuel each call into a compiled module gets. `None` is a job, which
 /// has no budget and stops through `should_stop`.
 ///
-/// Fuel can bound a compiled module where it cannot bound an interpreter
-/// (see [`fuel_for`]) because nothing here catches a wasm `throw`: stable
-/// Rust on wasm32-wasip1 aborts on panic and emits no exception-handling
-/// instructions, and a module that defines a tag is refused before it runs.
+/// A compiled module is bounded by fuel, where an interpreter is bounded by
+/// the wall clock (see [`fuel_for`]). It never catches a wasm `throw`:
+/// stable Rust on wasm32-wasip1 aborts on panic and emits no
+/// exception-handling instructions, and a module that defines a tag is
+/// refused before it runs (see `project::script_module`).
 pub fn module_fuel(instructions: Option<u32>) -> u64 {
     instructions.map_or(u64::MAX, |n| {
         u64::from(n).saturating_mul(FUEL_PER_INSTRUCTION)

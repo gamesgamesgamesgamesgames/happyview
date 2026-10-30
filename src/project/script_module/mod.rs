@@ -225,8 +225,11 @@ fn load_one(
             )]);
         }
     }
-    // Fuel is not reliably charged in a frame that catches a throw, so a
-    // module that could catch one could run past its instruction budget.
+    // A module is bounded by fuel, and wasmtime 49 predates the fix that
+    // saves and restores fuel around exception catches (wasmtime#14407, in
+    // 50). The shapes tested charge correctly on 49 regardless, but a module
+    // that catches its own throws is refused until fuel across a catch is
+    // something HappyView relies on and tests.
     if sections.uses_exceptions {
         return Err(vec![error(
             &artifact,
