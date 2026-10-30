@@ -18,6 +18,30 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 use wiremock::MockServer;
 
+/// See [`TestApp::build_router`].
+async fn as_dashboard(mut req: Request<Body>) -> Request<Body> {
+    let headers = req.headers();
+    let cookie = format!("{}=", happyview::auth::COOKIE_NAME);
+    let carries_session = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(';')
+                .any(|pair| pair.trim_start().starts_with(&cookie))
+        });
+    if carries_session
+        && !headers.contains_key("sec-fetch-site")
+        && !headers.contains_key(axum::http::header::ORIGIN)
+    {
+        req.headers_mut().insert(
+            "sec-fetch-site",
+            axum::http::HeaderValue::from_static("same-origin"),
+        );
+    }
+    req
+}
+
 use crate::common::{db, watchdog};
 
 pub struct TestApp {
@@ -249,8 +273,19 @@ impl TestApp {
         }
     }
 
+    /// The instance's router, as the dashboard's own browser reaches it: a
+    /// request carrying the session cookie and no fetch metadata is sent as
+    /// `Sec-Fetch-Site: same-origin`, because outside `/admin` the cookie
+    /// counts only on a same-origin request and a test request has no
+    /// browser to say so. A test about fetch metadata sends its own headers,
+    /// or uses [`TestApp::unmarked_router`] to send none.
     fn build_router(state: &AppState) -> axum::Router {
-        happyview::testkit::app::router(state)
+        happyview::testkit::app::router(state).layer(axum::middleware::map_request(as_dashboard))
+    }
+
+    /// The instance's router with nothing added to a request.
+    pub fn unmarked_router(&self) -> axum::Router {
+        happyview::testkit::app::router(&self.state)
     }
 
     pub fn rebuild_router(&mut self) {
