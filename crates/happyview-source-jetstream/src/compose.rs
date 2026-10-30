@@ -29,6 +29,32 @@ pub trait BackfillExecutor: Send + Sync + 'static {
     /// Backfill `collection`. Return early once [`JobHandle::should_stop`]
     /// says so; the job is then paused or cancelled, whatever this returns.
     async fn run(&self, job: JobHandle, collection: &str) -> Result<JobTotals, String>;
+    /// What this executor can say about `collection` now, apart from any
+    /// job: shown beside its backfills, since what it backfills from can
+    /// keep changing after a job ends. `None` says nothing.
+    async fn describe(&self, _collection: &str) -> Option<CollectionSummary> {
+        None
+    }
+}
+
+/// An executor's account of a collection it backfills
+/// ([`BackfillExecutor::describe`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CollectionSummary {
+    /// A sentence for the operator, in the executor's words.
+    pub message: String,
+    /// Records the executor holds for the collection, when it knows.
+    pub records: Option<i64>,
+    /// Whether what it backfills from is still being filled.
+    pub state: Option<SummaryState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryState {
+    Running,
+    Complete,
+    Failed,
 }
 
 /// What an executor's run did.
@@ -95,6 +121,12 @@ impl JobHandle {
                 total_records: None,
             },
         );
+    }
+
+    /// A sentence for the operator about what this job did or found, shown
+    /// with the job. A later note replaces an earlier one.
+    pub async fn note(&self, note: &str) {
+        backfill::set_note(&self.jobs, &self.id, note).await;
     }
 
     /// The job's stage, shown as it is.

@@ -288,6 +288,29 @@ impl WasmRuntime {
         tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
     }
 
+    /// Start compiling `plugin`'s module on a blocking thread, so its first
+    /// call finds it ready rather than waiting out a compile that takes
+    /// seconds for an interpreter. A call arriving mid-compile waits for this
+    /// one instead of starting its own. A plugin removed before the thread
+    /// runs is not compiled, and a failure is only logged: the first call
+    /// reports it.
+    pub fn warm(&self, plugin: &Arc<LoadedPlugin>) -> tokio::task::JoinHandle<()> {
+        let engine = self.engine.clone();
+        let modules = self.modules.clone();
+        let plugin = Arc::downgrade(plugin);
+        tokio::task::spawn_blocking(move || {
+            let Some(plugin) = plugin.upgrade() else {
+                return;
+            };
+            if modules.get_by_identity(&plugin.info.id, &plugin).is_some() {
+                return;
+            }
+            if let Err(e) = resolve(&engine, &modules, &plugin) {
+                tracing::warn!(plugin_id = %plugin.info.id, error = %e, "plugin module could not be precompiled");
+            }
+        })
+    }
+
     /// [`WasmRuntime::module_for`] on the calling thread, for a caller
     /// already off the async workers.
     pub fn module_for_blocking(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
@@ -377,14 +400,25 @@ fn resolve(
         return Ok(module);
     }
     let key = cache_key(engine, &sha);
-    if let Some(module) = modules.load_from_disk(engine, &key) {
+    // One compile per key at a time: whoever waited here finds the module
+    // the holder inserted.
+    let slot = modules.compiling(&key);
+    let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| -> Result<Module, anyhow::Error> {
+        if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
+            return Ok(module);
+        }
+        if let Some(module) = modules.load_from_disk(engine, &key) {
+            modules.insert(id, plugin, &sha, module.clone());
+            return Ok(module);
+        }
+        let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
+        modules.write_to_disk(&key, &module, serialized.as_deref());
         modules.insert(id, plugin, &sha, module.clone());
-        return Ok(module);
-    }
-    let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
-    modules.write_to_disk(&key, &module, serialized.as_deref());
-    modules.insert(id, plugin, &sha, module.clone());
-    Ok(module)
+        Ok(module)
+    })();
+    modules.done_compiling(&key, &slot);
+    result
 }
 
 /// The total size of the compiled modules the process keeps for its
@@ -572,9 +606,33 @@ struct ModuleCache {
     warned: AtomicBool,
     /// Set by [`WasmRuntime::without_shared_modules`].
     unshared: bool,
+    /// One lock per cache key being resolved, so two callers wanting the
+    /// same module compile it once.
+    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ModuleCache {
+    fn compiling(&self, key: &str) -> Arc<Mutex<()>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop `key`'s lock once nobody needs it. A waiter still holding a
+    /// clone finds the module by hash when it gets the lock.
+    fn done_compiling(&self, key: &str, slot: &Arc<Mutex<()>>) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(key)
+            .is_some_and(|held| Arc::ptr_eq(held, slot))
+        {
+            in_flight.remove(key);
+        }
+    }
+
     fn get_by_identity(&self, id: &str, plugin: &Arc<LoadedPlugin>) -> Option<Module> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.get(id)?;
@@ -1270,6 +1328,32 @@ mod tests {
 
         assert_eq!(runtime.compile_count(), 1);
         assert!(during > 0, "the ticker did not run during the compile");
+    }
+
+    /// Callers wanting a module nobody holds yet compile it once: the rest
+    /// wait for the first and take what it compiled.
+    #[test]
+    fn concurrent_callers_compile_a_module_once() {
+        let runtime = Arc::new(
+            WasmRuntime::without_ticker()
+                .unwrap()
+                .without_shared_modules(),
+        );
+        let plugin = plugin("p", &answering(7));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (runtime, plugin, start) = (runtime.clone(), plugin.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.module_for_blocking(&plugin).unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(answer(&runtime, &thread.join().unwrap()), 7);
+        }
+        assert_eq!(runtime.compile_count(), 1);
     }
 
     #[test]

@@ -54,7 +54,7 @@ curl -X PUT "http://localhost:3000/admin/project?dry_run=true" \
   },
   "backfills": ["com.example.post"],
   "warnings": [
-    { "path": "happyview.toml", "message": "[instance] is ignored by a deploy; it configures the instance, not the project" }
+    { "path": "happyview.toml", "message": "[instance] app_name differs from this instance's and is ignored by a deploy; [instance] configures the instance, not the project" }
   ]
 }
 ```
@@ -79,7 +79,7 @@ curl -X PUT "http://localhost:3000/admin/project?dry_run=true" \
 
 A backfill starts only for a record lexicon declared with `[lexicons."<nsid>"] backfill = true`, only if it is indexed, and only if its collection has never been backfilled on this instance, which is the rule `HAPPYVIEW_PROJECT` follows at boot. `project:deploy` is enough to start it.
 
-`[instance]`, `[dev]` and `[jetstream]` configure the instance rather than the project. A deploy ignores them and says so in `warnings`. `[interpreters]`, `[libraries]` and `[happyview] version` are ignored without a warning: the plugins have to be installed before the deploy, and the deploying client checks the version.
+`[instance]`, `[dev]` and `[jetstream]` configure the instance rather than the project. A deploy ignores them and says so in `warnings`. For `[instance]` it only does so when a key differs from what the instance runs with, and names those keys, so a project kept in step with its instance deploys without a warning. `[interpreters]`, `[libraries]` and `[happyview] version` are ignored without a warning: the plugins have to be installed before the deploy, and the deploying client checks the version.
 
 ### Errors
 

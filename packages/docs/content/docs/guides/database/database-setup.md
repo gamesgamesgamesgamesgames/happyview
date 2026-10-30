@@ -52,7 +52,7 @@ HappyView applies any pending migrations every time it starts, before it serves 
 
 **Multiple replicas on Postgres.** HappyView takes a database-wide lock while it migrates. A replica that starts while another holds it waits for that migration to finish, which takes as long as the slowest index build. When an upgrade carries a migration like this, roll it out to one replica first and start the rest once it is serving. Replicas still on an older release take the lock differently, and one that starts during a concurrent index build can deadlock with it. Postgres then aborts one side or the other, and that can be the upgraded replica's index build. That build leaves an invalid index, which HappyView drops and rebuilds from scratch on its next boot. An orchestrator that keeps restarting old replicas can therefore keep the build from ever finishing. While the first upgraded replica migrates, scale to that single replica, or at least keep replicas on the older release from starting, then bring the rest up once it is serving.
 
-The `happyview_records` index on `(collection, created_at DESC, uri DESC)` is one of these. It replaces the `idx_records_created_at_uri` and `idx_records_collection` indexes, which the same upgrade drops.
+Before the compact record format, the `happyview_records` table's index on `(collection, created_at DESC, uri DESC)` was one of these. It replaced the `idx_records_created_at_uri` and `idx_records_collection` indexes, which the same upgrade dropped. The compact format's records table has its own indexes, and `happyview_records` is now a view (see below).
 
 ## The compact record format
 
@@ -156,11 +156,27 @@ Writes go through triggers on the views, with these differences:
 
 Some queries are slower through the views, because `uri`, `source_uri` and `target_uri` are computed when they are read:
 
-- Filtering on `uri`, `source_uri` or `target_uri` reads every row. Filter `happyview_records` by `did`, `collection` and `rkey` instead, which use an index. For the records that link to a URI, use the [`happyview.backlinks`](../../api-reference/lua/libraries.md) library, or `host_backlinks_query` from a plugin.
+- Filtering on `uri`, `source_uri` or `target_uri` reads every row. Filter `happyview_records` by `did`, `collection` and `rkey` together instead, which use an index. For the records that link to a URI, use the [`happyview.backlinks`](../../api-reference/lua/libraries.md) library, or `host_backlinks_query` from a plugin.
+- Filtering by `collection` alone can read every record on a large Postgres database, even with a `LIMIT`. To read one collection, use `happyview_records_by_collection` (below).
 - `ORDER BY` or a range on `created_at`, `indexed_at` or `uri` sorts or scans the whole collection.
 - On Postgres, `cid`, `indexed_at` and `created_at` are converted back to text as they are read, about 6.6 µs per row for the three (about 7 seconds per million rows). A query that reads every row, such as an export, is faster when it selects only the columns it needs.
 
 HappyView's own queries read the tables directly and are not affected.
+
+### Reading one collection
+
+`happyview_records_by_collection` is a read-only view with `happyview_records`' columns plus `collection_id`, `created_at_us` and `indexed_at_us` (the timestamps in microseconds) and `id`. Filter it with `hv_collection_id`, which gives a collection's id, and order it by `created_at_us` and `id`, which is the order of the index on the records table:
+
+```sql
+SELECT uri, record FROM happyview_records_by_collection
+ WHERE collection_id = hv_collection_id('xyz.statusphere.status')
+ ORDER BY created_at_us DESC, id DESC
+ LIMIT 50;
+```
+
+That reads only the collection's newest rows, however large the database. For the next page, add `AND (created_at_us, id) < (?, ?)` with the last row's values. `hv_collection_id` answers `NULL` for a collection the database doesn't have, so the query returns nothing. Raw SQL may read this view and call the function; it may not read `happyview_collections` itself.
+
+`happyview_records` keeps its columns unchanged, so `SELECT *` and positional `INSERT`s on it work as before. Add the view to existing queries only where they filter by collection.
 
 #### When record storage offers a raw read route
 

@@ -8,7 +8,10 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::plugin::attestation::AttestationSigner;
 use crate::profile;
 
-use super::{MAX_HTTP_RESPONSE_SIZE, no_redirect_client};
+use super::{
+    BoundedError, MAX_HTTP_REQUEST_DURATION, MAX_HTTP_RESPONSE_SIZE, no_redirect_client,
+    send_bounded,
+};
 
 use happyview_plugin_sdk::wire::{AtprotoBlobDownload, AttestVerify, BlobData, Label};
 
@@ -178,50 +181,40 @@ async fn blob_download_capped(
     // `refuse_unsafe_endpoint` never saw.
     let client = no_redirect_client()
         .map_err(|e| AtprotoError::Other(format!("failed to build client: {e}")))?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AtprotoError::Other(format!("request failed: {e}")))?;
+    // Bounded as `host_http_request` is: an oversized blob is refused on its
+    // advertised size before any of it is read, or once the bytes read pass
+    // the cap, never after buffering all of it.
+    let (status, headers, bytes) =
+        match send_bounded(client.get(&url), cap, MAX_HTTP_REQUEST_DURATION).await {
+            Ok(response) => response,
+            Err(BoundedError::Over(size)) => return Err(too_large(size, cap)),
+            Err(BoundedError::TimedOut(after)) => {
+                return Err(AtprotoError::Other(format!(
+                    "request timed out after {}s",
+                    after.as_secs()
+                )));
+            }
+            Err(BoundedError::Failed(e)) => {
+                return Err(AtprotoError::Other(format!("request failed: {e}")));
+            }
+        };
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
         return Err(AtprotoError::Blob {
-            status: status.as_u16(),
-            body,
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
         });
     }
 
-    // Refuse on the advertised size before buffering the body, so an
-    // oversized blob is rejected without paying for the transfer.
-    if let Some(len) = response.content_length()
-        && len > cap
-    {
-        return Err(too_large(len, cap));
-    }
-
-    let mime_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AtprotoError::Other(format!("failed to read body: {e}")))?;
-
-    // A dishonest or absent `content-length` doesn't get a pass: check the
-    // body actually read too.
-    if bytes.len() as u64 > cap {
-        return Err(too_large(bytes.len() as u64, cap));
-    }
+    let mime_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
     Ok(BlobData {
         size: bytes.len() as u64,
-        bytes: bytes.to_vec(),
+        bytes,
         mime_type,
     })
 }

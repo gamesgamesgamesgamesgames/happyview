@@ -88,6 +88,15 @@ Jobs only run when the files they cover change, so a docs-only PR skips the Rust
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
 - **PR builds**: when your PR touches the server, CI builds Docker images and binaries, and a bot comments with `docker pull ghcr.io/gamesgamesgamesgamesgames/happyview:pr-<number>` so reviewers can try it.
+- **The `Vercel` check** builds a preview of the docs site. On a PR from a fork it fails with "Authorization required to deploy" until a maintainer authorizes it. It isn't a required check, so it never blocks your PR, and you don't need to do anything about it.
+
+### Pull requests from forks
+
+CI runs a fork's PR without the repository's secrets, and every required check is built to pass without them. PR images are pushed by a separate workflow that runs from the default branch and never executes the PR's code. What a maintainer does on a fork's PR:
+
+1. **Approve the workflow run** for a first-time contributor, from the banner on the PR's Checks tab. Read the diff first, especially anything under `.github/`: the run executes the PR's code on our runners.
+2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
+3. **Check the squash message before merging.** This repository fills it with the PR's commit messages, trailers included. Delete any trailer we don't carry, such as an AI co-author line, in the merge dialog, and keep the contributor's `Signed-off-by`.
 
 ### Unit tests
 

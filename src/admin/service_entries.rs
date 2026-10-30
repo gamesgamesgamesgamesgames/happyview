@@ -335,14 +335,7 @@ pub(super) async fn sync_plc_request(
             }
             e
         })?;
-    let agent = Agent::new(session);
-
-    agent
-        .api
-        .com
-        .atproto
-        .identity
-        .request_plc_operation_signature()
+    crate::repo::pds::request_plc_operation_signature(&session)
         .await
         .map_err(|e| {
             if is_pds_session_expired(&e) {
