@@ -757,11 +757,6 @@ pub async fn xrpc_post(
         )));
     }
 
-    if let Some(ref param_schema) = lexicon.parameters {
-        coerce_params(&mut params, param_schema);
-        validate::params(&mut params, param_schema)?;
-    }
-
     // For service auth, synthesise Claims from the caller's DID so the
     // procedure handler has an identity to work with.
     let service_auth_claims_owned;
@@ -775,6 +770,13 @@ pub async fn xrpc_post(
         service_auth_claims_owned = c;
         (&service_auth_claims_owned, None)
     };
+
+    // After auth, so a caller who may not call the procedure learns nothing
+    // about its lexicon from a validation error.
+    if let Some(ref param_schema) = lexicon.parameters {
+        coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
+    }
 
     // `input.encoding` decides what the script receives. Bytes are stored
     // before the script runs and reach it as an ordinary blob ref, so a script

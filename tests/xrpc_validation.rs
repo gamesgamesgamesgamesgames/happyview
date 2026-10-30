@@ -487,6 +487,36 @@ async fn a_procedure_param_is_checked() {
     );
 }
 
+/// Auth is checked first: a caller who may not call the procedure is told
+/// so, and learns nothing about its lexicon from a validation error. Both
+/// the params and the body here would be refused if they were reached.
+#[tokio::test]
+async fn an_unauthenticated_procedure_call_is_refused_before_validation() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/xrpc/{PROCEDURE}?dryRun=perhaps"))
+                .header("x-client-key", "hvc_test")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "too long" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = json_body(resp).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_ne!(body["error"], "InvalidRequest", "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // Procedure input
 // ---------------------------------------------------------------------------
