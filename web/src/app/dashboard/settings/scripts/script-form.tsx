@@ -18,8 +18,12 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { LexiconSummary } from "@/types/lexicons";
-import { defaultBodyFor, isDefaultBody } from "@/lib/lua-templates";
-import type { TriggerKind } from "@/types/scripts";
+import {
+  defaultBodyFor,
+  isDefaultBody,
+  languageLabel,
+} from "@/lib/script-templates";
+import type { ScriptLanguage, TriggerKind } from "@/types/scripts";
 import { TRIGGER_KIND_LABELS, parseTriggerId } from "@/types/scripts";
 
 /**
@@ -65,6 +69,8 @@ export interface ScriptFormState {
   source: string;
   description: string;
   body: string;
+  /** The script's `script_type`: the language its interpreter runs. */
+  language: ScriptLanguage;
 }
 
 /**
@@ -76,6 +82,7 @@ export function stateFromScript(args: {
   id: string;
   description: string | null | undefined;
   body: string;
+  language: ScriptLanguage;
 }): ScriptFormState {
   const parsed = parseTriggerId(args.id);
   const kind = parsed?.kind ?? "record.index";
@@ -89,6 +96,7 @@ export function stateFromScript(args: {
     source,
     description: args.description ?? "",
     body: args.body,
+    language: args.language,
   };
 }
 
@@ -165,7 +173,26 @@ function withKind(state: ScriptFormState, kind: TriggerKind): ScriptFormState {
   return {
     ...state,
     kind,
-    body: isDefaultBody(state.body) ? defaultBodyFor(kind) : state.body,
+    body: isDefaultBody(state.body)
+      ? defaultBodyFor(kind, state.language)
+      : state.body,
+  };
+}
+
+/**
+ * Change the language, swapping an untouched prefill for that language's.
+ * A body the operator wrote stays, for them to port or to switch back to.
+ */
+export function withLanguage(
+  state: ScriptFormState,
+  language: ScriptLanguage,
+): ScriptFormState {
+  return {
+    ...state,
+    language,
+    body: isDefaultBody(state.body)
+      ? defaultBodyFor(state.kind, language)
+      : state.body,
   };
 }
 
@@ -211,7 +238,7 @@ export function ScriptForm({
   lexicons,
   lexiconsLoading,
   readOnly,
-  language = "lua",
+  languages,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
@@ -222,8 +249,11 @@ export function ScriptForm({
   lexiconsLoading?: boolean;
   /** For a script a project file owns: everything shows, nothing edits. */
   readOnly?: boolean;
-  /** The script's `script_type`: the language its interpreter runs. */
-  language?: string;
+  /**
+   * The installed languages to pick from, for a script not yet created. A
+   * stored script keeps its language, so the detail page passes none.
+   */
+  languages?: ScriptLanguage[];
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -236,6 +266,29 @@ export function ScriptForm({
           lexicons={lexicons ?? []}
           lexiconsLoading={lexiconsLoading}
         />
+      )}
+
+      {languages && languages.length > 1 && (
+        <div className="flex flex-col gap-1">
+          <Label htmlFor="language" className="text-xs">
+            Language
+          </Label>
+          <Select
+            value={state.language}
+            onValueChange={(v) => onChange(withLanguage(state, v))}
+          >
+            <SelectTrigger id="language" className="w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {languages.map((language) => (
+                <SelectItem key={language} value={language}>
+                  {languageLabel(language)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       )}
 
       <div className="flex flex-col gap-1">
@@ -256,13 +309,13 @@ export function ScriptForm({
 
       <div className="flex flex-col flex-1 min-h-[300px] gap-1">
         <Label htmlFor="body" className="text-xs">
-          Lua body
+          {languageLabel(state.language)} body
         </Label>
         <div className="border rounded-md flex-1 min-h-[300px] overflow-hidden">
           <MonacoEditor
             value={state.body}
             onChange={(v) => onChange({ ...state, body: v })}
-            language={language}
+            language={state.language}
             trigger={state.suffix ? composeTriggerId(state) : undefined}
             readOnly={readOnly}
             className="h-full"
