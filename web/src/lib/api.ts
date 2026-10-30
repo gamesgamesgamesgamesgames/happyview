@@ -13,6 +13,7 @@ import type {
 } from "@/types/lexicon-publishing";
 import type { ResolvedIdentity } from "@/types/identity";
 import type {
+  BackfillCollection,
   BackfillJob,
   BackfillReposResponse,
   PdsSummaryResponse,
@@ -333,6 +334,12 @@ export function deleteNetworkLexicon(nsid: string) {
 // Backfill
 export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
+}
+
+export function getBackfillCollection(nsid: string) {
+  return apiFetch<BackfillCollection>(
+    `/admin/backfill/collections/${encodeURIComponent(nsid)}`,
+  );
 }
 
 export function createBackfillJob(body: {

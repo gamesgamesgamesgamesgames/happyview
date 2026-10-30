@@ -233,6 +233,7 @@ interface BackfillJob {
   created_at: string;
   discovery_complete: boolean;
   recent_completions_limit: number | null;
+  note: string | null;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/backfill/status", {
@@ -283,7 +284,8 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
     "completed_at": "2025-01-01T00:05:00Z",
     "created_at": "2025-01-01T00:00:00Z",
     "discovery_complete": true,
-    "recent_completions_limit": 1000
+    "recent_completions_limit": 1000,
+    "note": null
   }
 ]
 ```
@@ -315,7 +317,8 @@ A replay job looks like this:
   "completed_at": null,
   "created_at": "2025-01-01T00:00:00Z",
   "discovery_complete": true,
-  "recent_completions_limit": null
+  "recent_completions_limit": null,
+  "note": null
 }
 ```
 
@@ -329,7 +332,37 @@ The three repo counters count work units. A unit is one repo under one collectio
 
 `discovery_complete` is `false` while a network job is still listing repos from the relay. Discovery runs alongside resolving and fetching, and until it finishes `total_repos` counts the repos discovered so far. `recent_completions_limit` is set for jobs on the bounded queue (every job created after upgrading to the release that introduced it), which keep only that many completed repos for the `fetched` list. It is `null` for jobs created before that upgrade.
 
+A record source can backfill some collections itself rather than crawl or replay them. Such a job's `source` is the name the record source gives its backfills, its counters are whatever the record source reports, and `note` may carry a sentence from the record source about what the job did or found. `note` is `null` for every other job.
+
 A job HappyView paused itself, because it ran out of work with repos it could not complete still queued, has `status` `paused` and the reason in `error` (for example `"paused: 3 units could not be completed; resume to retry"`). A job an operator paused has no `error`. Resuming clears it.
+
+## Describe a collection's backfill
+
+```
+GET /admin/backfill/collections/{nsid}
+```
+
+Who backfills a collection and, when the record source backfills it itself, what the record source says about the collection now. That can change after a job ends, for example while the record source is still filling its own copy. Requires `BackfillRead`.
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/backfill/collections/xyz.statusphere.status -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+```json
+{
+  "collection": "xyz.statusphere.status",
+  "executor": "mirror",
+  "summary": {
+    "message": "This collection is served from the record source's own copy, which is still being filled.",
+    "records": 594312,
+    "state": "running"
+  }
+}
+```
+
+`executor` is `null` for a collection HappyView crawls or replays, and `summary` is then `null` too. A record source that backfills a collection but says nothing about it answers `"summary": null`. In a summary, `records` and `state` (`running`, `complete` or `failed`) are `null` when the record source doesn't know them.
 
 ## List errors for a job
 
@@ -488,6 +521,7 @@ Events are sent with `event: event` and a JSON `data` payload. Each event has a 
 | `job_counters`     | Updated progress counters                         |
 | `job_stage_changed`| The job moved to a new processing stage           |
 | `job_completed`    | The job finished (completed, failed, or cancelled) |
+| `job_note`         | The record source set the job's `note`             |
 | `job_snapshot`     | The job's current status, stage, counters, error counts and `discovery_complete`, sent on connect and after the stream falls behind |
 
 ## Flush job details
