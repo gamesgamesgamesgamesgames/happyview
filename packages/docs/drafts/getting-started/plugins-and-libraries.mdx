@@ -27,12 +27,12 @@ A self-hosted instance has no interpreter until you install one. At boot it logs
 
 ## Install from the registry
 
-HappyView reads its plugin catalogue from the HappyProto registry. The official plugins are published there under `did:plc:mo7vq4jbioxwafy5zkcc3eux`. The catalogue refreshes every 15 minutes.
+HappyView reads its plugins from the HappyProto registry. The official plugins are published there under `did:plc:mo7vq4jbioxwafy5zkcc3eux`. The registry list refreshes every 15 minutes.
 
 Each plugin publishes up to three channels: `latest`, `beta` and `alpha`. HappyView v3 is in alpha, so install from the `alpha` channel for now.
 
 1. Open **Plugins** in the dashboard, under **Integrations**, and click **Add plugin**.
-2. Pick a plugin from the catalogue, for example **Lua**.
+2. Pick a plugin from the registry, for example **Lua**.
 3. Set **Channel** to `alpha`. The picker starts on `latest` when the plugin publishes one.
 4. Open the **Permissions** tab and read what the plugin asks for. See [Capabilities](#capabilities) below.
 5. Click **Install**.

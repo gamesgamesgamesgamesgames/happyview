@@ -3,31 +3,36 @@ title: Reacting to records
 description: Run a script whenever a record in one of your collections is created, updated or deleted, and when a labeler labels it.
 type: how-to
 prerequisites:
+  - /docs/getting-started/running-locally
+  - /docs/getting-started/lexicons
   - /docs/getting-started/scripts
 ---
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 This page shows you how to run your own code each time a record in one of your collections changes, or a labeler applies a label to it.
 
-You'll write a record script, watch it run, extend it to handle updates and deletes, and then add a label script. The examples use the `xyz.statusphere.status` collection. Use any record collection your instance indexes.
+You'll add a record script to your project, watch it run, extend it to handle updates and deletes, and then add a label script. The examples use the `xyz.statusphere.status` collection. Use any record collection your project defines.
 
-:::note[You need an interpreter]
-Scripts run in an interpreter plugin. Self-hosted instances ship with no interpreter (install one from the alpha channel); HappyProto-managed instances have Lua preinstalled. See [Languages](/docs/reference/scripts/languages#install-an-interpreter).
-:::
+You need a project made with `hpy happyview create`, running under `hpy happyview dev`. `hpy happyview dev` picks up each file when you save it, so you don't need to restart it.
 
 ## Pick a collection
 
-A record script is tied to one collection. HappyView only runs record scripts for collections it indexes, so the collection needs a record lexicon on your instance. Check the **Lexicons** page in the dashboard. If the collection isn't there, add its lexicon first.
+A record script sits next to its collection's record lexicon in your project. So the collection needs a project lexicon: a file under `src/lexicons/` whose path matches its NSID. For `xyz.statusphere.status`, that's `src/lexicons/xyz/statusphere/status.json`. If your project doesn't have it yet, add it first. See [Lexicons](/docs/getting-started/lexicons).
 
 ## Write a create script
 
-1. Open **Scripts** in the dashboard and click **New script**.
-2. Set **Trigger source** to your collection, for example `xyz.statusphere.status`.
-3. Set **Action** to **Record create**. The **Resolved trigger id** shows `record.create:xyz.statusphere.status`.
-4. If more than one interpreter is installed, pick a **Language**.
-5. Replace the body with the script below and click **Create script**.
+A record script's file name is its lexicon's name, then the action, then the language's extension. Create `status.create.lua` (or `.js`, `.ts`) next to `status.json`:
 
-You can also start from the collection's own page under **Lexicons**, which links to a new script with the trigger filled in.
+```
+src/
+  lexicons/
+    xyz/
+      statusphere/
+        status.json
+        status.create.lua
+```
+
+Its trigger is `record.create:xyz.statusphere.status`. Put this in the file:
 
 <Tabs syncKey="lang">
 <TabItem label="Lua">
@@ -35,6 +40,8 @@ You can also start from the collection's own page under **Lexicons**, which link
 ```lua
 local log = require("internal.logging")
 
+---@param input lexicons.xyz.statusphere.status.Event
+---@param ctx happyview.RecordCtx
 function handle(input, ctx)
   log.info("new status", { uri = input.uri, did = input.did })
 
@@ -49,6 +56,10 @@ end
 ```js
 import log from "internal.logging";
 
+/**
+ * @param {import("happyview:lexicons/xyz.statusphere.status").Event} input
+ * @param {import("happyview:ctx").RecordCtx} ctx
+ */
 export default function handle(input, ctx) {
   log.info("new status", { uri: input.uri, did: input.did });
 
@@ -62,17 +73,10 @@ export default function handle(input, ctx) {
 
 ```ts
 import log from "internal.logging";
+import type { Event } from "happyview:lexicons/xyz.statusphere.status";
+import type { RecordCtx } from "happyview:ctx";
 
-interface RecordEvent {
-  action: "create" | "update" | "delete";
-  uri: string;
-  did: string;
-  collection: string;
-  rkey: string;
-  record?: Record<string, unknown>;
-}
-
-export default function handle(input: RecordEvent) {
+export default function handle(input: Event, ctx: RecordCtx) {
   log.info("new status", { uri: input.uri, did: input.did });
 
   // Return the record so it is indexed as it arrived.
@@ -83,25 +87,31 @@ export default function handle(input: RecordEvent) {
 </TabItem>
 </Tabs>
 
+The types come from `.happyview/types/`, which `hpy happyview dev` writes from your lexicons.
+
 `input` is the event: `action`, `uri`, `did`, `collection`, `rkey` and `record`. The script runs before the record is indexed, and what it returns decides what gets stored. Returning the record stores it unchanged.
 
 :::caution[Always return something]
 A script that returns nothing tells HappyView to skip the record, so it is never indexed. If your script only has side effects, end it by returning the record.
 :::
 
+A file that breaks the layout fails the build, and `hpy happyview dev` prints why. For example, `status.create.lua` with no `status.json` next to it is an error. `hpy happyview check` runs the same build without serving the project.
+
 ## See it run
 
-Create a record in the collection, for example by posting a status from a Statusphere client, or wait for one to arrive from the network.
+A record script runs for records that arrive from the network. It doesn't run for an XRPC request. By default, `hpy happyview dev` reads the real network, so a status posted from a Statusphere client reaches your script.
 
-Then open **Event Logs** in the dashboard and set **Category** to **Script**. Each `log.info` call appears as a `script.log` event whose subject is the script's trigger, `record.create:xyz.statusphere.status`. `info`, `warn` and `error` lines are recorded here. `debug` lines aren't recorded as events.
+To watch it, open your local dashboard and go to **System > Event Logs**. Set **Category** to **Script**. Each `log.info` call appears as a `script.log` event whose subject is the script's trigger, `record.create:xyz.statusphere.status`. `info`, `warn` and `error` lines are recorded here. `debug` lines aren't recorded as events.
 
-To see every script run, not just the lines your script logs, turn on **Verbose Event Logging** under **System > General**. It logs a `script.executed` event for each run. It writes a lot, so turn it off again when you're done.
+To see every script run, not just the lines your script logs, start `hpy happyview dev` with `VERBOSE_EVENT_LOGGING=true` in its environment. It logs a `script.executed` event for each run. It writes a lot, so turn it off again when you're done. The **Verbose Event Logging** switch under **System > General** sets the same thing, and wins over the variable.
 
-If the script fails, HappyView retries it and then moves the event to **Dead Letters**. The record is still indexed, so a broken script never stops indexing.
+If the script fails, HappyView tries it up to 4 times in all, then writes the event to **Data > Dead Letters**. The record is still indexed, so a broken script never stops indexing.
+
+To run the script on a record you choose, without waiting for the network, fire a record create at it from a test. See [Testing](/docs/getting-started/testing).
 
 ## Handle updates and deletes
 
-A `record.create` script only sees creates. To handle every action in one script, change the trigger to `record.index:xyz.statusphere.status`. HappyView uses a `record.create`, `record.update` or `record.delete` script when one exists for the action, and falls back to `record.index` otherwise.
+A `record.create` script only sees creates. To handle every action in one script, rename the file to `status.index.lua`. Its trigger is `record.index:xyz.statusphere.status`. HappyView uses `status.create`, `status.update` or `status.delete` when one exists for the action, and falls back to `status.index` otherwise.
 
 A delete carries no record, so returning `input.record` on a delete returns nothing and skips the delete. Return `true` to let it through.
 
@@ -113,6 +123,8 @@ This version also filters: it skips any record whose `status` field is empty, so
 ```lua
 local log = require("internal.logging")
 
+---@param input lexicons.xyz.statusphere.status.Event
+---@param ctx happyview.RecordCtx
 function handle(input, ctx)
   if input.action == "delete" then
     log.info("status deleted", { uri = input.uri })
@@ -134,6 +146,10 @@ end
 ```js
 import log from "internal.logging";
 
+/**
+ * @param {import("happyview:lexicons/xyz.statusphere.status").Event} input
+ * @param {import("happyview:ctx").RecordCtx} ctx
+ */
 export default function handle(input, ctx) {
   if (input.action === "delete") {
     log.info("status deleted", { uri: input.uri });
@@ -154,14 +170,10 @@ export default function handle(input, ctx) {
 
 ```ts
 import log from "internal.logging";
+import type { Event } from "happyview:lexicons/xyz.statusphere.status";
+import type { RecordCtx } from "happyview:ctx";
 
-interface RecordEvent {
-  action: "create" | "update" | "delete";
-  uri: string;
-  record?: { status?: string } & Record<string, unknown>;
-}
-
-export default function handle(input: RecordEvent) {
+export default function handle(input: Event, ctx: RecordCtx) {
   if (input.action === "delete") {
     log.info("status deleted", { uri: input.uri });
     return true;
@@ -181,8 +193,8 @@ export default function handle(input: RecordEvent) {
 
 To change what is stored instead, return a different object. It replaces the record in the index. The full table of return values is in [Script types and triggers](/docs/reference/scripts/types-and-triggers#record-scripts).
 
-:::tip[Create scripts may run more than once]
-The same record can reach a create script more than once, for example when a backfill runs or a failed script is retried. Write create scripts so that running twice does no harm: write by key and replace, avoid counters that add one per run, and check before one-time side effects. See [Create scripts may run more than once](/docs/reference/scripts/idempotency).
+:::caution[Record scripts run at least once]
+Record scripts run at least once for each change, not exactly once. If HappyView restarts, or the record source reconnects, while a batch of changes is being processed, the changes in that batch can be delivered again, and their record scripts run again. Write record scripts so that running one twice for the same record has the same result as running it once. A record script that only returns a modified record is already safe. A record script with side effects, such as creating a job, writing to another repository or sending a notification, should check whether it has already done that for this record and version (its `uri` and `cid`) before doing it again. See [Create scripts may run more than once](/docs/reference/scripts/idempotency).
 :::
 
 ## React to labels
@@ -191,21 +203,23 @@ Labelers are services that apply labels such as `spam` or `!hide` to records and
 
 ### Subscribe to a labeler
 
-Open **Labelers** in the dashboard, click **Add Labeler**, and enter the labeler's DID. Or use the admin API:
+List the labeler's DID under `[labels]` in `happyview.toml`:
 
-```sh
-curl -X POST "http://127.0.0.1:3000/admin/labelers" \
-  -H "$AUTH" \
-  -H "Content-Type: application/json" \
-  -d '{ "did": "did:plc:ar7c4by46qjdydhdevvrndac" }'
+```toml
+[labels]
+subscribe = ["did:plc:ar7c4by46qjdydhdevvrndac"]
 ```
+
+HappyView subscribes to each labeler in the list when it starts, and again each time you save `happyview.toml` under `hpy happyview dev`. Taking a DID out of the list doesn't unsubscribe from it: `hpy happyview dev` tells you the subscription stays until you delete it in the dashboard. Your subscriptions are listed under **Integrations > Labelers**.
 
 ### Write a label script
 
-Create a script with **Action** set to **Label arrival**. The trigger depends on the label's subject:
+A label script lives in `src/labels/`, named by the label's subject:
 
-- `labeler.apply:xyz.statusphere.status` runs for labels on records in that collection.
-- `labeler.apply:_actor` runs for labels on accounts. Pick **Actor** as the **Trigger source**.
+- `src/labels/xyz.statusphere.status.lua` runs for labels on records in that collection. Its trigger is `labeler.apply:xyz.statusphere.status`.
+- `src/labels/_actor.lua` runs for labels on accounts. Its trigger is `labeler.apply:_actor`.
+
+`src/labels/` is flat: a file's name is the whole NSID, so a label script can't sit in a subdirectory.
 
 `input` carries the label: `src` (the labeler's DID), `uri` (the subject), `val` (the label value), `neg` (`true` when the label is being removed), `cts` (when it was created) and, if it expires, `exp`.
 
@@ -219,6 +233,8 @@ local log = require("internal.logging")
 
 local ALLOWED = { ["!hide"] = true, ["spam"] = true }
 
+---@param input happyview.LabelEvent
+---@param ctx happyview.LabelCtx
 function handle(input, ctx)
   if not ALLOWED[input.val] then
     return nil -- drop the label
@@ -237,6 +253,10 @@ import log from "internal.logging";
 
 const ALLOWED = new Set(["!hide", "spam"]);
 
+/**
+ * @param {import("happyview:ctx").LabelEvent} input
+ * @param {import("happyview:ctx").LabelCtx} ctx
+ */
 export default function handle(input, ctx) {
   if (!ALLOWED.has(input.val)) {
     return undefined; // drop the label
@@ -252,19 +272,11 @@ export default function handle(input, ctx) {
 
 ```ts
 import log from "internal.logging";
-
-interface LabelEvent {
-  src: string;
-  uri: string;
-  val: string;
-  neg: boolean;
-  cts: string;
-  exp?: string;
-}
+import type { LabelEvent, LabelCtx } from "happyview:ctx";
 
 const ALLOWED = new Set(["!hide", "spam"]);
 
-export default function handle(input: LabelEvent) {
+export default function handle(input: LabelEvent, ctx: LabelCtx) {
   if (!ALLOWED.has(input.val)) {
     return undefined; // drop the label
   }
@@ -277,12 +289,14 @@ export default function handle(input: LabelEvent) {
 </TabItem>
 </Tabs>
 
-A label script has no caller, so `ctx.caller_did` is absent and it can't write to a PDS or create a job. See [Script types and triggers](/docs/reference/scripts/types-and-triggers#label-scripts).
+A label script has no caller, so `ctx.caller_did` is absent and it can't write to a PDS or create a job. A failing label script is retried and dead-lettered like a record script, and the label is stored as it arrived. See [Script types and triggers](/docs/reference/scripts/types-and-triggers#label-scripts).
 
 ## Next steps
 
 - [Background jobs](/docs/getting-started/background-jobs): move slow work out of record scripts
+- [Testing](/docs/getting-started/testing): fire record and label triggers at your scripts
 - [Script types and triggers](/docs/reference/scripts/types-and-triggers): every trigger and return value
 - [The script contract](/docs/reference/scripts/contract): what `input` and `ctx` carry
 - [Create scripts may run more than once](/docs/reference/scripts/idempotency)
+- [Labelers](/docs/guides/labelers)
 - [Limits](/docs/reference/scripts/limits)
