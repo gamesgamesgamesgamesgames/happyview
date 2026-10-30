@@ -35,6 +35,7 @@ import type {
   PublishableLexicon,
 } from "@/types/lexicon-publishing";
 import { DestinationCell } from "@/components/lexicon-publishing/destination-cell";
+import { DeleteLexiconDialog } from "@/components/lexicons/delete-lexicon-dialog";
 import {
   DnsStatus,
   dnsState,
@@ -44,24 +45,13 @@ import {
   nsidAuthority,
 } from "@/components/lexicon-publishing/model";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Eye, Rows3, Trash2 } from "lucide-react";
+import { Eye, Rows3 } from "lucide-react";
 
 export default function LexiconsPage() {
   const { hasPermission } = useCurrentUser();
@@ -94,14 +84,18 @@ export default function LexiconsPage() {
     load();
   }, [load]);
 
-  async function handleDelete(lex: LexiconSummary) {
+  async function handleDelete(lex: LexiconSummary, deleteRecords: boolean) {
     try {
       if (lex.source === "network") {
         await deleteNetworkLexicon(lex.id);
       } else {
-        await deleteLexicon(lex.id);
+        await deleteLexicon(lex.id, deleteRecords);
       }
-      toast.success("Lexicon deleted");
+      toast.success(
+        deleteRecords
+          ? "Lexicon deleted; its records are being deleted in the background"
+          : "Lexicon deleted",
+      );
       load();
     } catch (e: unknown) {
       toastError("Failed to delete lexicon", e);
@@ -270,39 +264,11 @@ export default function LexiconsPage() {
             {hasPermission("lexicons:delete") &&
               row.original.layer !== "project" &&
               !row.original.declared && (
-                <AlertDialog>
-                  <AlertDialogTrigger asChild>
-                    <Button
-                      variant="destructive"
-                      size="icon"
-                      className="size-8 text-muted-foreground hover:text-destructive"
-                      title="Delete lexicon"
-                      aria-label="Delete lexicon"
-                      onClick={(e) => e.stopPropagation()}
-                      onPointerDown={(e) => e.stopPropagation()}
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
-                  </AlertDialogTrigger>
-                  <AlertDialogContent onClick={(e) => e.stopPropagation()}>
-                    <AlertDialogHeader>
-                      <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
-                      <AlertDialogDescription>
-                        This will permanently remove the lexicon and its
-                        associated routes. This action cannot be undone.
-                      </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                      <AlertDialogCancel>Cancel</AlertDialogCancel>
-                      <AlertDialogAction
-                        variant="destructive"
-                        onClick={() => handleDelete(row.original)}
-                      >
-                        Delete
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
+                <DeleteLexiconDialog
+                  lexicon={row.original}
+                  canDeleteRecords={hasPermission("records:delete-collection")}
+                  onConfirm={handleDelete}
+                />
               )}
           </div>
         ),
