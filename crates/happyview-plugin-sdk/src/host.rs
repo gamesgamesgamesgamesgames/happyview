@@ -26,16 +26,17 @@ use serde_json::{Map, Value};
 use crate::abi::read_packed;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData, BlobInfo,
-    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
-    CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny,
-    JobProgressRequest, JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall,
-    LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut,
-    PanicReport, PluginError, RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch,
-    ResolvedIdentity, ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo,
-    SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut,
-    SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess,
-    SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, StrongRef, TableQuery, TestCall,
-    TestCalls, TestMock, TestPdsWrite, TestReport, TestTrigger, TestTriggerResult,
+    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
+    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, JobCreate,
+    JobGet, JobListAny, JobProgressRequest, JobView, Label, LabelsGet, LinkedRepoBlobUpload,
+    LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
+    LinkedRepoRecordPut, PanicReport, PluginError, RecordRef, RecordsCount, RecordsPage,
+    RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest, SpaceDelete, SpaceInfo,
+    SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove,
+    SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate,
+    SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery,
+    StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite, TestReport, TestTrigger,
+    TestTriggerResult,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{

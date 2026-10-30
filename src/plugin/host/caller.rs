@@ -16,8 +16,8 @@ use crate::auth::Claims;
 use crate::error::AppError;
 
 use happyview_plugin_sdk::wire::{
-    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
-    CallerXrpcProcedure, CallerXrpcQuery, RecordRef,
+    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
+    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, RecordRef,
 };
 
 use crate::plugin::caller::{CallerSession, check_writable_repo};
@@ -790,7 +790,10 @@ mod tests {
         let flag_only = json!({"did": "did:plc:me", "email": "", "emailConfirmed": true});
         assert_eq!(email_from_session(&flag_only), CallerEmail::default());
 
-        for body in [json!({"did": "did:plc:other"}), json!({"handle": "me.test"})] {
+        for body in [
+            json!({"did": "did:plc:other"}),
+            json!({"handle": "me.test"}),
+        ] {
             let err = check_session_did("did:plc:me", &body).unwrap_err();
             assert_eq!(err.code(), "PDS_ERROR", "{body}");
         }
@@ -867,7 +870,9 @@ mod tests {
             crate::linked_repos::client::LINKED_SESSIONS_TABLE,
         );
         let did_value = atrium_api::types::string::Did::new(did.to_string()).unwrap();
-        Store::set(&store, did_value.clone(), session).await.unwrap();
+        Store::set(&store, did_value.clone(), session)
+            .await
+            .unwrap();
         let session = state.linked_repos_client.restore(&did_value).await.unwrap();
         let caller = CallerSession {
             did: did.to_string(),

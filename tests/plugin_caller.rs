@@ -503,10 +503,17 @@ async fn a_session_naming_another_account_is_refused() {
 
     for function in ["get_session", "get_email"] {
         let (status, body) = call_as(&app, &session, function).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{function}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{function}: {body}"
+        );
         let message = body["message"].as_str().unwrap_or_default();
         assert!(message.contains("PDS_ERROR"), "{function}: {message}");
-        assert!(!message.contains("else@example.com"), "{function}: {message}");
+        assert!(
+            !message.contains("else@example.com"),
+            "{function}: {message}"
+        );
         assert!(!message.contains("else.test"), "{function}: {message}");
     }
 }
@@ -530,7 +537,11 @@ async fn get_session_errors_carry_the_pds_status() {
 
     for function in ["get_session", "get_email"] {
         let (status, body) = call_as(&app, &session, function).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{function}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{function}: {body}"
+        );
         let message = body["message"].as_str().unwrap_or_default();
         assert!(message.contains("PDS_ERROR"), "{function}: {message}");
         assert!(message.contains("503"), "{function}: {message}");
@@ -572,11 +583,10 @@ async fn the_email_call_needs_caller_email_declared() {
     let mut manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.join("manifest.json")).unwrap())
             .unwrap();
-    let wasm = std::fs::canonicalize(fixture.join(manifest["wasm_file"].as_str().unwrap()))
-        .expect(
-            "sdk_caller fixture not built. Run: cargo build --manifest-path \
+    let wasm = std::fs::canonicalize(fixture.join(manifest["wasm_file"].as_str().unwrap())).expect(
+        "sdk_caller fixture not built. Run: cargo build --manifest-path \
              tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release",
-        );
+    );
     manifest["wasm_file"] = json!(wasm.to_str().unwrap());
     manifest["capabilities"]
         .as_array_mut()
@@ -613,10 +623,28 @@ async fn a_delegated_request_reads_the_actors_account() {
     seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
     let (client_key, client_secret, dpop_key, access_token) =
         setup_dpop_session_with_secret(&app, OWNER).await;
-    update_session_pds_url(&app, OWNER, &format!("{}/pds/{OWNER}", app.mock_server.uri())).await;
+    update_session_pds_url(
+        &app,
+        OWNER,
+        &format!("{}/pds/{OWNER}", app.mock_server.uri()),
+    )
+    .await;
     let (client_key, dpop_key, access_token) = (&client_key, &dpop_key, &access_token);
-    link_account(&app, client_key, &client_secret, dpop_key, access_token, STUDIO).await;
-    update_session_pds_url(&app, STUDIO, &format!("{}/pds/{STUDIO}", app.mock_server.uri())).await;
+    link_account(
+        &app,
+        client_key,
+        &client_secret,
+        dpop_key,
+        access_token,
+        STUDIO,
+    )
+    .await;
+    update_session_pds_url(
+        &app,
+        STUDIO,
+        &format!("{}/pds/{STUDIO}", app.mock_server.uri()),
+    )
+    .await;
     mount_get_session(&app, OWNER, access_token, full_session(OWNER), 2).await;
     Mock::given(path(format!(
         "/pds/{STUDIO}/xrpc/com.atproto.server.getSession"
@@ -628,7 +656,10 @@ async fn a_delegated_request_reads_the_actors_account() {
     .await;
 
     for (function, expected) in [
-        ("get_session", json!({"did": OWNER, "handle": "session.test"})),
+        (
+            "get_session",
+            json!({"did": OWNER, "handle": "session.test"}),
+        ),
         (
             "get_email",
             json!({"email": "session@example.com", "email_confirmed": false}),
