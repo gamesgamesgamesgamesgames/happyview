@@ -20,6 +20,17 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
         Some(c) if !c.is_empty() => c.to_string(),
         _ => return NativeOutcome::Failed("input.collection is required".into()),
     };
+
+    // The admin handlers refuse this before enqueueing, so a job reaching here
+    // for a shared collection was queued when the answer was different: before
+    // the upgrade that added the refusal, or before the store claimed the
+    // collection. Deleting now would reach only this instance's overlay rows
+    // and report the count as a success, which is the thing the refusal exists
+    // to stop. Failing names the reason where the operator is already looking.
+    if let Some(reason) = crate::admin::records_not_locally_deletable(state, &collection) {
+        return NativeOutcome::Failed(reason);
+    }
+
     let backend = state.db_backend;
 
     let total: i64 = match state.records.count_collection(&collection).await {

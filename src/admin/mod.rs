@@ -40,6 +40,11 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 
+/// Re-exported for [`crate::jobs::native::delete_collection`], which guards on
+/// it as well: the admin handlers refuse a request for a collection a shared
+/// store serves, and the job refuses one that was already queued.
+pub(crate) use lexicons::records_not_locally_deletable;
+
 pub fn admin_routes(state: AppState) -> Router<AppState> {
     // The record source's routes, each behind the admin auth layer. Its
     // router carries its own state, so it joins this one as a stateless one.
