@@ -33,7 +33,6 @@ on:
         default: false
   delete:
 
-
 env:
   SQLX_OFFLINE: true
 
@@ -48,7 +47,9 @@ permissions:
 # `dispatch-native-release`, `tag-latest`) have no group. Each job that can be
 # first to cut a version (`release`, `release-oauth-client`, `release-nsid`)
 # needs every cancellable job, so none of those is still running, or
-# cancellable, once a version may have been cut. The event name in the `ci-`
+# cancellable, once a version may have been cut, and refuses to run if any
+# of its needs was cancelled: `always()` alone would let a run whose tests a
+# newer push cancelled cut a version anyway. The event name in the `ci-`
 # group keeps a branch deletion's run from cancelling a push's.
 jobs:
   # ---------------------------------------------------------------------------
@@ -982,6 +983,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
@@ -1385,6 +1388,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
@@ -1428,6 +1433,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
@@ -1475,6 +1482,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
@@ -1522,6 +1531,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
@@ -1569,6 +1580,8 @@ jobs:
       cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
