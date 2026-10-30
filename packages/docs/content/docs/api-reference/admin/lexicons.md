@@ -197,6 +197,53 @@ this was an upsert rather than a first upload, because the lexicon is not a
 record type, or because the caller lacks `backfill:create`. Poll it via
 `GET /admin/backfill/status`.
 
+### When the lexicon is not valid
+
+The document is checked against the lexicon spec before anything is stored. A
+document that cannot work is refused with `400 Bad Request` and **one entry per
+field**, so an editor can point at each place rather than showing one sentence:
+
+    {
+      "error": "the lexicon is not valid: defs.main.key: unknown record key 'uuid': must be tid, nsid, any, or literal:<value> (and 2 more)",
+      "issues": [
+        {
+          "path": "defs.main.key",
+          "message": "unknown record key 'uuid': must be tid, nsid, any, or literal:<value>",
+          "severity": "error"
+        },
+        {
+          "path": "defs.main.record.properties.a.ref",
+          "message": "'#missing' names no def in this lexicon ('missing' is not defined)",
+          "severity": "error"
+        }
+      ]
+    }
+
+`path` is a dotted path into the submitted document, with array entries as
+`required[0]`; it is the empty string for a problem with the document as a
+whole, such as its size. `error` still carries one sentence for anything that
+reads only that field.
+
+**`severity` matters.** Only an `error` refuses the upload. A `warning` is a
+document that works but reads oddly — an `array` with no `items`, a
+`minLength` above its `maxLength`, a def name that is not camelCase — and it is
+reported alongside the errors so one answer says everything. An upload whose
+only issues are warnings succeeds, and the warnings are still in the response.
+
+What is checked: the `lexicon` version and the `id` NSID; that `defs` is a
+non-empty object; that every def names a known type; that `record`, `query`,
+`procedure` and `subscription` appear only as `main`; that a record says how
+its rkey is chosen (`tid`, `nsid`, `any` or `literal:<value>`) and carries an
+object schema; that a `ref` or a `union` member resolves to a def this document
+defines, when it names one (a ref into another lexicon is checked only for
+shape, since that document is not here); that an object's `required` and
+`nullable` name properties it actually has; and that the document is at most
+256 KiB.
+
+The project build applies the same rules through the same function, so a file
+under `src/` cannot carry a lexicon this endpoint would refuse. It renders them
+as build diagnostics rather than per field.
+
 ## List lexicons
 
 ```
