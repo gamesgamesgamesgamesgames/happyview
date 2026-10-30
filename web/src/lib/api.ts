@@ -1118,10 +1118,10 @@ export function recheckApiClientAuthKey(id: string) {
   );
 }
 
-export function rotateApiClientAuthKey(id: string) {
+export function rotateApiClientAuthKey(id: string, immediate = false) {
   return apiFetch<KeyRotationResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
-    { method: "POST" },
+    { method: "POST", body: JSON.stringify({ immediate }) },
   );
 }
 
@@ -1145,9 +1145,10 @@ export function revokeAllApiClientAuthKeys(id: string) {
   );
 }
 
-export function rotateInstanceOauthKey() {
+export function rotateInstanceOauthKey(immediate = false) {
   return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
     method: "POST",
+    body: JSON.stringify({ immediate }),
   });
 }
 

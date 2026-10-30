@@ -1033,3 +1033,167 @@ async fn session_counts_by_kid_counts_across_all_three_session_tables_including_
         "a kid with no sessions must count as zero, not be missing in a way that panics a caller"
     );
 }
+
+/// Make a staged key due now, as if its overlap had run out.
+async fn backdate_activation(
+    pool: &sqlx::AnyPool,
+    backend: happyview::db::DatabaseBackend,
+    kid: &str,
+) {
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET activates_at = '2000-01-01T00:00:00.000Z' WHERE kid = ?",
+        backend,
+    ))
+    .bind(kid)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn a_staged_key_is_published_but_signs_nothing_until_it_takes_over() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let current = ensure_instance_key(&pool, backend, None).await.unwrap();
+    let (pending, activates_at) =
+        happyview::oauth::client_keys::stage_key(&pool, backend, None, INSTANCE_OWNER)
+            .await
+            .unwrap();
+    assert_eq!(pending.status, KeyStatus::Pending);
+    let activates_at = chrono::DateTime::parse_from_rfc3339(&activates_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        activates_at - chrono::Utc::now() > chrono::Duration::hours(1),
+        "the overlap must outlast an hour of metadata caching, got {activates_at}"
+    );
+
+    let keys = load_keys(&pool, backend, None, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    let kids: Vec<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
+    assert!(kids.contains(&pending.kid.as_str()), "{kids:?}");
+    assert_eq!(
+        happyview::oauth::client_keys::find_by_kid(&keys, None).map(|k| k.kid.as_str()),
+        Some(current.kid.as_str()),
+        "the current key keeps signing while the new one waits"
+    );
+    assert_eq!(
+        ensure_instance_key(&pool, backend, None).await.unwrap().kid,
+        current.kid
+    );
+
+    let promoted = happyview::oauth::client_keys::promote_due_keys(&pool, backend)
+        .await
+        .unwrap();
+    assert!(promoted.is_empty(), "nothing is due yet: {promoted:?}");
+
+    let (again, _) = happyview::oauth::client_keys::stage_key(&pool, backend, None, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.kid, pending.kid,
+        "staging again returns the waiting key"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_due_staged_key_takes_over_and_the_old_one_retires() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let old = ensure_instance_key(&pool, backend, None).await.unwrap();
+    let (new, _) = happyview::oauth::client_keys::stage_key(&pool, backend, None, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    backdate_activation(&pool, backend, &new.kid).await;
+
+    let promoted = happyview::oauth::client_keys::promote_due_keys(&pool, backend)
+        .await
+        .unwrap();
+    assert_eq!(promoted, vec![INSTANCE_OWNER.to_string()]);
+
+    let listed = list_keys_for_owner(&pool, backend, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    let status = |kid: &str| listed.iter().find(|k| k.kid == kid).map(|k| k.status);
+    assert_eq!(status(&new.kid), Some(KeyStatus::Current));
+    assert_eq!(status(&old.kid), Some(KeyStatus::Retiring));
+
+    let promoted = happyview::oauth::client_keys::promote_due_keys(&pool, backend)
+        .await
+        .unwrap();
+    assert!(
+        promoted.is_empty(),
+        "a promotion happens once: {promoted:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_immediate_rotation_switches_to_the_waiting_key() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let old = ensure_instance_key(&pool, backend, None).await.unwrap();
+    let (waiting, _) =
+        happyview::oauth::client_keys::stage_key(&pool, backend, None, INSTANCE_OWNER)
+            .await
+            .unwrap();
+
+    let now = happyview::oauth::client_keys::rotate_key(&pool, backend, None, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    assert_eq!(now.kid, waiting.kid, "the key published longest takes over");
+    assert_eq!(now.status, KeyStatus::Current);
+
+    let listed = list_keys_for_owner(&pool, backend, INSTANCE_OWNER)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2, "no second key was minted");
+    let status = |kid: &str| listed.iter().find(|k| k.kid == kid).map(|k| k.status);
+    assert_eq!(status(&waiting.kid), Some(KeyStatus::Current));
+    assert_eq!(status(&old.kid), Some(KeyStatus::Retiring));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_promotion_moves_the_instance_clients_to_the_new_key() {
+    common::require_db!();
+    let app = common::app::TestApp::new().await;
+    let pool = &app.state.db;
+    let backend = app.state.db_backend;
+
+    ensure_instance_key(pool, backend, None).await.unwrap();
+    let (new, _) = happyview::oauth::rotation::stage_instance_key(&app.state)
+        .await
+        .unwrap();
+
+    happyview::oauth::rotation::promote_and_install(&app.state)
+        .await
+        .unwrap();
+    assert!(
+        app.state.oauth.linked_repos_primary().is_none(),
+        "nothing is installed before the new key takes over"
+    );
+
+    backdate_activation(pool, backend, &new.kid).await;
+    happyview::oauth::rotation::promote_and_install(&app.state)
+        .await
+        .unwrap();
+    let (_client, kid) = app
+        .state
+        .oauth
+        .linked_repos_primary()
+        .expect("the promotion installs clients built around the new key");
+    assert_eq!(kid.as_deref(), Some(new.kid.as_str()));
+}

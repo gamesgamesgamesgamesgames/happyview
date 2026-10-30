@@ -418,9 +418,10 @@ async fn revoking_all_auth_keys_empties_the_jwks_and_un_delegates_the_client() {
         .unwrap();
     app.router
         .clone()
-        .oneshot(admin_post(
+        .oneshot(admin_post_json(
             &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
             app.admin_cookie(),
+            &json!({ "immediate": true }),
         ))
         .await
         .unwrap();
@@ -518,9 +519,10 @@ async fn a_retiring_client_auth_key_can_be_revoked_but_the_current_one_cannot() 
     let rotated = app
         .router
         .clone()
-        .oneshot(admin_post(
+        .oneshot(admin_post_json(
             &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
             app.admin_cookie(),
+            &json!({ "immediate": true }),
         ))
         .await
         .unwrap();
@@ -654,9 +656,10 @@ async fn assertion_endpoint_signs_with_an_explicitly_requested_kid() {
     let rotated = app
         .router
         .clone()
-        .oneshot(admin_post(
+        .oneshot(admin_post_json(
             &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
             app.admin_cookie(),
+            &json!({ "immediate": true }),
         ))
         .await
         .unwrap();
@@ -971,4 +974,80 @@ async fn assertion_endpoint_rejects_bad_credentials() {
     .await;
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_rotation_stages_the_new_key_until_caches_have_seen_it() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let client_id_url = "https://staged.example.com/oauth-client-metadata.json";
+    let (client_id, _client_key, _client_secret) =
+        create_confidential_api_client(&app, client_id_url).await;
+
+    let provisioned = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    let old_kid = json_body(provisioned).await["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rotated = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated = json_body(rotated).await;
+    assert_eq!(rotated["status"], "pending", "{rotated}");
+    assert!(rotated["activates_at"].is_string(), "{rotated}");
+    let new_kid = rotated["kid"].as_str().unwrap().to_string();
+    assert_ne!(new_kid, old_kid);
+
+    // Published straight away, so an authorization server can learn it...
+    let jwks = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/oauth/clients/{client_id}/jwks.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let jwks = json_body(jwks).await;
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kid"].as_str().unwrap())
+        .collect();
+    assert!(kids.contains(&old_kid.as_str()), "{kids:?}");
+    assert!(kids.contains(&new_kid.as_str()), "{kids:?}");
+
+    // ...while the old key keeps signing.
+    let keys = happyview::oauth::client_keys::load_keys(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &client_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        happyview::oauth::client_keys::find_by_kid(&keys, None).map(|k| k.kid.as_str()),
+        Some(old_kid.as_str())
+    );
 }

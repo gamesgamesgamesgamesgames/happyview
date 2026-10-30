@@ -1091,19 +1091,26 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
     }
   }
 
-  async function handleRotate() {
+  async function handleRotate(immediate: boolean) {
     setRotating(true);
     try {
-      const result = await rotateApiClientAuthKey(client.id);
-      setAuthKey((prev) => (prev ? { ...prev, kid: result.kid } : prev));
-      setProbe(null);
+      const result = await rotateApiClientAuthKey(client.id, immediate);
+      // A staged key signs nothing yet; the key shown is the one signing.
+      if (result.status === "current") {
+        setAuthKey((prev) => (prev ? { ...prev, kid: result.kid } : prev));
+        setProbe(null);
+      }
       setRotateConfirmOpen(false);
+      const title =
+        result.status === "pending"
+          ? `Published a new key (${result.kid.slice(0, 8)}…); it takes over ${result.activates_at ? `at ${new Date(result.activates_at).toLocaleString()}` : "shortly"}`
+          : `Rotated to a new key (${result.kid.slice(0, 8)}…)`;
       if (result.orphaned_sessions > 0) {
-        toast.success(`Rotated to a new key (${result.kid.slice(0, 8)}…)`, {
+        toast.success(title, {
           description: `${result.orphaned_sessions} session${result.orphaned_sessions === 1 ? "" : "s"} predate key pinning and cannot be protected by this or any future rotation.`,
         });
       } else {
-        toast.success("Rotated to a new key");
+        toast.success(title);
       }
       loadKeys();
     } catch (e: unknown) {
@@ -1157,6 +1164,8 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
 
   function keyStatusBadge(status: ApiClientAuthKeyListEntry["status"]) {
     switch (status) {
+      case "pending":
+        return <Badge variant="secondary">Pending</Badge>;
       case "current":
         return <Badge>Current</Badge>;
       case "retiring":
@@ -1264,20 +1273,34 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                             Generate a new signing key?
                           </AlertDialogTitle>
                           <AlertDialogDescription>
-                            This costs nothing: the current key keeps signing
-                            every session already established with it. New
-                            logins and refreshes for &ldquo;{client.name}&rdquo;
-                            will use the new key from now on. The old key stays
+                            This costs nothing: the new key is published now and
+                            takes over new logins and refreshes for &ldquo;
+                            {client.name}&rdquo; in about 75 minutes, once
+                            authorization servers&rsquo; cached copies of its
+                            keys include it. The current key keeps signing every
+                            session already established with it, and stays
                             published until nothing references it any longer.
+                          </AlertDialogDescription>
+                          <AlertDialogDescription>
+                            If the current key has leaked, switch now instead.
+                            Sign-ins through a PDS that cached the old keys can
+                            fail for up to an hour.
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <AlertDialogFooter>
                           <AlertDialogCancel disabled={rotating}>
                             Cancel
                           </AlertDialogCancel>
+                          <Button
+                            variant="outline"
+                            disabled={rotating}
+                            onClick={() => handleRotate(true)}
+                          >
+                            Switch now
+                          </Button>
                           <AlertDialogAction
                             disabled={rotating}
-                            onClick={handleRotate}
+                            onClick={() => handleRotate(false)}
                           >
                             {rotating ? "Rotating..." : "Generate new key"}
                           </AlertDialogAction>
@@ -1397,11 +1420,12 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                 <div className="flex flex-col gap-2">
                   <Label>Retiring and revoked keys</Label>
                   <p className="text-muted-foreground text-xs">
-                    To contain a leaked key: rotate first (the leaked one
-                    becomes retiring, so the client keeps working), then revoke
-                    the retiring key below. Revoking is immediate and destroys
-                    every session pinned to that key — it is the correct
-                    response to a leak, not routine cleanup.
+                    To contain a leaked key: rotate and choose{" "}
+                    <em>Switch now</em> (the leaked one becomes retiring, so the
+                    client keeps working), then revoke the retiring key below.
+                    Revoking is immediate and destroys every session pinned to
+                    that key — it is the correct response to a leak, not routine
+                    cleanup.
                   </p>
 
                   {keysLoading && (
@@ -1440,7 +1464,14 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                           <p className="text-xs text-muted-foreground">
                             Created {new Date(key.created_at).toLocaleString()}{" "}
                             ·{" "}
-                            {key.status === "revoked" ? (
+                            {key.status === "pending" ? (
+                              <>
+                                Takes over{" "}
+                                {key.activates_at
+                                  ? `at ${new Date(key.activates_at).toLocaleString()}`
+                                  : "shortly"}
+                              </>
+                            ) : key.status === "revoked" ? (
                               <>
                                 {key.session_count} session
                                 {key.session_count === 1 ? "" : "s"} destroyed

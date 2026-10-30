@@ -574,6 +574,7 @@ pub(super) async fn list_auth_keys(
                 "kid": k.kid,
                 "status": k.status.as_str(),
                 "created_at": k.created_at,
+                "activates_at": k.activates_at,
                 "session_count": session_count,
             })
         })
@@ -703,25 +704,42 @@ pub(super) async fn revoke_all_auth_keys(
     })))
 }
 
+/// The body of a key rotation.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct RotateKeyBody {
+    /// Switch now instead of staging the new key. Authorization servers that
+    /// cached the old key set refuse the new one until their cache runs out,
+    /// so this is for a key that must stop signing at once.
+    #[serde(default)]
+    immediate: bool,
+}
+
 /// POST /admin/api-clients/:id/auth-key/rotate — rotate the client's
-/// authentication key, demoting the current one to `retiring` rather than
-/// revoking it, so already-established sessions keep resolving until they
-/// naturally cycle off it (see `client_keys::rotate_key`'s doc comment).
+/// authentication key. By default the new key is published as `pending` and
+/// takes over after `client_keys::ROTATION_OVERLAP`; `{"immediate": true}`
+/// switches now. Either way the old key is demoted to `retiring` rather than
+/// revoked, so already-established sessions keep resolving until they
+/// naturally cycle off it.
 pub(super) async fn rotate_auth_key(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(id): Path<String>,
+    body: Option<Json<RotateKeyBody>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::ApiClientsEdit).await?;
     crate::auth::cli_client::refuse_change(&id)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let key = crate::oauth::client_keys::rotate_key(
-        &state.db,
-        state.db_backend,
-        state.config.token_encryption_key.as_ref(),
-        &id,
-    )
-    .await?;
+    let enc = state.config.token_encryption_key.as_ref();
+    let (key, activates_at) = if body.immediate {
+        let key =
+            crate::oauth::client_keys::rotate_key(&state.db, state.db_backend, enc, &id).await?;
+        (key, None)
+    } else {
+        let (key, at) =
+            crate::oauth::client_keys::stage_key(&state.db, state.db_backend, enc, &id).await?;
+        (key, Some(at))
+    };
 
     let orphaned_sessions =
         crate::oauth::client_keys::count_unstamped_sessions(&state.db, state.db_backend, &id)
@@ -736,6 +754,8 @@ pub(super) async fn rotate_auth_key(
             subject: Some(id),
             detail: serde_json::json!({
                 "kid": key.kid,
+                "status": key.status.as_str(),
+                "activates_at": activates_at,
                 "orphaned_sessions": orphaned_sessions,
             }),
         },
@@ -745,21 +765,38 @@ pub(super) async fn rotate_auth_key(
 
     Ok(Json(serde_json::json!({
         "kid": key.kid,
+        "status": key.status.as_str(),
+        "activates_at": activates_at,
         "orphaned_sessions": orphaned_sessions,
     })))
 }
 
 /// POST /admin/oauth/instance-key/rotate — rotate the instance's own OAuth
-/// client-authentication key and immediately rebuild the OAuth clients
-/// pinned to it (primary + every domain), so the new key takes effect
-/// without a restart. See `oauth::rotation::rotate_instance_key`.
+/// client-authentication key. By default the new key is published as
+/// `pending` and the OAuth clients switch to it after
+/// `client_keys::ROTATION_OVERLAP` (`oauth::rotation::run_key_promotion`);
+/// `{"immediate": true}` switches and rebuilds them now, without a restart.
 pub(super) async fn rotate_instance_key(
     State(state): State<AppState>,
     auth: UserAuth,
+    body: Option<Json<RotateKeyBody>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let (key, orphaned_sessions) = crate::oauth::rotation::rotate_instance_key(&state).await?;
+    let (key, activates_at) = if body.immediate {
+        let (key, _) = crate::oauth::rotation::rotate_instance_key(&state).await?;
+        (key, None)
+    } else {
+        let (key, at) = crate::oauth::rotation::stage_instance_key(&state).await?;
+        (key, Some(at))
+    };
+    let orphaned_sessions = crate::oauth::client_keys::count_unstamped_sessions(
+        &state.db,
+        state.db_backend,
+        crate::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await?;
 
     log_event(
         &state.db,
@@ -770,6 +807,8 @@ pub(super) async fn rotate_instance_key(
             subject: None,
             detail: serde_json::json!({
                 "kid": key.kid,
+                "status": key.status.as_str(),
+                "activates_at": activates_at,
                 "orphaned_sessions": orphaned_sessions,
             }),
         },
@@ -779,6 +818,8 @@ pub(super) async fn rotate_instance_key(
 
     Ok(Json(serde_json::json!({
         "kid": key.kid,
+        "status": key.status.as_str(),
+        "activates_at": activates_at,
         "orphaned_sessions": orphaned_sessions,
     })))
 }
@@ -810,6 +851,7 @@ pub(super) async fn list_instance_keys(
                 "kid": k.kid,
                 "status": k.status.as_str(),
                 "created_at": k.created_at,
+                "activates_at": k.activates_at,
                 "session_count": session_count,
             })
         })
