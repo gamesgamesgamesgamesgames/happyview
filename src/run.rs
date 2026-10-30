@@ -1049,6 +1049,13 @@ async fn boot(
 
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
+    let limits = match crate::limits::from_vars() {
+        Ok(limits) => limits,
+        Err(e) => {
+            tracing::error!("{e}");
+            return Err(std::process::ExitCode::FAILURE);
+        }
+    };
 
     let mut records = crate::record_store::RecordStore::shared(db_pool.clone(), db_backend)
         .await
@@ -1088,6 +1095,7 @@ async fn boot(
         client_jwks,
         telemetry_counters,
         script_limits,
+        limits: std::sync::Arc::new(happyview_provider::FixedLimits(limits)),
         test: None,
     };
 

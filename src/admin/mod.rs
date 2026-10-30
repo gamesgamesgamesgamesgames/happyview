@@ -13,6 +13,7 @@ mod jobs;
 mod labelers;
 mod lexicon_publishing;
 mod lexicons;
+mod limits;
 mod linked_repos;
 pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
@@ -162,6 +163,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             delete(records::delete_collection_records),
         )
         .route("/database/status", get(database::status))
+        .route("/limits", get(limits::get))
         .route(
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),

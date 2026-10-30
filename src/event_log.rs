@@ -198,6 +198,24 @@ pub async fn sweep_with_cutoff(
     SweepOutcome { deleted, vacuumed }
 }
 
+/// The event log retention the instance is set to: the
+/// `event_log_retention_days` setting, else `EVENT_LOG_RETENTION_DAYS`, else
+/// 30 days. `0` keeps logs forever. A value that is not a whole number is
+/// warned about and read as 30.
+pub async fn configured_retention_days(db: &AnyPool, backend: DatabaseBackend) -> u32 {
+    match crate::admin::settings::get_setting(db, "event_log_retention_days", backend).await {
+        Some(v) => v.parse::<u32>().unwrap_or_else(|e| {
+            tracing::warn!(
+                value = %v,
+                error = %e,
+                "event_log_retention_days is not a valid non-negative integer, defaulting to 30"
+            );
+            30
+        }),
+        None => 30,
+    }
+}
+
 /// Sweep rows older than `retention_days`. A retention of `0` is a no-op.
 pub async fn run_retention_sweep(
     db: &AnyPool,
@@ -303,23 +321,7 @@ pub async fn spawn_retention_cleanup(
             tracing::info!(count = tombstones, "cleaned up expired tombstones");
         }
 
-        let retention_days = match crate::admin::settings::get_setting(
-            &db,
-            "event_log_retention_days",
-            backend,
-        )
-        .await
-        {
-            Some(v) => v.parse::<u32>().unwrap_or_else(|e| {
-                tracing::warn!(
-                    value = %v,
-                    error = %e,
-                    "event_log_retention_days is not a valid non-negative integer, defaulting to 30"
-                );
-                30
-            }),
-            None => 30,
-        };
+        let retention_days = configured_retention_days(&db, backend).await;
 
         let outcome = run_retention_sweep(&db, retention_days, backend).await;
         if outcome.deleted > 0 {
