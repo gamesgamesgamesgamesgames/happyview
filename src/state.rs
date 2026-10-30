@@ -120,6 +120,7 @@ pub fn state_with_pool_on(
             crate::proxy_config::ProxyConfig::default(),
         ))),
         verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ignored_keeps: Arc::default(),
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
