@@ -1123,3 +1123,58 @@ async fn live_markers_still_purge_everything() {
         assert!(rkeys(&state, &did).await.is_empty());
     }
 }
+
+#[tokio::test]
+async fn a_batch_looks_its_hook_up_once() {
+    for state in states().await {
+        let trigger = format!("record.create:{NSID}");
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                state.db_backend,
+                crate::catalog::ScriptWrite {
+                    id: trigger.clone(),
+                    script_type: "lua".into(),
+                    body: "function handle() return true end".into(),
+                    description: None,
+                },
+            )
+            .await
+            .expect("store the hook");
+        let did = unique_did();
+        let events = (0..10)
+            .map(|i| {
+                happyview_provider::SourceEvent::Record(happyview_provider::RecordEvent {
+                    key: happyview_provider::RecordKey {
+                        did: did.clone(),
+                        collection: NSID.into(),
+                        rkey: format!("r{i}"),
+                    },
+                    action: happyview_provider::Action::Create,
+                    cid: None,
+                    rev: None,
+                    body: Some(serde_json::json!({"text": i})),
+                    time_us: None,
+                    origin: happyview_provider::Origin::Live,
+                    stored: false,
+                })
+            })
+            .collect();
+        let before = state.scripts.table_reads();
+
+        host(&state).ingest_batch(events).await;
+
+        assert_eq!(
+            state.scripts.table_reads() - before,
+            1,
+            "ten creates in one batch read the hook's row once"
+        );
+        state
+            .scripts
+            .remove(&state.db, state.db_backend, &trigger)
+            .await
+            .expect("remove the hook");
+        clean_up(&state, &did).await;
+    }
+}
