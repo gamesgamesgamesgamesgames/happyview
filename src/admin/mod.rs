@@ -65,6 +65,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/lexicons/{id}",
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
         )
+        .route(
+            "/lexicons/{id}/record-count",
+            get(lexicons::lexicon_record_count),
+        )
         .route("/lexicon-publishing", get(lexicon_publishing::overview))
         .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
         .route(
