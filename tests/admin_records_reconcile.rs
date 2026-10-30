@@ -576,6 +576,25 @@ async fn a_record_recreated_after_its_check_is_kept() {
     );
 }
 
+/// Claim job `id` as a worker would, and run `fut` as that claim's run:
+/// a job's progress is written only from the run holding its lease.
+async fn as_claimed_job<F: std::future::Future>(app: &TestApp, id: &str, fut: F) -> F::Output {
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_jobs SET status = 'running', claimed_by = 'reconcile-test', attempt = 1 \
+         WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(id)
+    .execute(&app.state.db)
+    .await
+    .expect("the job should be claimed");
+    let lease = happyview::jobs::held::Lease {
+        owner: "reconcile-test".into(),
+        attempt: 1,
+    };
+    happyview::jobs::held::run_under(happyview::jobs::held::Held::new(id, lease), fut).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pause_stops_a_listing_between_pages() {
     let app = app().await;
@@ -611,9 +630,13 @@ async fn a_pause_stops_a_listing_between_pages() {
         .await;
     get_record(&app, ALICE, "g1", true).await;
 
-    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
-        .await
-        .expect("reconcile runs");
+    let report = as_claimed_job(
+        &app,
+        &job_id,
+        reconcile::reconcile(&app.state, &options(false), Some(&job_id)),
+    )
+    .await
+    .expect("reconcile runs");
     assert_eq!(report.stopped.as_deref(), Some("pausing"));
     assert!(report.dids_skipped.is_empty(), "{:?}", report.dids_skipped);
     assert_eq!(report.deleted, 0);
@@ -651,9 +674,13 @@ async fn a_cancel_stops_inside_an_account_and_keeps_what_it_did() {
         .mount(&app.mock_server)
         .await;
 
-    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
-        .await
-        .expect("reconcile runs");
+    let report = as_claimed_job(
+        &app,
+        &job_id,
+        reconcile::reconcile(&app.state, &options(false), Some(&job_id)),
+    )
+    .await
+    .expect("reconcile runs");
     assert_eq!(report.stopped.as_deref(), Some("cancelling"));
     assert_eq!(report.deleted, 2, "{:?}", report.missing);
     assert!(!stored(&app, ALICE, "c1").await);
