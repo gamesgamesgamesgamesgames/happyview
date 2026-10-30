@@ -25,6 +25,7 @@
     "linked-repos",
     "plugins",
     "platform",
+    "limits",
     "dead-letters",
     "service-identity",
     "service-entries",

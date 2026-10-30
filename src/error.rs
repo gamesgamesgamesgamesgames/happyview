@@ -141,6 +141,10 @@ pub enum AppError {
         code: &'static str,
         message: String,
     },
+    /// The instance's plan does not allow one more of something. The limit,
+    /// its maximum and what is in use travel as fields, so a client can say
+    /// which limit without reading the message.
+    LimitReached(happyview_provider::LimitReached),
     RateLimited {
         retry_after: u64,
         limit: u32,
@@ -202,6 +206,7 @@ impl std::fmt::Display for AppError {
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             AppError::Conflict(msg) => write!(f, "conflict: {msg}"),
             AppError::FeatureDisabled(msg) => write!(f, "feature disabled: {msg}"),
+            AppError::LimitReached(reached) => write!(f, "limit reached: {reached}"),
             AppError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             AppError::InsufficientPermissions(perm) => write!(f, "Missing permission: {perm}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
@@ -236,6 +241,12 @@ impl std::fmt::Display for AppError {
                 (None, None) => write!(f, "script {error_type} error in {method}: {message}"),
             },
         }
+    }
+}
+
+impl From<happyview_provider::LimitReached> for AppError {
+    fn from(reached: happyview_provider::LimitReached) -> Self {
+        AppError::LimitReached(reached)
     }
 }
 
@@ -277,6 +288,18 @@ impl IntoResponse for AppError {
                     "file": file,
                 });
                 (status, axum::Json(body)).into_response()
+            }
+            // 403: nothing about the request is wrong, and asking again will
+            // not help; the plan does not permit it.
+            AppError::LimitReached(reached) => {
+                let body = serde_json::json!({
+                    "error": "LimitReached",
+                    "limit": reached.limit,
+                    "max": reached.max,
+                    "current": reached.current,
+                    "message": reached.to_string(),
+                });
+                (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
             }
             AppError::FeatureDisabled(msg) => {
                 let body = serde_json::json!({
@@ -359,6 +382,7 @@ impl IntoResponse for AppError {
                     AppError::PdsError(..)
                     | AppError::AuthDpopNonce(..)
                     | AppError::FeatureDisabled(..)
+                    | AppError::LimitReached(..)
                     | AppError::InsufficientPermissions(..)
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
@@ -387,6 +411,27 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn a_reached_limit_is_a_403_naming_the_limit_its_max_and_what_is_used() {
+        let reached = happyview_provider::LimitReached {
+            limit: happyview_provider::Limit::Seats,
+            max: 5,
+            current: 5,
+        };
+        let (status, body) = response_parts(reached.into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "LimitReached",
+                "limit": "seats",
+                "max": 5,
+                "current": 5,
+                "message": "this instance's plan allows 5 seats",
+            })
+        );
     }
 
     #[tokio::test]

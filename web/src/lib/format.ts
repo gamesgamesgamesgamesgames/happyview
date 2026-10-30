@@ -1,6 +1,16 @@
 import { toast } from "sonner";
 
+import { ApiError } from "@/lib/api";
+import { limitReachedText } from "@/lib/limits";
+
 export function toastError(context: string, e: unknown) {
+  // Before the 403 test below: a plan limit is not a missing permission.
+  if (e instanceof ApiError && e.limitReached) {
+    toast.error(`${context}: plan limit reached`, {
+      description: limitReachedText(e.limitReached.limit, e.limitReached.max),
+    });
+    return;
+  }
   const msg = e instanceof Error ? e.message : String(e);
   const lower = msg.toLowerCase();
   if (

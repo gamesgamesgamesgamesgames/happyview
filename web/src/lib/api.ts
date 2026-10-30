@@ -1,3 +1,4 @@
+import type { InstanceLimits, LimitReached } from "@/types/limits";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
@@ -73,6 +74,7 @@ import type {
 } from "@/types/dead-letters";
 
 export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
+export type { InstanceLimits, LimitReached } from "@/types/limits";
 export type { CollectionStat, StatsResponse } from "@/types/stats";
 export type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 export type { NetworkLexiconSummary } from "@/types/network-lexicons";
@@ -162,10 +164,18 @@ export class ApiError extends Error {
    * `removed_globals`. Absent on every other error.
    */
   removedGlobals?: string[];
-  constructor(status: number, message: string, removedGlobals?: string[]) {
+  /** Which plan limit a `LimitReached` refusal hit. Absent otherwise. */
+  limitReached?: LimitReached;
+  constructor(
+    status: number,
+    message: string,
+    removedGlobals?: string[],
+    limitReached?: LimitReached,
+  ) {
     super(message);
     this.status = status;
     this.removedGlobals = removedGlobals;
+    this.limitReached = limitReached;
   }
 }
 
@@ -192,21 +202,35 @@ async function apiFetch<T = unknown>(
     const text = await res.text().catch(() => res.statusText);
     let message = text;
     let removedGlobals: string[] | undefined;
+    let limitReached: LimitReached | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
       if (Array.isArray(parsed.removed_globals)) {
         removedGlobals = parsed.removed_globals;
       }
+      if (parsed.error === "LimitReached" && typeof parsed.limit === "string") {
+        limitReached = {
+          limit: parsed.limit,
+          max: parsed.max,
+          current: parsed.current,
+        };
+        if (typeof parsed.message === "string") message = parsed.message;
+      }
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message, removedGlobals);
+    throw new ApiError(res.status, message, removedGlobals, limitReached);
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
   if (!text) return null as T;
   return JSON.parse(text);
+}
+
+// Limits
+export function getLimits() {
+  return apiFetch<InstanceLimits>("/admin/limits");
 }
 
 // Stats

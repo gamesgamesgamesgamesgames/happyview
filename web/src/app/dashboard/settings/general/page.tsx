@@ -21,6 +21,7 @@ import {
   type DbInfo,
   type EventPurgeFilter,
 } from "@/lib/api";
+import { PlanLimits } from "@/components/plan-limits";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -401,6 +402,8 @@ export default function GeneralSettingsPage() {
         {notice && (
           <p className="text-sm text-green-600 dark:text-green-400">{notice}</p>
         )}
+
+        <PlanLimits />
 
         <div>
           <h2 className="text-lg font-semibold">Instance Identity</h2>
