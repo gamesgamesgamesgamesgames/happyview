@@ -227,8 +227,30 @@ reads only that field.
 **`severity` matters.** Only an `error` refuses the upload. A `warning` is a
 document that works but reads oddly — an `array` with no `items`, a
 `minLength` above its `maxLength`, a def name that is not camelCase — and it is
-reported alongside the errors so one answer says everything. An upload whose
-only issues are warnings succeeds, and the warnings are still in the response.
+reported alongside the errors so one answer says everything.
+
+An upload whose only issues are warnings **succeeds**, and carries them in
+`issues` on the success response, so nothing is accepted in silence:
+
+    {
+      "id": "com.example.events",
+      "revision": 1,
+      "backfill_job_id": null,
+      "issues": [
+        {
+          "path": "defs.main.type",
+          "message": "this is a valid 'subscription' lexicon, but HappyView does not serve subscriptions yet: it will be stored and no endpoint will be generated for it",
+          "severity": "warning"
+        }
+      ]
+    }
+
+That example is the warning most worth knowing about. A `subscription` lexicon
+is valid, and HappyView serves no subscriptions
+([#7](https://github.com/gamesgamesgamesgamesgames/happyview/issues/7)): it is
+stored and no endpoint is generated. Accepting one quietly would read as
+support, so the upload says what will happen instead. `record`, `query` and
+`procedure` warn about nothing.
 
 What is checked: the `lexicon` version and the `id` NSID; that `defs` is a
 non-empty object; that every def names a known type; that `record`, `query`,

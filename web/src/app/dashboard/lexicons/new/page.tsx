@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import {
@@ -193,11 +194,19 @@ export default function AddLexiconPage() {
     setSubmitting(true);
     try {
       const lexiconJson = JSON.parse(json);
-      const { id } = await uploadLexicon({
+      const { id, issues: warnings } = await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: localMainType === "record" && indexed && backfill,
         indexed: localMainType === "record" ? indexed : undefined,
       });
+      // The page navigates away on success, so a warning that only rendered
+      // here would never be read. A toast survives the navigation.
+      for (const warning of warnings ?? []) {
+        toast.warning("Lexicon uploaded with a warning", {
+          description: warning.message,
+          duration: 10000,
+        });
+      }
       router.push(`/dashboard/lexicons/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));

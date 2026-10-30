@@ -48,6 +48,12 @@ pub(super) async fn upload_lexicon(
     {
         return Err(AppError::InvalidLexicon(issues));
     }
+    // A warning does not refuse the upload, but it still has to reach the
+    // caller: a `subscription` lexicon is valid, stores, and generates
+    // nothing, and succeeding in silence is what makes that read as support.
+    // Carried on the success response, since there is no error to attach it
+    // to.
+    let warnings = issues;
 
     // Validate action
     let action =
@@ -143,6 +149,7 @@ pub(super) async fn upload_lexicon(
             "id": id,
             "revision": revision,
             "backfill_job_id": backfill_job_id,
+            "issues": warnings,
         })),
     ))
 }

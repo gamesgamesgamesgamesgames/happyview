@@ -258,7 +258,16 @@ export function uploadLexicon(body: {
   action?: string;
   token_cost?: number | null;
 }) {
-  return apiFetch<{ id: string; revision: number }>("/admin/lexicons", {
+  return apiFetch<{
+    id: string;
+    revision: number;
+    /**
+     * Warnings about a lexicon that was accepted anyway — a `subscription`,
+     * which stores and generates no endpoint, is the one that matters.
+     * Errors never reach here; they are an `ApiError`.
+     */
+    issues?: LexiconIssue[];
+  }>("/admin/lexicons", {
     method: "POST",
     body: JSON.stringify(body),
   });

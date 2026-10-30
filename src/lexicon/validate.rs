@@ -32,6 +32,13 @@ const FIELD_TYPES: &[&str] = &[
 /// only as the `main` def.
 const PRIMARY_TYPES: &[&str] = &["record", "query", "procedure", "subscription"];
 
+/// The primary types HappyView actually does something with. A `subscription`
+/// is a valid lexicon the spec defines and `LexiconType` has no variant for,
+/// so one uploads, is stored, and generates nothing. Accepting it silently
+/// reads as support; the warning says what will happen instead. Remove it
+/// from here when subscriptions are served (GH #7).
+const SERVED_PRIMARY_TYPES: &[&str] = &["record", "query", "procedure"];
+
 /// How a record's rkey is chosen.
 const RECORD_KEYS: &[&str] = &["tid", "nsid", "any"];
 
@@ -177,6 +184,14 @@ pub fn validate(raw: &Value) -> Vec<Issue> {
                 issues.push(Issue::error(
                     format!("{path}.type"),
                     format!("a '{kind}' may only be the 'main' def, not '{name}'"),
+                ));
+            }
+            if !SERVED_PRIMARY_TYPES.contains(&kind) {
+                issues.push(Issue::warning(
+                    format!("{path}.type"),
+                    format!(
+                        "this is a valid '{kind}' lexicon, but HappyView does not serve {kind}s yet: it will be stored and no endpoint will be generated for it"
+                    ),
                 ));
             }
             primary(kind, def, &path, &mut issues, &mut refs);
@@ -851,5 +866,62 @@ mod tests {
         });
         let err = super::super::check_document(&raw).unwrap_err();
         assert!(err.contains("defs.main.key"), "{err}");
+    }
+
+    /// A subscription lexicon is valid and HappyView serves none, so it
+    /// uploads with a warning rather than in silence.
+    #[test]
+    fn a_subscription_is_valid_and_warns_that_nothing_serves_it() {
+        let raw = json!({
+            "lexicon": 1,
+            "id": "com.example.events",
+            "defs": {
+                "main": {
+                    "type": "subscription",
+                    "message": {
+                        "schema": { "type": "union", "refs": ["#evt"] }
+                    }
+                },
+                "evt": { "type": "object", "properties": { "seq": { "type": "integer" } } }
+            }
+        });
+        assert_eq!(errors(&raw), Vec::<String>::new(), "it is a valid lexicon");
+        let warned = warnings(&raw);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].starts_with("defs.main.type:"), "{warned:?}");
+        assert!(
+            warned[0].contains("does not serve subscriptions yet"),
+            "{warned:?}"
+        );
+        assert!(
+            warned[0].contains("no endpoint will be generated"),
+            "it has to say what will happen: {warned:?}"
+        );
+    }
+
+    /// The types HappyView does serve warn about nothing, or the warning
+    /// would be noise on every upload.
+    #[test]
+    fn the_primary_types_happyview_serves_do_not_warn() {
+        for (kind, def) in [
+            (
+                "record",
+                json!({ "type": "record", "key": "tid", "record": { "type": "object" } }),
+            ),
+            ("query", json!({ "type": "query" })),
+            ("procedure", json!({ "type": "procedure" })),
+        ] {
+            let raw = json!({
+                "lexicon": 1,
+                "id": "com.example.thing",
+                "defs": { "main": def }
+            });
+            assert_eq!(errors(&raw), Vec::<String>::new(), "{kind}");
+            assert_eq!(
+                warnings(&raw),
+                Vec::<String>::new(),
+                "{kind} should not warn"
+            );
+        }
     }
 }
