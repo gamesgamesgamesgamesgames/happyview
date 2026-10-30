@@ -159,6 +159,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/records/collections", get(records::list_collections))
         .route(
+            "/records/collection/reconcile",
+            post(records::reconcile_collection),
+        )
+        .route(
             "/records/collection",
             delete(records::delete_collection_records),
         )

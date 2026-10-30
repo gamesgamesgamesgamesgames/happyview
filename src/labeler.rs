@@ -955,7 +955,7 @@ mod tests {
     #[serial]
     async fn the_sweep_deletes_only_orderable_expiries_on_postgres() {
         if std::env::var("TEST_DATABASE_URL").is_err() {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         }
         let url = std::env::var("TEST_DATABASE_URL").expect("the caller checks it first");

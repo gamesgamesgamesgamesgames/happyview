@@ -298,7 +298,7 @@ async fn the_codemod_scanner_answers_ahead_of_any_interpreter() {
 async fn the_hosts_guard_list_reaches_validate() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -327,7 +327,7 @@ async fn the_hosts_guard_list_reaches_validate() {
 async fn validate_reaches_no_run_and_logs_nothing() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -388,7 +388,7 @@ async fn a_save_is_refused_for_every_language_no_interpreter_claims() {
 async fn a_body_only_patch_is_checked_against_the_rows_own_language() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -425,7 +425,7 @@ async fn a_body_only_patch_is_checked_against_the_rows_own_language() {
 async fn a_save_leaves_the_bodys_artifact_for_its_runs() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -470,7 +470,7 @@ async fn a_save_leaves_the_bodys_artifact_for_its_runs() {
 async fn a_dashboard_script_that_imports_a_file_is_refused() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -567,7 +567,7 @@ async fn delete_script(app: &TestApp, id: &str) -> axum::response::Response {
 async fn a_replaced_or_deleted_body_leaves_the_cache() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;
