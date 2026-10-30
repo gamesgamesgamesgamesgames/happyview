@@ -1377,24 +1377,46 @@ pub async fn sweep_backfill_details_in_batches(
     Ok(deleted)
 }
 
+/// Days of backfill detail to keep when nothing sets it.
+pub const DEFAULT_BACKFILL_RETENTION_DAYS: u32 = 28;
+
+/// The `backfill_retention_days` the sweep uses: a whole number of days, `0`
+/// keeping details forever. Anything else, a negative number included, is
+/// warned about and read as the default. A negative value read as written
+/// would put the cutoff in the future and delete every finished job's detail.
+pub fn backfill_retention_days(raw: Option<&str>) -> u32 {
+    match raw {
+        None => DEFAULT_BACKFILL_RETENTION_DAYS,
+        Some(v) => v.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %v,
+                "backfill_retention_days is not a whole number of days, defaulting to {DEFAULT_BACKFILL_RETENTION_DAYS}"
+            );
+            DEFAULT_BACKFILL_RETENTION_DAYS
+        }),
+    }
+}
+
 pub(crate) async fn run_backfill_retention_cleanup(state: &JobState) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
 
     loop {
         interval.tick().await;
 
-        let retention_days: i64 = state
-            .host
-            .setting("backfill_retention_days")
-            .await
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(28);
+        let retention_days = backfill_retention_days(
+            state
+                .host
+                .setting("backfill_retention_days")
+                .await
+                .as_deref(),
+        );
 
         if retention_days == 0 {
             continue;
         }
 
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days))).to_rfc3339();
         match sweep_backfill_details(state, &cutoff).await {
             Ok(0) => {}
             Ok(deleted) => {
@@ -1448,6 +1470,21 @@ pub async fn resume_backfill_jobs(state: &JobState) {
 
 #[cfg(test)]
 mod running_tests {
+    #[test]
+    fn backfill_retention_is_a_whole_number_of_days_else_the_default() {
+        assert_eq!(super::backfill_retention_days(None), 28);
+        assert_eq!(super::backfill_retention_days(Some("7")), 7);
+        assert_eq!(super::backfill_retention_days(Some(" 14 ")), 14);
+        assert_eq!(
+            super::backfill_retention_days(Some("0")),
+            0,
+            "0 keeps details forever"
+        );
+        // A negative cutoff would lie in the future and delete every detail.
+        assert_eq!(super::backfill_retention_days(Some("-1")), 28);
+        assert_eq!(super::backfill_retention_days(Some("a month")), 28);
+    }
+
     use super::RunningJobs;
 
     #[test]
