@@ -254,6 +254,25 @@ pub(super) async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The crawl's concurrency as a backfill job will run it: each value from its
+/// instance setting, then its environment variable, then its default, the
+/// order the job reads them in. The backfill pool is sized from this at boot,
+/// so a setting raised from the dashboard takes effect at the next restart.
+/// Returns `(pds, dids_per_pds, resolution)`.
+pub async fn backfill_concurrency(pool: &AnyPool, backend: DatabaseBackend) -> (u32, u32, u32) {
+    let read = |key: &'static str, default: u32| async move {
+        get_setting(pool, key, backend)
+            .await
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    (
+        read("backfill_concurrent_pds", 10).await,
+        read("backfill_concurrent_dids_per_pds", 3).await,
+        read("backfill_concurrent_resolution", 100).await,
+    )
+}
+
 /// GET /admin/settings/db-info — return database connection pool info.
 pub(super) async fn db_info(
     State(state): State<AppState>,
@@ -275,26 +294,7 @@ pub(super) async fn db_info(
     let main_pool_size = state.db.options().get_max_connections() as i64;
     let backfill_pool_size = state.backfill_db.options().get_max_connections() as i64;
 
-    let pds: u32 = get_setting(&state.db, "backfill_concurrent_pds", state.db_backend)
-        .await
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-    let dids: u32 = get_setting(
-        &state.db,
-        "backfill_concurrent_dids_per_pds",
-        state.db_backend,
-    )
-    .await
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(3);
-    let resolution: u32 = get_setting(
-        &state.db,
-        "backfill_concurrent_resolution",
-        state.db_backend,
-    )
-    .await
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(100);
+    let (pds, dids, resolution) = backfill_concurrency(&state.db, state.db_backend).await;
     let would_be_pool_size =
         crate::db::compute_backfill_pool_size(state.db_backend, pds, dids, resolution);
     let restart_recommended = would_be_pool_size as i64 > backfill_pool_size;
