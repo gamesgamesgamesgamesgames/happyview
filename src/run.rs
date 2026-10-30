@@ -707,6 +707,12 @@ async fn boot(
     let linked_repos_scopes = oauth_scopes.clone();
     let oauth_scopes_for_by_kid = oauth_scopes.clone();
 
+    // A staged key that came due while the instance was down takes over
+    // before the clients are built around the current one.
+    if let Err(e) = crate::oauth::client_keys::promote_due_keys(&db_pool, db_backend).await {
+        warn!(error = %e, "failed to promote staged OAuth client keys");
+    }
+
     let instance_key = crate::oauth::client_keys::ensure_instance_key(
         &db_pool,
         db_backend,
@@ -1181,6 +1187,10 @@ async fn boot(
         state.db.clone(),
         state.db_backend,
     ));
+
+    // Staged OAuth client keys take over when they come due. In the boot,
+    // rather than in `run`, so `boot_for_test` exercises it too.
+    tokio::spawn(crate::oauth::rotation::run_key_promotion(state.clone()));
 
     // Where `jetstream::spawn` stood: live ingest starts after the project
     // is installed and before anything else is spawned.

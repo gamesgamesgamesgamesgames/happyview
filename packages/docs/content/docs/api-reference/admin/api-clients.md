@@ -389,7 +389,7 @@ curl -X POST http://127.0.0.1:3000/admin/api-clients/01J9.../auth-key -H "$AUTH"
 GET /admin/api-clients/{id}/auth-keys
 ```
 
-Requires `api-clients:view`. Every key the client holds, ordered `current`, then `retiring`, then `revoked`, each with a live `session_count`.
+Requires `api-clients:view`. Every key the client holds, ordered `pending`, then `current`, then `retiring`, then `revoked`, each with a live `session_count`. A `pending` key carries `activates_at`, when it takes over.
 
 Distinct from `GET .../auth-key`, which reports only the current key. An operator revoking a leaked key needs to see the **retiring** one and how many sessions revoking it will destroy. Revoked keys are listed so a revoke is visibly done.
 
@@ -421,7 +421,9 @@ Requires `api-clients:edit`. Re-fetches the client's published metadata and repo
 POST /admin/api-clients/{id}/auth-key/rotate
 ```
 
-Requires `api-clients:edit`. Mints a new `current` key and demotes the previous one to `retiring`. **Nothing is logged out**: a retiring key stays in the published JWKS and keeps signing refreshes for the sessions established with it.
+Requires `api-clients:edit`. Publishes a new key as `pending` in the client's JWKS. At `activates_at`, about 75 minutes later, once authorization servers' cached copies of the key set have had time to include it, the new key becomes `current` and the previous one is demoted to `retiring`. **Nothing is logged out**: a retiring key stays in the published JWKS and keeps signing refreshes for the sessions established with it. Send `{"immediate": true}` to switch now instead; sign-ins through a server that cached the old key set can fail for up to an hour, so keep that for a leaked key.
+
+**Response**: `200 OK` with `kid`, `status` (`pending`, or `current` after an immediate switch), `activates_at` and `orphaned_sessions`.
 
 ### Revoke a key
 
@@ -435,7 +437,7 @@ This is the response to a **leaked or compromised key**, not routine cleanup. Ro
 
 | Status | Meaning |
 | ------ | ------- |
-| `400`  | The target is the `current` key. Rotate first, then revoke the retiring key. |
+| `400`  | The target is the `current` key. Rotate with `"immediate": true` first, then revoke the retiring key. |
 | `404`  | No key with that `kid` belongs to this client. |
 
 ```sh tab="cURL" tab-group="language"
@@ -470,7 +472,7 @@ curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../auth-keys -H "$AU
 
 ### Responding to a leaked client key
 
-1. `POST .../auth-key/rotate` — the leaked key becomes `retiring`, a fresh key takes over, and the client keeps working.
+1. `POST .../auth-key/rotate` with `{"immediate": true}` — the leaked key becomes `retiring`, a fresh key takes over, and the client keeps working.
 2. `GET .../auth-keys` — confirm it is now `retiring` and note its `session_count`, which is how many users step 3 signs out.
 3. `DELETE .../auth-key/{kid}` on the leaked key.
 
