@@ -42,16 +42,20 @@ export function DeleteLexiconDialog({
   const [deleteRecords, setDeleteRecords] = useState(false);
   const [count, setCount] = useState<number | null>(null);
   const [countFailed, setCountFailed] = useState(false);
+  /** Null until the count answers; false when a shared store serves it. */
+  const [deletable, setDeletable] = useState<boolean | null>(null);
+  const [notDeletable, setNotDeletable] = useState<string | null>(null);
 
   // Only a record lexicon has records of its own. A query or procedure
   // lexicon reads another lexicon's collection through target_collection, so
   // offering to delete "its" records would delete someone else's.
   const hasRecords = lexicon.lexicon_type === "record";
-  // A network lexicon is removed through its own endpoint, which takes no
-  // such option. Better to say so than to show a checkbox that is quietly
-  // ignored.
-  const network = lexicon.source === "network";
-  const offerRecords = hasRecords && canDeleteRecords && !network;
+  // Whether the records are this instance's to delete is the server's call,
+  // not a guess from the lexicon's source: a collection a shared record
+  // store serves is refused, and the count endpoint says so. Until it
+  // answers, nothing is offered — better a moment's wait than a checkbox
+  // that turns out to be refused.
+  const offerRecords = hasRecords && canDeleteRecords && deletable === true;
 
   // Counting is a COUNT(*) over the collection, so it waits for the dialog
   // rather than loading with the table.
@@ -60,9 +64,13 @@ export function DeleteLexiconDialog({
       setDeleteRecords(false);
       return;
     }
-    if (!offerRecords || count !== null) return;
+    if (!hasRecords || !canDeleteRecords || count !== null) return;
     getLexiconRecordCount(lexicon.id)
-      .then((r) => setCount(r.count))
+      .then((r) => {
+        setCount(r.count);
+        setDeletable(r.deletable);
+        setNotDeletable(r.not_deletable_reason);
+      })
       .catch(() => setCountFailed(true));
   }
 
@@ -125,9 +133,12 @@ export function DeleteLexiconDialog({
         )}
         {hasRecords && !offerRecords && (
           <p className="text-muted-foreground text-xs">
-            {network
-              ? "The collection's indexed records will stay. Delete them from the Records page if you want them gone."
-              : "The collection's indexed records will stay. Deleting them needs the records:delete-collection permission."}
+            {!canDeleteRecords
+              ? "The collection's indexed records will stay. Deleting them needs the records:delete-collection permission."
+              : countFailed
+                ? "The collection's indexed records will stay: its record count could not be read."
+                : (notDeletable ??
+                  "Checking whether this collection's records can be deleted…")}
           </p>
         )}
 

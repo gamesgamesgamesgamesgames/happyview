@@ -243,16 +243,40 @@ pub(super) async fn lexicon_record_count(
         .count_collection(&id)
         .await
         .map_err(|e| AppError::Internal(format!("could not count '{id}': {e}")))?;
-    Ok(Json(
-        serde_json::json!({ "collection": id, "count": count }),
-    ))
+    // So the confirm can offer the option only where it would be honoured,
+    // rather than showing a control the delete would refuse.
+    let refusal = records_not_locally_deletable(&state, &id);
+    Ok(Json(serde_json::json!({
+        "collection": id,
+        "count": count,
+        "deletable": refusal.is_none(),
+        "not_deletable_reason": refusal,
+    })))
+}
+
+/// Why this instance may not delete a collection's indexed records, or
+/// `None` when it may.
+///
+/// A collection an external `RecordStorage` claims — the shared network store
+/// on a managed instance — is not this instance's to empty. The delete would
+/// reach only the tenant's own overlay rows while the shared records those
+/// union with stay exactly where they are, so the job would report success
+/// having removed a fraction of what the operator was looking at. Refusing
+/// says the true thing. The shared rows are safe either way: a tenant holds
+/// `SELECT` on them and nothing more.
+pub(super) fn records_not_locally_deletable(state: &AppState, collection: &str) -> Option<String> {
+    state.records.external_route(collection).is_some().then(|| {
+        format!(
+            "'{collection}' is served from a shared record store, so this instance cannot              delete its records: they belong to every instance reading that store, not to              this one. Delete the lexicon on its own, or ask whoever runs the store."
+        )
+    })
 }
 
 /// Why a lexicon has no records of its own to delete. A query or procedure
 /// lexicon reads and writes *another* lexicon's collection through
 /// `target_collection`, so honouring `delete_records` for one would destroy
 /// records that belong to a record lexicon nobody asked about.
-fn not_a_record_lexicon(id: &str, lexicon: &crate::lexicon::ParsedLexicon) -> String {
+pub(super) fn not_a_record_lexicon(id: &str, lexicon: &crate::lexicon::ParsedLexicon) -> String {
     let kind = match lexicon.lexicon_type {
         LexiconType::Record => "record",
         LexiconType::Query => "query",
@@ -316,6 +340,9 @@ pub(super) async fn delete_lexicon(
             .ok_or_else(|| AppError::NotFound(format!("lexicon '{id}' not found")))?;
         if lexicon.lexicon_type != LexiconType::Record {
             return Err(AppError::BadRequest(not_a_record_lexicon(&id, &lexicon)));
+        }
+        if let Some(reason) = records_not_locally_deletable(&state, &id) {
+            return Err(AppError::BadRequest(reason));
         }
         // Recorded for the event log, not to gate anything: a collection that
         // counts zero now may still have rows the job finds, and a count that
