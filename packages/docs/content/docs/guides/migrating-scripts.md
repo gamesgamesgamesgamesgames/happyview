@@ -129,7 +129,7 @@ These are the only markers the codemod emits, each substituting the specific nam
 A script stored before the upgrade stays in the table untouched, and the scripts list flags it with the globals it still references. It fails the first time it reads one of them, with an error that names the global:
 
 ```
-the 'params' global was removed in v3; run the script codemod (Settings → Scripts → Migrate, or happyview-codemod) -- see the Migrating scripts guide
+the 'params' global was removed in v3; run the script codemod (Migrate on the script's page under Integrations → Scripts, or happyview-codemod) -- see the Migrating scripts guide
 ```
 
 Only the removed names raise. Any other undefined name is `nil`, as in plain Lua, and a script may still assign its own globals, including one that reuses a removed name.
