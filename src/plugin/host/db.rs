@@ -152,7 +152,7 @@ mod tests {
                 let backend = DatabaseBackend::from_url(&url);
                 out.push((crate::db::connect(&url, backend).await, backend));
             }
-            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+            Err(_) => crate::test_support::unavailable(crate::test_support::NO_DATABASE),
         }
         out
     }
@@ -173,7 +173,7 @@ mod tests {
     #[serial]
     async fn a_routed_read_on_postgres_can_neither_write_nor_change_the_session() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("TEST_DATABASE_URL unset: skipped");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         let backend = DatabaseBackend::from_url(&url);

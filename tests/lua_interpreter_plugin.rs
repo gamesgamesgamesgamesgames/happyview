@@ -553,7 +553,7 @@ async fn os_time_on_a_table_is_read_as_utc_whatever_zone_the_host_is_in() {
 async fn a_library_call_from_inside_a_coroutine_answers_its_value() {
     common::require_db!();
     if !library_fixture_built() {
-        eprintln!("skipping: {LIBRARY_BUILD}");
+        happyview::test_support::unavailable(LIBRARY_BUILD);
         return;
     }
     let app = TestApp::new().await;

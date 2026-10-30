@@ -1301,7 +1301,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_compile_leaves_the_async_runtime_free() {
         let Some(dir) = std::env::var_os("HAPPYVIEW_LUA_PLUGIN") else {
-            eprintln!("skipping: HAPPYVIEW_LUA_PLUGIN is unset");
+            crate::test_support::unavailable(
+                "HAPPYVIEW_LUA_PLUGIN is unset. Run scripts/fetch-lua-plugin.sh and point it at tests/fixtures/lua-plugin",
+            );
             return;
         };
         let mut plugin = crate::plugin::loader::load_from_file(Path::new(&dir))

@@ -24,7 +24,7 @@ const BASIC: &str = "tests/fixtures/projects/basic";
 macro_rules! require_fixture {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };
