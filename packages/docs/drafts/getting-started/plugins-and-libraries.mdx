@@ -22,7 +22,7 @@ HappyView runs your scripts inside WebAssembly plugins. Two kinds matter for scr
 HappyView itself ships with no interpreter and no library. Everything a script can reach beyond the built-in `internal.*` modules comes from a library your project adds.
 
 :::note[Self-hosted instances start with no interpreter]
-A self-hosted instance has no interpreter until one is installed. At boot it logs a warning: "no interpreter plugin is installed, so no script can be saved or run". An operator can preinstall plugins with `HAPPYVIEW_DEFAULT_PLUGINS`: the plugins it names are installed on the first boot whose variable lists them.
+A self-hosted instance has no interpreter until one is installed. At boot it logs a warning: "no interpreter plugin is installed, so no script can be saved or run". An operator can preinstall plugins with `HAPPYVIEW_DEFAULT_PLUGINS`: the plugins it names are installed on the first boot whose variable lists them. HappyProto's provisioner preinstalls Lua on every HappyProto instance.
 :::
 
 ## Add a plugin to your project

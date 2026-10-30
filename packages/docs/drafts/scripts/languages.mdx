@@ -25,7 +25,7 @@ In a project, a script's file extension picks its language. `src/jobs/export.lua
 
 A self-hosted instance starts with no interpreter. HappyView does not bundle one, so a self-hosted instance can't save or run a script until you install one.
 
-Hosts can preinstall interpreters with [`HAPPYVIEW_DEFAULT_PLUGINS`](#on-first-boot). The plugins it names are installed in the background on the first boot whose variable lists them, so they may take a moment to appear.
+Hosts can preinstall interpreters with [`HAPPYVIEW_DEFAULT_PLUGINS`](#on-first-boot). The plugins it names are installed in the background on the first boot whose variable lists them, so they may take a moment to appear. HappyProto's provisioner preinstalls Lua on every HappyProto instance.
 
 Lua is also the default language in three places:
 
