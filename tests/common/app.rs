@@ -45,7 +45,22 @@ impl TestApp {
     pub async fn new_with_registry_config(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
-        Self::build(registry_config, false).await
+        Self::build(registry_config, false, None).await
+    }
+
+    /// A [`TestApp`] whose record store delegates the collections `external`
+    /// claims to it, as a managed instance's does to the shared network
+    /// store. It has to be given before the router is built, because the
+    /// router holds its own clone of the state.
+    pub async fn new_with_external_storage(
+        external: std::sync::Arc<dyn happyview_provider::RecordStorage>,
+    ) -> Self {
+        Self::build(
+            happyview::plugin::official_registry::RegistryConfig::production(),
+            false,
+            Some(external),
+        )
+        .await
     }
 
     /// A [`TestApp`] whose plugin registry writes `happyview_plugins` rows, as
@@ -54,12 +69,13 @@ impl TestApp {
     pub async fn new_with_persisted_plugins(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
-        Self::build(registry_config, true).await
+        Self::build(registry_config, true, None).await
     }
 
     async fn build(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
         persist_plugins: bool,
+        external: Option<std::sync::Arc<dyn happyview_provider::RecordStorage>>,
     ) -> Self {
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
@@ -198,6 +214,9 @@ impl TestApp {
         state.records = happyview::record_store::RecordStore::shared(pool.clone(), backend)
             .await
             .expect("load record dictionaries");
+        if let Some(external) = external {
+            state.records = state.records.clone().with_external(external);
+        }
         state.domain_cache = domain_cache;
         state.lexicons = lexicons;
         state.collections_tx = collections_tx;

@@ -385,6 +385,20 @@ Records a record script kept after the source deleted them are included: an
 operator deleting the collection overrides what a script chose to do with an
 upstream delete.
 
+**A collection served from a shared record store is refused** with
+`400 Bad Request`. On a managed instance the records are read from a store
+several instances share, and a delete here would reach only this instance's own
+overlay rows — the shared records would stay exactly where they are, and the
+job would report success having removed a fraction of what you were looking at.
+The shared rows are never at risk (this instance reads them and nothing more);
+the refusal is there because succeeding at almost nothing is worse than saying
+no. `GET /admin/lexicons/{id}/record-count` reports this as
+`deletable: false` with a `not_deletable_reason`, which is how the dashboard
+knows not to offer the option.
+
+The same parameter, on the same terms, works on
+[`DELETE /admin/network-lexicons/{nsid}`](#stop-tracking-a-network-lexicon).
+
 ## How many records a collection holds
 
 ```
@@ -397,7 +411,12 @@ curl http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status/record-count -H
 
 **Response**: `200 OK`
 
-    { "collection": "xyz.statusphere.status", "count": 1204 }
+    {
+      "collection": "xyz.statusphere.status",
+      "count": 1204,
+      "deletable": true,
+      "not_deletable_reason": null
+    }
 
 A separate route rather than a field on the lexicon because it counts the
 collection, which is far more expensive than reading the lexicon. The dashboard

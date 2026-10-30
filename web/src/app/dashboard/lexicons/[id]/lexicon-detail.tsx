@@ -100,7 +100,7 @@ export default function LexiconDetailPage() {
     setDeleting(true);
     try {
       if (lexicon.source === "network") {
-        await deleteNetworkLexicon(lexicon.id);
+        await deleteNetworkLexicon(lexicon.id, deleteRecords);
       } else {
         await deleteLexicon(lexicon.id, deleteRecords);
       }
