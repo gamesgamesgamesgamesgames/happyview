@@ -118,7 +118,7 @@ webpki-roots = "1.0"
 zstd = "0.14.3"
 # Wasmtime's defaults less `cache`, which pulls a zstd with open advisories and
 # which nothing uses: compiled modules are cached by `WasmRuntime::module_for`.
-wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
+wasmtime = { version = ">=49.0.5, <50", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -145,7 +145,7 @@ wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = { version = ">=49.0.4, <50", default-features = false, features = ["p1"] }
+wasmtime-wasi = { version = ">=49.0.5, <50", default-features = false, features = ["p1"] }
 regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"
