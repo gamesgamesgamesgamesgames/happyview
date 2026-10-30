@@ -78,14 +78,25 @@ pub async fn send_once(
 }
 
 /// Assemble and send one snapshot if consent currently permits it.
+/// The consent in force on this instance, a platform's mandate included.
+pub async fn effective_consent(state: &AppState) -> consent::Consent {
+    consent::load_effective(
+        &state.db,
+        state.db_backend,
+        state.config.telemetry_managed_by.as_deref(),
+    )
+    .await
+}
+
 pub async fn report_once(state: &AppState) -> Result<Option<Benchmarks>, String> {
-    let mut current = consent::load(&state.db, state.db_backend).await;
+    let mut current = effective_consent(state).await;
     if !current.mode.reports() {
         return Err("telemetry is disabled".to_string());
     }
 
     if current.instance_id.is_none() {
-        current.instance_id = consent::ensure_instance_id(&state.db, state.db_backend).await;
+        current.instance_id =
+            consent::ensure_instance_id(&state.db, state.db_backend, current.mode).await;
     }
 
     let snapshot = assemble::assemble(
@@ -109,7 +120,7 @@ pub async fn report_once(state: &AppState) -> Result<Option<Benchmarks>, String>
 
 /// Background loop. Spawned once from `main`.
 pub async fn run_reporter(state: AppState) {
-    let seed = consent::load(&state.db, state.db_backend)
+    let seed = effective_consent(&state)
         .await
         .instance_id
         .unwrap_or_else(|| state.config.public_url.clone());
@@ -118,7 +129,7 @@ pub async fn run_reporter(state: AppState) {
     tracing::info!("starting telemetry reporter");
 
     loop {
-        let mode = consent::load(&state.db, state.db_backend).await.mode;
+        let mode = effective_consent(&state).await.mode;
         if matches!(mode, consent::TelemetryMode::Auto) {
             match report_once(&state).await {
                 Ok(_) => tracing::debug!("telemetry snapshot sent"),
@@ -178,6 +189,7 @@ mod tests {
             happyview_version: "0.1.0".into(),
             process_started_at: "2026-08-18T00:00:00+00:00".into(),
             contact: None,
+            managed: None,
             totals: Default::default(),
             since_start: Default::default(),
             features: Default::default(),

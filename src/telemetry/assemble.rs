@@ -212,10 +212,21 @@ pub async fn assemble(
 
     let mut host_report = host_report;
     if let Some(keys) = configured_keys {
+        // An operator may name a setting anything, so a managed instance
+        // reports such keys only as a count.
+        let (keys, other): (Vec<_>, Vec<_>) = keys
+            .into_iter()
+            .partition(|k| consent.managed_by.is_none() || health::is_known_setting_key(k));
         host_report.insert(
             "configured_setting_keys".to_string(),
             serde_json::json!(keys),
         );
+        if consent.managed_by.is_some() {
+            host_report.insert(
+                "configured_other_setting_keys".to_string(),
+                serde_json::json!(other.len()),
+            );
+        }
     }
     if let Some(since) = version_since {
         host_report.insert("version_seen_since".to_string(), serde_json::json!(since));
@@ -247,6 +258,7 @@ pub async fn assemble(
         happyview_version: crate::version::version().to_string(),
         process_started_at: counters.process_started_at().to_string(),
         contact: consent.contact.clone(),
+        managed: consent.managed_by.clone(),
         totals,
         since_start: counters.snapshot(),
         features: feature_usage,
@@ -283,6 +295,7 @@ mod tests {
             lexicon_documents: false,
             instance_id: Some("11111111-2222-3333-4444-555555555555".into()),
             prompted: true,
+            managed_by: None,
         }
     }
 
@@ -388,6 +401,96 @@ mod tests {
             snap.lexicons.structures.is_none(),
             "names must not imply structure"
         );
+    }
+
+    async fn put_setting(pool: &sqlx::AnyPool, key: &str, value: &str) {
+        crate::admin::settings::put_setting(pool, key, value, DatabaseBackend::Sqlite)
+            .await
+            .unwrap();
+    }
+
+    async fn assemble_with(pool: &sqlx::AnyPool, c: &Consent) -> Snapshot {
+        assemble(
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
+            "sqlite::memory:",
+            c,
+            &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Every string in `value`, keys included.
+    fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    out.push(k.clone());
+                    strings(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_managed_snapshot_carries_only_instance_level_data() {
+        let pool = pool_for_assembly().await;
+        crate::db::query(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+             VALUES ('at://did:plc:alice/com.example.post/1', 'did:plc:alice', 'com.example.post', '1',
+                     '{\"text\":\"hello from alice\"}', 'bafy', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        put_setting(&pool, "app_name", "Example").await;
+        put_setting(&pool, "alice@example.com", "x").await;
+
+        let mut c = consent(TelemetryMode::Off);
+        c.contact = Some("operator@example.com".into());
+        c.lexicon_names = true;
+        let snap = assemble_with(&pool, &c.managed_by(Some("acme"))).await;
+
+        assert_eq!(snap.managed.as_deref(), Some("acme"));
+        assert_eq!(snap.report_mode, "auto");
+        assert!(snap.contact.is_none());
+        assert!(snap.lexicons.names.is_none());
+        assert_eq!(
+            snap.host["configured_setting_keys"],
+            serde_json::json!(["app_name"])
+        );
+        assert_eq!(snap.host["configured_other_setting_keys"], 1);
+        assert_eq!(snap.totals["records"], 1);
+
+        let mut seen = Vec::new();
+        strings(&serde_json::to_value(&snap).unwrap(), &mut seen);
+        for s in &seen {
+            assert!(
+                !s.contains('@') && !s.contains("did:") && !s.contains("alice"),
+                "a managed snapshot carried {s:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_snapshot_names_every_configured_key() {
+        let pool = pool_for_assembly().await;
+        put_setting(&pool, "app_name", "Example").await;
+        put_setting(&pool, "my_custom_key", "x").await;
+
+        let snap = assemble_with(&pool, &consent(TelemetryMode::Auto)).await;
+
+        assert!(snap.managed.is_none());
+        assert_eq!(
+            snap.host["configured_setting_keys"],
+            serde_json::json!(["app_name", "my_custom_key"])
+        );
+        assert!(!snap.host.contains_key("configured_other_setting_keys"));
     }
 
     #[tokio::test]

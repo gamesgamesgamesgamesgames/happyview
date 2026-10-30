@@ -252,6 +252,7 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
         telemetry_collector_url: String::new(),
+        telemetry_managed_by: None,
         plugin_cache_dir: None,
         platform_api_key_hash: None,
         job_worker_concurrency: 1,

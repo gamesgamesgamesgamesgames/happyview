@@ -57,6 +57,17 @@ async fn put_setting(state: &AppState, key: &str, value: &str) -> Result<(), App
     Ok(())
 }
 
+/// A hosting platform that made reporting mandatory owns these settings, so
+/// the operator cannot change them, by this route or the generic one.
+pub(super) fn refuse_if_managed(state: &AppState) -> Result<(), AppError> {
+    if state.config.telemetry_managed_by.is_some() {
+        return Err(AppError::Conflict(
+            "telemetry on this instance is managed by its hosting platform".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// `GET /admin/settings/telemetry`
 pub(super) async fn get(
     State(state): State<AppState>,
@@ -64,7 +75,7 @@ pub(super) async fn get(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
 
-    let c = consent::load(&state.db, state.db_backend).await;
+    let c = reporter::effective_consent(&state).await;
     Ok(Json(serde_json::json!({
         "mode": c.mode.as_str(),
         "contact": c.contact,
@@ -74,6 +85,7 @@ pub(super) async fn get(
         "instance_id": c.instance_id,
         "collector_url": state.config.telemetry_collector_url,
         "prompted": c.prompted,
+        "managed": c.managed_by.is_some(),
     })))
 }
 
@@ -84,6 +96,7 @@ pub(super) async fn update(
     Json(body): Json<TelemetryUpdate>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    refuse_if_managed(&state)?;
 
     if let Some(mode) = &body.mode {
         validate_mode(mode)?;
@@ -108,7 +121,8 @@ pub(super) async fn update(
         }
     }
 
-    consent::ensure_instance_id(&state.db, state.db_backend).await;
+    let mode = reporter::effective_consent(&state).await.mode;
+    consent::ensure_instance_id(&state.db, state.db_backend, mode).await;
 
     // Saving anything here is an answer to the telemetry question, including
     // saving "off". Without this, an operator who turned telemetry off from
@@ -145,7 +159,7 @@ pub(super) async fn preview(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
 
-    let mut c = consent::load(&state.db, state.db_backend).await;
+    let mut c = reporter::effective_consent(&state).await;
     if c.instance_id.is_none() {
         c.instance_id = Some("(generated when you enable telemetry)".to_string());
     }
@@ -173,7 +187,7 @@ pub(super) async fn send(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
 
-    let mode = consent::load(&state.db, state.db_backend).await.mode;
+    let mode = reporter::effective_consent(&state).await.mode;
     if !mode.reports() {
         return Err(AppError::BadRequest(
             "telemetry is disabled; enable manual or automatic reporting first".to_string(),

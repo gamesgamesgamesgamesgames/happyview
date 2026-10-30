@@ -845,6 +845,9 @@ export interface TelemetrySettings {
    * instance. False only for instances predating the setup wizard's
    * telemetry step, which is what the dashboard prompt exists to catch. */
   prompted: boolean;
+  /** Whether the hosting platform has made a daily report mandatory. Its
+   * settings are then fixed, and the API refuses changes to them. */
+  managed: boolean;
 }
 
 export interface TelemetryBenchmarkEntry {

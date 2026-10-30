@@ -62,6 +62,38 @@ pub async fn time_on_version(
 }
 
 /// Names of every setting key present in the database.
+/// Setting keys HappyView writes itself, beyond those with an environment
+/// fallback. `PUT /admin/settings/{key}` accepts any key, so on a managed
+/// instance only these are reported by name; see [`is_known_setting_key`].
+const INTERNAL_SETTING_KEYS: &[&str] = &[
+    crate::feature_flags::FeatureFlag::SPACES_PDS_MIGRATION,
+    crate::admin::default_plugins::APPLIED_KEY,
+    "happyview.require.loaded",
+    "jetstream_cursor",
+    "jetstream_host",
+    "jetstream_seq",
+    "rate_limit.default_procedure_cost",
+    "rate_limit.default_proxy_cost",
+    "rate_limit.default_query_cost",
+    "record_refs_rebuild_cursor",
+    "record_refs_rebuilt",
+    "record_store_copy_records_after",
+    "record_store_copy_refs_after",
+    "space_cid_backfill_completed_at",
+    "space_commit_format_rebuild_completed_at",
+    "sqlite_vacuum_attempt_started_at",
+    "sqlite_vacuum_completed_at",
+    "sqlite_vacuum_last_result",
+    "sqlite_vacuum_requested_at",
+    "xrpc_proxy_config",
+];
+
+/// Whether HappyView itself names `key`, as opposed to an operator who
+/// stored it through the settings API under a name of their choosing.
+pub fn is_known_setting_key(key: &str) -> bool {
+    crate::admin::settings::env_var_for(key).is_some() || INTERNAL_SETTING_KEYS.contains(&key)
+}
+
 pub async fn configured_keys(pool: &AnyPool, backend: DatabaseBackend) -> Vec<String> {
     let sql = adapt_sql(
         "SELECT key FROM happyview_instance_settings ORDER BY key",

@@ -169,6 +169,30 @@ pub fn parse_superadmin_did(raw: Option<&str>) -> Result<Option<String>, String>
         .map_err(|e| format!("SUPERADMIN_DID is not a valid DID ('{trimmed}'): {e}"))
 }
 
+/// The longest platform name `TELEMETRY_MANAGED_BY` accepts.
+const MAX_MANAGED_BY_LEN: usize = 64;
+
+/// Parse `TELEMETRY_MANAGED_BY`, the hosting platform that has made this
+/// instance's telemetry mandatory. Unset or blank means no platform has.
+pub fn parse_telemetry_managed_by(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = match raw.map(str::trim) {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let well_formed = trimmed.len() <= MAX_MANAGED_BY_LEN
+        && trimmed.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if well_formed {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Err(format!(
+            "TELEMETRY_MANAGED_BY must be lowercase letters, digits and '-', starting with a letter or digit, at most {MAX_MANAGED_BY_LEN} characters ('{trimmed}')"
+        ))
+    }
+}
+
 /// Environment entries whose name and value are both UTF-8; the rest cannot
 /// name a configuration variable and must not abort boot.
 pub fn utf8_env(
@@ -189,6 +213,9 @@ pub struct Config {
     pub session_secret: String,
     pub jetstream_url: String,
     pub telemetry_collector_url: String,
+    /// The hosting platform that has made telemetry mandatory on this
+    /// instance, from `TELEMETRY_MANAGED_BY`. `None` leaves it to the operator.
+    pub telemetry_managed_by: Option<String>,
     pub relay_url: String,
     pub plc_url: String,
     pub static_dir: Option<String>,
@@ -312,6 +339,11 @@ impl Config {
         if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
             return Err(project::ProjectConfigError::InvalidSetting { message });
         }
+        // Read as unmanaged, a misspelt platform name would let the operator
+        // turn off reporting the platform requires.
+        if let Err(message) = parse_telemetry_managed_by(var("TELEMETRY_MANAGED_BY").as_deref()) {
+            return Err(project::ProjectConfigError::InvalidSetting { message });
+        }
         if let Some(message) = project
             .as_ref()
             .and_then(|p| p.version_mismatch(crate::version::version()))
@@ -374,6 +406,15 @@ impl Config {
                 .unwrap_or_else(|| "wss://jetstream1.us-east.bsky.network".into()),
             telemetry_collector_url: var("TELEMETRY_COLLECTOR_URL")
                 .unwrap_or_else(|| "https://telemetry.happyview.dev/v1/snapshot".to_string()),
+            telemetry_managed_by: match parse_telemetry_managed_by(
+                var("TELEMETRY_MANAGED_BY").as_deref(),
+            ) {
+                Ok(by) => by,
+                Err(reason) => {
+                    tracing::error!("{reason}. Telemetry is not managed until it is fixed.");
+                    None
+                }
+            },
             relay_url: var("RELAY_URL").unwrap_or_else(|| "https://bsky.network".into()),
             plc_url: var("PLC_URL").unwrap_or_else(|| "https://plc.directory".into()),
             static_dir: var("STATIC_DIR").filter(|s| !s.is_empty()),
@@ -529,6 +570,7 @@ mod tests {
             "PLATFORM_API_KEY_HASH",
             "JOB_WORKER_CONCURRENCY",
             "SUPERADMIN_DID",
+            "TELEMETRY_MANAGED_BY",
             "HAPPYVIEW_PROJECT",
             "PLUGIN_DIR",
             "HAPPYVIEW_SCRIPT_ENV_FILE",
@@ -709,6 +751,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1200,6 +1243,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1239,6 +1283,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1278,6 +1323,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1317,6 +1363,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1386,6 +1433,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
@@ -1638,5 +1686,58 @@ mod tests {
             Ok(Some("did:plc:abc".to_string()))
         );
         assert!(parse_superadmin_did(Some("alice.bsky.social")).is_err());
+    }
+
+    #[test]
+    fn telemetry_managed_by_parsing() {
+        assert_eq!(parse_telemetry_managed_by(None), Ok(None));
+        assert_eq!(parse_telemetry_managed_by(Some("  ")), Ok(None));
+        assert_eq!(
+            parse_telemetry_managed_by(Some(" acme-hosting ")),
+            Ok(Some("acme-hosting".to_string()))
+        );
+        assert_eq!(
+            parse_telemetry_managed_by(Some("9host")),
+            Ok(Some("9host".to_string()))
+        );
+        for bad in [
+            "Acme",
+            "acme hosting",
+            "-acme",
+            "acme.example",
+            "acme_hosting",
+        ] {
+            assert!(parse_telemetry_managed_by(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(parse_telemetry_managed_by(Some(&"a".repeat(65))).is_err());
+        assert!(parse_telemetry_managed_by(Some(&"a".repeat(64))).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalid_telemetry_managed_by_refuses_boot() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("TELEMETRY_MANAGED_BY", "Acme Hosting");
+        }
+        let _reset = vars::LayerReset;
+        let err = Config::load_from(None, ConfigMode::Serve).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("TELEMETRY_MANAGED_BY"), "{message}");
+        assert!(message.contains("Acme Hosting"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn telemetry_managed_by_is_read_from_the_environment() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("TELEMETRY_MANAGED_BY", "acme");
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load_from(None, ConfigMode::Serve).unwrap();
+        assert_eq!(config.telemetry_managed_by.as_deref(), Some("acme"));
     }
 }
