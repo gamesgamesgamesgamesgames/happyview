@@ -1095,8 +1095,12 @@ jobs:
   # Mirror to Tangled
   # ---------------------------------------------------------------------------
   mirror:
-    # PRs have nothing to mirror, and fork PRs can't read the SSH key.
-    if: github.event_name != 'pull_request'
+    # Disabled until the TANGLED_SSH_PRIVATE_KEY secret / Tangled deploy key is
+    # fixed (HAP-49): tangled.org refuses the key, so every push run went red
+    # here. To re-enable, restore the condition below. PRs have nothing to
+    # mirror, and fork PRs can't read the SSH key. No job needs this one.
+    #   if: github.event_name != 'pull_request'
+    if: false
     runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
