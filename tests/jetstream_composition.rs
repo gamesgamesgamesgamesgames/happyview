@@ -71,7 +71,7 @@ fn record_lexicon(id: &str) -> Value {
 /// host over the returned state reads, which the test drives.
 async fn app(collections: &[&str]) -> Option<(TestApp, watch::Sender<Vec<String>>)> {
     if std::env::var("TEST_DATABASE_URL").is_err() {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
         return None;
     }
     let mut app = TestApp::new().await;

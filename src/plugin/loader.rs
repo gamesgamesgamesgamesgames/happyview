@@ -682,10 +682,10 @@ pub(crate) fn built_fixture(name: &str, target: &str) -> Option<std::path::PathB
     {
         return Some(dir);
     }
-    eprintln!(
-        "skipping: {name} fixture not built. Run: cargo build \
+    crate::test_support::unavailable(&format!(
+        "{name} fixture not built. Run: cargo build \
          --manifest-path tests/fixtures/{name}/Cargo.toml --target {target} --release"
-    );
+    ));
     None
 }
 

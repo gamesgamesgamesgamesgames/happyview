@@ -175,7 +175,7 @@ async fn a_patch_onto_a_language_with_no_interpreter_is_refused_and_stores_nothi
 async fn installing_the_interpreter_lets_the_same_body_save() {
     common::require_db!();
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let app = TestApp::new().await;

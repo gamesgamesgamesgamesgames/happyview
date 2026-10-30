@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 fn project() -> Option<TempDir> {
     if !common::echo_interpreter::is_built() {
-        eprintln!("skipping: {}", common::echo_interpreter::BUILD);
+        happyview::test_support::unavailable(common::echo_interpreter::BUILD);
         return None;
     }
     let dir = tempfile::tempdir().unwrap();

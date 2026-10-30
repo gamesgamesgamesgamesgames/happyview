@@ -165,7 +165,10 @@ macro_rules! wait_until {
 /// A TestApp tracking GAME, pointed at `mock`, whose replay settings use a
 /// fresh download dir, fast retries and `key`.
 async fn app(mock: &MockJetstream, key: Option<&str>) -> Option<TestApp> {
-    std::env::var("TEST_DATABASE_URL").ok()?;
+    if std::env::var("TEST_DATABASE_URL").is_err() {
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
+        return None;
+    }
     let mut app = TestApp::new().await;
     // Upload through the API so the lexicon is in both `happyview_lexicons`
     // (a job without a collection, like a gap replay, lists record lexicons

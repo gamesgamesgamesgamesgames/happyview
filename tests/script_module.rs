@@ -27,7 +27,7 @@ const SOURCE: &str = "tests/fixtures/script_module/src/lib.rs";
 macro_rules! require_fixture {
     ($path:expr, $build:literal) => {
         if !std::path::Path::new($path).exists() {
-            eprintln!(concat!("skipping: fixture not built. Run: ", $build));
+            happyview::test_support::unavailable(concat!("fixture not built. Run: ", $build));
             return;
         }
     };

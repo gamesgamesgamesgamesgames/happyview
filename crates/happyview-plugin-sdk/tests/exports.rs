@@ -246,11 +246,18 @@ fn module_interface(path: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)>
 fn check_fixture(name: &str, expected_exports: &[&str], expected_imports: &[&str]) {
     let path = fixture_path(name);
     let Some((exports, imports)) = module_interface(&path) else {
-        eprintln!(
-            "skipping: {} not built. Run `cargo build --manifest-path tests/fixtures/{name}/Cargo.toml --target wasm32-unknown-unknown --release` first.",
+        let what = format!(
+            "{} not built. Run `cargo build --manifest-path tests/fixtures/{name}/Cargo.toml --target wasm32-unknown-unknown --release` first.",
             path.display()
         );
-        return;
+        // The same rule as happyview's `test_support::unavailable`, which
+        // this crate cannot depend on: a missing fixture fails unless
+        // HAPPYVIEW_ALLOW_SKIPS=1.
+        if std::env::var("HAPPYVIEW_ALLOW_SKIPS").as_deref() == Ok("1") {
+            eprintln!("skipped: {what}");
+            return;
+        }
+        panic!("{what}\n\nOr set HAPPYVIEW_ALLOW_SKIPS=1 to skip it.");
     };
 
     let expected: BTreeSet<String> = expected_exports.iter().map(|s| s.to_string()).collect();

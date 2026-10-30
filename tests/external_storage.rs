@@ -397,7 +397,7 @@ async fn a_claimed_delete_clears_the_delta_so_a_recreate_is_served_fresh() {
 #[tokio::test]
 async fn a_stored_event_writes_only_the_hook_delta() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1449,7 +1449,7 @@ async fn open_dead_letters(state: &AppState) -> i64 {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1473,7 +1473,7 @@ async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from
 #[tokio::test]
 async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1495,7 +1495,7 @@ async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_replaces_names_the_replaced_body() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
