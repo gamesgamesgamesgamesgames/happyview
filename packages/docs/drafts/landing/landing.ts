@@ -106,7 +106,7 @@ export const hosting = {
 		title: 'HappyProto',
 		points: [
 			'Your instance at your-app.hpy.at, with Lua already installed.',
-			'Deploy a project from your terminal with `hpy happyview deploy`.',
+			'Deploy a project from your terminal with `hpy happyview deploy` (hpy 1.0 beta).',
 			'Three plan sizes, from 512 MB of memory and 5 GB of storage.',
 			'In beta now, by invite.',
 		],

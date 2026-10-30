@@ -65,14 +65,13 @@ rather than "the next request".
 
 - **CTA hrefs** (`/getting-started/`, `/guides/`, `/getting-started/deployment/`)
   are guesses at the new site's routes. happyview-76 owns the structure.
-- **No documented way to install hpy.** "Start a project" leads to
-  `hpy happyview create`, but nothing on alpha's docs says how to get hpy, and
-  nothing there mentions `hpy happyview create` at all. The getting-started
-  page needs both before the primary CTA works.
-- **"In beta now, by invite"** is true once invites go out.
+- **Installing hpy and `hpy happyview create`** aren't in alpha's docs; the new
+  docs site (happyproto/happyview-docs) covers both. Point "Start a project"
+  there.
+- **"In beta now, by invite"** is true once invites go out (Monday).
 - **Plan sizes** wait on provisioner#33.
 - **`hpy happyview deploy`** is in the beta channel (1.0.0-beta.3), not in
-  alpha.15.
+  alpha.15; the copy says "hpy 1.0 beta".
 
 ## Found while checking (not fixed here)
 
