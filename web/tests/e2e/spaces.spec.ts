@@ -28,6 +28,11 @@ const MEMBER_LIST_POLICY = {
 const PUBLIC_POLICY = { $type: "com.atproto.simplespace.defs#publicPolicy" };
 
 test.describe("Spaces API", () => {
+  // `page.request` runs outside the browser and sends no fetch metadata, and
+  // the session cookie counts on XRPC only on a request from the instance's
+  // own pages. This spec drives the API only, as the dashboard would.
+  test.use({ extraHTTPHeaders: { "sec-fetch-site": "same-origin" } });
+
   let createdSpaceUri: string | null = null;
 
   test.beforeEach(async ({ page }) => {
@@ -271,6 +276,9 @@ async function disableSpacesFeature(): Promise<void> {
 }
 
 test.describe("Spaces Feature Flag", () => {
+  // As in "Spaces API": the API request is the dashboard's own.
+  test.use({ extraHTTPHeaders: { "sec-fetch-site": "same-origin" } });
+
   test.beforeEach(async ({ page }) => {
     await disableSpacesFeature();
     await loginAsTestAdmin(page);
