@@ -13,6 +13,7 @@ import {
   pauseBackfillJob,
   resumeBackfillJob,
   createBackfillJob,
+  getBackfillCollection,
   getBackfillJobs,
   getBackfillRepos,
   getBackfillPdsSummary,
@@ -23,6 +24,7 @@ import {
   getLexicons,
 } from "@/lib/api";
 import type {
+  BackfillCollection,
   BackfillJob,
   BackfillRepoEntry,
   PdsSummaryEntry,
@@ -120,6 +122,15 @@ const SOURCE_LABELS: Record<BackfillSource, string> = {
   auto: "Auto",
   replay: "Replay",
   crawl: "Crawl",
+};
+
+const SUMMARY_STATE_LABELS: Record<
+  NonNullable<NonNullable<BackfillCollection["summary"]>["state"]>,
+  string
+> = {
+  running: "still being filled",
+  complete: "complete",
+  failed: "filling failed",
 };
 
 // Operators read these, not enum names.
@@ -907,6 +918,25 @@ function JobDetail({
   // Set only when HappyView paused the job itself; an operator's pause has no
   // reason, and resuming clears it.
   const pauseReason = job.status === "paused" ? job.error : null;
+  // Any other source names an executor: the record source backfills the
+  // collection itself, and says what it holds for it now.
+  const byExecutor = !(job.source in SOURCE_LABELS);
+  const [collectionSummary, setCollectionSummary] =
+    useState<BackfillCollection["summary"]>(null);
+  useEffect(() => {
+    if (!byExecutor || !job.collection) return;
+    let current = true;
+    getBackfillCollection(job.collection)
+      .then((resp) => {
+        if (current) setCollectionSummary(resp.summary);
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      current = false;
+    };
+  }, [byExecutor, job.collection, job.status]);
 
   // Detail data state
   const [discoveredRepos, setDiscoveredRepos] = useState<BackfillRepoEntry[]>(
@@ -1176,6 +1206,8 @@ function JobDetail({
         update((j) => ({ ...j, stage: e.stage! }));
       } else if (e.type === "job_completed" && e.status) {
         update((j) => ({ ...j, status: e.status!, error: e.error ?? null }));
+      } else if (e.type === "job_note" && e.note != null) {
+        update((j) => ({ ...j, note: e.note! }));
       }
     }
   }, []);
@@ -1283,6 +1315,39 @@ function JobDetail({
               </div>
             </div>
           )
+        )}
+
+        {job.note && (
+          <div>
+            <span className="text-muted-foreground text-sm">Result</span>
+            <div className="bg-muted mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+              {job.note}
+            </div>
+          </div>
+        )}
+
+        {collectionSummary && (
+          <div>
+            <span className="text-muted-foreground text-sm">
+              The collection now
+            </span>
+            <div className="mt-1 space-y-1 rounded-md border p-3 text-xs">
+              <p>{collectionSummary.message}</p>
+              {(collectionSummary.records != null ||
+                collectionSummary.state) && (
+                <p className="text-muted-foreground">
+                  {[
+                    collectionSummary.records != null &&
+                      `${collectionSummary.records.toLocaleString()} records`,
+                    collectionSummary.state &&
+                      SUMMARY_STATE_LABELS[collectionSummary.state],
+                  ]
+                    .filter(Boolean)
+                    .join(", ")}
+                </p>
+              )}
+            </div>
+          </div>
         )}
 
         <div>

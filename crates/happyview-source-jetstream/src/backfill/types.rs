@@ -41,6 +41,8 @@ pub struct BackfillJob {
     /// `auto` until an `auto` job has probed the archive, then `replay` or
     /// `crawl`.
     pub source: String,
+    /// What an executor's job said about itself ([`crate::JobHandle::note`]).
+    pub note: Option<String>,
     /// Replay progress; `None` for a crawl.
     pub replay: Option<ReplayProgress>,
 }
@@ -95,6 +97,10 @@ pub enum BackfillEvent {
         job_id: String,
         status: String,
         error: Option<String>,
+    },
+    JobNote {
+        job_id: String,
+        note: String,
     },
     ReplayProgress {
         job_id: String,
