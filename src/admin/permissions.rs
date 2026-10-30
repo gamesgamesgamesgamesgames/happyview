@@ -242,7 +242,7 @@ impl Permission {
             Self::ScriptVariablesCreate => PermissionInfo {
                 key: "script-variables:create",
                 name: "Create Script Variables",
-                description: "Add or update environment variables for Lua scripts",
+                description: "Add or update environment variables for scripts",
                 category: "Script Variables",
             },
             Self::ScriptVariablesRead => PermissionInfo {
