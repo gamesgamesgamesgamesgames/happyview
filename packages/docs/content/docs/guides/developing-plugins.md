@@ -567,6 +567,7 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `database:read` | High | Run arbitrary read-only SQL against indexed records, labels, lexicons, jobs and space data. Internal auth, secret and key tables are blocked. |
 | `database:write` | Critical | Run arbitrary SQL, including `INSERT`, `UPDATE`, `DELETE` and `DROP`, against indexed records, labels, lexicons, jobs and space data. This can destroy your index. |
 | `caller:read` | Medium | Read from the AT Protocol network as the user who ran the script. |
+| `caller:email` | High | Read the email address of the user who ran the script, and whether it is confirmed, from their PDS, whenever their sign-in granted this instance access to it. |
 | `caller:write` | High | Create, update and delete records in the user's own repository and upload blobs to it. Each record write is mirrored into the local index at once, so the plugin sees its own write on the next read. |
 | `caller:call` | Critical | Call any XRPC procedure as the user, including ones that change their account. A procedure this instance does not serve is forwarded to the NSID's authority without the user's credentials. |
 | `records:write` | High | Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them. |
@@ -592,11 +593,13 @@ Choose `network:request:defined` over `network:request` when the plugin talks to
 
 ### Acting as the caller
 
-A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
+A plugin declaring `caller:read`, `caller:email`, `caller:write`, `caller:call`, or `records:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
 
 | Import | Capability | Spec → result |
 | --------------------------- | ------------ | ------------------------------------------------------------------------------- |
 | `host_caller_xrpc_query`    | `caller:read`  | `{method, params?}` → the response body |
+| `host_caller_get_session`   | `caller:read`  | `{}` → `{did, handle?}` from the caller's PDS `getSession` |
+| `host_caller_get_email`     | `caller:email` | `{}` → `{email?, email_confirmed?}` from the caller's PDS `getSession`; both absent unless their sign-in granted the address, which the reference PDS does under `transition:email` or `account:email` |
 | `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate?}` → `{uri, cid}`; mirrored into the index |
 | `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate?}` → `{uri, cid}`; mirrored into the index |
 | `host_caller_delete_record` | `caller:write` | `{uri}` → nothing; removed from the index |
@@ -614,7 +617,9 @@ A library receives the script's session only when the script runner that made th
 
 A record write, put, or delete targets the caller's own repo, or the repo of the account the script is delegated to act for. Any other repo fails with `WRITABLE_REPO`, since a caller-acting write can never succeed against a repo the instance holds no credentials for.
 
-Every import checks the plugin's declared capability first. Five of the six `host_caller_*` imports then check for a session before decoding the spec; `host_caller_xrpc_query` needs no session — it decodes and runs on the capability check alone, falling back to the call context's `caller_did` for claims when there is no session to take them from. The two `host_records_index_*` imports also need no session and go straight from the capability check to decoding, and `host_lexicon_get` needs no capability at all. Errors reaching the guest use the codes `FORBIDDEN` (the capability isn't declared), `NO_SESSION`, `WRITABLE_REPO`, `AUTH_REQUIRED` (the session died), `PDS_ERROR` (the PDS rejected the write), `XRPC_ERROR` (the local handler or proxy rejected the call), `HOST_ERROR` (a failure with no PDS or XRPC status to report), and `BAD_INPUT`.
+Every import checks the plugin's declared capability first. Every `host_caller_*` import but one then checks for a session before decoding the spec; `host_caller_xrpc_query` needs no session — it decodes and runs on the capability check alone, falling back to the call context's `caller_did` for claims when there is no session to take them from. The two `host_records_index_*` imports also need no session and go straight from the capability check to decoding, and `host_lexicon_get` needs no capability at all. Errors reaching the guest use the codes `FORBIDDEN` (the capability isn't declared), `NO_SESSION`, `WRITABLE_REPO`, `AUTH_REQUIRED` (the session died), `PDS_ERROR` (the PDS rejected the write), `XRPC_ERROR` (the local handler or proxy rejected the call), `HOST_ERROR` (a failure with no PDS or XRPC status to report), and `BAD_INPUT`.
+
+`host_caller_get_session` and `host_caller_get_email` also refuse a service-auth caller with `NO_SESSION`: the runner lends such a caller the user's own sign-in to this instance, which the calling service was never handed. `caller:email` is High because the address is personal data `caller:read` never covered. A job that returns it, or passes it to `ctx.job.progress`, stores it in the job row, where `jobs:read` can read it.
 
 `caller:call` is Critical because an arbitrary procedure carries the same power as the user's whole session, including ones that change their account. `caller:write` is High because it is bounded to repo writes the PDS's own scope check still governs.
 
