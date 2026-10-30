@@ -68,6 +68,8 @@ pub enum LoadError {
     ManifestNotFound(String),
     #[error("the plugin's module URL is not a URL: {0}")]
     InvalidUrl(String),
+    #[error("this plugin uses {0}, which HappyView doesn't enable")]
+    DisabledProposal(&'static str),
     #[error("Capability mismatch: {0}")]
     CapabilityMismatch(String),
     #[error("Unknown host import: {0}")]
@@ -397,6 +399,9 @@ pub fn validate_capabilities(
     wasm_bytes: &[u8],
 ) -> Result<(), LoadError> {
     use crate::plugin::capabilities::{analyze_imports, check_declared};
+    if let Some(proposal) = crate::plugin::runtime::disabled_proposal(wasm_bytes) {
+        return Err(LoadError::DisabledProposal(proposal));
+    }
     let requirements = analyze_imports(wasm_bytes).map_err(LoadError::UnknownImport)?;
     check_declared(&manifest.capabilities, &requirements).map_err(|missing| {
         let names: Vec<String> = missing
@@ -682,10 +687,10 @@ pub(crate) fn built_fixture(name: &str, target: &str) -> Option<std::path::PathB
     {
         return Some(dir);
     }
-    eprintln!(
-        "skipping: {name} fixture not built. Run: cargo build \
+    crate::test_support::unavailable(&format!(
+        "{name} fixture not built. Run: cargo build \
          --manifest-path tests/fixtures/{name}/Cargo.toml --target {target} --release"
-    );
+    ));
     None
 }
 
@@ -950,6 +955,23 @@ mod tests {
         let err = validate_capabilities(&m, &module_importing_kv_get()).unwrap_err();
         assert!(matches!(err, LoadError::CapabilityMismatch(_)), "{err}");
         assert!(err.to_string().contains("host_kv_get"), "{err}");
+    }
+
+    #[test]
+    fn a_plugin_using_gc_is_refused_at_load_naming_the_proposal() {
+        let m = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":[]}"#,
+        );
+        let gc =
+            wat::parse_str(r#"(module (type (struct (field i32))) (memory (export "memory") 1))"#)
+                .unwrap();
+        let err = validate_capabilities(&m, &gc).unwrap_err();
+        assert!(matches!(err, LoadError::DisabledProposal(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "this plugin uses WebAssembly GC, which HappyView doesn't enable"
+        );
     }
 
     #[test]

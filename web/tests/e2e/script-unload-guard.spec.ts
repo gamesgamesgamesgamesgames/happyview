@@ -51,26 +51,26 @@ test.describe("New script unload guard", () => {
   test("does not warn about losing work while saving it", async ({ page }) => {
     await fillNewJobScript(page);
 
-    // Under `output: "export"` the [id] detail route has no prerendered
-    // payload, so the post-save router.push is a full page load. It has to be
-    // stopped for this page to stay inspectable, and the error code is
-    // load-bearing: `route.abort()` defaults to `failed` (net::ERR_FAILED),
-    // which Chrome answers by committing an error-page document. That replaces
-    // the very document these assertions read, and the race between the commit
-    // and the first probe is what made this test flaky ("Execution context was
-    // destroyed, most likely because of a navigation"). Only `aborted`
-    // (net::ERR_ABORTED) leaves the current document in place — which is also
-    // the state an operator is left in when they answer "Cancel" to the
-    // browser's prompt, so it is the accurate model as well as the stable one.
+    // The post-save router.push has to be stopped for this page to stay
+    // inspectable, and it can leave two ways. The client router first fetches
+    // the detail route's payload (`<id>.txt?_rsc=…`), which the server can
+    // answer, and then renders the detail page without a navigation request
+    // at all. That fetch is aborted, so the router falls back to a full page
+    // load, which is aborted too.
+    //
+    // The error code on the load is load-bearing: `route.abort()` defaults to
+    // `failed` (net::ERR_FAILED), which Chrome answers by committing an
+    // error-page document. That replaces the very document these assertions
+    // read ("Execution context was destroyed, most likely because of a
+    // navigation"). Only `aborted` (net::ERR_ABORTED) leaves the current
+    // document in place — which is also the state an operator is left in when
+    // they answer "Cancel" to the browser's prompt, so it is the accurate
+    // model as well as the stable one.
     await page.route(
-      (url) => url.pathname.includes(encodeURIComponent(TRIGGER_ID)),
-      async (route) => {
-        if (route.request().isNavigationRequest()) {
-          await route.abort("aborted");
-        } else {
-          await route.continue();
-        }
-      },
+      (url) =>
+        url.pathname.startsWith("/dashboard/") &&
+        url.pathname.includes(encodeURIComponent(TRIGGER_ID)),
+      (route) => route.abort("aborted"),
     );
 
     const saved = page.waitForResponse(

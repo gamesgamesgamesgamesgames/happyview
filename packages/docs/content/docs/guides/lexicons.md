@@ -35,6 +35,12 @@ When a record-type lexicon is uploaded for the first time, HappyView automatical
 
 Only the *first* upload starts one. Editing a lexicon afterwards re-saves it without re-crawling the network — if you want to backfill again, start one from the Backfill page. If you only want to index new records going forward, set `backfill` to `false`.
 
+## Indexed flag
+
+A record lexicon can be installed without HappyView collecting its records from the network: set `indexed` to `false`. No backfill starts for it. On a lexicon's page in the dashboard, the **Indexed** switch changes the setting for a dashboard or network lexicon, including one declared in `happyview.toml`. A lexicon defined by a project file takes the setting from its `[lexicons."<nsid>"]` table instead.
+
+Turning indexing on collects new records from then on. It doesn't fetch older ones, so start a backfill from the Backfill page if you want them. Turning it off stops collecting and keeps the records already stored. Changing the switch on a network lexicon fetches its current version from the network, as adding it again does.
+
 ## Jetstream collection filters
 
 When record-type lexicons change (uploaded or deleted), HappyView reconnects to Jetstream with an updated collection filter. HappyView always includes `com.atproto.lexicon.schema` in the filter to track network lexicon updates.

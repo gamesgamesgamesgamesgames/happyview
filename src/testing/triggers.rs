@@ -278,14 +278,14 @@ async fn job(state: &AppState, spec: &TestTrigger) -> Result<TestTriggerResult, 
     .await
     .map_err(host)?;
     // No worker runs in a test, so a job runs exactly when the test fires it.
-    crate::jobs::db::set_status(state, &id, "running")
-        .await
-        .map_err(host)?;
-    let job = crate::jobs::db::get_job(state, &id)
+    if !crate::jobs::worker::run_now(state, &id)
         .await
         .map_err(host)?
-        .ok_or_else(|| TestHostError::Host("the job row vanished".into()))?;
-    crate::jobs::worker::execute_job(state, &job).await;
+    {
+        return Err(TestHostError::Host(
+            "the job was taken before it ran".into(),
+        ));
+    }
     let job = crate::jobs::db::get_job(state, &id)
         .await
         .map_err(host)?

@@ -30,7 +30,7 @@ happyview-scopes = { path = "crates/happyview-scopes" }
 name = "happyview"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 default-run = "happyview"
 repository = "https://github.com/gamesgamesgamesgamesgames/happyview"
 
@@ -101,7 +101,10 @@ tempfile = "3"
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "any", "json", "chrono", "migrate"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# No TLS feature: the labeler dials TLS itself (src/labeler.rs), and the
+# webpki-roots feature would bring in webpki-roots 0.26, a shim the
+# RUSTSEC-2026-0381 advisory matches by version.
+tokio-tungstenite = "0.29"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 tower = { version = "0.5", features = ["util"] }
@@ -118,7 +121,7 @@ webpki-roots = "1.0"
 zstd = "0.14.3"
 # Wasmtime's defaults less `cache`, which pulls a zstd with open advisories and
 # which nothing uses: compiled modules are cached by `WasmRuntime::module_for`.
-wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
+wasmtime = { version = ">=50.0.1, <51", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -137,7 +140,6 @@ wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
     "debug-builtins",
     "runtime",
     "component-model",
-    "component-model-async",
     "threads",
     "stack-switching",
     "std",
@@ -145,7 +147,7 @@ wasmtime = { version = ">=49.0.4, <50", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = { version = ">=49.0.4, <50", default-features = false, features = ["p1"] }
+wasmtime-wasi = { version = ">=50.0.1, <51", default-features = false, features = ["p1"] }
 regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"

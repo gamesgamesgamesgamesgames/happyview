@@ -19,6 +19,9 @@ pub const INSTANCE_OWNER: &str = "instance";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyStatus {
+    /// Published in the JWKS so authorization servers learn it, but signs
+    /// nothing until it takes over as `current` (see [`stage_key`]).
+    Pending,
     /// Signs all new sessions.
     Current,
     /// Still signs sessions that were established with it; signs no new ones.
@@ -30,6 +33,7 @@ pub enum KeyStatus {
 impl KeyStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            KeyStatus::Pending => "pending",
             KeyStatus::Current => "current",
             KeyStatus::Retiring => "retiring",
             KeyStatus::Revoked => "revoked",
@@ -38,6 +42,7 @@ impl KeyStatus {
 
     pub fn parse(s: &str) -> Option<KeyStatus> {
         match s {
+            "pending" => Some(KeyStatus::Pending),
             "current" => Some(KeyStatus::Current),
             "retiring" => Some(KeyStatus::Retiring),
             "revoked" => Some(KeyStatus::Revoked),
@@ -194,8 +199,10 @@ pub async fn insert_key(
     Ok(())
 }
 
-/// Load an owner's usable keys, `current` first then `retiring`. Revoked keys
-/// are never returned — they must not be published or signed with.
+/// Load an owner's published keys, `current` first, then `pending` and
+/// `retiring`. Revoked keys are never returned — they must not be published
+/// or signed with. A `pending` key is published but never picked to sign by
+/// [`find_by_kid`] unless a session names it.
 pub async fn load_keys(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -278,34 +285,37 @@ pub struct ClientKeySummary {
     pub kid: String,
     pub status: KeyStatus,
     pub created_at: String,
+    /// When a `pending` key takes over.
+    pub activates_at: Option<String>,
 }
 
-/// List every key an owner holds — `current` first, then `retiring`, then
-/// `revoked` — for the admin listing.
+/// List every key an owner holds — `pending` first, then `current`, then
+/// `retiring`, then `revoked` — for the admin listing.
 pub async fn list_keys_for_owner(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     owner: &str,
 ) -> Result<Vec<ClientKeySummary>, AppError> {
     let sql = adapt_sql(
-        "SELECT kid, status, created_at FROM happyview_oauth_client_keys WHERE owner = ? \
-         ORDER BY CASE status WHEN 'current' THEN 0 WHEN 'retiring' THEN 1 ELSE 2 END, created_at",
+        "SELECT kid, status, created_at, activates_at FROM happyview_oauth_client_keys WHERE owner = ? \
+         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'current' THEN 1 WHEN 'retiring' THEN 2 ELSE 3 END, created_at",
         backend,
     );
-    let rows: Vec<(String, String, String)> = crate::db::query_as(&sql)
+    let rows: Vec<(String, String, String, Option<String>)> = crate::db::query_as(&sql)
         .bind(owner)
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list client keys: {e}")))?;
 
     rows.into_iter()
-        .map(|(kid, status, created_at)| {
+        .map(|(kid, status, created_at, activates_at)| {
             Ok(ClientKeySummary {
                 kid,
                 status: KeyStatus::parse(&status).ok_or_else(|| {
                     AppError::Internal(format!("unknown client key status: {status}"))
                 })?,
                 created_at,
+                activates_at,
             })
         })
         .collect()
@@ -368,13 +378,36 @@ pub fn resolve_signing_key<'a>(
     }
 }
 
-/// Generate a new current key, demoting the existing one to `retiring`.
+/// How long a staged key is published before it signs. Authorization servers
+/// cache client metadata and key sets: Tranquil for an hour from the fetch,
+/// the reference provider for less. A key that signs before every cache has
+/// expired fails `private_key_jwt` for new sign-ins and refreshes until the
+/// cache runs out.
+pub const ROTATION_OVERLAP: chrono::Duration = chrono::Duration::minutes(75);
+
+/// Switch keys now: the `pending` key if one is waiting (it has been
+/// published longest), otherwise a fresh one, becomes `current`, and the old
+/// `current` is demoted to `retiring`. An authorization server still holding
+/// the old key set refuses the new key until its cache expires; [`stage_key`]
+/// is the rotation that avoids that, and this one is for a key that must stop
+/// signing at once.
 pub async fn rotate_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     enc: Option<&[u8; 32]>,
     owner: &str,
 ) -> Result<ClientKey, AppError> {
+    if let Some(pending) = load_keys(pool, backend, enc, owner)
+        .await?
+        .into_iter()
+        .find(|k| k.status == KeyStatus::Pending)
+    {
+        promote(pool, backend, owner, &pending.kid).await?;
+        return Ok(ClientKey {
+            status: KeyStatus::Current,
+            ..pending
+        });
+    }
     let key = generate_client_key(owner)?;
     let (blob, encrypted) = seal_private_jwk(enc, &key.private_jwk)?;
     let public = serde_json::to_string(&key.public_jwk)
@@ -418,6 +451,156 @@ pub async fn rotate_key(
         .map_err(|e| AppError::Internal(format!("failed to commit key rotation: {e}")))?;
 
     Ok(key)
+}
+
+/// Publish a new key as `pending`, to take over from the current one after
+/// [`ROTATION_OVERLAP`] (see [`promote_due_keys`]). The current key keeps
+/// signing until then, so no authorization server ever sees a signature from
+/// a key it has not had the chance to fetch. Staging again while a key is
+/// waiting returns that key rather than a second one. An owner with no
+/// current key has nothing to keep signing with, so its new key is made
+/// current at once; the returned activation time is `None` then.
+pub async fn stage_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    enc: Option<&[u8; 32]>,
+    owner: &str,
+) -> Result<(ClientKey, Option<String>), AppError> {
+    let listed = list_keys_for_owner(pool, backend, owner).await?;
+    if let Some(waiting) = listed.iter().find(|k| k.status == KeyStatus::Pending) {
+        let key = load_keys(pool, backend, enc, owner)
+            .await?
+            .into_iter()
+            .find(|k| k.kid == waiting.kid)
+            .ok_or_else(|| AppError::Internal("the pending key vanished".into()))?;
+        return Ok((key, waiting.activates_at.clone()));
+    }
+    if !listed.iter().any(|k| k.status == KeyStatus::Current) {
+        return Ok((rotate_key(pool, backend, enc, owner).await?, None));
+    }
+    let mut key = generate_client_key(owner)?;
+    key.status = KeyStatus::Pending;
+    let (blob, encrypted) = seal_private_jwk(enc, &key.private_jwk)?;
+    let public = serde_json::to_string(&key.public_jwk)
+        .map_err(|e| AppError::Internal(format!("failed to serialise public JWK: {e}")))?;
+    let now = chrono::Utc::now();
+    let activates_at = rfc3339(now + ROTATION_OVERLAP);
+
+    let insert = adapt_sql(
+        "INSERT INTO happyview_oauth_client_keys (kid, owner, alg, private_jwk, public_jwk, encrypted, status, created_at, activates_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+    crate::db::query(&insert)
+        .bind(&key.kid)
+        .bind(&key.owner)
+        .bind(&key.alg)
+        .bind(&blob)
+        .bind(&public)
+        .bind(i32::from(encrypted))
+        .bind(key.status.as_str())
+        .bind(now_rfc3339())
+        .bind(&activates_at)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to store client key: {e}")))?;
+
+    Ok((key, Some(activates_at)))
+}
+
+/// When the next `pending` key is due, if any is waiting.
+pub async fn next_activation(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+    let sql = adapt_sql(
+        "SELECT MIN(activates_at) FROM happyview_oauth_client_keys WHERE status = 'pending'",
+        backend,
+    );
+    let (at,): (Option<String>,) = crate::db::query_as(&sql)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read the next key activation: {e}")))?;
+    Ok(at
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc)))
+}
+
+/// Promote every `pending` key whose overlap has run out, demoting its
+/// owner's `current` key to `retiring`. Returns the owners whose key changed.
+pub async fn promote_due_keys(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Vec<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT owner, kid FROM happyview_oauth_client_keys WHERE status = 'pending' AND activates_at <= ?",
+        backend,
+    );
+    let due: Vec<(String, String)> = crate::db::query_as(&sql)
+        .bind(rfc3339(chrono::Utc::now()))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to find keys due to take over: {e}")))?;
+
+    let mut promoted = Vec::new();
+    for (owner, kid) in due {
+        if promote(pool, backend, &owner, &kid).await? {
+            promoted.push(owner);
+        }
+    }
+    Ok(promoted)
+}
+
+/// Make `kid` the owner's `current` key, demoting the old one. False when
+/// another process promoted it first.
+async fn promote(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    owner: &str,
+    kid: &str,
+) -> Result<bool, AppError> {
+    let now = now_rfc3339();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let demote = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'retiring', retired_at = ? \
+         WHERE owner = ? AND status = 'current' \
+           AND EXISTS (SELECT 1 FROM happyview_oauth_client_keys WHERE owner = ? AND kid = ? AND status = 'pending')",
+        backend,
+    );
+    crate::db::query(&demote)
+        .bind(&now)
+        .bind(owner)
+        .bind(owner)
+        .bind(kid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to demote current key: {e}")))?;
+
+    let promote = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'current' WHERE owner = ? AND kid = ? AND status = 'pending'",
+        backend,
+    );
+    let changed = crate::db::query(&promote)
+        .bind(owner)
+        .bind(kid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to promote pending key: {e}")))?
+        .rows_affected()
+        > 0;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit key promotion: {e}")))?;
+    Ok(changed)
+}
+
+/// Fixed-width UTC, so `activates_at` compares correctly as text.
+fn rfc3339(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Revoke `retiring` keys that no session is pinned to.

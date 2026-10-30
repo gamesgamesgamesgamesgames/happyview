@@ -1576,7 +1576,7 @@ async fn job_counters_saturate_instead_of_overflowing() {
 #[tokio::test]
 async fn job_counters_saturate_instead_of_overflowing_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let job_id = format!("sat-{}", Uuid::new_v4().simple());
@@ -1703,7 +1703,7 @@ async fn delete_postgres_job(state: &AppState, job_id: &str, dids: &[&str]) {
 async fn a_network_job_runs_on_the_bounded_queue_on_postgres() {
     let mock = MockServer::start().await;
     let Some(state) = postgres_pipeline_state(&mock).await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let tag = Uuid::new_v4().simple().to_string();
@@ -1771,7 +1771,7 @@ async fn a_network_job_runs_on_the_bounded_queue_on_postgres() {
 async fn a_pre_upgrade_job_still_discovering_restarts_on_postgres() {
     let mock = MockServer::start().await;
     let Some(state) = postgres_pipeline_state(&mock).await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let tag = Uuid::new_v4().simple().to_string();
@@ -1789,7 +1789,7 @@ async fn a_pre_upgrade_job_still_discovering_restarts_on_postgres() {
 #[tokio::test]
 async fn the_completion_log_is_trimmed_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let job_id = format!("log-{}", Uuid::new_v4().simple());
@@ -2854,7 +2854,7 @@ async fn flush_and_retention_delete_in_batches() {
 #[tokio::test]
 async fn flush_and_retention_delete_in_batches_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let tag = Uuid::new_v4().simple().to_string();
@@ -3488,7 +3488,7 @@ async fn a_backfill_page_skips_unchanged_rows() {
 #[tokio::test]
 async fn a_backfill_page_skips_unchanged_rows_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let prefix = format!("p{}", Uuid::new_v4().simple());
@@ -3557,7 +3557,7 @@ async fn an_oversized_page_with_repeats_is_written() {
 #[tokio::test]
 async fn an_oversized_page_with_repeats_is_written_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let prefix = format!("o{}", Uuid::new_v4().simple());
@@ -3688,7 +3688,7 @@ async fn a_backfill_page_respects_tombstones_and_revs() {
 #[tokio::test]
 async fn a_backfill_page_respects_tombstones_and_revs_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let prefix = format!("t{}", Uuid::new_v4().simple());
@@ -3743,7 +3743,7 @@ async fn a_crawl_row_keeps_the_stored_rev() {
 #[tokio::test]
 async fn a_crawl_row_keeps_the_stored_rev_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let prefix = format!("k{}", Uuid::new_v4().simple());
@@ -3757,7 +3757,7 @@ async fn a_crawl_row_keeps_the_stored_rev_on_postgres() {
 #[tokio::test]
 async fn a_backfill_page_waits_for_a_concurrent_tombstone_on_postgres() {
     let Some(state) = crate::test_support::test_state_from_env().await else {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
         return;
     };
     let prefix = format!("r{}", Uuid::new_v4().simple());

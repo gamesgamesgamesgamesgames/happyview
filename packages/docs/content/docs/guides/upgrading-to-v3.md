@@ -89,7 +89,7 @@ A script stored before the upgrade stays in the table untouched and fails the fi
 Two things that matter for the order you do this in:
 
 - **The codemod does not need an interpreter.** It is a source rewrite, so you can migrate every stored script before installing one. Editing a script by hand afterwards does need an interpreter, because the save is validated through it.
-- **`happyview-codemod` is not in the published Docker image.** From a container, use `POST /admin/scripts/{id}/codemod` with `{"apply": true}`, or run the CLI from a source checkout against the same `DATABASE_URL`.
+- **`happyview-codemod` ships in the Docker image.** Run it inside a running container with `docker exec <container> happyview-codemod --database-url "$DATABASE_URL"`, or start one for it with `docker run --rm <image> happyview-codemod ...`. See [Running the codemod](migrating-scripts.md#from-the-cli).
 
 Saving is stricter than running: `POST` / `PATCH /admin/scripts` refuse a Lua body that still references a removed global, with the names in `removed_globals`. The codemod's own apply is the one exception, so a script with markers can be stored once you confirm.
 

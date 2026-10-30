@@ -1,7 +1,7 @@
 //! Snapshot assembly.
 
 use crate::db::now_rfc3339;
-use crate::telemetry::collect::{database, features, health, host};
+use crate::telemetry::collect::{database, features, health, host, lexicons as lexicon_detail};
 use crate::telemetry::consent::Consent;
 use crate::telemetry::counters::Counters;
 use crate::telemetry::payload::{LexiconReport, SCHEMA_VERSION, Snapshot};
@@ -143,11 +143,11 @@ pub async fn assemble(
     };
     // Through the catalog rather than the table, since a project's lexicons
     // have no rows.
-    let lexicon_count_fut = async {
-        match budgeted("lexicon_count", lexicons.list(pool, backend)).await {
-            Some(Ok(listed)) => Some(i64::try_from(listed.len()).unwrap_or(i64::MAX)),
+    let lexicon_list_fut = async {
+        match budgeted("lexicons", lexicons.list(pool, backend)).await {
+            Some(Ok(listed)) => Some(listed),
             Some(Err(e)) => {
-                tracing::warn!(metric = "lexicon_count", error = %e, "telemetry metric failed, omitting");
+                tracing::warn!(metric = "lexicons", error = %e, "telemetry metric failed, omitting");
                 None
             }
             None => None,
@@ -180,7 +180,7 @@ pub async fn assemble(
         vacuum_result,
         postgres_db_bytes,
         job_runtime_seconds,
-        lexicon_count,
+        lexicon_list,
         source_metrics,
     ) = tokio::join!(
         totals_fut,
@@ -195,7 +195,7 @@ pub async fn assemble(
         vacuum_fut,
         postgres_db_bytes_fut,
         job_runtime_seconds_fut,
-        lexicon_count_fut,
+        lexicon_list_fut,
         source_metrics_fut,
     );
 
@@ -212,21 +212,19 @@ pub async fn assemble(
 
     let mut host_report = host_report;
     if let Some(keys) = configured_keys {
-        // An operator may name a setting anything, so a managed instance
-        // reports such keys only as a count.
+        // An operator may name a setting anything, so such keys are reported
+        // only as a count.
         let (keys, other): (Vec<_>, Vec<_>) = keys
             .into_iter()
-            .partition(|k| consent.managed_by.is_none() || health::is_known_setting_key(k));
+            .partition(|k| health::is_known_setting_key(k));
         host_report.insert(
             "configured_setting_keys".to_string(),
             serde_json::json!(keys),
         );
-        if consent.managed_by.is_some() {
-            host_report.insert(
-                "configured_other_setting_keys".to_string(),
-                serde_json::json!(other.len()),
-            );
-        }
+        host_report.insert(
+            "configured_other_setting_keys".to_string(),
+            serde_json::json!(other.len()),
+        );
     }
     if let Some(since) = version_since {
         host_report.insert("version_seen_since".to_string(), serde_json::json!(since));
@@ -240,7 +238,24 @@ pub async fn assemble(
             .or_insert_with(|| serde_json::json!(bytes));
     }
 
-    let lexicon_count = lexicon_count
+    let docs: Vec<&serde_json::Value> = lexicon_list
+        .iter()
+        .flatten()
+        .map(|l| &l.lexicon_json)
+        .collect();
+    let structures = consent
+        .lexicon_structure
+        .then(|| lexicon_detail::structures(docs.iter().copied()));
+    let (documents, documents_omitted) = if consent.lexicon_documents {
+        let (kept, omitted) =
+            lexicon_detail::documents(docs.iter().copied(), lexicon_detail::DOCUMENTS_BYTE_BUDGET);
+        (Some(kept), (omitted > 0).then_some(omitted))
+    } else {
+        (None, None)
+    };
+    let lexicon_count = lexicon_list
+        .as_ref()
+        .map(|listed| i64::try_from(listed.len()).unwrap_or(i64::MAX))
         .or_else(|| totals.get("lexicons").copied())
         .unwrap_or(0);
     if lexicon_count > 0 {
@@ -267,8 +282,9 @@ pub async fn assemble(
             count: u32::try_from(lexicon_count).unwrap_or(u32::MAX),
             top_collection_shares: shares,
             names,
-            structures: None,
-            documents: None,
+            structures,
+            documents,
+            documents_omitted,
         },
     })
 }
@@ -410,12 +426,16 @@ mod tests {
     }
 
     async fn assemble_with(pool: &sqlx::AnyPool, c: &Consent) -> Snapshot {
+        assemble_in(pool, c, &LexiconCatalog::detached()).await
+    }
+
+    async fn assemble_in(pool: &sqlx::AnyPool, c: &Consent, catalog: &LexiconCatalog) -> Snapshot {
         assemble(
             &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             c,
             &Counters::new(),
-            &LexiconCatalog::detached(),
+            catalog,
             &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
@@ -454,12 +474,17 @@ mod tests {
         let mut c = consent(TelemetryMode::Off);
         c.contact = Some("operator@example.com".into());
         c.lexicon_names = true;
-        let snap = assemble_with(&pool, &c.managed_by(Some("acme"))).await;
+        c.lexicon_structure = true;
+        c.lexicon_documents = true;
+        let snap = assemble_in(&pool, &c.managed_by(Some("acme")), &project_catalog()).await;
 
         assert_eq!(snap.managed.as_deref(), Some("acme"));
         assert_eq!(snap.report_mode, "auto");
         assert!(snap.contact.is_none());
         assert!(snap.lexicons.names.is_none());
+        assert!(snap.lexicons.structures.is_none());
+        assert!(snap.lexicons.documents.is_none());
+        assert_eq!(snap.lexicons.count, 1);
         assert_eq!(
             snap.host["configured_setting_keys"],
             serde_json::json!(["app_name"])
@@ -477,8 +502,10 @@ mod tests {
         }
     }
 
+    /// An operator names a setting stored through the API, so its name could
+    /// identify them; it is counted, managed or not.
     #[tokio::test]
-    async fn an_unmanaged_snapshot_names_every_configured_key() {
+    async fn an_unmanaged_snapshot_counts_custom_setting_keys() {
         let pool = pool_for_assembly().await;
         put_setting(&pool, "app_name", "Example").await;
         put_setting(&pool, "my_custom_key", "x").await;
@@ -488,9 +515,54 @@ mod tests {
         assert!(snap.managed.is_none());
         assert_eq!(
             snap.host["configured_setting_keys"],
-            serde_json::json!(["app_name", "my_custom_key"])
+            serde_json::json!(["app_name"])
         );
-        assert!(!snap.host.contains_key("configured_other_setting_keys"));
+        assert_eq!(snap.host["configured_other_setting_keys"], 1);
+        assert!(
+            !serde_json::to_string(&snap)
+                .unwrap()
+                .contains("my_custom_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn lexicon_structure_appears_only_when_consented() {
+        let pool = pool_for_assembly().await;
+        let mut c = consent(TelemetryMode::Auto);
+        c.lexicon_structure = true;
+
+        let snap = assemble_in(&pool, &c, &project_catalog()).await;
+
+        let structures = snap.lexicons.structures.expect("structure was consented");
+        assert_eq!(structures.len(), 1);
+        assert_eq!(structures[0]["main_type"], "record");
+        assert!(
+            snap.lexicons.names.is_none(),
+            "structure must not imply names"
+        );
+        assert!(snap.lexicons.documents.is_none());
+        assert!(
+            !serde_json::to_string(&structures)
+                .unwrap()
+                .contains("com.example"),
+            "a structure carried the NSID"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexicon_documents_appear_only_when_consented() {
+        let pool = pool_for_assembly().await;
+        let mut c = consent(TelemetryMode::Auto);
+        c.lexicon_documents = true;
+
+        let snap = assemble_in(&pool, &c, &project_catalog()).await;
+
+        let documents = snap.lexicons.documents.expect("documents were consented");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0]["id"], "com.example.project.thing");
+        assert_eq!(snap.lexicons.documents_omitted, None);
+        assert!(snap.lexicons.structures.is_none());
+        assert!(snap.lexicons.names.is_none());
     }
 
     #[tokio::test]
@@ -565,8 +637,8 @@ mod tests {
         assert_eq!(snap.totals.get("job_runtime_seconds"), Some(&60));
     }
 
-    #[tokio::test]
-    async fn a_project_lexicon_is_counted_though_it_has_no_row() {
+    /// A catalog holding one project lexicon, `com.example.project.thing`.
+    fn project_catalog() -> LexiconCatalog {
         use crate::lexicon::{ParsedLexicon, ProcedureAction};
         use crate::project::snapshot::{ProjectLexicon, ProjectSnapshot};
 
@@ -593,21 +665,15 @@ mod tests {
                 indexed: true,
             },
         );
-        let catalog = LexiconCatalog::new(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+        LexiconCatalog::new(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             project,
-        )));
+        )))
+    }
 
+    #[tokio::test]
+    async fn a_project_lexicon_is_counted_though_it_has_no_row() {
         let pool = pool_for_assembly().await;
-        let snap = assemble(
-            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
-            "sqlite::memory:",
-            &consent(TelemetryMode::Auto),
-            &Counters::new(),
-            &catalog,
-            &*happyview_source_jetstream::JetstreamSource::detached(),
-        )
-        .await
-        .unwrap();
+        let snap = assemble_in(&pool, &consent(TelemetryMode::Auto), &project_catalog()).await;
 
         assert_eq!(snap.lexicons.count, 1);
         assert!(snap.features["lexicons"].ever);

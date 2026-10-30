@@ -3,6 +3,14 @@ import { readFileSync, existsSync } from 'node:fs';
 
 const configPath = new URL('../sequoia.json', import.meta.url);
 
+// Only the production deploy publishes. A preview builds whatever branch a pull
+// request carries, an authorised fork's included, and must not post it to the
+// publication's account.
+if (process.env.VERCEL_ENV !== 'production') {
+  console.log('[sequoia] Not a production build — skipping publish.');
+  process.exit(0);
+}
+
 if (!existsSync(configPath)) {
   console.log('[sequoia] No sequoia.json found — run `sequoia init` to set up. Skipping publish.');
   process.exit(0);

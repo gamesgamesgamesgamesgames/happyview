@@ -277,6 +277,22 @@ async fn a_test_run_stops_a_library_call_that_never_answers() {
         .await;
 
     let mut state = state_with_http().await;
+
+    // The first call compiles the module, which on a loaded machine can take
+    // longer than the limit itself. Pay for it before the limit applies, so
+    // the limit is measured against calls alone.
+    state
+        .plugin_executor()
+        .call_library(
+            "sdk_http",
+            "get",
+            &[serde_json::json!(format!("{}/fast", server.uri()))],
+            &LibraryCallContext::default(),
+            0,
+        )
+        .await
+        .unwrap();
+
     state.test = Some(std::sync::Arc::new(
         happyview::testing::TestHarness::new("a.test.lua")
             .with_library_call_limit(std::time::Duration::from_secs(5)),

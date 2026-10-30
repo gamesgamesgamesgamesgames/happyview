@@ -164,7 +164,17 @@ async function main() {
   console.log(`Generated ${generated.length} changelog(s).`);
 }
 
+// A production build must not ship stale changelogs. Anywhere else, such as a
+// pull request preview without a token or one rate limited on a shared build
+// host, the changelogs committed to the repo are good enough.
+const production = process.env.VERCEL_ENV === "production";
+
 main().catch((err) => {
-  console.error("Changelog generation failed:", err.message);
-  process.exit(1);
+  if (production) {
+    console.error("Changelog generation failed:", err.message);
+    process.exit(1);
+  }
+  console.warn(
+    `Changelog generation failed (${err.message}). Using existing files.`
+  );
 });

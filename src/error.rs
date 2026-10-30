@@ -131,6 +131,13 @@ pub enum AppError {
     /// The names travel as a field of their own so a client can offer the
     /// codemod without depending on the message's wording.
     UnmigratedScript(Vec<String>),
+    /// An uploaded lexicon that does not pass [`crate::lexicon::validate`].
+    ///
+    /// Carries one entry per field rather than one sentence, because a
+    /// lexicon has many places to be wrong at once and the editor can point
+    /// at each of them. Warnings travel with the errors so the caller sees
+    /// everything in one answer.
+    InvalidLexicon(Vec<crate::lexicon::validate::Issue>),
     /// An XRPC error carrying a lexicon-defined code, e.g. `UnsupportedPolicy`.
     ///
     /// Clients switch on `error`, so a generic BadRequest is not
@@ -188,6 +195,24 @@ pub(crate) fn file_of(chunk: Option<String>) -> Option<String> {
     chunk.filter(|chunk| chunk != crate::plugin::DEFAULT_CHUNK_NAME)
 }
 
+/// One sentence for a log line or a client that reads only `error`; the
+/// per-field detail is in `issues`.
+fn invalid_lexicon_message(issues: &[crate::lexicon::validate::Issue]) -> String {
+    let errors: Vec<&crate::lexicon::validate::Issue> = issues
+        .iter()
+        .filter(|i| i.severity == crate::lexicon::validate::Severity::Error)
+        .collect();
+    match errors.split_first() {
+        None => "the lexicon is not valid".to_string(),
+        Some((first, [])) => format!("the lexicon is not valid: {}", first.render()),
+        Some((first, rest)) => format!(
+            "the lexicon is not valid: {} (and {} more)",
+            first.render(),
+            rest.len()
+        ),
+    }
+}
+
 fn unmigrated_script_message(globals: &[String]) -> String {
     crate::script::checks::unmigrated_message(globals)
 }
@@ -210,6 +235,9 @@ impl std::fmt::Display for AppError {
             AppError::ServerMisconfigured(msg) => write!(f, "server misconfigured: {msg}"),
             AppError::UnmigratedScript(globals) => {
                 write!(f, "bad request: {}", unmigrated_script_message(globals))
+            }
+            AppError::InvalidLexicon(issues) => {
+                write!(f, "bad request: {}", invalid_lexicon_message(issues))
             }
             AppError::RateLimited { retry_after, .. } => {
                 write!(f, "rate limited: retry after {retry_after}s")
@@ -306,6 +334,13 @@ impl IntoResponse for AppError {
                 });
                 (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
             }
+            AppError::InvalidLexicon(issues) => {
+                let body = serde_json::json!({
+                    "error": invalid_lexicon_message(&issues),
+                    "issues": issues,
+                });
+                (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+            }
             AppError::XrpcError {
                 status,
                 code,
@@ -363,6 +398,7 @@ impl IntoResponse for AppError {
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
                     | AppError::UnmigratedScript(..)
+                    | AppError::InvalidLexicon(..)
                     | AppError::RateLimited { .. }
                     | AppError::XrpcError { .. }
                     | AppError::ScriptError { .. } => unreachable!(),

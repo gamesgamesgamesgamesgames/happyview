@@ -1,7 +1,7 @@
 //! The admin API accepts an app's DPoP session only when the authorization
 //! server granted it `dev.happyview.adminFull`, read from a token response
-//! HappyView received itself, and a service-auth JWT only when it is bound to
-//! the method that set grants. The built-in hpy client is seeded at boot.
+//! HappyView received itself, and never a service-auth JWT. The built-in hpy
+//! client is seeded at boot.
 
 mod common;
 
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ADMIN_GRANT: &str = "atproto rpc:dev.happyview.admin.manage?aud=*";
@@ -49,16 +49,7 @@ async fn authorization_server(
     listed: bool,
     responses: &[Value],
 ) -> MockServer {
-    let server = MockServer::start().await;
-    let issuer = server.uri();
-    Mock::given(method("GET"))
-        .and(path("/.well-known/oauth-authorization-server"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "issuer": issuer,
-            "token_endpoint": format!("{issuer}/oauth/token"),
-        })))
-        .mount(&server)
-        .await;
+    let server = issuer(app, did, listed).await;
     let (last, first) = responses.split_last().unwrap();
     for response in first {
         Mock::given(method("POST"))
@@ -71,6 +62,47 @@ async fn authorization_server(
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(last))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// An authorization server whose token endpoint answers a refresh by the
+/// session it comes from: each of `responses` is keyed to the access token
+/// a session was registered with, through [`refresh_token_for`].
+async fn keyed_authorization_server(
+    app: &common::app::TestApp,
+    did: &str,
+    responses: &[(&str, Value)],
+) -> MockServer {
+    let server = issuer(app, did, true).await;
+    for (access_token, response) in responses {
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains(refresh_token_for(access_token)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+/// The refresh token a session registered with `access_token` holds.
+fn refresh_token_for(access_token: &str) -> String {
+    format!("{access_token}-refresh")
+}
+
+/// An issuer with metadata and no token endpoint, listed by `did`'s PDS when
+/// `listed`.
+async fn issuer(app: &common::app::TestApp, did: &str, listed: bool) -> MockServer {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/oauth/token"),
+        })))
         .mount(&server)
         .await;
 
@@ -113,11 +145,54 @@ async fn token_requests(server: &MockServer) -> usize {
         .count()
 }
 
+/// The client an app signs in through: its key, and the Origin it sends, if any.
+struct Client {
+    key: String,
+    origin: Option<String>,
+}
+
+impl Client {
+    fn hpy() -> Self {
+        Self {
+            key: cli_client::CLIENT_KEY.to_string(),
+            origin: None,
+        }
+    }
+
+    fn headers(&self) -> Vec<(&str, &str)> {
+        let mut headers = vec![("x-client-key", self.key.as_str())];
+        if let Some(origin) = &self.origin {
+            headers.push(("origin", origin.as_str()));
+        }
+        headers
+    }
+}
+
 /// Signs in through the built-in client as hpy does: a DPoP key provisioned
 /// with PKCE and no Origin, then a session registered with the verifier and
 /// whatever scope the app claims. Returns the provision id and the DPoP key.
 async fn sign_in(
     app: &common::app::TestApp,
+    did: &str,
+    issuer: &str,
+    claimed_scope: &str,
+    access_token: &str,
+) -> (String, Value) {
+    sign_in_as(
+        app,
+        &Client::hpy(),
+        did,
+        issuer,
+        claimed_scope,
+        access_token,
+    )
+    .await
+}
+
+/// [`sign_in`] through any public client.
+async fn sign_in_as(
+    app: &common::app::TestApp,
+    client: &Client,
     did: &str,
     issuer: &str,
     claimed_scope: &str,
@@ -131,7 +206,7 @@ async fn sign_in(
         .oneshot(post_json(
             "/oauth/dpop-keys",
             &json!({ "pkce_challenge": challenge }),
-            &[("x-client-key", cli_client::CLIENT_KEY)],
+            &client.headers(),
         ))
         .await
         .unwrap();
@@ -148,12 +223,12 @@ async fn sign_in(
                 "pkce_verifier": verifier,
                 "did": did,
                 "access_token": access_token,
-                "refresh_token": "registered-refresh-token",
+                "refresh_token": refresh_token_for(access_token),
                 "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "scopes": claimed_scope,
                 "issuer": issuer,
             }),
-            &[("x-client-key", cli_client::CLIENT_KEY)],
+            &client.headers(),
         ))
         .await
         .unwrap();
@@ -171,13 +246,23 @@ async fn dpop_get(
     dpop_key: &Value,
     access_token: &str,
 ) -> (StatusCode, Value) {
+    dpop_get_as(app, &Client::hpy(), path, dpop_key, access_token).await
+}
+
+async fn dpop_get_as(
+    app: &common::app::TestApp,
+    client: &Client,
+    path: &str,
+    dpop_key: &Value,
+    access_token: &str,
+) -> (StatusCode, Value) {
     let url = format!("http://127.0.0.1{path}");
     let proof = generate_dpop_proof(dpop_key, "GET", &url, access_token, None).unwrap();
     let req = Request::builder()
         .method("GET")
         .uri(path)
         .header("host", "127.0.0.1")
-        .header("x-client-key", cli_client::CLIENT_KEY)
+        .header("x-client-key", &client.key)
         .header("authorization", format!("DPoP {access_token}"))
         .header("dpop", proof)
         .body(Body::empty())
@@ -226,6 +311,46 @@ async fn the_scope_an_app_claims_grants_nothing() {
 
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Nothing about the rule is particular to hpy: an ordinary registered app's
+/// session reaches the admin API only with the grant its authorization server
+/// reports, and `transition:generic` is not it.
+#[tokio::test]
+#[serial]
+async fn any_apps_session_is_held_to_the_grant() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let origin = "https://app.example".to_string();
+    let (key, _, _) = app
+        .create_api_client("public", Some(vec![origin.clone()]))
+        .await;
+    let client = Client {
+        key,
+        origin: Some(origin),
+    };
+
+    // One session per grant, each answered by its own refresh token, so the
+    // order the sessions refresh in does not matter.
+    let cases = [
+        (
+            "generic-token",
+            "atproto transition:generic",
+            StatusCode::FORBIDDEN,
+        ),
+        ("granted-token", ADMIN_GRANT, StatusCode::OK),
+    ];
+    let responses: Vec<(&str, Value)> = cases
+        .iter()
+        .map(|(token, granted, _)| (*token, token_response(&did, granted, 3600)))
+        .collect();
+    let server = keyed_authorization_server(&app, &did, &responses).await;
+    for (token, granted, expected) in cases.into_iter().rev() {
+        let (_, dpop_key) = sign_in_as(&app, &client, &did, &server.uri(), "atproto", token).await;
+        let (status, body) = dpop_get_as(&app, &client, "/admin/plugins", &dpop_key, token).await;
+        assert_eq!(status, expected, "granted {granted}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -343,17 +468,19 @@ async fn signing_in_again_forgets_the_previous_grant() {
 
 #[tokio::test]
 #[serial]
-async fn a_service_auth_token_must_name_the_admin_method() {
+async fn a_service_auth_token_never_reaches_admin() {
     common::require_db!();
     let mut app = common::app::TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance = app.setup_did_web().await;
     let did = app.admin_did.clone();
 
-    for (lxm, expected) in [
-        (None, StatusCode::FORBIDDEN),
-        (Some("com.example.other"), StatusCode::FORBIDDEN),
-        (Some(admin_scope::ADMIN_LXM), StatusCode::OK),
+    // Bound to the admin method or not: a PDS mints that one too, for any
+    // session holding `transition:generic`.
+    for lxm in [
+        None,
+        Some("com.example.other"),
+        Some(admin_scope::ADMIN_LXM),
     ] {
         let auth = app
             .service_auth_jwt_for(&plc_store, &did, &instance, "#happyview", lxm)
@@ -366,7 +493,12 @@ async fn a_service_auth_token_must_name_the_admin_method() {
             .unwrap();
         let resp = app.router.clone().oneshot(req).await.unwrap();
         let status = resp.status();
-        assert_eq!(status, expected, "{lxm:?}: {}", response_json(resp).await);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{lxm:?}: {}",
+            response_json(resp).await
+        );
     }
 }
 
@@ -464,4 +596,158 @@ async fn config_names_the_cli_client_key() {
     let app = common::app::TestApp::new().await;
     let body = app.get_json("/config").await;
     assert_eq!(body["cli_client_key"], cli_client::CLIENT_KEY);
+}
+
+/// Mint a client assertion for a sign-in in flight, as an app does for its
+/// PAR and its code exchange. Returns the kid it was signed with.
+async fn mint_for_provision(
+    app: &common::app::TestApp,
+    provision_id: &str,
+    verifier: &str,
+) -> String {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/client-assertion",
+            &json!({
+                "issuer": "https://pds.example.com",
+                "provision_id": provision_id,
+                "pkce_verifier": verifier,
+            }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let header = body["client_assertion"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_string();
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+    assert_eq!(
+        header["kid"], body["kid"],
+        "the response names the kid it signed with"
+    );
+    body["kid"].as_str().unwrap().to_string()
+}
+
+async fn provision(app: &common::app::TestApp, verifier: &str) -> String {
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/dpop-keys",
+            &json!({ "pkce_challenge": challenge }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    response_json(resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A sign-in's assertions, and the session it becomes, keep the key its
+/// first assertion used even when a staged key takes over before the code
+/// exchange: the reference provider refuses an exchange signed by another
+/// key than the PAR, and a refresh by another key than the exchange.
+#[tokio::test]
+#[serial]
+async fn a_sign_in_keeps_its_key_across_a_promotion() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let pool = &app.state.db;
+    let backend = app.state.db_backend;
+    let enc = app.state.config.token_encryption_key.as_ref();
+    let did = "did:plc:keepsitskey";
+    let server =
+        authorization_server(&app, did, true, &[token_response(did, ADMIN_GRANT, 3600)]).await;
+
+    // The client signs as a confidential atproto client.
+    let old = happyview::oauth::client_keys::generate_client_key(cli_client::CLIENT_ID).unwrap();
+    happyview::oauth::client_keys::insert_key(pool, backend, enc, &old)
+        .await
+        .unwrap();
+
+    let verifier = "keeps-its-key-verifier-0123456789abcdef0123";
+    let provision_id = provision(&app, verifier).await;
+    assert_eq!(
+        mint_for_provision(&app, &provision_id, verifier).await,
+        old.kid
+    );
+
+    // A staged key takes over while the user is at their PDS.
+    let (new, _) =
+        happyview::oauth::client_keys::stage_key(pool, backend, enc, cli_client::CLIENT_ID)
+            .await
+            .unwrap();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET activates_at = '2000-01-01T00:00:00.000Z' WHERE kid = ?",
+        backend,
+    ))
+    .bind(&new.kid)
+    .execute(pool)
+    .await
+    .unwrap();
+    happyview::oauth::client_keys::promote_due_keys(pool, backend)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mint_for_provision(&app, &provision_id, verifier).await,
+        old.kid,
+        "the code exchange must be signed with the PAR's key"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/sessions",
+            &json!({
+                "provision_id": provision_id,
+                "pkce_verifier": verifier,
+                "did": did,
+                "access_token": "app-token",
+                "refresh_token": "registered-refresh-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "scopes": ADMIN_GRANT,
+                "issuer": server.uri(),
+            }),
+            &[("x-client-key", cli_client::CLIENT_KEY)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        response_json(resp).await
+    );
+    let (pinned,): (Option<String>,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT signing_kid FROM happyview_dpop_sessions WHERE user_did = ?",
+        backend,
+    ))
+    .bind(did)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned.as_deref(),
+        Some(old.kid.as_str()),
+        "the session is pinned to the key that signed its exchange, not the one current at registration"
+    );
+
+    // A sign-in started after the promotion uses the new key.
+    let verifier = "after-promotion-verifier-0123456789abcdef01";
+    let later = provision(&app, verifier).await;
+    assert_eq!(mint_for_provision(&app, &later, verifier).await, new.kid);
 }
