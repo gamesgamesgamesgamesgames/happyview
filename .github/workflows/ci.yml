@@ -291,6 +291,7 @@ jobs:
         run: bash scripts/check-quickjs-plugins.sh --require
 
       - name: Run plugin SDK tests
+        if: matrix.shard == 1
         run: cargo test -p happyview-plugin-sdk
 
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
