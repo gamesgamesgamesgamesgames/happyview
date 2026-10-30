@@ -13,9 +13,7 @@
 mod interop_support;
 
 use base64::Engine;
-use happyview::spaces::commit::{SpaceVerifyingKey, verify_commit};
 use happyview::spaces::lthash::{LtHashState, record_element};
-use happyview::spaces::native_client::parse_signed_commit;
 use happyview::spaces::types::{AppAccess, MemberAccess, Policy, ResolvedMember};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -286,55 +284,18 @@ async fn a_commit_written_by_zds_verifies_and_agrees_with_our_set_hash() {
         expected.add(&record_element("com.example.note", rkey, cid));
     }
 
-    let (status, body) = get_json(
-        &format!(
-            "{ZDS}/xrpc/com.atproto.space.getLatestCommit?space={}&repo={}",
-            enc(&space_uri),
-            enc(&did)
-        ),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, 200, "getLatestCommit failed: {body}");
-
-    let commit = parse_signed_commit(&body["commit"]).expect("commit parses");
-    assert_eq!(commit.ver, 1);
-
-    let key = author_key(&did).await;
-    verify_commit(&commit, &space_uri, &did, &key)
-        .expect("a commit written by ZDS must verify with our own code");
+    // Fetched and authenticated as native sync does, whichever commit model
+    // ZDS speaks: a signed commit, or a proposal 0016 one with a MAC.
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space_uri, &did).await;
 
     // The migration turns on this check: our element encoding and LtHash must
     // produce the digest an independent implementation did over the same
     // records.
     assert_eq!(
-        commit.hash,
+        *commit.hash(),
         expected.hash(),
         "our set hash disagrees with ZDS's over the same two records"
     );
-}
-
-/// The account's `#atproto` signing key, from the DID document ZDS published.
-///
-/// Resolved through the PLC directory rather than the PDS: `describeRepo`
-/// returns a didDoc carrying only the service entry, and a commit is verified
-/// against the author's key.
-async fn author_key(did: &str) -> SpaceVerifyingKey {
-    let (status, body) = get_json(&format!("{PLC}/{}", enc(did)), None).await;
-    assert_eq!(status, 200, "PLC resolution failed: {body}");
-
-    let vm = body["verificationMethod"]
-        .as_array()
-        .expect("verificationMethod")
-        .iter()
-        .find(|v| v["id"].as_str().unwrap_or_default().ends_with("#atproto"))
-        .expect("an #atproto verification method");
-
-    let multibase = vm["publicKeyMultibase"]
-        .as_str()
-        .expect("publicKeyMultibase");
-    happyview::spaces::credential::multikey_to_space_key(multibase)
-        .expect("the published key must decode")
 }
 
 #[tokio::test]
@@ -411,17 +372,8 @@ async fn replaying_the_zds_oplog_across_pages_reproduces_its_commit() {
         }
     }
 
-    let (_, body) = get_json(
-        &format!(
-            "{ZDS}/xrpc/com.atproto.space.getLatestCommit?space={}&repo={}",
-            enc(&space_uri),
-            enc(&did)
-        ),
-        Some(&token),
-    )
-    .await;
-    let commit = parse_signed_commit(&body["commit"]).expect("commit parses");
-    assert_eq!(fold.hash(), commit.hash);
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space_uri, &did).await;
+    assert_eq!(fold.hash(), *commit.hash());
 }
 
 #[tokio::test]
@@ -454,8 +406,17 @@ async fn zds_encodes_commit_bytes_as_lexicon_bytes_not_bare_strings() {
     )
     .await;
 
-    for field in ["hash", "ikm", "sig", "mac"] {
-        let value = &body["commit"][field];
+    // A proposal 0016 commit carries its digest as `data` and is authenticated
+    // by a MAC header; a signed commit carries `hash` with its signature
+    // material.
+    let commit = &body["commit"];
+    let fields: &[&str] = if commit.get("data").is_some() {
+        &["data"]
+    } else {
+        &["hash", "ikm", "sig", "mac"]
+    };
+    for field in fields {
+        let value = &commit[*field];
         assert!(
             value.get("$bytes").and_then(|b| b.as_str()).is_some(),
             "{field} should be a lexicon bytes value, got {value}"
@@ -477,13 +438,12 @@ async fn the_migration_replay_lands_on_zds_with_the_hash_it_expects() {
 
     let records =
         interop_support::records_awaiting_migration(&space, &did, interop_support::Sample::Full);
-    let commit = interop_support::replay_as_migration(ZDS, &token, &space, &did, &records).await;
+    interop_support::replay_as_migration(ZDS, &token, &space, &did, &records).await;
 
     let disagreements =
         interop_support::cid_disagreements(ZDS, &token, &space, &did, &records).await;
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 
-    let commit = parse_signed_commit(&commit).expect("parses");
-    verify_commit(&commit, &space, &did, &author_key(&did).await).expect("authentic");
-    assert_eq!(commit.hash, interop_support::migration_expects(&records));
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space, &did).await;
+    assert_eq!(*commit.hash(), interop_support::migration_expects(&records));
 }
