@@ -675,22 +675,41 @@ pub async fn get_space_record(
     row.map(parse_record_row).transpose()
 }
 
+/// Which repo a by-parts lookup reads.
+pub enum RecordRepo<'a> {
+    /// Exactly this author's record.
+    Author(&'a str),
+    /// Any author's, preferring this DID's own, then the lowest author DID, so
+    /// one collection and rkey written by several authors always answers the
+    /// same record.
+    Prefer(&'a str),
+}
+
 pub async fn get_space_record_by_parts(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
+    repo: RecordRepo<'_>,
     collection: &str,
     rkey: &str,
 ) -> Result<Option<SpaceRecord>, AppError> {
-    let sql = adapt_sql(
-        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND collection = ? AND rkey = ? LIMIT 1",
-        backend,
-    );
+    const COLUMNS: &str = "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND collection = ? AND rkey = ?";
+    let (sql, did) = match repo {
+        RecordRepo::Author(did) => (format!("{COLUMNS} AND author_did = ? LIMIT 1"), did),
+        RecordRepo::Prefer(did) => (
+            format!(
+                "{COLUMNS} ORDER BY CASE WHEN author_did = ? THEN 0 ELSE 1 END, author_did LIMIT 1"
+            ),
+            did,
+        ),
+    };
+    let sql = adapt_sql(&sql, backend);
 
     let row: Option<RecordRow> = crate::db::query_as(&sql)
         .bind(space_id)
         .bind(collection)
         .bind(rkey)
+        .bind(did)
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space record: {e}")))?;
@@ -1469,18 +1488,22 @@ pub async fn increment_invite_uses(
     Ok(())
 }
 
+/// Revoke one of `space_id`'s invites. An id belonging to another space
+/// matches nothing, so it reads as not found.
 pub async fn revoke_invite(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
+    space_id: &str,
     invite_id: &str,
 ) -> Result<bool, AppError> {
     let sql = adapt_sql(
-        "UPDATE happyview_space_invites SET revoked = 1 WHERE id = ?",
+        "UPDATE happyview_space_invites SET revoked = 1 WHERE id = ? AND space_id = ?",
         backend,
     );
 
     let result = crate::db::query(&sql)
         .bind(invite_id)
+        .bind(space_id)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke invite: {e}")))?;
