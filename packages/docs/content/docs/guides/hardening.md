@@ -131,7 +131,7 @@ So HappyView refuses a request that changes something (`POST`, `PUT`, `PATCH` or
 - the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
 - its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md);
 - its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
-- or it carries neither header, because then it did not come from a browser.
+- or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
 
 Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
 
@@ -143,7 +143,7 @@ curl -X PUT "http://127.0.0.1:3000/admin/settings/cookie_integration_origins" \
   -d '{"value": "https://pentaract.example"}'
 ```
 
-A value that is not a list of origins is refused with `400`. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
+A value that is not a list of origins is refused with `400`. A listed origin is also allowed credentials by CORS, so it can send JSON requests and read the answers. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
 
 ## A checklist
 

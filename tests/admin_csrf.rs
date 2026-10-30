@@ -103,7 +103,8 @@ async fn a_request_from_outside_a_browser_runs() {
 }
 
 /// `same-site` is a sibling subdomain, not the instance, so it is judged by
-/// its origin: one of the instance's own domains runs.
+/// its origin: one of the instance's own domains runs, and a sibling that is
+/// not one is refused.
 #[tokio::test]
 #[serial]
 async fn an_origin_among_the_instances_domains_runs() {
@@ -143,6 +144,63 @@ async fn a_listed_integration_origin_runs() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(status(&app, cross_site()).await, StatusCode::FORBIDDEN);
+}
+
+/// A listed integration is trusted by CORS with credentials too: without it
+/// a JSON request fails its preflight and no response can be read.
+#[tokio::test]
+#[serial]
+async fn a_listed_integration_origin_is_allowed_credentials() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let preflight = || {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(ROUTE)
+            .header("host", "127.0.0.1")
+            .header("origin", INTEGRATION)
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let credentials = |resp: axum::response::Response| {
+        resp.headers()
+            .get("access-control-allow-credentials")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+
+    let resp = app.router.clone().oneshot(preflight()).await.unwrap();
+    assert_eq!(credentials(resp), None);
+
+    assert_eq!(
+        put_setting(&app, INTEGRATION_ORIGINS_SETTING, INTEGRATION).await,
+        StatusCode::NO_CONTENT
+    );
+    let resp = app.router.clone().oneshot(preflight()).await.unwrap();
+    assert_eq!(credentials(resp).as_deref(), Some("true"));
+
+    let req = form_post(app.admin_cookie(), Some(INTEGRATION), Some("cross-site"));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(credentials(resp).as_deref(), Some("true"));
+}
+
+/// An opaque origin (a sandboxed frame, a `data:` page) names no site, so no
+/// listing can match it.
+#[tokio::test]
+#[serial]
+async fn an_opaque_origin_is_refused() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    assert_eq!(
+        put_setting(&app, INTEGRATION_ORIGINS_SETTING, INTEGRATION).await,
+        StatusCode::NO_CONTENT
+    );
+    let req = form_post(app.admin_cookie(), Some("null"), Some("cross-site"));
+    assert_eq!(status(&app, req).await, StatusCode::FORBIDDEN);
+    let req = form_post(app.admin_cookie(), Some("null"), None);
+    assert_eq!(status(&app, req).await, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

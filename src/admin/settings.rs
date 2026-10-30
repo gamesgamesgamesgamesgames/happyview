@@ -188,6 +188,9 @@ pub(super) async fn upsert(
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
     refresh_script_limits(&state, &key).await;
+    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
+        state.integration_origins.forget().await;
+    }
 
     log_event(
         &state.db,
@@ -231,6 +234,9 @@ pub(super) async fn delete(
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
     refresh_script_limits(&state, &key).await;
+    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
+        state.integration_origins.forget().await;
+    }
 
     log_event(
         &state.db,

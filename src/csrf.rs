@@ -7,7 +7,13 @@
 //! when the browser says it came from this instance (`Sec-Fetch-Site`), or its
 //! `Origin` is one of the instance's domains or an integration origin an admin
 //! listed in [`INTEGRATION_ORIGINS_SETTING`]. A request with neither header did
-//! not come from a browser, and has no ambient cookie to abuse.
+//! not come from a browser, and has no ambient cookie to abuse: a browser that
+//! predates `Sec-Fetch-Site` still sends `Origin` on every unsafe request, so
+//! "neither" is reachable only from outside one.
+//!
+//! A listed origin is also trusted by CORS with credentials (`server::cors`),
+//! or its JSON requests would fail their preflight and it could not read a
+//! response.
 //!
 //! Bearer, DPoP and API-key requests are untouched: none of them is a
 //! credential a browser attaches by itself.
@@ -16,6 +22,9 @@ use axum::extract::{Request, State};
 use axum::http::{Method, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::AppState;
 use crate::error::AppError;
@@ -74,18 +83,51 @@ fn carries_session_cookie(req: &Request) -> bool {
 }
 
 async fn origin_allowed(state: &AppState, origin: &str) -> bool {
-    if state.domain_cache.is_allowed_origin(origin).await {
-        return true;
+    state.domain_cache.is_allowed_origin(origin).await
+        || state.integration_origins.contains(state, origin).await
+}
+
+/// How long [`IntegrationOrigins`] trusts what it read. A change made through
+/// the settings API lands at once; this bounds a change made elsewhere, such
+/// as by another instance on the same database.
+const INTEGRATION_ORIGINS_TTL: Duration = Duration::from_secs(10);
+
+/// The listed integration origins, read from the setting and kept briefly,
+/// because CORS asks on every cross-origin request.
+#[derive(Default)]
+pub struct IntegrationOrigins {
+    cached: tokio::sync::RwLock<Option<(Instant, Arc<Vec<String>>)>>,
+}
+
+impl IntegrationOrigins {
+    /// Whether `origin` is listed.
+    pub async fn contains(&self, state: &AppState, origin: &str) -> bool {
+        let origin = normalize(origin);
+        self.get(state).await.contains(&origin)
     }
-    let listed = crate::admin::settings::get_setting(
-        &state.db,
-        INTEGRATION_ORIGINS_SETTING,
-        state.db_backend,
-    )
-    .await
-    .unwrap_or_default();
-    let origin = normalize(origin);
-    parse_origins(&listed).any(|listed| listed == origin)
+
+    /// Drop what was read, so the next request reads the setting again.
+    pub async fn forget(&self) {
+        *self.cached.write().await = None;
+    }
+
+    async fn get(&self, state: &AppState) -> Arc<Vec<String>> {
+        if let Some((read_at, origins)) = &*self.cached.read().await
+            && read_at.elapsed() < INTEGRATION_ORIGINS_TTL
+        {
+            return origins.clone();
+        }
+        let value = crate::admin::settings::get_setting(
+            &state.db,
+            INTEGRATION_ORIGINS_SETTING,
+            state.db_backend,
+        )
+        .await
+        .unwrap_or_default();
+        let origins = Arc::new(parse_origins(&value).collect::<Vec<_>>());
+        *self.cached.write().await = Some((Instant::now(), origins.clone()));
+        origins
+    }
 }
 
 /// The origins in a setting value, normalized for comparison.
