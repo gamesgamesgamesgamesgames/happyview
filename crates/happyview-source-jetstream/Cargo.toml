@@ -2,7 +2,7 @@
 name = "happyview-source-jetstream"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 description = "The Jetstream record source for HappyView"
 license = "MIT"
 

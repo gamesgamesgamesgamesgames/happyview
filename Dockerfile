@@ -7,7 +7,7 @@ COPY web/ .
 ENV NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__
 RUN npm run build
 
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /app
 
