@@ -120,6 +120,11 @@ TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test c
 docker compose -f docker-compose.test.yml down
 ```
 
+CI splits that run across two runners per database:
+`scripts/e2e-shard.sh` computes each shard's targets from `cargo metadata`, so
+`cargo test $(bash scripts/e2e-shard.sh 1 2)` runs exactly what shard 1 ran,
+and `bash scripts/e2e-shard.sh --list 2` shows the split.
+
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
 file. Leaving the variable unset does not test SQLite: the end-to-end suite
 skips its database-backed tests silently, so point it at a file URL as

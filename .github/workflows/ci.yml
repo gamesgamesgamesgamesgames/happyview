@@ -147,7 +147,7 @@ jobs:
 
       # This job is deliberately database-free and fixture-free, so every test
       # that loads a plugin module skips here and runs for real under
-      # `cargo test --tests` in e2e-tests. libtest captures the skip line of a
+      # the e2e-tests shards. libtest captures the skip line of a
       # passing test, so without this the log would not say which coverage the
       # run left out. Reporting only: absent is the expected state here.
       - name: Report unbuilt plugin fixtures
@@ -170,13 +170,20 @@ jobs:
       - name: Run crate tests
         run: cargo test --workspace --exclude happyview
 
-  e2e-tests:
+  # The suite runs its test binaries one after another, which had taken the
+  # job to within three minutes of its timeout. Each shard is a slice of the
+  # targets `scripts/e2e-shard.sh` computes from `cargo metadata`, on its own
+  # runner and database; `e2e-tests` below is the check that reports them.
+  e2e-tests-shard:
+    name: e2e-tests (shard ${{ matrix.shard }}/2)
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    # Both e2e jobs have run within five minutes of 40, and a timeout costs a
-    # whole run.
-    timeout-minutes: 50
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       # Read by every target that loads the interpreter, so it sits on the job
       # rather than on each step that reaches one.
@@ -288,9 +295,11 @@ jobs:
 
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
       # database — schema + data, both SQLite and Postgres — not just a fresh one.
-      # (Also included in the full run below; runs here first for a clear signal,
-      # sharing the compiled test binary so the extra cost is ~a second.)
+      # (Also part of whichever shard's run holds it; runs here first, on one
+      # shard, for a clear signal, sharing the compiled test binary so the extra
+      # cost is ~a second.)
       - name: Migration upgrade test (old DB → latest)
+        if: matrix.shard == 1
         env:
           TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
           CARGO_PROFILE_DEV_DEBUG: "0"
@@ -302,24 +311,49 @@ jobs:
           # Drop debuginfo from the test build — it dominates target/ size and is
           # unnecessary in CI. Keeps the enlarged dependency build within disk.
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --tests
+          SHARD: ${{ matrix.shard }}
+        # Assigned first, so a failing script fails the step rather than
+        # leaving a bare `cargo test` to run something else.
+        run: |
+          args=$(bash scripts/e2e-shard.sh "$SHARD" 2)
+          test -n "$args"
+          read -ra targets <<<"$args"
+          cargo test "${targets[@]}"
 
       # The record-provider conformance cases. They are built only with the
       # kit's feature, so the run above leaves them out. The SQLite job runs
-      # them on SQLite.
+      # them on SQLite. One shard is enough.
       - name: Provider conformance (Postgres)
+        if: matrix.shard == 2
         env:
           TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --features testkit --test conformance
 
+  # The required check and what `release` waits on: passes only when every
+  # shard did.
+  e2e-tests:
+    needs: [changes, e2e-tests-shard]
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Every shard passed
+        env:
+          RESULT: ${{ needs.e2e-tests-shard.result }}
+        run: test "$RESULT" = success
+
   # The e2e suite again on SQLite: every database-backed test the job above
   # runs on Postgres, on a SQLite file, since self-hosting supports both.
-  e2e-tests-sqlite:
+  e2e-tests-sqlite-shard:
+    name: e2e-tests-sqlite (shard ${{ matrix.shard }}/2)
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       # Read by every target that loads the interpreter, so it sits on the job
       # rather than on each of the three steps that reach one.
@@ -416,13 +450,33 @@ jobs:
         env:
           TEST_DATABASE_URL: sqlite://${{ runner.temp }}/e2e.db?mode=rwc
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --tests
+          SHARD: ${{ matrix.shard }}
+        # Assigned first, so a failing script fails the step rather than
+        # leaving a bare `cargo test` to run something else.
+        run: |
+          args=$(bash scripts/e2e-shard.sh "$SHARD" 2)
+          test -n "$args"
+          read -ra targets <<<"$args"
+          cargo test "${targets[@]}"
 
       - name: Provider conformance (SQLite)
+        if: matrix.shard == 2
         env:
           TEST_DATABASE_URL: sqlite://${{ runner.temp }}/conformance.db?mode=rwc
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --features testkit --test conformance
+
+  # The required check and what `release` waits on: passes only when every
+  # shard did on SQLite.
+  e2e-tests-sqlite:
+    needs: [changes, e2e-tests-sqlite-shard]
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Every shard passed
+        env:
+          RESULT: ${{ needs.e2e-tests-sqlite-shard.result }}
+        run: test "$RESULT" = success
 
   # The only thing comparing the interpreter against the native runner case
   # for case, which is what lets the native one retire with evidence. A job of
@@ -435,7 +489,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
     env:
-      # `HAPPYVIEW_LUA_SRC` stays unset for the reason given on `e2e-tests`.
+      # `HAPPYVIEW_LUA_SRC` stays unset for the reason given on `e2e-tests-shard`.
       HAPPYVIEW_LUA_PLUGIN: ${{ github.workspace }}/lua-plugin
     steps:
       - name: Checkout repository
@@ -448,7 +502,7 @@ jobs:
         with:
           shared-key: lua-differential
 
-      # Pinned and fetched as in `e2e-tests`, with the module's identity in
+      # Pinned and fetched as in `e2e-tests-shard`, with the module's identity in
       # the summary beside the figures the run reports.
       - name: Fetch the Lua interpreter plugin
         run: |
