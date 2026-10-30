@@ -23,6 +23,9 @@ pub struct Job {
     pub inherit_auth: bool,
     pub api_client_id: Option<String>,
     pub dpop_key_id: Option<String>,
+    /// How many runs of this job have started, one that lost its worker
+    /// included.
+    pub attempt: i64,
 }
 
 static JOB_TYPE_RE: LazyLock<Regex> =

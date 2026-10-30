@@ -12,16 +12,46 @@ use super::db;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often each worker settles jobs whose worker stopped (see
+/// [`db::recover_expired_jobs`]).
+const RECOVER_EVERY: Duration = Duration::from_secs(60);
+
+/// This process's name in a job's `claimed_by`: unique to the process, so
+/// two instances on one database never take each other's claims for their
+/// own.
+fn instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "happyview".to_string());
+        format!("{host}:{}:{}", std::process::id(), uuid::Uuid::new_v4())
+    })
+}
+
 /// Start the background job worker. Polls for pending jobs and
 /// executes them one at a time per worker; see `spawn_workers`.
 pub async fn run_worker(state: AppState) {
-    tracing::info!("job worker started");
+    run_worker_as(state, instance_id().to_string()).await
+}
 
+/// [`run_worker`], claiming jobs as `owner`. Public so a test can run two
+/// instances' workers in one process.
+pub async fn run_worker_as(state: AppState, owner: String) {
+    tracing::info!(owner, "job worker started");
+
+    let mut recovered = tokio::time::Instant::now();
     loop {
-        match db::claim_next_job(&state).await {
+        if recovered.elapsed() >= RECOVER_EVERY {
+            recover(&state).await;
+            recovered = tokio::time::Instant::now();
+        }
+        match db::claim_next_job(&state, &owner).await {
             Ok(Some(job)) => {
-                tracing::info!(job_id = %job.id, job_type = %job.job_type, "executing job");
-                run_on_its_own_thread(&state, job).await;
+                tracing::info!(job_id = %job.id, job_type = %job.job_type, attempt = job.attempt, "executing job");
+                let lease = db::Lease {
+                    owner: owner.clone(),
+                    attempt: job.attempt,
+                };
+                run_on_its_own_thread(&state, job, lease).await;
             }
             Ok(None) => {
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -34,18 +64,45 @@ pub async fn run_worker(state: AppState) {
     }
 }
 
-/// Run one job on the blocking pool. A job has no deadline, so its guest
-/// never yields and holds whichever thread runs it until it finishes. On a
-/// runtime worker that starves every task queued behind it there, another
-/// job worker included, so two workers would run their jobs one after the
-/// other.
-async fn run_on_its_own_thread(state: &AppState, job: super::Job) {
-    let state = state.clone();
+/// Run one job on the blocking pool, renewing its lease while it runs. A job
+/// has no deadline, so its guest never yields and holds whichever thread runs
+/// it until it finishes. On a runtime worker that starves every task queued
+/// behind it there, another job worker and the renewal included, so two
+/// workers would run their jobs one after the other.
+async fn run_on_its_own_thread(state: &AppState, job: super::Job, lease: db::Lease) {
     let id = job.id.clone();
+    let renewal = tokio::spawn(renew_while_running(
+        state.clone(),
+        id.clone(),
+        lease.clone(),
+    ));
     let handle = tokio::runtime::Handle::current();
-    let run = tokio::task::spawn_blocking(move || handle.block_on(execute_job(&state, &job)));
+    let run = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(execute_job_under(&state, &job, &lease))
+        })
+    };
     if let Err(e) = run.await {
         tracing::error!(job_id = %id, error = %e, "job worker: the job's thread ended abnormally");
+    }
+    renewal.abort();
+}
+
+/// Renew `lease` every [`db::RENEW_EVERY`] until aborted. A lease that can no
+/// longer be renewed was lost: the job's outcome will not be recorded by this
+/// worker, and the job runs again, or has, elsewhere.
+async fn renew_while_running(state: AppState, id: String, lease: db::Lease) {
+    loop {
+        tokio::time::sleep(db::RENEW_EVERY).await;
+        match db::renew_lease(&state, &id, &lease).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(job_id = %id, owner = %lease.owner, "job worker: lost the job's lease");
+                return;
+            }
+            Err(e) => tracing::warn!(job_id = %id, error = %e, "job worker: failed to renew lease"),
+        }
     }
 }
 
@@ -59,30 +116,41 @@ pub fn spawn_workers(state: AppState, count: usize) -> Vec<tokio::task::JoinHand
         .collect()
 }
 
-/// Resume jobs that were interrupted by a server restart.
-pub async fn resume_interrupted_jobs(state: &AppState) {
-    let jobs = db::find_interrupted_jobs(state).await;
-
-    for job in jobs {
-        match job.status.as_str() {
-            "cancelling" => {
-                tracing::info!(job_id = %job.id, "finalising cancelled job from previous run");
-                let _ = db::set_status(state, &job.id, "cancelled").await;
-            }
-            "pausing" => {
-                tracing::info!(job_id = %job.id, "finalising paused job from previous run");
-                let _ = db::set_status(state, &job.id, "paused").await;
-            }
-            "running" => {
-                tracing::info!(job_id = %job.id, "re-queuing interrupted job");
-                let _ = db::set_status(state, &job.id, "pending").await;
-            }
-            _ => {}
-        }
+/// Settle the jobs whose worker stopped, at startup and then every
+/// [`RECOVER_EVERY`] from each worker. Only expired leases are touched, so
+/// this is safe beside other instances' running jobs.
+pub async fn recover(state: &AppState) {
+    match db::recover_expired_jobs(state).await {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(settled, "job worker: settled jobs whose worker stopped"),
+        Err(e) => tracing::error!(error = %e, "job worker: failed to recover jobs"),
     }
 }
 
-pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
+/// Run pending job `id` here and now, as a test fires it, rather than
+/// leaving it to a worker. It is held under a lease like any claimed job,
+/// so no other instance's recovery takes it while it runs. Returns `false`
+/// when the job was not pending.
+pub(crate) async fn run_now(state: &AppState, id: &str) -> Result<bool, crate::error::AppError> {
+    let owner = instance_id();
+    let Some(job) = db::hold_job(state, id, owner).await? else {
+        return Ok(false);
+    };
+    let lease = db::Lease {
+        owner: owner.to_string(),
+        attempt: job.attempt,
+    };
+    let renewal = tokio::spawn(renew_while_running(
+        state.clone(),
+        job.id.clone(),
+        lease.clone(),
+    ));
+    execute_job_under(state, &job, &lease).await;
+    renewal.abort();
+    Ok(true)
+}
+
+async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease) {
     let backend = state.db_backend;
 
     log_event(
@@ -106,7 +174,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
             super::native::NativeOutcome::Completed(v) => JobOutcome::Completed(v),
             super::native::NativeOutcome::Failed(e) => JobOutcome::Failed(e),
         };
-        finalize(state, job, outcome).await;
+        finalize(state, job, lease, outcome).await;
         return;
     }
 
@@ -117,7 +185,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
         None => {
             let error = format!("no script found for trigger: {}", lookup.id());
             tracing::error!(job_id = %job.id, %error);
-            let _ = db::set_error(state, &job.id, &error).await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Failed(&error)).await;
             log_event(
                 &state.db,
                 EventLog {
@@ -147,7 +215,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
                 Some(k) => *k,
                 None => {
                     let error = "inherit_auth with DPoP requires TOKEN_ENCRYPTION_KEY";
-                    let _ = db::set_error(state, &job.id, error).await;
+                    let _ = db::finish(state, &job.id, lease, db::Finish::Failed(error)).await;
                     return;
                 }
             };
@@ -162,7 +230,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
                 Err(e) => {
                     let error = format!("failed to obtain PDS auth for {}: {e}", job.created_by);
                     tracing::error!(job_id = %job.id, %error);
-                    let _ = db::set_error(state, &job.id, &error).await;
+                    let _ = db::finish(state, &job.id, lease, db::Finish::Failed(&error)).await;
                     log_event(
                         &state.db,
                         EventLog {
@@ -208,7 +276,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
     let trigger = match scripts::trigger_of(&script, Some(&job.id)) {
         Ok(trigger) => trigger,
         Err(error) => {
-            finalize(state, job, JobOutcome::Failed(error)).await;
+            finalize(state, job, lease, JobOutcome::Failed(error)).await;
             return;
         }
     };
@@ -250,7 +318,7 @@ pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
         )),
         Err(e) => JobOutcome::Failed(e.to_string()),
     };
-    finalize(state, job, outcome).await;
+    finalize(state, job, lease, outcome).await;
 }
 
 /// What a job's body produced, before pause/cancel is taken into account.
@@ -263,13 +331,13 @@ pub(crate) enum JobOutcome {
 ///
 /// Shared by the Lua and native paths so the two cannot drift apart on what
 /// `pausing` and `cancelling` mean.
-async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
+async fn finalize(state: &AppState, job: &super::Job, lease: &db::Lease, outcome: JobOutcome) {
     let backend = state.db_backend;
     let stop = db::should_stop(state, &job.id).await;
 
     let (event_type, severity, detail) = match (stop, &outcome) {
         (Some("pausing"), JobOutcome::Failed(error)) => {
-            let _ = db::set_status(state, &job.id, "paused").await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Paused).await;
             tracing::info!(job_id = %job.id, %error, "job paused (error during stop)");
             (
                 "job.paused",
@@ -278,7 +346,7 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
             )
         }
         (Some("pausing"), JobOutcome::Completed(_)) => {
-            let _ = db::set_status(state, &job.id, "paused").await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Paused).await;
             tracing::info!(job_id = %job.id, "job paused");
             (
                 "job.paused",
@@ -287,7 +355,7 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
             )
         }
         (Some("cancelling"), JobOutcome::Failed(error)) => {
-            let _ = db::set_status(state, &job.id, "cancelled").await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Cancelled).await;
             tracing::info!(job_id = %job.id, %error, "job cancelled (error during stop)");
             (
                 "job.cancelled",
@@ -296,7 +364,7 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
             )
         }
         (Some("cancelling"), JobOutcome::Completed(_)) => {
-            let _ = db::set_status(state, &job.id, "cancelled").await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Cancelled).await;
             tracing::info!(job_id = %job.id, "job cancelled");
             (
                 "job.cancelled",
@@ -305,7 +373,7 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
             )
         }
         (_, JobOutcome::Completed(result)) => {
-            let _ = db::set_result(state, &job.id, result).await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Completed(result)).await;
             tracing::info!(job_id = %job.id, "job completed");
             (
                 "job.completed",
@@ -316,7 +384,7 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
         (_, JobOutcome::Failed(error)) => {
             // Not necessarily a script: native jobs fail here too.
             tracing::error!(job_id = %job.id, %error, "job failed");
-            let _ = db::set_error(state, &job.id, error).await;
+            let _ = db::finish(state, &job.id, lease, db::Finish::Failed(error)).await;
             (
                 "job.failed",
                 Severity::Error,
