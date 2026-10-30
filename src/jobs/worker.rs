@@ -36,6 +36,13 @@ pub async fn run_worker(state: AppState) {
 /// [`run_worker`], claiming jobs as `owner`. Public so a test can run two
 /// instances' workers in one process.
 pub async fn run_worker_as(state: AppState, owner: String) {
+    run_worker_renewing(state, owner, db::RENEW_EVERY).await
+}
+
+/// [`run_worker_as`], renewing each job's lease every `renew_every`, which a
+/// test shortens to see a run outlast it.
+#[doc(hidden)]
+pub async fn run_worker_renewing(state: AppState, owner: String, renew_every: Duration) {
     tracing::info!(owner, "job worker started");
 
     loop {
@@ -46,7 +53,7 @@ pub async fn run_worker_as(state: AppState, owner: String) {
                     owner: owner.clone(),
                     attempt: job.attempt,
                 };
-                run_on_its_own_thread(&state, job, lease).await;
+                run_on_its_own_thread(&state, job, lease, renew_every).await;
             }
             Ok(None) => {
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -64,47 +71,44 @@ pub async fn run_worker_as(state: AppState, owner: String) {
 /// it until it finishes. On a runtime worker that starves every task queued
 /// behind it there, another job worker and the renewal included, so two
 /// workers would run their jobs one after the other.
-async fn run_on_its_own_thread(state: &AppState, job: super::Job, lease: db::Lease) {
+async fn run_on_its_own_thread(
+    state: &AppState,
+    job: super::Job,
+    lease: db::Lease,
+    renew_every: Duration,
+) {
     let id = job.id.clone();
-    let hold = super::held::hold(&id, lease.clone());
+    let held = super::held::Held::new(&id, lease.clone());
     let renewal = tokio::spawn(renew_while_running(
         state.clone(),
-        id.clone(),
-        hold.held().clone(),
+        held.clone(),
+        renew_every,
     ));
     let handle = tokio::runtime::Handle::current();
     let run = {
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
-            handle.block_on(execute_job_under(&state, &job, &lease))
+            handle.block_on(super::held::run_under(
+                held,
+                execute_job_under(&state, &job, &lease),
+            ))
         })
     };
     if let Err(e) = run.await {
         tracing::error!(job_id = %id, error = %e, "job worker: the job's thread ended abnormally");
     }
     renewal.abort();
-    drop(hold);
 }
 
-/// Renew `held`'s lease every [`db::RENEW_EVERY`] until aborted. A lease that
-/// can no longer be renewed was lost: the job was queued again or claimed
-/// elsewhere. It is marked lost, so the run's writes change nothing, its
-/// `should_stop` answers true, and a guest is interrupted at its next host
-/// import.
-async fn renew_while_running(state: AppState, id: String, held: super::held::Held) {
-    renew_every(state, id, held, db::RENEW_EVERY).await
-}
-
-/// [`renew_while_running`] at a given interval, which a test shortens.
-pub(crate) async fn renew_every(
-    state: AppState,
-    id: String,
-    held: super::held::Held,
-    every: Duration,
-) {
+/// Renew `held`'s lease every `every` until aborted. A lease that can no
+/// longer be renewed was lost: the job was queued again or claimed elsewhere.
+/// It is marked lost, so the run's writes change nothing, its `should_stop`
+/// answers true, and a guest is interrupted at its next host import.
+pub(crate) async fn renew_while_running(state: AppState, held: super::held::Held, every: Duration) {
+    let id = &held.id;
     loop {
         tokio::time::sleep(every).await;
-        match db::renew_lease(&state, &id, &held.lease).await {
+        match db::renew_lease(&state, id, &held.lease).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(job_id = %id, owner = %held.lease.owner, "job worker: lost the job's lease; stopping its run");
@@ -161,15 +165,14 @@ pub(crate) async fn run_now(state: &AppState, id: &str) -> Result<bool, crate::e
         owner: owner.to_string(),
         attempt: job.attempt,
     };
-    let hold = super::held::hold(&job.id, lease.clone());
+    let held = super::held::Held::new(&job.id, lease.clone());
     let renewal = tokio::spawn(renew_while_running(
         state.clone(),
-        job.id.clone(),
-        hold.held().clone(),
+        held.clone(),
+        db::RENEW_EVERY,
     ));
-    execute_job_under(state, &job, &lease).await;
+    super::held::run_under(held, execute_job_under(state, &job, &lease)).await;
     renewal.abort();
-    drop(hold);
     Ok(true)
 }
 
@@ -207,23 +210,7 @@ async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease
         Some(s) => s,
         None => {
             let error = format!("no script found for trigger: {}", lookup.id());
-            tracing::error!(job_id = %job.id, %error);
-            let _ = db::finish(state, &job.id, lease, db::Finish::Failed(&error)).await;
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "job.failed".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(job.created_by.clone()),
-                    subject: Some(job.job_type.clone()),
-                    detail: serde_json::json!({
-                        "job_id": job.id,
-                        "error": error,
-                    }),
-                },
-                backend,
-            )
-            .await;
+            finalize(state, job, lease, JobOutcome::Failed(error)).await;
             return;
         }
     };
@@ -238,7 +225,7 @@ async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease
                 Some(k) => *k,
                 None => {
                     let error = "inherit_auth with DPoP requires TOKEN_ENCRYPTION_KEY";
-                    let _ = db::finish(state, &job.id, lease, db::Finish::Failed(error)).await;
+                    finalize(state, job, lease, JobOutcome::Failed(error.to_string())).await;
                     return;
                 }
             };
@@ -252,23 +239,7 @@ async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease
                 Ok(session) => repo::PdsAuth::OAuth(Arc::new(session)),
                 Err(e) => {
                     let error = format!("failed to obtain PDS auth for {}: {e}", job.created_by);
-                    tracing::error!(job_id = %job.id, %error);
-                    let _ = db::finish(state, &job.id, lease, db::Finish::Failed(&error)).await;
-                    log_event(
-                        &state.db,
-                        EventLog {
-                            event_type: "job.failed".to_string(),
-                            severity: Severity::Error,
-                            actor_did: Some(job.created_by.clone()),
-                            subject: Some(job.job_type.clone()),
-                            detail: serde_json::json!({
-                                "job_id": job.id,
-                                "error": error,
-                            }),
-                        },
-                        backend,
-                    )
-                    .await;
+                    finalize(state, job, lease, JobOutcome::Failed(error)).await;
                     return;
                 }
             }

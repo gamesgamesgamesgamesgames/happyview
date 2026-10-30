@@ -242,25 +242,16 @@ pub async fn list_jobs(
     Ok((jobs, next_cursor))
 }
 
-/// Store a running job's progress. When this process holds the job's lease,
-/// only while it still does: a run whose lease was lost, and whose job was
-/// queued again or claimed elsewhere, writes nothing, and the loss is
-/// recorded so the run stops. Without a lease here (a job this process is
-/// not running), as unconditionally as before leases.
+/// Store a running job's progress, while its run still holds the job's
+/// lease: a run whose lease was lost, and whose job was queued again or
+/// claimed elsewhere (or by another worker here), writes nothing, and the
+/// loss is recorded so the run stops. Outside a job's run there is no lease
+/// to write under, and nothing is written.
 pub async fn update_progress(state: &AppState, id: &str, progress: &Value) -> Result<(), AppError> {
     let progress_str = serde_json::to_string(progress)
         .map_err(|e| AppError::Internal(format!("failed to serialize progress: {e}")))?;
-    let Some(held) = super::held::get(id) else {
-        let sql = adapt_sql(
-            "UPDATE happyview_jobs SET progress = ? WHERE id = ?",
-            state.db_backend,
-        );
-        crate::db::query(&sql)
-            .bind(&progress_str)
-            .bind(id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to update job progress: {e}")))?;
+    let Some(held) = super::held::current(id) else {
+        tracing::warn!(job_id = %id, "job progress written outside the job's run; ignored");
         return Ok(());
     };
     if held.is_lost() {
@@ -287,10 +278,10 @@ pub async fn update_progress(state: &AppState, id: &str, progress: &Value) -> Re
 }
 
 /// Whether a running job should stop: it was asked to pause or cancel, or
-/// (when this process holds its lease) the lease was lost to another claim,
+/// (asked from the job's run) the run's lease was lost to another claim,
 /// which answers `"lost"`. Same cooperative pattern as the backfill system.
 pub async fn should_stop(state: &AppState, id: &str) -> Option<&'static str> {
-    let held = super::held::get(id);
+    let held = super::held::current(id);
     if held.as_ref().is_some_and(super::held::Held::is_lost) {
         return Some("lost");
     }
@@ -794,31 +785,39 @@ mod lease_tests {
             .expect("b takes the job")
     }
 
+    use super::super::held::{Held, run_under};
+
     /// A stale run's progress lands nowhere, and the loss stops it.
     #[tokio::test]
     async fn a_run_that_lost_its_lease_writes_no_progress_and_is_told_to_stop() {
         for (a, b) in instances().await {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
-            let guard = super::super::held::hold(&id, lease("a", &first));
-            update_progress(&a, &id, &serde_json::json!({ "step": 1 }))
-                .await
-                .unwrap();
+            let held = Held::new(&id, lease("a", &first));
+            run_under(held.clone(), async {
+                update_progress(&a, &id, &serde_json::json!({ "step": 1 }))
+                    .await
+                    .unwrap();
+            })
+            .await;
             assert_eq!(progress_of(&a, &id).await, serde_json::json!({ "step": 1 }));
 
             taken_over(&a, &b, &id).await;
-            update_progress(&a, &id, &serde_json::json!({ "step": "stale" }))
-                .await
-                .unwrap();
+            let stop = run_under(held.clone(), async {
+                update_progress(&a, &id, &serde_json::json!({ "step": "stale" }))
+                    .await
+                    .unwrap();
+                should_stop(&a, &id).await
+            })
+            .await;
             assert_eq!(
                 progress_of(&a, &id).await,
                 serde_json::json!({ "step": 1 }),
                 "{:?}",
                 a.db_backend
             );
-            assert!(guard.held().is_lost());
-            assert_eq!(should_stop(&a, &id).await, Some("lost"));
-            drop(guard);
+            assert!(held.is_lost());
+            assert_eq!(stop, Some("lost"));
         }
     }
 
@@ -828,17 +827,140 @@ mod lease_tests {
         for (a, b) in instances().await {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
-            let guard = super::super::held::hold(&id, lease("a", &first));
-            assert_eq!(should_stop(&a, &id).await, None);
+            let held = Held::new(&id, lease("a", &first));
+            let before = run_under(held.clone(), should_stop(&a, &id)).await;
+            assert_eq!(before, None);
             taken_over(&a, &b, &id).await;
+            let after = run_under(held.clone(), should_stop(&a, &id)).await;
+            assert_eq!(after, Some("lost"), "{:?}", a.db_backend);
+            assert!(held.is_lost());
+        }
+    }
+
+    /// Two runs of one job in one process: the lease expired here while its
+    /// renewals failed, and another worker of this same process re-claimed
+    /// the job, under the same owner. The stale run still finds its own
+    /// lease rather than the newer run's, so its writes fail the fence and it
+    /// is told to stop, before and after the newer run ends.
+    #[tokio::test]
+    async fn a_stale_run_is_fenced_when_its_job_is_reclaimed_in_the_same_process() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            let first = hold_job(&a, &id, "x").await.unwrap().unwrap();
+            let stale = Held::new(&id, lease("x", &first));
+            expire(&a, &id).await;
+            recover_expired_jobs(&a).await.unwrap();
+            let second = hold_job(&a, &id, "x").await.unwrap().unwrap();
+            let fresh = Held::new(&id, lease("x", &second));
+
+            run_under(fresh.clone(), async {
+                update_progress(&a, &id, &serde_json::json!({ "run": "fresh" }))
+                    .await
+                    .unwrap();
+                assert_eq!(should_stop(&a, &id).await, None);
+            })
+            .await;
+            let stop = run_under(stale.clone(), async {
+                update_progress(&a, &id, &serde_json::json!({ "run": "stale" }))
+                    .await
+                    .unwrap();
+                should_stop(&a, &id).await
+            })
+            .await;
             assert_eq!(
-                should_stop(&a, &id).await,
-                Some("lost"),
+                progress_of(&a, &id).await,
+                serde_json::json!({ "run": "fresh" }),
                 "{:?}",
                 a.db_backend
             );
-            assert!(guard.held().is_lost());
-            drop(guard);
+            assert_eq!(stop, Some("lost"));
+            assert!(!fresh.is_lost());
+
+            // The newer run has finished; the stale one writes nothing still.
+            assert!(
+                finish(
+                    &a,
+                    &id,
+                    &fresh.lease,
+                    Finish::Completed(&serde_json::json!({}))
+                )
+                .await
+                .unwrap()
+            );
+            run_under(stale.clone(), async {
+                update_progress(&a, &id, &serde_json::json!({ "run": "late" }))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(
+                progress_of(&a, &id).await,
+                serde_json::json!({ "run": "fresh" })
+            );
+        }
+    }
+
+    /// Each half of the progress fence holds on its own.
+    #[tokio::test]
+    async fn a_progress_write_needs_both_the_owner_and_the_attempt() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let before = progress_of(&a, &id).await;
+            for (case, lease) in [
+                (
+                    "another owner",
+                    Lease {
+                        owner: "b".into(),
+                        attempt: held.attempt,
+                    },
+                ),
+                (
+                    "another attempt",
+                    Lease {
+                        owner: "a".into(),
+                        attempt: held.attempt + 1,
+                    },
+                ),
+            ] {
+                let run = Held::new(&id, lease);
+                run_under(run.clone(), async {
+                    update_progress(&a, &id, &serde_json::json!({ "case": case }))
+                        .await
+                        .unwrap();
+                })
+                .await;
+                assert_eq!(
+                    progress_of(&a, &id).await,
+                    before,
+                    "{case}: {:?}",
+                    a.db_backend
+                );
+                assert!(run.is_lost(), "{case}");
+            }
+        }
+    }
+
+    /// Progress belongs to a job's run: written from anywhere else, it lands
+    /// nowhere.
+    #[tokio::test]
+    async fn progress_written_outside_the_jobs_run_lands_nowhere() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let before = progress_of(&a, &id).await;
+            update_progress(&a, &id, &serde_json::json!({ "from": "nowhere" }))
+                .await
+                .unwrap();
+            // Nor from a run of another job.
+            let other = new_job(&a).await;
+            run_under(Held::new(&other, lease("a", &held)), async {
+                update_progress(&a, &id, &serde_json::json!({ "from": "another job" }))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(progress_of(&a, &id).await, before, "{:?}", a.db_backend);
         }
     }
 
@@ -849,20 +971,28 @@ mod lease_tests {
         for (a, b) in instances().await {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
-            let guard = super::super::held::hold(&id, lease("a", &first));
-            let renewal = tokio::spawn(super::super::worker::renew_every(
+            let held = Held::new(&id, lease("a", &first));
+            let renewal = tokio::spawn(super::super::worker::renew_while_running(
                 a.clone(),
-                id.clone(),
-                guard.held().clone(),
+                held.clone(),
                 Duration::from_millis(20),
             ));
             tokio::time::sleep(Duration::from_millis(80)).await;
-            assert!(!guard.held().is_lost(), "a live lease renews");
+            assert!(!held.is_lost(), "a live lease renews");
             assert_eq!(job(&a, &id).await.status, "running");
 
-            taken_over(&a, &b, &id).await;
+            // In one statement: expiring the lease and then recovering it
+            // would race the renewal running every 20ms.
+            crate::db::query(&adapt_sql(
+                "UPDATE happyview_jobs SET claimed_by = 'b', attempt = attempt + 1 WHERE id = ?",
+                b.db_backend,
+            ))
+            .bind(&id)
+            .execute(&b.db)
+            .await
+            .unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !guard.held().is_lost() {
+            while !held.is_lost() {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "renewal never noticed"
@@ -870,7 +1000,6 @@ mod lease_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             renewal.abort();
-            drop(guard);
         }
     }
 
