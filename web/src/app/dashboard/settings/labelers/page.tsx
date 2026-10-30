@@ -138,7 +138,7 @@ export default function LabelersPage() {
                 <TableHead>Cursor</TableHead>
                 <TableHead>Created</TableHead>
                 <TableHead>Updated</TableHead>
-                <TableHead className="w-20 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -195,7 +195,7 @@ export default function LabelersPage() {
                   <TableCell>
                     {new Date(l.updated_at).toLocaleString()}
                   </TableCell>
-                  <TableCell className="w-20 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     <div className="flex gap-1">
                       {hasPermission("labelers:create") && (
                         <Button

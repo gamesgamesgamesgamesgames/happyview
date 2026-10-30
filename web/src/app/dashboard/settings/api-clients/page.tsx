@@ -170,7 +170,7 @@ export default function ApiClientsPage() {
                 <TableHead>Created</TableHead>
                 <TableHead>Parent Client</TableHead>
                 <TableHead>Owner</TableHead>
-                <TableHead className="w-10 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -205,13 +205,18 @@ export default function ApiClientsPage() {
                     {client.client_id_url}
                   </TableCell>
                   <TableCell>
-                    <div className="flex flex-wrap gap-1">
+                    <div className="flex min-w-48 max-w-80 flex-wrap gap-1">
                       {client.scopes
                         .split(/\s+/)
                         .filter(Boolean)
                         .map((scope) => (
-                          <Badge key={scope} variant="secondary">
-                            {scope}
+                          <Badge
+                            key={scope}
+                            variant="secondary"
+                            className="max-w-full"
+                            title={scope}
+                          >
+                            <span className="truncate">{scope}</span>
                           </Badge>
                         ))}
                     </div>
@@ -233,7 +238,7 @@ export default function ApiClientsPage() {
                   <TableCell className="text-sm max-w-48 truncate">
                     {client.owner_did ?? "—"}
                   </TableCell>
-                  <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     <div className="flex gap-1">
                       {hasPermission("api-clients:edit") && (
                         <ApiClientAuthDialog client={client} />
