@@ -85,8 +85,6 @@ The `coverage` job also runs on server changes. It reruns the Rust suites under 
 
 Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
 
-Pushing to a PR again cancels the CI run still going for its previous push, so only the latest commit's checks report. Runs for pushes to `main`, `beta` and `alpha` are never cancelled.
-
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
 - **PR builds**: when your PR touches the server, CI builds Docker images and binaries, and a bot comments with `docker pull ghcr.io/gamesgamesgamesgamesgames/happyview:pr-<number>` so reviewers can try it.
