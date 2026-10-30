@@ -8,8 +8,8 @@ use tokio::sync::watch;
 
 use happyview_provider::{
     Action, BackfillError, BackfillRequest, BatchOutcome, Host, IngestCounters, IngestOutcome,
-    InstanceInfo, ProviderDb, ProviderError, ProviderEvent, RecordSource, ResolveError, Severity,
-    SourceEvent,
+    InstanceInfo, JobHookStats, ProviderDb, ProviderError, ProviderEvent, RecordSource,
+    ResolveError, Severity, SourceEvent,
 };
 use happyview_source_jetstream::JetstreamSource;
 use happyview_source_jetstream::archive::ArchiveConfig;
@@ -148,6 +148,32 @@ impl Host for AppHost {
 
     fn counters(&self) -> Arc<IngestCounters> {
         Arc::clone(&self.state.telemetry_counters.ingest)
+    }
+
+    fn observe_job_stage(
+        &self,
+        job_id: &str,
+        stage: &'static str,
+        elapsed: std::time::Duration,
+        n: u64,
+    ) {
+        self.state.metrics.observe_job(job_id, stage, elapsed, n);
+    }
+
+    fn note_job_progress(&self, job_id: &str, processed: i64, total: Option<i64>) {
+        self.state.metrics.job_progress(job_id, processed, total);
+    }
+
+    fn job_hook_stats_due(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.job_stats_due(job_id)
+    }
+
+    fn job_hook_stats(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.job_stats(job_id)
+    }
+
+    fn finish_job_hook_stats(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.finish_job(job_id)
     }
 }
 

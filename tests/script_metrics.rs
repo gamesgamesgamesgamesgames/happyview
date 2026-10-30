@@ -159,7 +159,18 @@ async fn a_run_is_counted_timed_and_read_back() {
     assert_eq!(script["outcomes"], json!({"ok": 1}));
     assert!(script["wall_ms"]["p50"].as_f64().unwrap() > 0.0);
     assert!(script["guest_ms"]["max"].is_number());
-    assert!(script["instantiate_ms_mean"].as_f64().unwrap() > 0.0);
+    let instantiate = script["instantiate_ms_mean"].as_f64().unwrap();
+    assert!(instantiate > 0.0);
+    // Instantiation is building the linker and everything after it, so the
+    // two parts add back up to it.
+    let link = script["link_ms_mean"].as_f64().unwrap();
+    let allocate = script["allocate_ms_mean"].as_f64().unwrap();
+    assert!(link > 0.0 && allocate > 0.0, "{script:#}");
+    assert!(
+        (link + allocate - instantiate).abs() < 0.01,
+        "{link} + {allocate} against {instantiate}"
+    );
+    assert!(script["teardown_ms_mean"].as_f64().unwrap() > 0.0);
     assert!(script["memory_peak_bytes"]["max"].as_u64().unwrap() > 0);
     // An installed interpreter's fuel says nothing, so none is reported.
     assert!(script["fuel_mean"].is_null());
@@ -205,6 +216,10 @@ async fn a_run_is_counted_timed_and_read_back() {
     assert_eq!(points.len(), 60);
     let ran: u64 = points.iter().map(|p| p["runs"].as_u64().unwrap()).sum();
     assert_eq!(ran, 2);
+    let last = points.last().unwrap();
+    for field in ["link_ms_mean", "allocate_ms_mean", "teardown_ms_mean"] {
+        assert!(last[field].as_f64().unwrap() > 0.0, "{field}: {last:#}");
+    }
 
     let (status, series) = get(
         &app,

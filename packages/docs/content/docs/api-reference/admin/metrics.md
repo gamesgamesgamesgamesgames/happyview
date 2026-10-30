@@ -15,7 +15,10 @@ Recording is on by default. Turn it off with the `script_metrics_enabled` [insta
 | `wall_ms` | The whole run: building the script's input, instantiating the interpreter, running the script, and settling the library calls it left running |
 | `guest_ms` | Time inside the script's own code: the call into the interpreter less the time spent in host imports |
 | `prepare_ms_mean` | Building the script's input, including reading script variables, and attaching its prepared artifact |
-| `instantiate_ms_mean` | Instantiating the interpreter or compiled module |
+| `instantiate_ms_mean` | Instantiating the interpreter or compiled module: `link_ms_mean` plus `allocate_ms_mean` |
+| `link_ms_mean` | Building the linker the instance's imports are resolved through |
+| `allocate_ms_mean` | The rest of instantiation: finding the module, building the store, the instance with its memory and stack, and running the module's initializer |
+| `teardown_ms_mean` | Dropping the store and instance once the run is over |
 | `host_ms_mean` | Time the script spent waiting on the host: database reads, library calls, HTTP requests |
 | `settle_ms_mean` | Waiting for library calls the script started and never awaited |
 | `host_imports` | The host imports the script called, each with its call count and mean time per call. A library call is counted once, under the import that made it |
@@ -71,6 +74,9 @@ One row per script that ran inside the window, busiest first. A script is keyed 
       "guest_ms": { "p50": 0.332, "p95": 0.332, "p99": 0.332, "max": 0.332, "mean": 0.332 },
       "prepare_ms_mean": 162.625,
       "instantiate_ms_mean": 0.551,
+      "link_ms_mean": 0.402,
+      "allocate_ms_mean": 0.149,
+      "teardown_ms_mean": 0.063,
       "host_ms_mean": 0.465,
       "settle_ms_mean": 0.002,
       "host_imports": [
@@ -122,7 +128,11 @@ One script's totals for the window and a series of points across it, merged over
       "outcomes": {},
       "wall_ms": { "p50": null, "p95": null, "max": null },
       "guest_ms": { "p50": null, "p95": null, "max": null },
-      "host_ms_mean": null
+      "host_ms_mean": null,
+      "instantiate_ms_mean": null,
+      "link_ms_mean": null,
+      "allocate_ms_mean": null,
+      "teardown_ms_mean": null
     },
     {
       "start": "2026-10-30T21:29:00+00:00",
@@ -130,7 +140,11 @@ One script's totals for the window and a series of points across it, merged over
       "outcomes": { "ok": 1, "runtime": 1 },
       "wall_ms": { "p50": 1.555, "p95": 1.555, "max": 164.064 },
       "guest_ms": { "p50": 0.087, "p95": 0.087, "max": 0.332 },
-      "host_ms_mean": 0.2325
+      "host_ms_mean": 0.2325,
+      "instantiate_ms_mean": 0.591,
+      "link_ms_mean": 0.433,
+      "allocate_ms_mean": 0.1575,
+      "teardown_ms_mean": 0.0495
     }
   ]
 }
@@ -142,6 +156,73 @@ One script's totals for the window and a series of points across it, merged over
 | ------ | --------- |
 | 400    | An unknown `window` or `step`, or `step=1m` with `window=24h` |
 | 404    | The script has not run inside the window |
+
+## Ingest
+
+```http
+GET /admin/metrics/ingest
+```
+
+The record pipeline: what each record of a collection costs on its way through ingest, around and inside its hook, so you can tell whether a slow backfill is the hook or the platform. One row per collection and action that saw records inside the window, busiest first. Every source is counted: the live stream, backfills, replays and dead-letter retries.
+
+**Query parameters:**
+
+| Parameter | Type   | Description |
+| --------- | ------ | ----------- |
+| `window`  | string | `1h` (default) or `24h` |
+
+**Permission:** `metrics:read`
+
+A record's stages:
+
+| Stage | Meaning |
+| ----- | ------- |
+| `resolve` | Looking up the record's hook. A batch looks each collection's hook up once, so this stays near zero |
+| `cid_check` | Checking that the body hashes to its claimed CID |
+| `hook` | Running the hook, its retries and their backoff included. Only for records a hook ran for |
+| `hook.link`, `hook.allocate`, `hook.teardown` | Parts of `hook`, not more of it: building and dropping the hook runs' instances, as in [What a run measures](#what-a-run-measures) |
+| `write` | Writing the record to the instance database. A batch writes in one transaction, shared evenly over its records |
+| `delta` | For a collection an external storage holds, its `apply_delta` as ingest waited on it, no-ops included. A record source that can tell a skipped write from a real one reports its own as `write` and `write_skipped` on its jobs' [hook stats](./backfill.md#hook-stats) |
+
+`record_ms` is a record's own time: its stages up to its decision plus its share of the write, not the time it waited for the rest of its batch. `script_ms_mean` is the hook's own time (its code and the host calls it made), over the records a hook ran for. `script_share` is script time over record time across every record, and `platform_share` is the rest: the lookup, the CID check, the write, and in the hook everything that is not the script's own code. `records_per_s` is over the part of the window that saw records. `outcomes` counts what was decided (`proceed`, `replace`, `skip`, `cid_mismatch`); `failed`, `timeouts` and `dead_lettered` count records whose hook failed at least once, timed out at least once, and was given up on.
+
+`scripts_table_reads` counts, since the process started, how often a record hook's lookup read the scripts table rather than answering from the project or its batch's earlier lookup.
+
+**Response:**
+
+```json
+{
+  "window": "1h",
+  "enabled": true,
+  "overflow": 0,
+  "scripts_table_reads": 12,
+  "collections": [
+    {
+      "collection": "app.test.metrics.claimed",
+      "action": "create",
+      "records": 2,
+      "records_per_s": 0.048,
+      "record_ms": { "p50": 1.722, "p95": 1.722, "p99": 1.722, "max": 2.333, "mean": 2.0275 },
+      "stages": {
+        "resolve": { "n": 2, "ms_mean": 0.2155 },
+        "cid_check": { "n": 2, "ms_mean": 0.0095 },
+        "hook": { "n": 2, "ms_mean": 1.7955 },
+        "hook.link": { "n": 2, "ms_mean": 0.393 },
+        "hook.allocate": { "n": 2, "ms_mean": 0.1135 },
+        "hook.teardown": { "n": 2, "ms_mean": 0.026 },
+        "delta": { "n": 2, "ms_mean": 0.001 }
+      },
+      "outcomes": { "skip": 2 },
+      "failed": 0,
+      "timeouts": 0,
+      "dead_lettered": 0,
+      "script_ms_mean": 0.0715,
+      "script_share": 0.035,
+      "platform_share": 0.965
+    }
+  ]
+}
+```
 
 ## Live
 
@@ -166,8 +247,13 @@ What is running now: script runs in progress by kind, background jobs waiting an
     "job": 0
   },
   "jobs": { "pending": 0, "running": 0 },
+  "backfill_jobs": [
+    { "job_id": "883232fb-1817-47bf-ba4d-91dcd8b0657f", "idle_s": 0, "hooks": { "done": 1200000, "rate_per_s": 410.2 } }
+  ],
   "module_cache": { "hits": 3, "misses": 1, "compiles": 1 }
 }
 ```
+
+`backfill_jobs` lists every backfill job this process holds [hook stats](./backfill.md#hook-stats) for that has not finished, most recently active first, with `idle_s` the seconds since its last record or report. A paused job stays listed until an hour after its last record. The example's `hooks` is cut short.
 
 `module_cache` counts every module lookup the runtime made, libraries included. `compiles` is how many modules it has compiled; a miss that loaded a module from disk does not add to it.

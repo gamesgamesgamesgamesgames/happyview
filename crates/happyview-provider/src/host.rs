@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::watch;
@@ -88,4 +89,29 @@ pub trait Host: Send + Sync + 'static {
         )))
     }
     fn counters(&self) -> Arc<IngestCounters>;
+
+    /// Add `n` records' worth of `elapsed` to backfill job `job_id`'s stage
+    /// `stage`, beside the stages HappyView measures itself. A stage whose
+    /// name ends in `_skipped` is a count: its time is ignored, so work that
+    /// was skipped never drags the mean of the stage it skipped. The default
+    /// ignores it.
+    fn observe_job_stage(&self, _job_id: &str, _stage: &'static str, _elapsed: Duration, _n: u64) {}
+    /// `processed` of `total` done for `job_id`, in the job's own units,
+    /// which is what its ETA is reckoned from. The default ignores it.
+    fn note_job_progress(&self, _job_id: &str, _processed: i64, _total: Option<i64>) {}
+    /// `job_id`'s hook stats, when they changed since they were last handed
+    /// out here and a second has passed since then. A source publishes what
+    /// this answers to its job's event stream.
+    fn job_hook_stats_due(&self, _job_id: &str) -> Option<JobHookStats> {
+        None
+    }
+    /// `job_id`'s hook stats now, while the host holds them.
+    fn job_hook_stats(&self, _job_id: &str) -> Option<JobHookStats> {
+        None
+    }
+    /// `job_id`'s final hook stats, for a job that has ended: nothing is due
+    /// for it after this.
+    fn finish_job_hook_stats(&self, _job_id: &str) -> Option<JobHookStats> {
+        None
+    }
 }

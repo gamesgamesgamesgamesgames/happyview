@@ -394,9 +394,10 @@ pub async fn backfill_status(
         i64,
         i32,
         Option<String>,
+        Option<String>,
     )> =
         happyview_provider::db::query_as(&adapt_sql(
-            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed, note FROM happyview_backfill_jobs",
+            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed, note, hook_stats FROM happyview_backfill_jobs",
             backend,
         ))
         .fetch_all(&state.backfill_db)
@@ -413,12 +414,18 @@ pub async fn backfill_status(
             i64,
             i32,
             Option<String>,
+            Option<String>,
         ),
     > = replay_rows
         .into_iter()
-        .map(|(id, source, after, through, tip, bytes, failed, note)| {
-            (id, (source, after, through, tip, bytes, failed, note))
-        })
+        .map(
+            |(id, source, after, through, tip, bytes, failed, note, hook_stats)| {
+                (
+                    id,
+                    (source, after, through, tip, bytes, failed, note, hook_stats),
+                )
+            },
+        )
         .collect();
 
     let jobs: Vec<BackfillJob> = rows
@@ -442,9 +449,14 @@ pub async fn backfill_status(
                 queue_version,
                 discovery_complete,
             )| {
-                let (source, after, through, tip, bytes, failed, note) = replay
+                let (source, after, through, tip, bytes, failed, note, hook_stats) = replay
                     .remove(&id)
-                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None));
+                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None, None));
+                let hooks = state.host.job_hook_stats(&id);
+                // Written by this crate as JSON, so a row that does not parse
+                // was edited by hand and is left out rather than failing the
+                // listing.
+                let hook_stats = hook_stats.and_then(|raw| serde_json::from_str(&raw).ok());
                 // Only a replay (or an `auto` job yet to probe) has replay
                 // progress; a crawl and an executor's job have none.
                 let replay =
@@ -477,6 +489,8 @@ pub async fn backfill_status(
                     source,
                     note,
                     replay,
+                    hooks,
+                    hook_stats,
                 }
             },
         )
@@ -545,6 +559,7 @@ pub(crate) async fn backfill_events(
                         | crate::backfill::types::BackfillEvent::JobCompleted { job_id, .. }
                         | crate::backfill::types::BackfillEvent::JobNote { job_id, .. }
                         | crate::backfill::types::BackfillEvent::ReplayProgress { job_id, .. }
+                        | crate::backfill::types::BackfillEvent::HookStats { job_id, .. }
                         | crate::backfill::types::BackfillEvent::JobSnapshot { job_id, .. } => job_id,
                     };
                     if *event_job_id != job_id {

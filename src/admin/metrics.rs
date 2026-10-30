@@ -92,6 +92,25 @@ pub(super) async fn script(
     Ok(Json(body))
 }
 
+/// GET /admin/metrics/ingest — the record pipeline, by collection and action.
+pub(super) async fn ingest(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Query(query): Query<WindowQuery>,
+) -> Result<Json<Value>, AppError> {
+    auth.require(Permission::MetricsRead).await?;
+    let window = window_of(&query)?;
+    Ok(Json(json!({
+        "window": window.as_str(),
+        "enabled": state.metrics.enabled(),
+        "overflow": state.metrics.overflow(),
+        // Since boot, not in the window: how often a record hook's lookup
+        // missed the project and its batch and read the scripts table.
+        "scripts_table_reads": state.scripts.table_reads(),
+        "collections": state.metrics.ingest(window),
+    })))
+}
+
 /// GET /admin/metrics/live — what is running now.
 pub(super) async fn live(
     State(state): State<AppState>,
@@ -121,6 +140,7 @@ pub(super) async fn live(
         "enabled": state.metrics.enabled(),
         "active_runs": active,
         "jobs": { "pending": jobs("pending"), "running": jobs("running") },
+        "backfill_jobs": state.metrics.live_jobs(),
         "module_cache": {
             "hits": runtime.cache_hits(),
             "misses": runtime.cache_misses(),
