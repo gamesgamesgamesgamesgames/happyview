@@ -396,24 +396,7 @@ async fn a_delete_hook_that_keeps_the_record_is_honoured() {
         return;
     }
     let app = app().await;
-    app.state
-        .plugin_registry
-        .register(common::echo_interpreter::plugin("lua"))
-        .await;
-    app.state
-        .scripts
-        .put_manual(
-            &app.state.db,
-            app.state.db_backend,
-            happyview::catalog::ScriptWrite {
-                id: format!("record.delete:{GAME}"),
-                script_type: "lua".to_string(),
-                body: "value:none".to_string(),
-                description: None,
-            },
-        )
-        .await
-        .expect("install the delete hook");
+    keeping_delete_hook(&app).await;
     for rkey in ["g1", "g2"] {
         seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
     }
@@ -499,6 +482,14 @@ async fn an_empty_page_that_carries_a_cursor_fails_the_listing() {
         .respond_with(ResponseTemplate::new(200).set_body_json(page(ALICE, &[], Some("more"))))
         .mount(&app.mock_server)
         .await;
+    // Followed, the cursor ends the listing: only the empty page's own
+    // cursor says it was cut short.
+    Mock::given(method("GET"))
+        .and(path(list.clone()))
+        .and(query_param("cursor", "more"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(ALICE, &[], None)))
+        .mount(&app.mock_server)
+        .await;
     Mock::given(method("GET"))
         .and(path(list))
         .respond_with(ResponseTemplate::new(200).set_body_json(page(
@@ -512,13 +503,48 @@ async fn an_empty_page_that_carries_a_cursor_fails_the_listing() {
 
     let report = run(&app, &options(false)).await;
     assert_eq!(report.dids_skipped[0].reason, "listing_failed");
+    assert!(
+        report.dids_skipped[0].detail.contains("empty page"),
+        "{:?}",
+        report.dids_skipped
+    );
     assert_eq!(report.deleted, 0);
     assert!(stored(&app, ALICE, "g1").await);
 }
 
+/// A delete hook that keeps every record (the echo interpreter's
+/// `value:none`): a run that reaches it reports `kept_by_hook`.
+async fn keeping_delete_hook(app: &TestApp) {
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
+    app.state
+        .scripts
+        .put_manual(
+            &app.state.db,
+            app.state.db_backend,
+            happyview::catalog::ScriptWrite {
+                id: format!("record.delete:{GAME}"),
+                script_type: "lua".to_string(),
+                body: "value:none".to_string(),
+                description: None,
+            },
+        )
+        .await
+        .expect("install the delete hook");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_record_recreated_after_its_check_is_kept() {
+    if !common::echo_interpreter::is_built() {
+        eprintln!("skipping: {}", common::echo_interpreter::BUILD);
+        return;
+    }
     let app = app().await;
+    // Had it run, this hook would keep the record and say so; the recreated
+    // record must not reach it at all.
+    keeping_delete_hook(&app).await;
     for rkey in ["g1", "g2"] {
         seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
     }
@@ -543,10 +569,57 @@ async fn a_record_recreated_after_its_check_is_kept() {
     assert_eq!(report.deleted, 0);
     assert_eq!(report.changed_since_check, 1);
     assert_eq!(report.missing[0].outcome, "changed_since_check");
+    assert_eq!(report.kept_by_hook, 0, "the hook never ran");
     assert!(
         stored(&app, ALICE, "g1").await,
         "the recreated record stays"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_stops_a_listing_between_pages() {
+    let app = app().await;
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    let (status, created) = post(&app, json!({ "collection": GAME, "dry_run": false }), None).await;
+    assert_eq!(status, 202, "{created}");
+    let job_id = created["job_id"].as_str().expect("a job id").to_string();
+    let list = format!("{}/xrpc/com.atproto.repo.listRecords", pds(ALICE));
+    Mock::given(method("GET"))
+        .and(path(list.clone()))
+        .and(query_param("cursor", "next"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(ALICE, &[], None)))
+        .expect(0)
+        .mount(&app.mock_server)
+        .await;
+    // The operator pauses while the first page is being read.
+    Mock::given(method("GET"))
+        .and(path(list))
+        .respond_with(Meanwhile::new(
+            &app,
+            &format!("UPDATE happyview_jobs SET status = 'pausing' WHERE id = '{job_id}'"),
+            1,
+            ResponseTemplate::new(200).set_body_json(page(
+                ALICE,
+                &[("g2", "bafyg2")],
+                Some("next"),
+            )),
+        ))
+        .mount(&app.mock_server)
+        .await;
+    get_record(&app, ALICE, "g1", true).await;
+
+    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
+        .await
+        .expect("reconcile runs");
+    assert_eq!(report.stopped.as_deref(), Some("pausing"));
+    assert!(report.dids_skipped.is_empty(), "{:?}", report.dids_skipped);
+    assert_eq!(report.deleted, 0);
+    assert!(stored(&app, ALICE, "g1").await);
+    let job = app.get_json(&format!("/admin/jobs/{job_id}")).await;
+    assert_eq!(job["progress"]["report"]["stopped"], "pausing", "{job}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

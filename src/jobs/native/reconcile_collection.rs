@@ -317,8 +317,15 @@ async fn check(
             Ok(pds) => pds,
             Err(e) => return skip(report, "pds_unresolved", e.message),
         };
-    let listing = match list_records(state, pacer, &pds, did, collection).await {
+    let listing = match list_records(state, pacer, job_id, &pds, did, collection).await {
         Ok(listing) => listing,
+        Err(Unusable {
+            reason: STOPPED,
+            detail,
+        }) => {
+            report.stopped = Some(detail);
+            return;
+        }
         Err(Unusable { reason, detail }) => return skip(report, reason, detail),
     };
 
@@ -410,9 +417,14 @@ async fn delete(
     cid: &Option<String>,
     rev: &Option<String>,
 ) -> &'static str {
-    let body = match state.records.get(at).await {
-        Ok(Some(row)) => serde_json::from_str::<serde_json::Value>(&row.record).ok(),
-        Ok(None) => return "changed_since_check",
+    // A row recreated or removed since it was read is left before its hook
+    // runs, so the hook never acts on a record that stays. The compare in
+    // the delete's transaction is still what guards the delete itself.
+    let body = match state.records.network_row(did, collection, rkey).await {
+        Ok(Some((now_cid, now_rev, body))) if now_cid == *cid && now_rev == *rev => {
+            serde_json::from_str::<serde_json::Value>(&body).ok()
+        }
+        Ok(_) => return "changed_since_check",
         Err(e) => {
             tracing::warn!(uri = %at, error = %e, "reconcile could not read a record to delete");
             return "failed";
@@ -450,7 +462,7 @@ async fn delete(
     }
     let now = crate::db::now_rfc3339();
     let deleted = crate::db::with_change_reason(
-        Some("backfill".to_string()),
+        Some("reconcile".to_string()),
         crate::db::retry_on_busy(|| {
             state.records.delete_network_if_unchanged(
                 &state.db,
@@ -540,9 +552,14 @@ struct ListedRecord {
 
 /// Every record `did`'s PDS lists in `collection`: rkey to CID. Complete or
 /// an error, never partial.
+/// The [`Unusable::reason`] of a listing given up because the job was
+/// paused or cancelled; its detail is which.
+const STOPPED: &str = "stopped";
+
 async fn list_records(
     state: &AppState,
     pacer: &mut Pacer,
+    job_id: Option<&str>,
     pds: &str,
     did: &str,
     collection: &str,
@@ -552,6 +569,14 @@ async fn list_records(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     loop {
+        if let Some(id) = job_id
+            && let Some(reason) = jobs_db::should_stop(state, id).await
+        {
+            return Err(Unusable {
+                reason: STOPPED,
+                detail: reason.to_string(),
+            });
+        }
         let mut url = format!(
             "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
             urlencoding::encode(did),

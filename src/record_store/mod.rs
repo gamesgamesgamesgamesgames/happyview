@@ -1131,6 +1131,35 @@ impl RecordStore {
             .await
     }
 
+    /// The CID, rev and body of `did`'s network row at `rkey` in
+    /// `collection` in this instance's own tables, as
+    /// [`Self::network_keys_of`] reads them; `None` when there is none.
+    pub async fn network_row(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<(Option<String>, Option<String>, String)>, sqlx::Error> {
+        let body = match self.backend {
+            DatabaseBackend::Sqlite => "hv_record(r.body, r.body_dict)",
+            DatabaseBackend::Postgres => "r.record",
+        };
+        let sql = adapt_sql(
+            &format!(
+                "SELECT hv_cid_text(r.cid), r.rev, {body} FROM happyview_records_v2 r \
+                 WHERE r.did_id = {DID_ID} AND r.collection_id = {COLLECTION_ID} \
+                   AND r.rkey = ? AND r.indexed_at IS NOT NULL"
+            ),
+            self.backend,
+        );
+        crate::db::query_as::<(Option<String>, Option<String>, String)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&self.db)
+            .await
+    }
+
     /// [`Self::delete_network`] without a rev, but only while the stored row
     /// still has the CID and rev it had when `expected_cid` and
     /// `expected_rev` were read: a record recreated at the same key since
