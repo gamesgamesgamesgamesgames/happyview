@@ -16,8 +16,8 @@ use crate::auth::Claims;
 use crate::error::AppError;
 
 use happyview_plugin_sdk::wire::{
-    CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, RecordRef,
+    CallerAccount, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
+    CallerXrpcProcedure, CallerXrpcQuery, RecordRef,
 };
 
 use crate::plugin::caller::{CallerSession, check_writable_repo};
@@ -309,6 +309,75 @@ pub async fn upload_blob(
     )
     .await
     .map_err(pds_failure)
+}
+
+/// The caller's account as their PDS reports it. Only the DID, handle and
+/// email fields are passed on, so whatever else a PDS adds to `getSession`
+/// never reaches a plugin. A PDS that names a different account is refused
+/// rather than believed.
+pub async fn get_session(
+    caller: &CallerSession,
+    _spec: Value,
+) -> Result<CallerAccount, CallerError> {
+    let response = caller
+        .pds_auth
+        .get_with_headers(
+            &caller.app_state,
+            &caller.did,
+            "com.atproto.server.getSession",
+            "",
+            &[],
+        )
+        .await
+        .map_err(pds_failure)?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|e| CallerError::Pds {
+        status: 0,
+        body: e.to_string(),
+    })?;
+    if !status.is_success() {
+        return Err(CallerError::Pds {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        });
+    }
+    let body: Value = serde_json::from_slice(&bytes).map_err(|e| CallerError::Pds {
+        status: status.as_u16(),
+        body: format!("getSession answered with something that isn't JSON: {e}"),
+    })?;
+    account_from_session(&caller.did, &body)
+}
+
+/// The fields of a `getSession` body a plugin may see, checked against the
+/// account the session belongs to.
+fn account_from_session(did: &str, body: &Value) -> Result<CallerAccount, CallerError> {
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match text("did") {
+        Some(reported) if reported == did => {}
+        other => {
+            return Err(CallerError::Pds {
+                status: 200,
+                body: format!(
+                    "getSession named {} rather than the caller, {did}",
+                    other.as_deref().unwrap_or("no account")
+                ),
+            });
+        }
+    }
+    let email = text("email");
+    Ok(CallerAccount {
+        did: did.to_string(),
+        handle: text("handle"),
+        email_confirmed: email
+            .as_ref()
+            .and_then(|_| body.get("emailConfirmed").and_then(Value::as_bool)),
+        email,
+    })
 }
 
 /// Unlike every other `host_caller_*` import, this one runs with no
@@ -655,6 +724,49 @@ mod tests {
 
         assert_eq!(CallerError::Validation("bad".into()).code(), "BAD_INPUT");
         assert_eq!(CallerError::Other("boom".into()).code(), "HOST_ERROR");
+    }
+
+    /// Only the account fields pass, the email only with its address, and a
+    /// session naming another account is refused.
+    #[test]
+    fn a_session_is_trimmed_to_the_account_fields() {
+        let full = json!({
+            "did": "did:plc:me", "handle": "me.test", "email": "me@example.com",
+            "emailConfirmed": true, "emailAuthFactor": false, "active": true,
+            "didDoc": {"id": "did:plc:me"},
+        });
+        let account = account_from_session("did:plc:me", &full).unwrap();
+        assert_eq!(
+            serde_json::to_value(&account).unwrap(),
+            json!({"did": "did:plc:me", "handle": "me.test", "email": "me@example.com", "email_confirmed": true})
+        );
+
+        // No transition:email: the PDS leaves the address out.
+        let bare = account_from_session(
+            "did:plc:me",
+            &json!({"did": "did:plc:me", "handle": "me.test"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"did": "did:plc:me", "handle": "me.test"})
+        );
+        // A confirmation flag with no address means nothing.
+        let flag_only = account_from_session(
+            "did:plc:me",
+            &json!({"did": "did:plc:me", "email": "", "emailConfirmed": true}),
+        )
+        .unwrap();
+        assert_eq!(flag_only.email, None);
+        assert_eq!(flag_only.email_confirmed, None);
+
+        for body in [
+            json!({"did": "did:plc:other"}),
+            json!({"handle": "me.test"}),
+        ] {
+            let err = account_from_session("did:plc:me", &body).unwrap_err();
+            assert_eq!(err.code(), "PDS_ERROR", "{body}");
+        }
     }
 
     /// The refusal message reaches the guest verbatim, so it has to survive

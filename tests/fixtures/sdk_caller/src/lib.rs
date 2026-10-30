@@ -24,6 +24,7 @@ fn surface() -> ApiSurface {
             "delete_record",
             "upload_blob",
             "xrpc_query",
+            "get_session",
             "xrpc_procedure",
             "index_put",
             "index_delete",
@@ -57,6 +58,7 @@ fn dispatch(function: &str, args: &[Value], _ctx: &CallContext) -> Result<Value,
         }
         "upload_blob" => host::caller_upload_blob(&one::<CallerBlobUpload>(args)?),
         "xrpc_query" => host::caller_xrpc_query(&one::<CallerXrpcQuery>(args)?),
+        "get_session" => serde_json::to_value(host::caller_get_session()?).map_err(PluginError::from),
         "xrpc_procedure" => host::caller_xrpc_procedure(&one::<CallerXrpcProcedure>(args)?),
         "index_put" => serde_json::to_value(host::records_index_put(&one::<IndexPut>(args)?)?)
             .map_err(PluginError::from),

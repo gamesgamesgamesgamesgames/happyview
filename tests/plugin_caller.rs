@@ -358,6 +358,65 @@ async fn blob_upload_errors_carry_the_pds_status() {
     assert!(message.contains("413"), "{message}");
 }
 
+/// The caller's account comes from their own PDS's getSession, as them, and
+/// only the account fields reach the plugin.
+#[tokio::test]
+#[serial]
+async fn get_session_reads_the_callers_pds_account() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+
+    const DID: &str = "did:plc:sdkcallersession";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    // Ahead of the getSession mock `setup_dpop_session` mounted for session
+    // verification, which answers with the DID alone.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/pds/{DID}/xrpc/com.atproto.server.getSession"
+        )))
+        .and(header(
+            "authorization",
+            format!("DPoP {access_token}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": DID,
+            "handle": "session.test",
+            "email": "session@example.com",
+            "emailConfirmed": false,
+            "active": true,
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &call("get_session", json!({})),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "did": DID,
+            "handle": "session.test",
+            "email": "session@example.com",
+            "email_confirmed": false,
+        })
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn xrpc_query_reaches_a_local_handler() {

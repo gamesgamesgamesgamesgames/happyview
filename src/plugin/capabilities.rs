@@ -364,6 +364,10 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         any_of: &[PluginCapability::CallerRead],
     },
     Requirement {
+        import: "host_caller_get_session",
+        any_of: &[PluginCapability::CallerRead],
+    },
+    Requirement {
         import: "host_caller_create_record",
         any_of: &[PluginCapability::CallerWrite],
     },
@@ -832,6 +836,7 @@ mod tests {
             "host_caller_delete_record",
             "host_caller_upload_blob",
             "host_caller_xrpc_query",
+            "host_caller_get_session",
             "host_caller_xrpc_procedure",
             "host_blob_put",
             "host_blob_get",
@@ -921,6 +926,7 @@ mod tests {
     fn caller_imports_map_to_their_capability() {
         for (import, expected) in [
             ("host_caller_xrpc_query", PluginCapability::CallerRead),
+            ("host_caller_get_session", PluginCapability::CallerRead),
             ("host_caller_create_record", PluginCapability::CallerWrite),
             ("host_caller_put_record", PluginCapability::CallerWrite),
             ("host_caller_delete_record", PluginCapability::CallerWrite),

@@ -597,6 +597,7 @@ A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:wri
 | Import | Capability | Spec → result |
 | --------------------------- | ------------ | ------------------------------------------------------------------------------- |
 | `host_caller_xrpc_query`    | `caller:read`  | `{method, params?}` → the response body |
+| `host_caller_get_session`   | `caller:read`  | `{}` → `{did, handle?, email?, email_confirmed?}` from the caller's PDS `getSession`; `email` only when their session was granted `transition:email` |
 | `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate?}` → `{uri, cid}`; mirrored into the index |
 | `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate?}` → `{uri, cid}`; mirrored into the index |
 | `host_caller_delete_record` | `caller:write` | `{uri}` → nothing; removed from the index |
