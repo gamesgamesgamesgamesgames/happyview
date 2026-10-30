@@ -578,7 +578,14 @@ impl PluginRegistry {
         let candidate = PluginNode::from(&plugin);
         let installed = self.nodes().await;
         graph::validate_install(&installed, &candidate)?;
+        let id = plugin.info.id.clone();
         self.register(plugin).await;
+        // Compile now, off the request path, rather than on the first call.
+        if let Some(runtime) = &self.runtime
+            && let Some(plugin) = self.get(&id).await
+        {
+            runtime.warm(&plugin);
+        }
         Ok(())
     }
 
@@ -945,6 +952,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runtime.compile_count(), 3);
+    }
+
+    /// Installing a plugin compiles its module in the background, so the
+    /// first call finds it compiled rather than paying for the compile.
+    #[tokio::test]
+    async fn install_compiles_the_module_before_the_first_call() {
+        let runtime = Arc::new(
+            WasmRuntime::without_ticker()
+                .unwrap()
+                .without_shared_modules(),
+        );
+        let registry = PluginRegistry::new().with_runtime(runtime.clone());
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "namespace": "p", "capabilities": [],
+        }))
+        .unwrap();
+        registry
+            .install(LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: "p".into() },
+                wasm_bytes: wat::parse_str(r#"(module (func (export "f")))"#).unwrap(),
+                manifest: Some(manifest),
+            })
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while runtime.compile_count() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "install did not compile the module"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        runtime
+            .module_for(&registry.get("p").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(runtime.compile_count(), 1);
     }
 
     /// `enabled` is BOOLEAN on Postgres and INTEGER on SQLite, so the persist

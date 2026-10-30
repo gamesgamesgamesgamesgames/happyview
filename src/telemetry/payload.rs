@@ -17,6 +17,10 @@ pub struct LexiconReport {
     pub structures: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documents: Option<Vec<serde_json::Value>>,
+    /// Documents left out of `documents` to keep the report under the
+    /// collector's size limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents_omitted: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

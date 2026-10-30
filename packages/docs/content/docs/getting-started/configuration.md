@@ -67,6 +67,7 @@ HappyView is configured via environment variables. Serving with a plain `happyvi
 | `SUPERADMIN_DID` | no | --- | DID seeded as a super user at every boot, before the server accepts requests. Setting it turns off the first-sign-in admin bootstrap, even if seeding fails (restart to retry). A value that is not a valid DID refuses boot. Additive: other super users keep their role, and removing it later demotes nobody. A platform super-user transfer demotes the other super users, and the configured superadmin is promoted again at the next boot |
 | `HAPPYVIEW_PROJECT` | no | --- | Path to a project directory. Its `happyview.toml` is read at boot; see [Project file](#project-file-happyviewtoml). A path that does not exist stops boot |
 | `LOGO_URI` | no | --- | URL to application logo for OAuth screens. Overridden by database setting or logo upload |
+| `COOKIE_INTEGRATION_ORIGINS` | no | --- | Origins, separated by commas or whitespace, of integrations that call the instance from another site with the dashboard session cookie, such as `https://pentaract.example`. Without a listing, a cross-site request that carries the cookie and changes something is refused with `403`. See [Hardening](../guides/hardening.md#cross-site-requests-with-the-session-cookie). Overridden by database setting if set via admin API |
 | `TOS_URI` | no | --- | URL to terms of service. Overridden by database setting if set via admin API |
 | `POLICY_URI` | no | --- | URL to privacy policy. Overridden by database setting if set via admin API |
 

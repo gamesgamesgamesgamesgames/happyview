@@ -264,3 +264,116 @@ async fn boot_installs_the_default_plugins() {
     );
     assert!(state.plugin_registry.get("lua").await.is_some());
 }
+
+async fn boot_in(dir: &std::path::Path) -> AppState {
+    happyview::run::boot_for_test(
+        config(dir),
+        Providers {
+            source: Arc::new(Double::default()),
+            storage: None,
+        },
+    )
+    .await
+}
+
+/// Boot, and let the boot's promotion task finish its first pass, so a key
+/// staged afterwards is left to the next boot rather than to that task,
+/// which then sleeps for a minute.
+async fn boot_and_settle(dir: &std::path::Path) -> AppState {
+    let state = boot_in(dir).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    state
+}
+
+/// The kid of the instance key the boot built its clients around.
+fn booted_kid(state: &AppState) -> String {
+    serde_json::to_value(&state.client_jwks[0]).unwrap()["kid"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn stage_instance_key_due_at(state: &AppState, at: chrono::DateTime<chrono::Utc>) -> String {
+    let (staged, _) = happyview::oauth::client_keys::stage_key(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .unwrap();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET activates_at = ? WHERE kid = ?",
+        state.db_backend,
+    ))
+    .bind(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .bind(&staged.kid)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    staged.kid
+}
+
+async fn instance_key_status(
+    state: &AppState,
+    kid: &str,
+) -> Option<happyview::oauth::client_keys::KeyStatus> {
+    happyview::oauth::client_keys::list_keys_for_owner(
+        &state.db,
+        state.db_backend,
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|k| k.kid == kid)
+    .map(|k| k.status)
+}
+
+/// A staged key that came due while the instance was down takes over before
+/// the boot builds its clients, not a poll later.
+#[tokio::test]
+async fn boot_promotes_a_staged_key_that_came_due_while_it_was_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = boot_and_settle(dir.path()).await;
+    let old = booted_kid(&first);
+    let staged =
+        stage_instance_key_due_at(&first, chrono::Utc::now() - chrono::Duration::minutes(1)).await;
+
+    let second = boot_in(dir.path()).await;
+
+    assert_ne!(staged, old);
+    assert_eq!(
+        booted_kid(&second),
+        staged,
+        "the boot must build its clients around the key that is due"
+    );
+}
+
+/// The boot starts the task that promotes a staged key when it comes due.
+#[tokio::test]
+async fn boot_starts_promoting_staged_keys_as_they_come_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = boot_and_settle(dir.path()).await;
+    let old = booted_kid(&first);
+    let staged =
+        stage_instance_key_due_at(&first, chrono::Utc::now() + chrono::Duration::seconds(2)).await;
+
+    let second = boot_in(dir.path()).await;
+    assert_eq!(booted_kid(&second), old, "not due at boot");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while instance_key_status(&second, &staged).await
+        != Some(happyview::oauth::client_keys::KeyStatus::Current)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing promoted the staged key once it came due"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        instance_key_status(&second, &old).await,
+        Some(happyview::oauth::client_keys::KeyStatus::Retiring)
+    );
+}
