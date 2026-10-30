@@ -461,8 +461,12 @@ test.describe("OAuth instance key dashboard — list and revoke", () => {
       .locator("div.rounded-lg.border")
       .filter({ hasText: pending!.kid })
       .filter({ hasText: "Pending" });
-    await expect(pendingRow.getByText(/takes over at/i)).toBeVisible({
-      timeout: 10000,
-    });
+    // The key's own row, not the "last rotation" note above the list, which
+    // names the same kid.
+    await expect(pendingRow.getByText(/created .* takes over at/i)).toBeVisible(
+      {
+        timeout: 10000,
+      },
+    );
   });
 });
