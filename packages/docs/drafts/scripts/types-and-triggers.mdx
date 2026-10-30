@@ -19,7 +19,33 @@ A script is identified by its **trigger string**. The trigger is the script's `i
 | `labeler.apply:_actor` | A label arrives whose subject is a bare DID | The literal `_actor` |
 | `job.run:<type>` | A background job of type `<type>` is picked up by the worker | A job type |
 
-Any other prefix is refused when you save. The suffix can't be empty. A job type may not end in `.test`, because in a project `src/jobs/<type>.test.<ext>` is a test file.
+Any other prefix is refused. The suffix can't be empty. A job type may not end in `.test`, because in a project `src/jobs/<type>.test.<ext>` is a test file.
+
+## Name a script file
+
+In a project, you don't write the trigger. A script's path under `src/` decides it, and the file's extension decides its [language](./languages.mdx):
+
+| File | Trigger |
+| --- | --- |
+| `src/lexicons/<path>/<name>.<ext>`, next to a query lexicon `<name>.json` | `xrpc.query:<nsid>` |
+| `src/lexicons/<path>/<name>.<ext>`, next to a procedure lexicon `<name>.json` | `xrpc.procedure:<nsid>` |
+| `src/lexicons/<path>/<name>.index.<ext>`, next to a record lexicon `<name>.json` | `record.index:<nsid>` |
+| `src/lexicons/<path>/<name>.create.<ext>`, `.update.<ext>` or `.delete.<ext>` | `record.create:<nsid>`, `record.update:<nsid>` or `record.delete:<nsid>` |
+| `src/labels/<nsid>.<ext>` | `labeler.apply:<nsid>` |
+| `src/labels/_actor.<ext>` | `labeler.apply:_actor` |
+| `src/jobs/<type>.<ext>` | `job.run:<type>` |
+
+For example, `src/lexicons/xyz/statusphere/status.create.lua` next to `status.json` is the script for `record.create:xyz.statusphere.status`.
+
+A file that names a trigger it can't have fails the build, with a message saying why:
+
+- A record script needs a record lexicon next to it. `status.create.lua` with no `status.json`, or next to a query lexicon, is an error.
+- A record lexicon has four triggers, so a bare `status.lua` next to a record lexicon is an error that asks you to name the action.
+- A definitions or space lexicon runs no script, so a file named after one is an error.
+- `src/jobs/` and `src/labels/` are flat: a file in a subdirectory is an error. A name the trigger grammar refuses, such as `src/jobs/Nightly.lua`, is an error too.
+- A script in an extension no installed interpreter claims is an error that lists the extensions that are claimed.
+
+`*.test.<ext>` is a test file wherever it sits. Any other file with a claimed extension is a module that scripts can import. A `.md`, `.markdown` or `.txt` file where a script would go is ignored, so a README can sit next to the code it describes.
 
 ## Record triggers fall back to `record.index`
 
@@ -79,7 +105,13 @@ Record and label scripts fail open so a broken script can't stop indexing. They 
 
 ## Create a script
 
-From the dashboard, open **Scripts** and click **New script**. Pick the trigger, the target, and, if more than one interpreter is installed, the [language](./languages.mdx#pick-a-language-in-the-dashboard).
+### In a project
+
+Create the file at the path for its trigger, as in [Name a script file](#name-a-script-file). `hpy happyview dev` picks it up when you save it, and `hpy happyview deploy` sends it to an instance.
+
+### From the dashboard
+
+Open **Integrations > Scripts** and click **New script**. Pick the trigger, the target, and, if more than one interpreter is installed, the [language](./languages.mdx#pick-a-language-in-the-dashboard). Then click **Create script**.
 
 With the admin API, `POST /admin/scripts` with the trigger as `id`:
 

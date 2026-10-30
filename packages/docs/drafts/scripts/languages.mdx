@@ -5,7 +5,7 @@ description: Install the Lua, JavaScript and TypeScript interpreter plugins, pic
 
 # Languages
 
-Each language is an interpreter plugin. Install the ones you want to write scripts in. You can install all three at once.
+Each language is an interpreter plugin. Add the ones you want to write scripts in. You can use all three in one project.
 
 | Language | `script_type` | Plugin | File extensions |
 | --- | --- | --- | --- |
@@ -13,23 +13,42 @@ Each language is an interpreter plugin. Install the ones you want to write scrip
 | JavaScript | `javascript` | `happyview-javascript` | `.js`, `.mjs` |
 | TypeScript | `typescript` | `happyview-typescript` | `.ts`, `.mts` |
 
+## Choose a language in a project
+
+In a project, a script's file extension picks its language. `src/jobs/export.lua` runs in Lua, and `src/jobs/export.ts` runs in TypeScript. Where the file sits picks its trigger; see [Name a script file](./types-and-triggers.mdx#name-a-script-file). Scripts in different languages can sit side by side.
+
+- An extension counts only when an installed interpreter claims it. A script whose extension none claims fails the build, and the error lists the extensions that are claimed.
+- Extensions match exactly. `format.LUA` is ignored, with a warning that tells you to rename it to `.lua`.
+- Elsewhere under `src/`, a file with a claimed extension is a module that scripts can import, and a file with any other extension is ignored.
+
 ## Which interpreter a new instance has
 
 A self-hosted instance starts with no interpreter. HappyView does not bundle one, so a self-hosted instance can't save or run a script until you install one.
 
-Hosts can preinstall interpreters with [`HAPPYVIEW_DEFAULT_PLUGINS`](#on-first-boot). The plugins it names are installed in the background on the first boot whose variable lists them, so they may take a moment to appear. On HappyProto, Lua is preinstalled this way.
+Hosts can preinstall interpreters with [`HAPPYVIEW_DEFAULT_PLUGINS`](#on-first-boot). The plugins it names are installed in the background on the first boot whose variable lists them, so they may take a moment to appear.
 
-Lua is also the default language in two places:
+Lua is also the default language in three places:
 
+- `hpy happyview create` preselects Lua when it asks which interpreters to add.
 - The admin API stores a script as `lua` when a create request leaves `script_type` out.
 - The dashboard starts a new script in Lua when the Lua interpreter is installed.
 
 ## Install an interpreter
 
+### In a project
+
+`hpy happyview create` asks which interpreters to add, with Lua preselected, or takes them from `--interpreter`. It needs at least one: without an interpreter, no script can run. To add one later, name its language:
+
+```sh
+hpy happyview add typescript
+```
+
+This adds it under `[interpreters]` in `happyview.toml` and to `happyview.lock`. Restart `hpy happyview dev` to load it. `hpy happyview deploy` installs the locked version on an instance. See [Plugins and libraries](../getting-started/plugins-and-libraries.mdx).
+
 ### From the dashboard
 
-1. Open **Plugins** in the dashboard and click **Add plugin**.
-2. Pick `happyview-lua`, `happyview-javascript` or `happyview-typescript` from the catalog.
+1. Open **Integrations > Plugins** in the dashboard and click **Add plugin**.
+2. Pick `happyview-lua`, `happyview-javascript` or `happyview-typescript` from the registry.
 3. Choose a **Channel**. The dashboard selects `latest` when the project publishes it, and otherwise the first channel the project has. While v3 is in alpha, the interpreters are published on the `alpha` channel only, so that is the channel to pick.
 4. Review the capabilities the plugin asks for, then install it.
 
@@ -54,7 +73,7 @@ curl "http://127.0.0.1:3000/admin/scripts/languages" -H "$AUTH"
 
 ## Pick a language in the dashboard
 
-When you create a script from **Scripts > New script**, the form shows a **Language** picker if more than one interpreter is installed. With only one installed, there is nothing to pick and the form uses that language.
+When you create a script in the dashboard, from **Integrations > Scripts** and then **New script**, the form shows a **Language** picker if more than one interpreter is installed. With only one installed, there is nothing to pick and the form uses that language.
 
 - The picker lists only installed languages.
 - A new script starts in Lua when Lua is installed, and otherwise in the first installed language.

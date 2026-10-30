@@ -1,6 +1,6 @@
 ---
 title: Plugins and libraries
-description: Install the interpreter your scripts run in and the libraries they load, and read the capabilities each one asks for.
+description: Add the interpreters your scripts run in and the libraries they load to your project, and read the capabilities each one asks for.
 type: how-to
 prerequisites:
   - /docs/getting-started/scripts
@@ -8,60 +8,100 @@ prerequisites:
 ---
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-This page shows you how to install the plugins your scripts need, load a library from a script, and decide what each plugin is allowed to do.
+This page shows you how to add the plugins your scripts need to your project, load a library from a script, and decide what each plugin is allowed to do.
 
-You'll install an interpreter and a library from the registry, use the library in a query, and read the capabilities on the consent screen. The examples use the `happyview.db` library and the `xyz.statusphere.status` collection.
+You'll add a library with `hpy happyview add`, see what it writes to `happyview.toml` and `happyview.lock`, use the library in a query script, and read the capabilities it asks for. The examples use the `happyview.db` library and the `xyz.statusphere.status` collection.
 
 ## Interpreters and libraries
 
 HappyView runs your scripts inside WebAssembly plugins. Two kinds matter for scripts:
 
-- An **interpreter** runs scripts in one language. The official ones are `happyview-lua`, `happyview-javascript` and `happyview-typescript`. A script's language is whichever interpreter runs it.
+- An **interpreter** runs scripts in one language. The official ones are `happyview-lua`, `happyview-javascript` and `happyview-typescript`. A script's language is whichever interpreter claims its file extension.
 - A **library** gives scripts a set of functions under a `happyview.*` name, such as `happyview.db` for reading indexed records or `happyview.jobs` for queuing background jobs. A script loads a library with `require` in Lua or `import` in JavaScript and TypeScript.
 
-HappyView itself ships with no interpreter and no library. Everything a script can reach beyond the built-in `internal.*` modules comes from a library you install.
+HappyView itself ships with no interpreter and no library. Everything a script can reach beyond the built-in `internal.*` modules comes from a library your project adds.
 
 :::note[Self-hosted instances start with no interpreter]
-A self-hosted instance has no interpreter until you install one. At boot it logs a warning: "no interpreter plugin is installed, so no script can be saved or run". Saving a script is refused until an interpreter for its language is installed. HappyProto-managed instances have Lua preinstalled.
+A self-hosted instance has no interpreter until one is installed. At boot it logs a warning: "no interpreter plugin is installed, so no script can be saved or run". An operator can preinstall plugins with `HAPPYVIEW_DEFAULT_PLUGINS`: the plugins it names are installed on the first boot whose variable lists them.
 :::
 
-## Install from the registry
+## Add a plugin to your project
 
-HappyView reads its plugins from the HappyProto registry. The official plugins are published there under `did:plc:mo7vq4jbioxwafy5zkcc3eux`. The registry list refreshes every 15 minutes.
-
-Each plugin publishes up to three channels: `latest`, `beta` and `alpha`. HappyView v3 is in alpha, so install from the `alpha` channel for now.
-
-1. Open **Plugins** in the dashboard, under **Integrations**, and click **Add plugin**.
-2. Pick a plugin from the registry, for example **Lua**.
-3. Set **Channel** to `alpha`. The picker starts on `latest` when the plugin publishes one.
-4. Open the **Permissions** tab and read what the plugin asks for. See [Capabilities](#capabilities) below.
-5. Click **Install**.
-
-The plugin loads straight away. You don't need to restart HappyView. Repeat for each library your scripts use, such as **Records** (`happyview-db`) for the example below, or **Jobs** (`happyview-jobs`) for [background jobs](/docs/getting-started/background-jobs).
-
-An installed plugin follows its channel. When the channel moves to a new version, the dashboard offers you the update. **Switch channel** moves a plugin to another channel and follows that one from then on.
-
-You can also install with the admin API. Name the registry project and the channel, and list the capabilities you accept:
+`hpy happyview create` already added the interpreters you chose, Lua by default. To add a library, or another interpreter, run `hpy happyview add` from the project root with the library's name or the interpreter's language:
 
 ```sh
-curl -X POST "http://127.0.0.1:3000/admin/plugins" \
-  -H "$AUTH" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "registry": {
-      "did": "did:plc:mo7vq4jbioxwafy5zkcc3eux",
-      "name": "happyview-db",
-      "channel": "alpha"
-    },
-    "accepted_capabilities": ["records:read"]
-  }'
+hpy happyview add happyview.db          # a library, by its namespace
+hpy happyview add happyview-db          # the same library, by its project name
+hpy happyview add javascript            # an interpreter, by its language
 ```
 
-Installing needs the `plugins:create` permission. If the plugin would be granted a capability missing from `accepted_capabilities`, the request fails with `capability consent missing`. For installs from a URL, the file system or environment variables, see [Plugins](/docs/guides/plugins).
+hpy looks the name up in the registry and works out whether it's an interpreter or a library. If a name is both, pass `--interpreter` or `--library`. If several registry projects answer to one name, hpy asks which one you mean, or you can name it with `--project`.
+
+Each plugin publishes up to three channels: `latest`, `beta` and `alpha`. With no option, hpy follows `latest`, or the first of `beta` and `alpha` the plugin publishes if it has no `latest`. To choose:
+
+```sh
+hpy happyview add happyview.db --channel alpha    # follow a channel: latest, beta or alpha
+hpy happyview add happyview.db --version 1.2.0    # pin one exact version
+```
+
+`--channel` accepts only `latest`, `beta` and `alpha`. You can't pass both `--channel` and `--version`.
+
+### What it writes
+
+`add` writes an entry to `happyview.toml`. Interpreters go under `[interpreters]`, keyed by language. Libraries go under `[libraries]`, keyed by namespace:
+
+```toml
+[interpreters]
+lua = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-lua", channel = "alpha" }
+
+[libraries]
+"happyview.db" = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-db", channel = "alpha" }
+```
+
+Each entry names the registry project by its publisher's DID and its name, and follows either a `channel` or one exact `version`.
+
+`add` then resolves every entry to an exact version, downloads each plugin, and writes `happyview.lock`. The lock pins the version and the CIDs that the downloaded files must match. Commit it, and don't edit it by hand:
+
+```toml
+# Written by hpy from happyview.toml. Commit it; don't edit it by hand.
+
+version = 2
+
+[happyview]
+version = "3.0.0"
+
+[[plugin]]
+id = "happyview-db"
+kind = "library"
+keys = ["happyview.db"]
+project = "at://did:plc:mo7vq4jbioxwafy5zkcc3eux/software.release.project/happyview-db"
+version = "1.2.0"
+channel = "alpha"
+version_uri = "at://did:plc:mo7vq4jbioxwafy5zkcc3eux/software.release.version/happyview-db.1.2.0"
+# manifest_cid, package_cid and manifest_blob_cid follow
+dependencies = []
+```
+
+A channel moving on to a newer version doesn't change the lock. Your project keeps the locked version until you run `hpy happyview add` for that plugin again. Run `hpy happyview add` with no plugin names to bring the lock up to date with `happyview.toml` and download it.
+
+If anything fails, such as a name the registry doesn't know or a download that doesn't match, `add` changes neither file.
+
+### Restart `hpy happyview dev`
+
+`hpy happyview dev` puts the locked plugins in place before it starts HappyView. A running `dev` doesn't watch the plugins directory, so stop it and start it again after `add`.
+
+## Deploy the locked versions
+
+`hpy happyview deploy` makes an instance match your project. Plugins come first: it installs each plugin in `happyview.lock` at its locked version, or moves an installed one to that version. Then it sends your lexicons, scripts and modules. Sign in to the instance first with `hpy happyview login`.
+
+- A deploy installs exactly what the lock pins. If `happyview.lock` doesn't match `happyview.toml`, the deploy is refused and tells you to run `hpy happyview add`.
+- It lists the plugin steps, such as `install happyview-db 1.2.0`, and asks before it changes anything. `--yes` skips the question. `--dry-run` shows the changes without making them.
+- A plugin installed on the instance but missing from the lock is kept. Pass `--prune-plugins` to uninstall it.
+- The account you deploy with needs the `plugins:create` permission to install plugins.
 
 ## Use a library in a script
 
-Once `happyview-db` is installed, any script can load `happyview.db`. This query lists one account's statuses, newest first:
+Once `happyview.db` is in your project, any script can load it. This query script lists one account's statuses, newest first:
 
 <Tabs syncKey="lang">
 <TabItem label="Lua">
@@ -132,7 +172,7 @@ export default async function handle(input: Params) {
 
 `require` looks for a built-in `internal.*` module first, then for an installed library with that name. In JavaScript and TypeScript, every library call returns a promise, so `await` it. In Lua, a library call returns its result directly.
 
-If the library isn't installed, the script fails when it runs, with an error such as `module 'happyview.db' not found -- is the 'happyview.db' library plugin installed?`. Saving the script doesn't catch this, so install the library before you rely on it.
+If the library isn't installed, the script fails when it runs, with an error such as `module 'happyview.db' not found -- is the 'happyview.db' library plugin installed?`. The build doesn't check library names, so `hpy happyview check` won't catch this. Add the library before you rely on it.
 
 ### Handle a library error
 
@@ -192,8 +232,6 @@ The full list of libraries, with what each one does, is in [Libraries](/docs/ref
 
 Every plugin declares the capabilities it needs, and HappyView grants it exactly those and nothing more. A capability is a group of things the plugin may do through HappyView, such as `records:read` to look up indexed records or `database:write` to run any SQL.
 
-The **Permissions** tab on the install screen is the consent screen. It lists each capability with its risk level (**Low risk**, **Medium risk**, **High risk** or **Critical**) and a sentence that says what it allows. The riskiest are listed first. Clicking **Install** grants what is shown there.
-
 Some examples from the official plugins:
 
 | Plugin | Capabilities |
@@ -204,11 +242,21 @@ Some examples from the official plugins:
 | `happyview-jobs` | `jobs:create`, `jobs:read`, `jobs:read_any` |
 | `happyview-http` | `network:request:unrestricted` |
 
-A library's capabilities bound what every script can do through it. With `happyview-sql` installed, any script can run any SQL statement. With `happyview-http`, any script can call any host. Install only the libraries your scripts use.
+A library's capabilities bound what every script can do through it. With `happyview-sql` installed, any script can run any SQL statement. With `happyview-http`, any script can call any host. Add only the libraries your scripts use.
 
 An interpreter's `library:call` lets scripts call installed libraries. Each library runs with its own capabilities, not the interpreter's.
 
-When an update or a channel switch asks for a capability the installed version doesn't have, the dashboard shows **This version asks for new permissions**. Check **Allow these permissions** to go ahead. If you don't, the installed version keeps running.
+### Consent is the operator's call
+
+Whoever installs a plugin on an instance agrees to the capabilities it asks for. How that happens depends on the way it's installed:
+
+- **`hpy happyview deploy`** doesn't list capabilities, and the instance grants each plugin every capability its manifest declares. Adding a plugin to `happyview.lock` is where you agree to them, so read them before you add it.
+- **The dashboard** shows them on the install screen's **Permissions** tab, with a risk level for each (**Low risk**, **Medium risk**, **High risk** or **Critical**) and a sentence that says what it allows. Installing grants what is shown there. When an update or a channel switch asks for a capability the installed version doesn't have, the dashboard shows **This version asks for new permissions**. Check **Allow these permissions** to go ahead. If you don't, the installed version keeps running.
+- **`HAPPYVIEW_DEFAULT_PLUGINS`**: naming a plugin there consents to every capability its manifest declares.
+
+:::note[What's installed on an instance]
+**Integrations > Plugins** in the dashboard lists the plugins an instance has, with each one's capabilities on its **Permissions** tab. An operator can also install a plugin there, or with `POST /admin/plugins`, on a deployed instance, and it loads without a restart. A plugin installed that way isn't in your project, so the next deploy keeps it but doesn't manage it. See [Plugins](/docs/guides/plugins).
+:::
 
 ### Capabilities don't replace a caller
 
@@ -223,7 +271,9 @@ The same holds for an anonymous request to a query. Record scripts act as the re
 ## Next steps
 
 - [Authentication](/docs/getting-started/authentication): sign users in, so scripts have a caller
-- [Plugins](/docs/guides/plugins): channels, updates, and installing from a URL or the file system
+- [Deploying](/docs/getting-started/deploying): put your project, and its locked plugins, on an instance
+- [The CLI](/docs/reference/cli): every `hpy happyview` command and option
 - [Libraries](/docs/reference/scripts/libraries): every library and the capabilities it asks for
+- [Plugins](/docs/guides/plugins): channels, updates, and installing from a URL or the file system
 - [Plugins admin API](/docs/reference/admin/plugins)
 - [Developing plugins](/docs/guides/developing-plugins): build your own library
