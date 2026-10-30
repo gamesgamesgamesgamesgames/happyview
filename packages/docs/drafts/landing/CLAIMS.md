@@ -63,8 +63,9 @@ rather than "the next request".
 
 ## Before this ships
 
-- **CTA hrefs** (`/getting-started/`, `/guides/`, `/getting-started/deployment/`)
-  are guesses at the new site's routes. happyview-76 owns the structure.
+- **Hrefs** follow happyview-76's routes: "Get started" →
+  `/docs/getting-started/installation`, self-host → `/docs/guides/self-hosting/docker`.
+  The tiles' other `/docs/getting-started/*` pages are guesses at P2's pages.
 - **Installing hpy and `hpy happyview create`** aren't in alpha's docs; the new
   docs site (happyproto/happyview-docs) covers both. Point "Start a project"
   there.
@@ -75,9 +76,10 @@ rather than "the next request".
 
 ## Found while checking (not fixed here)
 
-- **A query's lexicon constraints aren't enforced on its parameters.**
-  `com.example.hello` declares `name` with `maxLength: 64`. A 65-character
-  `name` answers `200` over HTTP, and `test.query` with the same input answers
-  `200` too. `guides/testing.md` says "Lexicon validation, parameter parsing
-  and auth checks all apply" to `query` and `procedure`. Either the guide or
-  the router is wrong. The landing copy doesn't claim request validation.
+- **A query's lexicon constraints weren't enforced on its parameters.**
+  `com.example.hello` declares `name` with `maxLength: 64`; on alpha.42 a
+  65-character `name` answers `200`, over HTTP and through `test.query`. Fixed
+  in happyview#276 (HAP-289), which refuses such calls with `400
+  InvalidRequest`. Once it merges, `guides/testing.md`'s "Lexicon validation
+  … all apply" is true. The landing copy doesn't claim request validation
+  either way.
