@@ -33,6 +33,17 @@ on:
         default: false
   delete:
 
+# A newer push to a pull request cancels the run it supersedes. Every other
+# event is keyed by its event, ref and commit and never cancels, so a push to
+# main, beta or alpha always runs to the end, release jobs included. The ref is
+# in the key because one commit can reach two branches (a fast-forward), and a
+# group holds only one pending run: a third arrival would cancel the second.
+# For `delete`, `github.event.ref` is the deleted branch, which keeps
+# several deletions apart.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}-{2}', github.event_name, github.event.ref || github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SQLX_OFFLINE: true
 
