@@ -2,6 +2,7 @@ pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
+pub(crate) mod validate;
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
@@ -560,6 +561,7 @@ pub async fn xrpc_get(
 
     if let Some(ref param_schema) = lexicon.parameters {
         coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
     }
 
     let mut response =
@@ -751,6 +753,7 @@ pub async fn xrpc_post(
 
     if let Some(ref param_schema) = lexicon.parameters {
         coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
     }
 
     // For service auth, synthesise Claims from the caller's DID so the
@@ -774,7 +777,9 @@ pub async fn xrpc_post(
     let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
         ingest_body(&state, &parts, &lexicon, &raw_body).await?
     } else {
-        json_body(&parts, &raw_body)?
+        let body = json_body(&parts, &raw_body)?;
+        validate::input(&state, &lexicon, &body).await?;
+        body
     };
 
     let mut response =
