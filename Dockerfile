@@ -7,7 +7,7 @@ COPY web/ .
 ENV NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__
 RUN npm run build
 
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /app
 
@@ -57,6 +57,7 @@ RUN cargo build --release
 
 FROM scratch AS binary
 COPY --from=builder /app/target/release/happyview /target/release/happyview
+COPY --from=builder /app/target/release/happyview-codemod /target/release/happyview-codemod
 
 FROM debian:bookworm-slim
 
@@ -75,7 +76,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/happyview /usr/local/bin/happyview
-RUN chmod +x /usr/local/bin/happyview
+# The v2-to-v3 script rewrite, for `docker run <image> happyview-codemod ...` or
+# `docker exec` into a running container (see entrypoint.sh).
+COPY --from=builder /app/target/release/happyview-codemod /usr/local/bin/happyview-codemod
+# CI hands these in as downloaded artifacts, which keep no file modes.
+RUN chmod +x /usr/local/bin/happyview /usr/local/bin/happyview-codemod
 COPY --from=frontend /app/web/out /srv/static
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && touch /srv/static/.base-path-pending

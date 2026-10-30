@@ -68,5 +68,9 @@ pub struct ResourceUsage {
 pub const MAX_HTTP_REQUESTS: u32 = 100;
 pub const MAX_HTTP_RESPONSE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 pub const MAX_HTTP_TOTAL_TRANSFER: u64 = 500 * 1024 * 1024; // 500 MB
+/// How long one request may take, from connecting to the end of its body. A
+/// job has no other time limit, so without this a server that trickles bytes
+/// holds it for as long as it likes.
+pub const MAX_HTTP_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_secs(120);
 pub const MAX_HTTP_CONCURRENT: usize = 5;
 pub const MAX_KV_SIZE_PER_USER: u64 = 1024 * 1024; // 1 MB

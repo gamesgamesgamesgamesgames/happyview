@@ -43,7 +43,7 @@ fn form_post(
 }
 
 async fn status(app: &TestApp, req: Request<Body>) -> StatusCode {
-    app.router.clone().oneshot(req).await.unwrap().status()
+    app.unmarked_router().oneshot(req).await.unwrap().status()
 }
 
 async fn put_setting(app: &TestApp, key: &str, value: &str) -> StatusCode {

@@ -38,7 +38,22 @@ pub(super) async fn upload_lexicon(
     // Before any other validation, so a project-owned id is always a 409.
     state.lexicons.check_writable(&id)?;
 
-    crate::lexicon::check_document(&body.lexicon_json).map_err(AppError::BadRequest)?;
+    // Per field rather than one sentence: an editor can point at each place
+    // the document is wrong, and warnings ride along with the errors so one
+    // answer says everything. Same rule set the project build uses.
+    let issues = crate::lexicon::validate::validate(&body.lexicon_json);
+    if issues
+        .iter()
+        .any(|i| i.severity == crate::lexicon::validate::Severity::Error)
+    {
+        return Err(AppError::InvalidLexicon(issues));
+    }
+    // A warning does not refuse the upload, but it still has to reach the
+    // caller: a `subscription` lexicon is valid, stores, and generates
+    // nothing, and succeeding in silence is what makes that read as support.
+    // Carried on the success response, since there is no error to attach it
+    // to.
+    let warnings = issues;
 
     // Validate action
     let action =
@@ -134,6 +149,7 @@ pub(super) async fn upload_lexicon(
             "id": id,
             "revision": revision,
             "backfill_job_id": backfill_job_id,
+            "issues": warnings,
         })),
     ))
 }

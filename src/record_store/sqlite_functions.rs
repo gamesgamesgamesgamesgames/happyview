@@ -78,7 +78,7 @@ unsafe extern "C" fn init(
     if rc != ffi::SQLITE_OK {
         return rc;
     }
-    let functions: [(&CStr, c_int, c_int, ScalarFn); 6] = [
+    let functions: [(&CStr, c_int, c_int, ScalarFn); 7] = [
         (c"hv_cid_text", 1, PURE, hv_cid_text),
         (c"hv_cid_bytes", 1, PURE, hv_cid_bytes),
         (c"hv_ts_text", 1, PURE, hv_ts_text),
@@ -89,6 +89,13 @@ unsafe extern "C" fn init(
             0,
             ffi::SQLITE_UTF8 | ffi::SQLITE_INNOCUOUS,
             hv_now_micros,
+        ),
+        // Reads the database, so not deterministic.
+        (
+            c"hv_collection_id",
+            1,
+            ffi::SQLITE_UTF8 | ffi::SQLITE_INNOCUOUS,
+            hv_collection_id,
         ),
     ];
     for (name, args, flags, function) in functions {
@@ -284,6 +291,63 @@ unsafe fn load_dict(db: *mut ffi::sqlite3, id: i64) -> Result<Vec<u8>, Fail> {
         };
         ffi::sqlite3_finalize(stmt);
         out
+    }
+}
+
+/// The id of collection `nsid`, read on the connection running the query.
+unsafe fn collection_id(db: *mut ffi::sqlite3, nsid: &str) -> Result<Option<i64>, Fail> {
+    // SAFETY: as for `load_dict`; the bound text is copied by SQLite
+    // (`SQLITE_TRANSIENT`), and the statement is finalized on every path.
+    unsafe {
+        let mut stmt = std::ptr::null_mut();
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            c"SELECT id FROM happyview_collections WHERE nsid = ?1".as_ptr(),
+            -1,
+            &mut stmt,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(
+                format!("hv_collection_id: cannot read the collections (error {rc})").into(),
+            );
+        }
+        let Ok(len) = c_int::try_from(nsid.len()) else {
+            ffi::sqlite3_finalize(stmt);
+            return Err(Fail::NoMem);
+        };
+        ffi::sqlite3_bind_text(
+            stmt,
+            1,
+            nsid.as_ptr().cast::<c_char>(),
+            len,
+            ffi::SQLITE_TRANSIENT(),
+        );
+        let out = match ffi::sqlite3_step(stmt) {
+            ffi::SQLITE_ROW => Ok(Some(ffi::sqlite3_column_int64(stmt, 0))),
+            ffi::SQLITE_DONE => Ok(None),
+            rc => Err(format!("hv_collection_id: cannot read the collections (error {rc})").into()),
+        };
+        ffi::sqlite3_finalize(stmt);
+        out
+    }
+}
+
+/// `hv_collection_id(nsid)`: the collection's id, or NULL when the database
+/// has no such collection. The Postgres function of the same name answers
+/// the same.
+unsafe extern "C" fn hv_collection_id(
+    ctx: *mut ffi::sqlite3_context,
+    _argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    unsafe {
+        let value = arg(argv, 0).map(|v| text(v));
+        let db = ffi::sqlite3_context_db_handle(ctx);
+        finish(ctx, || match value {
+            None => Ok(Out::Null),
+            Some(nsid) => Ok(collection_id(db, nsid?)?.map_or(Out::Null, Out::Int)),
+        })
     }
 }
 

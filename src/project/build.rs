@@ -26,6 +26,9 @@ pub use super::diagnostic::{Diagnostic, Severity};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuildOptions {
     pub include_tests: bool,
+    /// Whether a lexicon's spec violations stop this build. Defaults to
+    /// `Strict`, so only the one caller that must not fail — boot — opts out.
+    pub lexicons: super::lexicons::Leniency,
 }
 
 pub struct BuildReport {
@@ -102,7 +105,7 @@ pub async fn build_snapshot_with(
     let mut index = LexiconIndex::default();
     for file in lexicon_paths {
         lexicon_files.insert(lexicons::expected_id(file));
-        match lexicons::load_lexicon(file, &config.lexicons) {
+        match lexicons::load_lexicon(file, &config.lexicons, opts.lexicons, &mut diagnostics) {
             Ok(lexicon) => {
                 index.insert(
                     file.dir(),
@@ -680,6 +683,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await
@@ -893,6 +897,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await
@@ -1118,6 +1123,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await

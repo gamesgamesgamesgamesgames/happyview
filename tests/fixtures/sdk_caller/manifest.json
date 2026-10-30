@@ -5,7 +5,7 @@
   "api_version": "2",
   "plugin_type": "library",
   "namespace": "caller",
-  "capabilities": ["caller:read", "caller:write", "caller:call", "records:read", "records:write"],
+  "capabilities": ["caller:read", "caller:email", "caller:write", "caller:call", "records:read", "records:write"],
   "allowed_hosts": [],
   "dependencies": [],
   "wasm_file": "target/wasm32-unknown-unknown/release/sdk_caller.wasm"

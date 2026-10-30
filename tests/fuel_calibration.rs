@@ -40,9 +40,9 @@ const MODULE: &str = "tests/fixtures/script_module/target/wasm32-wasip1/release/
 macro_rules! require_module {
     () => {
         if !std::path::Path::new(MODULE).exists() {
-            eprintln!(
-                "skipping: fixture not built. Run: cargo build --manifest-path \
-                 tests/fixtures/script_module/Cargo.toml --target wasm32-wasip1 --release"
+            happyview::test_support::unavailable(
+                "script_module fixture not built. Run: cargo build --manifest-path \
+                 tests/fixtures/script_module/Cargo.toml --target wasm32-wasip1 --release",
             );
             return;
         }
