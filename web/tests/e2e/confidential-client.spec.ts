@@ -48,9 +48,22 @@ test.describe("Confidential OAuth client (domain)", () => {
 
     expect(domainMetadata.token_endpoint_auth_method).toBe("private_key_jwt");
     expect(domainMetadata.token_endpoint_auth_signing_alg).toBe("ES256");
-    expect(Array.isArray(domainMetadata.jwks?.keys)).toBe(true);
-    expect(domainMetadata.jwks.keys.length).toBeGreaterThan(0);
-    for (const key of domainMetadata.jwks.keys) {
+    // The key set is served by reference, so an authorization server that
+    // meets an unfamiliar kid can fetch it again (HAP-238).
+    expect(domainMetadata.jwks).toBeUndefined();
+    // Next to the document it is named in, on whichever origin served it.
+    expect(domainMetadata.jwks_uri).toBe(
+      `${new URL(domainMetadata.client_id).origin}/oauth/clients/instance/jwks.json`,
+    );
+    const domainJwksResp = await page.request.get(
+      new URL(domainMetadata.jwks_uri).pathname,
+      { headers: { "x-forwarded-host": DOMAIN_HOST } },
+    );
+    expect(domainJwksResp.ok()).toBeTruthy();
+    const domainJwks = await domainJwksResp.json();
+    expect(Array.isArray(domainJwks.keys)).toBe(true);
+    expect(domainJwks.keys.length).toBeGreaterThan(0);
+    for (const key of domainJwks.keys) {
       expect(key.kid).toBeTruthy();
       // The private scalar must never be served, even for our own domain.
       expect(key.d).toBeUndefined();
@@ -79,9 +92,16 @@ test.describe("Confidential OAuth client (domain)", () => {
     expect(primaryMetadata.client_id).toBe(
       `${origin}/oauth-client-metadata.json`,
     );
-    expect(Array.isArray(primaryMetadata.jwks?.keys)).toBe(true);
-    expect(primaryMetadata.jwks.keys.length).toBeGreaterThan(0);
-    for (const key of primaryMetadata.jwks.keys) {
+    expect(primaryMetadata.jwks).toBeUndefined();
+    expect(primaryMetadata.jwks_uri).toBe(
+      `${origin}/oauth/clients/instance/jwks.json`,
+    );
+    const primaryJwksResp = await page.request.get(primaryMetadata.jwks_uri);
+    expect(primaryJwksResp.ok()).toBeTruthy();
+    const primaryJwks = await primaryJwksResp.json();
+    expect(Array.isArray(primaryJwks.keys)).toBe(true);
+    expect(primaryJwks.keys.length).toBeGreaterThan(0);
+    for (const key of primaryJwks.keys) {
       expect(key.kid).toBeTruthy();
       expect(key.d).toBeUndefined();
     }

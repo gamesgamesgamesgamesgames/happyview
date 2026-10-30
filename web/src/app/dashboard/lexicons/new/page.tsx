@@ -2,12 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import {
   addNetworkLexicon,
   resolveNetworkLexicon,
   uploadLexicon,
+  ApiError,
+  type LexiconIssue,
 } from "@/lib/api";
 import { isValidNsid } from "@happyview/nsid";
 import { LEXICON_TEMPLATE } from "@/lib/lua-templates";
@@ -37,6 +40,7 @@ export default function AddLexiconPage() {
   const { hasPermission, loading } = useCurrentUser();
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
+  const [issues, setIssues] = useState<LexiconIssue[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // Redirect if the user cannot create lexicons (only after loading completes)
@@ -186,17 +190,27 @@ export default function AddLexiconPage() {
 
   async function handleUploadLocal() {
     setError(null);
+    setIssues(null);
     setSubmitting(true);
     try {
       const lexiconJson = JSON.parse(json);
-      const { id } = await uploadLexicon({
+      const { id, issues: warnings } = await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: localMainType === "record" && indexed && backfill,
         indexed: localMainType === "record" ? indexed : undefined,
       });
+      // The page navigates away on success, so a warning that only rendered
+      // here would never be read. A toast survives the navigation.
+      for (const warning of warnings ?? []) {
+        toast.warning("Lexicon uploaded with a warning", {
+          description: warning.message,
+          duration: 10000,
+        });
+      }
       router.push(`/dashboard/lexicons/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setIssues(e instanceof ApiError ? (e.lexiconIssues ?? null) : null);
       setSubmitting(false);
     }
   }
@@ -243,6 +257,25 @@ export default function AddLexiconPage() {
           <TabsContent value="local" className="flex flex-col flex-1 min-h-0">
             <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 pt-0 md:p-6 md:pt-0">
               {error && <p className="text-destructive text-sm">{error}</p>}
+              {issues && issues.length > 0 && (
+                <ul className="space-y-1 text-sm">
+                  {issues.map((issue, i) => (
+                    <li
+                      key={`${issue.path}-${i}`}
+                      className={
+                        issue.severity === "error"
+                          ? "text-destructive"
+                          : "text-muted-foreground"
+                      }
+                    >
+                      <code className="text-xs">
+                        {issue.path || "(document)"}
+                      </code>{" "}
+                      {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
 
               {/* Metadata fields */}
               {/* <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

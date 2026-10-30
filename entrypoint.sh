@@ -29,4 +29,10 @@ if [ -f "$MARKER" ]; then
     rm "$MARKER"
 fi
 
+# The image's other binary runs as itself; everything else is happyview's.
+if [ "$1" = "happyview-codemod" ]; then
+    shift
+    exec happyview-codemod "$@"
+fi
+
 exec happyview "$@"

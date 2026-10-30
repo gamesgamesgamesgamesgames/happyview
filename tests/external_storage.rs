@@ -394,10 +394,64 @@ async fn a_claimed_delete_clears_the_delta_so_a_recreate_is_served_fresh() {
     assert_eq!(local_rows(&state).await, 0);
 }
 
+/// A delete hook that returns nil asks to keep a record its storage has
+/// deleted, which can't be done. That warns in the event log: once per
+/// collection per hour with a count, or every time under verbose logging.
+#[tokio::test]
+async fn an_ignored_keep_on_delete_warns() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    install_script(&state, &format!("record.delete:{CLAIMED}"), "value:none").await;
+    let warned = |state: AppState| async move {
+        let rows: Vec<(String, String)> = happyview::db::query_as(
+            "SELECT severity, detail FROM happyview_event_logs \
+              WHERE event_type = 'record.skip_ignored' ORDER BY created_at, id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(severity, detail)| {
+                let detail: Value = serde_json::from_str(&detail).unwrap();
+                (severity, detail["rkey"].clone(), detail["ignored"].clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let delete = |rkey: &str| record_event(CLAIMED, rkey, Action::Delete, None, Some(tid(2)), true);
+
+    for rkey in ["d1", "d2", "d3"] {
+        let outcome = happyview::ingest::apply(&state, delete(rkey)).await;
+        assert_eq!(outcome, IngestOutcome::Matched, "the delete still applies");
+    }
+    assert_eq!(
+        warned(state.clone()).await,
+        [("warn".to_string(), json!("d1"), json!(1))],
+        "one report for the collection, not one per delete"
+    );
+
+    state.verbose_event_logging.store(true, Ordering::Relaxed);
+    for rkey in ["d4", "d5"] {
+        let outcome = happyview::ingest::apply(&state, delete(rkey)).await;
+        assert_eq!(outcome, IngestOutcome::Matched);
+    }
+    let rows = warned(state.clone()).await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[1], ("warn".to_string(), json!("d4"), json!(1)));
+    assert_eq!(rows[2], ("warn".to_string(), json!("d5"), json!(1)));
+}
+
 #[tokio::test]
 async fn a_stored_event_writes_only_the_hook_delta() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1449,7 +1503,7 @@ async fn open_dead_letters(state: &AppState) -> i64 {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1473,7 +1527,7 @@ async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from
 #[tokio::test]
 async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1495,7 +1549,7 @@ async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_replaces_names_the_replaced_body() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1585,4 +1639,27 @@ async fn a_batch_reports_a_claimed_delta_that_applied_as_a_change() {
         ]
     );
     assert_eq!(local_rows(&state).await, 0);
+}
+
+/// HAP-270: a collection external storage claims isn't this instance's to
+/// reconcile; a stale record there is the store's.
+#[tokio::test]
+async fn a_claimed_collection_is_not_reconciled_here() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let options = happyview::jobs::native::reconcile_collection::Options {
+        collection: CLAIMED.into(),
+        dry_run: false,
+        dids: None,
+        pds_requests_per_second: None,
+        allow_suspicious: vec![],
+    };
+    let refused = happyview::jobs::native::reconcile_collection::reconcile(&state, &options, None)
+        .await
+        .expect_err("a claimed collection is refused");
+    assert!(refused.contains("shared record store"), "{refused}");
+    assert!(
+        happyview::jobs::native::reconcile_collection::refusal(&state, LOCAL).is_none(),
+        "a local collection is reconciled here"
+    );
 }

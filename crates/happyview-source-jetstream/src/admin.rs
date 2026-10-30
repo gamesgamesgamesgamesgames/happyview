@@ -385,22 +385,41 @@ pub async fn backfill_status(
 
     // The row above is at sqlx's tuple limit; the replay columns come apart.
     #[allow(clippy::type_complexity)]
-    let replay_rows: Vec<(String, String, Option<i64>, Option<i64>, Option<i64>, i64, i32)> =
+    let replay_rows: Vec<(
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i32,
+        Option<String>,
+    )> =
         happyview_provider::db::query_as(&adapt_sql(
-            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs",
+            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed, note FROM happyview_backfill_jobs",
             backend,
         ))
         .fetch_all(&state.backfill_db)
         .await
         .map_err(|e| AdminError::Internal(format!("failed to list backfill jobs: {e}")))?;
     #[allow(clippy::type_complexity)]
-    let mut replay: HashMap<String, (String, Option<i64>, Option<i64>, Option<i64>, i64, i32)> =
-        replay_rows
-            .into_iter()
-            .map(|(id, source, after, through, tip, bytes, failed)| {
-                (id, (source, after, through, tip, bytes, failed))
-            })
-            .collect();
+    let mut replay: HashMap<
+        String,
+        (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i32,
+            Option<String>,
+        ),
+    > = replay_rows
+        .into_iter()
+        .map(|(id, source, after, through, tip, bytes, failed, note)| {
+            (id, (source, after, through, tip, bytes, failed, note))
+        })
+        .collect();
 
     let jobs: Vec<BackfillJob> = rows
         .into_iter()
@@ -423,9 +442,9 @@ pub async fn backfill_status(
                 queue_version,
                 discovery_complete,
             )| {
-                let (source, after, through, tip, bytes, failed) = replay
+                let (source, after, through, tip, bytes, failed, note) = replay
                     .remove(&id)
-                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0));
+                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None));
                 // Only a replay (or an `auto` job yet to probe) has replay
                 // progress; a crawl and an executor's job have none.
                 let replay =
@@ -456,6 +475,7 @@ pub async fn backfill_status(
                         == QueueVersion::Bounded)
                         .then_some(RECENT_COMPLETIONS_PER_JOB),
                     source,
+                    note,
                     replay,
                 }
             },
@@ -463,6 +483,26 @@ pub async fn backfill_status(
         .collect();
 
     Ok(Json(jobs))
+}
+
+/// GET /admin/backfill/collections/{nsid} — who backfills a collection, and
+/// what it says about the collection now.
+pub(crate) async fn backfill_collection(
+    State(state): State<JobState>,
+    AdminUser(auth): AdminUser,
+    Path(nsid): Path<String>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    auth.require("backfill:read")?;
+    let executor = state.compose.executor(&nsid);
+    let summary = match &executor {
+        Some(executor) => executor.describe(&nsid).await,
+        None => None,
+    };
+    Ok(Json(serde_json::json!({
+        "collection": nsid,
+        "executor": executor.map(|e| e.name()),
+        "summary": summary,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +543,7 @@ pub(crate) async fn backfill_events(
                         | crate::backfill::types::BackfillEvent::JobCounters { job_id, .. }
                         | crate::backfill::types::BackfillEvent::JobStageChanged { job_id, .. }
                         | crate::backfill::types::BackfillEvent::JobCompleted { job_id, .. }
+                        | crate::backfill::types::BackfillEvent::JobNote { job_id, .. }
                         | crate::backfill::types::BackfillEvent::ReplayProgress { job_id, .. }
                         | crate::backfill::types::BackfillEvent::JobSnapshot { job_id, .. } => job_id,
                     };
@@ -1233,6 +1274,7 @@ pub(crate) fn router() -> axum::Router<JobState> {
     axum::Router::new()
         .route("/backfill", post(create_backfill))
         .route("/backfill/status", get(backfill_status))
+        .route("/backfill/collections/{nsid}", get(backfill_collection))
         .route("/backfill/details", delete(flush_all_backfill_details))
         .route("/backfill/{id}/cancel", post(cancel_backfill))
         .route("/backfill/{id}/pause", post(pause_backfill))

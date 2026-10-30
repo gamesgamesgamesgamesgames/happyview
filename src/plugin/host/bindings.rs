@@ -332,6 +332,42 @@ pub(crate) fn define_host_functions(
     )?;
 
     imports.define(
+        "host_caller_get_session",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_caller_impl(
+                    caller,
+                    "host_caller_get_session",
+                    req_ptr,
+                    req_len,
+                    |session, spec: serde_json::Value| async move {
+                        super::get_session(&session, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_caller_get_email",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_caller_impl(
+                    caller,
+                    "host_caller_get_email",
+                    req_ptr,
+                    req_len,
+                    |session, spec: serde_json::Value| async move {
+                        super::get_email(&session, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
         "host_caller_xrpc_procedure",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {
@@ -1242,7 +1278,9 @@ impl<'l> HostImports<'l> {
 
     /// One `env` import. The guest's deadline stops when it enters and
     /// starts again when it returns, so an import's own latency is never
-    /// charged to the script.
+    /// charged to the script. A job run whose worker lost its lease traps on
+    /// entry instead, so the import's side effect does not happen alongside
+    /// the run that took the job over.
     pub(crate) fn define<Params, R, F>(
         &mut self,
         name: &'static str,
@@ -1266,10 +1304,13 @@ impl<'l> HostImports<'l> {
             name,
             move |mut caller: wasmtime::Caller<'_, PluginState>, params: Params| {
                 Box::new(async move {
+                    if lease_lost(&caller) {
+                        return Err(wasmtime::Error::msg(LEASE_LOST));
+                    }
                     suspend_guest_deadline(&mut caller);
                     let out = f(&mut caller, params).await;
                     resume_guest_deadline(&mut caller);
-                    out
+                    Ok(out)
                 })
             },
         )?;
@@ -1282,10 +1323,29 @@ fn suspend_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     caller.data_mut().deadline.suspend();
 }
 
-/// The guest is about to run again: re-arm the store with what is left.
+/// The guest is about to run again: re-arm the store with what is left. A
+/// job run whose worker lost its lease gets nothing left, so it is
+/// interrupted as soon as it resumes rather than repeating the job's side
+/// effects alongside the run that took the job over.
 fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     let remaining = caller.data_mut().deadline.resume();
-    caller.as_context_mut().set_epoch_deadline(remaining);
+    let lost = lease_lost(caller);
+    caller
+        .as_context_mut()
+        .set_epoch_deadline(if lost { 0 } else { remaining });
+}
+
+/// Why a job run that lost its lease stops at a host import.
+const LEASE_LOST: &str = "the job was taken over by another run; this run stops";
+
+/// Whether the store's run is a job run whose worker lost its lease.
+fn lease_lost(caller: &wasmtime::Caller<'_, PluginState>) -> bool {
+    caller
+        .data()
+        .script_run
+        .as_ref()
+        .and_then(|run| run.lease_lost.as_ref())
+        .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// One entry point for the five imports that act on the script run in

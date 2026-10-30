@@ -81,21 +81,40 @@ These checks must pass before merging:
 | `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
 | `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 
-The `coverage` job also runs on server changes. It reruns the Rust suites under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
+The Postgres e2e shards run their tests under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), and the `coverage` job merges what they measured: it writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
 
 Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
 
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
 - **PR builds**: when your PR touches the server, CI builds Docker images and binaries, and a bot comments with `docker pull ghcr.io/gamesgamesgamesgamesgames/happyview:pr-<number>` so reviewers can try it.
+- **The `Vercel` check** builds a preview of the docs site. On a PR from a fork it fails with "Authorization required to deploy" until a maintainer authorizes it. It isn't a required check, so it never blocks your PR, and you don't need to do anything about it.
+
+### Pull requests from forks
+
+CI runs a fork's PR without the repository's secrets, and every required check is built to pass without them. PR images are pushed by a separate workflow that runs from the default branch and never executes the PR's code. What a maintainer does on a fork's PR:
+
+1. **Approve the workflow run** for a first-time contributor, from the banner on the PR's Checks tab. Read the diff first, especially anything under `.github/`: the run executes the PR's code on our runners.
+2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
+3. **Check the squash message before merging.** This repository fills it with the PR's commit messages, trailers included. Delete any trailer we don't carry, such as an AI co-author line, in the merge dialog, and keep the contributor's `Signed-off-by`.
+
+### Missing prerequisites fail
+
+A test that needs a database, a built plugin fixture or an interpreter plugin
+fails when it is missing, naming what is missing and how to get it. A skipped
+test reports `ok`, so a fresh worktree used to report hundreds of passes while
+testing far less. Set `HAPPYVIEW_ALLOW_SKIPS=1` when you mean to run without
+them, and those tests skip instead. A test that runs only on the other
+database backend (Postgres-only on SQLite, or the reverse) still skips, since
+nothing is missing.
 
 ### Unit tests
 
 No database, no fixtures:
 
 ```bash
-cargo test --lib
-cargo test --workspace --exclude happyview
+HAPPYVIEW_ALLOW_SKIPS=1 cargo test --lib
+HAPPYVIEW_ALLOW_SKIPS=1 cargo test --workspace --exclude happyview
 ```
 
 That is not the whole suite. `mlua` is an optional dependency behind the
@@ -112,9 +131,11 @@ cargo test --features lua-reference --lib --test codemod_cases
 
 ### End-to-end tests
 
-Needs Postgres and every plugin WASM fixture built:
+Needs Postgres, every plugin WASM fixture built, and the interpreter plugins:
 
 ```bash
+bash scripts/build-plugin-fixtures.sh
+bash scripts/fetch-lua-plugin.sh && export HAPPYVIEW_LUA_PLUGIN=tests/fixtures/lua-plugin
 docker compose -f docker-compose.test.yml up -d
 TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test cargo test --tests
 docker compose -f docker-compose.test.yml down
@@ -126,9 +147,7 @@ CI splits that run across two runners per database:
 and `bash scripts/e2e-shard.sh --list 2` shows the split.
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
-file. Leaving the variable unset does not test SQLite: the end-to-end suite
-skips its database-backed tests silently, so point it at a file URL as
-below. Run it this way once when you change SQL,
+file. Run it this way once when you change SQL,
 migrations or anything that touches the write path:
 
 ```bash
@@ -148,15 +167,8 @@ summaries in the pull request. The storage settings it exercises
 `BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
 `packages/docs/content/docs/getting-started/configuration.md`.
 
-A test whose plugin module is missing skips rather than fails, so this job
-asserts the fixtures are there before running them:
-
-```bash
-bash scripts/check-plugin-fixtures.sh --require
-```
-
-It names every artefact it could not find; the `e2e-tests` job in
-`.github/workflows/ci.yml` carries the build command for each one.
+`bash scripts/check-plugin-fixtures.sh --require` names every fixture
+artefact that is missing, before a run rather than test by test.
 
 `scripts/build-plugin-fixtures.sh` can fail in a worktree created inside the
 main checkout (for example under `.worktrees/`) with "current package believes
@@ -167,15 +179,12 @@ your branch added. Create the worktree outside the checkout
 `Cargo.toml` up to date with your branch.
 
 The real Lua interpreter plugin is another repository's artefact and needs a C
-toolchain, so nothing here can build it and the targets that load it skip.
-`bash scripts/check-lua-plugin.sh` reports what a run therefore left out and
-names the two variables, `HAPPYVIEW_LUA_PLUGIN` and `HAPPYVIEW_LUA_SRC`, that
-make those targets run. CI runs it in reporting mode, so absent is not a
-failure there.
-
-The provider conformance kit (`cargo test --features testkit --test
-conformance`) is the exception: it does not skip. It panics when
-`TEST_DATABASE_URL` or `HAPPYVIEW_LUA_PLUGIN` is unset.
+toolchain, so nothing here builds it: `scripts/fetch-lua-plugin.sh` downloads
+the pinned release, and `HAPPYVIEW_LUA_PLUGIN` names where it is.
+`scripts/fetch-quickjs-plugins.sh` does the same for the JavaScript and
+TypeScript interpreters (`HAPPYVIEW_JAVASCRIPT_PLUGIN`,
+`HAPPYVIEW_TYPESCRIPT_PLUGIN`). `bash scripts/check-lua-plugin.sh` reports
+whether the Lua plugin is in place.
 
 The job also runs the SDK crate's tests and the `migration_upgrade` target
 ahead of the full run, for a separately named signal. Both are already

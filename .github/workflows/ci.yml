@@ -39,12 +39,27 @@ env:
 permissions:
   id-token: write # Required for OIDC
 
+# Concurrency is set per job. A newer run on the same pull request, or the
+# same branch, cancels the older run's checks (`ci-…` groups). The jobs that
+# cut a version (`release`, `release-*`) are never cancelled once started
+# (`release-…` groups, cancel-in-progress false; a newer run can only drop one
+# still pending, which has cut nothing), and the jobs after them (`build`,
+# `dispatch-native-release`, `tag-latest`) have no group. Each job that can be
+# first to cut a version (`release`, `release-oauth-client`, `release-nsid`)
+# needs every cancellable job, so none of those is still running, or
+# cancellable, once a version may have been cut, and refuses to run if any
+# of its needs was cancelled: `always()` alone would let a run whose tests a
+# newer push cancelled cut a version anyway. The event name in the `ci-`
+# group keeps a branch deletion's run from cancelling a push's.
 jobs:
   # ---------------------------------------------------------------------------
   # Path detection — determines which job groups should run.
   # Required because workflow-level `paths` filters can't vary per job.
   # ---------------------------------------------------------------------------
   changes:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-changes
+      cancel-in-progress: true
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: depot-ubuntu-24.04
     outputs:
@@ -104,6 +119,9 @@ jobs:
   # Build server binary — shared by playwright and pr-build (amd64)
   # ---------------------------------------------------------------------------
   build-server:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-build-server
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -129,13 +147,23 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: happyview-server
-          path: target/release/happyview
+          path: |
+            target/release/happyview
+            target/release/happyview-codemod
 
   unit-tests:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-unit-tests
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
+    env:
+      # A test whose database, fixture or interpreter is missing fails unless
+      # this is set. This job builds none of them on purpose, and e2e-tests
+      # and coverage run those tests with everything present, without it.
+      HAPPYVIEW_ALLOW_SKIPS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -146,10 +174,11 @@ jobs:
           shared-key: test
 
       # This job is deliberately database-free and fixture-free, so every test
-      # that loads a plugin module skips here and runs for real under
-      # the e2e-tests shards. libtest captures the skip line of a
-      # passing test, so without this the log would not say which coverage the
-      # run left out. Reporting only: absent is the expected state here.
+      # that loads a plugin module skips here (HAPPYVIEW_ALLOW_SKIPS above) and
+      # runs for real under the e2e-tests shards. libtest captures the skip
+      # line of a passing test, so without this the log would not say which
+      # coverage the run left out. Reporting only: absent is the expected
+      # state here.
       - name: Report unbuilt plugin fixtures
         run: bash scripts/check-plugin-fixtures.sh
 
@@ -176,6 +205,9 @@ jobs:
   # runner and database; `e2e-tests` below is the check that reports them.
   e2e-tests-shard:
     name: e2e-tests (shard ${{ matrix.shard }}/2)
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-shard-${{ matrix.shard }}
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -215,10 +247,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # Instrumented for coverage, so these shards keep their own cache rather
+      # than evicting the plain `test` one.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test
+          shared-key: coverage
 
       # Reclaim ~20 GB of preinstalled tooling the Rust build never uses. The
       # e2e build (all test binaries in debug) plus the restored target cache
@@ -273,26 +307,41 @@ jobs:
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
 
-      # This is the job where the fixture-loading tests are supposed to run,
-      # so here a missing module is a failure and not a skip. Without it a
-      # build that stopped producing one would leave those tests skipping
-      # inside a green run — quieter than the panic it replaced.
+      # This is the job where the fixture-loading tests are supposed to run.
+      # They fail on a missing module themselves; this names every missing
+      # one up front, before the suite fails on them test by test.
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
 
-      # Same reasoning for the interpreter: the targets that load it skip when
-      # it is absent, so a fetch that produced nothing would leave them
-      # skipping inside a green run — among them the three refusal messages an
-      # operator reads when a script will not save.
+      # The same for the interpreter, which the targets that load it need:
+      # among them the three refusal messages an operator reads when a script
+      # will not save.
       - name: Verify the Lua interpreter is present
         run: bash scripts/check-lua-plugin.sh --require
 
       - name: Verify the JavaScript and TypeScript interpreters are present
         run: bash scripts/check-quickjs-plugins.sh --require
 
-      - name: Run plugin SDK tests
+      # Coverage is measured here rather than by a separate job running the
+      # whole suite a second time: every test below runs instrumented, each
+      # shard writes its own lcov, and `coverage` merges the two.
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Start from no coverage data
+        run: cargo llvm-cov clean --workspace
+
+      # The other workspace crates' tests, the SDK's among them, on one shard:
+      # the old coverage job ran `--workspace`, so its report covered them.
+      - name: Workspace crate tests
         if: matrix.shard == 1
-        run: cargo test -p happyview-plugin-sdk
+        env:
+          TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo llvm-cov --no-report --workspace --exclude happyview
 
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
       # database — schema + data, both SQLite and Postgres — not just a fresh one.
@@ -304,7 +353,7 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --test migration_upgrade
+        run: cargo llvm-cov --no-report --test migration_upgrade
 
       - name: Run e2e tests
         env:
@@ -319,7 +368,17 @@ jobs:
           args=$(bash scripts/e2e-shard.sh "$SHARD" 2)
           test -n "$args"
           read -ra targets <<<"$args"
-          cargo test "${targets[@]}"
+          cargo llvm-cov --no-report "${targets[@]}"
+
+      - name: Write this shard's coverage
+        run: cargo llvm-cov report --lcov --output-path lcov-shard-${{ matrix.shard }}.info
+
+      - name: Upload this shard's coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: lcov-shard-${{ matrix.shard }}.info
+          retention-days: 3
 
       # The record-provider conformance cases. They are built only with the
       # kit's feature, so the run above leaves them out. The SQLite job runs
@@ -334,6 +393,9 @@ jobs:
   # The required check and what `release` waits on: passes only when every
   # shard did.
   e2e-tests:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests
+      cancel-in-progress: true
     needs: [changes, e2e-tests-shard]
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -347,6 +409,9 @@ jobs:
   # runs on Postgres, on a SQLite file, since self-hosting supports both.
   e2e-tests-sqlite-shard:
     name: e2e-tests-sqlite (shard ${{ matrix.shard }}/2)
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-sqlite-shard-${{ matrix.shard }}
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -430,17 +495,15 @@ jobs:
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
 
-      # This is the job where the fixture-loading tests are supposed to run,
-      # so here a missing module is a failure and not a skip. Without it a
-      # build that stopped producing one would leave those tests skipping
-      # inside a green run — quieter than the panic it replaced.
+      # This is the job where the fixture-loading tests are supposed to run.
+      # They fail on a missing module themselves; this names every missing
+      # one up front, before the suite fails on them test by test.
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
 
-      # Same reasoning for the interpreter: the targets that load it skip when
-      # it is absent, so a fetch that produced nothing would leave them
-      # skipping inside a green run — among them the three refusal messages an
-      # operator reads when a script will not save.
+      # The same for the interpreter, which the targets that load it need:
+      # among them the three refusal messages an operator reads when a script
+      # will not save.
       - name: Verify the Lua interpreter is present
         run: bash scripts/check-lua-plugin.sh --require
 
@@ -470,6 +533,9 @@ jobs:
   # The required check and what `release` waits on: passes only when every
   # shard did on SQLite.
   e2e-tests-sqlite:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-sqlite
+      cancel-in-progress: true
     needs: [changes, e2e-tests-sqlite-shard]
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -485,6 +551,9 @@ jobs:
   # PUC Lua from C to do it, and that build sat at the end of an e2e job
   # already near its timeout.
   lua-differential:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-lua-differential
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -520,8 +589,8 @@ jobs:
       - name: Build the library fixture
         run: bash scripts/build-plugin-fixtures.sh differential_library
 
-      # The target skips when either module is absent, and a skip here would
-      # read as the two runners agreeing.
+      # The target needs both modules, and a run without them would read as
+      # the two runners agreeing.
       - name: Verify the fixture and the interpreter are present
         run: |
           bash scripts/check-plugin-fixtures.sh --require differential_library
@@ -540,70 +609,45 @@ jobs:
 
   # Runs the unit, crate, and e2e suites once under LLVM source-based
   # instrumentation. Informational for now: no threshold gates the PR.
+  # Merges what the Postgres e2e shards measured into one report: the summary
+  # on the job page, Coveralls, and the `coverage` artifact. Informational: no
+  # threshold gates the PR.
   coverage:
-    needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-coverage
+      cancel-in-progress: true
+    needs: [changes, e2e-tests-shard]
+    if: >-
+      always()
+      && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+      && needs.e2e-tests-shard.result == 'success'
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: happyview
-          POSTGRES_PASSWORD: happyview
-          POSTGRES_DB: happyview_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # Instrumented artifacts differ from the plain test build, so they get
-      # their own cache rather than evicting the `test` one.
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Download each shard's coverage
+        uses: actions/download-artifact@v8
         with:
-          shared-key: coverage
+          pattern: coverage-shard-*
+          merge-multiple: true
 
-      - name: Free disk space
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+
+      # `-a` sums the shards' hit counts line by line; both cover the same
+      # sources, from the same checkout path.
+      - name: Merge and report
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Install LLVM tools
-        run: rustup component add llvm-tools
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      # `--workspace` below runs every fixture-loading test, so this job needs
-      # the whole set and not the one plugin a narrower run would reach.
-      - name: Build plugin fixtures
-        run: bash scripts/build-plugin-fixtures.sh
-
-      - name: Verify plugin fixtures are built
-        run: bash scripts/check-plugin-fixtures.sh --require
-
-      - name: Run tests with coverage
-        env:
-          TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo llvm-cov --workspace --no-report
-
-      - name: Generate reports
-        run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --html
+          set -euo pipefail
+          lcov --ignore-errors inconsistent,unused \
+            -a lcov-shard-1.info -a lcov-shard-2.info -o lcov.info
+          genhtml --ignore-errors inconsistent,unused,category \
+            --output-directory coverage-html lcov.info > /dev/null
           {
             echo '## Rust coverage'
             echo '```'
-            cargo llvm-cov report --summary-only
+            lcov --ignore-errors inconsistent --summary lcov.info 2>&1
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -619,9 +663,12 @@ jobs:
           name: coverage
           path: |
             lcov.info
-            target/llvm-cov/html
+            coverage-html
 
   frontend:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-frontend
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -678,6 +725,9 @@ jobs:
           mv web/out.aside web/out
 
   lint:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-lint
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -713,19 +763,19 @@ jobs:
       - name: Clippy (native Lua reference)
         run: cargo clippy --features lua-reference --all-targets -- -D warnings
 
-  # The release targets that no other job compiles. Windows proves the code
-  # builds without unix-only APIs; the musl binary is booted from an empty
-  # directory, which is what proves it carries its migrations and needs no
-  # system OpenSSL.
+  # The release target that no other job compiles: the musl binary is booted
+  # from an empty directory, which is what proves it carries its migrations
+  # and needs no system OpenSSL.
   portability:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-portability-${{ matrix.target }}
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runs-on: depot-windows-2022
-            target: x86_64-pc-windows-msvc
           - runs-on: depot-ubuntu-24.04
             target: x86_64-unknown-linux-musl
     runs-on: ${{ matrix.runs-on }}
@@ -768,6 +818,9 @@ jobs:
           exit 1
 
   audit:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-audit
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
@@ -786,6 +839,9 @@ jobs:
         run: cargo audit
 
   playwright:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-playwright
+      cancel-in-progress: true
     needs: [changes, frontend, build-server]
     if: >-
       always()
@@ -876,6 +932,9 @@ jobs:
   # of one reviewers can already pull.
   # ---------------------------------------------------------------------------
   pr-build:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-pr-build-${{ matrix.arch }}
+      cancel-in-progress: true
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
@@ -930,7 +989,7 @@ jobs:
       - name: Prepare binary override
         run: |
           mkdir -p .builder-override/app/target/release
-          cp target/release/happyview .builder-override/app/target/release/happyview
+          cp target/release/happyview target/release/happyview-codemod .builder-override/app/target/release/
 
       - name: Extract metadata
         id: meta
@@ -952,6 +1011,17 @@ jobs:
           provenance: false
           outputs: type=docker,name=happyview-pr:${{ matrix.arch }},dest=happyview-image-${{ matrix.arch }}.tar
 
+      # The image runs the codemod, not just the server: a v2 query rewritten
+      # through the entrypoint comes back on the v3 contract.
+      - name: Smoke-test the codemod in the image
+        run: |
+          docker load -i happyview-image-${{ matrix.arch }}.tar
+          out=$(printf 'function handle()\n  return { did = caller_did }\nend\n' \
+            | docker run --rm -i happyview-pr:${{ matrix.arch }} happyview-codemod --stdin --kind query)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'function handle(input, ctx)'
+          printf '%s\n' "$out" | grep -q 'did = ctx.caller_did'
+
       - name: Upload image
         uses: actions/upload-artifact@v7
         with:
@@ -960,6 +1030,9 @@ jobs:
           retention-days: 7
 
   pr-build-metadata:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-pr-build-metadata
+      cancel-in-progress: true
     needs: pr-build
     runs-on: depot-ubuntu-24.04
     steps:
@@ -979,8 +1052,13 @@ jobs:
   # Server release
   # ---------------------------------------------------------------------------
   release:
+    concurrency:
+      group: release-${{ github.ref }}-release
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
@@ -991,7 +1069,7 @@ jobs:
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
       && needs.portability.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability]
+    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability, build-server, coverage, audit, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
@@ -1093,7 +1171,7 @@ jobs:
       - name: Prepare binary override
         run: |
           mkdir -p .builder-override/app/target/release
-          cp target/release/happyview .builder-override/app/target/release/happyview
+          cp target/release/happyview target/release/happyview-codemod .builder-override/app/target/release/
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -1240,6 +1318,9 @@ jobs:
   # SDK — per-package tests + releases
   # ---------------------------------------------------------------------------
   test-oauth-client:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
     runs-on: depot-ubuntu-24.04
@@ -1263,6 +1344,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client' test
 
   test-oauth-client-browser:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client-browser
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
     runs-on: depot-ubuntu-24.04
@@ -1289,6 +1373,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client-browser' test
 
   test-oauth-client-node:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-oauth-client-node
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
     runs-on: depot-ubuntu-24.04
@@ -1315,6 +1402,9 @@ jobs:
         run: bun run --filter '@happyview/oauth-client-node' test
 
   test-lex-agent:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-lex-agent
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
     runs-on: depot-ubuntu-24.04
@@ -1341,6 +1431,9 @@ jobs:
         run: bun run --filter '@happyview/lex-agent' test
 
   test-nsid:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-test-nsid
+      cancel-in-progress: true
     needs: changes
     if: always() && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
     runs-on: depot-ubuntu-24.04
@@ -1364,12 +1457,17 @@ jobs:
         run: bun run --filter '@happyview/nsid' test
 
   release-oauth-client:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
-    needs: [changes, test-oauth-client]
+    needs: [changes, test-oauth-client, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1404,8 +1502,13 @@ jobs:
         run: npx semantic-release
 
   release-oauth-client-browser:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client-browser
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
@@ -1448,8 +1551,13 @@ jobs:
         run: npx semantic-release
 
   release-oauth-client-node:
+    concurrency:
+      group: release-${{ github.ref }}-release-oauth-client-node
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
@@ -1492,8 +1600,13 @@ jobs:
         run: npx semantic-release
 
   release-lex-agent:
+    concurrency:
+      group: release-${{ github.ref }}-release-lex-agent
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
@@ -1536,12 +1649,17 @@ jobs:
         run: npx semantic-release
 
   release-nsid:
+    concurrency:
+      group: release-${{ github.ref }}-release-nsid
+      cancel-in-progress: false
     if: >-
       always()
+      && !cancelled()
+      && !contains(needs.*.result, 'cancelled')
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
-    needs: [changes, test-nsid]
+    needs: [changes, test-nsid, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1579,6 +1697,9 @@ jobs:
   # Mirror to Tangled
   # ---------------------------------------------------------------------------
   mirror:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-mirror
+      cancel-in-progress: true
     # PRs have nothing to mirror, and fork PRs can't read the SSH key.
     if: github.event_name != 'pull_request'
     runs-on: depot-ubuntu-24.04

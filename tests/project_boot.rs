@@ -154,3 +154,96 @@ async fn a_project_that_builds_is_applied_at_boot() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+/// Upgrading must not turn a serving instance into one that exits 1.
+///
+/// The fixture's lexicon names a def it does not define, which the spec
+/// checks refuse and every HappyView before them accepted. Boot builds
+/// leniently: it warns, names the file, and goes on to serve. `happyview
+/// check` on the very same project refuses it, which is where someone is
+/// watching.
+#[test]
+fn a_lexicon_the_spec_checks_refuse_warns_at_boot_and_fails_check() {
+    const FIXTURE: &str = "tests/fixtures/projects/legacy-lexicon";
+
+    // `check` reads no database, so it answers on its own.
+    let checked = Command::new(env!("CARGO_BIN_EXE_happyview"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["check", FIXTURE])
+        .output()
+        .expect("run happyview check");
+    let said = String::from_utf8_lossy(&checked.stderr).to_string()
+        + &String::from_utf8_lossy(&checked.stdout);
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "check must refuse it: {said}"
+    );
+    assert!(
+        said.contains("src/lexicons/com/example/legacy/thing.json"),
+        "check should name the file: {said}"
+    );
+    assert!(
+        said.contains("names no def in this lexicon"),
+        "check should say what is wrong: {said}"
+    );
+
+    // Boot takes the same project and serves anyway.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("happyview.db");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let log_path = dir.path().join("stderr.log");
+    let closed = "127.0.0.1:9";
+    let mut server = Running(
+        Command::new(env!("CARGO_BIN_EXE_happyview"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env(
+                "DATABASE_URL",
+                format!("sqlite://{}?mode=rwc", db_path.display()),
+            )
+            .env("PUBLIC_URL", format!("http://127.0.0.1:{port}"))
+            .env("PORT", port.to_string())
+            .env("PLUGIN_URLS", "")
+            .env("PLUGIN_DIR", dir.path().join("plugins"))
+            .env("JETSTREAM_URL", format!("ws://{closed}"))
+            .env("RELAY_URL", format!("http://{closed}"))
+            .env("PLC_URL", format!("http://{closed}"))
+            .env("TELEMETRY_COLLECTOR_URL", format!("http://{closed}"))
+            .env("HAPPYVIEW_PROJECT", FIXTURE)
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log_path).unwrap())
+            .spawn()
+            .expect("start happyview"),
+    );
+
+    // It has to still be running, and it has to have said why it is unhappy.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let said = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(status) = server.0.try_wait().unwrap() {
+            panic!(
+                "boot exited with {:?} over a lexicon it should only have warned about:\n{said}",
+                status.code()
+            );
+        }
+        if said.contains("names no def in this lexicon") {
+            assert!(
+                said.contains("src/lexicons/com/example/legacy/thing.json"),
+                "the warning should name the file: {said}"
+            );
+            assert!(
+                !said.contains("the project did not build"),
+                "it must not read as a failed build: {said}"
+            );
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("boot never warned about the lexicon:\n{said}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

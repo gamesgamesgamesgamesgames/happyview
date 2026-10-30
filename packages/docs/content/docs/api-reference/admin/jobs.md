@@ -37,6 +37,7 @@ Returns a paginated list of jobs, newest first.
       "error": null,
       "created_by": "did:plc:abc123",
       "inherit_auth": false,
+      "attempt": 1,
       "started_at": "2026-07-01T12:00:05Z",
       "completed_at": "2026-07-01T12:02:30Z",
       "created_at": "2026-07-01T12:00:00Z"
@@ -146,6 +147,7 @@ Resume a paused job. Sets the status back to `pending` so the worker picks it up
 | `error`        | string\|null | Error message on failure                                                        |
 | `created_by`   | string       | DID of the user who enqueued the job                                            |
 | `inherit_auth` | boolean      | Whether the job inherits the creator's PDS auth                                 |
+| `attempt`      | number       | How many runs of the job have started, a run whose worker stopped included      |
 | `started_at`   | string\|null | ISO 8601 timestamp when the worker started executing                            |
 | `completed_at` | string\|null | ISO 8601 timestamp when the job finished                                        |
 | `created_at`   | string       | ISO 8601 timestamp when the job was enqueued                                    |

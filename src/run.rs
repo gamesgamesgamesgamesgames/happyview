@@ -217,7 +217,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
     }
 
     // Resume interrupted jobs and start the job worker
-    crate::jobs::worker::resume_interrupted_jobs(&state).await;
+    crate::jobs::worker::spawn_recovery(state.clone());
     crate::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
 
     {
@@ -707,6 +707,12 @@ async fn boot(
     let linked_repos_scopes = oauth_scopes.clone();
     let oauth_scopes_for_by_kid = oauth_scopes.clone();
 
+    // A staged key that came due while the instance was down takes over
+    // before the clients are built around the current one.
+    if let Err(e) = crate::oauth::client_keys::promote_due_keys(&db_pool, db_backend).await {
+        warn!(error = %e, "failed to promote staged OAuth client keys");
+    }
+
     let instance_key = crate::oauth::client_keys::ensure_instance_key(
         &db_pool,
         db_backend,
@@ -1085,9 +1091,11 @@ async fn boot(
         official_registry_config,
         proxy_config,
         verbose_event_logging,
+        ignored_keeps: Arc::default(),
         client_jwks,
         telemetry_counters,
         script_limits,
+        integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };
 
@@ -1179,6 +1187,10 @@ async fn boot(
         state.db.clone(),
         state.db_backend,
     ));
+
+    // Staged OAuth client keys take over when they come due. In the boot,
+    // rather than in `run`, so `boot_for_test` exercises it too.
+    tokio::spawn(crate::oauth::rotation::run_key_promotion(state.clone()));
 
     // Where `jetstream::spawn` stood: live ingest starts after the project
     // is installed and before anything else is spawned.

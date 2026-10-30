@@ -56,7 +56,7 @@ impl Drop for Consumer {
 
 async fn app() -> Option<TestApp> {
     if std::env::var("TEST_DATABASE_URL").is_err() {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
         return None;
     }
     let app = TestApp::new().await;

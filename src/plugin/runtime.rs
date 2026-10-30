@@ -23,16 +23,16 @@ pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub fn fuel_for(plugin_type: PluginType) -> u64 {
     match plugin_type {
         PluginType::Library | PluginType::Auth => DEFAULT_FUEL,
-        // Fuel cannot bound an interpreter: wasmtime 49's Cranelift does not
-        // reload the fuel counter in a frame that catches a `throw`, so a
-        // guest that catches an error erases the fuel its body spent, and
-        // every Lua error on the wasi route is such a throw (reproduction:
-        // `.superpowers/spikes/lua-wasm/candidates/eh-probe/fuel_loss.wat`).
-        // Epoch interruption is the boundary that holds, which is why the
-        // engine keeps exceptions enabled: `executor::deadline`'s catching
-        // guest test shows the deadline stopping a `try_table` loop that
-        // fuel does not. Fuel stays enabled engine-wide because it is what
-        // bounds libraries. The whole range also covers the per-byte
+        // An interpreter is bounded by the operator's wall clock, an epoch
+        // deadline armed per run, rather than by fuel: nothing has calibrated
+        // a fuel budget against a script's instruction budget. That choice was
+        // first forced by wasmtime 49.0.0, which dropped the fuel a callee
+        // spent when it returned by a `throw` its caller caught, and every Lua
+        // error on the wasi route is such a throw (100 million iterations
+        // under a caught throw cost 1,101 fuel). Wasmtime 49.0.1 fixed that
+        // (GHSA-m63x-6p34-q65x; #14407 in 50), and HappyView requires 49.0.4,
+        // so fuel is now charged across a caught throw. Fuel stays enabled
+        // engine-wide because it is what bounds libraries. The whole range also covers the per-byte
         // instantiation charge a megabytes-sized interpreter image draws on
         // a host without copy-on-write memory.
         PluginType::Interpreter => u64::MAX,
@@ -90,10 +90,11 @@ pub const FUEL_PER_INSTRUCTION: u64 = 4_000;
 /// The fuel each call into a compiled module gets. `None` is a job, which
 /// has no budget and stops through `should_stop`.
 ///
-/// Fuel can bound a compiled module where it cannot bound an interpreter
-/// (see [`fuel_for`]) because nothing here catches a wasm `throw`: stable
-/// Rust on wasm32-wasip1 aborts on panic and emits no exception-handling
-/// instructions, and a module that defines a tag is refused before it runs.
+/// A compiled module is bounded by fuel, where an interpreter is bounded by
+/// the wall clock (see [`fuel_for`]). It never catches a wasm `throw`:
+/// stable Rust on wasm32-wasip1 aborts on panic and emits no
+/// exception-handling instructions, and a module that defines a tag is
+/// refused before it runs (see `project::script_module`).
 pub fn module_fuel(instructions: Option<u32>) -> u64 {
     instructions.map_or(u64::MAX, |n| {
         u64::from(n).saturating_mul(FUEL_PER_INSTRUCTION)
@@ -171,6 +172,31 @@ pub struct WasmRuntime {
     modules: Arc<ModuleCache>,
 }
 
+/// The WebAssembly proposal HappyView turns off that `bytes` needs, if one
+/// is why the engine would refuse it: the component model, GC, or typed
+/// function references. `None` for a module that is valid without them, or
+/// one that is invalid anyway, whose own error says why.
+pub fn disabled_proposal(bytes: &[u8]) -> Option<&'static str> {
+    use wasmparser::{Parser, Validator, WasmFeatures};
+    if Parser::is_component(bytes) {
+        return Some("the WebAssembly component model");
+    }
+    let valid = |features: WasmFeatures| {
+        Validator::new_with_features(features)
+            .validate_all(bytes)
+            .is_ok()
+    };
+    let all = WasmFeatures::default();
+    let without_gc = all.difference(WasmFeatures::GC);
+    if valid(without_gc.difference(WasmFeatures::FUNCTION_REFERENCES)) || !valid(all) {
+        None
+    } else if !valid(without_gc) {
+        Some("WebAssembly GC")
+    } else {
+        Some("WebAssembly typed function references")
+    }
+}
+
 impl WasmRuntime {
     pub fn new() -> Result<Self, anyhow::Error> {
         Self::with_cache_dir(None)
@@ -221,6 +247,14 @@ impl WasmRuntime {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        // Off: no plugin HappyView runs uses them, and each is engine surface
+        // a guest could reach. The `gc` crate feature stays, because wasmtime
+        // enables exception handling only with it and the Lua interpreter
+        // throws. Reference types stay on: rustc and wasi-sdk's clang encode
+        // every `call_indirect` with them, so every plugin needs them.
+        config.wasm_gc(false);
+        config.wasm_function_references(false);
+        config.wasm_component_model(false);
         config.max_wasm_stack(MAX_WASM_STACK);
         config.async_stack_size(ASYNC_STACK_SIZE);
 
@@ -286,6 +320,29 @@ impl WasmRuntime {
         let modules = self.modules.clone();
         let plugin = plugin.clone();
         tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
+    }
+
+    /// Start compiling `plugin`'s module on a blocking thread, so its first
+    /// call finds it ready rather than waiting out a compile that takes
+    /// seconds for an interpreter. A call arriving mid-compile waits for this
+    /// one instead of starting its own. A plugin removed before the thread
+    /// runs is not compiled, and a failure is only logged: the first call
+    /// reports it.
+    pub fn warm(&self, plugin: &Arc<LoadedPlugin>) -> tokio::task::JoinHandle<()> {
+        let engine = self.engine.clone();
+        let modules = self.modules.clone();
+        let plugin = Arc::downgrade(plugin);
+        tokio::task::spawn_blocking(move || {
+            let Some(plugin) = plugin.upgrade() else {
+                return;
+            };
+            if modules.get_by_identity(&plugin.info.id, &plugin).is_some() {
+                return;
+            }
+            if let Err(e) = resolve(&engine, &modules, &plugin) {
+                tracing::warn!(plugin_id = %plugin.info.id, error = %e, "plugin module could not be precompiled");
+            }
+        })
     }
 
     /// [`WasmRuntime::module_for`] on the calling thread, for a caller
@@ -377,14 +434,25 @@ fn resolve(
         return Ok(module);
     }
     let key = cache_key(engine, &sha);
-    if let Some(module) = modules.load_from_disk(engine, &key) {
+    // One compile per key at a time: whoever waited here finds the module
+    // the holder inserted.
+    let slot = modules.compiling(&key);
+    let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| -> Result<Module, anyhow::Error> {
+        if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
+            return Ok(module);
+        }
+        if let Some(module) = modules.load_from_disk(engine, &key) {
+            modules.insert(id, plugin, &sha, module.clone());
+            return Ok(module);
+        }
+        let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
+        modules.write_to_disk(&key, &module, serialized.as_deref());
         modules.insert(id, plugin, &sha, module.clone());
-        return Ok(module);
-    }
-    let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
-    modules.write_to_disk(&key, &module, serialized.as_deref());
-    modules.insert(id, plugin, &sha, module.clone());
-    Ok(module)
+        Ok(module)
+    })();
+    modules.done_compiling(&key, &slot);
+    result
 }
 
 /// The total size of the compiled modules the process keeps for its
@@ -477,7 +545,13 @@ fn compile(
         }
     }
     modules.compiles.fetch_add(1, Ordering::Relaxed);
-    let module = Module::new(engine, wasm_bytes)?;
+    let module =
+        Module::new(engine, wasm_bytes).map_err(|e| match disabled_proposal(wasm_bytes) {
+            Some(proposal) => {
+                anyhow::anyhow!("this plugin uses {proposal}, which HappyView doesn't enable")
+            }
+            None => anyhow::Error::from(e),
+        })?;
     let Some(shared) = shared else {
         return Ok(Compiled {
             module,
@@ -572,9 +646,33 @@ struct ModuleCache {
     warned: AtomicBool,
     /// Set by [`WasmRuntime::without_shared_modules`].
     unshared: bool,
+    /// One lock per cache key being resolved, so two callers wanting the
+    /// same module compile it once.
+    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ModuleCache {
+    fn compiling(&self, key: &str) -> Arc<Mutex<()>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop `key`'s lock once nobody needs it. A waiter still holding a
+    /// clone finds the module by hash when it gets the lock.
+    fn done_compiling(&self, key: &str, slot: &Arc<Mutex<()>>) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(key)
+            .is_some_and(|held| Arc::ptr_eq(held, slot))
+        {
+            in_flight.remove(key);
+        }
+    }
+
     fn get_by_identity(&self, id: &str, plugin: &Arc<LoadedPlugin>) -> Option<Module> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.get(id)?;
@@ -910,6 +1008,93 @@ mod tests {
     }
 
     #[test]
+    fn a_module_using_gc_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let gc = wat::parse_str(
+            r#"(module
+                (type $point (struct (field i32)))
+                (func (export "make") (result (ref null $point))
+                    i32.const 1
+                    struct.new $point))"#,
+        )
+        .unwrap();
+        let err = runtime.compile(&gc).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses WebAssembly GC, which HappyView doesn't enable"
+        );
+    }
+
+    #[test]
+    fn a_module_using_typed_function_references_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let typed = wat::parse_str(
+            r#"(module
+                (type $f (func))
+                (func $g)
+                (elem declare func $g)
+                (func (export "call") (call_ref $f (ref.func $g))))"#,
+        )
+        .unwrap();
+        let err = runtime.compile(&typed).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses WebAssembly typed function references, which HappyView doesn't enable"
+        );
+    }
+
+    #[test]
+    fn a_component_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let component = wat::parse_str("(component)").unwrap();
+        let err = runtime.compile(&component).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses the WebAssembly component model, which HappyView doesn't enable"
+        );
+    }
+
+    /// Every plugin rustc or wasi-sdk builds needs reference types, and the
+    /// Lua interpreter throws, so turning the others off must leave both.
+    #[test]
+    fn reference_types_and_exceptions_still_compile() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (type $v (func))
+                (table $a 1 funcref)
+                (table $b 1 funcref)
+                (tag $oops (param i32))
+                (func $f)
+                (elem (table $b) (i32.const 0) func $f)
+                (func (export "run") (result i32)
+                    i32.const 0
+                    call_indirect $b (type $v)
+                    ref.null func
+                    drop
+                    block $caught (result i32)
+                        try_table (catch $oops $caught)
+                            i32.const 7
+                            throw $oops
+                        end
+                        i32.const 0
+                    end))"#,
+        )
+        .unwrap();
+        assert_eq!(disabled_proposal(&wasm), None);
+        runtime.compile(&wasm).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_module_keeps_its_own_error() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let wasm = wat::parse_str(r#"(module (func (result i32) i64.const 1))"#).unwrap();
+        assert_eq!(disabled_proposal(&wasm), None);
+        let err = runtime.compile(&wasm).unwrap_err().to_string();
+        assert!(!err.contains("doesn't enable"), "{err}");
+    }
+
+    #[test]
     fn test_fuel_constant_value() {
         // 10M fuel ≈ 100ms CPU time per spec
         assert_eq!(DEFAULT_FUEL, 10_000_000);
@@ -1242,7 +1427,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_compile_leaves_the_async_runtime_free() {
         let Some(dir) = std::env::var_os("HAPPYVIEW_LUA_PLUGIN") else {
-            eprintln!("skipping: HAPPYVIEW_LUA_PLUGIN is unset");
+            crate::test_support::unavailable(
+                "HAPPYVIEW_LUA_PLUGIN is unset. Run scripts/fetch-lua-plugin.sh and point it at tests/fixtures/lua-plugin",
+            );
             return;
         };
         let mut plugin = crate::plugin::loader::load_from_file(Path::new(&dir))
@@ -1270,6 +1457,32 @@ mod tests {
 
         assert_eq!(runtime.compile_count(), 1);
         assert!(during > 0, "the ticker did not run during the compile");
+    }
+
+    /// Callers wanting a module nobody holds yet compile it once: the rest
+    /// wait for the first and take what it compiled.
+    #[test]
+    fn concurrent_callers_compile_a_module_once() {
+        let runtime = Arc::new(
+            WasmRuntime::without_ticker()
+                .unwrap()
+                .without_shared_modules(),
+        );
+        let plugin = plugin("p", &answering(7));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (runtime, plugin, start) = (runtime.clone(), plugin.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.module_for_blocking(&plugin).unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(answer(&runtime, &thread.join().unwrap()), 7);
+        }
+        assert_eq!(runtime.compile_count(), 1);
     }
 
     #[test]
