@@ -1,9 +1,10 @@
 //! Cross-site request forgery protection for cookie-authenticated requests.
 //!
-//! On an https instance the session cookie is `SameSite=None`, so a browser
-//! sends it with a request another site starts. CORS keeps that site from
-//! reading the response, not the request from running, and a form POST needs
-//! no preflight. So an unsafe request carrying the session cookie runs only
+//! The session cookie is `SameSite=Lax`, so a browser sends it with a
+//! top-level `GET` navigation another site starts and with any request from a
+//! sibling on the same site, and an older browser may not honour the
+//! attribute at all. CORS keeps a page from reading the response, not the
+//! request from running. So an unsafe request carrying the session cookie runs only
 //! when the browser says it came from this instance (`Sec-Fetch-Site`), or its
 //! `Origin` is one of the instance's domains or an integration origin an admin
 //! listed in [`INTEGRATION_ORIGINS_SETTING`]. A request with neither header did
@@ -15,11 +16,15 @@
 //! or its JSON requests would fail their preflight and it could not read a
 //! response.
 //!
+//! Outside `/admin` the cookie is held to the stricter
+//! [`cookie_request_is_same_origin`]: it counts only on a request from the
+//! instance's own pages, and any other request runs as anonymous.
+//!
 //! Bearer, DPoP and API-key requests are untouched: none of them is a
 //! credential a browser attaches by itself.
 
 use axum::extract::{Request, State};
-use axum::http::{Method, header};
+use axum::http::{HeaderMap, Method, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -38,27 +43,14 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if is_safe(req.method()) || !carries_session_cookie(&req) {
         return next.run(req).await;
     }
-    let headers = req.headers();
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    let allowed = match (fetch_site, origin.as_deref()) {
-        (Some("same-origin" | "none"), _) => true,
-        (None, None) => true,
-        (_, Some(origin)) => origin_allowed(&state, origin).await,
-        (Some(_), None) => false,
-    };
-    if allowed {
+    if cookie_request_is_first_party(&state, req.headers()).await {
         return next.run(req).await;
     }
 
     tracing::warn!(
         method = %req.method(),
         path = req.uri().path(),
-        origin = origin.as_deref().unwrap_or(""),
+        origin = origin_of(req.headers()).unwrap_or(""),
         "refused a cross-site request carrying the session cookie"
     );
     AppError::Forbidden(format!(
@@ -66,6 +58,40 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
          integration's origin in the {INTEGRATION_ORIGINS_SETTING} setting"
     ))
     .into_response()
+}
+
+/// Whether a request carrying the session cookie may use it: the browser says
+/// it came from this instance, or its `Origin` is one of the instance's
+/// domains or a listed integration, or it sent neither header and so did not
+/// come from a browser. [`guard`]'s rule for an unsafe request; outside
+/// `/admin` the cookie is held to [`cookie_request_is_same_origin`].
+async fn cookie_request_is_first_party(state: &AppState, headers: &HeaderMap) -> bool {
+    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    match (fetch_site, origin_of(headers)) {
+        (Some("same-origin" | "none"), _) => true,
+        (None, None) => true,
+        (_, Some(origin)) => origin_allowed(state, origin).await,
+        (Some(_), None) => false,
+    }
+}
+
+/// Whether a request came from one of this instance's own pages, the only
+/// place the session cookie counts outside `/admin`: the browser says so
+/// (`Sec-Fetch-Site: same-origin`), or, from a browser too old to send that,
+/// its `Origin` is one of the instance's domains. Anything else, including a
+/// request with neither header, is not.
+pub async fn cookie_request_is_same_origin(state: &AppState, headers: &HeaderMap) -> bool {
+    match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        Some(site) => site == "same-origin",
+        None => match origin_of(headers) {
+            Some(origin) => state.domain_cache.is_allowed_origin(origin).await,
+            None => false,
+        },
+    }
+}
+
+fn origin_of(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
 }
 
 fn is_safe(method: &Method) -> bool {

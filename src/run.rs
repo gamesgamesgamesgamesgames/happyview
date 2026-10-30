@@ -404,6 +404,12 @@ async fn boot(
     }
 
     crate::telemetry::collect::health::note_restart(&db_pool, db_backend).await;
+    crate::telemetry::collect::health::note_version(
+        &db_pool,
+        db_backend,
+        crate::version::version(),
+    )
+    .await;
     crate::maintenance::nsid_audit::run(&db_pool, db_backend).await;
     crate::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
