@@ -221,6 +221,8 @@ curl -X POST http://127.0.0.1:3000/admin/api-clients \
 | `scopes`                 | string   | no       | Space-separated OAuth scopes (default `"atproto"`)                                     |
 | `rate_limit_capacity`    | integer  | no       | Per-client token bucket capacity. Falls back to `DEFAULT_RATE_LIMIT_CAPACITY` if unset |
 | `rate_limit_refill_rate` | number   | no       | Tokens added per second. Falls back to `DEFAULT_RATE_LIMIT_REFILL_RATE` if unset       |
+| `client_type`            | string   | no       | `"confidential"` (default) or `"public"`. Any other value is refused with `400`        |
+| `allowed_origins`        | string[] | no       | Origins a public client's requests may come from                                       |
 
 **Response**: `201 Created`
 
@@ -317,7 +319,10 @@ curl -X PUT http://127.0.0.1:3000/admin/api-clients/01J9... \
 | `scopes`                 | string   | Replace the OAuth scopes                                               |
 | `rate_limit_capacity`    | integer  | New bucket capacity. Pass `null` to clear the override                 |
 | `rate_limit_refill_rate` | number   | New refill rate. Pass `null` to clear the override                     |
+| `allowed_origins`        | string[] | Replace the allowed origins. Pass `null` to clear them                 |
 | `is_active`              | boolean  | Disable (`false`) or re-enable (`true`) the client without deleting it |
+
+A field left out is unchanged; `null` clears it.
 
 **Response**: `204 No Content`
 

@@ -330,10 +330,11 @@ pub(super) async fn bulk_retry(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::DeadLettersManage).await?;
     let ids = resolve_bulk_ids(&state, &body).await?;
+    let mut results = Vec::with_capacity(ids.len());
     for id in &ids {
-        retry_single(&state, id).await?;
+        results.push((id.clone(), retry_single(&state, id).await));
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(bulk_results(results)))
 }
 
 /// `POST /admin/dead-letters/bulk/reindex`
@@ -344,10 +345,31 @@ pub(super) async fn bulk_reindex(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::DeadLettersManage).await?;
     let ids = resolve_bulk_ids(&state, &body).await?;
+    let mut results = Vec::with_capacity(ids.len());
     for id in &ids {
-        reindex_single(&state, id).await?;
+        results.push((id.clone(), reindex_single(&state, id).await));
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(bulk_results(results)))
+}
+
+/// A bulk action's answer: one entry per dead letter, in the order they were
+/// tried, so one that fails does not stop the rest or hide which did. `ok`
+/// is whether every one succeeded.
+fn bulk_results(results: Vec<(String, Result<(), AppError>)>) -> Value {
+    let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+    let items: Vec<Value> = results
+        .into_iter()
+        .map(|(id, result)| match result {
+            Ok(()) => serde_json::json!({ "id": id, "ok": true }),
+            Err(e) => serde_json::json!({ "id": id, "ok": false, "error": e.to_string() }),
+        })
+        .collect();
+    serde_json::json!({
+        "ok": failed == 0,
+        "succeeded": items.len() - failed,
+        "failed": failed,
+        "results": items,
+    })
 }
 
 // ---------------------------------------------------------------------------

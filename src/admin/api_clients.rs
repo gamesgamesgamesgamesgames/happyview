@@ -32,6 +32,12 @@ pub(super) async fn create_api_client(
 ) -> Result<(StatusCode, Json<CreateApiClientResponse>), AppError> {
     auth.require(Permission::ApiClientsCreate).await?;
 
+    if body.client_type != "confidential" && body.client_type != "public" {
+        return Err(AppError::BadRequest(
+            "client_type must be 'confidential' or 'public'".into(),
+        ));
+    }
+
     if state.oauth.is_domain_client_id(&body.client_id_url) {
         return Err(AppError::Conflict(format!(
             "client_id_url '{}' conflicts with a registered domain's OAuth client",
