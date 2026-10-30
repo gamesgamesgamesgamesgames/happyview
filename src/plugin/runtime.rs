@@ -25,13 +25,14 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
         PluginType::Library | PluginType::Auth => DEFAULT_FUEL,
         // An interpreter is bounded by the operator's wall clock, an epoch
         // deadline armed per run, rather than by fuel: nothing has calibrated
-        // a fuel budget against a script's instruction budget. Fuel is still
-        // charged, including across a caught `throw` (every Lua error on the
-        // wasi route is one): on wasmtime 49.0.5 and 50.0.1, a frame that
-        // catches a throw keeps the fuel its callees spent, whether they were
-        // reached by `call`, `call_indirect` or `call_ref`, and runs out of
-        // fuel when it should. Fuel stays enabled engine-wide because it is
-        // what bounds libraries. The whole range also covers the per-byte
+        // a fuel budget against a script's instruction budget. That choice was
+        // first forced by wasmtime 49.0.0, which dropped the fuel a callee
+        // spent when it returned by a `throw` its caller caught, and every Lua
+        // error on the wasi route is such a throw (100 million iterations
+        // under a caught throw cost 1,101 fuel). Wasmtime 49.0.1 fixed that
+        // (GHSA-m63x-6p34-q65x; #14407 in 50), and HappyView requires 49.0.4,
+        // so fuel is now charged across a caught throw. Fuel stays enabled
+        // engine-wide because it is what bounds libraries. The whole range also covers the per-byte
         // instantiation charge a megabytes-sized interpreter image draws on
         // a host without copy-on-write memory.
         PluginType::Interpreter => u64::MAX,

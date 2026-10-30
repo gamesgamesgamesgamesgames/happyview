@@ -2060,8 +2060,9 @@ mod deadline {
 
     /// Wasmtime 49 accepts exception handling, and the epoch deadline stops
     /// a guest that loops inside a frame catching its own throws. Fuel is
-    /// charged for that loop too, about 9 per iteration; a throw is slow
-    /// enough that the deadline arrives well before the fuel runs out.
+    /// charged for that loop too (wasmtime 49.0.0 dropped it; 49.0.1 fixed
+    /// that), about 9 per iteration; a throw is slow enough that the deadline
+    /// arrives well before the fuel runs out.
     /// `cargo test --lib plugin::executor::deadline::a_guest -- --nocapture`
     /// prints the fuel the loop was charged.
     #[tokio::test]

@@ -225,11 +225,11 @@ fn load_one(
             )]);
         }
     }
-    // A module is bounded by fuel, and wasmtime 49 predates the fix that
-    // saves and restores fuel around exception catches (wasmtime#14407, in
-    // 50). The shapes tested charge correctly on 49 regardless, but a module
-    // that catches its own throws is refused until fuel across a catch is
-    // something HappyView relies on and tests.
+    // A module is bounded by fuel. Wasmtime 49.0.0 dropped the fuel a callee
+    // spent when it returned by a caught `throw`; 49.0.1 fixed that
+    // (GHSA-m63x-6p34-q65x), and HappyView requires 49.0.4. A module that
+    // catches its own throws is still refused until fuel across a catch is
+    // something HappyView tests rather than takes from wasmtime's changelog.
     if sections.uses_exceptions {
         return Err(vec![error(
             &artifact,
