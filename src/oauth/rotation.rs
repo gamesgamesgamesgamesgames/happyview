@@ -43,27 +43,44 @@ pub async fn rotate_instance_key(state: &AppState) -> Result<(ClientKey, u64), A
 
 /// Publish a new instance key that takes over after
 /// [`client_keys::ROTATION_OVERLAP`]. Returns it and when it takes over;
-/// [`run_key_promotion`] switches the clients over then.
-pub async fn stage_instance_key(state: &AppState) -> Result<(ClientKey, String), AppError> {
-    client_keys::stage_key(
+/// [`run_key_promotion`] switches the clients over then. With no current
+/// key to keep signing, the new one is installed at once and the time is
+/// `None`.
+pub async fn stage_instance_key(state: &AppState) -> Result<(ClientKey, Option<String>), AppError> {
+    let (key, activates_at) = client_keys::stage_key(
         &state.db,
         state.db_backend,
         state.config.token_encryption_key.as_ref(),
         INSTANCE_OWNER,
     )
-    .await
+    .await?;
+    if activates_at.is_none() {
+        install_instance_key(state, &key).await;
+    }
+    Ok((key, activates_at))
 }
 
-/// Every minute, promote the staged keys that are due, and rebuild the
-/// instance's clients when its key has changed underneath them, whether this
-/// process promoted it or another did.
+/// The longest [`run_key_promotion`] sleeps. A key staged while it sleeps
+/// is promoted at most this long after it comes due.
+const PROMOTION_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Promote the staged keys as they come due, and rebuild the instance's
+/// clients when its key has changed underneath them, whether this process
+/// promoted it or another did. Wakes when the next staged key is due, and
+/// at least every [`PROMOTION_POLL`]. Spawned by the boot.
 pub async fn run_key_promotion(state: AppState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
-        interval.tick().await;
         if let Err(e) = promote_and_install(&state).await {
             tracing::warn!(error = %e, "failed to promote staged OAuth client keys");
         }
+        let wait = match client_keys::next_activation(&state.db, state.db_backend).await {
+            Ok(Some(at)) => (at - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default()
+                .min(PROMOTION_POLL),
+            _ => PROMOTION_POLL,
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 

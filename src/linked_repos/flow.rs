@@ -61,14 +61,30 @@ pub async fn client_and_kid_for_grant(
     resolve_grant_client(state, grant, true).await
 }
 
-/// The client to use when starting a *new* authorization.
+/// The client to use when starting a *new* authorization, and the kid it
+/// signs with.
 pub async fn client_for_new_authorization(
     state: &AppState,
     grant: &LinkedRepo,
-) -> Result<Arc<HappyViewOAuthClient>, AppError> {
-    resolve_grant_client(state, grant, false)
-        .await
-        .map(|(client, _)| client)
+) -> Result<(Arc<HappyViewOAuthClient>, Option<String>), AppError> {
+    resolve_grant_client(state, grant, false).await
+}
+
+/// The client to finish an authorization with: the one that started it,
+/// when its key is still held, since the reference provider refuses a code
+/// exchange signed by another key than the request was. Otherwise as for a
+/// refresh.
+pub async fn client_and_kid_for_callback(
+    state: &AppState,
+    grant: &LinkedRepo,
+    authorize_kid: Option<&str>,
+) -> Result<(Arc<HappyViewOAuthClient>, Option<String>), AppError> {
+    if let Some(kid) = authorize_kid
+        && let Some(client) = state.oauth.get_linked_repos_for_kid(kid)
+    {
+        return Ok((client, Some(kid.to_string())));
+    }
+    client_and_kid_for_grant(state, grant).await
 }
 
 async fn resolve_grant_client(
@@ -177,7 +193,7 @@ pub async fn start_authorization(
     origin: AuthOrigin,
 ) -> Result<String, AppError> {
     let scopes = crate::auth::parse_scope_string(&grant.scopes);
-    let client = client_for_new_authorization(state, grant).await?;
+    let (client, authorize_kid) = client_for_new_authorization(state, grant).await?;
 
     let guard = state.oauth_state_store.authorize_lock.lock().await;
 
@@ -213,8 +229,8 @@ pub async fn start_authorization(
     drop(guard);
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_linked_repo_auth_state (state, grant_id, expires_at, origin) \
-         VALUES (?, ?, ?, ?)",
+        "INSERT INTO happyview_linked_repo_auth_state (state, grant_id, expires_at, origin, kid) \
+         VALUES (?, ?, ?, ?, ?)",
         state.db_backend,
     );
     crate::db::query(&sql)
@@ -222,6 +238,7 @@ pub async fn start_authorization(
         .bind(&grant.id)
         .bind(expires_at(STATE_TTL_SECS))
         .bind(origin.as_str())
+        .bind(authorize_kid.as_deref())
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to store linked auth state: {e}")))?;
@@ -384,6 +401,8 @@ pub enum PendingGrant {
     Grant {
         grant_id: String,
         origin: AuthOrigin,
+        /// The key the authorization was started with.
+        kid: Option<String>,
     },
 }
 
@@ -392,17 +411,17 @@ pub async fn take_pending_grant(
     oauth_state: &str,
 ) -> Result<PendingGrant, AppError> {
     let sql = adapt_sql(
-        "SELECT grant_id, expires_at, origin FROM happyview_linked_repo_auth_state \
+        "SELECT grant_id, expires_at, origin, kid FROM happyview_linked_repo_auth_state \
          WHERE state = ? AND token_hash IS NULL",
         state.db_backend,
     );
-    let row: Option<(String, String, Option<String>)> = crate::db::query_as(&sql)
+    let row: Option<(String, String, Option<String>, Option<String>)> = crate::db::query_as(&sql)
         .bind(oauth_state)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to look up linked auth state: {e}")))?;
 
-    let Some((grant_id, expires, origin)) = row else {
+    let Some((grant_id, expires, origin, kid)) = row else {
         return Ok(PendingGrant::NotLinked);
     };
     let origin = AuthOrigin::parse(origin.as_deref());
@@ -425,7 +444,11 @@ pub async fn take_pending_grant(
         return Ok(PendingGrant::Expired);
     }
 
-    Ok(PendingGrant::Grant { grant_id, origin })
+    Ok(PendingGrant::Grant {
+        grant_id,
+        origin,
+        kid,
+    })
 }
 
 pub async fn complete(state: &AppState, grant_id: &str, did: &str) -> Result<(), AppError> {

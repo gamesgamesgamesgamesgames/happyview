@@ -1027,6 +1027,13 @@ async fn a_rotation_stages_the_new_key_until_caches_have_seen_it() {
         )
         .await
         .unwrap();
+    // No cache that honours it keeps the set past the overlap.
+    assert_eq!(
+        jwks.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=600")
+    );
     let jwks = json_body(jwks).await;
     let kids: Vec<&str> = jwks["keys"]
         .as_array()

@@ -457,24 +457,26 @@ pub async fn rotate_key(
 /// [`ROTATION_OVERLAP`] (see [`promote_due_keys`]). The current key keeps
 /// signing until then, so no authorization server ever sees a signature from
 /// a key it has not had the chance to fetch. Staging again while a key is
-/// waiting returns that key rather than a second one.
+/// waiting returns that key rather than a second one. An owner with no
+/// current key has nothing to keep signing with, so its new key is made
+/// current at once; the returned activation time is `None` then.
 pub async fn stage_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     enc: Option<&[u8; 32]>,
     owner: &str,
-) -> Result<(ClientKey, String), AppError> {
-    if let Some(waiting) = list_keys_for_owner(pool, backend, owner)
-        .await?
-        .into_iter()
-        .find(|k| k.status == KeyStatus::Pending)
-    {
+) -> Result<(ClientKey, Option<String>), AppError> {
+    let listed = list_keys_for_owner(pool, backend, owner).await?;
+    if let Some(waiting) = listed.iter().find(|k| k.status == KeyStatus::Pending) {
         let key = load_keys(pool, backend, enc, owner)
             .await?
             .into_iter()
             .find(|k| k.kid == waiting.kid)
             .ok_or_else(|| AppError::Internal("the pending key vanished".into()))?;
-        return Ok((key, waiting.activates_at.unwrap_or_default()));
+        return Ok((key, waiting.activates_at.clone()));
+    }
+    if !listed.iter().any(|k| k.status == KeyStatus::Current) {
+        return Ok((rotate_key(pool, backend, enc, owner).await?, None));
     }
     let mut key = generate_client_key(owner)?;
     key.status = KeyStatus::Pending;
@@ -502,7 +504,25 @@ pub async fn stage_key(
         .await
         .map_err(|e| AppError::Internal(format!("failed to store client key: {e}")))?;
 
-    Ok((key, activates_at))
+    Ok((key, Some(activates_at)))
+}
+
+/// When the next `pending` key is due, if any is waiting.
+pub async fn next_activation(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+    let sql = adapt_sql(
+        "SELECT MIN(activates_at) FROM happyview_oauth_client_keys WHERE status = 'pending'",
+        backend,
+    );
+    let (at,): (Option<String>,) = crate::db::query_as(&sql)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read the next key activation: {e}")))?;
+    Ok(at
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc)))
 }
 
 /// Promote every `pending` key whose overlap has run out, demoting its

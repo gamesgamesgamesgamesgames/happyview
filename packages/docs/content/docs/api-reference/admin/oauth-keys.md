@@ -17,7 +17,9 @@ Because of that difference, **the current key cannot be revoked** — doing so w
 
 Authorization servers cache a client's metadata and key set: Tranquil for an hour from when it fetched them, the reference PDS for less. A key that signs before a server has seen it fails `private_key_jwt`, so every new sign-in through that server would fail until its cache ran out. A rotated key is therefore published first, as `pending`, and only signs once that has had time to happen (`activates_at`, 75 minutes after the rotation). The instance switches over on its own; nothing needs restarting.
 
-The instance's metadata names its key set by `jwks_uri` (`/oauth/clients/instance/jwks.json`) rather than inlining it, so a server that meets an unfamiliar `kid` can fetch the set again instead of waiting for the whole document to expire.
+The instance's metadata names its key set by `jwks_uri` (`/oauth/clients/instance/jwks.json`) rather than inlining it, so a server that meets an unfamiliar `kid` can fetch the set again instead of waiting for the whole document to expire. Every key set is served with `Cache-Control: public, max-age=600`, well inside the overlap, for servers that honour it.
+
+A sign-in that is in flight when a key takes over finishes with the key it started with. Its session is pinned to that key, which stays published as `retiring`.
 
 ```ts tab="TypeScript" tab-group="language"
 const TOKEN = "hv_..."; // your API key
@@ -118,7 +120,7 @@ POST /admin/oauth/instance-key/rotate
 
 Publishes a new key as `pending`. At `activates_at`, about 75 minutes later, it becomes `current` and the previous key is demoted to `retiring` (see [Why a new key waits](#why-a-new-key-waits)). Nothing is logged out: the retiring key stays in the published JWKS and keeps signing refreshes for every session established with it. New sessions use the new key from then on. Rotating again while a key is pending returns that key.
 
-Send `{"immediate": true}` to switch now instead: the pending key if there is one, otherwise a fresh key, becomes `current` at once. Sign-ins through a server that cached the old key set can fail for up to an hour, so keep this for a key that has leaked.
+An owner with no current key gets its new key as `current` at once, since there is nothing to keep signing with in the meantime. Send `{"immediate": true}` to switch now instead: the pending key if there is one, otherwise a fresh key, becomes `current` at once. Sign-ins through a server that cached the old key set can fail for up to an hour, so keep this for a key that has leaked.
 
 `orphaned_sessions` counts sessions that predate key pinning and therefore carry no recorded `kid`. These cannot be protected by this or any future rotation.
 

@@ -166,8 +166,6 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
         });
     }
 
-    tokio::spawn(crate::oauth::rotation::run_key_promotion(state.clone()));
-
     {
         let telemetry_state = state.clone();
         tokio::spawn(async move {
@@ -1187,6 +1185,10 @@ async fn boot(
         state.db.clone(),
         state.db_backend,
     ));
+
+    // Staged OAuth client keys take over when they come due. In the boot,
+    // rather than in `run`, so `boot_for_test` exercises it too.
+    tokio::spawn(crate::oauth::rotation::run_key_promotion(state.clone()));
 
     // Where `jetstream::spawn` stood: live ingest starts after the project
     // is installed and before anything else is spawned.

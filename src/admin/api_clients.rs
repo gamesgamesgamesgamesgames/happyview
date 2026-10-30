@@ -736,9 +736,7 @@ pub(super) async fn rotate_auth_key(
             crate::oauth::client_keys::rotate_key(&state.db, state.db_backend, enc, &id).await?;
         (key, None)
     } else {
-        let (key, at) =
-            crate::oauth::client_keys::stage_key(&state.db, state.db_backend, enc, &id).await?;
-        (key, Some(at))
+        crate::oauth::client_keys::stage_key(&state.db, state.db_backend, enc, &id).await?
     };
 
     let orphaned_sessions =
@@ -788,8 +786,7 @@ pub(super) async fn rotate_instance_key(
         let (key, _) = crate::oauth::rotation::rotate_instance_key(&state).await?;
         (key, None)
     } else {
-        let (key, at) = crate::oauth::rotation::stage_instance_key(&state).await?;
-        (key, Some(at))
+        crate::oauth::rotation::stage_instance_key(&state).await?
     };
     let orphaned_sessions = crate::oauth::client_keys::count_unstamped_sessions(
         &state.db,

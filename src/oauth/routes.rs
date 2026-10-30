@@ -33,10 +33,14 @@ pub fn routes() -> Router<AppState> {
 /// stranger's PDS. It is public key material and reveals nothing: an unknown
 /// or keyless client id returns an empty key set rather than a 404, so this
 /// endpoint cannot be used to enumerate which client ids exist.
+///
+/// `Cache-Control` asks caches to keep it no longer than [`JWKS_MAX_AGE`],
+/// well inside `client_keys::ROTATION_OVERLAP`, so a cache that honours it
+/// has the staged key before it signs.
 async fn client_jwks(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
@@ -44,8 +48,17 @@ async fn client_jwks(
         &id,
     )
     .await?;
-    Ok(Json(super::client_keys::render_jwks(&keys)))
+    Ok((
+        [(
+            axum::http::header::CACHE_CONTROL,
+            format!("public, max-age={JWKS_MAX_AGE}"),
+        )],
+        Json(super::client_keys::render_jwks(&keys)),
+    ))
 }
+
+/// Seconds a key set may be cached for; see [`client_jwks`].
+pub const JWKS_MAX_AGE: u64 = 600;
 
 #[derive(Deserialize)]
 struct ClientAssertionBody {
@@ -157,8 +170,22 @@ async fn mint_client_assertion(
     )
     .await?;
 
-    let key = super::client_keys::find_by_kid(&keys, body.kid.as_deref()).ok_or_else(
-        || match body.kid.as_deref() {
+    // A sign-in's PAR and its code exchange each need an assertion, and the
+    // reference provider refuses an exchange signed by another key than the
+    // PAR was. So a provision keeps the key its first assertion used, even
+    // if a staged key took over in between, for as long as that key is held.
+    let provision_kid = match body.provision_id.as_deref() {
+        Some(provision_id) if body.kid.is_none() => {
+            keys::provision_assertion_kid(&state.db, state.db_backend, provision_id)
+                .await?
+                .filter(|kid| keys_hold(&keys, kid))
+        }
+        _ => None,
+    };
+    let wanted_kid = body.kid.as_deref().or(provision_kid.as_deref());
+
+    let key = super::client_keys::find_by_kid(&keys, wanted_kid).ok_or_else(|| {
+        match body.kid.as_deref() {
             Some(kid) => AppError::BadRequest(format!(
                 "no usable authentication key '{kid}' for this client; it may have been revoked, \
                  in which case any session established under it is gone and the app must run a \
@@ -167,8 +194,8 @@ async fn mint_client_assertion(
             None => AppError::BadRequest(
                 "this client has no authentication key; provision one first".into(),
             ),
-        },
-    )?;
+        }
+    })?;
 
     let client_id_url =
         super::pds_write::lookup_client_id_url(&state.db, state.db_backend, &client.id).await?;
@@ -193,6 +220,11 @@ async fn mint_client_assertion(
 
     let assertion =
         super::client_assertion::build(&key.private_jwk, &key.kid, &client_id_url, &body.issuer)?;
+
+    if let Some(provision_id) = body.provision_id.as_deref() {
+        keys::record_provision_assertion_kid(&state.db, state.db_backend, provision_id, &key.kid)
+            .await?;
+    }
 
     Ok(Json(serde_json::json!({
         "client_assertion": assertion,
@@ -248,6 +280,12 @@ struct ProvisionKeyResponse {
 struct RegisterSessionBody {
     provision_id: String,
     pkce_verifier: Option<String>,
+    /// The kid of the client assertion that signed the token exchange, as
+    /// `/oauth/client-assertion` returned it. Its refreshes must be signed
+    /// with the same key. Optional: HappyView remembers it for assertions
+    /// minted against this provision.
+    #[serde(default)]
+    signing_kid: Option<String>,
     did: String,
     access_token: String,
     refresh_token: Option<String>,
@@ -516,16 +554,29 @@ async fn register_session(
         ));
     }
 
-    let signing_kid = super::client_keys::load_keys(
+    // Pin the session to the key that signed its token exchange, not the one
+    // current now: a staged key may have taken over in between, and a
+    // refresh signed by another key than the session's destroys it.
+    let client_keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
         state.config.token_encryption_key.as_ref(),
         &client.id,
     )
-    .await?
-    .into_iter()
-    .find(|k| k.status == super::client_keys::KeyStatus::Current)
-    .map(|k| k.kid);
+    .await?;
+    let provision_kid =
+        keys::provision_assertion_kid(&state.db, state.db_backend, &body.provision_id).await?;
+    let signing_kid = body
+        .signing_kid
+        .clone()
+        .or(provision_kid)
+        .filter(|kid| keys_hold(&client_keys, kid))
+        .or_else(|| {
+            client_keys
+                .iter()
+                .find(|k| k.status == super::client_keys::KeyStatus::Current)
+                .map(|k| k.kid.clone())
+        });
 
     // Store the session
     let session_id = Uuid::new_v4().to_string();
@@ -988,4 +1039,10 @@ async fn authenticate_request_client(
         resolved,
         dpop_key_id: Some(dpop_key_id),
     })
+}
+
+/// Whether `kid` is one of the client's published keys: a session can only
+/// be pinned to, and an assertion only signed with, a key that is.
+fn keys_hold(keys: &[super::client_keys::ClientKey], kid: &str) -> bool {
+    keys.iter().any(|k| k.kid == kid)
 }

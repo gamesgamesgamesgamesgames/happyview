@@ -1064,9 +1064,10 @@ async fn a_staged_key_is_published_but_signs_nothing_until_it_takes_over() {
             .await
             .unwrap();
     assert_eq!(pending.status, KeyStatus::Pending);
-    let activates_at = chrono::DateTime::parse_from_rfc3339(&activates_at)
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let activates_at =
+        chrono::DateTime::parse_from_rfc3339(activates_at.as_deref().expect("staged"))
+            .unwrap()
+            .with_timezone(&chrono::Utc);
     assert!(
         activates_at - chrono::Utc::now() > chrono::Duration::hours(1),
         "the overlap must outlast an hour of metadata caching, got {activates_at}"
@@ -1196,4 +1197,101 @@ async fn a_promotion_moves_the_instance_clients_to_the_new_key() {
         .linked_repos_primary()
         .expect("the promotion installs clients built around the new key");
     assert_eq!(kid.as_deref(), Some(new.kid.as_str()));
+}
+
+/// With no current key there is nothing to keep signing while a staged one
+/// waits, so a rotation makes its key current at once.
+#[tokio::test]
+#[serial]
+async fn staging_with_no_current_key_switches_at_once() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let (key, activates_at) =
+        happyview::oauth::client_keys::stage_key(&pool, backend, None, "keyless-client")
+            .await
+            .unwrap();
+    assert_eq!(key.status, KeyStatus::Current);
+    assert_eq!(activates_at, None);
+    let keys = load_keys(&pool, backend, None, "keyless-client")
+        .await
+        .unwrap();
+    assert_eq!(
+        happyview::oauth::client_keys::find_by_kid(&keys, None).map(|k| k.kid.as_str()),
+        Some(key.kid.as_str()),
+        "the client can sign straight away"
+    );
+}
+
+/// An authorization in flight when a key takes over finishes with the key
+/// it started with: the reference provider refuses a code exchange signed by
+/// another key than the request was.
+#[tokio::test]
+#[serial]
+async fn an_authorization_finishes_with_the_key_it_started_with() {
+    common::require_db!();
+    let app = common::app::TestApp::new().await;
+    let pool = &app.state.db;
+    let backend = app.state.db_backend;
+    ensure_instance_key(pool, backend, None).await.unwrap();
+
+    let (started_with, _) = happyview::oauth::rotation::rotate_instance_key(&app.state)
+        .await
+        .unwrap();
+    let (current, _) = happyview::oauth::rotation::rotate_instance_key(&app.state)
+        .await
+        .unwrap();
+
+    // A dashboard login's callback finds the client for the key it started with.
+    assert!(
+        app.state
+            .oauth
+            .get_for_kid(
+                &app.state.config.instance_client_id_url(),
+                &started_with.kid
+            )
+            .is_some(),
+        "a superseded key's client stays registered for in-flight sign-ins"
+    );
+
+    // A linked-repo authorization's callback uses that key's client too.
+    let grant = happyview::linked_repos::db::create(
+        &app.state,
+        None,
+        None,
+        None,
+        "atproto",
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+    let (client, kid) = happyview::linked_repos::flow::client_and_kid_for_callback(
+        &app.state,
+        &grant,
+        Some(&started_with.kid),
+    )
+    .await
+    .unwrap();
+    assert_eq!(kid.as_deref(), Some(started_with.kid.as_str()));
+    assert!(std::sync::Arc::ptr_eq(
+        &client,
+        &app.state
+            .oauth
+            .get_linked_repos_for_kid(&started_with.kid)
+            .unwrap()
+    ));
+
+    let (_, kid) =
+        happyview::linked_repos::flow::client_and_kid_for_callback(&app.state, &grant, None)
+            .await
+            .unwrap();
+    // A loopback instance's fallback client signs with nothing at all.
+    assert_ne!(
+        kid.as_deref(),
+        Some(started_with.kid.as_str()),
+        "with no recorded key, never the superseded one"
+    );
+    assert_ne!(current.kid, started_with.kid);
 }
