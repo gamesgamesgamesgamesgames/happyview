@@ -119,6 +119,53 @@ pub async fn repin_dpop_session_signing_kid(
     Ok(())
 }
 
+/// The scope the authorization server reported for this session, if HappyView
+/// has read one from a token response of its own since the session was last
+/// registered.
+pub async fn get_granted_scope(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    session_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT granted_scope FROM happyview_dpop_sessions WHERE id = ?",
+        backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read granted scope: {e}")))?;
+    Ok(row.and_then(|(scope,)| scope))
+}
+
+/// Set (or, with `None`, clear) the session's granted scope. Only a token
+/// response HappyView received may set it; a registration clears it, since the
+/// tokens it brings came from the app.
+pub async fn set_granted_scope(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    dpop_key_id: &str,
+    user_did: &str,
+    scope: Option<&str>,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_sessions SET granted_scope = ? \
+         WHERE api_client_id = ? AND dpop_key_id = ? AND user_did = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(scope)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
+        .bind(user_did)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to store granted scope: {e}")))?;
+    Ok(())
+}
+
 /// Look up a DPoP session by api_client_id, user_did, and dpop_key_id, decrypting tokens.
 pub async fn get_dpop_session(
     pool: &sqlx::AnyPool,

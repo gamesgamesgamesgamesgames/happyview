@@ -1,0 +1,2059 @@
+//! Replay backfill against a mock Jetstream archive. Needs TEST_DATABASE_URL
+//! for the database tests; the writer and mock tests run without it.
+
+mod common;
+
+use common::app::TestApp;
+use common::jetstream::{self as js, MockJetstream};
+use common::segment_writer::write_segment;
+use happyview::host::AppHost;
+use happyview_source_jetstream::archive::SourceChoice;
+use happyview_source_jetstream::archive::client::{ArchiveClient, PlanMode, PlanRequest};
+use happyview_source_jetstream::archive::{ArchiveConfig, rows, segment};
+use happyview_source_jetstream::consumer::config::{
+    DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
+};
+use happyview_source_jetstream::consumer::workers::RetryPolicy;
+use serde_json::json;
+use serial_test::serial;
+use std::io::Cursor;
+use std::time::Duration;
+
+const GAME: &str = "games.gamesgamesgamesgames.game";
+
+fn game(title: &str) -> serde_json::Value {
+    json!({ "$type": GAME, "title": title, "createdAt": "2026-10-12T00:00:00.000Z" })
+}
+
+#[test]
+fn the_test_writer_round_trips_through_the_reader() {
+    let events = vec![
+        js::archive_create(1, "did:plc:a", GAME, "r1", game("one")),
+        js::archive_update(2, "did:plc:a", GAME, "r1", game("two")),
+        js::archive_delete(3, "did:plc:a", GAME, "r1"),
+        js::archive_account(4, "did:plc:a", false, Some("takendown")),
+        js::archive_sync(5, "did:plc:b"),
+        js::archive_identity(6, "did:plc:c"),
+        js::archive_create(
+            7,
+            "did:plc:b",
+            "app.other.thing",
+            "r2",
+            json!({ "$type": "app.other.thing" }),
+        ),
+    ];
+    let written = write_segment(&events, 3);
+    assert_eq!(written.blocks.len(), 3);
+    let mut file = Cursor::new(&written.bytes);
+    let index = segment::read_index(&mut file, written.bytes.len() as u64).unwrap();
+    let mut rows_read = Vec::new();
+    for entry in &index {
+        rows_read.extend(
+            segment::decode_block(&segment::read_block_frame(&mut file, entry).unwrap()).unwrap(),
+        );
+    }
+    assert_eq!(rows_read.len(), events.len());
+    for (row, event) in rows_read.iter().zip(&events) {
+        assert_eq!(
+            (row.seq, row.kind, &row.did, &row.payload),
+            (event.seq, event.kind, &event.did, &event.payload)
+        );
+        assert_eq!(row.witnessed_at, event.witnessed_at);
+    }
+    // And the conversion agrees with the live mock's events of the same seq.
+    let created = rows::row_to_event(rows_read[0].clone()).unwrap().unwrap();
+    let live = js::create(1, "did:plc:a", GAME, "r1", game("one"));
+    let happyview_source_jetstream::consumer::event::EventKind::Commit(commit) = created.kind
+    else {
+        panic!()
+    };
+    assert_eq!(commit.cid.as_deref(), live["cid"].as_str());
+    assert_eq!(commit.rev.as_deref(), live["rev"].as_str());
+    assert_eq!(commit.record.as_ref(), Some(&live["record"]));
+}
+
+#[tokio::test]
+async fn the_mock_archive_plans_pages_and_serves_what_it_planned() {
+    let mock = MockJetstream::start().await;
+    let a = mock.seal(
+        (1..=8)
+            .map(|s| js::archive_create(s, "did:plc:a", GAME, &format!("r{s}"), game("x")))
+            .collect(),
+        4,
+    );
+    let b = mock.seal(
+        (9..=16)
+            .map(|s| {
+                if s == 12 {
+                    js::archive_create(s, "did:plc:a", GAME, "r12", game("x"))
+                } else {
+                    js::archive_create(
+                        s,
+                        "did:plc:b",
+                        "app.other.thing",
+                        &format!("o{s}"),
+                        json!({ "$type": "app.other.thing" }),
+                    )
+                }
+            })
+            .collect(),
+        4,
+    );
+    mock.set_plan_page_entries(1);
+    let endpoint = happyview_source_jetstream::consumer::config::parse_endpoint(&mock.url());
+    let client = ArchiveClient::new(&endpoint, &ArchiveConfig::default());
+    let request = |after, before| PlanRequest {
+        kinds: vec!["commit".into()],
+        collections: vec![GAME.into()],
+        after_seq: after,
+        before_seq: before,
+        ..PlanRequest::default()
+    };
+    let first = client.plan(&request(0, None)).await.unwrap();
+    assert_eq!((first.planned_through_seq, first.sealed_tip_seq), (8, 16));
+    assert_eq!(first.segments[0].name, a);
+    assert_eq!(first.segments[0].mode, PlanMode::Segment);
+    let second = client.plan(&request(8, Some(16))).await.unwrap();
+    assert_eq!(second.planned_through_seq, 16);
+    assert_eq!(second.segments[0].name, b);
+    assert_eq!(
+        second.segments[0].mode,
+        PlanMode::Blocks,
+        "1 of 2 blocks matches"
+    );
+    assert_eq!(
+        (
+            second.segments[0].blocks[0].first,
+            second.segments[0].blocks[0].last
+        ),
+        (0, 0)
+    );
+    let frame = client.block(&b, 0).await.unwrap();
+    assert_eq!(segment::decode_block(&frame).unwrap().len(), 4);
+
+    let path = std::env::temp_dir().join(format!("hv-mock-{}", uuid::Uuid::new_v4()));
+    client.segment(&a, &path).await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        segment::read_index(&mut Cursor::new(&bytes), bytes.len() as u64)
+            .unwrap()
+            .len(),
+        2
+    );
+    std::fs::remove_file(&path).ok();
+    assert_eq!(mock.segment_downloads(), vec![a]);
+    assert_eq!(mock.plan_requests().len(), 2);
+}
+
+macro_rules! wait_until {
+    ($what:expr, $cond:expr) => {{
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if $cond {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                $what
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }};
+}
+
+/// A TestApp tracking GAME, pointed at `mock`, whose replay settings use a
+/// fresh download dir, fast retries and `key`.
+async fn app(mock: &MockJetstream, key: Option<&str>) -> Option<TestApp> {
+    std::env::var("TEST_DATABASE_URL").ok()?;
+    let mut app = TestApp::new().await;
+    // Upload through the API so the lexicon is in both `happyview_lexicons`
+    // (a job without a collection, like a gap replay, lists record lexicons
+    // from the table) and the in-memory registry. `backfill: false`, or the
+    // upload starts a job of its own.
+    let (status, body) = app
+        .post_json_status(
+            "/admin/lexicons",
+            json!({ "lexicon_json": common::fixtures::game_record_lexicon(), "backfill": false }),
+        )
+        .await;
+    assert!(status == 200 || status == 201, "{body}");
+    app.state.config.jetstream_url = mock.url();
+    app.archive = ArchiveConfig {
+        api_key: key.map(str::to_string),
+        download_dir: std::env::temp_dir().join(format!("hv-replay-{}", uuid::Uuid::new_v4())),
+        retry_unit: Duration::from_millis(5),
+        ..ArchiveConfig::default()
+    };
+    app.rebuild_router();
+    Some(app)
+}
+
+async fn start_job(app: &TestApp, body: serde_json::Value) -> String {
+    let (status, json) = app.post_json_status("/admin/backfill", body).await;
+    assert_eq!(status, 201, "{json}");
+    json["id"].as_str().expect("job id").to_string()
+}
+
+async fn job(app: &TestApp, id: &str) -> serde_json::Value {
+    let jobs = app.get_json("/admin/backfill/status").await;
+    jobs.as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == id)
+        .cloned()
+        .expect("job listed")
+}
+
+async fn finished(app: &TestApp, id: &str) -> serde_json::Value {
+    wait_until!("the job to finish", {
+        let status = job(app, id).await["status"].as_str().unwrap().to_string();
+        matches!(
+            status.as_str(),
+            "completed" | "failed" | "cancelled" | "paused"
+        )
+    });
+    job(app, id).await
+}
+
+/// `uri, cid, record, rev` of every network record, sorted.
+async fn dump(app: &TestApp) -> Vec<(String, String, String, Option<String>)> {
+    happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT uri, cid, record, rev FROM happyview_records WHERE indexed_at IS NOT NULL ORDER BY uri",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .expect("dump")
+}
+
+/// The TestApp's relay (wiremock) lists no repos, so a crawl completes at
+/// once instead of failing discovery on an unmounted route.
+async fn empty_relay(app: &TestApp) {
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/xrpc/com.atproto.sync.listReposByCollection",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "repos": [] })))
+    .mount(&app.mock_server)
+    .await;
+}
+
+fn games(
+    range: std::ops::RangeInclusive<i64>,
+    did: &str,
+) -> Vec<common::segment_writer::ArchiveEvent> {
+    range
+        .map(|s| js::archive_create(s, did, GAME, &format!("g{s:04}"), game(&format!("t{s}"))))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn replay_matches_applying_the_same_events_live() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (a, b) = ("did:plc:replaya", "did:plc:replayb");
+    let mut events = games(1..=30, a);
+    events.extend(games(31..=40, b));
+    events.push(js::archive_update(41, a, GAME, "g0003", game("edited")));
+    events.push(js::archive_delete(42, a, GAME, "g0004"));
+    events.push(js::archive_create(
+        43,
+        b,
+        "app.other.thing",
+        "o1",
+        json!({ "$type": "app.other.thing" }),
+    ));
+    events.push(js::archive_sync(44, b));
+    events.push(js::archive_create(45, b, GAME, "g0045", game("after sync")));
+    events.push(js::archive_identity(46, a));
+    let all = events.clone();
+    mock.seal(events.drain(..20).collect(), 4);
+    mock.seal(events, 4);
+
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["source"], "replay");
+    let replayed = dump(&app).await;
+
+    common::db::truncate_all(&app.state.db).await;
+    for event in all {
+        let row = happyview_source_jetstream::archive::segment::Row {
+            seq: event.seq,
+            witnessed_at: event.witnessed_at,
+            indexed_at: 0,
+            kind: event.kind,
+            collection: event.collection,
+            did: event.did,
+            rkey: event.rkey,
+            rev: event.rev,
+            payload: event.payload,
+        };
+        if let Some(event) = rows::row_to_event(row).unwrap() {
+            happyview_source_jetstream::consumer::apply::apply_event(
+                &*AppHost::new(app.state.clone()),
+                &[GAME.to_string()],
+                event,
+            )
+            .await;
+        }
+    }
+    assert_eq!(dump(&app).await, replayed);
+    assert!(replayed.iter().all(|(uri, ..)| uri.contains(GAME)));
+    assert!(
+        !replayed.iter().any(|(uri, ..)| uri.ends_with("/g0004")),
+        "deleted"
+    );
+    assert!(
+        !replayed
+            .iter()
+            .any(|(uri, ..)| uri.starts_with(&format!("at://{b}/{GAME}/g003"))),
+        "purged by sync"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn commit_sweeps_ask_for_commits_only() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=5, "did:plc:kinds"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let plans = mock.plan_requests();
+    let commits: Vec<_> = plans
+        .iter()
+        .filter(|p| p.get("collections").is_some())
+        .collect();
+    assert!(!commits.is_empty());
+    for plan in &commits {
+        assert_eq!(plan["kinds"], json!(["commit"]), "{plan}");
+        assert_eq!(plan["collections"], json!([GAME]));
+    }
+    for plan in plans.iter().filter(|p| p.get("collections").is_none()) {
+        assert_eq!(plan["kinds"], json!(["account", "sync"]), "{plan}");
+        assert!(
+            plan["dids"]
+                .as_array()
+                .is_some_and(|d| !d.is_empty() && d.len() <= 10_000)
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_job_replays_account_markers_for_the_dids_it_holds() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (kept, taken) = ("did:plc:kept", "did:plc:taken");
+    let mut events = games(1..=4, kept);
+    events.extend(games(5..=8, taken));
+    events.push(js::archive_account(9, taken, false, Some("takendown")));
+    events.push(js::archive_account(
+        10,
+        "did:plc:stranger",
+        false,
+        Some("deleted"),
+    ));
+    mock.seal(events, 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(uris.len(), 4);
+    assert!(uris.iter().all(|u| u.contains(kept)));
+    let marker_plan = mock
+        .plan_requests()
+        .into_iter()
+        .find(|p| p["kinds"] == json!(["account", "sync"]))
+        .expect("a marker sweep");
+    let mut dids: Vec<String> = serde_json::from_value(marker_plan["dids"].clone()).unwrap();
+    dids.sort();
+    assert_eq!(
+        dids,
+        vec![kept.to_string(), taken.to_string()],
+        "only DIDs holding records"
+    );
+    assert_eq!(
+        marker_plan["afterSeq"], 0,
+        "an archive that lists no segments has its markers swept whole: {marker_plan}"
+    );
+    assert!(!mock.segment_list_requests().is_empty());
+}
+
+/// `events` witnessed `hours` later than their seqs say.
+fn hours_later(
+    mut events: Vec<common::segment_writer::ArchiveEvent>,
+    hours: i64,
+) -> Vec<common::segment_writer::ArchiveEvent> {
+    for event in &mut events {
+        event.witnessed_at += hours * 60 * 60 * 1_000_000;
+    }
+    events
+}
+
+const OLD_TAKEDOWN: &str = "did:plc:oldtakedown";
+const NEW_TAKEDOWN: &str = "did:plc:newtakedown";
+const TAIL_KEPT: &str = "did:plc:tailkept";
+
+/// Three segments, witnessed 30 hours apart end to end: an account taken
+/// down in the first, 30 hours before the tip; records in the second, 20
+/// hours after the first; and an account taken down in the third. With the
+/// default 12-hour tail, the markers sweep starts after seq 3, the first
+/// segment's last.
+fn seal_tail_archive(mock: &MockJetstream) {
+    let mut old = games(1..=2, OLD_TAKEDOWN);
+    old.push(js::archive_account(
+        3,
+        OLD_TAKEDOWN,
+        false,
+        Some("takendown"),
+    ));
+    mock.seal(old, 4);
+    mock.seal(hours_later(games(4..=5, TAIL_KEPT), 20), 4);
+    let mut new = games(6..=7, NEW_TAKEDOWN);
+    new.push(js::archive_account(
+        8,
+        NEW_TAKEDOWN,
+        false,
+        Some("takendown"),
+    ));
+    mock.seal(hours_later(new, 30), 4);
+}
+
+fn marker_plans(mock: &MockJetstream) -> Vec<serde_json::Value> {
+    mock.plan_requests()
+        .into_iter()
+        .filter(|p| p["kinds"] == json!(["account", "sync"]))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_job_sweeps_markers_over_the_uncompacted_tail_only() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    seal_tail_archive(&mock);
+    mock.list_segments(1);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests(),
+        vec![None, Some("1".into()), Some("2".into())],
+        "every page of the segment list, once"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 3, "{plans:?}");
+    assert!(plans.iter().all(|p| p["afterSeq"].as_u64() >= Some(3)));
+    let mut uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    uris.retain(|u| !u.contains(TAIL_KEPT));
+    // The known limitation: a takedown older than the tail is not replayed.
+    assert_eq!(uris.len(), 2, "{uris:?}");
+    assert!(uris.iter().all(|u| u.contains(OLD_TAKEDOWN)), "{uris:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_job_sweeps_every_marker_when_the_archive_lists_no_segments() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    seal_tail_archive(&mock);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests().len(),
+        1,
+        "asked, and answered 404"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 0, "{plans:?}");
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(uris.len(), 2, "both takedowns purge: {uris:?}");
+    assert!(uris.iter().all(|u| u.contains(TAIL_KEPT)), "{uris:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_zero_marker_tail_sweeps_every_marker_without_listing_segments() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    app.archive.marker_tail = Duration::ZERO;
+    app.rebuild_router();
+    seal_tail_archive(&mock);
+    mock.list_segments(1000);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert!(mock.segment_list_requests().is_empty());
+    assert_eq!(marker_plans(&mock)[0]["afterSeq"], 0);
+    assert_eq!(dump(&app).await.len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_resumed_job_keeps_the_marker_floor_it_chose() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    let did = "did:plc:resumetail";
+    mock.seal(games(1..=4, did), 4);
+    mock.seal(hours_later(games(5..=8, did), 20), 4);
+    // Two segments of markers only, so the marker sweep alone fetches them.
+    let first_markers = mock.seal(
+        hours_later(vec![js::archive_account(9, did, true, None)], 30),
+        4,
+    );
+    mock.seal(
+        hours_later(vec![js::archive_account(10, did, true, None)], 30),
+        4,
+    );
+    mock.list_segments(1000);
+    mock.hold_segment(&first_markers);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the marker sweep's first download",
+        mock.segment_downloads().contains(&first_markers)
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    mock.release_segment(&first_markers);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests().len(),
+        1,
+        "the resumed run reuses the stored floor"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 4, "{plans:?}");
+    assert!(plans.len() > 1, "{plans:?}");
+    assert!(
+        plans.iter().all(|p| p["afterSeq"].as_u64() >= Some(4)),
+        "{plans:?}"
+    );
+    assert_eq!(dump(&app).await.len(), 8);
+}
+
+#[tokio::test]
+#[serial]
+async fn replay_never_resurrects_a_record_deleted_live() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:livedelete";
+    mock.seal(games(1..=4, did), 4);
+    // Live ingest saw the create at seq 2, then its delete at seq 50, before
+    // the backfill started.
+    for event in [
+        js::create(2, did, GAME, "g0002", game("t2")),
+        js::delete(50, did, GAME, "g0002"),
+    ] {
+        let happyview_source_jetstream::consumer::event::Frame::Event(event) =
+            happyview_source_jetstream::consumer::event::parse_v2(
+                &json!({ "$type": "message", "payload": event }).to_string(),
+            )
+            .unwrap()
+        else {
+            panic!("an event")
+        };
+        happyview_source_jetstream::consumer::apply::apply_event(
+            &*AppHost::new(app.state.clone()),
+            &[GAME.to_string()],
+            event,
+        )
+        .await;
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(uris.len(), 3);
+    assert!(!uris.iter().any(|u| u.ends_with("/g0002")));
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_falls_back_to_crawl_when_the_archive_answers_404() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(404);
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    // The crawl finds nothing: the relay mock lists no repos. The point is
+    // that the job runs as a crawl and completes.
+    empty_relay(&app).await;
+    let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["source"], "crawl", "{job}");
+    assert_eq!(job["status"], "completed", "{job}");
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_without_a_key_crawls_when_the_archive_wants_one() {
+    for status in [401, 403] {
+        let mock = MockJetstream::start().await;
+        mock.disable_archive(status);
+        let Some(app) = app(&mock, None).await else {
+            return;
+        };
+        empty_relay(&app).await;
+        let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+        let job = finished(&app, &id).await;
+        assert_eq!(job["source"], "crawl", "{status}: {job}");
+        assert_eq!(job["status"], "completed", "{status}: {job}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_with_a_refused_key_fails() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(401);
+    let Some(app) = app(&mock, Some("wrong")).await else {
+        return;
+    };
+    let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        format!(
+            "the jetstream at {} refused the replay key (HTTP 401)",
+            mock.host()
+        )
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_replay_job_without_a_key_names_the_setting() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(403);
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        format!(
+            "the jetstream at {} needs a key to replay its archive (HTTP 403); set JETSTREAM_API_KEY",
+            mock.host()
+        )
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_falls_back_to_crawl_when_nothing_listens() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = listener.local_addr().unwrap();
+    drop(listener);
+    app.state.config.jetstream_url = format!("ws://{closed}");
+    app.rebuild_router();
+    empty_relay(&app).await;
+    let id = start_job(&app, json!({ "collection": GAME })).await;
+    // No `source`: the TestApp default is crawl, so ask for auto explicitly too.
+    let job = finished(&app, &id).await;
+    assert_eq!(job["source"], "crawl");
+    let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(
+        (job["source"].as_str(), job["status"].as_str()),
+        (Some("crawl"), Some("completed")),
+        "{job}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_replay_job_without_an_archive_fails_with_a_reason() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(501);
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed");
+    assert_eq!(
+        job["error"],
+        format!(
+            "the jetstream at {} has no replay archive (HTTP 501)",
+            mock.host()
+        )
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unknown_source_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (status, body) = app
+        .post_json_status(
+            "/admin/backfill",
+            json!({ "collection": GAME, "source": "relay" }),
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(
+        body.to_string()
+            .contains("source must be one of auto, replay, crawl"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_replayed_sync_supersedes_only_what_came_before_it() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (synced, other) = ("did:plc:synced", "did:plc:other");
+    let mut events = games(1..=4, synced);
+    events.extend(games(5..=8, other));
+    events.push(js::archive_sync(9, synced));
+    events.push(js::archive_create(
+        10,
+        synced,
+        GAME,
+        "g0010",
+        game("replacement"),
+    ));
+    mock.seal(events, 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    let mut expected: Vec<String> = (5..=8)
+        .map(|s| format!("at://{other}/{GAME}/g{s:04}"))
+        .collect();
+    expected.push(format!("at://{synced}/{GAME}/g0010"));
+    expected.sort();
+    assert_eq!(
+        uris, expected,
+        "the sync superseded g1-g4 and nothing written after it"
+    );
+}
+
+/// The `source` a job was stored with.
+async fn job_source(app: &TestApp, id: &str) -> String {
+    job(app, id).await["source"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_on_auto_crawls() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:autoaccount"), 4);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "source": "auto", "dids": ["did:plc:autoaccount"] }),
+    )
+    .await;
+    assert_eq!(job_source(&app, &id).await, "crawl");
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_asking_for_replay_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let jobs_before = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    let (status, body) = app
+        .post_json_status(
+            "/admin/backfill",
+            json!({ "collection": GAME, "source": "replay", "dids": ["did:plc:replayaccount"] }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"],
+        "replay is only available for collection backfills; account backfills always crawl",
+        "{body}"
+    );
+    let jobs_after = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(jobs_after, jobs_before, "no job created");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_crawls_when_the_default_is_replay() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    app.archive.default_source = SourceChoice::Replay;
+    app.rebuild_router();
+    mock.seal(games(1..=4, "did:plc:defaultreplay"), 4);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "dids": ["did:plc:defaultreplay"] }),
+    )
+    .await;
+    assert_eq!(job_source(&app, &id).await, "crawl");
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn paging_pins_the_tip_and_ignores_segments_sealed_later() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    mock.seal(games(1..=4, "did:plc:page"), 4);
+    mock.seal(games(5..=8, "did:plc:page"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    // `#[tokio::test]` runs on one thread, so the job has not planned yet.
+    // Wait until the first page has been answered (the mock computes a page
+    // in the same poll that records its request), then seal a third
+    // segment: it lies past the tip that page pinned.
+    wait_until!("the first plan request", !mock.plan_requests().is_empty());
+    mock.seal(games(9..=12, "did:plc:page"), 4);
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let plans: Vec<_> = mock
+        .plan_requests()
+        .into_iter()
+        .filter(|p| p.get("collections").is_some())
+        .collect();
+    assert!(
+        plans.len() >= 2,
+        "one entry a page, two segments: {plans:?}"
+    );
+    assert!(plans[0].get("beforeSeq").is_none());
+    assert!(
+        plans[1..].iter().all(|p| p["beforeSeq"] == json!(8)),
+        "{plans:?}"
+    );
+    // Only the two segments under the pinned tip were replayed. The job's
+    // `replay.tip_seq` is not checked: it mirrors the sweep running last, the
+    // marker sweep, which pins its own tip after the third seal.
+    assert_eq!(dump(&app).await.len(), 8);
+}
+
+#[tokio::test]
+#[serial]
+async fn bytes_downloaded_are_counted_on_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=8, "did:plc:bytes"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert!(job["replay"]["bytes"].as_i64().unwrap() > 256, "{job}");
+    assert_eq!(job["replay"]["blocks_failed"], 0);
+    assert_eq!(job["total_records"], 8);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_live_stream_never_sees_the_api_key() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, Some("s3cret")).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:key"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
+    let mut state = app.state.clone();
+    state.collections_tx = tx.clone();
+    let consumer = app.jetstream.spawn_consumer(
+        AppHost::new(state.clone()),
+        happyview_source_jetstream::consumer::config::Settings::from_env(
+            &state.config.jetstream_url,
+        ),
+        None,
+    );
+    wait_until!("a live connection", !mock.connections().is_empty());
+    consumer.abort();
+    drop(tx);
+    let authorizations = mock.authorizations();
+    for route in ["plan", "segment", "v2"] {
+        assert!(
+            authorizations.iter().any(|(r, _)| r == route),
+            "no {route} request: {authorizations:?}"
+        );
+    }
+    for (route, auth) in authorizations {
+        if matches!(route.as_str(), "plan" | "segment" | "block" | "list") {
+            assert_eq!(auth.as_deref(), Some("Bearer s3cret"), "{route}");
+        } else {
+            assert_eq!(auth, None, "{route}");
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_resumed_job_does_not_refetch_finished_entries() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    let first = mock.seal(games(1..=4, "did:plc:resume"), 4);
+    let second = mock.seal(games(5..=8, "did:plc:resume"), 4);
+    // Hold the second segment's download, so the job is known to be inside
+    // the second entry, with the first one finished, when it is paused.
+    mock.hold_segment(&second);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the second download to start, after the first entry",
+        mock.segment_downloads().contains(&second) && dump(&app).await.len() == 4
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    // The entry in flight finishes, and the job stops at its next check.
+    mock.release_segment(&second);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed");
+    assert_eq!(
+        job["total_records"], 8,
+        "records from before the pause still count: {job}"
+    );
+    let completed: Vec<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT detail FROM happyview_event_logs WHERE event_type = 'backfill.completed'",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .expect("completion events");
+    let detail: serde_json::Value = completed
+        .iter()
+        .map(|(d,)| serde_json::from_str::<serde_json::Value>(d).unwrap())
+        .find(|d| d["job_id"] == id.as_str())
+        .expect("a backfill.completed event");
+    assert_eq!(
+        detail["bytes_downloaded"], job["replay"]["bytes"],
+        "the event reports every run's bytes: {detail}"
+    );
+    let downloads = mock.segment_downloads();
+    assert_eq!(
+        downloads.iter().filter(|n| **n == first).count(),
+        1,
+        "{downloads:?}"
+    );
+    assert_eq!(
+        downloads.iter().filter(|n| **n == second).count(),
+        1,
+        "{downloads:?}"
+    );
+    assert_eq!(dump(&app).await.len(), 8);
+}
+
+/// 16 events in 4 blocks of which only block 2 holds GAME records, so the
+/// plan asks for that one block (`mode: "blocks"`).
+fn one_game_block(did: &str) -> Vec<common::segment_writer::ArchiveEvent> {
+    (1..=16)
+        .map(|s| {
+            if (9..=12).contains(&s) {
+                js::archive_create(s, did, GAME, &format!("g{s:04}"), game("t"))
+            } else {
+                js::archive_create(
+                    s,
+                    "did:plc:noise",
+                    "app.other.thing",
+                    &format!("o{s}"),
+                    json!({ "$type": "app.other.thing" }),
+                )
+            }
+        })
+        .collect()
+}
+
+async fn errors(app: &TestApp, job: &str) -> Vec<(String, String, String)> {
+    happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT did, phase, kind FROM happyview_backfill_errors WHERE job_id = ? ORDER BY did, phase",
+        app.state.db_backend,
+    ))
+    .bind(job)
+    .fetch_all(&app.state.db)
+    .await
+    .expect("errors")
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_block_is_recorded_and_retry_failed_refetches_just_it() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(one_game_block("did:plc:retry"), 4);
+    mock.fail_block(&segment, 2, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(
+        job["status"], "completed",
+        "a failed block doesn't fail the job"
+    );
+    assert_eq!(job["replay"]["blocks_failed"], 1);
+    assert_eq!(
+        errors(&app, &id).await,
+        vec![(
+            segment.clone(),
+            "replay_block:2".into(),
+            "replay_block".into()
+        )]
+    );
+    assert!(dump(&app).await.is_empty());
+
+    mock.fail_block(&segment, 2, 0);
+    let plans_before = mock.plan_requests().len();
+    let block_2 = |mock: &MockJetstream| {
+        mock.block_fetches()
+            .iter()
+            .filter(|(s, i)| *s == segment && *i == 2)
+            .count()
+    };
+    let fetches_before = block_2(&mock);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let retry = body["id"].as_str().unwrap().to_string();
+    let job = finished(&app, &retry).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["source"], "replay");
+    assert_eq!(dump(&app).await.len(), 4);
+    let plans = mock.plan_requests();
+    assert!(plans.len() > plans_before, "the retry replays markers");
+    for plan in &plans[plans_before..] {
+        assert_eq!(
+            plan["kinds"],
+            json!(["account", "sync"]),
+            "a retry plans only the markers of what it wrote: {plan}"
+        );
+        assert_eq!(plan["dids"], json!(["did:plc:retry"]), "{plan}");
+    }
+    assert_eq!(
+        block_2(&mock),
+        fetches_before + 1,
+        "exactly one more fetch of block 2"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_corrupt_block_is_recorded_as_a_failed_block() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(one_game_block("did:plc:corrupt"), 4);
+    mock.corrupt_block(&segment, 2);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["replay"]["blocks_failed"], 1);
+    assert_eq!(errors(&app, &id).await[0].1, "replay_block:2");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_segment_that_fails_to_download_is_retried_whole() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=8, "did:plc:wholeseg"), 4);
+    mock.fail_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        errors(&app, &id).await,
+        vec![(
+            segment.clone(),
+            "replay_segment".into(),
+            "replay_block".into()
+        )]
+    );
+    mock.fail_segment(&segment);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        finished(&app, body["id"].as_str().unwrap()).await["status"],
+        "completed"
+    );
+    assert_eq!(dump(&app).await.len(), 8);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_failed_without_block_failures_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:clean"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn retrying_an_account_job_whose_dids_are_gone_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    // An account replay from before account backfills always crawled, whose
+    // queue rows went with a detail flush or the retention sweep.
+    let id = old_account_replay(&app, "completed").await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_backfill_errors (job_id, did, phase, kind, message, attempts, last_at) \
+         VALUES (?, 'seg_0000000001.jss', 'replay_block:2', 'replay_block', 'HTTP 502', 1, '2026-10-12T00:00:00+00:00')",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .execute(&app.state.db)
+    .await
+    .expect("a failed block");
+    let jobs_before = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("the job's DID list is no longer available"),
+        "{body}"
+    );
+    let jobs_after = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(jobs_after, jobs_before, "no network job in its place");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retried_block_applies_markers_only_for_dids_with_records() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (held, stranger) = ("did:plc:heldretry", "did:plc:strangerretry");
+    let mut events = games(1..=4, held);
+    events.extend([
+        js::archive_create(
+            5,
+            "did:plc:noise",
+            "app.other.thing",
+            "o5",
+            json!({ "$type": "app.other.thing" }),
+        ),
+        js::archive_account(6, held, false, Some("takendown")),
+        js::archive_account(7, stranger, false, Some("deleted")),
+        js::archive_create(
+            8,
+            "did:plc:noise",
+            "app.other.thing",
+            "o8",
+            json!({ "$type": "app.other.thing" }),
+        ),
+    ]);
+    let segment = mock.seal(events, 4);
+    // Block 1 (seqs 5-8) holds both markers; fail it in the marker sweep.
+    mock.fail_block(&segment, 1, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        dump(&app).await.len(),
+        4,
+        "the takedown was in the failed block"
+    );
+    mock.fail_block(&segment, 1, 0);
+    let (_, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(
+        finished(&app, body["id"].as_str().unwrap()).await["status"],
+        "completed"
+    );
+    assert!(dump(&app).await.is_empty(), "the takedown applied on retry");
+    let tombstones: Vec<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT did FROM happyview_did_tombstones WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(stranger)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert!(
+        tombstones.is_empty(),
+        "no tombstone for a DID this instance holds nothing for"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retry_replays_the_markers_of_the_dids_it_wrote() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:retrytakedown";
+    let segment = mock.seal(one_game_block(did), 4);
+    // The account is taken down after the records the failed block holds.
+    mock.seal(
+        vec![js::archive_account(17, did, false, Some("takendown"))],
+        4,
+    );
+    mock.fail_block(&segment, 2, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert!(dump(&app).await.is_empty());
+    // Whatever tombstone the takedown left has expired.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "DELETE FROM happyview_did_tombstones WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .execute(&app.state.db)
+    .await
+    .expect("expire the tombstone");
+
+    mock.fail_block(&segment, 2, 0);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let retry = finished(&app, body["id"].as_str().unwrap()).await;
+    assert_eq!(retry["status"], "completed", "{retry}");
+    assert!(
+        dump(&app).await.is_empty(),
+        "the later takedown purged what the retry wrote"
+    );
+}
+
+/// `GAME` records at seqs `games`, noise elsewhere in `seqs`, one event a
+/// block.
+fn games_among_noise(
+    seqs: std::ops::RangeInclusive<i64>,
+    games: std::ops::RangeInclusive<i64>,
+    did: &str,
+) -> Vec<common::segment_writer::ArchiveEvent> {
+    seqs.map(|s| {
+        if games.contains(&s) {
+            js::archive_create(s, did, GAME, &format!("g{s:04}"), game("t"))
+        } else {
+            js::archive_create(
+                s,
+                "did:plc:noise",
+                "app.other.thing",
+                &format!("o{s}"),
+                json!({ "$type": "app.other.thing" }),
+            )
+        }
+    })
+    .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn sixteen_failed_blocks_in_a_row_stop_the_job_inside_the_entry() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    // 32 blocks, 20 with records: planned as one run of blocks 0-19.
+    let segment = mock.seal(games_among_noise(1..=32, 1..=20, "did:plc:outage"), 1);
+    for index in 2..=17 {
+        // Six answers: every attempt of the first fetch fails.
+        mock.fail_block(&segment, index, 6);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        "the archive failed 16 blocks in a row; stopping (resume to continue)"
+    );
+    assert_eq!(
+        job["replay"]["through_seq"], 0,
+        "the cursor stays before the entry: {job}"
+    );
+    assert!(
+        errors(&app, &id).await.is_empty(),
+        "the entry is redone on resume, so its blocks are not recorded"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn blocks_that_do_not_decode_never_stop_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games_among_noise(1..=32, 1..=20, "did:plc:baddata"), 1);
+    // More bad blocks in a row than an outage may fail; the archive answers
+    // every one of them.
+    for index in 2..=19 {
+        mock.corrupt_block(&segment, index);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["replay"]["blocks_failed"], 18, "{job}");
+    assert_eq!(errors(&app, &id).await.len(), 18);
+    assert_eq!(dump(&app).await.len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_replay_job_resumes_where_it_stopped() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    let did = "did:plc:resumefailed";
+    let first = mock.seal(games(1..=4, did), 4);
+    let second = mock.seal(games_among_noise(5..=36, 5..=24, did), 1);
+    for index in 2..=17 {
+        mock.fail_block(&second, index, 6);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(job["replay"]["through_seq"], 4, "{job}");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["error"], serde_json::Value::Null, "{job}");
+    assert_eq!(job["total_records"], 24, "{job}");
+    assert_eq!(job["replay"]["blocks_failed"], 0, "{job}");
+    assert_eq!(dump(&app).await.len(), 24);
+    assert!(errors(&app, &id).await.is_empty());
+    let downloads = mock.segment_downloads();
+    assert_eq!(
+        downloads.iter().filter(|n| **n == first).count(),
+        1,
+        "the finished entry is not refetched: {downloads:?}"
+    );
+}
+
+/// An account (`dids`) replay job as one created before account backfills
+/// always crawled, in `status`, with no queue rows: its DID list is gone, as
+/// after a detail flush or the retention sweep.
+async fn old_account_replay(app: &TestApp, status: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, \
+          started_at, created_at, source, error) \
+         VALUES (?, ?, 'did:plc:oldaccount', 'dids', ?, 'replaying', 1, 2, 1, \
+          '2026-10-12T00:00:00+00:00', '2026-10-12T00:00:00+00:00', 'replay', NULL)",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .bind(GAME)
+    .bind(status)
+    .execute(&app.state.db)
+    .await
+    .expect("an old account replay job");
+    id
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_account_replay_whose_dids_are_gone_is_not_resumed() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:oldaccount"), 4);
+    let id = old_account_replay(&app, "failed").await;
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("the job's DID list is no longer available"),
+        "{body}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(job(&app, &id).await["status"], "failed");
+    assert!(mock.plan_requests().is_empty(), "nothing was planned");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_replay_without_dids_fails_instead_of_widening() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:oldaccount"), 4);
+    let id = old_account_replay(&app, "paused").await;
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(
+        job["error"]
+            .as_str()
+            .unwrap()
+            .contains("the job's DID list is no longer available"),
+        "{job}"
+    );
+    assert!(mock.plan_requests().is_empty(), "nothing was planned");
+}
+
+#[tokio::test]
+#[serial]
+async fn two_resumes_at_once_run_the_job_once() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=4, "did:plc:tworesumes"), 4);
+    mock.seal(games(5..=8, "did:plc:tworesumes"), 4);
+    mock.set_plan_page_entries(1);
+    mock.hold_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the download to start",
+        mock.segment_downloads().contains(&segment)
+    );
+    let (status, _) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200);
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+
+    let path = format!("/admin/backfill/{id}/resume");
+    let (first, second) = tokio::join!(
+        app.post_json_status(&path, json!({})),
+        app.post_json_status(&path, json!({}))
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 400], "{first:?} {second:?}");
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_crawl_job_cannot_be_resumed() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, collection, scope, status, stage, source, error, created_at) \
+         VALUES (?, ?, 'network', 'failed', 'pending', 'crawl', 'boom', '2026-10-12T00:00:00+00:00')",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .bind(GAME)
+    .execute(&app.state.db)
+    .await
+    .expect("a failed crawl job");
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(job(&app, &id).await["status"], "failed");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_block_whose_error_row_cannot_be_stored_stops_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:fulllog";
+    mock.set_plan_page_entries(1);
+    let first = mock.seal(games(1..=4, did), 4);
+    // Blocks of 4 (seqs 5-8, ... 17-20); only block 2 holds records.
+    let second = mock.seal(games_among_noise(5..=20, 13..=16, did), 4);
+    mock.fail_block(&second, 2, usize::MAX);
+    mock.hold_segment(&first);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the first download to start",
+        mock.segment_downloads().contains(&first)
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    mock.release_segment(&first);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+    // Fill the job's error log to its cap.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) \
+         INSERT INTO happyview_backfill_errors (job_id, did, phase, kind, message, attempts, last_at) \
+         SELECT ?, 'filler', 'filler:' || i, 'replay_block', 'filler', 1, '2026-10-12T00:00:00+00:00' FROM n",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .execute(&app.state.db)
+    .await
+    .expect("fill the error log");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    let error = job["error"].as_str().unwrap();
+    assert!(
+        error.contains("could not record the failed block replay_block:2"),
+        "{error}"
+    );
+    assert_eq!(
+        job["replay"]["through_seq"], 4,
+        "the cursor stays before the entry: {job}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_plan_that_stops_advancing_fails_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:stall"), 4);
+    mock.stall_plan(5);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["error"], "the archive plan stopped advancing at seq 0");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_slow_plan_outlasts_the_shared_clients_read_timeout() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    // The shared client gives up on a silent response long before the
+    // archive's network-wide plans start answering (16-30 s on Bluesky's).
+    app.state.http = reqwest::Client::builder()
+        .read_timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    app.rebuild_router();
+    mock.seal(games(1..=4, "did:plc:slowplan"), 4);
+    mock.delay_plan(Duration::from_secs(1));
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(dump(&app).await.len(), 4);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_throttled_archive_is_waited_out() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:throttle"), 4);
+    mock.throttle_archive(3);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(dump(&app).await.len(), 4);
+}
+
+#[tokio::test]
+#[serial]
+async fn cancelling_a_replay_stops_it() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=4, "did:plc:cancel"), 4);
+    mock.hold_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the download to start",
+        mock.segment_downloads().contains(&segment)
+    );
+    let (status, _) = app
+        .post_json_status(&format!("/admin/backfill/{id}/cancel"), json!({}))
+        .await;
+    assert_eq!(status, 200);
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &id).await["status"], "cancelled");
+}
+
+fn settings(mock: &MockJetstream) -> Settings {
+    Settings {
+        endpoint: parse_endpoint(&mock.url()),
+        protocol: ProtocolChoice::Auto,
+        compression: true,
+        workers: 8,
+        invalid_request_retry: Duration::from_millis(100),
+        drain_timeout: DRAIN_TIMEOUT,
+    }
+}
+
+/// Retries in milliseconds, so a test never waits on the production backoff.
+fn fast_retries() -> RetryPolicy {
+    RetryPolicy {
+        delays: vec![Duration::from_millis(10); 3],
+        max_unavailable_delay: Duration::from_millis(50),
+    }
+}
+
+/// Seed a setting. Every seeded row shares one `updated_at`, as `cursor::save`
+/// writes the seq and the time together (copied from tests/jetstream_live.rs).
+async fn save_setting(app: &TestApp, key: &str, value: &str) {
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&app.state.db)
+        .await
+        .expect("seed setting");
+}
+
+/// Run the live consumer on GAME against `mock`; abort it by dropping the
+/// handle's task (`.abort()`), keeping the sender alive until then.
+fn consume(
+    app: &TestApp,
+    mock: &MockJetstream,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<Vec<String>>,
+) {
+    let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
+    let mut state = app.state.clone();
+    state.collections_tx = tx.clone();
+    let handle = app.jetstream.spawn_consumer(
+        AppHost::new(state.clone()),
+        settings(mock),
+        Some(fast_retries()),
+    );
+    (handle, tx)
+}
+
+/// `app` with `BACKFILL_SOURCE=auto`, the opt-in that turns gap replay on.
+/// The default crawls, and under `crawl` gap replay is off (P8).
+async fn auto_app(mock: &MockJetstream) -> Option<TestApp> {
+    let mut app = app(mock, None).await?;
+    app.archive.default_source = SourceChoice::Auto;
+    app.rebuild_router();
+    Some(app)
+}
+
+/// The details of every `jetstream.gap` event, oldest first.
+async fn gap_events(app: &TestApp) -> Vec<serde_json::Value> {
+    happyview::db::query_as::<(String,)>(&happyview::db::adapt_sql(
+        "SELECT detail FROM happyview_event_logs WHERE event_type = 'jetstream.gap' ORDER BY created_at",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .expect("gap events")
+    .into_iter()
+    .map(|(detail,)| serde_json::from_str(&detail).expect("detail is JSON"))
+    .collect()
+}
+
+fn replay_jobs(jobs: &serde_json::Value) -> Vec<serde_json::Value> {
+    jobs.as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["source"] == "replay")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_replays_the_gap_and_resumes_live_at_the_sealed_tip() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:gap";
+    mock.seal(games(1..=50, did), 10);
+    // Live events after the sealed tip.
+    mock.push(
+        (51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game(&format!("t{s}")))),
+    );
+    // The consumer last applied seq 20 on this host, long enough ago that the
+    // server refuses it.
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(
+        400,
+        "CursorTooOld",
+        "cursor is older than the retention floor",
+    );
+
+    let (consumer, _collections) = consume(&app, &mock);
+
+    wait_until!(
+        "seq 51-55 applied live",
+        dump(&app)
+            .await
+            .iter()
+            .filter(|r| r.0.ends_with("g0055"))
+            .count()
+            == 1
+    );
+    let jobs = app.get_json("/admin/backfill/status").await;
+    let gap = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["source"] == "replay")
+        .expect("a gap replay job")
+        .clone();
+    let gap = finished(&app, gap["id"].as_str().unwrap()).await;
+    assert_eq!(gap["status"], "completed", "{gap}");
+    assert_eq!(gap["replay"]["after_seq"], 20);
+    consumer.abort();
+
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(
+        uris.len(),
+        35,
+        "21-50 replayed, 51-55 live, 1-20 not refetched: {uris:?}"
+    );
+    let connections = mock.connections();
+    let resumed = connections.last().unwrap();
+    assert_eq!(
+        resumed.param("cursor").as_deref(),
+        Some("50"),
+        "resumed at the sealed tip"
+    );
+    let gaps = gap_events(&app).await;
+    let detail = &gaps[0];
+    assert_eq!(detail["reason"], "cursor_too_old");
+    assert_eq!(detail["after_seq"], 20);
+    assert_eq!(detail["resumed_at_seq"], 50);
+    assert_eq!(detail["replay_job_id"], gap["id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_without_an_archive_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(404);
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:noarchive", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no replay job without an archive"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_with_a_keyed_archive_and_no_key_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(401);
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:keyless", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert_eq!(mock.plan_requests().len(), 1, "the archive was asked once");
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no gap job without a key: {jobs}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_with_a_hung_archive_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = auto_app(&mock).await else {
+        return;
+    };
+    app.archive.gap_plan_timeout = Duration::from_millis(200);
+    app.rebuild_router();
+    mock.seal(games(1..=50, "did:plc:hungarchive"), 10);
+    // Far longer than the gap plan may take, retries or not.
+    mock.delay_plan(Duration::from_secs(60));
+    mock.push((51..=55).map(|s| {
+        js::create(
+            s,
+            "did:plc:hungarchive",
+            GAME,
+            &format!("g{s:04}"),
+            game("t"),
+        )
+    }));
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let started = std::time::Instant::now();
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the consumer waited {:?} on the archive",
+        started.elapsed()
+    );
+    assert_eq!(mock.plan_requests().len(), 1, "the gap plan was asked for");
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no gap job when the plan times out: {jobs}"
+    );
+    let connections = mock.connections();
+    assert_eq!(
+        connections.last().unwrap().param("cursor"),
+        None,
+        "resumed from the tip, as without an archive"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_under_crawl_never_asks_the_archive() {
+    // P8: with BACKFILL_SOURCE=crawl (the default), CursorTooOld is
+    // handled exactly as before, even though this host has an archive.
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=50, "did:plc:crawlgap"), 10);
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:crawlgap", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no replay job under crawl"
+    );
+}
+
+/// The ids of the replay jobs listed.
+async fn gap_job_ids(app: &TestApp) -> Vec<String> {
+    replay_jobs(&app.get_json("/admin/backfill/status").await)
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_repeated_cursor_too_old_reuses_the_running_gap_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:gaptwice";
+    // 25 events a block: (20, 50] touches both blocks, so the plan answers
+    // in segment mode and `hold_segment` can keep the job running.
+    let segment = mock.seal(games(1..=50, did), 25);
+    mock.hold_segment(&segment);
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    // The first consumer is refused at seq 20, starts the gap job and
+    // resumes at the sealed tip. Nothing new arrives, so the saved seq is
+    // still 20 when it stops.
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (first, _first_collections) = consume(&app, &mock);
+    wait_until!(
+        "the first consumer to resume at the sealed tip",
+        mock.connections()
+            .iter()
+            .any(|c| c.param("cursor").as_deref() == Some("50"))
+    );
+    first.abort();
+    // A restarted consumer is refused at seq 20 again: the same gap.
+    mock.reject_next(400, "CursorTooOld", "still too old");
+    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!(
+        "the live stream to resume",
+        dump(&app).await.iter().any(|r| r.0.ends_with("g0055"))
+    );
+    let jobs = gap_job_ids(&app).await;
+    assert_eq!(
+        jobs.len(),
+        1,
+        "one gap job for seq 20, however often it is refused: {jobs:?}"
+    );
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &jobs[0]).await["status"], "completed");
+    consumer.abort();
+    let gaps = gap_events(&app).await;
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert!(
+        gaps.iter().all(|g| g["replay_job_id"] == jobs[0].as_str()),
+        "{gaps:?}"
+    );
+    assert_eq!(dump(&app).await.len(), 35);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_sealed_tip_falls_back_to_the_live_tip() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:tiprefused";
+    let segment = mock.seal(games(1..=50, did), 25);
+    mock.hold_segment(&segment);
+    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    // Refused at the saved seq 20, then at the sealed tip 50 the gap replay
+    // resumed at. Planning the gap again would only send 50 again.
+    mock.reject_next(400, "CursorTooOld", "too old");
+    mock.reject_next(400, "CursorTooOld", "the tip is too old too");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!(
+        "the live stream to resume from the tip",
+        dump(&app).await.iter().any(|r| r.0.ends_with("g0055"))
+    );
+    // The gap job's own first page, besides the gap replay's plan.
+    wait_until!("the gap job to plan", mock.plan_requests().len() >= 2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.plan_requests().len(),
+        2,
+        "the refused tip is not planned again: {:?}",
+        mock.plan_requests()
+    );
+    let connections = mock.connections();
+    assert_eq!(connections.len(), 3, "seq 20, the tip 50, then no cursor");
+    assert_eq!(connections[1].param("cursor").as_deref(), Some("50"));
+    assert_eq!(connections[2].param("cursor"), None, "resumed from the tip");
+    let jobs = gap_job_ids(&app).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let gaps = gap_events(&app).await;
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert_eq!(gaps[0]["replay_job_id"], jobs[0].as_str());
+    assert_eq!(gaps[1]["reason"], "cursor_too_old");
+    assert!(gaps[1].get("replay_job_id").is_none(), "{gaps:?}");
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &jobs[0]).await["status"], "completed");
+    consumer.abort();
+}

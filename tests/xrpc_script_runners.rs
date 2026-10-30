@@ -1,0 +1,868 @@
+//! The XRPC query and procedure runners, driven through the real routes.
+//!
+//! The `interpreter_echo` fixture claims `lua`, which is what a script row's
+//! `script_type` holds, so a request resolves a script and reaches the fixture
+//! exactly as it would reach a deployed interpreter. The fixture interprets
+//! nothing — its `source` is a directive, and anything it does not recognise
+//! echoes the whole `execute` input back — so what this pins is the runners'
+//! half: what reaches an interpreter, what a caller is told about what came
+//! back, and the rows an operator reads afterwards.
+//!
+//! Language semantics belong to the interpreter and are pinned where it is
+//! loaded, in `lua_interpreter_plugin.rs` and `lua_differential.rs`.
+
+mod common;
+
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
+use tower::ServiceExt;
+
+use common::app::TestApp;
+use common::echo_interpreter;
+
+const QUERY: &str = "games.gamesgamesgamesgames.listGames";
+const PROCEDURE: &str = "games.gamesgamesgamesgames.createGame";
+
+/// Skips the caller when the fixture's module is absent, naming the build that
+/// produces it. Every fixture's `target/` is gitignored, so that is a step
+/// nobody ran; panicking on it would report it as a failure of the runners.
+macro_rules! require_fixture {
+    () => {
+        if !echo_interpreter::is_built() {
+            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// The echo fixture installed as the interpreter for `lua`, the language a
+/// seeded script row names.
+async fn interpreter(app: &TestApp) {
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+}
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn upload_lexicon(app: &TestApp, lexicon: Value) {
+    let cookie = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/lexicons")
+                .header(cookie.0, cookie.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "lexicon_json": lexicon,
+                        "target_collection": "games.gamesgamesgamesgames.game",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
+    seed_script_as(app, trigger_id, body, "lua").await;
+}
+
+async fn seed_script_as(app: &TestApp, trigger_id: &str, body: &str, script_type: &str) {
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(trigger_id)
+        .bind(body)
+        .bind(script_type)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed a script row");
+}
+
+/// A query endpoint bound to `source`, ready to call.
+async fn query_app(source: &str) -> TestApp {
+    let app = query_app_without_interpreter(source, "lua").await;
+    interpreter(&app).await;
+    app
+}
+
+/// The same endpoint with nothing installed that claims `script_type`. The
+/// language is the caller's because the row's language is the whole subject:
+/// `lua` is the one a language filter in the handler would still resolve, so
+/// only a second language says the handler stopped filtering.
+async fn query_app_without_interpreter(source: &str, script_type: &str) -> TestApp {
+    let app = TestApp::new().await;
+    upload_lexicon(&app, common::fixtures::list_games_query_lexicon()).await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY}"), source, script_type).await;
+    app
+}
+
+/// A procedure endpoint bound to `source`, ready to call.
+async fn procedure_app(source: &str) -> TestApp {
+    let app = procedure_app_without_interpreter(source, "lua").await;
+    interpreter(&app).await;
+    app
+}
+
+async fn procedure_app_without_interpreter(source: &str, script_type: &str) -> TestApp {
+    let app = TestApp::new().await;
+    upload_lexicon(&app, common::fixtures::create_game_procedure_lexicon()).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE}"),
+        source,
+        script_type,
+    )
+    .await;
+    app
+}
+
+async fn call_query(app: &TestApp, query_string: &str) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/xrpc/{QUERY}{query_string}"))
+                .header("x-client-key", "hvc_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn call_procedure(app: &TestApp, body: &Value) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/xrpc/{PROCEDURE}"))
+                .header(cookie.0, cookie.1)
+                .header("x-client-key", "hvc_test")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The `detail` of the one row of `event_type`, so a test reads what an
+/// operator reads rather than what the runner meant to write.
+async fn one_event(app: &TestApp, event_type: &str) -> (Option<String>, Option<String>, Value) {
+    let rows: Vec<(Option<String>, Option<String>, String)> =
+        happyview::db::query_as(&happyview::db::adapt_sql(
+            "SELECT actor_did, subject, detail FROM happyview_event_logs WHERE event_type = ?",
+            app.state.db_backend,
+        ))
+        .bind(event_type)
+        .fetch_all(&app.state.db)
+        .await
+        .expect("read the event log");
+    assert_eq!(rows.len(), 1, "{event_type}: {rows:?}");
+    let detail = serde_json::from_str(&rows[0].2).expect("the detail should be JSON");
+    (rows[0].0.clone(), rows[0].1.clone(), detail)
+}
+
+fn detail_keys(detail: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = detail
+        .as_object()
+        .expect("a detail object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    keys
+}
+
+// ---------------------------------------------------------------------------
+// What reaches the interpreter
+// ---------------------------------------------------------------------------
+
+/// The whole input, echoed back as the response body: the first argument of
+/// `handle` and every context field a query run fills.
+#[tokio::test]
+async fn a_query_hands_the_interpreter_its_params_and_its_context() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("echo").await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_script_variables (key, value, created_at) VALUES (?, ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind("API_KEY")
+    .bind("k")
+    .bind(happyview::db::now_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .expect("seed a script variable");
+
+    let resp = call_query(&app, "?limit=5").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = json_body(resp).await;
+
+    assert_eq!(echo_interpreter::script_text(&sent), "echo");
+    assert_eq!(sent["kind"], "xrpc_query");
+    assert_eq!(sent["input"]["limit"], 5);
+    assert_eq!(sent["context"]["trigger"], format!("xrpc.query:{QUERY}"));
+    assert_eq!(sent["context"]["method"], QUERY);
+    assert_eq!(
+        sent["context"]["collection"],
+        "games.gamesgamesgamesgames.game"
+    );
+    assert_eq!(sent["context"]["has_pds_auth"], false);
+    assert_eq!(sent["context"]["env"]["API_KEY"], "k");
+    assert!(sent["context"].get("params").is_none(), "{sent}");
+    assert!(sent["context"].get("caller_did").is_none(), "{sent}");
+    assert!(sent["context"].get("job").is_none(), "{sent}");
+}
+
+#[tokio::test]
+async fn a_procedure_hands_the_interpreter_its_input_and_its_caller() {
+    common::require_db!();
+    require_fixture!();
+    let app = procedure_app("echo").await;
+
+    let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = json_body(resp).await;
+
+    assert_eq!(sent["kind"], "xrpc_procedure");
+    assert_eq!(sent["input"]["title"], "hello");
+    assert_eq!(
+        sent["context"]["trigger"],
+        format!("xrpc.procedure:{PROCEDURE}")
+    );
+    assert_eq!(sent["context"]["caller_did"], app.admin_did);
+    assert_eq!(sent["context"]["method"], PROCEDURE);
+    assert!(
+        sent["context"]["params"].is_object(),
+        "a procedure's parameters are its own field: {sent}"
+    );
+}
+
+/// The budget an interpreter is given is the instance's cached one, so a
+/// settings change reaches the next run without a restart.
+#[tokio::test]
+async fn the_cached_instruction_budget_is_what_reaches_the_interpreter() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("echo").await;
+
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(
+        sent["limits"]["instructions"],
+        app.state.script_limits.instruction_limit()
+    );
+
+    app.state.script_limits.set_instruction_limit(1_000);
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(sent["limits"]["instructions"], 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// What a caller is told
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_returned_value_is_the_response_body() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("value:other").await;
+
+    let resp = call_query(&app, "?limit=5").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!({ "limit": 5 }));
+}
+
+/// `nil` is a body of `null`, not an empty body and not an error: a query that
+/// found nothing still answered.
+#[tokio::test]
+async fn a_run_that_returned_nothing_answers_null() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("value:none").await;
+
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, Value::Null);
+}
+
+#[tokio::test]
+async fn a_failure_carries_the_interpreters_kind_message_and_line() {
+    common::require_db!();
+    require_fixture!();
+    for (kind, status) in [
+        ("syntax", StatusCode::INTERNAL_SERVER_ERROR),
+        ("runtime", StatusCode::INTERNAL_SERVER_ERROR),
+        ("memory", StatusCode::INTERNAL_SERVER_ERROR),
+        ("missing_handle", StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let app = query_app(&format!("error:{kind}")).await;
+        let resp = call_query(&app, "").await;
+        assert_eq!(resp.status(), status, "{kind}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "script_error", "{kind}");
+        assert_eq!(body["errorType"], kind, "{kind}");
+        assert_eq!(body["message"], format!("echo: {kind}"), "{kind}");
+        assert_eq!(body["method"], QUERY, "{kind}");
+        assert_eq!(body["line"], 7, "{kind}");
+    }
+}
+
+/// A spent budget is the one failure whose message is the host's: the limit is
+/// the host's, and the status says to retry rather than to fix the script.
+#[tokio::test]
+async fn a_timeout_is_a_408_with_the_execution_limit_sentence() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("error:timeout").await;
+
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let body = json_body(resp).await;
+    assert_eq!(body["errorType"], "timeout");
+    assert_eq!(body["message"], "script exceeded execution time limit");
+}
+
+/// A guest that never yields is stopped by the host's own deadline rather than
+/// by anything the script could catch, and reaches a caller the same way a
+/// spent budget does.
+#[tokio::test]
+async fn a_script_that_never_returns_is_a_408() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("spin").await;
+    app.state.script_limits.set_wall_clock_seconds(1);
+
+    let started = std::time::Instant::now();
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        json_body(resp).await["message"],
+        "script exceeded execution time limit"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the run outlived the one-second clock: {:?}",
+        started.elapsed()
+    );
+}
+
+/// An interpreter that traps rather than answering has failed on its own
+/// account, and what it says about itself names wasmtime internals and paths
+/// inside this instance. A caller gets a correlation id; the text is the
+/// operator's, in the log and in the `script.error` row.
+#[tokio::test]
+async fn an_interpreter_that_traps_answers_a_correlation_id() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("grow:1").await;
+
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(resp).await;
+    assert!(body["correlationId"].is_string(), "{body}");
+    assert!(
+        body.get("errorType").is_none() && body.get("message").is_none(),
+        "a trap is not the script's failure to report: {body}"
+    );
+
+    let (_, _, detail) = one_event(&app, "script.error").await;
+    assert!(
+        detail["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("trap")),
+        "{detail}"
+    );
+}
+
+/// Nothing claims the row's language, so no answer this endpoint could give
+/// would be the one the script defines. The operator's fix is named in the
+/// body: there is nobody else who can act on it, and no secret in it.
+///
+/// Both languages are exercised because a 503 for `lua` alone would also hold
+/// if the handler read a row's language and treated anything else as no row at
+/// all — which answered a bound query with the default record listing, a
+/// wrong answer rather than a refused one.
+#[tokio::test]
+async fn a_query_whose_language_has_no_interpreter_is_a_503_naming_it() {
+    common::require_db!();
+    for language in ["lua", "typescript"] {
+        let app = query_app_without_interpreter("value:other", language).await;
+
+        let resp = call_query(&app, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{language}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "ServerMisconfigured", "{language}");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains(language), "{language}: {body}");
+        assert!(message.contains("plugins page"), "{language}: {body}");
+    }
+}
+
+/// The stake on the procedure path is a write rather than a reply: treating
+/// the row as absent reached the create-or-put branch, which forwards the
+/// caller's raw input in place of whatever the bound script would have made
+/// of it.
+#[tokio::test]
+async fn a_procedure_whose_language_has_no_interpreter_is_a_503_naming_it() {
+    common::require_db!();
+    for language in ["lua", "typescript"] {
+        let app = procedure_app_without_interpreter("value:other", language).await;
+
+        let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{language}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "ServerMisconfigured", "{language}");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains(language), "{language}: {body}");
+        assert!(message.contains("plugins page"), "{language}: {body}");
+    }
+}
+
+/// Installing the interpreter is the whole fix: the same request answers the
+/// script's own value with nothing else changed.
+#[tokio::test]
+async fn installing_the_interpreter_makes_the_same_query_answer() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app_without_interpreter("value:other", "lua").await;
+    assert_eq!(
+        call_query(&app, "?limit=5").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    interpreter(&app).await;
+    let resp = call_query(&app, "?limit=5").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!({ "limit": 5 }));
+}
+
+// ---------------------------------------------------------------------------
+// What an operator reads afterwards
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_successful_query_writes_the_executed_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(call_query(&app, "?limit=5").await.status(), StatusCode::OK);
+
+    let (actor, subject, detail) = one_event(&app, "script.executed").await;
+    assert_eq!(actor, None, "a query run acts as nobody");
+    assert_eq!(subject.as_deref(), Some(QUERY));
+    assert_eq!(
+        detail_keys(&detail),
+        [
+            "duration_ms",
+            "method",
+            "params",
+            "response",
+            "response_size"
+        ]
+    );
+    assert_eq!(detail["method"], QUERY);
+    assert_eq!(detail["params"]["limit"], 5);
+    assert_eq!(detail["response"], json!({ "limit": 5 }));
+    assert_eq!(detail["response_size"], r#"{"limit":5}"#.len());
+}
+
+/// The event log keeps the interpreter's unparsed text, which is the only
+/// place the line, the chunk name and any traceback survive.
+#[tokio::test]
+async fn a_failed_query_writes_the_error_row_with_the_unparsed_text() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("error:runtime").await;
+
+    assert_eq!(
+        call_query(&app, "").await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let (actor, subject, detail) = one_event(&app, "script.error").await;
+    assert_eq!(actor, None);
+    assert_eq!(subject.as_deref(), Some(QUERY));
+    assert_eq!(
+        detail_keys(&detail),
+        ["duration_ms", "error", "method", "script_source"]
+    );
+    assert_eq!(detail["error"], r#"[string "script"]:7: echo: runtime"#);
+    assert_eq!(detail["script_source"], "error:runtime");
+}
+
+#[tokio::test]
+async fn a_successful_procedure_writes_the_executed_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = procedure_app("value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(
+        call_procedure(&app, &json!({ "title": "hello" }))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let (actor, subject, detail) = one_event(&app, "script.executed").await;
+    assert_eq!(actor.as_deref(), Some(app.admin_did.as_str()));
+    assert_eq!(subject.as_deref(), Some(PROCEDURE));
+    assert_eq!(
+        detail_keys(&detail),
+        [
+            "caller_did",
+            "duration_ms",
+            "input",
+            "method",
+            "response",
+            "response_size"
+        ]
+    );
+    assert_eq!(detail["caller_did"], app.admin_did);
+    assert_eq!(detail["input"]["title"], "hello");
+    assert_eq!(detail["response"]["title"], "hello");
+}
+
+#[tokio::test]
+async fn a_failed_procedure_writes_the_error_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = procedure_app("error:runtime").await;
+
+    assert_eq!(
+        call_procedure(&app, &json!({ "title": "hello" }))
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let (actor, subject, detail) = one_event(&app, "script.error").await;
+    assert_eq!(actor.as_deref(), Some(app.admin_did.as_str()));
+    assert_eq!(subject.as_deref(), Some(PROCEDURE));
+    assert_eq!(
+        detail_keys(&detail),
+        [
+            "caller_did",
+            "duration_ms",
+            "error",
+            "input",
+            "method",
+            "script_source"
+        ]
+    );
+    assert_eq!(detail["error"], r#"[string "script"]:7: echo: runtime"#);
+    assert_eq!(detail["input"]["title"], "hello");
+}
+
+/// Every run is counted, whatever became of it: a counter lost to an early
+/// return is a runtime graph that disagrees with the event log.
+#[tokio::test]
+async fn every_run_moves_the_script_counters() {
+    common::require_db!();
+    require_fixture!();
+    let app = TestApp::new().await;
+    interpreter(&app).await;
+    upload_lexicon(&app, common::fixtures::list_games_query_lexicon()).await;
+    let counters = app.state.telemetry_counters.clone();
+
+    for (run, source) in ["value:other", "error:missing_handle", "error:runtime"]
+        .into_iter()
+        .enumerate()
+    {
+        happyview::db::query(&happyview::db::adapt_sql(
+            "DELETE FROM happyview_scripts WHERE id = ?",
+            app.state.db_backend,
+        ))
+        .bind(format!("xrpc.query:{QUERY}"))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+        seed_script(&app, &format!("xrpc.query:{QUERY}"), source).await;
+
+        call_query(&app, "").await;
+        assert_eq!(
+            counters.script_executions.load(Ordering::Relaxed),
+            run as u64 + 1,
+            "{source}"
+        );
+    }
+    assert!(counters.script_runtime_us.load(Ordering::Relaxed) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// The lexicon's declared encodings
+// ---------------------------------------------------------------------------
+
+/// A second query method, so both encodings can be exercised against one app:
+/// two `TestApp`s in a test share a database and spend minutes contending for
+/// it.
+const QUERY_BYTES: &str = "games.gamesgamesgamesgames.getArtifact";
+
+/// `list_games_query_lexicon` under another id and output encoding, so the
+/// declaration is the only difference between the two endpoints below.
+fn query_lexicon_for(id: &str, encoding: &str) -> Value {
+    let mut lexicon = common::fixtures::list_games_query_lexicon();
+    lexicon["id"] = json!(id);
+    lexicon["defs"]["main"]["output"] = json!({ "encoding": encoding });
+    lexicon
+}
+
+async fn call_method(app: &TestApp, method: &str) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/xrpc/{method}"))
+                .header("x-client-key", "hvc_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The runner has to consult the lexicon, not just run the script.
+///
+/// The echo fixture answers with its own `execute` input, an object that is
+/// neither of the byte forms. Declared as JSON that is a 200; declared `*/*`
+/// it has to be refused, naming what a byte-returning script should have
+/// produced. Deleting the runner's call to `script::response::resolve` answers
+/// 200 for both, which is what makes this a test of the wiring rather than of
+/// the helper.
+#[tokio::test]
+async fn the_output_encoding_decides_how_a_query_answers() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, query_lexicon_for(QUERY, "application/json")).await;
+    upload_lexicon(&app, query_lexicon_for(QUERY_BYTES, "*/*")).await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY}"), "echo me", "lua").await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY_BYTES}"), "echo me", "lua").await;
+    interpreter(&app).await;
+
+    let resp = call_method(&app, QUERY).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a json-declared query should answer with the value as it stands"
+    );
+
+    let resp = call_method(&app, QUERY_BYTES).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a */*-declared query must not answer an ordinary object as JSON"
+    );
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "script_error");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("blob ref") && message.contains("$bytes"),
+        "the refusal should name both accepted forms, got {message:?}"
+    );
+}
+
+/// A procedure taking bytes, as `uploadBlob` declares them.
+const PROCEDURE_BYTES: &str = "games.gamesgamesgamesgames.uploadArtifact";
+
+fn procedure_lexicon_taking_bytes(id: &str) -> Value {
+    let mut lexicon = common::fixtures::create_game_procedure_lexicon();
+    lexicon["id"] = json!(id);
+    lexicon["defs"]["main"]["input"] = json!({ "encoding": "*/*" });
+    lexicon["defs"]["main"]["output"] = json!({ "encoding": "application/json" });
+    lexicon
+}
+
+async fn post_bytes(
+    app: &TestApp,
+    method: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/xrpc/{method}"))
+        .header(cookie.0, cookie.1)
+        .header("x-client-key", "hvc_test");
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    app.router
+        .clone()
+        .oneshot(request.body(Body::from(bytes.to_vec())).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A procedure whose lexicon takes bytes is handed a blob ref, not a parsed
+/// body — and the bytes are stored before the script runs, so the script
+/// authorizes and records without ever carrying them.
+///
+/// The echo fixture answers with its own `execute` input, so what the script
+/// received is readable straight off the response.
+#[tokio::test]
+async fn a_byte_input_reaches_the_script_as_a_stored_blob_ref() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, procedure_lexicon_taking_bytes(PROCEDURE_BYTES)).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE_BYTES}"),
+        "echo me",
+        "lua",
+    )
+    .await;
+    interpreter(&app).await;
+
+    // Deliberately not valid UTF-8, so nothing can be quietly treating this
+    // as text.
+    let artifact: &[u8] = &[0x00, 0x61, 0xff, 0x73, 0x6d];
+    let resp = post_bytes(&app, PROCEDURE_BYTES, Some("application/wasm"), artifact).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let echoed = json_body(resp).await;
+    let input = &echoed["input"];
+    assert_eq!(input["$type"], "blob", "the script saw {input}");
+    assert_eq!(input["mimeType"], "application/wasm");
+    assert_eq!(input["size"], artifact.len());
+
+    // The CID is the one the network would mint for these bytes, so a client
+    // can verify what it uploaded without trusting us.
+    let expected = happyview::cid_verify::raw_cid(artifact)
+        .expect("a CID for the artifact")
+        .to_string();
+    assert_eq!(input["ref"]["$link"], expected);
+
+    // And the bytes are actually at rest under it.
+    let stored = happyview::blobs::get(&app.state.db, app.state.db_backend, &expected)
+        .await
+        .expect("read the blob back")
+        .expect("the ingest should have stored it");
+    assert_eq!(stored.bytes, artifact);
+    assert_eq!(stored.mime_type, "application/wasm");
+}
+
+/// `*/*` means the caller names the type, so an absent body has nothing to
+/// store and is refused rather than stored empty.
+#[tokio::test]
+async fn a_byte_input_refuses_an_empty_body() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, procedure_lexicon_taking_bytes(PROCEDURE_BYTES)).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE_BYTES}"),
+        "echo me",
+        "lua",
+    )
+    .await;
+    interpreter(&app).await;
+
+    let resp = post_bytes(&app, PROCEDURE_BYTES, Some("application/wasm"), b"").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A JSON-declared procedure keeps rejecting a body that is not JSON, which
+/// the `Json` extractor used to do before the handler read bytes itself.
+#[tokio::test]
+async fn a_json_procedure_still_requires_a_json_body() {
+    require_fixture!();
+
+    let app = procedure_app("echo me").await;
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/wasm"), b"\x00not json").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/json"), b"{ not json").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/json"), b"{}").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// The project layer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_project_script_answers_a_query_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("row").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("xrpc.query:{QUERY}"),
+        "project",
+        "src/lexicons/listGames.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(sent["source"], "project");
+
+    app.state.project.store(std::sync::Arc::new(
+        happyview::project::ProjectSnapshot::empty(),
+    ));
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(echo_interpreter::script_text(&sent), "row");
+}
+
+#[tokio::test]
+async fn a_project_script_answers_a_procedure_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = procedure_app("row").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("xrpc.procedure:{PROCEDURE}"),
+        "project",
+        "src/lexicons/createGame.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["source"], "project");
+}

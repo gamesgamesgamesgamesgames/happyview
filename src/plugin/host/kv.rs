@@ -164,10 +164,11 @@ mod tests {
             scope: "did:plc:test".to_string(),
             secrets: Default::default(),
             config: serde_json::Value::Null,
+            records: crate::record_store::RecordStore::new(db.clone(), backend),
             db,
             db_backend: backend,
             http_client: reqwest::Client::new(),
-            lexicons: std::sync::Arc::new(crate::lexicon::LexiconRegistry::new()),
+            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),
         }
     }
 

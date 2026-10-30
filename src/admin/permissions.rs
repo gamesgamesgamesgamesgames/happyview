@@ -19,6 +19,8 @@ pub enum Permission {
     LexiconsRead,
     #[serde(rename = "lexicons:delete")]
     LexiconsDelete,
+    #[serde(rename = "lexicons:publish")]
+    LexiconsPublish,
 
     #[serde(rename = "records:read")]
     RecordsRead,
@@ -131,6 +133,9 @@ pub enum Permission {
     LinkedReposCreate,
     #[serde(rename = "linked-repos:delete")]
     LinkedReposDelete,
+
+    #[serde(rename = "project:deploy")]
+    ProjectDeploy,
 }
 
 impl Permission {
@@ -140,6 +145,7 @@ impl Permission {
             Self::LexiconsCreate => "lexicons:create",
             Self::LexiconsRead => "lexicons:read",
             Self::LexiconsDelete => "lexicons:delete",
+            Self::LexiconsPublish => "lexicons:publish",
             Self::RecordsRead => "records:read",
             Self::RecordsDelete => "records:delete",
             Self::RecordsDeleteCollection => "records:delete-collection",
@@ -188,6 +194,7 @@ impl Permission {
             Self::LinkedReposRead => "linked-repos:read",
             Self::LinkedReposCreate => "linked-repos:create",
             Self::LinkedReposDelete => "linked-repos:delete",
+            Self::ProjectDeploy => "project:deploy",
         }
     }
 
@@ -209,6 +216,12 @@ impl Permission {
                 key: "lexicons:delete",
                 name: "Delete Lexicons",
                 description: "Remove lexicon schemas",
+                category: "Lexicons",
+            },
+            Self::LexiconsPublish => PermissionInfo {
+                key: "lexicons:publish",
+                name: "Publish Lexicons",
+                description: "Publish lexicons to the network and manage publishing rules",
                 category: "Lexicons",
             },
             Self::RecordsRead => PermissionInfo {
@@ -499,6 +512,12 @@ impl Permission {
                 description: "Revoke linked repos and delete their stored sessions",
                 category: "Linked Repos",
             },
+            Self::ProjectDeploy => PermissionInfo {
+                key: "project:deploy",
+                name: "Deploy Project",
+                description: "Replace the instance's project with a deployed bundle and start the backfills it declares",
+                category: "Project",
+            },
         }
     }
 
@@ -508,6 +527,7 @@ impl Permission {
             Self::LexiconsCreate,
             Self::LexiconsRead,
             Self::LexiconsDelete,
+            Self::LexiconsPublish,
             Self::RecordsRead,
             Self::RecordsDelete,
             Self::RecordsDeleteCollection,
@@ -556,6 +576,7 @@ impl Permission {
             Self::LinkedReposRead,
             Self::LinkedReposCreate,
             Self::LinkedReposDelete,
+            Self::ProjectDeploy,
         ])
     }
 }
@@ -567,6 +588,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         LexiconsCreate,
         LexiconsRead,
         LexiconsDelete,
+        LexiconsPublish,
         RecordsRead,
         RecordsDelete,
         RecordsDeleteCollection,
@@ -615,6 +637,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         LinkedReposRead,
         LinkedReposCreate,
         LinkedReposDelete,
+        ProjectDeploy,
     ]
     .iter()
     .map(|p| p.info())
@@ -704,9 +727,11 @@ impl Template {
                 let mut perms = Self::Operator.permissions();
                 perms.insert(Permission::LexiconsCreate);
                 perms.insert(Permission::LexiconsDelete);
+                perms.insert(Permission::LexiconsPublish);
                 perms.insert(Permission::ScriptVariablesCreate);
                 perms.insert(Permission::ScriptVariablesDelete);
                 perms.insert(Permission::ScriptsManage);
+                perms.insert(Permission::ProjectDeploy);
                 perms.insert(Permission::RecordsDelete);
                 perms.insert(Permission::LabelersCreate);
                 perms.insert(Permission::LabelersRead);

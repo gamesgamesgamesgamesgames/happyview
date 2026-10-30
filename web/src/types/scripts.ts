@@ -1,9 +1,11 @@
 /**
- * Scripting language a script is written for. The backend stamps this
- * on every row so a future runtime (e.g. `"typescript"`) can land
- * without a schema migration. Today only `"lua"` ships.
+ * Scripting language a script is written for. The set is whatever the
+ * installed interpreter plugins declare, which is a runtime fact about one
+ * instance — so no literal union can state it, and a saved language the
+ * instance cannot run is reported by `Script.runnable` rather than refused
+ * by this type.
  */
-export type ScriptLanguage = "lua"
+export type ScriptLanguage = string;
 
 /**
  * One row from the `scripts` table — what the admin API returns.
@@ -24,28 +26,129 @@ export type ScriptLanguage = "lua"
  */
 export interface Script {
   /** Trigger string; identifies the row. */
-  id: string
-  script_type: ScriptLanguage
-  body: string
-  description?: string | null
-  created_at: string
-  updated_at: string
+  id: string;
+  script_type: ScriptLanguage;
+  body: string;
+  description?: string | null;
+  /** `null` for a project script, which has no stored row. */
+  created_at: string | null;
+  updated_at: string | null;
+  /**
+   * `"project"` when a file in the instance's project defines this script.
+   * Such a script is read-only here: it changes by editing the file.
+   */
+  layer: "project" | "manual";
+  /** Project-relative file path, for a project script only. */
+  path: string | null;
+  /**
+   * A dashboard script sits under this project file. It is kept untouched and
+   * runs again if the file is removed.
+   */
+  shadows_stored: boolean;
   /**
    * `false` when this script's own trigger id would be refused if submitted
    * today — the NSID rules tightened after it was created. It still fires and
    * can still be edited, but deleting it is irreversible: it cannot be
    * recreated with the same id.
    */
-  recreatable: boolean
+  recreatable: boolean;
+  /**
+   * Removed v2 globals (`db`, `Record`, `now`, `params`, …) this script still
+   * references as free names. Empty once migrated onto `require("happyview.*")`
+   * / `require("internal.*")` — always empty for a JavaScript script, since
+   * the codemod only understands Lua. Can instead be `["unparseable"]` when
+   * the body does not parse as Lua at all, so migration status can't be read
+   * off it.
+   */
+  needs_migration: string[];
+  /**
+   * `false` when no installed interpreter claims `script_type`. The script is
+   * stored and intact but inert: every trigger it is bound to refuses until
+   * the interpreter is installed.
+   */
+  runnable: boolean;
+  /**
+   * Set when a compiled module's handler answers this trigger. Such a row
+   * comes from the project build and is read-only: it has no body, and it
+   * changes only when the module is rebuilt.
+   */
+  module?: ScriptModuleRow | null;
+}
+
+/** A compiled module's handler, which has no body to show or edit. */
+export interface ScriptModuleRow {
+  /** The `[modules.<name>]` key in happyview.toml. */
+  module: string;
+  /** The module's crate, relative to the project root. */
+  path: string;
+  /** The Rust function that handles this trigger; empty when the build did not record it. */
+  handler: string;
+  /** sha256 of the build HappyView is running. */
+  hash: string;
+}
+
+/** One construct the codemod could not rewrite mechanically. */
+export interface CodemodNote {
+  /** Line number in the *original* source the construct sits on. */
+  line: number;
+  message: string;
+}
+
+/** Result of `POST /admin/scripts/{id}/codemod`. */
+export interface CodemodResult {
+  source: string;
+  notes: CodemodNote[];
+  /**
+   * `false` when the rewrite equals the stored body, so applying would store
+   * nothing. Not the same as being on the v3 contract: a script applied with
+   * markers left in place reports `false` too.
+   */
+  changed: boolean;
+}
+
+/**
+ * Body for `POST /admin/scripts/{id}/codemod`. Omit entirely, or send `{}`,
+ * to preview without storing anything.
+ */
+export interface CodemodRequestBody {
+  /**
+   * Stores the rewritten body. Previewing needs `scripts:read`; this needs
+   * `scripts:manage`, since it writes the row.
+   */
+  apply?: boolean;
+  /**
+   * Required alongside `apply` when the rewrite changed the body and still
+   * leaves `-- codemod:` markers behind; otherwise the request is refused
+   * with 409. Sent only when the operator ticks it, never as `false`, so the
+   * server's default refusal holds.
+   */
+  allow_markers?: boolean;
+  /**
+   * Text to rewrite in place of the stored body, for an editor holding edits
+   * the server has not seen. Preview only: the server refuses it alongside
+   * `apply`. No stored script is needed, so it works before the first save;
+   * the id in the path then supplies only the script's kind.
+   */
+  source?: string;
+}
+
+/**
+ * The 400 `POST /admin/scripts` and `PATCH /admin/scripts/{id}` answer for a
+ * Lua body that still references removed v2 globals. `removed_globals` is
+ * what identifies it; `error` is the same list as a sentence.
+ */
+export interface UnmigratedScriptError {
+  error: string;
+  removed_globals: string[];
 }
 
 /** Body for `POST /admin/scripts` (create or replace by `id`). */
 export interface UpsertScriptBody {
-  id: string
+  id: string;
   /** Defaults to `"lua"` server-side if omitted. */
-  script_type?: ScriptLanguage
-  body: string
-  description?: string | null
+  script_type?: ScriptLanguage;
+  body: string;
+  description?: string | null;
 }
 
 /**
@@ -54,9 +157,9 @@ export interface UpsertScriptBody {
  * stale body against a new language).
  */
 export interface PatchScriptBody {
-  script_type?: ScriptLanguage
-  body?: string
-  description?: string | null
+  script_type?: ScriptLanguage;
+  body?: string;
+  description?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +175,7 @@ export type TriggerKind =
   | "xrpc.query"
   | "xrpc.procedure"
   | "labeler.apply"
-  | "job.run"
+  | "job.run";
 
 /** Display labels for each trigger kind. */
 export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
@@ -84,24 +187,24 @@ export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
   "xrpc.procedure": "XRPC procedure",
   "labeler.apply": "Label arrival",
   "job.run": "Job runner",
-}
+};
 
 /** Top-level grouping for the Scripts list page. */
-export type TriggerFamily = "record" | "xrpc" | "labeler" | "job"
+export type TriggerFamily = "record" | "xrpc" | "labeler" | "job";
 
 export const TRIGGER_FAMILY_LABELS: Record<TriggerFamily, string> = {
   record: "Record events",
   xrpc: "XRPC handlers",
   labeler: "Label arrivals",
   job: "Job runners",
-}
+};
 
 /** Map a trigger kind to its top-level family. */
 export function familyOf(kind: TriggerKind): TriggerFamily {
-  if (kind.startsWith("record.")) return "record"
-  if (kind.startsWith("xrpc.")) return "xrpc"
-  if (kind.startsWith("job.")) return "job"
-  return "labeler"
+  if (kind.startsWith("record.")) return "record";
+  if (kind.startsWith("xrpc.")) return "xrpc";
+  if (kind.startsWith("job.")) return "job";
+  return "labeler";
 }
 
 /**
@@ -112,61 +215,22 @@ export function familyOf(kind: TriggerKind): TriggerFamily {
 export function parseTriggerId(
   id: string,
 ): { kind: TriggerKind; suffix: string } | null {
-  const sep = id.indexOf(":")
-  if (sep <= 0 || sep === id.length - 1) return null
-  const prefix = id.slice(0, sep)
-  const suffix = id.slice(sep + 1)
-  const kind = ([
-    "record.index",
-    "record.create",
-    "record.update",
-    "record.delete",
-    "xrpc.query",
-    "xrpc.procedure",
-    "labeler.apply",
-    "job.run",
-  ] as const).find((k) => k === prefix)
-  if (!kind) return null
-  return { kind, suffix }
+  const sep = id.indexOf(":");
+  if (sep <= 0 || sep === id.length - 1) return null;
+  const prefix = id.slice(0, sep);
+  const suffix = id.slice(sep + 1);
+  const kind = (
+    [
+      "record.index",
+      "record.create",
+      "record.update",
+      "record.delete",
+      "xrpc.query",
+      "xrpc.procedure",
+      "labeler.apply",
+      "job.run",
+    ] as const
+  ).find((k) => k === prefix);
+  if (!kind) return null;
+  return { kind, suffix };
 }
-
-/**
- * A reasonable starter script body — defines the required `handle()`
- * function. Used to prefill the new-script form.
- */
-export const DEFAULT_SCRIPT_BODY = `-- Trigger script: receives an \`event\` table describing what fired
--- the script and returns either a transformed event/record (table) or
--- \`nil\` to skip the operation.
---
--- Available APIs: db.*, http.*, xrpc.*, atproto.*, Record.*, env.<KEY>
-
-function handle()
-  log("script fired")
-  return event
-end
-`
-
-export const DEFAULT_JOB_SCRIPT_BODY = `-- Job runner: executes as a background job.
---
--- Available globals:
---   job.input      — the input table passed to jobs.create()
---   job.id         — the job's UUID
---   job.progress() — persist progress (visible in the dashboard)
---   job.should_stop() — check for pause/cancel (cooperative)
---   job.wait(seconds) — sleep (0–3600s)
---
--- Available APIs: db.*, http.*, xrpc.*, atproto.*, Record.*, env.<KEY>
--- Return value becomes the job's result.
-
-function handle()
-  local input = job.input
-
-  job.progress({ status = "working" })
-
-  if job.should_stop() then
-    return { partial = true }
-  end
-
-  return { done = true }
-end
-`

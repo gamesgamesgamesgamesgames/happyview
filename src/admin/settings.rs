@@ -3,15 +3,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use base64::Engine;
 use sqlx::AnyPool;
-use std::env;
 
 use crate::AppState;
+use crate::config::vars;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{
     DEFAULT_RETENTION_DAYS, EventLog, SPACE_ACCESS_RETENTION_SETTING, Severity,
     effective_protected_retention, log_event, write_event,
 };
+use crate::lua::limits as script_limits;
 
 const GENERAL_RETENTION_SETTING: &str = "event_log_retention_days";
 
@@ -46,6 +47,8 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ),
     ("tos_uri", "TOS_URI"),
     ("policy_uri", "POLICY_URI"),
+    ("script_instruction_limit", "SCRIPT_INSTRUCTION_LIMIT"),
+    ("script_wall_clock_seconds", "SCRIPT_WALL_CLOCK_SECONDS"),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
 
@@ -124,10 +127,7 @@ fn audited_setting_events(
 
 /// The env var value a key falls back to when it has no database row.
 fn env_fallback(key: &str) -> Option<String> {
-    ENV_FALLBACKS
-        .iter()
-        .find(|(setting_key, _)| *setting_key == key)
-        .and_then(|(_, env_var)| env::var(env_var).ok())
+    env_var_for(key).and_then(vars::var)
 }
 
 /// Write a setting change and its audit event together, so an audited setting
@@ -212,8 +212,55 @@ async fn write_audited<'q>(
     Ok(affected)
 }
 
+/// The environment variable a setting falls back to, if it has one.
+pub fn env_var_for(key: &str) -> Option<&'static str> {
+    ENV_FALLBACKS
+        .iter()
+        .find(|(setting_key, _)| *setting_key == key)
+        .map(|(_, env_var)| *env_var)
+}
+
 /// Resolve a setting value: check the DB first, then fall back to env var.
+/// A database that cannot be read counts as holding no row.
 pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
+    try_get_setting(pool, key, backend).await.ok().flatten()
+}
+
+/// Store a setting in `happyview_instance_settings`, replacing any value.
+pub async fn put_setting(
+    pool: &AnyPool,
+    key: &str,
+    value: &str,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        r#"
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
+        "#,
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind(&now)
+        .bind(value)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// [`get_setting`] for a caller that must tell a missing row from a database
+/// it could not ask: the script budgets keep their cached values on the
+/// second, where the first means the env var or the default.
+pub async fn try_get_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -221,22 +268,41 @@ pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) ->
     let row: Option<(String,)> = crate::db::query_as(&sql)
         .bind(key)
         .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        .await?;
 
     if let Some((value,)) = row {
-        return Some(value);
+        return Ok(Some(value));
     }
 
-    // Fall back to env var if one is mapped for this key.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if *setting_key == key {
-            return env::var(env_var).ok();
-        }
-    }
+    Ok(env_var_for(key).and_then(vars::var))
+}
 
-    None
+/// The script budgets are read from a cache rather than the database on
+/// every run, so a write to one of them is folded in here instead of waiting
+/// for the next poll.
+async fn refresh_script_limits(state: &AppState, key: &str) {
+    if script_limits::is_limit_key(key) {
+        state
+            .script_limits
+            .refresh(&state.db, state.db_backend)
+            .await;
+    }
+}
+
+/// Fallback values for settings with no stored row, labelled with where
+/// they came from so the dashboard can say which file or variable to edit.
+fn fallback_entries(db_keys: &std::collections::HashSet<String>) -> Vec<SettingEntry> {
+    ENV_FALLBACKS
+        .iter()
+        .filter(|(setting_key, _)| !db_keys.contains(*setting_key))
+        .filter_map(|(setting_key, env_var)| {
+            vars::var_with_source(env_var).map(|(value, source)| SettingEntry {
+                key: setting_key.to_string(),
+                value,
+                source: source.as_str().to_string(),
+            })
+        })
+        .collect()
 }
 
 /// GET /admin/settings — list all settings with their source.
@@ -267,18 +333,7 @@ pub(super) async fn list(
         })
         .collect();
 
-    // Add env-var fallback entries for keys not already present in DB.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if !db_keys.contains(*setting_key)
-            && let Ok(value) = env::var(env_var)
-        {
-            entries.push(SettingEntry {
-                key: setting_key.to_string(),
-                value,
-                source: "env".to_string(),
-            });
-        }
-    }
+    entries.extend(fallback_entries(&db_keys));
 
     Ok(Json(entries))
 }
@@ -291,6 +346,10 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertSettingBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
+    script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
 
     let backend = state.db_backend;
     let now = now_rfc3339();
@@ -309,6 +368,7 @@ pub(super) async fn upsert(
         .bind(&body.value)
         .bind(&now);
     write_audited(&state, &auth, &key, change, Some(body.value.clone())).await?;
+    refresh_script_limits(&state, &key).await;
 
     log_event(
         &state.db,
@@ -333,6 +393,9 @@ pub(super) async fn delete(
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
 
     let backend = state.db_backend;
     let sql = adapt_sql(
@@ -343,6 +406,7 @@ pub(super) async fn delete(
     if write_audited(&state, &auth, &key, change, env_fallback(&key)).await? == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
+    refresh_script_limits(&state, &key).await;
 
     log_event(
         &state.db,
@@ -557,5 +621,105 @@ pub(crate) async fn serve_logo(
                 .unwrap())
         }
         _ => Err(AppError::NotFound("no logo uploaded".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use serial_test::serial;
+
+    use super::*;
+    use crate::config::vars::{LayerReset, set_project_layer};
+    use crate::test_support::migrated_memory_pool;
+
+    fn file_says_app_name(value: &str) -> LayerReset {
+        set_project_layer([("APP_NAME".to_string(), value.to_string())].into());
+        LayerReset
+    }
+
+    /// Restores `APP_NAME` to unset even when the test panics.
+    struct AppNameEnv;
+
+    impl AppNameEnv {
+        fn set(value: Option<&str>) -> Self {
+            match value {
+                Some(v) => unsafe { std::env::set_var("APP_NAME", v) },
+                None => unsafe { std::env::remove_var("APP_NAME") },
+            }
+            Self
+        }
+    }
+
+    impl Drop for AppNameEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("APP_NAME") };
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_file_answers_when_neither_the_database_nor_the_env_does() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The File")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_env_wins_over_the_file() {
+        let _env = AppNameEnv::set(Some("From Env"));
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        let value = get_setting(&pool, "app_name", DatabaseBackend::Sqlite).await;
+        assert_eq!(value.as_deref(), Some("From Env"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_stored_setting_wins_over_the_file() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind("app_name")
+        .bind("From The Dashboard")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The Dashboard")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_listing_names_the_file_as_the_source() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let entries = fallback_entries(&HashSet::new());
+        let app_name = entries.iter().find(|e| e.key == "app_name").unwrap();
+        assert_eq!(app_name.value, "From The File");
+        assert_eq!(app_name.source, "project");
+
+        let stored: HashSet<String> = ["app_name".to_string()].into();
+        assert!(
+            fallback_entries(&stored)
+                .iter()
+                .all(|e| e.key != "app_name")
+        );
     }
 }

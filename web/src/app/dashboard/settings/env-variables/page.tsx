@@ -105,15 +105,14 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet. Variables defined here are accessible to Lua scripts via the env global table.
+                    No script variables yet. Variables defined here are
+                    accessible to Lua scripts via the env global table.
                   </TableCell>
                 </TableRow>
               )}
               {vars.map((v) => (
                 <TableRow key={v.key}>
-                  <TableCell className="font-mono text-sm">
-                    {v.key}
-                  </TableCell>
+                  <TableCell className="font-mono text-sm">{v.key}</TableCell>
                   <TableCell className="font-mono text-sm text-muted-foreground">
                     {v.preview}
                   </TableCell>
@@ -122,10 +121,7 @@ export default function EnvVariablesPage() {
                   </TableCell>
                   <TableCell className="w-20 sticky right-0 bg-inherit z-[1]">
                     <div className="flex gap-1">
-                      <UpsertVariableDialog
-                        onSuccess={load}
-                        editKey={v.key}
-                      />
+                      <UpsertVariableDialog onSuccess={load} editKey={v.key} />
                       {hasPermission("script-variables:delete") && (
                         <AlertDialog>
                           <AlertDialogTrigger asChild>
@@ -141,10 +137,13 @@ export default function EnvVariablesPage() {
                           </AlertDialogTrigger>
                           <AlertDialogContent>
                             <AlertDialogHeader>
-                              <AlertDialogTitle>Delete variable?</AlertDialogTitle>
+                              <AlertDialogTitle>
+                                Delete variable?
+                              </AlertDialogTitle>
                               <AlertDialogDescription>
-                                This will permanently remove the variable. Scripts
-                                using this variable will fail on next execution.
+                                This will permanently remove the variable.
+                                Scripts using this variable will fail on next
+                                execution.
                               </AlertDialogDescription>
                             </AlertDialogHeader>
                             <AlertDialogFooter>

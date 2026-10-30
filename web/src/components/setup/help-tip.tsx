@@ -1,11 +1,16 @@
-"use client"
+"use client";
 
-import { HelpCircle } from "lucide-react"
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { HelpCircle } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface HelpTipProps {
-  label: string
-  href?: string
+  label: string;
+  href?: string;
 }
 
 export function HelpTip({ label, href }: HelpTipProps) {
@@ -24,7 +29,10 @@ export function HelpTip({ label, href }: HelpTipProps) {
               <HelpCircle className="h-3.5 w-3.5" />
             </a>
           ) : (
-            <span className="text-muted-foreground inline-flex align-middle cursor-help" aria-label={label}>
+            <span
+              className="text-muted-foreground inline-flex align-middle cursor-help"
+              aria-label={label}
+            >
               <HelpCircle className="h-3.5 w-3.5" />
             </span>
           )}
@@ -34,5 +42,5 @@ export function HelpTip({ label, href }: HelpTipProps) {
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
-  )
+  );
 }

@@ -2,6 +2,15 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
+import type {
+  CreatePublishRuleBody,
+  LexiconDnsCheck,
+  LexiconDnsEntry,
+  LexiconPublishingOverview,
+  PublishOutcome,
+  PublishRule,
+  UpdatePublishRuleBody,
+} from "@/types/lexicon-publishing";
 import type { ResolvedIdentity } from "@/types/identity";
 import type {
   BackfillJob,
@@ -17,6 +26,7 @@ import type {
 } from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
+import type { BackfillSource } from "@/types/backfill";
 import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
@@ -31,10 +41,14 @@ import type { EventLogEntry, EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
   Script,
+  ScriptLanguage,
   UpsertScriptBody,
   PatchScriptBody,
+  CodemodResult,
+  CodemodRequestBody,
 } from "@/types/scripts";
 import type { LabelerSummary } from "@/types/labelers";
+import type { EditorDeclarations } from "@/types/editor";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
@@ -52,9 +66,9 @@ import type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
 } from "@/types/external-accounts";
 import type {
   DeadLettersListResponse,
@@ -98,8 +112,8 @@ export {
   TRIGGER_FAMILY_LABELS,
   familyOf,
   parseTriggerId,
-  DEFAULT_SCRIPT_BODY,
 } from "@/types/scripts";
+export { DEFAULT_SCRIPT_BODY } from "@/lib/lua-templates";
 export type { LabelerSummary } from "@/types/labelers";
 export type { RecordLabel } from "@/types/records";
 export type {
@@ -115,15 +129,24 @@ export type {
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
 } from "@/types/api-clients";
-export type { SettingEntry, InstanceSettings } from "@/types/settings";
-export { INSTANCE_SETTING_KEYS } from "@/types/settings";
+export type {
+  SettingEntry,
+  InstanceSettings,
+  ScriptLimitSettings,
+} from "@/types/settings";
+export {
+  INSTANCE_SETTING_KEYS,
+  SCRIPT_LIMIT_BOUNDS,
+  SCRIPT_LIMIT_DEFAULTS,
+  SCRIPT_LIMIT_SETTING_KEYS,
+} from "@/types/settings";
 export type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
   ConfigSchema,
   ConfigProperty,
 } from "@/types/external-accounts";
@@ -139,9 +162,15 @@ const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /**
+   * The removed v2 globals a refused script save named, from the response's
+   * `removed_globals`. Absent on every other error.
+   */
+  removedGlobals?: string[];
+  constructor(status: number, message: string, removedGlobals?: string[]) {
     super(message);
     this.status = status;
+    this.removedGlobals = removedGlobals;
   }
 }
 
@@ -167,13 +196,17 @@ async function apiFetch<T = unknown>(
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     let message = text;
+    let removedGlobals: string[] | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
+      if (Array.isArray(parsed.removed_globals)) {
+        removedGlobals = parsed.removed_globals;
+      }
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, removedGlobals);
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
@@ -202,6 +235,7 @@ export function getLexicon(id: string) {
 export function uploadLexicon(body: {
   lexicon_json: unknown;
   backfill?: boolean;
+  indexed?: boolean;
   target_collection?: string;
   action?: string;
   token_cost?: number | null;
@@ -215,6 +249,55 @@ export function uploadLexicon(body: {
 export function deleteLexicon(id: string) {
   return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+// Lexicon publishing
+export function getLexiconPublishing() {
+  return apiFetch<LexiconPublishingOverview>("/admin/lexicon-publishing");
+}
+
+export function getLexiconPublishingDns() {
+  return apiFetch<LexiconDnsEntry[]>("/admin/lexicon-publishing/dns");
+}
+
+export function checkLexiconDns(nsid: string) {
+  return apiFetch<LexiconDnsCheck>(
+    `/admin/lexicon-publishing/dns/${encodeURIComponent(nsid)}`,
+  );
+}
+
+export function createPublishRule(body: CreatePublishRuleBody) {
+  return apiFetch<PublishRule>("/admin/lexicon-publishing/rules", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updatePublishRule(id: string, body: UpdatePublishRuleBody) {
+  return apiFetch<PublishRule>(
+    `/admin/lexicon-publishing/rules/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+export function deletePublishRule(id: string) {
+  return apiFetch(`/admin/lexicon-publishing/rules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function publishLexicons(nsids: string[]) {
+  return apiFetch<{ results: PublishOutcome[] }>(
+    "/admin/lexicon-publishing/publish",
+    { method: "POST", body: JSON.stringify({ nsids }) },
+  );
+}
+
+export function unpublishLexicon(nsid: string) {
+  return apiFetch("/admin/lexicon-publishing/unpublish", {
+    method: "POST",
+    body: JSON.stringify({ nsid }),
   });
 }
 
@@ -235,6 +318,7 @@ export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
 export function addNetworkLexicon(body: {
   nsid: string;
   backfill?: boolean;
+  indexed?: boolean;
   target_collection?: string;
 }) {
   return apiFetch<{
@@ -242,10 +326,7 @@ export function addNetworkLexicon(body: {
     authority_did: string;
     revision: number;
     backfill_job_id: string | null;
-  }>(
-    "/admin/network-lexicons",
-    { method: "POST", body: JSON.stringify(body) },
-  );
+  }>("/admin/network-lexicons", { method: "POST", body: JSON.stringify(body) });
 }
 
 export function deleteNetworkLexicon(nsid: string) {
@@ -259,7 +340,11 @@ export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
 }
 
-export function createBackfillJob(body: { collection?: string; dids?: string[] }) {
+export function createBackfillJob(body: {
+  collection?: string;
+  dids?: string[];
+  source?: BackfillSource;
+}) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
     body: JSON.stringify(body),
@@ -790,6 +875,13 @@ export interface DatabaseStatus {
     last_result: VacuumResult | null;
   };
   journal_size_limit: number;
+  checkpoint: {
+    at: string;
+    busy: boolean;
+    wal_frames: number;
+    checkpointed_frames: number;
+  } | null;
+  checkpoint_interval_secs: number;
 }
 
 export function getDatabaseStatus() {
@@ -808,6 +900,30 @@ export function cancelVacuum() {
   });
 }
 
+// Jetstream
+
+export interface JetstreamStatus {
+  protocol: "v2" | "v1" | null;
+  host: string | null;
+  connected: boolean;
+  compression: boolean;
+  dictionary_id: number | null;
+  /** The newest event that it and every event before it have been applied. Null on v1, which has no seq. */
+  applied_seq: number | null;
+  applied_time_us: number | null;
+  lag_ms: number | null;
+  /** Events waiting in each worker's queue, not counting the one being applied. */
+  worker_queue_depths: number[];
+  /** Per worker, when its current job started (unix ms); null when idle. */
+  worker_busy_since_ms: (number | null)[];
+  /** Server time at the snapshot (unix ms); age busy workers against this. */
+  now_ms: number;
+}
+
+export function getJetstreamStatus() {
+  return apiFetch<JetstreamStatus>("/admin/jetstream/status");
+}
+
 // Telemetry
 
 export interface TelemetrySettings {
@@ -822,6 +938,9 @@ export interface TelemetrySettings {
    * instance. False only for instances predating the setup wizard's
    * telemetry step, which is what the dashboard prompt exists to catch. */
   prompted: boolean;
+  /** Whether the hosting platform has made a daily report mandatory. Its
+   * settings are then fixed, and the API refuses changes to them. */
+  managed: boolean;
 }
 
 export interface TelemetryBenchmarkEntry {
@@ -1169,16 +1288,16 @@ export function authorizeExternal(pluginId: string, redirectUri: string) {
   );
 }
 
-export function syncExternal(pluginId: string) {
-  return apiFetch<SyncResponse>(
-    `/external-auth/${encodeURIComponent(pluginId)}/sync`,
+export function unlinkExternal(pluginId: string) {
+  return apiFetch<UnlinkResponse>(
+    `/external-auth/${encodeURIComponent(pluginId)}/unlink`,
     { method: "POST" },
   );
 }
 
-export function unlinkExternal(pluginId: string) {
-  return apiFetch<UnlinkResponse>(
-    `/external-auth/${encodeURIComponent(pluginId)}/unlink`,
+export function refreshExternalAccount(pluginId: string) {
+  return apiFetch<RefreshResponse>(
+    `/external-auth/${encodeURIComponent(pluginId)}/refresh`,
     { method: "POST" },
   );
 }
@@ -1198,6 +1317,10 @@ import type {
   PluginSummary,
   PluginsListResponse,
   OfficialPluginsListResponse,
+  PluginType,
+  PluginDependency,
+  CapabilityReport,
+  LifecycleState,
 } from "@/types/plugins";
 export type {
   PluginSummary,
@@ -1205,13 +1328,50 @@ export type {
   OfficialPluginSummary,
   OfficialPluginsListResponse,
   ReleaseEntry,
+  ChannelEntry,
+  LifecycleState,
+  PluginRegistryStatus,
 } from "@/types/plugins";
 
 export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
 }
 
-export function addPlugin(body: { url: string; sha256?: string }) {
+/** A registry project and which of its versions: a channel to follow
+ * (`latest` when neither is named) or one version to pin. */
+export interface RegistryProjectRef {
+  did: string;
+  name: string;
+  channel?: string;
+  version?: string;
+  /** The version a preview showed. The server refuses with 409 when the
+   * project now resolves to another, so nothing unreviewed is installed. */
+  expected_version?: string;
+}
+
+/** Another version of the project a registry install came from. Empty keeps
+ * what it has: the channel it follows, or its pinned version.
+ * `expected_version` is as on {@link RegistryProjectRef}. */
+export type RegistrySelector = { expected_version?: string } & (
+  | { channel?: never; version?: never }
+  | { channel: string; version?: never }
+  | { version: string; channel?: never }
+);
+
+/** The version a registry preview resolved to, to send back as
+ * `expected_version`. */
+export function previewedVersion(preview: PluginPreview): string {
+  return preview.registry?.version ?? preview.version;
+}
+
+/** Where a plugin comes from: a manifest URL, or a registry project. A
+ * registry plugin is checked against its CIDs, so it takes no `sha256`. */
+export type PluginOrigin =
+  { url: string; sha256?: string } | { registry: RegistryProjectRef };
+
+export function addPlugin(
+  body: PluginOrigin & { accepted_capabilities?: string[] },
+) {
   return apiFetch<PluginSummary>("/admin/plugins", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1224,7 +1384,12 @@ export function removePlugin(id: string) {
   });
 }
 
-export function reloadPlugin(id: string, body?: { url?: string }) {
+export function reloadPlugin(
+  id: string,
+  body?:
+    | { url?: string; accepted_capabilities?: string[] }
+    | { registry: RegistrySelector; accepted_capabilities?: string[] },
+) {
   return apiFetch<PluginSummary>(
     `/admin/plugins/${encodeURIComponent(id)}/reload`,
     {
@@ -1266,6 +1431,23 @@ export function updatePluginSecrets(
   });
 }
 
+export interface PluginAllowedHostsResponse {
+  hosts: string[];
+}
+
+export function getPluginAllowedHosts(id: string) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+  );
+}
+
+export function updatePluginAllowedHosts(id: string, hosts: string[]) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+    { method: "PUT", body: JSON.stringify({ hosts }) },
+  );
+}
+
 export interface SecretDefinition {
   key: string;
   name: string;
@@ -1278,16 +1460,38 @@ export interface PluginPreview {
   version: string;
   description: string | null;
   icon_url: string | null;
+  banner_url: string | null;
   auth_type: string;
   required_secrets: SecretDefinition[];
   manifest_url: string;
   wasm_url: string;
+  plugin_type: PluginType;
+  namespace: string | null;
+  dependencies: PluginDependency[];
+  allowed_hosts: string[];
+  capabilities: CapabilityReport;
+  sha256: string;
+  /** The registry version a registry preview resolved to. */
+  registry?: PreviewRegistry;
 }
 
-export function previewPlugin(url: string, signal?: AbortSignal) {
+export interface PreviewRegistry {
+  did: string;
+  name: string;
+  channel: string | null;
+  version: string;
+  version_uri: string;
+  state: LifecycleState;
+}
+
+export function previewPlugin(
+  origin: string | { url: string } | { registry: RegistryProjectRef },
+  signal?: AbortSignal,
+) {
+  const body = typeof origin === "string" ? { url: origin } : origin;
   return apiFetch<PluginPreview>("/admin/plugins/preview", {
     method: "POST",
-    body: JSON.stringify({ url }),
+    body: JSON.stringify(body),
     signal,
   });
 }
@@ -1387,6 +1591,17 @@ export function getScripts(opts?: { suffix?: string }) {
   return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`);
 }
 
+/** The languages a script can be written in: the installed interpreters'. */
+export function getScriptLanguages() {
+  return apiFetch<ScriptLanguage[]>("/admin/scripts/languages");
+}
+
+export function getEditorDeclarations(language: string) {
+  return apiFetch<EditorDeclarations>(
+    `/admin/editor/declarations?language=${encodeURIComponent(language)}`,
+  );
+}
+
 export function getScript(id: string) {
   return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`);
 }
@@ -1411,14 +1626,54 @@ export function deleteScript(id: string) {
   });
 }
 
+/**
+ * Preview (or, with `apply`, perform) the v3 codemod on a stored script.
+ * `CodemodRequestBody` says what each flag needs.
+ */
+export function codemodScript(
+  id: string,
+  apply?: boolean,
+  allowMarkers?: boolean,
+) {
+  const body: CodemodRequestBody = {};
+  if (apply) body.apply = true;
+  if (allowMarkers) body.allow_markers = true;
+  return apiFetch<CodemodResult>(
+    `/admin/scripts/${encodeURIComponent(id)}/codemod`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/**
+ * Preview the v3 codemod on text the server does not hold: an editor's unsaved
+ * body, or a script that has never been saved.
+ */
+export function previewCodemodDraft(id: string, source: string) {
+  const body: CodemodRequestBody = { source };
+  return apiFetch<CodemodResult>(
+    `/admin/scripts/${encodeURIComponent(id)}/codemod`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/**
+ * Whether a save failed because the body still references removed v2 globals,
+ * the one save error the Migrate dialog can resolve.
+ */
+export function isUnmigratedRefusal(e: unknown): boolean {
+  return e instanceof ApiError && e.removedGlobals !== undefined;
+}
+
 // Setup
 export interface SetupStatus {
   identity_mode:
-    | "did_web"
-    | "did_plc"
-    | "attach_account"
-    | "not_exposed"
-    | null;
+    "did_web" | "did_plc" | "attach_account" | "not_exposed" | null;
   identity_configured: boolean;
   plc_verified: boolean;
   setup_complete: boolean;

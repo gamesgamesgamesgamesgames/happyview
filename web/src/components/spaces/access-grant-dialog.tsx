@@ -95,7 +95,10 @@ export function AccessGrantDialog({
                 </SelectTrigger>
                 <SelectContent>
                   {scopeOptions.map((o, i) => (
-                    <SelectItem key={`${o.scope}:${o.target}`} value={String(i)}>
+                    <SelectItem
+                      key={`${o.scope}:${o.target}`}
+                      value={String(i)}
+                    >
                       {o.label}
                     </SelectItem>
                   ))}
@@ -122,7 +125,9 @@ export function AccessGrantDialog({
               <SelectContent>
                 {durations.map((d) => (
                   <SelectItem key={d} value={String(d)}>
-                    {d < 60 ? `${d} minutes` : `${d / 60} hour${d === 60 ? "" : "s"}`}
+                    {d < 60
+                      ? `${d} minutes`
+                      : `${d / 60} hour${d === 60 ? "" : "s"}`}
                   </SelectItem>
                 ))}
               </SelectContent>

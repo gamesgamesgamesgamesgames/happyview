@@ -25,9 +25,25 @@ import { toastError } from "@/lib/format";
 import {
   deleteLexicon,
   deleteNetworkLexicon,
+  getLexiconPublishing,
+  getLexiconPublishingDns,
   getLexicons,
 } from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
+import type {
+  LexiconDnsEntry,
+  PublishableLexicon,
+} from "@/types/lexicon-publishing";
+import { DestinationCell } from "@/components/lexicon-publishing/destination-cell";
+import {
+  DnsStatus,
+  dnsState,
+} from "@/components/lexicon-publishing/dns-status";
+import {
+  expectedDid,
+  nsidAuthority,
+} from "@/components/lexicon-publishing/model";
+import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -51,11 +67,27 @@ export default function LexiconsPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
+  // `null` until publishing has loaded and something can publish. The
+  // publishing columns appear only then: an instance with nowhere to publish
+  // has nothing to report, and a failed read leaves the list as it was.
+  const [publishing, setPublishing] = useState<Map<
+    string,
+    PublishableLexicon
+  > | null>(null);
+  const [dns, setDns] = useState<DnsLookup | null>(null);
 
   const load = useCallback(() => {
     getLexicons()
       .then(setLexicons)
       .catch((e) => toastError("Failed to load lexicons", e));
+    getLexiconPublishing()
+      .then((o) =>
+        setPublishing(
+          o.usable ? new Map(o.lexicons.map((l) => [l.nsid, l])) : null,
+        ),
+      )
+      .catch(() => setPublishing(null));
+    setDns(null);
   }, []);
 
   useEffect(() => {
@@ -151,9 +183,17 @@ export default function LexiconsPage() {
           options: [
             { label: "Manual", value: "manual" },
             { label: "Network", value: "network" },
+            { label: "Project", value: "project" },
           ],
         },
       },
+      ...(publishing
+        ? [
+            publishedColumn(publishing),
+            destinationColumn(publishing),
+            dnsColumn(publishing, dns),
+          ]
+        : []),
       {
         id: "action",
         accessorKey: "action",
@@ -169,7 +209,12 @@ export default function LexiconsPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Backfill" />
         ),
-        cell: ({ row }) => (row.original.backfill ? "Yes" : "No"),
+        cell: ({ row }) =>
+          !row.original.indexed
+            ? "Not indexed"
+            : row.original.backfill
+              ? "Yes"
+              : "No",
         enableSorting: true,
       },
       {
@@ -222,35 +267,43 @@ export default function LexiconsPage() {
               </Link>
             </Button>
 
-            {hasPermission("lexicons:delete") && (
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="destructive"
-                    size="icon"
-                    className="size-8 text-muted-foreground hover:text-destructive"
-                    title="Delete lexicon"
-                    aria-label="Delete lexicon"
-                    onClick={(e) => e.stopPropagation()}
-                    onPointerDown={(e) => e.stopPropagation()}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This will permanently remove the lexicon and its associated routes. This action cannot be undone.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original)}>Delete</AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            )}
+            {hasPermission("lexicons:delete") &&
+              row.original.layer !== "project" &&
+              !row.original.declared && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="destructive"
+                      size="icon"
+                      className="size-8 text-muted-foreground hover:text-destructive"
+                      title="Delete lexicon"
+                      aria-label="Delete lexicon"
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => e.stopPropagation()}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This will permanently remove the lexicon and its
+                        associated routes. This action cannot be undone.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction
+                        variant="destructive"
+                        onClick={() => handleDelete(row.original)}
+                      >
+                        Delete
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
           </div>
         ),
         enableSorting: false,
@@ -258,14 +311,34 @@ export default function LexiconsPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [hasPermission],
+    [hasPermission, publishing, dns],
   );
 
   const [sorting, setSorting] = useState<SortingState>([
     { id: "id", desc: false },
   ]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({
+    destination: false,
+    dns: false,
+  });
+
+  // DNS answers in seconds rather than milliseconds, so it is asked for only
+  // once someone shows the column.
+  const showDns = columnVisibility.dns === true && publishing !== null;
+  useEffect(() => {
+    if (!showDns || dns) return;
+    getLexiconPublishingDns()
+      .then((entries) =>
+        setDns({ entries: new Map(entries.map((e) => [e.authority, e])) }),
+      )
+      .catch((e) =>
+        setDns({
+          entries: new Map(),
+          failure: e instanceof Error ? e.message : String(e),
+        }),
+      );
+  }, [showDns, dns]);
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: 20,
@@ -318,4 +391,98 @@ export default function LexiconsPage() {
       </div>
     </>
   );
+}
+
+function publishedColumn(
+  publishing: Map<string, PublishableLexicon>,
+): ColumnDef<LexiconSummary> {
+  return {
+    id: "published",
+    accessorFn: (lex) => publishing.get(lex.id)?.status ?? "",
+    header: ({ column }) => (
+      <DataTableColumnHeader column={column} label="Published" />
+    ),
+    cell: ({ row }) => {
+      if (row.original.source === "network") {
+        return (
+          <span
+            className="text-muted-foreground"
+            title="Network lexicons can't be published"
+          >
+            —
+          </span>
+        );
+      }
+      const entry = publishing.get(row.original.id);
+      if (!entry) return <span className="text-muted-foreground">—</span>;
+      return <PublishStatusBadge lexicon={entry} compact explain />;
+    },
+    enableSorting: true,
+    meta: { label: "Published" },
+  };
+}
+
+type DnsLookup = {
+  entries: Map<string, LexiconDnsEntry>;
+  failure?: string;
+};
+
+function destinationColumn(
+  publishing: Map<string, PublishableLexicon>,
+): ColumnDef<LexiconSummary> {
+  return {
+    id: "destination",
+    accessorFn: (lex) => {
+      const target = publishing.get(lex.id)?.target;
+      return target?.handle ?? target?.did ?? target?.kind ?? "";
+    },
+    header: ({ column }) => (
+      <DataTableColumnHeader column={column} label="Destination" />
+    ),
+    cell: ({ row }) => {
+      const entry = publishing.get(row.original.id);
+      if (!entry) return <span className="text-muted-foreground">—</span>;
+      return <DestinationCell lexicon={entry} />;
+    },
+    enableSorting: true,
+    meta: { label: "Destination" },
+  };
+}
+
+function dnsColumn(
+  publishing: Map<string, PublishableLexicon>,
+  dns: DnsLookup | null,
+): ColumnDef<LexiconSummary> {
+  const counts = new Map<string, number>();
+  for (const nsid of publishing.keys()) {
+    const a = nsidAuthority(nsid);
+    counts.set(a, (counts.get(a) ?? 0) + 1);
+  }
+  return {
+    id: "dns",
+    // View lists only columns with an accessor.
+    accessorFn: (lex) => nsidAuthority(lex.id),
+    header: "DNS",
+    cell: ({ row }) => {
+      const entry = publishing.get(row.original.id);
+      if (!entry) return <span className="text-muted-foreground">—</span>;
+      const authority = nsidAuthority(entry.nsid);
+      const found = dns?.failure
+        ? {
+            authority,
+            record_name: `_lexicon.${authority}`,
+            did: null,
+            error: dns.failure,
+          }
+        : dns?.entries.get(authority);
+      return (
+        <DnsStatus
+          state={dnsState(found, dns === null, expectedDid(entry))}
+          coverCount={counts.get(authority) ?? 1}
+        />
+      );
+    },
+    enableSorting: false,
+    meta: { label: "DNS" },
+  };
 }

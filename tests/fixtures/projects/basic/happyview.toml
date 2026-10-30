@@ -1,0 +1,5 @@
+[lexicons."com.example.project.getThing"]
+target_collection = "com.example.project.thing"
+
+[scripts."job.run:thing.reindex"]
+description = "Reindexes every thing."

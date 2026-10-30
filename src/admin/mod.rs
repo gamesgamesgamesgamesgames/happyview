@@ -1,23 +1,24 @@
 pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
-pub mod backfill;
-pub mod backfill_errors;
-pub mod backfill_retry;
 mod database;
 mod dead_letters;
+pub mod default_plugins;
 mod domains;
+mod editor;
 mod events;
 mod feature_flags;
 mod identity;
 mod jobs;
 mod labelers;
+mod lexicon_publishing;
 mod lexicons;
 mod linked_repos;
-mod network_lexicons;
+pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
 mod plugins;
+mod project;
 mod proxy_config;
 mod records;
 mod script_variables;
@@ -29,6 +30,7 @@ pub(crate) mod space_access;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
+mod storage;
 mod telemetry;
 pub(crate) mod types;
 mod users;
@@ -39,8 +41,19 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 
-pub fn admin_routes(_state: AppState) -> Router<AppState> {
+pub fn admin_routes(state: AppState) -> Router<AppState> {
+    // The record source's routes, each behind the admin auth layer. Its
+    // router carries its own state, so it joins this one as a stateless one.
+    let source_routes = state
+        .source
+        .admin_routes()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin_caller,
+        ))
+        .with_state(());
     Router::new()
+        .merge(source_routes)
         .route(
             "/lexicons",
             post(lexicons::upload_lexicon).get(lexicons::list_lexicons),
@@ -53,31 +66,38 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/lexicons/{id}",
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
         )
+        .route("/lexicon-publishing", get(lexicon_publishing::overview))
+        .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
+        .route(
+            "/lexicon-publishing/dns/{nsid}",
+            get(lexicon_publishing::dns_for_lexicon),
+        )
+        .route(
+            "/lexicon-publishing/rules",
+            post(lexicon_publishing::create_rule),
+        )
+        .route(
+            "/lexicon-publishing/rules/{id}",
+            patch(lexicon_publishing::update_rule).delete(lexicon_publishing::delete_rule),
+        )
+        .route(
+            "/lexicon-publishing/publish",
+            post(lexicon_publishing::publish),
+        )
+        .route(
+            "/lexicon-publishing/unpublish",
+            post(lexicon_publishing::unpublish),
+        )
+        .route(
+            "/project",
+            put(project::put_project).get(project::get_project).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::project::deploy::bundle::MAX_COMPRESSED_BYTES,
+                ),
+            ),
+        )
         .route("/stats", get(stats::stats))
-        .route("/backfill", post(backfill::create_backfill))
-        .route("/backfill/status", get(backfill::backfill_status))
-        .route(
-            "/backfill/details",
-            delete(backfill::flush_all_backfill_details),
-        )
-        .route("/backfill/{id}/cancel", post(backfill::cancel_backfill))
-        .route("/backfill/{id}/pause", post(backfill::pause_backfill))
-        .route("/backfill/{id}/resume", post(backfill::resume_backfill))
-        .route("/backfill/{id}/events", get(backfill::backfill_events))
-        .route("/backfill/{id}/repos", get(backfill::backfill_repos))
-        .route(
-            "/backfill/{id}/pds-summary",
-            get(backfill::backfill_pds_summary),
-        )
-        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
-        .route(
-            "/backfill/{id}/retry-failed",
-            post(backfill::retry_failed_backfill),
-        )
-        .route(
-            "/backfill/{id}/details",
-            delete(backfill::flush_backfill_details),
-        )
+        .route("/stats/counts", get(stats::counts))
         .route(
             "/spaces/migration-status",
             get(spaces_migration::migration_status),
@@ -170,6 +190,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
+        .route("/storage/retrain", post(storage::retrain))
         .route(
             "/network-lexicons",
             post(network_lexicons::add).get(network_lexicons::list),
@@ -184,13 +205,16 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             post(script_variables::upsert).get(script_variables::list),
         )
         .route("/script-variables/{key}", delete(script_variables::delete))
+        .route("/editor/declarations", get(editor::declarations))
         .route("/scripts", get(scripts::list).post(scripts::upsert))
+        .route("/scripts/languages", get(scripts::languages))
         .route(
             "/scripts/{id}",
             get(scripts::get)
                 .patch(scripts::patch)
                 .delete(scripts::delete),
         )
+        .route("/scripts/{id}/codemod", post(scripts::codemod_apply))
         .route("/labelers", post(labelers::add).get(labelers::list))
         .route(
             "/labelers/{did}",
@@ -227,6 +251,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/plugins/{id}/secrets",
             get(plugins::get_secrets).put(plugins::update_secrets),
+        )
+        .route(
+            "/plugins/{id}/allowed-hosts",
+            get(plugins::get_allowed_hosts).put(plugins::update_allowed_hosts),
         )
         .route(
             "/api-clients",

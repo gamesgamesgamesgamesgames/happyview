@@ -124,7 +124,8 @@ export default function ApiKeysPage() {
                     colSpan={6}
                     className="text-muted-foreground text-center"
                   >
-                    No API keys yet. Create an API key to allow external services to authenticate with this AppView.
+                    No API keys yet. Create an API key to allow external
+                    services to authenticate with this AppView.
                   </TableCell>
                 </TableRow>
               )}
@@ -201,17 +202,14 @@ function CreateApiKeyDialog({
   onSuccess: () => void;
   permissions: PermissionEntry[];
 }) {
-  const categories = useMemo(
-    () => buildCategories(permissions),
-    [permissions],
-  );
+  const categories = useMemo(() => buildCategories(permissions), [permissions]);
   const allKeys = useMemo(() => permissions.map((p) => p.key), [permissions]);
 
   const [name, setName] = useState("");
   const [selectedPermissions, setSelectedPermissions] = useState<string[]>([]);
   const [open, setOpen] = useState(false);
   const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(
-    null
+    null,
   );
   const [copied, setCopied] = useState(false);
 
@@ -231,7 +229,7 @@ function CreateApiKeyDialog({
 
   function togglePermission(perm: string) {
     setSelectedPermissions((prev) =>
-      prev.includes(perm) ? prev.filter((p) => p !== perm) : [...prev, perm]
+      prev.includes(perm) ? prev.filter((p) => p !== perm) : [...prev, perm],
     );
   }
 
@@ -334,10 +332,10 @@ function CreateApiKeyDialog({
                 {Object.entries(categories).map(([category, perms]) => {
                   const keys = perms.map((p) => p.key);
                   const allSelected = keys.every((k) =>
-                    selectedPermissions.includes(k)
+                    selectedPermissions.includes(k),
                   );
                   const someSelected = keys.some((k) =>
-                    selectedPermissions.includes(k)
+                    selectedPermissions.includes(k),
                   );
                   return (
                     <div key={category} className="flex flex-col gap-2">

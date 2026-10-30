@@ -7,15 +7,20 @@ Load an existing record, apply multiple transformations, and save it back.
 **Lexicon type:** procedure
 
 ```lua
-function handle()
+local time = require("internal.time")
+local db = require("happyview.db")
+local record = require("happyview.record")
+
+function handle(input, ctx)
   if not input.uri then
     return { error = "uri is required" }
   end
 
-  local r = Record.load(input.uri)
-  if not r then
+  local row = db.get(input.uri)
+  if not row then
     return { error = "not found" }
   end
+  local r = row.record
 
   -- Increment a counter
   r.likeCount = (r.likeCount or 0) + 1
@@ -48,23 +53,21 @@ function handle()
   end
 
   -- Set a computed field
-  r.updatedAt = now()
+  r.updatedAt = time.to_iso8601(time.now())
 
-  r:save()
-
-  return { uri = r._uri, cid = r._cid }
+  return record.put(input.uri, r)
 end
 ```
 
 ## How it works
 
-1. Load the existing record with [`Record.load`](../../api-reference/lua/record-api.md#static-methods). This gives you a mutable `Record` instance with all the current field values.
-2. Apply transformations directly on the record's fields:
+1. Load the existing record with `db.get`. The envelope's `record` field is the stored body, a plain table you can change in place.
+2. Apply transformations directly on the body's fields:
    - **Increment a counter**: use `or 0` to handle the field being `nil` on first access.
    - **Merge tags**: iterate over `input.tags`, skip duplicates already in `r.tags`, append new ones, then trim the list to 10.
    - **Normalize a string**: use `string.gsub` to trim whitespace.
-   - **Set a timestamp**: use [`now()`](../../guides/lua-scripting.md#utility-globals) for UTC ISO 8601.
-3. Call `r:save()`. Since `_uri` is set (from the load), this calls `putRecord` to update the record on the user's PDS.
+   - **Set a timestamp**: [`time.to_iso8601(time.now())`](../../api-reference/lua/built-in-modules.md#internaltime) for UTC ISO 8601.
+3. Write the body back with `record.put`, which calls `putRecord` to update the record on the user's PDS.
 
 ## Usage
 
@@ -139,6 +142,6 @@ curl -X POST http://127.0.0.1:3000/xrpc/xyz.statusphere.updatePost \
 
 ## Use case
 
-This pattern is useful when updates involve more than simple field replacement: counters, bounded lists, string normalization, or computed fields. All mutations happen in memory before the single `r:save()` call, so there's no partial save: either all changes are written or none are.
+This pattern is useful when updates involve more than simple field replacement: counters, bounded lists, string normalization, or computed fields. All mutations happen in memory before the single `record.put` call, so there's no partial save: either all changes are written or none are.
 
-If the record has a schema, HappyView only sends fields defined in the schema's `properties` to the PDS on save. Extra fields you set on the record instance are ignored.
+The body is validated against the collection's lexicon before the write; pass `{ validate = false }` as a third argument to skip that check.

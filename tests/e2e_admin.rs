@@ -7,6 +7,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, ResponseTemplate};
 
 use common::app::TestApp;
 use common::fixtures;
@@ -410,6 +412,34 @@ async fn record_lexicon_with_backfill_starts_a_backfill_job() {
 
 #[tokio::test]
 #[serial]
+async fn record_lexicon_upload_does_not_backfill_when_automatic_backfill_is_off() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.auto_backfill = false;
+    app.rebuild_router();
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    assert!(json["backfill_job_id"].is_null(), "{json}");
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn re_uploading_a_lexicon_does_not_start_a_second_backfill_job() {
     common::require_db!();
     let app = TestApp::new().await;
@@ -458,6 +488,122 @@ async fn record_lexicon_without_backfill_starts_no_job() {
         backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
         0
     );
+}
+
+const GAME: &str = "games.gamesgamesgamesgames.game";
+
+#[tokio::test]
+#[serial]
+async fn an_unindexed_upload_is_reported_unindexed_and_neither_watched_nor_backfilled() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true,
+        "indexed": false
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{GAME}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["indexed"], json!(false));
+    assert!(!app.state.collections_tx.borrow().iter().any(|c| c == GAME));
+    assert_eq!(backfill_job_count(&app, GAME).await, 0);
+}
+
+async fn upload_game(app: &TestApp, extra: Value) {
+    let mut body = json!({ "lexicon_json": fixtures::game_record_lexicon(), "backfill": true });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+async fn reported_indexed(app: &TestApp) -> Value {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{GAME}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    json_body(resp).await["indexed"].clone()
+}
+
+fn watched(app: &TestApp) -> bool {
+    app.state.collections_tx.borrow().iter().any(|c| c == GAME)
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_as_indexed_starts_watching_without_a_backfill() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_game(&app, json!({ "indexed": false })).await;
+    assert!(!watched(&app));
+    upload_game(&app, json!({ "indexed": true })).await;
+    assert!(watched(&app));
+    assert_eq!(reported_indexed(&app).await, json!(true));
+    assert_eq!(backfill_job_count(&app, GAME).await, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_without_the_field_keeps_an_unindexed_lexicon_unindexed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_game(&app, json!({ "indexed": false })).await;
+    upload_game(&app, json!({})).await;
+    assert_eq!(reported_indexed(&app).await, json!(false));
+    assert!(!watched(&app));
+}
+
+#[tokio::test]
+#[serial]
+async fn an_upload_without_the_field_is_indexed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "lexicon_json": fixtures::game_record_lexicon(), "backfill": false });
+    app.router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{GAME}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["indexed"], json!(true));
+    assert!(app.state.collections_tx.borrow().iter().any(|c| c == GAME));
 }
 
 #[tokio::test]
@@ -704,22 +850,28 @@ async fn stats_with_seeded_records() {
     let app = TestApp::new().await;
     let backend = app.state.db_backend;
 
-    // Seed a lexicon so the stats query can join against it
+    // Seed a lexicon so the stats list has a collection to count
     let lexicon_json_val = serde_json::json!({
         "lexicon": 1,
         "id": "test.collection",
         "defs": { "main": { "type": "record", "key": "tid", "record": { "type": "object", "properties": {} } } }
     });
     let now = now_rfc3339();
-    let sql = adapt_sql(
-        "INSERT INTO happyview_lexicons (id, lexicon_json, created_at) VALUES (?, ?, ?)",
-        backend,
-    );
-    happyview::db::query(&sql)
-        .bind("test.collection")
-        .bind(serde_json::to_string(&lexicon_json_val).unwrap_or_default())
-        .bind(&now)
-        .execute(&app.state.db)
+    app.state
+        .lexicons
+        .put_manual(
+            &app.state.db,
+            backend,
+            happyview::catalog::LexiconWrite {
+                lexicon_json: lexicon_json_val,
+                backfill: false,
+                target_collection: None,
+                action: happyview::lexicon::ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: None,
+                indexed: true,
+            },
+        )
         .await
         .unwrap();
 
@@ -955,6 +1107,261 @@ async fn backfill_cancel_not_found_returns_404() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Poll the job list until `job_id` has finished.
+async fn wait_for_backfill(app: &TestApp, job_id: &str) -> Value {
+    for _ in 0..120 {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_get("/admin/backfill/status", app.admin_cookie()))
+            .await
+            .unwrap();
+        let jobs = json_body(resp).await;
+        if let Some(job) = jobs.as_array().unwrap().iter().find(|j| j["id"] == job_id)
+            && matches!(
+                job["status"].as_str(),
+                Some("completed" | "failed" | "cancelled" | "paused")
+            )
+        {
+            return job.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("backfill {job_id} did not finish");
+}
+
+/// A backfill job's rows in one of its per-job tables.
+async fn job_rows(app: &TestApp, table: &str, job_id: &str) -> i64 {
+    let sql = adapt_sql(
+        &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?"),
+        app.state.db_backend,
+    );
+    let (rows,): (i64,) = happyview::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    rows
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_backfill_drains_its_bounded_queue() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let collection = "games.gamesgamesgamesgames.game";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/lexicons",
+            app.admin_cookie(),
+            &json!({ "lexicon_json": fixtures::game_record_lexicon(), "backfill": false }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "lexicon upload: {}",
+        resp.status()
+    );
+
+    let pds = app.mock_server.uri();
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.sync.listReposByCollection"))
+        .and(query_param("collection", collection))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "repos": [{ "did": "did:plc:bfa" }, { "did": "did:plc:bfb" }]
+        })))
+        .mount(&app.mock_server)
+        .await;
+    for did in ["did:plc:bfa", "did:plc:bfb"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{did}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixtures::did_document(did, &pds)),
+            )
+            .mount(&app.mock_server)
+            .await;
+        let value = json!({ "$type": collection, "title": did });
+        let cid = happyview::cid_verify::compute_record_cid(&value)
+            .expect("cid")
+            .to_string();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .and(query_param("repo", did))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "records": [{ "uri": format!("at://{did}/{collection}/one"), "cid": cid, "value": value }]
+            })))
+            .mount(&app.mock_server)
+            .await;
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/backfill",
+            app.admin_cookie(),
+            &json!({ "collection": collection }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let job_id = json_body(resp).await["id"].as_str().unwrap().to_string();
+
+    let job = wait_for_backfill(&app, &job_id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["processed_repos"], 2, "{job}");
+    assert_eq!(job["total_records"], 2, "{job}");
+    assert_eq!(job["discovery_complete"], true, "{job}");
+    assert_eq!(job["recent_completions_limit"], 1000, "{job}");
+
+    let fetched_uri = format!("/admin/backfill/{job_id}/repos?phase=fetched");
+    let fetched = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get(&fetched_uri, app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut fetched_dids: Vec<&str> = fetched["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["did"].as_str().unwrap())
+        .collect();
+    fetched_dids.sort_unstable();
+    assert_eq!(fetched_dids, ["did:plc:bfa", "did:plc:bfb"], "{fetched}");
+    assert!(fetched["cursor"].is_null(), "{fetched}");
+
+    let summary_uri = format!("/admin/backfill/{job_id}/pds-summary");
+    let summary = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get(&summary_uri, app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        summary["pds_endpoints"].as_array().unwrap().len(),
+        1,
+        "{summary}"
+    );
+    assert_eq!(
+        summary["pds_endpoints"][0]["pds_endpoint"], pds,
+        "{summary}"
+    );
+    assert_eq!(summary["pds_endpoints"][0]["total_repos"], 2, "{summary}");
+    assert_eq!(
+        summary["pds_endpoints"][0]["completed_repos"], 2,
+        "{summary}"
+    );
+    assert_eq!(summary["pds_endpoints"][0]["total_records"], 2, "{summary}");
+
+    assert_eq!(job_rows(&app, "happyview_backfill_queue", &job_id).await, 0);
+    assert_eq!(
+        job_rows(&app, "happyview_backfill_cursors", &job_id).await,
+        1
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/backfill/{job_id}/details"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    for table in [
+        "happyview_backfill_queue",
+        "happyview_backfill_cursors",
+        "happyview_backfill_completions",
+        "happyview_backfill_pds_stats",
+    ] {
+        assert_eq!(job_rows(&app, table, &job_id).await, 0, "{table}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_running_bounded_backfill_refuses_a_flush() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let backend = app.state.db_backend;
+
+    // Inserted directly, so no pipeline runs and the job stays as seeded.
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, status, stage, queue_version, discovery_complete, started_at, created_at) \
+         VALUES (?, 'paused', 'resolving_and_fetching', 2, 0, ?, ?)",
+        backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&job_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_queue (job_id, collection, did) VALUES (?, 'games.gamesgamesgamesgames.game', 'did:plc:waiting')",
+        backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&job_id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/backfill/{job_id}/details"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(job_rows(&app, "happyview_backfill_queue", &job_id).await, 1);
+
+    let queued = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get(
+                &format!("/admin/backfill/{job_id}/repos"),
+                app.admin_cookie(),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(queued["repos"][0]["did"], "did:plc:waiting", "{queued}");
+    assert_eq!(queued["repos"][0]["status"], "pending", "{queued}");
+
+    let jobs = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/backfill/status", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let job = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == job_id.as_str())
+        .unwrap();
+    assert_eq!(job["discovery_complete"], false, "{job}");
 }
 
 // ---------------------------------------------------------------------------

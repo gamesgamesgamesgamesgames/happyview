@@ -1,0 +1,12 @@
+{
+  "id": "differential_library",
+  "name": "Differential library",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "differential",
+  "description": "Answers and records every library call the differential harness makes.",
+  "capabilities": ["kv:read", "kv:write"],
+  "dependencies": [],
+  "wasm_file": "differential_library.wasm"
+}

@@ -1,6 +1,4 @@
-use axum::Json;
-use axum::response::{IntoResponse, Response};
-use mlua::LuaSerdeExt;
+use axum::response::Response;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,19 +7,21 @@ use std::time::Instant;
 
 use crate::AppState;
 use crate::auth::Claims;
-use crate::db::{DatabaseBackend, adapt_sql};
-use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, parse_lua_line};
+use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, file_of};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
+use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
+use crate::script::{DispatchError, Invocation, ScriptOrigin, dispatch};
 use crate::telemetry::counters::Counters;
 
-use super::atproto_api;
 use super::context;
-use super::db_api;
-use super::http_api;
-use super::record;
-use super::sandbox;
+use super::scripts::{ResolvedScript, trigger_of};
+
+/// What a caller is told when the budget ended the run. The limit is the
+/// host's, so the sentence is the host's rather than whatever text the
+/// interpreter raised on its way out.
+const EXECUTION_LIMIT_MESSAGE: &str = "script exceeded execution time limit";
 
 struct ScriptTimingGuard {
     counters: Arc<Counters>,
@@ -38,27 +38,148 @@ impl Drop for ScriptTimingGuard {
     }
 }
 
-/// Load all script variables from the database as a key-value map.
-async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+/// The text after the auth-error prefix, wherever it sits in the message.
+/// An interpreter wraps a raised error in context of its own, so the prefix is
+/// not guaranteed to lead the string — `strip_prefix` would then miss it and
+/// the whole wrapped message, prefix included, would leak into the 401 body.
+fn auth_message_after_prefix(msg: &str) -> String {
+    match msg.find(LUA_AUTH_ERROR_PREFIX) {
+        Some(i) => msg[i + LUA_AUTH_ERROR_PREFIX.len()..].to_string(),
+        None => msg.to_string(),
+    }
 }
 
-/// Execute a Lua script for a procedure endpoint.
+/// The 401 an `AUTH_ERROR:` prefix recovers: a library's credential failure,
+/// raised through the script, which a caller can act on rather than report.
+///
+/// Every text a failure carries is searched, because which of them keeps the
+/// prefix is the interpreter's choice: one that trims its `message` to the
+/// line's own text may still carry the prefix in `raw`, and a 401 that
+/// degraded to a 500 would read as this instance being broken.
+fn auth_error(texts: &[&str]) -> Option<AppError> {
+    texts
+        .iter()
+        .find(|text| text.contains(LUA_AUTH_ERROR_PREFIX))
+        .map(|text| AppError::Auth(auth_message_after_prefix(text)))
+}
+
+/// The 400 a record page cursor the caller sent and the store refused
+/// (`record_store::query::INVALID_CURSOR`) recovers: the cursor is the
+/// caller's, so a script that passes the refusal on has not itself failed.
+fn invalid_cursor_error(texts: &[&str]) -> Option<AppError> {
+    let invalid = crate::record_store::query::INVALID_CURSOR;
+    texts
+        .iter()
+        .any(|text| text.contains(invalid))
+        .then(|| AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: invalid.to_string(),
+        })
+}
+
+/// The 503 a record import's `STORAGE_UNAVAILABLE` recovers: the storage
+/// claiming the collection is down, which a caller can retry, and the
+/// script that passed it on has not itself failed.
+fn storage_unavailable_error(texts: &[&str]) -> Option<AppError> {
+    texts
+        .iter()
+        .any(|text| text.contains(crate::error::STORAGE_UNAVAILABLE))
+        .then(crate::error::storage_unavailable)
+}
+
+/// A failure the script owns: its kind, its own text and its line reach the
+/// caller, which is what [`AppError::ScriptError`] exists to allow. A spent
+/// budget carries [`EXECUTION_LIMIT_MESSAGE`] instead, since the limit is the
+/// host's rather than the script's.
+fn script_error(
+    method: &str,
+    error_type: ScriptErrorType,
+    message: String,
+    line: Option<u32>,
+    file: Option<String>,
+) -> AppError {
+    AppError::ScriptError {
+        error_type,
+        message: match error_type {
+            ScriptErrorType::Timeout => EXECUTION_LIMIT_MESSAGE.to_string(),
+            _ => message,
+        },
+        method: method.to_string(),
+        line,
+        file,
+    }
+}
+
+/// One run's outcome as a runner needs it: the value to serialise, or the
+/// interpreter's unparsed text for the event log beside the error the caller
+/// sees.
+///
+/// `value_kind` is not read here: an XRPC response is the value, and a script
+/// that returned nothing answers `null` rather than a third outcome.
+fn returned_value(
+    method: &str,
+    outcome: Result<ScriptExecuteOutput, DispatchError>,
+) -> Result<Value, (String, AppError)> {
+    match outcome {
+        Ok(ScriptExecuteOutput::Returned { value, .. }) => Ok(value),
+        Ok(ScriptExecuteOutput::Error {
+            kind,
+            message,
+            line,
+            raw,
+            chunk,
+        }) => {
+            let error = auth_error(&[&message, &raw])
+                .or_else(|| invalid_cursor_error(&[&message, &raw]))
+                .or_else(|| storage_unavailable_error(&[&message, &raw]))
+                .unwrap_or_else(|| {
+                    script_error(method, kind.into(), message, line, file_of(chunk))
+                });
+            Err((raw, error))
+        }
+        // An endpoint whose interpreter is absent cannot answer until an
+        // operator installs one, which is what 503 says. Answering anything
+        // else would hand a caller a reply the script never shaped; a
+        // correlation id would hide a sentence that names only the language
+        // the row asked for and nothing about this instance.
+        Err(e @ DispatchError::NoInterpreter { .. }) => {
+            let raw = e.to_string();
+            Err((raw.clone(), AppError::ServerMisconfigured(raw)))
+        }
+        // A run that produced no result at all is told apart by whose failure
+        // it describes, not by how bad it is. The two limits describe the
+        // script's own run and keep its envelope; every other way an
+        // interpreter fails to answer describes this instance.
+        //
+        // "Your script failed" and "we could not run anything" are also
+        // different claims, so they do not share an envelope.
+        Err(e) => {
+            let raw = e.to_string();
+            let error = auth_error(&[&raw]).unwrap_or_else(|| match &e {
+                DispatchError::Execution(ExecutionError::Timeout) => {
+                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None, None)
+                }
+                DispatchError::Execution(ExecutionError::MemoryLimit { .. }) => {
+                    script_error(method, ScriptErrorType::Memory, raw.clone(), None, None)
+                }
+                _ => AppError::Internal(raw.clone()),
+            });
+            Err((raw, error))
+        }
+    }
+}
+
+/// Execute a procedure endpoint's script.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_procedure_script(
     state: &AppState,
     method: &str,
     claims: &Claims,
     input: &Value,
-    params: &std::collections::HashMap<String, Value>,
+    params: &HashMap<String, Value>,
     lexicon: &ParsedLexicon,
-    script: &str,
+    script: &ResolvedScript,
     space_ctx: Option<&context::SpaceContext>,
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
@@ -78,10 +199,12 @@ pub async fn execute_procedure_script(
     let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source and input for error logging before anything is consumed.
-    let script_source = script.to_string();
+    let script_source = script.body.clone();
     let input_json = input.clone();
 
-    let pds_auth: Option<repo::PdsAuth> = if let Some(client_key) = claims.client_key() {
+    let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
+        Some(auth)
+    } else if let Some(client_key) = claims.client_key() {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -129,523 +252,79 @@ pub async fn execute_procedure_script(
             .map(|s| repo::PdsAuth::OAuth(Arc::new(s)))
     };
 
-    let lua = match sandbox::create_sandbox() {
-        Ok(l) => l,
-        Err(e) => {
-            let error_message = format!("failed to create Lua VM: {e}");
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(claims.did().to_string()),
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": error_message,
-                        "script_source": script_source,
-                        "input": input_json,
-                        "caller_did": claims.did(),
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(AppError::Internal(error_message));
-        }
-    };
-
-    let state_arc = Arc::new(state.clone());
     let claims_arc = Arc::new(claims.clone());
-    let pds_auth_arc = pds_auth.map(Arc::new);
-
-    if let Err(e) = db_api::register_db_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register db API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = http_api::register_http_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register http API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) =
-        super::xrpc_api::register_xrpc_api(&lua, state_arc.clone(), Some(claims.did().to_string()))
-    {
-        let error_message = format!("failed to register xrpc API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = atproto_api::register_atproto_api(&lua, state_arc.clone(), Some(claims.did())) {
-        let error_message = format!("failed to register atproto API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
-        &lua,
-        state_arc.clone(),
-        Some(claims.did()),
-    ) {
-        let error_message = format!("failed to register spaces write API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::linked_repos_api::register_linked_repos_api(&lua, state_arc.clone())
-    {
-        let error_message = format!("failed to register linked repos API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Some(ref pds_auth) = pds_auth_arc
-        && let Err(e) = atproto_api::register_atproto_blob_api(
-            &lua,
-            state_arc.clone(),
-            claims_arc.clone(),
-            pds_auth.clone(),
-        )
-    {
-        let error_message = format!("failed to register atproto blob API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = super::jobs_api::register_jobs_api(
-        &lua,
-        state_arc.clone(),
-        Some(super::jobs_api::JobsCaller {
+    let caller_session = pds_auth.map(|pds_auth| {
+        Arc::new(crate::plugin::caller::CallerSession {
             did: claims.did().to_string(),
-            api_client_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
-                repo::PdsAuth::Dpop { api_client_id, .. } => Some(api_client_id.clone()),
-                _ => None,
-            }),
-            dpop_key_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
-                repo::PdsAuth::Dpop { dpop_key_id, .. } => Some(dpop_key_id.clone()),
-                _ => None,
-            }),
-        }),
-    ) {
-        let error_message = format!("failed to register jobs API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
+            delegate_did: delegate_did.map(|s| s.to_string()),
+            claims: claims_arc.clone(),
+            pds_auth: Arc::new(pds_auth),
+            app_state: state.clone(),
+        })
+    });
+    let has_pds_auth = caller_session.is_some();
+    let space = space_ctx.map(ScriptSpace::from);
 
-    if let Err(e) = record::register_record_api(
-        &lua,
-        state_arc.clone(),
-        Some(claims_arc),
-        pds_auth_arc,
-        delegate_did.map(|s| s.to_string()),
-    ) {
-        let error_message = format!("failed to register Record API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
+    let outcome = dispatch(
+        state,
+        &Invocation {
+            trigger_id: &script.id,
+            trigger: trigger_of(script, None).map_err(AppError::Internal)?,
+            language: &script.script_type,
+            source: &script.body,
+            input: &input_json,
+            caller_did: Some(claims.did()),
+            has_pds_auth,
+            method: Some(method),
+            collection: Some(collection),
+            params: Some(params),
+            delegate_did,
+            space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
+        },
+        caller_session,
+    )
+    .await;
 
-    // Override the sandbox's tracing-only `log()` with a version that
-    // also writes a `script.log` row to `event_logs` so operators can
-    // see script output from the dashboard. The xrpc trigger id is
-    // computed from the lexicon's id + procedure type.
-    let trigger_id = format!("xrpc.procedure:{}", lexicon.id);
-    if let Err(e) =
-        super::scripts::register_log_event_api(&lua, &state_arc, &trigger_id, Some(claims.did()))
-    {
-        let error_message = format!("failed to register log API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
+    let json_value = match returned_value(method, outcome) {
+        Ok(value) => value,
+        Err((raw, error)) => {
+            tracing::error!(method, error = %raw, "script execution failed");
+            log_event(
+                &state.db,
+                EventLog {
+                    event_type: "script.error".to_string(),
+                    severity: Severity::Error,
+                    actor_did: Some(claims.did().to_string()),
+                    subject: Some(method.to_string()),
+                    detail: serde_json::json!({
+                        "error": raw,
+                        "script_source": script_source,
+                        "input": input_json,
+                        "caller_did": claims.did(),
+                        "method": method,
+                        "duration_ms": start.elapsed().as_millis() as u64,
+                    }),
+                },
+                backend,
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
-    if let Err(e) = context::set_procedure_context(
-        &lua,
+    // The lexicon's declared output encoding decides whether this answers
+    // JSON or bytes, so a method declaring `application/json` is never
+    // examined for the byte forms and cannot be reinterpreted.
+    let answer = crate::script::response::resolve(
+        &state.db,
+        backend,
         method,
-        input,
-        params,
-        claims.did(),
-        collection,
-        space_ctx,
-        delegate_did,
-    ) {
-        let error_message = format!("failed to set context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
-        let error_message = format!("failed to set env context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = lua.load(script).exec() {
-        let error_message = format!("{e}");
-        tracing::error!(method, error = %e, "lua script load failed");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        let (line, clean_msg) = parse_lua_line(&error_message);
-        return Err(AppError::ScriptError {
-            error_type: ScriptErrorType::Syntax,
-            message: clean_msg,
-            method: method.to_string(),
-            line,
-        });
-    }
-
-    let handle: mlua::Function = match lua.globals().get("handle") {
-        Ok(f) => f,
-        Err(e) => {
-            let error_message = format!("{e}");
-            tracing::error!(method, error = %e, "lua script missing handle function");
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(claims.did().to_string()),
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": error_message,
-                        "script_source": script_source,
-                        "input": input_json,
-                        "caller_did": claims.did(),
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(AppError::ScriptError {
-                error_type: ScriptErrorType::MissingHandle,
-                message: "script does not define a handle() function".to_string(),
-                method: method.to_string(),
-                line: None,
-            });
-        }
-    };
-
-    let result: mlua::Value = match handle.call_async(()).await {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            tracing::error!(method, error = %msg, "lua script execution failed");
-            let (line, clean_msg) = parse_lua_line(&msg);
-            let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
-                || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
-            {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
-                AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
-                AppError::ScriptError {
-                    error_type: ScriptErrorType::Timeout,
-                    message: "script exceeded execution time limit".to_string(),
-                    method: method.to_string(),
-                    line,
-                }
-            } else {
-                AppError::ScriptError {
-                    error_type: ScriptErrorType::Runtime,
-                    message: clean_msg,
-                    method: method.to_string(),
-                    line,
-                }
-            };
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(claims.did().to_string()),
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": msg,
-                        "script_source": script_source,
-                        "input": input_json,
-                        "caller_did": claims.did(),
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(app_error);
-        }
-    };
-
-    let json_value: Value = match lua.from_value(result) {
-        Ok(v) => v,
-        Err(e) => {
-            let error_message = format!("{e}");
-            tracing::error!(method, error = %e, "failed to convert lua result to JSON");
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(claims.did().to_string()),
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": error_message,
-                        "script_source": script_source,
-                        "input": input_json,
-                        "caller_did": claims.did(),
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(AppError::ScriptError {
-                error_type: ScriptErrorType::Runtime,
-                message: error_message,
-                method: method.to_string(),
-                line: None,
-            });
-        }
-    };
+        &crate::script::encoding::of_output(lexicon),
+        &crate::script::response::declared_errors(lexicon),
+        json_value,
+    )
+    .await?;
 
     span.in_scope(|| {
         tracing::info!(
@@ -665,9 +344,9 @@ pub async fn execute_procedure_script(
                     "method": method,
                     "caller_did": claims.did(),
                     "duration_ms": start.elapsed().as_millis() as u64,
-                    "response_size": json_value.to_string().len(),
+                    "response_size": answer.response_size(),
                     "input": input_json,
-                    "response": json_value,
+                    "response": answer.log_detail(),
                 }),
             },
             backend,
@@ -675,16 +354,17 @@ pub async fn execute_procedure_script(
         .await;
     }
 
-    Ok(Json(json_value).into_response())
+    Ok(answer.into_response())
 }
 
-/// Execute a Lua script for a query endpoint.
+/// Execute a query endpoint's script.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_query_script(
     state: &AppState,
     method: &str,
-    params: &HashMap<String, serde_json::Value>,
+    params: &HashMap<String, Value>,
     lexicon: &ParsedLexicon,
-    script: &str,
+    script: &ResolvedScript,
     claims: Option<&Claims>,
     space_ctx: Option<&context::SpaceContext>,
 ) -> Result<Response, AppError> {
@@ -699,12 +379,39 @@ pub async fn execute_query_script(
     let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source for error logging.
-    let script_source = script.to_string();
+    let script_source = script.body.clone();
 
-    let lua = match sandbox::create_sandbox() {
-        Ok(l) => l,
-        Err(e) => {
-            let error_message = format!("failed to create Lua VM: {e}");
+    // A query's parameters are the first argument of `handle`, which is why
+    // `ctx.params` carries nothing: the same values twice would leave a script
+    // author guessing which one a runner fills.
+    let input_json = Value::Object(params.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    let space = space_ctx.map(ScriptSpace::from);
+
+    let outcome = dispatch(
+        state,
+        &Invocation {
+            trigger_id: &script.id,
+            trigger: trigger_of(script, None).map_err(AppError::Internal)?,
+            language: &script.script_type,
+            source: &script.body,
+            input: &input_json,
+            caller_did: claims.map(|c| c.did()),
+            has_pds_auth: false,
+            method: Some(method),
+            collection: Some(collection),
+            params: None,
+            delegate_did: None,
+            space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
+        },
+        None,
+    )
+    .await;
+
+    let json_value = match returned_value(method, outcome) {
+        Ok(value) => value,
+        Err((raw, error)) => {
+            tracing::error!(method, error = %raw, "script execution failed");
             log_event(
                 &state.db,
                 EventLog {
@@ -713,7 +420,7 @@ pub async fn execute_query_script(
                     actor_did: None,
                     subject: Some(method.to_string()),
                     detail: serde_json::json!({
-                        "error": error_message,
+                        "error": raw,
                         "script_source": script_source,
                         "method": method,
                         "duration_ms": start.elapsed().as_millis() as u64,
@@ -722,402 +429,22 @@ pub async fn execute_query_script(
                 backend,
             )
             .await;
-            return Err(AppError::Internal(error_message));
+            return Err(error);
         }
     };
 
-    let state_arc = Arc::new(state.clone());
-
-    if let Err(e) = db_api::register_db_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register db API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = http_api::register_http_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register http API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = super::xrpc_api::register_xrpc_api(
-        &lua,
-        state_arc.clone(),
-        claims.map(|c| c.did().to_string()),
-    ) {
-        let error_message = format!("failed to register xrpc API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) =
-        atproto_api::register_atproto_api(&lua, state_arc.clone(), claims.map(|c| c.did()))
-    {
-        let error_message = format!("failed to register atproto API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
-        &lua,
-        state_arc.clone(),
-        claims.map(|c| c.did()),
-    ) {
-        let error_message = format!("failed to register spaces write API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::linked_repos_api::register_linked_repos_api(&lua, state_arc.clone())
-    {
-        let error_message = format!("failed to register linked repos API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    // Register the Record API in no-auth mode. Queries don't have a PDS
-    // auth context — the local-only methods (Record.load, :save_local,
-    // :delete_local, Record.delete_local) work; PDS-touching variants
-    // error with the no-PDS-auth message.
-    if let Err(e) = record::register_record_api_no_auth(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register Record API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    // Override the sandbox's tracing-only `log()` with a version that
-    // also writes a `script.log` row to `event_logs`.
-    let trigger_id = format!("xrpc.query:{}", lexicon.id);
-    if let Err(e) = super::scripts::register_log_event_api(
-        &lua,
-        &state_arc,
-        &trigger_id,
-        claims.map(|c| c.did()),
-    ) {
-        let error_message = format!("failed to register log API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = context::set_query_context(
-        &lua,
+    // The lexicon's declared output encoding decides whether this answers
+    // JSON or bytes, so a method declaring `application/json` is never
+    // examined for the byte forms and cannot be reinterpreted.
+    let answer = crate::script::response::resolve(
+        &state.db,
+        backend,
         method,
-        params,
-        collection,
-        claims.map(|c| c.did()),
-        space_ctx,
-    ) {
-        let error_message = format!("failed to set context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
-        let error_message = format!("failed to set env context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = lua.load(script).exec() {
-        let error_message = format!("{e}");
-        tracing::error!(method, error = %e, "lua script load failed");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        let (line, clean_msg) = parse_lua_line(&error_message);
-        return Err(AppError::ScriptError {
-            error_type: ScriptErrorType::Syntax,
-            message: clean_msg,
-            method: method.to_string(),
-            line,
-        });
-    }
-
-    let handle: mlua::Function = match lua.globals().get("handle") {
-        Ok(f) => f,
-        Err(e) => {
-            let error_message = format!("{e}");
-            tracing::error!(method, error = %e, "lua script missing handle function");
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: None,
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": error_message,
-                        "script_source": script_source,
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(AppError::ScriptError {
-                error_type: ScriptErrorType::MissingHandle,
-                message: "script does not define a handle() function".to_string(),
-                method: method.to_string(),
-                line: None,
-            });
-        }
-    };
-
-    let result: mlua::Value = match handle.call_async(()).await {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            tracing::error!(method, error = %msg, "lua script execution failed");
-            let (line, clean_msg) = parse_lua_line(&msg);
-            let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
-                || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
-            {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
-                AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
-                AppError::ScriptError {
-                    error_type: ScriptErrorType::Timeout,
-                    message: "script exceeded execution time limit".to_string(),
-                    method: method.to_string(),
-                    line,
-                }
-            } else {
-                AppError::ScriptError {
-                    error_type: ScriptErrorType::Runtime,
-                    message: clean_msg,
-                    method: method.to_string(),
-                    line,
-                }
-            };
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: None,
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": msg,
-                        "script_source": script_source,
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(app_error);
-        }
-    };
-
-    let json_value: Value = match lua.from_value(result) {
-        Ok(v) => v,
-        Err(e) => {
-            let error_message = format!("{e}");
-            tracing::error!(method, error = %e, "failed to convert lua result to JSON");
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "script.error".to_string(),
-                    severity: Severity::Error,
-                    actor_did: None,
-                    subject: Some(method.to_string()),
-                    detail: serde_json::json!({
-                        "error": error_message,
-                        "script_source": script_source,
-                        "method": method,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                    }),
-                },
-                backend,
-            )
-            .await;
-            return Err(AppError::ScriptError {
-                error_type: ScriptErrorType::Runtime,
-                message: error_message,
-                method: method.to_string(),
-                line: None,
-            });
-        }
-    };
+        &crate::script::encoding::of_output(lexicon),
+        &crate::script::response::declared_errors(lexicon),
+        json_value,
+    )
+    .await?;
 
     span.in_scope(|| {
         tracing::info!(
@@ -1136,9 +463,9 @@ pub async fn execute_query_script(
                 detail: serde_json::json!({
                     "method": method,
                     "duration_ms": start.elapsed().as_millis() as u64,
-                    "response_size": json_value.to_string().len(),
+                    "response_size": answer.response_size(),
                     "params": params,
-                    "response": json_value,
+                    "response": answer.log_detail(),
                 }),
             },
             backend,
@@ -1146,14 +473,16 @@ pub async fn execute_query_script(
         .await;
     }
 
-    Ok(Json(json_value).into_response())
+    Ok(answer.into_response())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
     use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
+    use axum::response::IntoResponse;
 
     fn query_lexicon() -> ParsedLexicon {
         ParsedLexicon {
@@ -1175,107 +504,325 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn successful_script_execution_moves_the_script_counters() {
-        let state = test_state_with_pool(memory_pool().await);
-        let lexicon = query_lexicon();
-        let params = HashMap::new();
-        let counters = state.telemetry_counters.clone();
-
-        let result = execute_query_script(
-            &state,
-            "com.example.probe",
-            &params,
-            &lexicon,
-            "function handle() return { ok = true } end",
-            None,
-            None,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "script should have executed: {:?}",
-            result.err()
-        );
-        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn a_script_missing_handle_still_moves_the_script_counters() {
-        let state = test_state_with_pool(memory_pool().await);
-        let lexicon = query_lexicon();
-        let params = HashMap::new();
-        let counters = state.telemetry_counters.clone();
-
-        let result = execute_query_script(
-            &state,
-            "com.example.probe",
-            &params,
-            &lexicon,
-            "local unused = 1",
-            None,
-            None,
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "script has no handle() function, so this must error"
-        );
-        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn a_lua_runtime_error_still_moves_the_script_counters() {
-        // `handle()` runs and raises — a different early return than the
-        // "missing handle" case (this one comes from `handle.call_async`
-        // failing, not from `lua.globals().get("handle")` failing).
-        let state = test_state_with_pool(memory_pool().await);
-        let lexicon = query_lexicon();
-        let params = HashMap::new();
-        let counters = state.telemetry_counters.clone();
-
-        let result = execute_query_script(
-            &state,
-            "com.example.probe",
-            &params,
-            &lexicon,
-            "function handle() error('boom') end",
-            None,
-            None,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn script_counters_accumulate_across_calls_on_the_same_counters() {
-        let state = test_state_with_pool(memory_pool().await);
-        let lexicon = query_lexicon();
-        let params = HashMap::new();
-        let counters = state.telemetry_counters.clone();
-
-        for _ in 0..20 {
-            let _ = execute_query_script(
-                &state,
-                "com.example.probe",
-                &params,
-                &lexicon,
-                "function handle() return {} end",
-                None,
-                None,
-            )
-            .await;
+    /// A query row bound to the lexicon above, as a resolve would answer it.
+    fn query_script(body: &str) -> ResolvedScript {
+        ResolvedScript {
+            id: "xrpc.query:com.example.probe".to_string(),
+            trigger: crate::lua::TriggerKind::XrpcQuery,
+            script_type: "lua".to_string(),
+            body: body.to_string(),
+            layer: crate::catalog::Layer::Manual,
+            path: None,
+            chunk_name: crate::catalog::DASHBOARD_CHUNK_NAME.to_string(),
+            outbound_xrpcs: Vec::new(),
+            snapshot: std::sync::Arc::new(crate::project::ProjectSnapshot::empty()),
         }
+    }
 
-        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 20);
-        assert!(
-            counters.script_runtime_us.load(Ordering::Relaxed) > 0,
-            "20 script executions should accumulate measurable wall-clock time"
+    fn failed(kind: ScriptErrorKind, message: &str) -> Result<ScriptExecuteOutput, DispatchError> {
+        Ok(ScriptExecuteOutput::Error {
+            kind,
+            message: message.to_string(),
+            line: Some(7),
+            raw: format!("[string \"script\"]:7: {message}"),
+            chunk: None,
+        })
+    }
+
+    #[test]
+    fn auth_message_survives_a_prefix_that_is_not_leading() {
+        let wrapped = format!(
+            "runtime error: caller.create_record: Plugin returned error: AUTH_REQUIRED - {}DPoP session not found",
+            LUA_AUTH_ERROR_PREFIX
         );
+        assert_eq!(
+            auth_message_after_prefix(&wrapped),
+            "DPoP session not found"
+        );
+    }
+
+    #[test]
+    fn auth_message_falls_back_to_the_whole_string_without_a_prefix() {
+        assert_eq!(
+            auth_message_after_prefix("no prefix here"),
+            "no prefix here"
+        );
+    }
+
+    #[test]
+    fn a_returned_value_is_the_body_whatever_its_kind() {
+        for value_kind in [
+            ScriptValueKind::Object,
+            ScriptValueKind::None,
+            ScriptValueKind::Other,
+        ] {
+            let value = serde_json::json!({ "ok": true });
+            let body = returned_value(
+                "com.example.probe",
+                Ok(ScriptExecuteOutput::Returned {
+                    value: value.clone(),
+                    value_kind,
+                }),
+            )
+            .unwrap_or_else(|(raw, _)| panic!("{value_kind:?}: {raw}"));
+            assert_eq!(body, value, "{value_kind:?}");
+        }
+    }
+
+    /// Each kind reaches its own `ScriptErrorType`, which is what the status
+    /// and the `errorType` field are read from.
+    #[test]
+    fn every_error_kind_keeps_its_type_its_line_and_its_message() {
+        for (kind, expected) in [
+            (ScriptErrorKind::Syntax, ScriptErrorType::Syntax),
+            (ScriptErrorKind::Runtime, ScriptErrorType::Runtime),
+            (ScriptErrorKind::Memory, ScriptErrorType::Memory),
+            (
+                ScriptErrorKind::MissingHandle,
+                ScriptErrorType::MissingHandle,
+            ),
+        ] {
+            let (raw, error) = returned_value(
+                "com.example.probe",
+                failed(kind, "attempt to index a nil value (local 't')"),
+            )
+            .expect_err("a failed run has no value");
+            assert_eq!(
+                raw, "[string \"script\"]:7: attempt to index a nil value (local 't')",
+                "{kind:?}"
+            );
+            match error {
+                AppError::ScriptError {
+                    error_type,
+                    message,
+                    method,
+                    line,
+                    ..
+                } => {
+                    assert_eq!(error_type, expected, "{kind:?}");
+                    assert_eq!(message, "attempt to index a nil value (local 't')");
+                    assert_eq!(method, "com.example.probe");
+                    assert_eq!(line, Some(7));
+                }
+                other => panic!("{kind:?}: expected a script error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_timeout_carries_the_hosts_own_sentence() {
+        let (_, error) = returned_value(
+            "com.example.probe",
+            failed(ScriptErrorKind::Timeout, "interrupt"),
+        )
+        .expect_err("a failed run has no value");
+        match error {
+            AppError::ScriptError {
+                error_type: ScriptErrorType::Timeout,
+                message,
+                ..
+            } => assert_eq!(message, EXECUTION_LIMIT_MESSAGE),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    /// A record page cursor the caller sent that does not parse (one from
+    /// before the compact format included) is the caller's error: 400
+    /// `InvalidRequest`, not the 500 of a script failure, however the script
+    /// passed the library's error on.
+    #[test]
+    fn an_invalid_record_cursor_is_the_callers_400() {
+        let message = format!(
+            "runtime error: db.records: Plugin returned error: INVALID_SPEC - {}",
+            crate::record_store::query::INVALID_CURSOR
+        );
+        let (_, error) = returned_value(
+            "com.example.probe",
+            failed(ScriptErrorKind::Runtime, &message),
+        )
+        .expect_err("a failed run has no value");
+        match error {
+            AppError::XrpcError {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(
+                    (status, code),
+                    (axum::http::StatusCode::BAD_REQUEST, "InvalidRequest")
+                );
+                assert_eq!(message, crate::record_store::query::INVALID_CURSOR);
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_auth_error_message_recovers_its_401_whatever_the_kind() {
+        for kind in [ScriptErrorKind::Runtime, ScriptErrorKind::Timeout] {
+            let message = format!("runtime error: {LUA_AUTH_ERROR_PREFIX}DPoP session not found");
+            let (_, error) = returned_value("com.example.probe", failed(kind, &message))
+                .expect_err("a failed run has no value");
+            match error {
+                AppError::Auth(message) => assert_eq!(message, "DPoP session not found"),
+                other => panic!("{kind:?}: expected an auth error, got {other:?}"),
+            }
+        }
+    }
+
+    /// An interpreter that trims its `message` keeps the prefix in `raw`, and
+    /// the 401 has to survive either spelling.
+    #[test]
+    fn an_auth_error_is_recovered_from_the_unparsed_text_alone() {
+        let (_, error) = returned_value(
+            "com.example.probe",
+            Ok(ScriptExecuteOutput::Error {
+                kind: ScriptErrorKind::Runtime,
+                message: "caller.create_record failed".into(),
+                line: Some(4),
+                raw: format!(
+                    "[string \"script\"]:4: {LUA_AUTH_ERROR_PREFIX}DPoP session not found"
+                ),
+                chunk: None,
+            }),
+        )
+        .expect_err("a failed run has no value");
+        match error {
+            AppError::Auth(message) => assert_eq!(message, "DPoP session not found"),
+            other => panic!("expected an auth error, got {other:?}"),
+        }
+    }
+
+    /// The two limits describe the script's own run, so they keep its envelope
+    /// and its `errorType`.
+    #[test]
+    fn an_interpreter_that_does_not_answer_keeps_the_two_limits_apart() {
+        for (error, expected) in [
+            (ExecutionError::Timeout, ScriptErrorType::Timeout),
+            (
+                ExecutionError::MemoryLimit {
+                    requested: 2,
+                    ceiling: 1,
+                },
+                ScriptErrorType::Memory,
+            ),
+        ] {
+            let raw = error.to_string();
+            let (logged, app_error) =
+                returned_value("com.example.probe", Err(DispatchError::Execution(error)))
+                    .expect_err("a run that did not happen has no value");
+            assert_eq!(logged, raw);
+            match app_error {
+                AppError::ScriptError {
+                    error_type, line, ..
+                } => {
+                    assert_eq!(error_type, expected, "{raw}");
+                    assert_eq!(
+                        line, None,
+                        "an interpreter that did not answer names no line"
+                    );
+                }
+                other => panic!("{raw}: expected a script error, got {other:?}"),
+            }
+        }
+    }
+
+    /// A failure that describes this instance rather than the script reaches a
+    /// caller as a correlation id and nothing else. Its text is an operator's:
+    /// it names wasmtime internals, a missing export, a plugin id — none of
+    /// which is a stranger's to read, and none of which a script author could
+    /// act on. The text still reaches the operator, through the log line
+    /// `AppError::Internal` writes and through the `script.error` row.
+    #[tokio::test]
+    async fn a_host_origin_failure_answers_a_correlation_id_rather_than_its_text() {
+        const SECRET: &str = "wasm trap: wasm backtrace at /srv/happyview/probe.wasm";
+        for error in [
+            DispatchError::Execution(ExecutionError::Trap(wasmtime::Error::msg(SECRET))),
+            DispatchError::Execution(ExecutionError::Instantiation(anyhow::anyhow!(SECRET))),
+            DispatchError::Execution(ExecutionError::MissingExport(SECRET.into())),
+            DispatchError::Execution(ExecutionError::NotAnInterpreter(SECRET.into())),
+            DispatchError::Execution(ExecutionError::InvalidResponse(SECRET.into())),
+        ] {
+            let label = error.to_string();
+            let (logged, app_error) = returned_value("com.example.probe", Err(error))
+                .expect_err("a run that did not happen has no value");
+            assert!(
+                logged.contains(SECRET),
+                "{label}: the operator's record must keep the text"
+            );
+
+            let response = app_error.into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{label}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+            assert!(
+                body["correlationId"].is_string(),
+                "{label}: {body} carries no correlation id"
+            );
+            assert!(
+                !body.to_string().contains(SECRET),
+                "{label}: {body} leaks the host's own text"
+            );
+        }
+    }
+
+    /// An absent interpreter is the one host-origin failure whose text a
+    /// caller gets in full. It names no internals — only the language the row
+    /// asked for — and an operator reading a correlation id would learn less
+    /// than the sentence itself says.
+    #[tokio::test]
+    async fn an_absent_interpreter_answers_a_503_naming_the_language() {
+        let (logged, app_error) = returned_value(
+            "com.example.probe",
+            Err(DispatchError::NoInterpreter {
+                language: "typescript".into(),
+            }),
+        )
+        .expect_err("a run that did not happen has no value");
+        assert!(logged.contains("typescript"), "{logged}");
+
+        let response = app_error.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(body["error"], "ServerMisconfigured");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains("typescript"), "{body}");
+        assert!(message.contains("plugins page"), "{body}");
+    }
+
+    /// The guard reports a run whatever became of it, so a counter cannot be
+    /// lost to a path that returns early.
+    #[tokio::test]
+    async fn a_run_that_reached_no_interpreter_still_moves_the_script_counters() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let counters = state.telemetry_counters.clone();
+
+        execute_query_script(
+            &state,
+            "com.example.probe",
+            &HashMap::new(),
+            &lexicon,
+            &query_script("function handle() return {} end"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("no interpreter is installed, so the run cannot happen");
+
+        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
     }
 
     async fn executed_event_count(state: &AppState) -> i64 {
@@ -1292,6 +839,7 @@ mod tests {
     /// stores the full request and response, so the row is gated like the other
     /// per-request telemetry.
     #[tokio::test]
+    #[ignore = "needs an interpreter plugin, and v3 ships none to tests"]
     async fn script_executed_is_not_logged_while_verbose_logging_is_off() {
         let state = test_state_with_pool(migrated_memory_pool().await);
         let lexicon = query_lexicon();
@@ -1302,7 +850,7 @@ mod tests {
             "com.example.probe",
             &params,
             &lexicon,
-            "function handle() return { ok = true } end",
+            &query_script("function handle() return { ok = true } end"),
             None,
             None,
         )
@@ -1321,6 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs an interpreter plugin, and v3 ships none to tests"]
     async fn script_executed_is_logged_when_verbose_logging_is_on() {
         let state = test_state_with_pool(migrated_memory_pool().await);
         state.verbose_event_logging.store(true, Ordering::Relaxed);
@@ -1332,7 +881,7 @@ mod tests {
             "com.example.probe",
             &params,
             &lexicon,
-            "function handle() return { ok = true } end",
+            &query_script("function handle() return { ok = true } end"),
             None,
             None,
         )
@@ -1348,5 +897,80 @@ mod tests {
             1,
             "script.executed must still be logged when verbose event logging is on"
         );
+    }
+
+    #[test]
+    fn a_failure_in_a_project_file_names_the_file() {
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(12),
+            raw: "src/lib/format.lua:12: boom".into(),
+            chunk: Some("src/lib/format.lua".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        match error {
+            AppError::ScriptError { file, line, .. } => {
+                assert_eq!(file.as_deref(), Some("src/lib/format.lua"));
+                assert_eq!(line, Some(12));
+            }
+            other => panic!("expected a script error, got {other:?}"),
+        }
+    }
+
+    /// A panic's location travels as `chunk` and `line`, so the caller reads
+    /// the file once: in the sentence, and once more in the body's own field.
+    #[tokio::test]
+    async fn a_panic_names_its_file_once() {
+        const PLACED: &str = "modules/registry/src/lib.rs";
+        let report = happyview_plugin_sdk::wire::PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 3,
+            column: 1,
+        };
+        let outcome = Ok(crate::plugin::executor::panic_output(
+            report,
+            Some(std::path::Path::new("modules/registry")),
+        ));
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        let sentence = error.to_string();
+        assert_eq!(
+            sentence,
+            format!("script runtime error in com.example.probe at {PLACED}:3: boom")
+        );
+
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(body["message"], "boom");
+        assert_eq!(body["file"], PLACED);
+        assert_eq!(body["line"], 3);
+        assert_eq!(body.to_string().matches(PLACED).count(), 1, "{body}");
+    }
+
+    /// A dashboard script is chunk `script`, which names no file anyone can
+    /// open; its error must read exactly as it did before chunks had paths.
+    #[test]
+    fn a_dashboard_failure_names_no_file() {
+        assert_eq!(file_of(Some("script".into())), None);
+        assert_eq!(file_of(None), None);
+        assert_eq!(file_of(Some("src/a.lua".into())), Some("src/a.lua".into()));
+
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(7),
+            raw: "[string \"script\"]:7: boom".into(),
+            chunk: Some("script".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "script runtime error in com.example.probe at line 7: boom"
+        );
+        assert!(matches!(error, AppError::ScriptError { file: None, .. }));
     }
 }

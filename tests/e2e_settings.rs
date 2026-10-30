@@ -183,6 +183,118 @@ async fn settings_crud() {
 
 #[tokio::test]
 #[serial]
+async fn a_script_budget_must_be_an_integer_inside_its_range() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let cases = [
+        (
+            "script_instruction_limit",
+            "1000",
+            "1000000000",
+            &["999", "1000000001", "4294967295"][..],
+        ),
+        (
+            "script_wall_clock_seconds",
+            "1",
+            "300",
+            &["0", "301", "600000"][..],
+        ),
+    ];
+    for (key, min, max, outside) in cases {
+        for bad in ["-1", "abc", "1.5", "", "1e6"].iter().chain(outside) {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["error"],
+                format!("{key} must be an integer from {min} to {max}")
+            );
+        }
+
+        for edge in [min, max] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": edge }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{key}={edge}");
+        }
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+    let entries = json_body(resp).await;
+    for (key, _, max, _) in cases {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {entries}"));
+        assert_eq!(entry["value"], max);
+        assert_eq!(entry["source"], "database");
+    }
+}
+
+/// A run reads the budget from the in-process cache and never queries for it,
+/// so a change made through the settings API has to reach that cache without a
+/// restart. That the cached value is what reaches an interpreter is pinned in
+/// `xrpc_script_runners.rs`; spending it is the interpreter's own, and only a
+/// target that loads a real one sees a run end on it.
+#[tokio::test]
+#[serial]
+async fn a_script_budget_change_reaches_the_cache_without_restart() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let default = app.state.script_limits.instruction_limit();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+            &json!({ "value": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(app.state.script_limits.instruction_limit(), 1_000);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(app.state.script_limits.instruction_limit(), default);
+}
+
+#[tokio::test]
+#[serial]
 async fn settings_requires_auth() {
     common::require_db!();
     let app = TestApp::new().await;
@@ -792,4 +904,45 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
         retiring_entry["session_count"], 0,
         "a kid with no sessions must report zero, not be omitted"
     );
+}
+
+/// Clears the project layer and `APP_NAME` when dropped, so a failing
+/// assertion cannot leak either into the next test.
+struct ProjectLayerGuard;
+
+impl Drop for ProjectLayerGuard {
+    fn drop(&mut self) {
+        happyview::config::vars::set_project_layer(Default::default());
+        unsafe { std::env::remove_var("APP_NAME") };
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_listing_reports_a_project_file_value_with_its_source() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let _guard = ProjectLayerGuard;
+    unsafe { std::env::remove_var("APP_NAME") };
+    happyview::config::vars::set_project_layer(
+        [("APP_NAME".to_string(), "From The File".to_string())].into(),
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let entry = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "app_name")
+        .expect("app_name entry not found in settings");
+    assert_eq!(entry["value"], "From The File");
+    assert_eq!(entry["source"], "project");
 }

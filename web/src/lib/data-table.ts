@@ -28,4 +28,3 @@ export function getColumnPinningStyle<TData>({
     zIndex: isPinned ? 1 : undefined,
   };
 }
-

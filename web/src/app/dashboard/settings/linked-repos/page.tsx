@@ -6,7 +6,11 @@ import { Loader2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
-import { deleteLinkedRepo, getLinkedRepoInvites, getLinkedRepos } from "@/lib/api";
+import {
+  deleteLinkedRepo,
+  getLinkedRepoInvites,
+  getLinkedRepos,
+} from "@/lib/api";
 import type { LinkedRepo } from "@/types/linked-repos";
 import {
   LinkedRepoDetail,

@@ -76,17 +76,24 @@ pub(super) async fn list_records(
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
 
-    let sql = adapt_sql(
-        "SELECT uri, did, collection, rkey, cid, indexed_at, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
-        backend,
-    );
-    let rows: Vec<RecordRow> = crate::db::query_as(&sql)
-        .bind(&params.collection)
-        .bind(limit + 1)
-        .bind(offset)
-        .fetch_all(&state.db)
+    let rows: Vec<RecordRow> = state
+        .records
+        .list_recent(&params.collection, None, limit + 1, offset)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list records: {e}")))?;
+        .map_err(|e| record_error(&state, Some(&params.collection), "list records", e))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.uri,
+                r.did,
+                r.collection,
+                r.rkey,
+                r.cid.unwrap_or_default(),
+                r.indexed_at,
+                r.record,
+            )
+        })
+        .collect();
 
     let has_more = rows.len() as i64 > limit;
     let visible_rows: Vec<RecordRow> = rows.into_iter().take(limit as usize).collect();
@@ -219,18 +226,16 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql)
-        .bind(&params.uri)
-        .execute(&state.db)
+    let collection = crate::record_store::codec::parse_record_uri(&params.uri)
+        .map(|(_, collection, _)| collection);
+    let deleted = state
+        .records
+        .delete(&params.uri)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to delete record: {e}")))?;
-
-    if result.rows_affected() == 0 {
+        .map_err(|e| record_error(&state, collection, "delete record", e))?;
+    if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -241,15 +246,24 @@ pub(super) async fn list_collections(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::RecordsRead).await?;
 
-    let sql = adapt_sql(
-        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
-        state.db_backend,
-    );
-    let rows: Vec<(String,)> = crate::db::query_as(&sql)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list collections: {e}")))?;
-
-    let collections: Vec<&str> = rows.iter().map(|(id,)| id.as_str()).collect();
+    let collections = state.lexicons.get_record_lexicon_ids().await;
     Ok(Json(serde_json::json!({ "collections": collections })))
+}
+
+/// A failed record call on `collection`: 503 when the external storage that
+/// claims it is unreachable, otherwise a 500.
+fn record_error(
+    state: &AppState,
+    collection: Option<&str>,
+    what: &str,
+    e: sqlx::Error,
+) -> AppError {
+    let storage_down = collection
+        .and_then(|collection| state.records.external_route(collection))
+        .is_some_and(|ext| ext.unavailable(&e));
+    if storage_down {
+        crate::error::storage_unavailable()
+    } else {
+        AppError::Internal(format!("failed to {what}: {e}"))
+    }
 }

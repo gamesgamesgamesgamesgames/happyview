@@ -1,9 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
 
 /// The type of a lexicon's `main` definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -190,144 +186,24 @@ impl ParsedLexicon {
     }
 }
 
-/// In-memory cache of all parsed lexicons, keyed by NSID.
-#[derive(Debug, Clone)]
-pub struct LexiconRegistry {
-    inner: Arc<RwLock<HashMap<String, ParsedLexicon>>>,
-}
-
-impl Default for LexiconRegistry {
-    fn default() -> Self {
-        Self::new()
+/// The structural checks every lexicon passes before it is stored or served:
+/// lexicon version 1 and a string `id` that is a valid NSID. Returns the id.
+/// The admin upload and the project build both call this, so a file cannot
+/// carry a lexicon the upload would refuse.
+pub fn check_document(raw: &Value) -> Result<String, String> {
+    let version = raw
+        .get("lexicon")
+        .and_then(|v| v.as_i64())
+        .ok_or("lexicon JSON must have a numeric 'lexicon' field")?;
+    if version != 1 {
+        return Err(format!("unsupported lexicon version: {version}"));
     }
-}
-
-impl LexiconRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Load all lexicons from the database, replacing any existing entries.
-    pub async fn load_from_db(&self, db: &sqlx::AnyPool) -> Result<(), String> {
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(
-            String,
-            String,
-            i32,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-        )> = crate::db::query_as(
-            "SELECT id, lexicon_json, revision, target_collection, action, token_cost FROM happyview_lexicons",
-        )
-        .fetch_all(db)
-        .await
-        .map_err(|e| format!("failed to load lexicons: {e}"))?;
-
-        let mut inner = self.inner.write().await;
-        inner.clear();
-
-        let mut loaded = 0u32;
-        for (id, json_str, revision, target_collection, action_str, token_cost) in rows {
-            let json: Value = match serde_json::from_str(&json_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(%id, "failed to parse lexicon_json: {e}");
-                    continue;
-                }
-            };
-            let action = match ProcedureAction::from_optional_str(action_str.as_deref()) {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!(%id, "invalid action value: {e}");
-                    ProcedureAction::Upsert
-                }
-            };
-            match ParsedLexicon::parse(
-                json,
-                revision,
-                target_collection,
-                action,
-                token_cost.map(|c| c as u32),
-            ) {
-                Ok(parsed) => {
-                    inner.insert(id, parsed);
-                    loaded += 1;
-                }
-                Err(e) => {
-                    warn!(%id, "failed to parse lexicon: {e}");
-                }
-            }
-        }
-
-        info!(count = loaded, "loaded lexicons into registry");
-        Ok(())
-    }
-
-    /// Insert or update a single lexicon in the registry.
-    pub async fn upsert(&self, parsed: ParsedLexicon) {
-        let mut inner = self.inner.write().await;
-        inner.insert(parsed.id.clone(), parsed);
-    }
-
-    /// Remove a lexicon from the registry by NSID.
-    pub async fn remove(&self, id: &str) -> bool {
-        let mut inner = self.inner.write().await;
-        inner.remove(id).is_some()
-    }
-
-    /// Get a single lexicon by NSID.
-    pub async fn get(&self, id: &str) -> Option<ParsedLexicon> {
-        let inner = self.inner.read().await;
-        inner.get(id).cloned()
-    }
-
-    /// Return NSIDs of all record-type lexicons.
-    pub async fn get_record_collections(&self) -> Vec<String> {
-        let inner = self.inner.read().await;
-        inner
-            .values()
-            .filter(|lex| lex.lexicon_type == LexiconType::Record)
-            .map(|lex| lex.id.clone())
-            .collect()
-    }
-
-    /// Return NSIDs of all query-type lexicons.
-    pub async fn get_queries(&self) -> Vec<String> {
-        let inner = self.inner.read().await;
-        inner
-            .values()
-            .filter(|lex| lex.lexicon_type == LexiconType::Query)
-            .map(|lex| lex.id.clone())
-            .collect()
-    }
-
-    /// Return NSIDs of all procedure-type lexicons.
-    pub async fn get_procedures(&self) -> Vec<String> {
-        let inner = self.inner.read().await;
-        inner
-            .values()
-            .filter(|lex| lex.lexicon_type == LexiconType::Procedure)
-            .map(|lex| lex.id.clone())
-            .collect()
-    }
-
-    /// Return the total count of registered lexicons.
-    pub async fn count(&self) -> usize {
-        let inner = self.inner.read().await;
-        inner.len()
-    }
-
-    /// Look up a space-type declaration by NSID. Returns `None` if not found or not a space type.
-    pub async fn get_space_declaration(&self, id: &str) -> Option<ParsedLexicon> {
-        let inner = self.inner.read().await;
-        inner
-            .get(id)
-            .filter(|lex| lex.lexicon_type == LexiconType::Space)
-            .cloned()
-    }
+    let id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("lexicon JSON must have a string 'id' field")?;
+    happyview_nsid::validate_nsid(id).map_err(|e| e.to_string())?;
+    Ok(id.to_string())
 }
 
 #[cfg(test)]
@@ -356,6 +232,31 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn check_document_returns_the_id_of_a_valid_lexicon() {
+        assert_eq!(
+            check_document(&record_lexicon_json()).unwrap(),
+            "games.gamesgamesgamesgames.game"
+        );
+    }
+
+    #[test]
+    fn check_document_says_what_is_wrong() {
+        let cases = [
+            (json!({"id": "com.example.x"}), "numeric 'lexicon'"),
+            (
+                json!({"lexicon": 2, "id": "com.example.x"}),
+                "unsupported lexicon version: 2",
+            ),
+            (json!({"lexicon": 1}), "string 'id'"),
+            (json!({"lexicon": 1, "id": "not an nsid"}), "invalid NSID"),
+        ];
+        for (raw, expected) in cases {
+            let err = check_document(&raw).unwrap_err();
+            assert!(err.contains(expected), "{raw}: {err}");
+        }
     }
 
     fn query_lexicon_json() -> Value {
@@ -519,148 +420,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LexiconRegistry
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn registry_new_is_empty() {
-        let reg = LexiconRegistry::new();
-        assert_eq!(reg.count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn registry_upsert_and_get() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        let got = reg.get("games.gamesgamesgamesgames.game").await;
-        assert!(got.is_some());
-        assert_eq!(got.unwrap().lexicon_type, LexiconType::Record);
-    }
-
-    #[tokio::test]
-    async fn registry_upsert_replaces() {
-        let reg = LexiconRegistry::new();
-        let v1 = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(v1).await;
-
-        let v2 = ParsedLexicon::parse(
-            record_lexicon_json(),
-            5,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(v2).await;
-
-        assert_eq!(reg.count().await, 1);
-        assert_eq!(
-            reg.get("games.gamesgamesgamesgames.game")
-                .await
-                .unwrap()
-                .revision,
-            5
-        );
-    }
-
-    #[tokio::test]
-    async fn registry_remove_existing() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        assert!(reg.remove("games.gamesgamesgamesgames.game").await);
-        assert_eq!(reg.count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn registry_remove_nonexistent() {
-        let reg = LexiconRegistry::new();
-        assert!(!reg.remove("nonexistent").await);
-    }
-
-    #[tokio::test]
-    async fn registry_get_nonexistent() {
-        let reg = LexiconRegistry::new();
-        assert!(reg.get("nonexistent").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn registry_type_filtered_collections() {
-        let reg = LexiconRegistry::new();
-
-        let record = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        let query =
-            ParsedLexicon::parse(query_lexicon_json(), 1, None, ProcedureAction::Upsert, None)
-                .unwrap();
-        let procedure = ParsedLexicon::parse(
-            procedure_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        let defs = ParsedLexicon::parse(
-            definitions_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-
-        reg.upsert(record).await;
-        reg.upsert(query).await;
-        reg.upsert(procedure).await;
-        reg.upsert(defs).await;
-
-        assert_eq!(reg.count().await, 4);
-
-        let records = reg.get_record_collections().await;
-        assert_eq!(records.len(), 1);
-        assert!(records.contains(&"games.gamesgamesgamesgames.game".to_string()));
-
-        let queries = reg.get_queries().await;
-        assert_eq!(queries.len(), 1);
-        assert!(queries.contains(&"games.gamesgamesgamesgames.listGames".to_string()));
-
-        let procedures = reg.get_procedures().await;
-        assert_eq!(procedures.len(), 1);
-        assert!(procedures.contains(&"games.gamesgamesgamesgames.createGame".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
     // ProcedureAction
     // -----------------------------------------------------------------------
 
@@ -817,52 +576,6 @@ mod tests {
         let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("collections"));
-    }
-
-    #[tokio::test]
-    async fn registry_get_space_declaration() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            space_declaration_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        let decl = reg.get_space_declaration("com.example.forum").await;
-        assert!(decl.is_some());
-        assert_eq!(
-            decl.unwrap().space_collections,
-            Some(vec![
-                "com.example.forum.post".to_string(),
-                "com.example.forum.comment".to_string()
-            ])
-        );
-
-        let not_space = reg.get_space_declaration("nonexistent").await;
-        assert!(not_space.is_none());
-    }
-
-    #[tokio::test]
-    async fn registry_get_space_declaration_excludes_non_space_types() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        let result = reg
-            .get_space_declaration("games.gamesgamesgamesgames.game")
-            .await;
-        assert!(result.is_none());
     }
 
     #[test]

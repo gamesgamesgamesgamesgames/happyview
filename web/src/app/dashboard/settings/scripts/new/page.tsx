@@ -1,17 +1,27 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { getLexicons, upsertScript } from "@/lib/api";
-import type { LexiconSummary } from "@/types/lexicons";
-import type { TriggerKind } from "@/types/scripts";
 import {
-  DEFAULT_JOB_SCRIPT_BODY,
-  DEFAULT_SCRIPT_BODY,
-  parseTriggerId,
-} from "@/types/scripts";
+  getLexicons,
+  getScriptLanguages,
+  isUnmigratedRefusal,
+  upsertScript,
+} from "@/lib/api";
+import type { LexiconSummary } from "@/types/lexicons";
+import { defaultBodyFor, defaultLanguage } from "@/lib/script-templates";
+import type { ScriptLanguage, TriggerKind } from "@/types/scripts";
+import { parseTriggerId } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -26,6 +36,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 
+import { MigrateScriptDialog } from "../migrate-dialog";
 import {
   JOB_SOURCE,
   ScriptForm,
@@ -33,6 +44,7 @@ import {
   composeTriggerId,
   isValidJobType,
   scriptsReturnHref,
+  withLanguage,
 } from "../script-form";
 
 function NewScriptInner() {
@@ -40,20 +52,27 @@ function NewScriptInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [state, setState] = useState<ScriptFormState>(() =>
-    initialState(searchParams),
+    initialState(searchParams, "lua"),
   );
   // The Lexicon picker is sourced from /admin/lexicons; we render the
   // form even if the call fails (the operator can still pick "Actor"
   // and create a labeler.apply:_actor script).
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
   const [lexiconsLoading, setLexiconsLoading] = useState(true);
+  // What the installed interpreters can run. Until it arrives, or if it
+  // can't be read, the form offers Lua alone, as it did before there was a
+  // choice; the server still refuses a language nothing installed claims.
+  const [languages, setLanguages] = useState<ScriptLanguage[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
   const returnHref = scriptsReturnHref(searchParams);
 
   // If the URL changes (e.g. user navigates with new ?id=...), refresh state.
+  // The language carries over: it was picked from what is installed, which
+  // the URL says nothing about.
   useEffect(() => {
-    setState(initialState(searchParams));
+    setState((s) => initialState(searchParams, s.language));
   }, [searchParams]);
 
   useEffect(() => {
@@ -63,13 +82,25 @@ function NewScriptInner() {
       .finally(() => setLexiconsLoading(false));
   }, []);
 
+  useEffect(() => {
+    getScriptLanguages()
+      .then((installed) => {
+        setLanguages(installed);
+        // Lua is the starting language only while it is installed.
+        setState((s) =>
+          installed.length === 0 || installed.includes(s.language)
+            ? s
+            : withLanguage(s, defaultLanguage(installed)),
+        );
+      })
+      .catch(() => setLanguages([]));
+  }, []);
+
   const isDirty = useMemo(() => {
-    const defaultBody =
-      state.source === JOB_SOURCE ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY;
     return (
       state.suffix !== "" ||
       state.description !== "" ||
-      state.body !== defaultBody
+      state.body !== defaultBodyFor(state.kind, state.language)
     );
   }, [state]);
 
@@ -103,10 +134,12 @@ function NewScriptInner() {
     if (!canSave) return;
     setSaving(true);
     setError(null);
+    setRefused(false);
     try {
       const id = composeTriggerId(state);
       await upsertScript({
         id,
+        script_type: state.language,
         body: state.body,
         description: state.description.trim() || null,
       });
@@ -118,6 +151,7 @@ function NewScriptInner() {
       );
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setRefused(isUnmigratedRefusal(e));
     } finally {
       // Also runs on the success path. The navigation that follows a save is a
       // full page load, and a load can be abandoned — by a prompt the operator
@@ -156,8 +190,35 @@ function NewScriptInner() {
       <SiteHeader title="New script" backHref={returnHref} />
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">
-          {error && <p className="text-destructive text-sm">{error}</p>}
-          <ScriptForm state={state} onChange={setState} lexicons={lexicons} lexiconsLoading={lexiconsLoading} />
+          {error && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-destructive text-sm">{error}</p>
+              {refused && (
+                <MigrateScriptDialog
+                  scriptId={composeTriggerId(state)}
+                  currentBody={state.body}
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      <Wand2 className="size-4" />
+                      Migrate this script
+                    </Button>
+                  }
+                  onRewritten={(source) => {
+                    setState({ ...state, body: source });
+                    setError(null);
+                    setRefused(false);
+                  }}
+                />
+              )}
+            </div>
+          )}
+          <ScriptForm
+            state={state}
+            onChange={setState}
+            lexicons={lexicons}
+            lexiconsLoading={lexiconsLoading}
+            languages={languages}
+          />
         </div>
         <footer className="bg-sidebar-accent flex justify-between gap-2 px-4 py-2 md:px-6 md:py-4 rounded-b-md">
           {isDirty ? (
@@ -184,17 +245,11 @@ function NewScriptInner() {
               </AlertDialogContent>
             </AlertDialog>
           ) : (
-            <Button
-              variant="outline"
-              onClick={() => router.push(returnHref)}
-            >
+            <Button variant="outline" onClick={() => router.push(returnHref)}>
               Cancel
             </Button>
           )}
-          <Button
-            onClick={handleSave}
-            disabled={!canSave}
-          >
+          <Button onClick={handleSave} disabled={!canSave}>
             {saving ? "Creating..." : "Create script"}
             <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
               ⌘↵
@@ -218,7 +273,10 @@ export default function NewScriptPage() {
   );
 }
 
-function initialState(searchParams: URLSearchParams): ScriptFormState {
+function initialState(
+  searchParams: URLSearchParams,
+  language: ScriptLanguage,
+): ScriptFormState {
   // Optional `?id=record.create:<nsid>` pre-fills the form — the lexicon
   // detail page links here with a candidate trigger id.
   const presetId = searchParams.get("id");
@@ -231,20 +289,24 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
         suffix: parsed.suffix,
         source: isJob ? JOB_SOURCE : parsed.suffix,
         description: "",
-        body: isJob ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY,
+        body: defaultBodyFor(parsed.kind, language),
+        language,
       };
     }
   }
   // Fallbacks to a sensible default. Suffix starts empty so the form
   // surfaces the "Pick a source to compose the trigger id" hint.
-  const kind = (searchParams.get("kind") as TriggerKind | null) ?? "record.index";
+  const kind =
+    (searchParams.get("kind") as TriggerKind | null) ?? "record.index";
   const source = searchParams.get("source") ?? searchParams.get("suffix") ?? "";
   const isJob = kind === "job.run" || source === JOB_SOURCE;
+  const resolvedKind: TriggerKind = isJob ? "job.run" : kind;
   return {
-    kind: isJob ? "job.run" : kind,
+    kind: resolvedKind,
     suffix: isJob ? "" : (searchParams.get("suffix") ?? ""),
     source: isJob ? JOB_SOURCE : source,
     description: "",
-    body: isJob ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY,
+    body: defaultBodyFor(resolvedKind, language),
+    language,
   };
 }

@@ -32,7 +32,9 @@ export function AccessGrantBanner({
             </>
           )}
         </span>
-        <span className="text-muted-foreground break-words">{grant.reason}</span>
+        <span className="text-muted-foreground break-words">
+          {grant.reason}
+        </span>
         <span className="text-muted-foreground text-xs tabular-nums">
           {formatRemaining(remainingMs)}
         </span>

@@ -15,9 +15,9 @@
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::lthash::{LtHashState, record_element};
 use crate::spaces::{commit, db};
+use crate::tid::generate_tid;
 
 /// Marker so the one-time commit-format rebuild does not repeat on every boot.
 const COMMIT_FORMAT_MARKER_KEY: &str = "space_commit_format_rebuild_completed_at";
@@ -133,8 +133,7 @@ pub async fn run_commit_format_rebuild(
         return Ok(None);
     }
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool, backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 

@@ -1,0 +1,11 @@
+{
+  "lexicon": 1,
+  "id": "com.example.project.thing",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "tid",
+      "record": { "type": "object", "properties": { "name": { "type": "string" } } }
+    }
+  }
+}

@@ -90,6 +90,18 @@ pub async fn resolve_profile(
     let pds_endpoint = find_service_endpoint(&did_doc, "atproto_pds")
         .ok_or_else(|| AppError::NotFound("no PDS endpoint in DID document".into()))?;
 
+    // The forged PDS serves no profile record, and asking it would wait on DNS.
+    if crate::testing::identity::forging() {
+        return Ok(Profile {
+            did: did.to_string(),
+            handle: handle.unwrap_or_else(|| did.to_string()),
+            display_name: None,
+            description: None,
+            avatar_url: None,
+            avatar: None,
+        });
+    }
+
     let (display_name, description, avatar_url, avatar) =
         fetch_profile_from_pds(http, &pds_endpoint, did)
             .await
@@ -148,27 +160,7 @@ pub async fn resolve_labeler_endpoint(
         .ok_or_else(|| AppError::NotFound("no labeler or PDS endpoint in DID document".into()))
 }
 
-/// Host portion of an origin URL, for cooldown keying.
-pub fn host_of(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or(url)
-        .to_string()
-}
-
-/// The host a DID-document resolution will contact.
-///
-/// Used to key retry cooldowns. Every `did:plc` shares one host, so a rate
-/// limit learned from one applies to all of them.
-pub fn did_doc_host(plc_url: &str, did: &str) -> String {
-    if let Some(domain) = did.strip_prefix("did:web:") {
-        return domain.to_string();
-    }
-    host_of(plc_url)
-}
+pub use happyview_provider::http::{did_doc_host, host_of};
 
 /// One attempt at fetching a DID document. Never sleeps and never retries —
 /// the caller decides what a failure means. Backfill defers; a user-facing
@@ -177,8 +169,12 @@ pub async fn resolve_did_document_once(
     http: &reqwest::Client,
     plc_url: &str,
     did: &str,
-) -> Result<DidDocument, crate::admin::backfill_errors::BackfillFailure> {
-    use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+) -> Result<DidDocument, happyview_provider::failure::BackfillFailure> {
+    use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
+
+    if crate::testing::identity::forging() {
+        return Ok(crate::testing::identity::did_document(did));
+    }
 
     let url = if let Some(domain) = did.strip_prefix("did:web:") {
         format!("https://{}/.well-known/did.json", domain)
@@ -212,8 +208,8 @@ pub async fn resolve_pds_endpoint_once(
     http: &reqwest::Client,
     plc_url: &str,
     did: &str,
-) -> Result<String, crate::admin::backfill_errors::BackfillFailure> {
-    use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+) -> Result<String, happyview_provider::failure::BackfillFailure> {
+    use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
     let doc = resolve_did_document_once(http, plc_url, did).await?;
     find_service_endpoint(&doc, "atproto_pds").ok_or(BackfillFailure {
@@ -229,6 +225,10 @@ pub async fn resolve_did_document(
     plc_url: &str,
     did: &str,
 ) -> Result<DidDocument, AppError> {
+    if crate::testing::identity::forging() {
+        return Ok(crate::testing::identity::did_document(did));
+    }
+
     let url = if let Some(domain) = did.strip_prefix("did:web:") {
         format!("https://{}/.well-known/did.json", domain)
     } else {

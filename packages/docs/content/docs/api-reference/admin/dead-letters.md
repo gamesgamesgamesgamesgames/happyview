@@ -4,6 +4,8 @@ title: "Dead Letters"
 
 Events that failed all retry attempts are stored as dead letters for inspection and manual resolution. Dead letters come from two sources: legacy index hooks (`happyview_dead_letter_hooks`) and trigger-keyed scripts (`happyview_dead_letter_scripts`). Both tables are surfaced through a single unified API.
 
+Resolved script dead letters are deleted once they have been resolved for `DEAD_LETTER_RETENTION_DAYS` days (30 by default; see [Configuration](../../getting-started/configuration.md)). Unresolved ones are kept until someone deals with them.
+
 Read endpoints require `dead-letters:read`. Action endpoints (dismiss, retry, reindex) require `dead-letters:manage`.
 
 ```sh tab="cURL" tab-group="language"

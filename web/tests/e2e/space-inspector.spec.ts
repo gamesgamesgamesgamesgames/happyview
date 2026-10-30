@@ -38,7 +38,10 @@ async function setSetting(key: string, value: string | null) {
   await client.connect();
   try {
     if (value === null) {
-      await client.query("DELETE FROM happyview_instance_settings WHERE key = $1", [key]);
+      await client.query(
+        "DELETE FROM happyview_instance_settings WHERE key = $1",
+        [key],
+      );
     } else {
       await client.query(
         `INSERT INTO happyview_instance_settings (key, value, updated_at)
@@ -55,14 +58,17 @@ async function setSetting(key: string, value: string | null) {
 async function createSpace(
   page: Page,
 ): Promise<{ uri: string; id: string; creatorDid: string }> {
-  const resp = await page.request.post("/xrpc/com.atproto.simplespace.createSpace", {
-    data: {
-      spaceType: "com.example.inspector",
-      skey: `inspector-${Date.now()}`,
-      readPolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
-      writePolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
+  const resp = await page.request.post(
+    "/xrpc/com.atproto.simplespace.createSpace",
+    {
+      data: {
+        spaceType: "com.example.inspector",
+        skey: `inspector-${Date.now()}`,
+        readPolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
+        writePolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
+      },
     },
-  });
+  );
   expect(resp.ok()).toBe(true);
   const { uri } = await resp.json();
   return { uri, ...(await spaceRowFor(uri)) };
@@ -74,7 +80,9 @@ async function createSpace(
  * that state. The creator differs from the DID in the URI, which is the space's
  * authority.
  */
-async function spaceRowFor(uri: string): Promise<{ id: string; creatorDid: string }> {
+async function spaceRowFor(
+  uri: string,
+): Promise<{ id: string; creatorDid: string }> {
   const [did, , typeNsid, skey] = uri.replace(/^at:\/\//, "").split("/");
   const client = new pg.Client(DB_URL);
   await client.connect();
@@ -110,7 +118,9 @@ test.describe("Space inspector", () => {
     await setSetting("feature.space_inspector_enabled", null);
     await revokeOpenGrants();
     if (spaceUri) {
-      await page.request.post("/xrpc/com.atproto.simplespace.deleteSpace", { data: { space: spaceUri } });
+      await page.request.post("/xrpc/com.atproto.simplespace.deleteSpace", {
+        data: { space: spaceUri },
+      });
       spaceUri = null;
     }
   });
@@ -119,11 +129,17 @@ test.describe("Space inspector", () => {
     const { uri, id } = await createSpace(page);
     spaceUri = uri;
     await page.goto(`/dashboard/spaces/${encodeURIComponent(id)}/`);
-    await expect(page.getByText("The space inspector is turned off")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Request access" })).toHaveCount(0);
+    await expect(
+      page.getByText("The space inspector is turned off"),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Request access" }),
+    ).toHaveCount(0);
   });
 
-  test("requesting access unlocks records and ending it locks them again", async ({ page }) => {
+  test("requesting access unlocks records and ending it locks them again", async ({
+    page,
+  }) => {
     await setSetting("feature.space_inspector_enabled", "true");
     const { uri, id } = await createSpace(page);
     spaceUri = uri;
@@ -131,19 +147,29 @@ test.describe("Space inspector", () => {
 
     await page.getByRole("button", { name: "Request access" }).click();
     const dialog = page.getByRole("dialog");
-    await expect(dialog.getByRole("button", { name: "Grant access" })).toBeDisabled();
-    await dialog.getByLabel("Reason").fill("Report #1: checking a flagged thread");
+    await expect(
+      dialog.getByRole("button", { name: "Grant access" }),
+    ).toBeDisabled();
+    await dialog
+      .getByLabel("Reason")
+      .fill("Report #1: checking a flagged thread");
     await dialog.getByRole("button", { name: "Grant access" }).click();
 
-    await expect(page.getByText("Report #1: checking a flagged thread")).toBeVisible();
+    await expect(
+      page.getByText("Report #1: checking a flagged thread"),
+    ).toBeVisible();
     await expect(page.getByText(/remaining/)).toBeVisible();
     await expect(page.getByText("No records match.")).toBeVisible();
 
     await page.getByRole("button", { name: "End access" }).click();
-    await expect(page.getByRole("button", { name: "Request access" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Request access" }),
+    ).toBeVisible();
   });
 
-  test("account view lists spaces before access and records after", async ({ page }) => {
+  test("account view lists spaces before access and records after", async ({
+    page,
+  }) => {
     await setSetting("feature.space_inspector_enabled", "true");
     const { uri, creatorDid } = await createSpace(page);
     spaceUri = uri;
@@ -156,7 +182,10 @@ test.describe("Space inspector", () => {
 
     await page.getByRole("button", { name: "Request access" }).click();
     await page.getByRole("dialog").getByLabel("Reason").fill("Report #2");
-    await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Grant access" })
+      .click();
     const banner = page
       .locator("div")
       .filter({ hasText: "Access to" })
@@ -173,7 +202,10 @@ test.describe("Space inspector", () => {
     await page.goto(`/dashboard/spaces/${encodeURIComponent(id)}/`);
     await page.getByRole("button", { name: "Request access" }).click();
     await page.getByRole("dialog").getByLabel("Reason").fill("Report #3");
-    await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Grant access" })
+      .click();
     await expect(page.getByText("No records match.")).toBeVisible();
 
     await page.goto("/dashboard/events/");

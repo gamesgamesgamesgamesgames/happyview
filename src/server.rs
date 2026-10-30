@@ -4,10 +4,6 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use bytes::Bytes;
-use http_body_util::Full;
-use std::convert::Infallible;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::AppState;
@@ -21,46 +17,6 @@ use crate::repo;
 use crate::xrpc;
 
 pub fn router(state: AppState) -> Router {
-    let static_dir = state.config.static_dir.clone();
-
-    // SPA fallback: when ServeDir can't find a static file, check if the
-    // parent path contains a _/index.html (Next.js dynamic route shell)
-    // before falling back to the root index.html.
-    let fallback_dir = static_dir.clone();
-    let spa_fallback = tower::service_fn(move |req: axum::http::Request<_>| {
-        let dir = fallback_dir.clone();
-        async move {
-            let path = req.uri().path();
-            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-
-            // Try _/index.html in the parent directory (matches Next.js dynamic routes)
-            if segments.len() >= 2 {
-                let parent = segments[..segments.len() - 1].join("/");
-                let dynamic_path = format!("{}/{}/_/index.html", dir, parent);
-                if let Ok(body) = tokio::fs::read(&dynamic_path).await {
-                    return Ok::<_, Infallible>(
-                        axum::http::Response::builder()
-                            .header("content-type", "text/html; charset=utf-8")
-                            .body(Full::new(Bytes::from(body)))
-                            .unwrap(),
-                    );
-                }
-            }
-
-            // Default: serve root index.html
-            let index = format!("{}/index.html", dir);
-            let body = tokio::fs::read(&index).await.unwrap_or_default();
-            Ok::<_, Infallible>(
-                axum::http::Response::builder()
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Full::new(Bytes::from(body)))
-                    .unwrap(),
-            )
-        }
-    });
-
-    let serve_dir = ServeDir::new(&static_dir).not_found_service(spa_fallback);
-
     let domain_routes = Router::new()
         .merge(
             crate::spaces::routes::space_routes().layer(axum::middleware::from_fn_with_state(
@@ -151,11 +107,13 @@ pub fn router(state: AppState) -> Router {
             resolve_domain,
         ));
 
-    let app_routes = Router::new()
-        .nest("/admin", admin::admin_routes(state.clone()))
-        .merge(domain_routes)
-        .route("/", get(|| async { Redirect::to("/dashboard/") }))
-        .fallback_service(serve_dir);
+    let app_routes = crate::dashboard::attach(
+        Router::new()
+            .nest("/admin", admin::admin_routes(state.clone()))
+            .merge(domain_routes)
+            .route("/", get(|| async { Redirect::to("/dashboard/") })),
+        &state.config,
+    );
 
     let outer = if let Some(ref base_path) = state.config.base_path {
         let bp = base_path.clone();
@@ -364,8 +322,10 @@ async fn config_endpoint(
         "app_name": app_name,
         // Whether a managed-hosting platform administers this instance, so the
         // dashboard can say so.
-        "platform_managed": state.config.platform_api_key_hash.is_some(),
+        "platform_managed": state.config.platform_managed(),
         "logo_url": logo_url,
+        // The key hpy signs in with; see `auth::cli_client`.
+        "cli_client_key": crate::auth::cli_client::CLIENT_KEY,
         "features": {
             "spaces": spaces_enabled,
             "space_inspector": space_inspector_enabled,

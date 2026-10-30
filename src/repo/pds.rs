@@ -22,6 +22,8 @@ pub(crate) enum PdsAuth {
         dpop_key_id: String,
         encryption_key: [u8; 32],
     },
+    /// The in-process PDS of a test run. Only `test_pds_auth` builds one.
+    Fake(Arc<crate::testing::FakePds>),
 }
 
 impl PdsAuth {
@@ -81,6 +83,11 @@ impl PdsAuth {
                 )
                 .await
             }
+            PdsAuth::Fake(pds) => Ok(crate::testing::fake_pds::to_response(pds.post(
+                user_did,
+                xrpc_method,
+                body,
+            ))),
         }
     }
 
@@ -94,6 +101,7 @@ impl PdsAuth {
     pub async fn granted_scopes(&self, state: &AppState) -> Result<Option<String>, AppError> {
         match self {
             PdsAuth::OAuth(_) => Ok(None),
+            PdsAuth::Fake(_) => Ok(None),
             PdsAuth::Dpop {
                 api_client_id,
                 dpop_key_id,
@@ -146,6 +154,9 @@ impl PdsAuth {
                 )
                 .await
             }
+            PdsAuth::Fake(_) => Ok(crate::testing::fake_pds::to_response(Err(
+                crate::testing::FakePdsError::not_served(xrpc_method),
+            ))),
         }
     }
 }
@@ -297,6 +308,15 @@ fn parse_labelers_header(
     Ok(labelers)
 }
 
+/// In a test run every credential lookup answers the in-process PDS, so a
+/// forged caller writes without a session and nothing reaches the network.
+pub(crate) fn test_pds_auth(state: &AppState) -> Option<PdsAuth> {
+    state
+        .test
+        .as_ref()
+        .map(|test| PdsAuth::Fake(test.pds().clone()))
+}
+
 /// Build the PDS credentials a request should act with, from its claims.
 ///
 /// Third-party apps present a client key and authenticate with DPoP; the
@@ -305,6 +325,9 @@ pub(crate) async fn pds_auth_for_claims(
     state: &AppState,
     claims: &crate::auth::Claims,
 ) -> Result<PdsAuth, AppError> {
+    if let Some(auth) = test_pds_auth(state) {
+        return Ok(auth);
+    }
     let Some(client_key) = claims.client_key() else {
         return Ok(PdsAuth::OAuth(std::sync::Arc::new(
             super::session::get_oauth_session(state, claims.did()).await?,
@@ -525,5 +548,35 @@ mod tests {
     #[test]
     fn labelers_header_empty_is_empty_not_an_error() {
         assert!(parse_labelers_header("").unwrap().is_empty());
+    }
+
+    async fn state(test: bool) -> AppState {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = test.then(|| Arc::new(crate::testing::TestHarness::new("a.test.lua")));
+        state
+    }
+
+    /// A caller with no session of any kind still writes in a test run.
+    #[tokio::test]
+    async fn a_test_runs_credentials_are_the_in_process_pds() {
+        let state = state(true).await;
+        let claims = crate::auth::Claims::internal("did:plc:alice".into());
+        let auth = pds_auth_for_claims(&state, &claims).await.unwrap();
+        assert!(matches!(auth, PdsAuth::Fake(_)));
+    }
+
+    /// Outside a test run the same caller is looked up as an OAuth session,
+    /// which it does not have.
+    #[tokio::test]
+    async fn a_served_requests_credentials_are_its_own_session() {
+        let state = state(false).await;
+        assert!(test_pds_auth(&state).is_none());
+        let claims = crate::auth::Claims::internal("did:plc:alice".into());
+        let Err(err) = pds_auth_for_claims(&state, &claims).await else {
+            panic!("a caller with no session found credentials");
+        };
+        assert!(matches!(err, AppError::Auth(_)), "{err}");
     }
 }

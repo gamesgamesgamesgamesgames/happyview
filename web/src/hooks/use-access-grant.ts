@@ -54,8 +54,7 @@ export function useAccessGrant(
 
   // Hidden while disabled, and for any target other than the one it was
   // fetched for.
-  const grant =
-    enabled && found?.key === targetKey ? found.grant : null;
+  const grant = enabled && found?.key === targetKey ? found.grant : null;
 
   useEffect(() => {
     if (!grant) return;
@@ -63,7 +62,9 @@ export function useAccessGrant(
       setNow(Date.now());
       if (Date.parse(grant.expires_at) <= Date.now()) {
         setFound((current) =>
-          current?.grant?.id === grant.id ? { ...current, grant: null } : current,
+          current?.grant?.id === grant.id
+            ? { ...current, grant: null }
+            : current,
         );
       }
     }, 1000);

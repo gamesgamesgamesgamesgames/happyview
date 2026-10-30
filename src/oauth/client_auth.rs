@@ -167,7 +167,7 @@ pub async fn resolve_client_by_key(
 pub async fn validate_scopes(
     token_scopes: &str,
     client_scopes: &str,
-    lexicons: &crate::lexicon::LexiconRegistry,
+    lexicons: &crate::catalog::LexiconCatalog,
 ) -> Result<(), AppError> {
     let token_list = happyview_scopes::parse_scope_list(token_scopes);
 
@@ -210,7 +210,7 @@ pub async fn validate_scopes(
 /// whole validation, matching the reference, which skips what it cannot use.
 async fn expand_permission_set(
     scope: &str,
-    lexicons: &crate::lexicon::LexiconRegistry,
+    lexicons: &crate::catalog::LexiconCatalog,
     out: &mut Vec<String>,
 ) {
     let Some(include) = happyview_scopes::IncludeScope::parse(scope) else {
@@ -218,13 +218,20 @@ async fn expand_permission_set(
         return;
     };
 
-    let Some(lexicon) = lexicons.get(&include.nsid).await else {
-        tracing::warn!(nsid = %include.nsid, "permission set lexicon not found in registry");
-        return;
+    // HappyView's own set is built in, so every instance can expand it
+    // without holding the lexicon, and no stored copy can widen it.
+    let raw = match crate::auth::admin_scope::builtin_permission_set(&include.nsid) {
+        Some(raw) => raw,
+        None => match lexicons.get(&include.nsid).await {
+            Some(lexicon) => lexicon.raw.clone(),
+            None => {
+                tracing::warn!(nsid = %include.nsid, "permission set lexicon not found in registry");
+                return;
+            }
+        },
     };
 
-    let Some(permissions) = lexicon
-        .raw
+    let Some(permissions) = raw
         .get("defs")
         .and_then(|d| d.get("main"))
         .and_then(|m| m.get("permissions"))
@@ -285,7 +292,7 @@ async fn expand_permission_set(
 /// Convert one lexicon `permission` entry into the crate's representation,
 /// preserving scalar/list arity — the reference treats a scalar supplied where
 /// a list belongs as invalidating the permission rather than coercing it.
-fn lex_permission(value: &serde_json::Value) -> Option<happyview_scopes::LexPermission> {
+pub(crate) fn lex_permission(value: &serde_json::Value) -> Option<happyview_scopes::LexPermission> {
     use happyview_scopes::LexValue;
 
     let obj = value.as_object()?;
@@ -328,8 +335,8 @@ pub fn verify_pkce(challenge: &str, verifier: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn empty_registry() -> crate::lexicon::LexiconRegistry {
-        crate::lexicon::LexiconRegistry::new()
+    fn empty_registry() -> crate::catalog::LexiconCatalog {
+        crate::catalog::LexiconCatalog::detached()
     }
 
     #[tokio::test]

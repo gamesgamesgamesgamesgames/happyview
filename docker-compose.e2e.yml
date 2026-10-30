@@ -99,11 +99,26 @@ services:
       # A closed port, so e2e runs never send snapshots to the production
       # collector and the telemetry test sees a send fail.
       TELEMETRY_COLLECTOR_URL: http://127.0.0.1:9/v1/snapshot
+      # The plugin catalogue reaches nothing live: empty turns it off.
+      # Otherwise a run's toasts depend on what has been released since the
+      # stack's pins were set -- a newer `happyview-lua` than the pinned one
+      # put an "update available" toast on screen and broke two unrelated
+      # specs.
+      PLUGIN_REGISTRY_URL: ""
     ports:
       - "3200:3000"
     volumes:
       - ./scripts/e2e-entrypoint.sh:/e2e-entrypoint.sh:ro
       - caddy_data:/caddy-data:ro
+      # Saving a script asks the interpreter its language names whether the
+      # body is one it can run, so a stack with nothing claiming `lua`
+      # refuses every save and the script specs fail. This is the published
+      # interpreter, fetched by `scripts/fetch-lua-plugin.sh` — which has to
+      # run before `up`, since Docker answers a missing bind source with an
+      # empty directory and the stack would come up with no interpreter at
+      # all. `globalSetup` refuses such a run, because an empty directory
+      # here otherwise reads as several broken specs.
+      - ./tests/fixtures/lua-plugin:/app/plugins/lua:ro
     depends_on:
       postgres:
         condition: service_healthy

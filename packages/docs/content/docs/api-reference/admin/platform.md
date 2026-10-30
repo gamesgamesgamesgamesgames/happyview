@@ -19,7 +19,7 @@ A request with `Authorization: Bearer <key>` is then authenticated as the **plat
 
 The platform principal can:
 
-- list, add, remove and promote [domains](./domains.md)
+- list, add, remove and promote [domains](./domains.md); while it's set, it is the only caller that can add, remove or promote one
 - read [stats](./stats.md)
 - call the endpoints on this page
 

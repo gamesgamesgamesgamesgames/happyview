@@ -58,8 +58,11 @@ impl AttestationSigner {
         })
     }
 
-    /// Create a new signer with a test key (for testing only)
-    #[cfg(test)]
+    /// Create a new signer with a fixed test key. Not gated behind
+    /// `#[cfg(test)]`: an integration test under `tests/` compiles this crate
+    /// as an ordinary dependency, not with `cfg(test)`, so a unit-test-only
+    /// constructor is unreachable there — the same reason `test_support`
+    /// stays ungated. For testing only; the key is fixed and public.
     pub fn for_testing(key_id: String, sig_type: String) -> Self {
         // Fixed test key (32 bytes of 0x01) - DO NOT USE IN PRODUCTION
         let test_key_bytes = [0x01u8; 32];
@@ -374,16 +377,16 @@ fn legacy_json_to_cbor(value: &Value) -> ciborium::Value {
 pub type SharedAttestationSigner = Arc<AttestationSigner>;
 
 pub fn load_from_env() -> Result<Option<AttestationSigner>, AttestationError> {
-    let private_key = match std::env::var("ATTESTATION_PRIVATE_KEY") {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
+    let private_key = match crate::config::vars::var("ATTESTATION_PRIVATE_KEY") {
+        Some(k) => k,
+        None => return Ok(None),
     };
 
-    let key_id = std::env::var("ATTESTATION_KEY_ID")
-        .unwrap_or_else(|_| "did:web:localhost#attestation".to_string());
+    let key_id = crate::config::vars::var("ATTESTATION_KEY_ID")
+        .unwrap_or_else(|| "did:web:localhost#attestation".to_string());
 
-    let sig_type = std::env::var("ATTESTATION_SIG_TYPE")
-        .unwrap_or_else(|_| "games.gamesgamesgamesgames.attestation".to_string());
+    let sig_type = crate::config::vars::var("ATTESTATION_SIG_TYPE")
+        .unwrap_or_else(|| "games.gamesgamesgamesgames.attestation".to_string());
 
     Ok(Some(AttestationSigner::from_hex(
         &private_key,
@@ -640,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_creates_key() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let pool = sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -676,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_sign_verify_roundtrip() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let pool = sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")

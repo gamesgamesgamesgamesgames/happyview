@@ -1,10 +1,10 @@
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
+use crate::tid::generate_tid;
 use sha2::{Digest, Sha256};
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {
@@ -144,7 +144,11 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
-pub(crate) async fn fetch_space_blob(
+///
+/// Public only so `tests/test_runner_identity.rs` can show it refuses a
+/// forged PDS before any request; the routes are its real callers.
+#[doc(hidden)]
+pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
     cid: &str,
@@ -159,6 +163,13 @@ pub(crate) async fn fetch_space_blob(
     let pds_endpoint =
         crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
             .await?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "fetching a space blob").map_err(
+        |message| AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message,
+        },
+    )?;
 
     let url = format!(
         "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
@@ -276,6 +287,30 @@ pub(crate) async fn service_signing_key(
         )
     })?;
     load_signing_key(&state.db, state.db_backend, encryption_key).await
+}
+
+/// Begin a write to one space, holding the space for the whole transaction.
+///
+/// Every write reads its author's repo state and folds into it, so writes to
+/// a space have to land one at a time. SQLite's `BEGIN IMMEDIATE` already
+/// does that. Postgres runs them in parallel, so the space row is locked
+/// first: taken any later, after an insert's foreign key has share-locked the
+/// same row, two writers each wait on the other's share lock and deadlock.
+pub(crate) async fn begin_space_write(
+    state: &AppState,
+    space_id: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if state.db_backend == DatabaseBackend::Postgres {
+        crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR UPDATE")
+            .bind(space_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock space: {e}")))?;
+    }
+    Ok(tx)
 }
 
 pub(crate) async fn commit_write(
@@ -430,6 +465,19 @@ async fn forward_write_if_native(
         return Ok(None);
     }
 
+    // The in-process PDS answers repo writes only, so re-authenticating, which
+    // is the advice below, could never help here.
+    if state.test.is_some() {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message: format!(
+                "this space lives on {author_did}'s PDS, and a test run serves no \
+                 PDS-backed spaces; {method} reaches only spaces HappyView hosts"
+            ),
+        });
+    }
+
     tracing::warn!(
         space_id = %space.id,
         author_did,
@@ -549,11 +597,7 @@ pub(crate) async fn create_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
     let committed = commit_write(
         &mut tx,
@@ -643,11 +687,7 @@ pub(crate) async fn put_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = match swap_cid.as_deref() {
         Some(swap) => Some(swap.to_string()),
@@ -737,11 +777,7 @@ pub(crate) async fn delete_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = if let Some(swap) = swap_cid {
         db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
@@ -918,18 +954,27 @@ async fn revoke_member_credentials(
     Ok(())
 }
 
+/// Upsert a member. `access` of `None` leaves an existing member's read and
+/// write untouched, and gives a new one read — so a caller who names only a
+/// DID, or only `is_delegation`, neither grants nor withdraws access.
+///
+/// `read_self` is carried forward on the same principle: it is HappyView-local,
+/// and replacing read and write is not a request to lift an own-records-only
+/// restriction.
 pub(crate) async fn put_member(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
     member_did: &str,
-    access: MemberAccess,
+    access: Option<MemberAccess>,
     is_delegation: Option<bool>,
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
 
     let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    let current = existing.as_ref().map(|m| m.access);
+    let access = access.unwrap_or_else(|| current.unwrap_or(MemberAccess::READ));
     let member = SpaceMember {
         id: existing
             .as_ref()
@@ -938,7 +983,7 @@ pub(crate) async fn put_member(
         space_id: space.id.clone(),
         did: member_did.to_string(),
         access: MemberAccess {
-            read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
+            read_self: current.map(|a| a.read_self).unwrap_or(false),
             ..access
         },
         is_delegation: is_delegation.unwrap_or(false),
@@ -1134,10 +1179,7 @@ pub(crate) async fn accept_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use crate::lexicon::LexiconRegistry;
-    use tokio::sync::watch;
 
     macro_rules! require_test_db {
         () => {
@@ -1154,129 +1196,10 @@ mod tests {
         let backend = DatabaseBackend::from_url(&url);
         let pool = crate::db::connect(&url, backend).await;
 
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            database_url: String::new(),
-            database_backend: backend,
-            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
-            public_url: String::new(),
-            user_agent: String::new(),
-            session_secret: "test-secret".into(),
-            jetstream_url: String::new(),
-            relay_url: String::new(),
-            plc_url: String::new(),
-            static_dir: String::new(),
-            base_path: None,
-            event_log_retention_days: 30,
-            app_name: None,
-            logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
-            // Space writes need this to decrypt the `#atproto_space` signing key.
-            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
-            default_rate_limit_capacity: 100,
-            default_rate_limit_refill_rate: 2.0,
-            telemetry_collector_url: String::new(),
-            platform_api_key_hash: None,
-            job_worker_concurrency: 1,
-        };
-        let (collections_tx, _) = watch::channel(vec![]);
-        let (labeler_subscriptions_tx, _) = watch::channel(());
-
-        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
-        let did_resolver = atrium_identity::did::CommonDidResolver::new(
-            atrium_identity::did::CommonDidResolverConfig {
-                plc_directory_url: "https://plc.directory".into(),
-                http_client: std::sync::Arc::clone(&atrium_http),
-            },
-        );
-        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
-            atrium_identity::handle::AtprotoHandleResolverConfig {
-                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
-                http_client: atrium_http,
-            },
-        );
-        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
-            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![atrium_oauth::Scope::Known(
-                    atrium_oauth::KnownScope::Atproto,
-                )]),
-            },
-            keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend),
-            resolver: atrium_oauth::OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-            http_client: crate::http_retry::HappyViewHttpClient::default(),
-        })
-        .expect("Failed to create test OAuth client");
-
-        let state = AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: pool.clone(),
-            backfill_db: pool.clone(),
-            db_backend: backend,
-            domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
-            collections_tx,
-            labeler_subscriptions_tx,
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            linked_repos_client: std::sync::Arc::new(
-                crate::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    vec![atrium_oauth::Scope::Known(
-                        atrium_oauth::KnownScope::Atproto,
-                    )],
-                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-                    pool.clone(),
-                    backend,
-                    None,
-                )
-                .expect("Failed to create test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-for-tests-only-not-production",
-            ),
-            plugin_registry: std::sync::Arc::new(crate::plugin::PluginRegistry::new()),
-            wasm_runtime: std::sync::Arc::new(
-                crate::plugin::WasmRuntime::new().expect("wasm runtime"),
-            ),
-            attestation_signer: None,
-            official_registry: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
-            ),
-            proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
-                crate::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-        };
+        // Port 0: the one field the shared fixture's configuration sets
+        // differently.
+        let mut state = crate::test_support::test_state_with_pool_on(pool, backend);
+        state.config.port = 0;
 
         crate::test_support::provision_space_signing_key(&state).await;
 
@@ -2022,7 +1945,7 @@ mod tests {
             "did:plc:creator",
             &uri,
             "did:plc:friend",
-            MemberAccess::READ,
+            Some(MemberAccess::READ),
             None,
         )
         .await
@@ -2032,7 +1955,7 @@ mod tests {
             "did:plc:friend",
             &uri,
             "did:plc:other",
-            MemberAccess::READ,
+            Some(MemberAccess::READ),
             None,
         )
         .await
@@ -2244,6 +2167,33 @@ mod native_write_bridge_tests {
             "the error should tell the user what to do: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn a_native_write_in_a_test_run_says_the_run_serves_no_pds_spaces() {
+        let (mut state, space) = state_with_space(HostMode::Native).await;
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "src/a.test.lua",
+        )));
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a test run cannot forward a write to a PDS");
+
+        let AppError::XrpcError {
+            status, message, ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(message.contains("test run"), "{message}");
+        assert!(!message.contains("re-authenticate"), "{message}");
+    }
 }
 
 #[cfg(test)]
@@ -2395,6 +2345,82 @@ mod invite_access_tests {
                 .expect("read the invite back")
                 .expect("the invite exists");
             assert_eq!(fetched.access, access, "round-trip of {access:?}");
+        }
+    }
+
+    /// The migration's backfill, against rows that actually predate it.
+    ///
+    /// A fresh database and a migrated one both cross this migration with
+    /// nothing to convert, so the four mappings are exercised by no ordinary
+    /// run. They matter: each has to be exactly what `parse_wire` made of that
+    /// word, or an outstanding invite changes meaning as it crosses.
+    ///
+    /// The SQL is read from the migration rather than restated, so the test
+    /// cannot drift from the thing it checks. The two backends' files are
+    /// asserted byte-identical, which is what lets one execution speak for
+    /// both — reversing the migration on the shared Postgres database would
+    /// break it for every other test.
+    #[tokio::test]
+    async fn the_migration_backfills_each_access_word() {
+        let (state, space) = state_with_space().await;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let name = "20260930000005_space_invite_booleans.sql";
+        let sqlite_sql = std::fs::read_to_string(dir.join("sqlite").join(name)).expect("read it");
+        let postgres_sql =
+            std::fs::read_to_string(dir.join("postgres").join(name)).expect("read it");
+        assert_eq!(
+            sqlite_sql, postgres_sql,
+            "the two backends' migrations have diverged, so this covers only one"
+        );
+
+        // Back to the shape the migration expects to find.
+        for stmt in [
+            "ALTER TABLE happyview_space_invites ADD COLUMN access TEXT NOT NULL DEFAULT 'read'",
+            "ALTER TABLE happyview_space_invites DROP COLUMN can_read",
+            "ALTER TABLE happyview_space_invites DROP COLUMN can_write",
+            "ALTER TABLE happyview_space_invites DROP COLUMN read_self",
+        ] {
+            crate::db::query(stmt)
+                .execute(&state.db)
+                .await
+                .expect("undo the migration");
+        }
+
+        let words = ["read", "write", "read_self", "none"];
+        for word in words {
+            crate::db::query(
+                "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, access, uses, revoked, created_at) \
+                 VALUES (?, ?, ?, ?, ?, 0, 0, ?)",
+            )
+            .bind(word)
+            .bind(&space.id)
+            .bind(format!("hash-{word}"))
+            .bind(ADMIN)
+            .bind(word)
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .expect("seed a pre-migration invite");
+        }
+
+        // The string comes off disk from this repo, not from a caller.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sqlite_sql.clone()))
+            .execute(&state.db)
+            .await
+            .expect("run the migration");
+
+        for word in words {
+            let row =
+                db::get_invite_by_token_hash(&state.db, state.db_backend, &format!("hash-{word}"))
+                    .await
+                    .expect("read the invite back")
+                    .expect("the invite survived");
+            assert_eq!(
+                row.access,
+                MemberAccess::parse_wire(word).unwrap(),
+                "'{word}' crossed the migration as something else"
+            );
         }
     }
 }

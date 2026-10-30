@@ -35,7 +35,7 @@ graph LR
   Labeler["Labeler<br/><small>WebSocket (out-of-band)</small>"] -->|label events| DB
 ```
 
-Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream); historical records are backfilled in-process by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
+Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream) (its v2 `subscribeEvents` stream when the host offers it, otherwise v1), applied in order for each repo, with the stream position saved only once every earlier event has been applied; historical records are backfilled in-process, either by replaying the Jetstream archive or by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
 
 ## Request flow
 
@@ -53,7 +53,7 @@ sequenceDiagram
     X->>R: Lookup (must be Query type)
     alt Lua script attached
         R->>L: Execute script
-        L->>D: db.query / db.get / db.raw
+        L->>D: happyview.db / happyview.sql
         D-->>L: Results
         L-->>X: Response table
     else No script
@@ -80,8 +80,8 @@ sequenceDiagram
     A->>X: Validated claims
     X->>R: Lookup (must be Procedure type)
     alt Lua script attached
-        R->>L: Execute script (Record API)
-        L->>S: Record:save()
+        R->>L: Execute script
+        L->>S: happyview.record create/put
     else No script
         R->>S: Default create/update (auto-detect from uri field)
     end
@@ -139,9 +139,42 @@ sequenceDiagram
     J->>H: Lexicon schema event (com.atproto.lexicon.schema)
     H->>D: Update tracked network lexicons
     H->>R: Update in-memory registry
-    Note over H,D: Cursor persisted to instance_settings for resume on reconnect
+    Note over H,D: Applied watermark persisted to instance_settings for resume on reconnect
     Note over H,J: Reconnects on collection filter changes (lexicon add/remove)
 ```
+
+**Ordering.** Events are split across `JETSTREAM_WORKERS` workers by account DID, so each repo's events apply in the order they arrived while different repos apply in parallel. Each worker runs one event at a time, record script included, so script latency bounds throughput: with slow scripts on Postgres, raise `JETSTREAM_WORKERS`. The saved cursor is the applied watermark: the position below which every event has been applied. After a restart or reconnect HappyView resumes from it, so delivery is at-least-once, and writes are idempotent (a replayed record carries the same `rev` and is ignored).
+
+**Accounts.** An account event with `active=false` is handled by its status:
+
+- `deleted`, `takendown` and `suspended` purge the account's records and leave an account tombstone (`jetstream.account_deleted`, `jetstream.account_takendown`). A relay can still be relaying a PDS that a deleted account has left. So before purging a `deleted` account it holds records for, HappyView asks the account's current PDS (`com.atproto.sync.getRepoStatus`, 5 second timeout). If that PDS says the account is active, nothing is purged or tombstoned and `jetstream.account_status_mismatch` is logged. If the PDS cannot be asked, the purge goes ahead. `takendown` and `suspended` are purged without asking, because a relay may impose them and the account's PDS cannot see that.
+- `deactivated`, `desynchronized` and `throttled` keep the records (`jetstream.account_inactive`).
+- `active=true` lifts the account's tombstone. Records that were purged come back only through a new [backfill](../guides/backfill.md).
+- A `#sync` removes the repo's records in registered collections, and the current ones that follow replace them. `identity` events change nothing, because HappyView caches no identities.
+
+**Failures.**
+
+- A database outage is retried indefinitely with growing delays, at most every 16 seconds by default, so ingest pauses rather than skipping events. While paused, the consumer cannot notice a collection change or a shutdown until the queue drains.
+- Any other failure is retried for about 31 seconds, then logged as `jetstream.apply_failed` and skipped.
+- Invalid input (no record body, an unknown operation, data the database rejects) is skipped at once with one `jetstream.record_invalid` warning.
+
+**Recovering a cursor.**
+
+- A cursor older than Jetstream keeps (`CursorTooOld`) is replayed from the Jetstream archive when it has one and `BACKFILL_SOURCE` is `auto` or `replay`: see Gap replay under [Backfill](#backfill). Otherwise it resumes from the stored witnessed time. Jetstream clamps that to its oldest event and announces the gap with `#info OutdatedCursor`, which is logged as `jetstream.gap` with reason `outdated_cursor`. Only when there is no stored time does HappyView resume from the live tip, logged as `cursor_too_old`. A [backfill](../guides/backfill.md) recovers what was missed.
+- If the server renumbers its seqs (`FutureCursor`), HappyView resumes by witnessed time too.
+- An unexplained 400 first drops compression, then the seq cursor (only when a seq was sent and a witnessed time is saved; otherwise it goes straight to the hourly retry and keeps the cursor), then retries hourly and logs `jetstream.invalid_request`.
+- Under `auto`, a 404 falls back to v1 until the process restarts.
+
+**Edge cases of revs and tombstones.**
+
+- The Lua [record script](../guides/record-scripts.md) can run for a write that a tombstone then refuses.
+- An account tombstone's `rev` is a TID of the time Jetstream witnessed the event. A PDS whose clock differs from Jetstream's can therefore let an older replay through, or block a newer write until the tombstone is swept (`RECORD_TOMBSTONE_RETENTION_HOURS`, 72 by default).
+- A stale record tombstone left after a newer recreate blocks writes without a rev (crawl writes) to that record until the sweep.
+- A crawl row fetched before a live update but written after it can overwrite the newer body while keeping the stored `rev`. A later replay at that `rev` heals it.
+- A delete with a `rev` removes a crawled row that has none.
+- A delete for a record HappyView does not hold leaves a tombstone only when the account holds records in that collection, or a running or pausing backfill covers it. Those are the cases where a create could still arrive. The network sends many deletes for records an instance never held, and tombstoning each would fill the table.
+
+Admins can watch the consumer with `GET /admin/jetstream/status` and the About page's Jetstream card. See [Jetstream status](../api-reference/admin/admin-api.md#jetstream-status).
 
 ### Backfill
 
@@ -157,34 +190,38 @@ sequenceDiagram
     A->>H: POST /admin/backfill
     H->>D: Create backfill_jobs record (status = running)
 
-    rect rgb(240, 248, 255)
-    note over H,Relay: Phase 1: Discovery
-    H->>Relay: listReposByCollection (paginated)
-    Relay-->>H: List of DIDs
-    H->>D: Insert backfill_repos rows
-    end
-
     rect rgb(240, 255, 240)
-    note over H,PDS: Phase 2: Pipelined resolve + fetch (concurrent)
-    par Resolver task
-        loop Unresolved DIDs
+    note over H,PDS: Discovery, resolution and fetching run concurrently
+    par Discovery (network backfills)
+        loop Each collection, while the queue has room
+            H->>Relay: listReposByCollection (one page)
+            Relay-->>H: DIDs
+            H->>D: Queue (did, collection) units, save the relay cursor
+        end
+    and Resolver task
+        loop Unresolved units
             H->>PLC: Resolve DID document
             PLC-->>H: PDS endpoint
-            H->>D: Update backfill_repos.pds_endpoint
+            H->>D: Record the unit's PDS
         end
     and Fetcher task
-        loop Resolved DIDs (as they arrive)
-            H->>PDS: listRecords (paginated)
+        loop Resolved units (as they arrive)
+            H->>PDS: listRecords for the unit's collection (paginated)
             PDS-->>H: Records
-            H->>D: UPSERT each record
+            H->>D: UPSERT each page
+            H->>D: Delete the completed unit, bump counters
         end
     end
     end
+    Note over H,D: At most BACKFILL_DISCOVERY_WINDOW units are queued per job
 
     H->>D: Mark job completed (or failed)
 ```
 
-## Database schema
+**Two sources.** A backfill job reads its records from one of two places, chosen by `BACKFILL_SOURCE` (default `crawl`) or the job's `source`. A crawl runs the pipeline above, and every account backfill crawls. A replay asks the Jetstream archive for a plan (`planSnapshot`), downloads the segments and blocks that hold the job's collections, and writes the records through the same path as live events. A second sweep then applies the account and sync events for the accounts that hold records. Markers are applied as of their own time, so the two sweeps give the same result in either order and never remove records written after them. `auto` replays when the Jetstream has an archive and crawls when it doesn't. A replay returns only what the archive holds; some repos' history in Bluesky's archive starts after their first record, which a crawl would find.
+
+**Gap replay.** When the live consumer's cursor is older than Jetstream keeps, HappyView creates a replay job for the gap between its last applied seq and the archive's sealed tip, and resumes the live stream at that tip. The consumer waits at most 30 seconds for the archive's plan; past that it resumes without a replay. Live events and the replay overlap safely, because the rev guard and tombstones make every write idempotent. Instances on `BACKFILL_SOURCE=crawl` (the default), or on a Jetstream without an archive, keep the old behaviour of skipping the gap.
+
 
 ### `records`
 
@@ -196,7 +233,12 @@ sequenceDiagram
 | `rkey`       | text        | Record key                          |
 | `record`     | jsonb       | Record value                        |
 | `cid`        | text        | Content identifier                  |
-| `indexed_at` | timestamptz | When HappyView indexed this record  |
+| `indexed_at` | timestamptz | When HappyView indexed this version of the record. Redelivering an identical record (same CID and body) keeps the original value. A local write that Jetstream will echo back (an XRPC procedure, a `happyview.record` mirror, a linked-repo write) stores `NULL`, on insert and on update, until the echo stamps it. A plugin's direct local-index write gets no echo, so an update through it keeps the existing value |
+| `rev`        | text        | TID of the repo commit that wrote this version, from Jetstream. `NULL` for local writes, `listRecords` backfill rows and rows written before revs were stored. A delivery with an older rev than the stored one is ignored |
+
+### `record_tombstones` and `did_tombstones`
+
+Recently deleted records (`uri`, `rev`, `deleted_at`) and deleted accounts (`did`, `rev`, `seq`, `deleted_at`). A create or update at or before a tombstone's rev, or one without a rev, is not written, so a late or replayed copy cannot bring a deleted record back. Tombstones are kept for `RECORD_TOMBSTONE_RETENTION_HOURS` (72 by default).
 
 ### `lexicons`
 
@@ -491,9 +533,9 @@ sequenceDiagram
 | `did`             | text        | Target DID (null = all)                                  |
 | `status`          | text        | pending, running, pausing, paused, cancelling, cancelled, completed, failed |
 | `stage`           | text        | pending, discovering_repos, resolving_and_fetching, completed, failed, cancelled |
-| `total_repos`     | integer     | Total DIDs discovered                                    |
-| `resolved_repos`  | integer     | DIDs with PDS endpoint resolved                          |
-| `processed_repos` | integer     | DIDs with records fetched                                |
+| `total_repos`     | integer     | Work units discovered (a unit is one repo under one collection; one per account for account-targeted jobs) |
+| `resolved_repos`  | integer     | Units with PDS endpoint resolved                         |
+| `processed_repos` | integer     | Units with records fetched                               |
 | `total_records`   | integer     | Total records indexed                                    |
 | `error`           | text        | Error message if failed                                  |
 | `started_at`      | timestamptz |                                                          |

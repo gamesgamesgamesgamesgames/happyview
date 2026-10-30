@@ -28,6 +28,7 @@ import {
   IconShieldLock,
   IconChartBar,
   IconLock,
+  IconWorldUpload,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -162,6 +163,12 @@ const systemItems: NavItem[] = [
     requiredPermissions: ["settings:manage"],
   },
   {
+    title: "Lexicon Publishing",
+    url: "/dashboard/settings/lexicon-publishing",
+    icon: IconWorldUpload,
+    requiredPermissions: ["lexicons:read"],
+  },
+  {
     title: "OAuth Keys",
     url: "/dashboard/settings/oauth-keys",
     icon: IconShieldLock,
@@ -202,7 +209,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { addReason, removeReason } = useRestart();
 
   const [deadLetterCount, setDeadLetterCount] = useState(0);
-
   useEffect(() => {
     let cancelled = false;
     async function fetchCount() {

@@ -8,6 +8,17 @@ const nextConfig: NextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
   basePath,
+  turbopack: {
+    rules: {
+      // Editor templates are kept as Lua files, imported as plain strings,
+      // so a Rust test can parse the same source the editor prefills.
+      "*.lua": { loaders: ["./scripts/lua-source-loader.js"], as: "*.js" },
+      // The JavaScript and TypeScript starters, kept as `.js.txt` and
+      // `.ts.txt` so neither the bundler nor the type checker reads them as
+      // code of this app's own.
+      "*.txt": { loaders: ["./scripts/lua-source-loader.js"], as: "*.js" },
+    },
+  },
 };
 
 if (process.env.NODE_ENV === "production") {
@@ -26,8 +37,14 @@ if (process.env.NODE_ENV === "production") {
       { source: "/config", destination: `${apiBase}/config` },
       { source: "/config/", destination: `${apiBase}/config` },
       { source: "/oauth/:path*", destination: `${apiBase}/oauth/:path*` },
-      { source: "/external-auth/:path*", destination: `${apiBase}/external-auth/:path*` },
-      { source: "/.well-known/:path*", destination: `${apiBase}/.well-known/:path*` },
+      {
+        source: "/external-auth/:path*",
+        destination: `${apiBase}/external-auth/:path*`,
+      },
+      {
+        source: "/.well-known/:path*",
+        destination: `${apiBase}/.well-known/:path*`,
+      },
     ],
     afterFiles: [],
     fallback: [],

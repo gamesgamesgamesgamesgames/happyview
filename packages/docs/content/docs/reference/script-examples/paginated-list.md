@@ -7,26 +7,25 @@ List records from a collection with cursor-based pagination and an optional DID 
 **Lexicon type:** query
 
 ```lua
-function handle()
-  local limit = tonumber(params.limit) or 20
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  local limit = tonumber(input.limit) or 20
   if limit > 100 then limit = 100 end
 
-  local result = db.query({
-    collection = collection,
-    did = params.did,
-    limit = limit,
-    cursor = params.cursor,
-  })
-
-  return result
+  return db.records(ctx.collection)
+    :did(input.did)
+    :limit(limit)
+    :cursor(input.cursor)
+    :run()
 end
 ```
 
 ## How it works
 
 1. Parse `limit` from the query string, defaulting to 20 and capping at 100.
-2. Call [`db.query`](../../api-reference/lua/database-api.md#dbquery) with the target collection, optional DID filter, and cursor for pagination.
-3. Return the result directly. `db.query` returns `{ records = [...], cursor = "..." }` where `cursor` is an opaque string present when more records exist.
+2. Build a `db.records` chain on the target collection, narrowed by the optional DID filter and continued from the cursor. A step given `nil` is skipped, so a request without `did` or `cursor` needs no branching.
+3. `run()` answers `{ records = [...], cursor = "..." }`, where each record is an envelope and `cursor` is an opaque string present when more records exist.
 
 ## Usage
 
@@ -39,4 +38,4 @@ GET /xrpc/xyz.statusphere.listStatuses?cursor=<opaque>&limit=20
 
 ## Use case
 
-A list endpoint for feeds, timelines, or browsing records by collection. The `cursor` value returned by `db.query` is an opaque string. Clients pass it back as the `cursor` parameter to fetch the next page — don't parse or modify it.
+A list endpoint for feeds, timelines, or browsing records by collection. The `cursor` value returned by `run()` is an opaque string. Clients pass it back as the `cursor` parameter to fetch the next page — don't parse or modify it.

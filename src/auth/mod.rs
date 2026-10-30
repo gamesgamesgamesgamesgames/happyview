@@ -1,4 +1,6 @@
+pub mod admin_scope;
 pub mod atrium_panic;
+pub mod cli_client;
 pub mod client_registry;
 pub mod middleware;
 pub mod oauth_store;

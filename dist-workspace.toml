@@ -1,0 +1,45 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell"]
+install-path = "CARGO_HOME"
+install-updater = false
+features = ["embedded-dashboard"]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+]
+# semantic-release (ci.yml) tags the release, creates it on GitHub, and then
+# dispatches release.yml with the tag; dist uploads into that release.
+dispatch-releases = true
+create-release = false
+# Builds the dashboard and stamps the tag's version before each local build.
+github-build-setup = "../build-setup.yml"
+# release.yml carries hand-added version-stamp steps in the plan, global and
+# host jobs; `dist generate` would drop them, so it is told not to own the file.
+# After regenerating, re-add the three "Stamp the release version" steps.
+allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+global = "depot-ubuntu-24.04"
+x86_64-unknown-linux-gnu = "depot-ubuntu-22.04"
+aarch64-unknown-linux-gnu = "depot-ubuntu-22.04-arm"
+x86_64-unknown-linux-musl = "depot-ubuntu-24.04"
+aarch64-unknown-linux-musl = "depot-ubuntu-24.04-arm"
+aarch64-apple-darwin = "depot-macos-15"
+# Depot's macOS runners are Apple silicon; the Intel build cross-compiles.
+x86_64-apple-darwin = { runner = "depot-macos-15", host = "aarch64-apple-darwin" }
+x86_64-pc-windows-msvc = "depot-windows-2022"
+
+[dist.github-action-commits]
+"actions/checkout" = "v7"
+"actions/upload-artifact" = "v7"
+"actions/download-artifact" = "v8"

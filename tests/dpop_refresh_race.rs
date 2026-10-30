@@ -7,7 +7,7 @@ use serde_json::json;
 use serial_test::serial;
 use std::time::Duration;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn post_json_with_headers(
@@ -104,12 +104,27 @@ async fn concurrent_refresh_does_not_destroy_session() {
         .mount(&auth_server)
         .await;
 
+    // The PDS accepts the rotated token, as a real one would. Rejecting it too
+    // sent any request that read the session after the winner saved into a
+    // refresh of its own, with the rotated refresh token, so the count below
+    // measured how the tasks happened to be scheduled.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.example.race.get"))
+        .and(header("authorization", "DPoP rotated-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .with_priority(1)
+        .mount(&pds)
+        .await;
+
     // The PDS rejects the expired access token, which is what sends every
-    // request into the refresh path in the first place.
+    // request into the refresh path in the first place. The delay holds the
+    // winner's refresh back, so a task the scheduler starts late still reads
+    // the expired token and the six requests overlap.
     Mock::given(method("GET"))
         .and(path("/xrpc/com.example.race.get"))
         .respond_with(
             ResponseTemplate::new(401)
+                .set_delay(Duration::from_secs(1))
                 .insert_header("www-authenticate", "DPoP error=\"invalid_token\"")
                 .set_body_json(json!({"error": "invalid_token"})),
         )

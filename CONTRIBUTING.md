@@ -60,21 +60,26 @@ Point git at the tracked hooks once per clone:
 git config core.hooksPath .githooks
 ```
 
-- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins.
+- **pre-commit** runs `cargo fmt --check` and `cargo clippy` over the lib and bins,
+  then formats the dashboard's staged files with prettier and restages them. A file
+  that is staged *and* modified in the working tree is left alone, so the hook never
+  commits work you did not stage. Needs `npm ci` in `web/`; without it the formatting
+  half is skipped.
 - **pre-push** runs `cargo clippy --all-targets`, which also covers test code.
 
 ## What CI checks
 
 These checks must pass before merging:
 
-| Check                   | Run it locally                                                                                                                                            |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lint`                  | `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`                                                                        |
-| `unit-tests`            | `cargo test --lib` and `cargo test --workspace --exclude happyview`                                                                                       |
-| `e2e-tests`             | `cargo test --tests` with `TEST_DATABASE_URL` pointing at a Postgres database (`docker compose -f docker-compose.test.yml up -d` starts one on port 5433) |
-| `frontend`              | `npm ci && npm run build` in `web/`                                                                                                                       |
-| `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                         |
-| `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                       |
+| Check                   | Run it locally                                                                                                                                                                                 |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lint`                  | `cargo fmt -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy --features lua-reference --all-targets -- -D warnings`, `bash scripts/check-no-native-lua.sh` |
+| `unit-tests`            | See [Unit tests](#unit-tests)                                                                                                                                                                  |
+| `e2e-tests`             | See [End-to-end tests](#end-to-end-tests)                                                                                                                                                      |
+| `playwright`            | See [Browser tests](#browser-tests)                                                                                                                                                            |
+| `frontend`              | `npm ci`, `npm run format:check`, `npm run build` in `web/`                                                                                                                                    |
+| `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
+| `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 
 The `coverage` job also runs on server changes. It reruns the Rust suites under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
 
@@ -83,6 +88,121 @@ Jobs only run when the files they cover change, so a docs-only PR skips the Rust
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
 - **PR builds**: when your PR touches the server, CI builds Docker images and binaries, and a bot comments with `docker pull ghcr.io/gamesgamesgamesgamesgames/happyview:pr-<number>` so reviewers can try it.
+
+### Unit tests
+
+No database, no fixtures:
+
+```bash
+cargo test --lib
+cargo test --workspace --exclude happyview
+```
+
+That is not the whole suite. `mlua` is an optional dependency behind the
+non-default `lua-reference` feature, so a default build links no Lua
+interpreter — scripts run in an interpreter plugin instead, and the native
+runtime survives only as the reference a differential harness compares that
+plugin against. Every test that runs a script through it is gated with it, so
+over a hundred tests do not appear in the run above. CI runs them as well, and
+so should you:
+
+```bash
+cargo test --features lua-reference --lib --test codemod_cases
+```
+
+### End-to-end tests
+
+Needs Postgres and every plugin WASM fixture built:
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test cargo test --tests
+docker compose -f docker-compose.test.yml down
+```
+
+The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
+file. Leaving the variable unset does not test SQLite: the end-to-end suite
+skips its database-backed tests silently, so point it at a file URL as
+below. Run it this way once when you change SQL,
+migrations or anything that touches the write path:
+
+```bash
+dir=$(mktemp -d)
+TEST_DATABASE_URL="sqlite://$dir/e2e.db?mode=rwc" cargo test --tests -- --test-threads=1
+```
+
+For a change that affects storage or ingest cost, measure it.
+`scripts/measure-backfill-storage.sh [dids-file] [collection]` backfills a fixed
+list of repos (`scripts/measure-backfill-dids.txt` by default) into a fresh
+SQLite database. It reports the write-ahead log's peak, the database size and,
+on Linux, the bytes the server wrote (`write_bytes` reads `unavailable` on other
+systems, which have no `/proc/<pid>/io`). It reaches the real PLC directory and
+PDSes, so run it on your branch and on `alpha` back to back, and put both
+summaries in the pull request. The storage settings it exercises
+(`SQLITE_SYNCHRONOUS`, `SQLITE_CHECKPOINT_INTERVAL_SECS`, `SQLITE_WAL_CHECKPOINT_BYTES`,
+`BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
+`packages/docs/content/docs/getting-started/configuration.md`.
+
+A test whose plugin module is missing skips rather than fails, so this job
+asserts the fixtures are there before running them:
+
+```bash
+bash scripts/check-plugin-fixtures.sh --require
+```
+
+It names every artefact it could not find; the `e2e-tests` job in
+`.github/workflows/ci.yml` carries the build command for each one.
+
+`scripts/build-plugin-fixtures.sh` can fail in a worktree created inside the
+main checkout (for example under `.worktrees/`) with "current package believes
+it's in a workspace when it's not". Cargo walks up from a fixture and finds the
+parent checkout's `Cargo.toml`, whose `workspace.exclude` may lack a fixture
+your branch added. Create the worktree outside the checkout
+(`git worktree add ../my-branch -b my-branch`), or bring the parent's
+`Cargo.toml` up to date with your branch.
+
+The real Lua interpreter plugin is another repository's artefact and needs a C
+toolchain, so nothing here can build it and the targets that load it skip.
+`bash scripts/check-lua-plugin.sh` reports what a run therefore left out and
+names the two variables, `HAPPYVIEW_LUA_PLUGIN` and `HAPPYVIEW_LUA_SRC`, that
+make those targets run. CI runs it in reporting mode, so absent is not a
+failure there.
+
+The provider conformance kit (`cargo test --features testkit --test
+conformance`) is the exception: it does not skip. It panics when
+`TEST_DATABASE_URL` or `HAPPYVIEW_LUA_PLUGIN` is unset.
+
+The job also runs the SDK crate's tests and the `migration_upgrade` target
+ahead of the full run, for a separately named signal. Both are already
+included in the commands above.
+
+### Browser tests
+
+Playwright drives the whole stack in Docker: HappyView behind Caddy, its own
+Postgres, a PLC directory and a PDS. It gates a release the same way the other
+checks do, and runs only after `frontend` and `build-server` have succeeded.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml \
+  --target wasm32-unknown-unknown --release
+docker compose -f docker-compose.e2e.yml down -v
+docker compose -f docker-compose.e2e.yml up -d --build
+cd web && npx playwright test
+```
+
+Two things that look like test failures and are not. The stack's `lua`
+interpreter is that fixture, bind-mounted from a path git ignores, and saving a
+script asks the interpreter its language names whether the body is one it can
+run — so without the build above every save is refused and the suite stops in
+`globalSetup`. And `down -v` matters because `scripts/init-e2e-dbs.sql` runs
+only when the volume is new: on a reused one the PDS and PLC containers
+crash-loop over missing databases, and the specs that cover first-run setup
+need a database where setup has not happened.
+
+## The provider contract
+
+The `happyview-provider` crate is the contract that record sources and stores implement, and it is licensed MIT OR Apache-2.0 so providers can be built under any terms. A change to it is a contract change. If the change breaks existing providers, bump `CONTRACT_VERSION` in `crates/happyview-provider/src/types.rs`. See [Record providers](packages/docs/content/docs/guides/record-providers.md).
 
 ## Code of conduct
 

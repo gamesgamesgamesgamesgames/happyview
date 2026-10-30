@@ -1,12 +1,18 @@
 {
   "title": "Guides",
   "pages": [
+    "upgrading-to-v3",
     "upgrading-to-v2",
     "lexicons",
+    "publishing-lexicons",
     "backfill",
     "background-jobs",
+    "record-providers",
     "record-scripts",
     "lua-scripting",
+    "testing",
+    "editor-types",
+    "migrating-scripts",
     "api-clients",
     "linked-repos",
     "attestation-signing",

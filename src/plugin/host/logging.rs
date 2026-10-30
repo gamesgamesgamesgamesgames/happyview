@@ -1,29 +1,9 @@
-use std::str::FromStr;
 use tracing::{debug, error, info, warn};
 
-/// Log level for plugin logging
-#[derive(Debug, Clone, Copy, Default)]
-pub enum LogLevel {
-    Debug,
-    #[default]
-    Info,
-    Warn,
-    Error,
-}
-
-impl FromStr for LogLevel {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_lowercase().as_str() {
-            "debug" => Self::Debug,
-            "info" => Self::Info,
-            "warn" | "warning" => Self::Warn,
-            "error" => Self::Error,
-            _ => Self::Info,
-        })
-    }
-}
+/// The severity a plugin named, as the SDK defines it. A level the SDK does not
+/// know fails to parse; the binding logs such a line at `info` rather than
+/// dropping it.
+pub use happyview_plugin_sdk::wire::Level as LogLevel;
 
 /// Log a message from a plugin.
 ///
@@ -52,12 +32,7 @@ pub fn log(
         LogLevel::Warn => crate::event_log::Severity::Warn,
         LogLevel::Error => crate::event_log::Severity::Error,
     };
-    let level_str = match level {
-        LogLevel::Debug => "debug",
-        LogLevel::Info => "info",
-        LogLevel::Warn => "warn",
-        LogLevel::Error => "error",
-    };
+    let level_str = level.as_str();
 
     let event = crate::event_log::EventLog {
         event_type: "plugin.log".to_string(),
@@ -79,24 +54,35 @@ pub fn log(
 mod tests {
     use super::*;
 
+    /// The binding parses the level string with `unwrap_or_default()`, so
+    /// these are the levels the host actually ends up logging at.
     #[test]
     fn test_log_level_from_str_known_values() {
-        assert!(matches!("debug".parse::<LogLevel>(), Ok(LogLevel::Debug)));
-        assert!(matches!("DEBUG".parse::<LogLevel>(), Ok(LogLevel::Debug)));
-        assert!(matches!("info".parse::<LogLevel>(), Ok(LogLevel::Info)));
-        assert!(matches!("INFO".parse::<LogLevel>(), Ok(LogLevel::Info)));
-        assert!(matches!("warn".parse::<LogLevel>(), Ok(LogLevel::Warn)));
-        assert!(matches!("warning".parse::<LogLevel>(), Ok(LogLevel::Warn)));
-        assert!(matches!("WARN".parse::<LogLevel>(), Ok(LogLevel::Warn)));
-        assert!(matches!("error".parse::<LogLevel>(), Ok(LogLevel::Error)));
-        assert!(matches!("ERROR".parse::<LogLevel>(), Ok(LogLevel::Error)));
+        for (text, expected) in [
+            ("debug", LogLevel::Debug),
+            ("DEBUG", LogLevel::Debug),
+            ("info", LogLevel::Info),
+            ("INFO", LogLevel::Info),
+            ("warn", LogLevel::Warn),
+            ("warning", LogLevel::Warn),
+            ("WARN", LogLevel::Warn),
+            ("error", LogLevel::Error),
+            ("ERROR", LogLevel::Error),
+        ] {
+            assert_eq!(
+                text.parse::<LogLevel>().unwrap_or_default(),
+                expected,
+                "{text}"
+            );
+        }
     }
 
     #[test]
     fn test_log_level_from_str_unknown_defaults_to_info() {
-        assert!(matches!("trace".parse::<LogLevel>(), Ok(LogLevel::Info)));
-        assert!(matches!("".parse::<LogLevel>(), Ok(LogLevel::Info)));
-        assert!(matches!("unknown".parse::<LogLevel>(), Ok(LogLevel::Info)));
+        for text in ["trace", "", "unknown"] {
+            assert!(text.parse::<LogLevel>().is_err(), "{text}");
+            assert_eq!(text.parse::<LogLevel>().unwrap_or_default(), LogLevel::Info);
+        }
     }
 
     #[test]

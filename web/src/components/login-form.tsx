@@ -1,65 +1,65 @@
-"use client"
+"use client";
 
-import { useState } from "react"
-import { XIcon } from "lucide-react"
+import { useState } from "react";
+import { XIcon } from "lucide-react";
 
-import { cn } from "@/lib/utils"
-import { useAuth } from "@/lib/auth-context"
+import { cn } from "@/lib/utils";
+import { useAuth } from "@/lib/auth-context";
 import {
   useHandleTypeahead,
   type TypeaheadActor,
-} from "@/hooks/use-handle-typeahead"
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-import { Button } from "@/components/ui/button"
+} from "@/hooks/use-handle-typeahead";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
 import {
   Combobox,
   ComboboxContent,
   ComboboxInput,
   ComboboxItem,
   ComboboxList,
-} from "@/components/ui/combobox"
+} from "@/components/ui/combobox";
 import {
   Field,
   FieldDescription,
   FieldGroup,
   FieldLabel,
-} from "@/components/ui/field"
+} from "@/components/ui/field";
 
 export function LoginForm({
   className,
   externalError,
   ...props
 }: React.ComponentProps<"div"> & { externalError?: string | null }) {
-  const [handle, setHandle] = useState("")
+  const [handle, setHandle] = useState("");
   const [selectedActor, setSelectedActor] = useState<TypeaheadActor | null>(
     null,
-  )
-  const [dropdownOpen, setDropdownOpen] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const { login } = useAuth()
-  const { actors } = useHandleTypeahead(selectedActor ? "" : handle)
+  );
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { login } = useAuth();
+  const { actors } = useHandleTypeahead(selectedActor ? "" : handle);
 
-  const actorsByHandle = new Map(actors.map((a) => [a.handle, a]))
-  const showDropdown = dropdownOpen && actors.length > 0
+  const actorsByHandle = new Map(actors.map((a) => [a.handle, a]));
+  const showDropdown = dropdownOpen && actors.length > 0;
 
   async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    const value = selectedActor?.handle ?? handle
-    if (!value.trim()) return
-    setLoading(true)
-    setError(null)
+    e.preventDefault();
+    const value = selectedActor?.handle ?? handle;
+    if (!value.trim()) return;
+    setLoading(true);
+    setError(null);
     try {
-      await login(value.trim().toLowerCase())
+      await login(value.trim().toLowerCase());
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Login failed")
-      setLoading(false)
+      setError(e instanceof Error ? e.message : "Login failed");
+      setLoading(false);
     }
   }
 
   function clearSelection() {
-    setSelectedActor(null)
-    setHandle("")
+    setSelectedActor(null);
+    setHandle("");
   }
 
   return (
@@ -73,7 +73,9 @@ export function LoginForm({
             </FieldDescription>
           </div>
           {(externalError || error) && (
-            <p className="text-destructive text-center text-sm">{externalError || error}</p>
+            <p className="text-destructive text-center text-sm">
+              {externalError || error}
+            </p>
           )}
           <Field>
             <FieldLabel htmlFor="handle">Handle</FieldLabel>
@@ -88,8 +90,7 @@ export function LoginForm({
                   )}
                   <AvatarFallback>
                     {(
-                      selectedActor.displayName?.[0] ??
-                      selectedActor.handle[0]
+                      selectedActor.displayName?.[0] ?? selectedActor.handle[0]
                     ).toUpperCase()}
                   </AvatarFallback>
                 </Avatar>
@@ -117,17 +118,17 @@ export function LoginForm({
                 inputValue={handle}
                 onInputValueChange={(value, details) => {
                   if (details.reason === "input-change") {
-                    setHandle(value)
+                    setHandle(value);
                   }
                 }}
                 onValueChange={(value) => {
                   if (value) {
-                    const actor = actorsByHandle.get(value as string)
+                    const actor = actorsByHandle.get(value as string);
                     if (actor) {
-                      setSelectedActor(actor)
-                      setHandle(actor.handle)
+                      setSelectedActor(actor);
+                      setHandle(actor.handle);
                     } else {
-                      setHandle(value as string)
+                      setHandle(value as string);
                     }
                   }
                 }}
@@ -146,7 +147,7 @@ export function LoginForm({
                 <ComboboxContent className="min-w-(--anchor-width)">
                   <ComboboxList>
                     {(item: string) => {
-                      const actor = actorsByHandle.get(item)
+                      const actor = actorsByHandle.get(item);
                       return (
                         <ComboboxItem key={item} value={item}>
                           <Avatar size="sm">
@@ -170,7 +171,7 @@ export function LoginForm({
                             </span>
                           </div>
                         </ComboboxItem>
-                      )
+                      );
                     }}
                   </ComboboxList>
                 </ComboboxContent>
@@ -189,5 +190,5 @@ export function LoginForm({
         </FieldGroup>
       </form>
     </div>
-  )
+  );
 }

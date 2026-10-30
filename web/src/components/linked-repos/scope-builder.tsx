@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { AlertTriangle, Check, Plus, X } from "lucide-react";
 
 import { isValidNsid } from "@happyview/nsid";
 
@@ -17,6 +17,7 @@ import {
   ComboboxList,
 } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import {
   InputGroup,
   InputGroupAddon,
@@ -30,9 +31,15 @@ import {
  * button, so the value inputs all end at the same x. Secondary content —
  * checkboxes, errors, notes — sits at `col-start-2` and therefore lines up
  * under the value it describes instead of hanging off the left edge.
+ *
+ * Below `sm` an 11rem prefix leaves a collection NSID a few characters, so
+ * the prefix takes a line of its own and the value gets the full width.
  */
 const ROW_GRID =
-  "grid grid-cols-[11rem_minmax(0,1fr)_2.25rem] items-start gap-x-2 gap-y-1";
+  "grid grid-cols-[minmax(0,1fr)_2.25rem] items-start gap-x-2 gap-y-1 sm:grid-cols-[11rem_minmax(0,1fr)_2.25rem]";
+
+/** Secondary content under a row's value, at every width. */
+const UNDER_VALUE = "col-span-2 sm:col-start-2";
 
 // Mirrors src/linked_repos/scope.rs byte-for-byte. Keep the two in sync —
 // this is the client-side half of the same grammar the server enforces.
@@ -226,27 +233,31 @@ function hoistRepoActions(
   return { rest: target, actions: orderActions(actions) };
 }
 
+/** One scope token as an editable row; `atproto` has no row of its own. */
+function tokenToRow(token: string): ScopeRow | null {
+  if (token === BASE_SCOPE) return null;
+  const sep = token.indexOf(":");
+  if (sep === -1) return { ...EMPTY_ROW, prefix: token };
+  const prefix = token.slice(0, sep);
+  const rest = token.slice(sep + 1);
+  const hoisted = prefix === "repo" ? hoistRepoActions(rest) : null;
+  return hoisted
+    ? { prefix, rest: hoisted.rest, actions: hoisted.actions }
+    : { ...EMPTY_ROW, prefix, rest };
+}
+
+/** The rows a scope string spells out, in order. */
+function tokensToRows(value: string): ScopeRow[] {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(tokenToRow)
+    .filter((row): row is ScopeRow => row !== null);
+}
+
 /** Split a stored scope string back into editable rows, dropping `atproto`. */
 function parseInitialRows(value: string): ScopeRow[] {
-  const rows: ScopeRow[] = [];
-  for (const token of value.split(/\s+/).filter(Boolean)) {
-    if (token === BASE_SCOPE) continue;
-    const sep = token.indexOf(":");
-    if (sep === -1) {
-      rows.push({ ...EMPTY_ROW, prefix: token });
-      continue;
-    }
-    const prefix = token.slice(0, sep);
-    const rest = token.slice(sep + 1);
-    const hoisted = prefix === "repo" ? hoistRepoActions(rest) : null;
-    rows.push(
-      hoisted
-        ? { prefix, rest: hoisted.rest, actions: hoisted.actions }
-        : { ...EMPTY_ROW, prefix, rest },
-    );
-  }
-  rows.push({ ...EMPTY_ROW });
-  return rows;
+  return [...tokensToRows(value), { ...EMPTY_ROW }];
 }
 
 function rowToToken(row: ScopeRow): string {
@@ -305,6 +316,35 @@ function buildScopeString(rows: ScopeRow[]): string {
     parts.push(token);
   }
   return parts.join(" ");
+}
+
+/**
+ * Scope sets a feature needs, offered whole so an operator does not have to
+ * know the collection or remember that publishing upserts.
+ */
+const PRESETS: { label: string; rows: ScopeRow[] }[] = [
+  {
+    // Publishing upserts, which needs create and update; unpublishing needs
+    // delete. Mirrors what src/lexicon_publishing/target.rs checks.
+    label: "Lexicon publishing",
+    rows: [
+      {
+        prefix: "repo",
+        rest: "com.atproto.lexicon.schema",
+        actions: ["create", "update", "delete"],
+      },
+    ],
+  },
+];
+
+/** Whether every action a preset row asks for is already granted. */
+function rowCovered(rows: ScopeRow[], wanted: ScopeRow): boolean {
+  return rows.some(
+    (r) =>
+      r.prefix.trim() === wanted.prefix &&
+      r.rest.trim() === wanted.rest &&
+      wanted.actions.every((a) => r.actions.includes(a)),
+  );
 }
 
 interface ScopeBuilderProps {
@@ -372,6 +412,18 @@ export function ScopeBuilder({
     setRow(index, { rest: raw });
   }
 
+  // A pasted scope string becomes rows, one per token, in place of the row it
+  // landed on: a grant's scopes are copied from another grant or a client's
+  // settings far more often than typed one token at a time.
+  function pasteRows(index: number, e: React.ClipboardEvent<HTMLInputElement>) {
+    const text = e.clipboardData.getData("text");
+    if (!/\s/.test(text.trim())) return;
+    const pasted = tokensToRows(text);
+    if (pasted.length === 0) return;
+    e.preventDefault();
+    update([...rows.slice(0, index), ...pasted, ...rows.slice(index + 1)]);
+  }
+
   function toggleAction(index: number, action: RepoAction, checked: boolean) {
     const current = rows[index]?.actions ?? [];
     setRow(index, {
@@ -383,6 +435,28 @@ export function ScopeBuilder({
 
   function removeRow(index: number) {
     update(rows.filter((_, i) => i !== index));
+  }
+
+  // Widens a row that already names the collection rather than adding a
+  // second one, so the preview never carries the same collection twice.
+  function applyPreset(preset: (typeof PRESETS)[number]) {
+    let next = rows.filter((r) => r.prefix.trim() || r.rest.trim());
+    for (const wanted of preset.rows) {
+      const i = next.findIndex(
+        (r) =>
+          r.prefix.trim() === wanted.prefix && r.rest.trim() === wanted.rest,
+      );
+      if (i === -1) {
+        next = [...next, { ...wanted }];
+      } else {
+        next = next.map((r, j) =>
+          j === i
+            ? { ...r, actions: orderActions([...r.actions, ...wanted.actions]) }
+            : r,
+        );
+      }
+    }
+    update(next);
   }
 
   const rowErrors = rows.map((row) => {
@@ -407,6 +481,39 @@ export function ScopeBuilder({
           it may perform on that collection.
         </p>
 
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-muted-foreground text-xs">Presets</span>
+          {PRESETS.map((preset) => {
+            const applied = preset.rows.every((r) => rowCovered(rows, r));
+            return (
+              <Button
+                key={preset.label}
+                type="button"
+                // An applied preset takes the secondary variant rather than
+                // aria-pressed overrides on the outline one, whose dark-mode
+                // border and fill outrank them. aria-disabled rather than
+                // disabled keeps it focusable and announced; it is never
+                // dimmed, since it is on rather than unavailable.
+                variant={applied ? "secondary" : "outline"}
+                size="xs"
+                className={cn(
+                  "rounded-full",
+                  applied &&
+                    "hover:bg-secondary border border-transparent opacity-100 aria-disabled:cursor-default",
+                )}
+                aria-disabled={applied}
+                aria-pressed={applied}
+                onClick={() => {
+                  if (!applied) applyPreset(preset);
+                }}
+              >
+                {applied ? <Check aria-hidden /> : <Plus aria-hidden />}
+                {preset.label}
+              </Button>
+            );
+          })}
+        </div>
+
         <div className="flex flex-col gap-2">
           {/* `atproto` is mandatory in every authorization request, so it is
               shown as a fixed row rather than something to add or remove. It
@@ -417,7 +524,7 @@ export function ScopeBuilder({
               value={BASE_SCOPE}
               readOnly
               aria-label="Base scope, always included"
-              className="col-span-2 bg-muted font-mono text-sm"
+              className="bg-muted font-mono text-sm sm:col-span-2"
             />
           </div>
 
@@ -439,7 +546,7 @@ export function ScopeBuilder({
                   }}
                 >
                   <ComboboxInput
-                    className="w-full font-mono text-sm"
+                    className="col-span-2 w-full font-mono text-sm sm:col-span-1"
                     placeholder="prefix"
                     aria-label={`Scope ${index + 1} prefix`}
                   />
@@ -465,6 +572,7 @@ export function ScopeBuilder({
                     <InputGroupInput
                       value={row.rest}
                       onChange={(e) => setRest(index, e.target.value)}
+                      onPaste={(e) => pasteRows(index, e)}
                       placeholder={known?.hint ?? "value"}
                       aria-label={`Scope ${index + 1} value`}
                       className="font-mono text-sm"
@@ -476,7 +584,7 @@ export function ScopeBuilder({
                       // to the checkboxes, so it stops here.
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <fieldset className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
+                      <fieldset className="flex flex-wrap items-center gap-x-3 gap-y-1.5 sm:gap-x-5">
                         <legend className="sr-only">
                           Scope {index + 1} actions
                         </legend>
@@ -514,6 +622,7 @@ export function ScopeBuilder({
                   <Input
                     value={row.rest}
                     onChange={(e) => setRest(index, e.target.value)}
+                    onPaste={(e) => pasteRows(index, e)}
                     placeholder={known?.hint ?? "value"}
                     aria-label={`Scope ${index + 1} value`}
                     className="font-mono text-sm"
@@ -536,13 +645,15 @@ export function ScopeBuilder({
                 )}
 
                 {rowErrors[index] && (
-                  <p className="col-start-2 col-span-2 text-destructive text-xs">
+                  <p className={cn(UNDER_VALUE, "text-destructive text-xs")}>
                     {rowErrors[index]}
                   </p>
                 )}
 
                 {cannotUpsert(row) && (
-                  <p className="col-start-2 col-span-2 text-muted-foreground text-xs">
+                  <p
+                    className={cn(UNDER_VALUE, "text-muted-foreground text-xs")}
+                  >
                     <code className="font-mono">update</code> without{" "}
                     <code className="font-mono">create</code> can&apos;t{" "}
                     <code className="font-mono">put_record</code>, which upserts
@@ -567,7 +678,6 @@ export function ScopeBuilder({
             </p>
           </div>
         )}
-
       </div>
 
       <div className="flex flex-col gap-2">
@@ -577,8 +687,9 @@ export function ScopeBuilder({
         </p>
         {grantsNoAccess(scopeString) && (
           <p className="text-muted-foreground text-xs">
-            Nothing selected yet. <code className="font-mono">{BASE_SCOPE}</code>{" "}
-            on its own authorizes no reads or writes.
+            Nothing selected yet.{" "}
+            <code className="font-mono">{BASE_SCOPE}</code> on its own
+            authorizes no reads or writes.
           </p>
         )}
       </div>

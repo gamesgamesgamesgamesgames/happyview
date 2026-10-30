@@ -521,6 +521,43 @@ async fn put_record_creates_updates_and_rejects_stale_swap() {
 }
 
 /// A non-member cannot putRecord into a space.
+/// Every write reads the author's repo state and then writes on it. Begun
+/// deferred on SQLite, a write whose read predates another's commit cannot
+/// take the write lock and fails at once with `SQLITE_BUSY_SNAPSHOT` instead
+/// of waiting its turn.
+#[tokio::test]
+#[serial]
+async fn concurrent_writes_to_one_space_all_land() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+    let writes = (0..32).map(|i| {
+        let req = create_record_req(
+            &space_uri,
+            "com.example.doc",
+            &json!({ "$type": "com.example.doc", "n": i }),
+            Some(cookie_for(&app, &writer)),
+        );
+        app.router.clone().oneshot(req)
+    });
+    let statuses: Vec<StatusCode> = futures::future::join_all(writes)
+        .await
+        .into_iter()
+        .map(|resp| resp.unwrap().status())
+        .collect();
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::CREATED),
+        "{statuses:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn put_record_rejects_non_member() {

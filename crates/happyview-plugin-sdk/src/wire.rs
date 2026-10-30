@@ -1,0 +1,5135 @@
+//! Every type that crosses the WASM boundary, defined once.
+//!
+//! The host (`src/plugin/` in HappyView) re-exports these rather than keeping
+//! its own copies, so a field added here reaches both sides at once and the two
+//! cannot drift. Guest ergonomics — the builders, `no_std`, the `Cow` body
+//! reader — live here too; none of them change what goes on the wire.
+//!
+//! Import paths are stable: [`crate::types`], [`crate::envelope`] and
+//! [`crate::host`] re-export the types that used to live in them.
+
+use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::Engine as _;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{Map, Value};
+
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+
+/// The `{ok}` / `{error}` envelope every host import answers with, and the
+/// shape a plugin's own exports return; the host parses it as
+/// `PluginResponse`.
+///
+/// Read by its top-level key rather than `untagged`: an untagged enum buffers
+/// the whole envelope into serde's `Content` before choosing a variant, which
+/// costs a second copy of every answer — a blob's included — inside a guest's
+/// memory. An `error` key makes it an error even beside an `ok`, and keys it
+/// does not know are skipped, so it reads flattened beside a `handle` too.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Response<T> {
+    Err { error: PluginError },
+    Ok { ok: T },
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Response<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Key {
+            Ok,
+            Error,
+            #[serde(other)]
+            Other,
+        }
+
+        struct EnvelopeVisitor<T>(core::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for EnvelopeVisitor<T> {
+            type Value = Response<T>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("an {\"ok\"} or {\"error\"} envelope")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut ok = None;
+                let mut error = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Key::Ok if ok.is_some() => return Err(de::Error::duplicate_field("ok")),
+                        Key::Ok => ok = Some(map.next_value()?),
+                        Key::Error if error.is_some() => {
+                            return Err(de::Error::duplicate_field("error"))
+                        }
+                        Key::Error => error = Some(map.next_value()?),
+                        Key::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                match (error, ok) {
+                    (Some(error), _) => Ok(Response::Err { error }),
+                    (None, Some(ok)) => Ok(Response::Ok { ok }),
+                    (None, None) => Err(de::Error::custom(
+                        "an envelope needs an \"ok\" or an \"error\" key",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor(core::marker::PhantomData))
+    }
+}
+
+impl<T> Response<T> {
+    /// Collapse the envelope into a `Result`.
+    pub fn into_result(self) -> Result<T, PluginError> {
+        match self {
+            Response::Ok { ok } => Ok(ok),
+            Response::Err { error } => Err(error),
+        }
+    }
+}
+
+/// What `host_call_library_wait_any` answers when one of the handles it was
+/// given has settled: the call's own `{ok}`/`{error}` envelope, exactly as
+/// `host_call_library` would have answered it, with the handle beside it. A
+/// wait the host refuses outright is a bare `{error}` envelope with no
+/// `handle`, which is how the two failures stay apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LibraryCallSettled {
+    pub handle: u32,
+    #[serde(flatten)]
+    pub outcome: Response<Value>,
+}
+
+/// A structured plugin error. `code` is a free-form string; the host relays it
+/// verbatim to whoever called the plugin. Known there as `PluginEnvelopeError`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+impl PluginError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// Mark this error as worth retrying. The host surfaces the flag; it does
+    /// not retry on the plugin's behalf.
+    pub fn retryable(mut self) -> Self {
+        self.retryable = true;
+        self
+    }
+
+    /// Input the plugin could not make sense of. Code `BAD_INPUT`.
+    pub fn bad_input(message: impl Into<String>) -> Self {
+        Self::new("BAD_INPUT", message)
+    }
+
+    /// The caller named an export this plugin does not have. Code `UNKNOWN_FUNCTION`.
+    pub fn unknown_function(name: &str) -> Self {
+        Self::new("UNKNOWN_FUNCTION", format!("no such function: {name}"))
+    }
+
+    /// A host call failed in a way that is not the caller's fault. Code `HOST_ERROR`.
+    pub fn host(message: impl Into<String>) -> Self {
+        Self::new("HOST_ERROR", message)
+    }
+}
+
+impl From<serde_json::Error> for PluginError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::bad_input(format!("{err}"))
+    }
+}
+
+impl core::fmt::Display for PluginError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+/// `core::error::Error` is `std::error::Error`, so this is what lets the host
+/// carry a plugin's error as a `#[source]`.
+impl core::error::Error for PluginError {}
+
+// ---------------------------------------------------------------------------
+// Identity and call envelope
+// ---------------------------------------------------------------------------
+
+/// What `plugin_info` returns.
+///
+/// `icon_url` and `config_schema` are serialised even when absent, because the
+/// host's struct gives neither a serde default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+    pub icon_url: Option<String>,
+    #[serde(default)]
+    pub required_secrets: Vec<String>,
+    /// `"oauth2"`, `"openid"` or `"api_key"`. Only auth plugins read it.
+    #[serde(default = "default_auth_type")]
+    pub auth_type: String,
+    pub config_schema: Option<Value>,
+}
+
+fn default_auth_type() -> String {
+    String::from("oauth2")
+}
+
+impl PluginInfo {
+    /// A v2 plugin with no secrets, no icon and no config schema.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            version: version.into(),
+            api_version: String::from("2"),
+            icon_url: None,
+            required_secrets: Vec::new(),
+            auth_type: default_auth_type(),
+            config_schema: None,
+        }
+    }
+
+    pub fn api_version(mut self, version: impl Into<String>) -> Self {
+        self.api_version = version.into();
+        self
+    }
+
+    pub fn icon_url(mut self, url: impl Into<String>) -> Self {
+        self.icon_url = Some(url.into());
+        self
+    }
+
+    /// Environment-variable names the operator must supply, e.g.
+    /// `PLUGIN_STEAM_API_KEY`. The prefix is `PLUGIN_`, the plugin id
+    /// upper-cased with every non-alphanumeric character replaced by `_`, then
+    /// `_` — so `auth-steam` reads `PLUGIN_AUTH_STEAM_API_KEY`. A plugin asks
+    /// the host for the part after that prefix: `host::get_secret("API_KEY")`.
+    pub fn required_secrets<I, S>(mut self, secrets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_secrets = secrets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// How this plugin authenticates: `"oauth2"`, `"openid"` or `"api_key"`.
+    /// Only an [`auth_plugin!`](crate::auth_plugin) sets it; a library or an
+    /// interpreter leaves the default alone, because nothing reads it there.
+    pub fn auth_type(mut self, auth_type: impl Into<String>) -> Self {
+        self.auth_type = auth_type.into();
+        self
+    }
+
+    pub fn config_schema(mut self, schema: Value) -> Self {
+        self.config_schema = Some(schema);
+        self
+    }
+}
+
+/// Who a call acts as. Threaded from the script runner and never widened by a
+/// library, so a plugin may narrow what it does but never claim more. The host
+/// calls this `LibraryCallContext`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallContext {
+    #[serde(default)]
+    pub caller_did: Option<String>,
+    #[serde(default)]
+    pub has_pds_auth: bool,
+    /// `"sqlite"` or `"postgres"`. A guest has no other way to learn which
+    /// placeholder syntax raw SQL needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_backend: Option<String>,
+}
+
+/// The `call` export's input. Every field but `function` defaults, so an
+/// abbreviated envelope still dispatches. The host calls this
+/// `LibraryCallInput`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallInput {
+    pub function: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+    #[serde(default)]
+    pub context: CallContext,
+}
+
+/// What `get_api_surface` returns: everything an interpreter needs to render
+/// this library into its own idiom.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiSurface {
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub exports: Vec<ApiExport>,
+    /// Named types the exports refer to, each `{name, description?, type}`.
+    #[serde(default)]
+    pub types: Vec<Value>,
+}
+
+impl ApiSurface {
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            import_path: None,
+            description: None,
+            exports: Vec::new(),
+            types: Vec::new(),
+        }
+    }
+
+    pub fn describe(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn import_path(mut self, path: impl Into<String>) -> Self {
+        self.import_path = Some(path.into());
+        self
+    }
+
+    pub fn export(mut self, export: ApiExport) -> Self {
+        self.exports.push(export);
+        self
+    }
+
+    pub fn exports<I: IntoIterator<Item = ApiExport>>(mut self, exports: I) -> Self {
+        self.exports.extend(exports);
+        self
+    }
+
+    pub fn types<I: IntoIterator<Item = Value>>(mut self, types: I) -> Self {
+        self.types.extend(types);
+        self
+    }
+
+    /// A named type the exports can refer to by `name`. `ty` is a type
+    /// string or an inline `{"type": "object", "properties": [...]}`.
+    pub fn named_type(mut self, name: &str, description: &str, ty: Value) -> Self {
+        self.types.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "type": ty,
+        }));
+        self
+    }
+}
+
+/// One entry in an [`ApiSurface`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiExport {
+    pub name: String,
+    /// `"function"`, `"constant"` or `"constructor"`; interpreters may agree
+    /// on others.
+    #[serde(default = "default_export_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub params: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<Value>,
+    /// Present on a `constructor` export: the methods of the object it
+    /// returns. A `lazy` method accumulates a step; an `immediate` method
+    /// sends the object's arguments, its steps and the call in one library
+    /// call named after the constructor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<ApiMethod>,
+    /// Everything else the library said about the export, preserved for
+    /// interpreters. A builder leaves it empty.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn default_export_kind() -> String {
+    String::from("function")
+}
+
+impl ApiExport {
+    pub fn function(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: default_export_kind(),
+            description: None,
+            params: Vec::new(),
+            returns: None,
+            methods: Vec::new(),
+            extra: Map::new(),
+        }
+    }
+
+    pub fn constant(name: impl Into<String>) -> Self {
+        Self {
+            kind: String::from("constant"),
+            ..Self::function(name)
+        }
+    }
+
+    pub fn constructor(name: impl Into<String>) -> Self {
+        Self {
+            kind: String::from("constructor"),
+            ..Self::function(name)
+        }
+    }
+
+    pub fn describe(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// A plain `{name, type, description}` parameter.
+    pub fn param(self, name: &str, ty: &str, description: &str) -> Self {
+        self.param_json(serde_json::json!({
+            "name": name,
+            "type": ty,
+            "description": description,
+        }))
+    }
+
+    /// A parameter that needs more than name, type and description — nested
+    /// `properties`, say.
+    pub fn param_json(mut self, param: Value) -> Self {
+        self.params.push(param);
+        self
+    }
+
+    pub fn returns(mut self, returns: Value) -> Self {
+        self.returns = Some(returns);
+        self
+    }
+
+    pub fn lazy(mut self, name: impl Into<String>) -> Self {
+        self.methods.push(ApiMethod::lazy(name));
+        self
+    }
+
+    pub fn immediate(mut self, name: impl Into<String>) -> Self {
+        self.methods.push(ApiMethod::immediate(name));
+        self
+    }
+
+    /// A method with its own signature, for when `lazy`/`immediate` by name
+    /// alone say too little.
+    pub fn method(mut self, method: ApiMethod) -> Self {
+        self.methods.push(method);
+        self
+    }
+
+    pub fn is_function(&self) -> bool {
+        self.kind == "function"
+    }
+
+    pub fn is_constructor(&self) -> bool {
+        self.kind == "constructor"
+    }
+}
+
+/// A method on the object a `constructor` export returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiMethod {
+    pub name: String,
+    /// `"lazy"` or `"immediate"`.
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<Value>,
+    /// What the method returns. A lazy method that leaves this out returns
+    /// the object it was called on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<Value>,
+}
+
+impl ApiMethod {
+    fn with_mode(name: impl Into<String>, mode: &str) -> Self {
+        Self {
+            name: name.into(),
+            mode: String::from(mode),
+            description: None,
+            params: Vec::new(),
+            returns: None,
+        }
+    }
+
+    pub fn lazy(name: impl Into<String>) -> Self {
+        Self::with_mode(name, "lazy")
+    }
+
+    pub fn immediate(name: impl Into<String>) -> Self {
+        Self::with_mode(name, "immediate")
+    }
+
+    pub fn describe(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// A plain `{name, type, description}` parameter.
+    pub fn param(self, name: &str, ty: &str, description: &str) -> Self {
+        self.param_json(serde_json::json!({
+            "name": name,
+            "type": ty,
+            "description": description,
+        }))
+    }
+
+    pub fn param_json(mut self, param: Value) -> Self {
+        self.params.push(param);
+        self
+    }
+
+    pub fn returns(mut self, returns: Value) -> Self {
+        self.returns = Some(returns);
+        self
+    }
+
+    pub fn is_lazy(&self) -> bool {
+        self.mode == "lazy"
+    }
+
+    pub fn is_immediate(&self) -> bool {
+        self.mode == "immediate"
+    }
+}
+
+/// One accumulated lazy call, on the wire as a one-key object such as
+/// `{"where": ["a", "=", "1"]}`, so a document reads as the chain that
+/// produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+impl Serialize for Step {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.name, &self.args)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Step {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map = Map::<String, Value>::deserialize(deserializer)?;
+        if map.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "a step is an object with exactly one key",
+            ));
+        }
+        let (name, args) = map.into_iter().next().expect("length checked");
+        let args = match args {
+            Value::Array(a) => a,
+            _ => return Err(serde::de::Error::custom("step arguments must be an array")),
+        };
+        Ok(Step { name, args })
+    }
+}
+
+/// The immediate method that ended a chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodCall {
+    pub name: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+}
+
+/// What an immediate method sends: the constructor's arguments, every lazy
+/// step since, and the call itself. Objects have no guest memory between
+/// calls, so this document is the whole object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectCall {
+    #[serde(default)]
+    pub args: Vec<Value>,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+    pub call: MethodCall,
+}
+
+impl ObjectCall {
+    /// The single argument a constructor-named library call receives.
+    pub fn from_args(args: &[Value]) -> Result<Self, PluginError> {
+        let [doc] = args else {
+            return Err(PluginError::bad_input(
+                "expected exactly one object document",
+            ));
+        };
+        serde_json::from_value(doc.clone())
+            .map_err(|e| PluginError::bad_input(format!("invalid object document: {e}")))
+    }
+}
+
+/// One comparison in a record or table filter. `value` is a string, number
+/// or boolean; a null is refused, since neither backend compares one the way
+/// a caller would read it.
+///
+/// **A record filter compares by the value's own JSON type.** `score > 100`
+/// asks a numeric question and gets a numeric answer, and `score = "100"`
+/// asks a different one — it matches a field holding the *string* `"100"`,
+/// not the number. A record body carries no schema, so the value is the only
+/// thing that can say which comparison was meant.
+///
+/// A type that does not match what the records hold is therefore an **empty
+/// result, not an error**: quoting a number is the mistake to look for first
+/// when a filter matches nothing it should. A field holding different JSON
+/// types in different rows is the one case the two backends order
+/// differently, and no ordering of a number against a string is more correct
+/// than another.
+///
+/// **A table filter compares against the column's type**, which the host
+/// reads from the table rather than guessing: a value the column cannot hold
+/// is refused, naming the column, instead of being coerced to something
+/// arbitrary.
+///
+/// `like`, `not like` and `ilike` compare as text on both, whatever the
+/// field or column holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Condition {
+    pub field: String,
+    pub op: String,
+    pub value: Value,
+}
+
+/// A filter tree. Untagged so a bare condition and a group both read
+/// naturally; a group's `conditions` may nest further groups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Filter {
+    Condition(Condition),
+    Group {
+        combine: String,
+        conditions: Vec<Filter>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sort {
+    pub field: String,
+    pub direction: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsQuery {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Sort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsCount {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsSearch {
+    pub collection: String,
+    pub field: String,
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableQuery {
+    pub table: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Sort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub count: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BacklinksQuery {
+    pub uri: String,
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsPage {
+    /// Each entry is a [`RecordEnvelope`] as JSON.
+    pub records: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// One indexed record as `host_records_query`, `host_records_get`,
+/// `host_records_search` and `host_backlinks_query` return it: the index's
+/// columns beside the stored body, the way an XRPC `getRecord` answers. The
+/// body sits under its own key so a record may carry any field, `uri`
+/// included, without colliding with what the index knows about it.
+///
+/// `cid` is null while the row holds the empty placeholder a local index write
+/// stores; `indexed_at` is null until the network has echoed the record back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordEnvelope {
+    pub uri: String,
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default)]
+    pub cid: Option<String>,
+    #[serde(default)]
+    pub indexed_at: Option<String>,
+    /// The stored body verbatim.
+    pub record: Value,
+}
+
+/// A strong reference to an AT Protocol record, as `host_lookup_record` returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrongRef {
+    pub uri: String,
+    pub cid: String,
+}
+
+// ---------------------------------------------------------------------------
+// Caller-acting writes, index writes, and lexicon lookup
+// ---------------------------------------------------------------------------
+
+/// What a successful create or put on the caller's own repo returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordRef {
+    pub uri: String,
+    pub cid: String,
+}
+
+/// A record create issued as the calling script's user. Needs `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordCreate {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    /// The repo to write to. Absent means the caller's own repo — the only
+    /// repo a caller-acting write can ever target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    pub record: Value,
+    /// How the record is checked against its lexicon. `Some(true)`: here and
+    /// by the PDS, which refuses a record whose lexicon it cannot resolve.
+    /// `Some(false)`: neither. `None`, the default and what
+    /// `com.atproto.repo.createRecord` itself defaults to: here, and by the PDS
+    /// when it knows or can resolve the lexicon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
+}
+
+/// A record put (upsert) issued as the calling script's user. Needs
+/// `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordPut {
+    pub uri: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the PDS refuses unless this CID is the
+    /// record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+    /// As [`CallerRecordCreate`]'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
+}
+
+/// A record delete issued as the calling script's user. Needs `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordDelete {
+    pub uri: String,
+}
+
+/// A blob upload issued as the calling script's user. Needs `caller:write`.
+///
+/// `bytes` travels as [`Bytes`] does: a JSON string when it is valid UTF-8,
+/// `{"$bytes": "<base64>"}` otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerBlobUpload {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// An XRPC query issued as the calling script's user. Needs `caller:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerXrpcQuery {
+    pub method: String,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+/// An XRPC procedure issued as the calling script's user. Needs `caller:call`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerXrpcProcedure {
+    pub method: String,
+    pub input: Value,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+/// A write to the local record index, bypassing the PDS. Needs
+/// `records:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexPut {
+    pub collection: String,
+    pub rkey: String,
+    /// The record's author, and half of the URI the row is keyed by. The host
+    /// has no default for it and refuses a spec without one; pass the DID from
+    /// the call context, or the repo the record was written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    pub record: Value,
+    /// The CID the network assigned this version, when the caller has one —
+    /// from a PDS create, say. It is recorded only when the row is new: a CID
+    /// describes what a PDS holds, so an index write may introduce one but
+    /// never overwrite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// An index removal, bypassing the PDS. Needs `records:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexDelete {
+    pub uri: String,
+}
+
+/// A lookup of an uploaded lexicon's raw JSON, by NSID. Needs no capability —
+/// a lexicon is public schema, not user data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexiconGet {
+    pub nsid: String,
+}
+
+// ---------------------------------------------------------------------------
+// AT Protocol service resolution, blob download, labels, and attestation
+// ---------------------------------------------------------------------------
+
+/// Resolve the AT Protocol service a DID's document advertises (its PDS,
+/// typically). Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoResolveService {
+    pub did: String,
+}
+
+/// Resolve a handle or a DID to both. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoResolveIdentity {
+    /// A handle, with or without a leading `@`, or a DID.
+    pub identifier: String,
+}
+
+/// What an identifier resolved to.
+///
+/// `handle` is present only when the handle resolves to this DID *and* the
+/// DID document claims that handle. A one-directional match is how a handle
+/// gets impersonated, so an unconfirmed one is reported as absent rather than
+/// returned for display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedIdentity {
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
+/// Download a blob from a repo, by the DID that owns it and the blob's CID.
+/// Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoBlobDownload {
+    pub did: String,
+    pub cid: String,
+}
+
+/// A downloaded blob. `bytes` travels as [`Bytes`] does: a JSON string when
+/// it is valid UTF-8, `{"$bytes": "<base64>"}` otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobData {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// Store bytes, which are filed under the CID of their own content. Needs
+/// `blobs:write`. `bytes` travels the way a [`BlobData`]'s do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobPut {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// Where stored bytes landed. The host computes the CID from the content, so
+/// this is the answer rather than something the caller chose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobStored {
+    pub cid: String,
+}
+
+/// Name a stored blob. Needs `blobs:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobLookup {
+    pub cid: String,
+}
+
+/// What a blob is, without transferring it. Absent rather than present with
+/// zeroes when nothing is stored under the CID, which is also how a caller
+/// asks whether it is held at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobInfo {
+    pub cid: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// Look up labels applied to a set of URIs. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelsGet {
+    pub uris: Vec<String>,
+}
+
+/// One label, as issued by a labeler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Label {
+    pub src: String,
+    pub uri: String,
+    pub val: String,
+    pub cts: String,
+}
+
+/// A record to sign an attestation over. Needs `attest:sign`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestSign {
+    pub record: Value,
+}
+
+/// A record and its signature, to verify. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestVerify {
+    pub record: Value,
+    pub signature: Value,
+    pub repo_did: String,
+}
+
+// ---------------------------------------------------------------------------
+// Linked repos and jobs
+// ---------------------------------------------------------------------------
+
+/// One linked-repo grant. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub status: String,
+    pub scopes: String,
+}
+
+/// A record create against a linked repo, as the DID the grant names. Needs
+/// `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordCreate {
+    pub did: String,
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    pub record: Value,
+}
+
+/// A record put (upsert) against a linked repo. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordPut {
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the PDS refuses unless this CID is the
+    /// record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// A record delete against a linked repo. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordDelete {
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+}
+
+/// A blob upload against a linked repo. `bytes` travels the same way a
+/// [`CallerBlobUpload`]'s does. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoBlobUpload {
+    pub did: String,
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// An XRPC call against a linked repo, as the DID the grant names. Needs
+/// `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoCall {
+    pub did: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+}
+
+/// A job to enqueue for the background worker. Needs `jobs:create`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobCreate {
+    pub job_type: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub auth: bool,
+}
+
+/// Read one of the current user's jobs. Needs `jobs:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobGet {
+    pub id: String,
+}
+
+/// List jobs across every user, newest first. Needs `jobs:read_any`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct JobListAny {
+    /// Statuses to include; empty means every status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_type: Option<String>,
+    /// Defaults to 50 on the host; the host caps it at 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// A job as plugins see it. Never carries the session fields
+/// (`inherit_auth`, `api_client_id`, `dpop_key_id`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobView {
+    pub id: String,
+    pub job_type: String,
+    pub status: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub progress: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Spaces
+// ---------------------------------------------------------------------------
+
+/// A permissioned space's fields, as `happyview.spaces` reads and returns
+/// them. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub uri: String,
+    pub id: String,
+    pub did: String,
+    pub authority_did: String,
+    pub creator_did: String,
+    #[serde(rename = "spaceType")]
+    pub type_nsid: String,
+    pub skey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub read_policy: Value,
+    pub write_policy: Value,
+    pub app_access: Value,
+    pub config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One member of a space. Needs `spaces:read`.
+///
+/// `read` and `write` are the member's actual pair; `access` is the nearest
+/// word for it, which collapses a write-only member into `"write"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberInfo {
+    pub did: String,
+    pub access: String,
+    pub read: bool,
+    pub write: bool,
+}
+
+/// An invite minted for a space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInviteInfo {
+    pub invite_id: String,
+    pub token: String,
+    pub access: String,
+    pub read: bool,
+    pub write: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+/// One record read back from a space. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordInfo {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    pub cid: String,
+    pub author_did: String,
+}
+
+/// A page of space records. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordsPage {
+    pub records: Vec<SpaceRecordInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// Look up a space's fields by URI. `Ok(None)` means no such space. Needs
+/// `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesInfo {
+    pub uri: String,
+}
+
+/// Page through a space's records, optionally filtered to one collection.
+/// Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesQuery {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// List a space's members. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesMembers {
+    pub uri: String,
+}
+
+/// A DID's access level on a space. `Ok(None)` means the DID is not a member,
+/// or the space does not exist. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesAccess {
+    pub uri: String,
+    pub did: String,
+}
+
+/// Create a space. `skey` and the collection's `spaceType` NSID are the only
+/// required fields; every policy defaults to whatever the service assigns an
+/// unconfigured space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesCreate {
+    #[serde(rename = "spaceType")]
+    pub type_nsid: String,
+    pub skey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_access: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// Redeem an invite token, joining the space it names. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesAcceptInvite {
+    pub token: String,
+}
+
+/// Create a record in a space, as the caller. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordWrite {
+    pub uri: String,
+    pub collection: String,
+    pub record: Value,
+}
+
+/// Put (create-or-update) a record in a space, as the caller. Needs
+/// `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordPut {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the service refuses unless this CID is
+    /// the record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// Delete a record from a space, as the caller. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordDelete {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// Add or set a space member. Shared by `add_member` (refuses an existing
+/// member) and `set_member` (the service's upsert, which keeps an existing
+/// member's `read_self`). Needs `spaces:write`.
+///
+/// Access is named either as the `read`/`write` pair or as the `access`
+/// word, never both, and the pair is all-or-nothing: the word cannot express
+/// write without read, and supplying one boolean alone would leave the host
+/// to invent the other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberAdd {
+    pub uri: String,
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_delegation: Option<bool>,
+}
+
+/// Remove a space member. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberRemove {
+    pub uri: String,
+    pub did: String,
+}
+
+/// Update a space's fields. `display_name` and `description` are
+/// [`Patch`]es; the policy fields are plain replacements, since a script
+/// always sends a complete policy document rather than editing one in place.
+/// Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceUpdate {
+    pub uri: String,
+    #[serde(
+        default,
+        deserialize_with = "patch_string",
+        skip_serializing_if = "Patch::is_unchanged"
+    )]
+    pub display_name: Patch<String>,
+    #[serde(
+        default,
+        deserialize_with = "patch_string",
+        skip_serializing_if = "Patch::is_unchanged"
+    )]
+    pub description: Patch<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_access: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// A field that can be left alone, cleared, or set to a new value.
+///
+/// A Lua script can send `false` but has no way to send JSON `null`, so an
+/// absent key is the only spelling left for "leave this alone" — `Unchanged`.
+/// `false` or an explicit `null` means `Clear`; a string means `Set`.
+/// `#[serde(default)]` gives `Unchanged` when the key is missing entirely, and
+/// serializing skips `Unchanged` (via `Patch::is_unchanged`) so a spec built
+/// without touching a field never mentions it on the wire.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Patch<T> {
+    #[default]
+    Unchanged,
+    Clear,
+    Set(T),
+}
+
+impl<T> Patch<T> {
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Patch::Unchanged)
+    }
+}
+
+impl<T: Serialize> Serialize for Patch<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Never reached when the field carries `skip_serializing_if =
+            // "Patch::is_unchanged"`; `null` is the closest honest answer if
+            // it ever is.
+            Patch::Unchanged | Patch::Clear => serializer.serialize_none(),
+            Patch::Set(value) => value.serialize(serializer),
+        }
+    }
+}
+
+/// The `deserialize_with` for a `Patch<String>` field. Not a generic
+/// `Deserialize` impl: the three-state reading (`false`/`null` vs. absent)
+/// only makes sense at the field, where `#[serde(default)]` already handles
+/// "absent", so this only ever sees a key that was actually present.
+pub fn patch_string<'de, D>(deserializer: D) -> Result<Patch<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Null | Value::Bool(false) => Ok(Patch::Clear),
+        Value::String(s) => Ok(Patch::Set(s)),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a string, false, or null for a patch field, found {other}"
+        ))),
+    }
+}
+
+/// Delete a space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceDelete {
+    pub uri: String,
+}
+
+/// Mint an invite for a space. Needs `spaces:write`.
+///
+/// Access follows [`SpaceMemberAdd`]'s rule: the `read`/`write` pair or the
+/// `access` word, never both, and never one boolean alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInviteCreate {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Auth plugin inputs and outputs
+// ---------------------------------------------------------------------------
+
+/// What `get_authorize_url` receives. `config` is the operator's plugin
+/// configuration, passed through untouched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeUrlInput {
+    /// Opaque CSRF state the host minted. Put it in the provider's URL
+    /// unchanged — the host matches it when the callback lands.
+    pub state: String,
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `handle_callback` receives.
+///
+/// The host flattens *every* callback query parameter at the top level beside
+/// `config`, because the shape differs by protocol: OAuth 2.0 sends `code` and
+/// `state`, OpenID 2.0 sends a dozen `openid.*` keys. So the parameters are a
+/// map rather than named fields, and [`param`](Self::param) reads one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallbackInput {
+    #[serde(default)]
+    pub config: Value,
+    /// Every query parameter the provider sent back. The host sends these as
+    /// strings; the type stays [`Value`] so a non-string value does not fail
+    /// the whole callback.
+    #[serde(flatten)]
+    pub params: BTreeMap<String, Value>,
+}
+
+impl CallbackInput {
+    /// One callback parameter, if it was sent as a string.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params.get(name).and_then(Value::as_str)
+    }
+}
+
+/// What `refresh_tokens` receives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RefreshInput {
+    pub refresh_token: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `get_profile` receives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenInput {
+    pub access_token: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `handle_callback` and `refresh_tokens` return.
+///
+/// `expires_at` is an RFC 3339 timestamp. A guest has no clock, so it cannot
+/// turn a provider's duration (what Microsoft and Xbox return) into an absolute
+/// instant; prefer [`expires_in`](Self::expires_in) and use `expires_at` only
+/// when the provider itself gives an absolute instant. The host resolves the
+/// two through `TokenSetExt::resolved_expires_at`, which is where an
+/// unparseable `expires_at` is refused.
+///
+/// Absent fields are omitted rather than sent as null.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSet {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Seconds until expiry. The host computes an absolute expiry from this
+    /// when `expires_at` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+    pub token_type: String,
+}
+
+impl TokenSet {
+    /// A token set with no refresh token and no expiry, e.g.
+    /// `TokenSet::new(access, "Bearer")`.
+    pub fn new(access_token: impl Into<String>, token_type: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+            expires_in: None,
+            token_type: token_type.into(),
+        }
+    }
+
+    pub fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self {
+        self.refresh_token = Some(refresh_token.into());
+        self
+    }
+
+    /// An RFC 3339 instant, e.g. `2026-01-01T00:00:00Z`. Prefer
+    /// [`expires_in`](Self::expires_in) unless the provider itself gives an
+    /// absolute timestamp.
+    pub fn expires_at(mut self, expires_at: impl Into<String>) -> Self {
+        self.expires_at = Some(expires_at.into());
+        self
+    }
+
+    /// Seconds until the token expires, e.g. `TokenSet::new(access,
+    /// "Bearer").expires_in(3600)`. Forward the provider's value as-is; the host
+    /// computes the absolute expiry.
+    pub fn expires_in(mut self, seconds: u64) -> Self {
+        self.expires_in = Some(seconds);
+        self
+    }
+}
+
+/// What `get_profile` returns: who the access token belongs to on the
+/// provider's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalProfile {
+    /// The provider's own stable id for the account. HappyView keys the link
+    /// on it, so it must not change between calls.
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
+impl ExternalProfile {
+    pub fn new(account_id: impl Into<String>) -> Self {
+        Self {
+            account_id: account_id.into(),
+            display_name: None,
+            profile_url: None,
+            avatar_url: None,
+        }
+    }
+
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn profile_url(mut self, profile_url: impl Into<String>) -> Self {
+        self.profile_url = Some(profile_url.into());
+        self
+    }
+
+    pub fn avatar_url(mut self, avatar_url: impl Into<String>) -> Self {
+        self.avatar_url = Some(avatar_url.into());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interpreter exports
+// ---------------------------------------------------------------------------
+
+/// Which runner a script is executing for. Names are snake_case on the wire
+/// like every other name that crosses; the trigger id in the context says
+/// which event, this says which contract the result is read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptKind {
+    XrpcQuery,
+    XrpcProcedure,
+    RecordEvent,
+    Label,
+    Job,
+    /// A `*.test.<ext>` file run by `happyview test`. It defines no `handle`:
+    /// the interpreter runs the file, collects its tests, runs them and
+    /// reports each through `host_test_report`. An interpreter built before
+    /// this variant existed fails to decode the input and answers `BAD_INPUT`.
+    Test,
+}
+
+impl ScriptKind {
+    pub const ALL: [ScriptKind; 6] = [
+        ScriptKind::XrpcQuery,
+        ScriptKind::XrpcProcedure,
+        ScriptKind::RecordEvent,
+        ScriptKind::Label,
+        ScriptKind::Job,
+        ScriptKind::Test,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScriptKind::XrpcQuery => "xrpc_query",
+            ScriptKind::XrpcProcedure => "xrpc_procedure",
+            ScriptKind::RecordEvent => "record_event",
+            ScriptKind::Label => "label",
+            ScriptKind::Job => "job",
+            ScriptKind::Test => "test",
+        }
+    }
+}
+
+/// A library a script may `require`. `require` resolves the namespace and
+/// `host_get_api_surface`/`host_call_library` take the id, so the pair is
+/// sent together and the interpreter never resolves a namespace itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryRef {
+    pub namespace: String,
+    pub id: String,
+}
+
+/// The chunk name of a script that has no file: a dashboard row, or a run
+/// from a host that predates chunk naming.
+pub const DEFAULT_CHUNK_NAME: &str = "script";
+
+fn default_chunk_name() -> String {
+    String::from(DEFAULT_CHUNK_NAME)
+}
+
+/// What `execute` receives. Every field is data: nothing in it is a handle
+/// or a credential, and the host holds the identity the five `script:host`
+/// imports act on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecuteInput {
+    /// Empty when `artifact` is present: the host sends whichever of the two
+    /// the interpreter should load, never both.
+    pub source: String,
+    pub kind: ScriptKind,
+    /// The first argument of `handle`.
+    pub input: Value,
+    pub context: ExecuteContext,
+    #[serde(default)]
+    pub libraries: Vec<LibraryRef>,
+    pub limits: ExecuteLimits,
+    /// Names a free-variable read must refuse. They travel as data so the
+    /// guard and the host's codemod stay one list; a list baked into a
+    /// separately released plugin could not be pinned to it.
+    ///
+    /// Empty and absent both mean no guard, so an empty list is not sent —
+    /// the spelling [`ValidateInput::removed_globals`] uses, since one field
+    /// name spelled two ways across these types is the drift this module
+    /// exists to prevent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_globals: Vec<String>,
+    /// What the interpreter names the handler's chunk, and the `referrer` it
+    /// sends `host_module_resolve` for an import from it. A project file's
+    /// path from the project root (`src/jobs/tick.lua`), so an error points
+    /// at a file a terminal can open.
+    #[serde(default = "default_chunk_name")]
+    pub chunk_name: String,
+    /// The handler as this interpreter's own `validate` prepared it. Only the
+    /// host supplies one, and only one it stamped for this interpreter build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
+}
+
+/// The data half of `ctx`. A field that does not apply to the script's kind
+/// is absent from the JSON, never null, so an interpreter for a language
+/// that distinguishes the two renders each correctly.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExecuteContext {
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
+    #[serde(default)]
+    pub has_pds_auth: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<ScriptSpace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<ScriptJob>,
+}
+
+/// `ctx.space`, for a space-scoped query or procedure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptSpace {
+    pub uri: String,
+    pub id: String,
+    pub did: String,
+    pub authority_did: String,
+    #[serde(rename = "spaceType")]
+    pub type_nsid: String,
+    pub skey: String,
+}
+
+/// `ctx.job`'s data. Its three controls act on the job row while the script
+/// runs, so they are host imports rather than fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptJob {
+    pub id: String,
+}
+
+/// The budgets the interpreter enforces itself. Execution time is not here:
+/// the host owns it as an epoch deadline on the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLimits {
+    /// `null` means no budget. The key is always present because absent and
+    /// null mean different things to the reader: an interpreter that finds
+    /// it missing is talking to a host that did not decide.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub instructions: Option<u32>,
+    pub memory_bytes: u64,
+}
+
+/// How a returned value should be read. The record-event runner branches
+/// three ways and a JSON `null` cannot tell a returned nothing from a
+/// returned null sentinel; the names are the host's branch rather than any
+/// language's type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptValueKind {
+    /// The language's "returned nothing": Lua `nil`, JavaScript `undefined`.
+    None,
+    /// A key-value mapping.
+    Object,
+    /// Anything else, an explicit null included.
+    Other,
+}
+
+/// Why a script did not return. The host maps each onto its own error type
+/// one to one, and a test on the host side pins that neither list can gain a
+/// variant alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptErrorKind {
+    Syntax,
+    Runtime,
+    Timeout,
+    Memory,
+    MissingHandle,
+}
+
+impl ScriptErrorKind {
+    pub const ALL: [ScriptErrorKind; 5] = [
+        ScriptErrorKind::Syntax,
+        ScriptErrorKind::Runtime,
+        ScriptErrorKind::Timeout,
+        ScriptErrorKind::Memory,
+        ScriptErrorKind::MissingHandle,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScriptErrorKind::Syntax => "syntax",
+            ScriptErrorKind::Runtime => "runtime",
+            ScriptErrorKind::Timeout => "timeout",
+            ScriptErrorKind::Memory => "memory",
+            ScriptErrorKind::MissingHandle => "missing_handle",
+        }
+    }
+}
+
+/// What a string no `ScriptErrorKind` spells parses to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseScriptErrorKindError;
+
+impl core::fmt::Display for ParseScriptErrorKindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("expected one of: syntax, runtime, timeout, memory, missing_handle")
+    }
+}
+
+impl core::error::Error for ParseScriptErrorKindError {}
+
+impl core::str::FromStr for ScriptErrorKind {
+    type Err = ParseScriptErrorKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ScriptErrorKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == s)
+            .ok_or(ParseScriptErrorKindError)
+    }
+}
+
+/// What `execute` returns inside the `{ok}` envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExecuteOutput {
+    Returned {
+        value: Value,
+        value_kind: ScriptValueKind,
+    },
+    Error {
+        kind: ScriptErrorKind,
+        /// What a caller is shown. A `timeout` is the host's cue to write its
+        /// own sentence, and an `AUTH_ERROR:` prefix passes through untouched.
+        /// It carries no `chunk:line:` prefix: `chunk` and `line` say where,
+        /// and the host prints them beside the message, so a prefix would
+        /// read twice.
+        message: String,
+        /// Omitted rather than null when the interpreter could not place the
+        /// error on a line, the same spelling [`ValidateError`] uses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        /// The interpreter's unparsed text, for the event log.
+        raw: String,
+        /// The chunk the interpreter reports `line` in, as it named it: a
+        /// module's id or the run's `chunk_name`, in full, since the chunk
+        /// text inside a message may be truncated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk: Option<String>,
+    },
+}
+
+/// What a chunk is for. A handler must define `handle`; a module and a test
+/// need not, so validation that insisted would refuse every module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkRole {
+    #[default]
+    Handler,
+    Module,
+    Test,
+}
+
+impl ChunkRole {
+    pub fn is_handler(&self) -> bool {
+        matches!(self, ChunkRole::Handler)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// What `validate` receives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateInput {
+    pub source: String,
+    /// Names a free-variable read must refuse, as
+    /// [`ExecuteInput::removed_globals`] carries them. Validation loads the
+    /// chunk under the same guard a run does, so without this list the editor
+    /// would accept a top-level read of a name every run then refuses.
+    ///
+    /// Empty and absent mean the same thing here — no guard — so an empty
+    /// list is not sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_globals: Vec<String>,
+    /// The name to give the chunk, which a prepared artifact keeps in its
+    /// debug information. Absent means [`DEFAULT_CHUNK_NAME`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_name: Option<String>,
+    /// Return a [`PreparedArtifact`] beside the verdict. Absent and false
+    /// mean the editor's plain check.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prepare: bool,
+    #[serde(default, skip_serializing_if = "ChunkRole::is_handler")]
+    pub role: ChunkRole,
+}
+
+/// What `validate` returns: `{valid: true}`, or `{valid: false, errors}`,
+/// plus the artifact and the literal imports when asked to prepare.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateOutput {
+    pub valid: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ValidateError>,
+    /// Absent from an interpreter that cannot prepare, which the host answers
+    /// by running from source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
+    /// Every import whose specifier is a literal, so a missing local module
+    /// is reported when the file is saved rather than at its first run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ImportRef>,
+}
+
+impl ValidateOutput {
+    pub fn valid() -> Self {
+        Self {
+            valid: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn invalid(errors: Vec<ValidateError>) -> Self {
+        Self {
+            valid: false,
+            errors,
+            ..Self::default()
+        }
+    }
+}
+
+/// A script or module as its interpreter can load it quickly — bytecode,
+/// typically. Opaque to the host, which only stamps and routes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedArtifact {
+    /// The interpreter plugin's id. The host overwrites whatever the guest
+    /// wrote, so an artifact can only ever claim the build that made it.
+    pub interpreter: String,
+    /// The interpreter build, stamped by the host the same way.
+    pub version: String,
+    /// The engine inside the interpreter, set by the interpreter, e.g.
+    /// `puc-lua-5.4.7`.
+    pub engine: String,
+    /// What `bytes` holds, e.g. `lua-bytecode`.
+    pub format: String,
+    /// Base64 on the wire, standard alphabet (RFC 4648 §4), padded, with no
+    /// whitespace: bytecode is binary, and a JSON array of numbers would be
+    /// several times its size on every run. Any other dialect is refused
+    /// when the JSON is parsed.
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_map: Option<String>,
+}
+
+/// One import `validate` found whose specifier is a literal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRef {
+    pub specifier: String,
+    pub line: u32,
+}
+
+/// What `host_module_resolve` receives. `referrer` is the importing chunk's
+/// name: the run's `chunk_name`, or the `id` a previous resolution answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleResolve {
+    pub specifier: String,
+    pub referrer: String,
+}
+
+/// A resolved local module. `id` is canonical — two specifiers naming one
+/// file answer the same `id` — so an interpreter de-duplicates by it and
+/// names the module's chunk with it.
+///
+/// `source` is always present. `artifact` is present only when the host holds
+/// one this interpreter build prepared from that same source; load it when it
+/// is there, and fall back to `source` when it is absent or will not load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModule {
+    pub id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
+}
+
+mod base64_bytes {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(text.as_bytes())
+            .map_err(|e| serde::de::Error::custom(alloc::format!("bytes are not base64: {e}")))
+    }
+}
+
+/// One reason a script does not validate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateError {
+    pub kind: ScriptErrorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// The reason alone, with no `chunk:line:` prefix: `line` says where,
+    /// and the host names the file beside the message.
+    pub message: String,
+}
+
+/// What `host_script_log` receives. The host attributes the line to the
+/// run's trigger, caller and job, none of which the guest can name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScriptLogRequest {
+    pub level: Level,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Value>,
+}
+
+/// What `host_script_panic` receives: where a guest panicked and what it
+/// said. A guest built with `panic = "abort"` cannot return an `execute`
+/// answer once it panics, so its hook sends this just before it traps and the
+/// host answers the run with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanicReport {
+    pub message: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// What `host_job_progress` receives: the value stored on the job row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobProgressRequest {
+    pub data: Value,
+}
+
+/// What `host_job_should_stop` receives. Empty: the run's job is the host's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobShouldStopRequest {}
+
+/// What `host_job_wait` receives. The host clamps the range.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct JobWaitRequest {
+    pub seconds: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Test runner imports
+// ---------------------------------------------------------------------------
+
+/// Which trigger `host_test_trigger` fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestTriggerKind {
+    Query,
+    Procedure,
+    RecordCreate,
+    RecordUpdate,
+    RecordDelete,
+    Job,
+    Label,
+}
+
+impl TestTriggerKind {
+    pub const ALL: [TestTriggerKind; 7] = [
+        TestTriggerKind::Query,
+        TestTriggerKind::Procedure,
+        TestTriggerKind::RecordCreate,
+        TestTriggerKind::RecordUpdate,
+        TestTriggerKind::RecordDelete,
+        TestTriggerKind::Job,
+        TestTriggerKind::Label,
+    ];
+}
+
+/// What `host_test_trigger` receives. `target` is the NSID, collection, job
+/// type or label subject URI the kind needs; `input` is the query's
+/// parameters, the procedure's body, the record, the job's input or the
+/// label's body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTrigger {
+    pub kind: TestTriggerKind,
+    pub target: String,
+    #[serde(default)]
+    pub input: Value,
+    /// The record's author, for the three record kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    /// The caller the trigger is forged as.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub as_did: Option<String>,
+}
+
+/// What a trigger produced: an HTTP status and a JSON body for every kind, so
+/// a test asserts on one shape whichever trigger it fired.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTriggerResult {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// What `host_test_mock` receives: `{method: response | [responses]}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestMock {
+    pub namespace: String,
+    pub responses: Value,
+}
+
+/// What `host_test_calls` receives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCalls {
+    pub namespace: String,
+}
+
+/// One recorded library call, `args` as the JSON array the call carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestCall {
+    pub method: String,
+    pub args: Value,
+}
+
+/// What `host_test_pds_writes` receives. Empty: the writes are the run's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestPdsWritesRequest {}
+
+/// One write the in-process PDS accepted. `record` and `cid` are absent for a
+/// delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestPdsWrite {
+    pub action: String,
+    pub repo: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// A test's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+/// What `host_test_report` receives, once per test. `name` is the test's
+/// full name, its `describe` blocks joined with ` > `; `file` and `line` place
+/// the failing assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestReport {
+    pub path: String,
+    pub name: String,
+    pub status: TestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub duration_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Host calls
+// ---------------------------------------------------------------------------
+
+/// An outbound HTTP request. `headers` are sent as the host expects them,
+/// `[[name, value], ...]`.
+///
+/// The body is bytes, because an HTTP body is bytes; it travels as [`Bytes`]
+/// does: a JSON string whenever it is valid UTF-8, and
+/// `{"$bytes": "<base64>"}` otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_body",
+        deserialize_with = "deserialize_optional_body"
+    )]
+    pub body: Option<Vec<u8>>,
+}
+
+impl HttpRequest {
+    /// A request with no headers and no body.
+    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// A text body. The wire form is a JSON string.
+    pub fn body_text(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into().into_bytes());
+        self
+    }
+
+    /// A body that is not text — an image, say. The wire form is
+    /// `{"$bytes": "<base64>"}` unless the bytes happen to be valid UTF-8.
+    pub fn body_bytes(mut self, body: Vec<u8>) -> Self {
+        self.body = Some(body);
+        self
+    }
+}
+
+/// A response from `host::http_request`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HttpResponse {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    /// Sent as a string when the body is valid UTF-8 and as
+    /// `{"$bytes": "<base64>"}` when it is not, as [`Bytes`] travel.
+    #[serde(
+        default,
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body"
+    )]
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Look up a response header, ignoring case. The host does not normalise
+    /// header names, so a case-sensitive match would miss most of them.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The body as text, with invalid UTF-8 replaced rather than refused.
+    /// Borrows when the body is already valid UTF-8.
+    pub fn text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+}
+
+/// The key the atproto data model's JSON form puts bytes under:
+/// `{"$bytes": "<base64>"}`.
+const BYTES_KEY: &str = "$bytes";
+
+/// Standard base64, written without padding as atproto writes it, and read
+/// with or without.
+const BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_encode_padding(false)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// Bytes as the wire carries them, for a plugin's own arguments and results.
+///
+/// A JSON string when they are valid UTF-8, so text stays readable on both
+/// sides, and otherwise the atproto data model's `{"$bytes": "<base64>"}`.
+/// Base64 rather than an array of numbers: an array costs four or so bytes of
+/// JSON per byte, and many times that once parsed, where base64 costs a third
+/// more and nothing once decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bytes(pub Vec<u8>);
+
+impl Bytes {
+    /// Read bytes out of an argument without copying the JSON first, which
+    /// for a blob is megabytes of base64.
+    pub fn from_value(value: &Value) -> Result<Self, serde_json::Error> {
+        Self::deserialize(value)
+    }
+}
+
+impl Serialize for Bytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_body(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_body(deserializer).map(Bytes)
+    }
+}
+
+fn serialize_body<S: Serializer>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    match core::str::from_utf8(body) {
+        Ok(text) => serializer.serialize_str(text),
+        Err(_) => {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(BYTES_KEY, &BASE64.encode(body))?;
+            map.end()
+        }
+    }
+}
+
+fn serialize_optional_body<S: Serializer>(
+    body: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match body {
+        Some(body) => serializer.serialize_some(&BodyRef(body)),
+        None => serializer.serialize_none(),
+    }
+}
+
+struct BodyRef<'a>(&'a [u8]);
+
+impl Serialize for BodyRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_body(self.0, serializer)
+    }
+}
+
+/// Reads a string as its UTF-8 bytes and `{"$bytes": "<base64>"}` as the bytes
+/// it encodes. `null` is `None`.
+struct BodyVisitor;
+
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Option<Vec<u8>>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str("a string, {\"$bytes\": \"<base64>\"}, or null")
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(BodyVisitor)
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Some(v.as_bytes().to_vec()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Some(v.into_bytes()))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let key: Cow<'de, str> = map
+            .next_key()?
+            .ok_or_else(|| de::Error::custom("bytes as an object need a \"$bytes\" key"))?;
+        if key != BYTES_KEY {
+            return Err(de::Error::unknown_field(&key, &[BYTES_KEY]));
+        }
+        let bytes = map.next_value_seed(Base64Seed)?;
+        if map.next_key::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom(
+                "bytes as an object carry only \"$bytes\"",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Decodes a base64 string straight to bytes, without keeping the string.
+struct Base64Seed;
+
+impl<'de> de::DeserializeSeed<'de> for Base64Seed {
+    type Value = Vec<u8>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Base64Visitor;
+
+        impl Visitor<'_> for Base64Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("a base64 string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                BASE64
+                    .decode(v)
+                    .map_err(|e| E::custom(format!("\"$bytes\" is not base64: {e}")))
+            }
+        }
+
+        deserializer.deserialize_str(Base64Visitor)
+    }
+}
+
+fn deserialize_optional_body<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(BodyVisitor)
+}
+
+/// As [`deserialize_optional_body`], where an absent or null body is empty
+/// rather than missing.
+fn deserialize_body<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(deserialize_optional_body(deserializer)?.unwrap_or_default())
+}
+
+/// Which indexed record to look for, by a value nested inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupRequest {
+    pub collection: String,
+    /// Dotted path into the record, e.g. `externalIds.steam`.
+    pub external_id_field: String,
+    pub external_id_value: String,
+}
+
+impl LookupRequest {
+    pub fn new(
+        collection: impl Into<String>,
+        external_id_field: impl Into<String>,
+        external_id_value: impl Into<String>,
+    ) -> Self {
+        Self {
+            collection: collection.into(),
+            external_id_field: external_id_field.into(),
+            external_id_value: external_id_value.into(),
+        }
+    }
+}
+
+/// Severity for `host::log` and `host::script_log`. The host parses these
+/// exact strings, and calls the type `LogLevel`. On the wire it is the
+/// [`as_str`](Self::as_str) spelling, read back through `FromStr`, so the
+/// JSON form and the string form cannot disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Level {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl Level {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Level::Debug => "debug",
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        }
+    }
+}
+
+impl core::fmt::Display for Level {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Level {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = Cow::<'de, str>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// What a level the host does not know parses to. The host logs such a line at
+/// `info` rather than dropping it, so this rarely reaches a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseLevelError;
+
+impl core::fmt::Display for ParseLevelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("expected one of: debug, info, warn, error")
+    }
+}
+
+impl core::error::Error for ParseLevelError {}
+
+impl core::str::FromStr for Level {
+    type Err = ParseLevelError;
+
+    /// Case-insensitive. `warning` is accepted for `warn`, which is what a
+    /// plugin writing its own level string is most likely to send.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("debug") {
+            Ok(Level::Debug)
+        } else if s.eq_ignore_ascii_case("info") {
+            Ok(Level::Info)
+        } else if s.eq_ignore_ascii_case("warn") || s.eq_ignore_ascii_case("warning") {
+            Ok(Level::Warn)
+        } else if s.eq_ignore_ascii_case("error") {
+            Ok(Level::Error)
+        } else {
+            Err(ParseLevelError)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+    use alloc::vec;
+    use core::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn ok_envelope_round_trips() {
+        let envelope = Response::Ok {
+            ok: serde_json::json!({"status": 200}),
+        };
+        let text = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(text, r#"{"ok":{"status":200}}"#);
+        let parsed: Response<Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.into_result().unwrap(),
+            serde_json::json!({"status": 200})
+        );
+    }
+
+    #[test]
+    fn error_envelope_round_trips() {
+        let envelope: Response<Value> = Response::Err {
+            error: PluginError::new("HTTP_ERROR", "boom").retryable(),
+        };
+        let text = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(
+            text,
+            r#"{"error":{"code":"HTTP_ERROR","message":"boom","retryable":true}}"#
+        );
+        let parsed: Response<Value> = serde_json::from_str(&text).unwrap();
+        let err = parsed.into_result().unwrap_err();
+        assert_eq!(err.code, "HTTP_ERROR");
+        assert!(err.retryable);
+    }
+
+    #[test]
+    fn a_settled_call_is_its_envelope_with_the_handle_beside_it() {
+        let ok = LibraryCallSettled {
+            handle: 3,
+            outcome: Response::Ok {
+                ok: serde_json::json!({"status": 200}),
+            },
+        };
+        let value = serde_json::to_value(&ok).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"handle": 3, "ok": {"status": 200}})
+        );
+        assert_eq!(
+            serde_json::from_value::<LibraryCallSettled>(value).unwrap(),
+            ok
+        );
+
+        let failed = LibraryCallSettled {
+            handle: 7,
+            outcome: Response::Err {
+                error: PluginError::new("HTTP_ERROR", "boom"),
+            },
+        };
+        let value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"handle": 7, "error": {"code": "HTTP_ERROR", "message": "boom", "retryable": false}})
+        );
+        assert_eq!(
+            serde_json::from_value::<LibraryCallSettled>(value).unwrap(),
+            failed
+        );
+
+        // A null result is still a result.
+        let null: LibraryCallSettled =
+            serde_json::from_value(serde_json::json!({"handle": 1, "ok": null})).unwrap();
+        assert_eq!(null.outcome.into_result().unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn a_refused_wait_is_not_a_settled_call() {
+        let refused = serde_json::json!({"error": {"code": "BAD_INPUT", "message": "no", "retryable": false}});
+        assert!(serde_json::from_value::<LibraryCallSettled>(refused).is_err());
+    }
+
+    #[test]
+    fn retryable_defaults_to_false_when_the_host_omits_it() {
+        let parsed: Response<Value> =
+            serde_json::from_str(r#"{"error":{"code":"X","message":"y"}}"#).unwrap();
+        assert!(!parsed.into_result().unwrap_err().retryable);
+    }
+
+    #[test]
+    fn error_constructors_use_the_codes_the_host_expects() {
+        assert_eq!(PluginError::bad_input("nope").code, "BAD_INPUT");
+        assert_eq!(PluginError::host("nope").code, "HOST_ERROR");
+
+        let unknown = PluginError::unknown_function("frobnicate");
+        assert_eq!(unknown.code, "UNKNOWN_FUNCTION");
+        assert_eq!(unknown.message, "no such function: frobnicate");
+        assert!(!unknown.retryable);
+
+        let parse_error = serde_json::from_str::<Value>("{oops").unwrap_err();
+        assert_eq!(PluginError::from(parse_error).code, "BAD_INPUT");
+    }
+
+    #[test]
+    fn an_ok_envelope_holding_an_error_key_still_parses_as_ok() {
+        // The ambiguity here is in the *value under* `ok`, not in the
+        // envelope's own top-level shape, so `{"ok": ...}` wins regardless of
+        // variant order.
+        let parsed: Response<Value> = serde_json::from_str(r#"{"ok":{"error":"inner"}}"#).unwrap();
+        assert_eq!(
+            parsed.into_result().unwrap(),
+            serde_json::json!({"error": "inner"})
+        );
+    }
+
+    /// `Response<Option<_>>` must resolve on the envelope's top-level key,
+    /// not on whether `T` happens to accept a missing field.
+    #[test]
+    fn an_error_envelope_parses_as_err_even_when_ok_would_be_optional() {
+        let parsed: Response<Option<Value>> =
+            serde_json::from_str(r#"{"error":{"code":"NOT_AUTHORIZED","message":"nope"}}"#)
+                .unwrap();
+        let err = parsed.into_result().unwrap_err();
+        assert_eq!(err.code, "NOT_AUTHORIZED");
+
+        let parsed: Response<Option<Value>> = serde_json::from_str(r#"{"ok":null}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap(), None);
+    }
+
+    #[test]
+    fn an_envelope_with_an_error_is_an_error_even_beside_an_ok() {
+        let parsed: Response<Value> =
+            serde_json::from_str(r#"{"ok":1,"error":{"code":"X","message":"y"}}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap_err().code, "X");
+    }
+
+    #[test]
+    fn an_envelope_skips_keys_it_does_not_know_and_needs_one_it_does() {
+        let parsed: Response<Value> = serde_json::from_str(r#"{"handle":3,"ok":true}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap(), Value::Bool(true));
+
+        let neither = serde_json::from_str::<Response<Option<Value>>>(r#"{"handle":3}"#);
+        assert!(neither
+            .unwrap_err()
+            .to_string()
+            .contains("\"ok\" or an \"error\""));
+        assert!(serde_json::from_str::<Response<Value>>(r#"{"ok":1,"ok":2}"#).is_err());
+        assert!(serde_json::from_str::<Response<Value>>("[]").is_err());
+    }
+
+    #[test]
+    fn bytes_are_a_string_when_they_are_text_and_base64_when_not() {
+        assert_eq!(serde_json::to_value(Bytes(b"hi".to_vec())).unwrap(), "hi");
+        let binary = Bytes(vec![0x00, 0xff, 0xfe, 0x80]);
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value, serde_json::json!({"$bytes": "AP/+gA"}));
+        assert_eq!(serde_json::from_value::<Bytes>(value).unwrap(), binary);
+        assert_eq!(
+            serde_json::from_str::<Bytes>(r#""hi""#).unwrap(),
+            Bytes(b"hi".to_vec())
+        );
+    }
+
+    #[test]
+    fn bytes_read_from_a_borrowed_value_as_from_text() {
+        let value = serde_json::json!({"$bytes": "AP8"});
+        assert_eq!(Bytes::from_value(&value).unwrap(), Bytes(vec![0x00, 0xff]));
+        assert_eq!(
+            Bytes::from_value(&Value::from("hi")).unwrap(),
+            Bytes(b"hi".to_vec())
+        );
+        assert!(Bytes::from_value(&serde_json::json!([0, 255])).is_err());
+    }
+
+    #[test]
+    fn malformed_bytes_are_refused_saying_why() {
+        let err = |json: &str| serde_json::from_str::<Bytes>(json).unwrap_err().to_string();
+        assert!(err(r#"{"$bytes":"not base64!"}"#).contains("not base64"));
+        assert!(err(r#"{"bytes":"AA"}"#).contains("$bytes"));
+        assert!(err(r#"{"$bytes":"AA","extra":1}"#).contains("only"));
+        assert!(err(r#"{}"#).contains("$bytes"));
+        assert!(err("[0,1]").contains("a string"));
+    }
+
+    #[test]
+    fn call_input_defaults_every_field_but_function() {
+        let input: CallInput = serde_json::from_str(r#"{"function":"get"}"#).unwrap();
+        assert_eq!(input.function, "get");
+        assert!(input.args.is_empty());
+        assert_eq!(input.context, CallContext::default());
+        assert_eq!(input.context.caller_did, None);
+        assert!(!input.context.has_pds_auth);
+    }
+
+    #[test]
+    fn call_input_context_fields_default_independently() {
+        let input: CallInput =
+            serde_json::from_str(r#"{"function":"f","args":[1],"context":{"has_pds_auth":true}}"#)
+                .unwrap();
+        assert_eq!(input.args, vec![Value::from(1)]);
+        assert_eq!(input.context.caller_did, None);
+        assert!(input.context.has_pds_auth);
+    }
+
+    #[test]
+    fn call_input_round_trips_as_the_host_sends_it() {
+        let input = CallInput {
+            function: "get".to_string(),
+            args: vec![Value::from("https://example.test")],
+            context: CallContext {
+                caller_did: Some("did:plc:abc".to_string()),
+                has_pds_auth: true,
+                db_backend: None,
+            },
+        };
+        let json = serde_json::to_value(&input).unwrap();
+        assert_eq!(json["function"], "get");
+        assert_eq!(json["args"][0], "https://example.test");
+        assert_eq!(json["context"]["caller_did"], "did:plc:abc");
+        assert_eq!(json["context"]["has_pds_auth"], true);
+        assert_eq!(serde_json::from_value::<CallInput>(json).unwrap(), input);
+    }
+
+    #[test]
+    fn plugin_info_serialises_absent_optionals_as_null() {
+        let json = serde_json::to_value(PluginInfo::new("http", "HTTP Client", "1.0.0")).unwrap();
+        assert_eq!(json["api_version"], "2");
+        assert_eq!(json["auth_type"], "oauth2");
+        assert_eq!(json["icon_url"], Value::Null);
+        assert_eq!(json["config_schema"], Value::Null);
+        assert_eq!(json["required_secrets"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn api_surface_builder_matches_the_host_shape() {
+        let surface = ApiSurface::new("http")
+            .describe("Outbound HTTP requests")
+            .export(
+                ApiExport::function("get")
+                    .describe("Send a GET request")
+                    .param("url", "string", "Target URL")
+                    .returns(serde_json::json!({"type": "object"})),
+            );
+        let json = serde_json::to_value(&surface).unwrap();
+        assert_eq!(json["namespace"], "http");
+        assert!(json.get("import_path").is_none(), "absent, not null");
+        assert_eq!(json["exports"][0]["kind"], "function");
+        assert_eq!(json["exports"][0]["params"][0]["name"], "url");
+        assert_eq!(json["types"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_export_keeps_whatever_else_the_library_said_about_it() {
+        // An interpreter may read fields the SDK has never heard of, so an
+        // unknown key survives the round trip rather than being dropped.
+        let export: ApiExport = serde_json::from_str(
+            r#"{"name":"get","kind":"function","deprecated":true,"since":"1.2.0"}"#,
+        )
+        .unwrap();
+        assert!(export.is_function());
+        assert_eq!(export.extra["deprecated"], true);
+        assert_eq!(export.extra["since"], "1.2.0");
+
+        let json = serde_json::to_value(&export).unwrap();
+        assert_eq!(json["deprecated"], true);
+        assert_eq!(json["since"], "1.2.0");
+        assert!(json.get("extra").is_none(), "flattened, not nested");
+    }
+
+    #[test]
+    fn a_builder_export_carries_no_extra_fields() {
+        let json = serde_json::to_value(ApiExport::constant("VERSION")).unwrap();
+        assert_eq!(json["kind"], "constant");
+        assert!(!ApiExport::constant("VERSION").is_function());
+        assert_eq!(json.as_object().unwrap().len(), 3, "name, kind, params");
+    }
+
+    #[test]
+    fn authorize_url_input_matches_what_the_host_sends() {
+        let input: AuthorizeUrlInput = serde_json::from_str(
+            r#"{"state":"s1","redirect_uri":"https://app.test/cb","config":{"realm":"r"}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.state, "s1");
+        assert_eq!(input.redirect_uri, "https://app.test/cb");
+        assert_eq!(input.config["realm"], "r");
+    }
+
+    #[test]
+    fn a_callback_parameter_is_readable_whatever_the_provider_called_it() {
+        // OpenID 2.0 sends dotted keys; the host flattens them beside `config`.
+        let input: CallbackInput =
+            serde_json::from_str(r#"{"code":"c","state":"s","openid.claimed_id":"x","config":{}}"#)
+                .unwrap();
+        assert_eq!(input.param("code"), Some("c"));
+        assert_eq!(input.param("state"), Some("s"));
+        assert_eq!(input.param("openid.claimed_id"), Some("x"));
+        assert_eq!(input.param("missing"), None);
+        // `config` is a field, not a parameter, so it never shows up as one.
+        assert_eq!(input.params.len(), 3);
+        assert_eq!(input.config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_callback_with_no_parameters_and_no_config_still_decodes() {
+        let input: CallbackInput = serde_json::from_str("{}").unwrap();
+        assert!(input.params.is_empty());
+        assert_eq!(input.config, Value::Null);
+        assert_eq!(input.param("code"), None);
+    }
+
+    #[test]
+    fn a_non_string_callback_parameter_is_kept_but_not_returned_as_text() {
+        let input: CallbackInput = serde_json::from_str(r#"{"code":7}"#).unwrap();
+        assert_eq!(input.param("code"), None);
+        assert_eq!(input.params["code"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn refresh_and_token_inputs_default_their_config() {
+        let refresh: RefreshInput = serde_json::from_str(r#"{"refresh_token":"r"}"#).unwrap();
+        assert_eq!(refresh.refresh_token, "r");
+        assert_eq!(refresh.config, Value::Null);
+
+        let token: TokenInput =
+            serde_json::from_str(r#"{"access_token":"a","config":{"k":1}}"#).unwrap();
+        assert_eq!(token.access_token, "a");
+        assert_eq!(token.config["k"], 1);
+    }
+
+    #[test]
+    fn token_set_omits_absent_fields_rather_than_sending_null() {
+        let json = serde_json::to_string(&TokenSet::new("a", "Bearer")).unwrap();
+        assert_eq!(json, r#"{"access_token":"a","token_type":"Bearer"}"#);
+
+        let full = TokenSet::new("a", "Bearer")
+            .refresh_token("r")
+            .expires_at("2026-01-01T00:00:00Z");
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["refresh_token"], "r");
+        assert_eq!(value["expires_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(value.get("expires_in"), None);
+        assert_eq!(serde_json::from_value::<TokenSet>(value).unwrap(), full);
+    }
+
+    #[test]
+    fn token_set_expires_in_is_the_preferred_duration_field() {
+        let json = serde_json::to_string(&TokenSet::new("a", "Bearer").expires_in(3600)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"access_token":"a","expires_in":3600,"token_type":"Bearer"}"#
+        );
+
+        let round_tripped: TokenSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.expires_in, Some(3600));
+        assert_eq!(round_tripped.expires_at, None);
+    }
+
+    #[test]
+    fn token_set_without_expires_in_deserializes_with_it_absent() {
+        let ts: TokenSet =
+            serde_json::from_str(r#"{"access_token":"a","token_type":"Bearer"}"#).unwrap();
+        assert_eq!(ts.expires_in, None);
+    }
+
+    #[test]
+    fn external_profile_round_trips_with_only_an_account_id() {
+        let json = serde_json::to_string(&ExternalProfile::new("76561198000000000")).unwrap();
+        assert_eq!(json, r#"{"account_id":"76561198000000000"}"#);
+
+        let full = ExternalProfile::new("id")
+            .display_name("Name")
+            .profile_url("https://example.test/u/id")
+            .avatar_url("https://example.test/a/id.png");
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["display_name"], "Name");
+        assert_eq!(
+            serde_json::from_value::<ExternalProfile>(value).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn response_header_lookup_ignores_case() {
+        let response = HttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Rate-Limit".to_string(), "60".to_string()),
+            ],
+            body: Vec::new(),
+        };
+        assert_eq!(response.header("content-type"), Some("application/json"));
+        assert_eq!(response.header("CONTENT-TYPE"), Some("application/json"));
+        assert_eq!(response.header("x-rate-limit"), Some("60"));
+        assert_eq!(response.header("accept"), None);
+    }
+
+    #[test]
+    fn response_body_accepts_a_string_or_bytes_and_refuses_a_number_array() {
+        let text: HttpResponse =
+            serde_json::from_str(r#"{"status":200,"headers":[],"body":"hi"}"#).unwrap();
+        assert_eq!(text.body, b"hi");
+        assert_eq!(text.text(), "hi");
+
+        let bytes: HttpResponse =
+            serde_json::from_str(r#"{"status":204,"headers":[],"body":{"$bytes":"aGk"}}"#).unwrap();
+        assert_eq!(bytes.body, b"hi");
+
+        // Bytes travel as base64 only: an array of numbers costs many times
+        // the payload once parsed, which is what this encoding replaced.
+        assert!(serde_json::from_str::<HttpResponse>(
+            r#"{"status":204,"headers":[],"body":[104,105]}"#
+        )
+        .is_err());
+
+        let missing: HttpResponse = serde_json::from_str(r#"{"status":204,"headers":[]}"#).unwrap();
+        assert!(missing.body.is_empty());
+        assert_eq!(missing.text(), "");
+
+        let null: HttpResponse =
+            serde_json::from_str(r#"{"status":204,"headers":[],"body":null}"#).unwrap();
+        assert!(null.body.is_empty());
+    }
+
+    #[test]
+    fn a_utf8_response_body_travels_as_a_string_and_a_binary_one_as_bytes() {
+        let text = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"hi".to_vec(),
+        };
+        assert_eq!(
+            serde_json::to_string(&text).unwrap(),
+            r#"{"status":200,"headers":[],"body":"hi"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<HttpResponse>(&serde_json::to_string(&text).unwrap()).unwrap(),
+            text
+        );
+
+        let binary = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: vec![0xff, 0xfe],
+        };
+        assert_eq!(
+            serde_json::to_string(&binary).unwrap(),
+            r#"{"status":200,"headers":[],"body":{"$bytes":"//4"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<HttpResponse>(&serde_json::to_string(&binary).unwrap()).unwrap(),
+            binary
+        );
+        // Not valid UTF-8, so reading it as text replaces rather than fails.
+        assert_eq!(binary.text(), "\u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn a_request_body_travels_the_same_way_and_stays_null_when_absent() {
+        let none = HttpRequest::new("GET", "https://example.test");
+        assert_eq!(
+            serde_json::to_string(&none).unwrap(),
+            r#"{"method":"GET","url":"https://example.test","headers":[],"body":null}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<HttpRequest>(&serde_json::to_string(&none).unwrap()).unwrap(),
+            none
+        );
+
+        let text = HttpRequest::new("POST", "https://example.test").body_text("{}");
+        assert_eq!(
+            serde_json::to_value(&text).unwrap()["body"],
+            Value::from("{}")
+        );
+        assert_eq!(text.body.as_deref(), Some(&b"{}"[..]));
+
+        let binary = HttpRequest::new("POST", "https://example.test").body_bytes(vec![0xff, 0xfe]);
+        assert_eq!(
+            serde_json::to_value(&binary).unwrap()["body"],
+            serde_json::json!({"$bytes": "//4"})
+        );
+        assert_eq!(
+            serde_json::from_value::<HttpRequest>(serde_json::to_value(&binary).unwrap()).unwrap(),
+            binary
+        );
+    }
+
+    #[test]
+    fn the_original_body_builder_still_sets_a_text_body() {
+        assert_eq!(
+            HttpRequest::new("POST", "https://example.test").body_text("hi"),
+            HttpRequest::new("POST", "https://example.test").body_text("hi")
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_headers_and_no_body_key_still_decodes() {
+        let request: HttpRequest =
+            serde_json::from_str(r#"{"method":"GET","url":"https://example.test"}"#).unwrap();
+        assert!(request.headers.is_empty());
+        assert_eq!(request.body, None);
+    }
+
+    #[test]
+    fn log_levels_parse_case_insensitively_and_refuse_anything_else() {
+        assert_eq!(Level::from_str("debug"), Ok(Level::Debug));
+        assert_eq!(Level::from_str("INFO"), Ok(Level::Info));
+        assert_eq!(Level::from_str("Warn"), Ok(Level::Warn));
+        // The host has always accepted `warning` for `warn`.
+        assert_eq!(Level::from_str("warning"), Ok(Level::Warn));
+        assert_eq!(Level::from_str("error"), Ok(Level::Error));
+
+        assert_eq!(Level::from_str("trace"), Err(ParseLevelError));
+        assert_eq!(Level::from_str(""), Err(ParseLevelError));
+        // Which is what makes `unwrap_or_default()` at the host's call site
+        // log an unknown level at `info` rather than dropping the line.
+        assert_eq!(Level::from_str("nonsense").unwrap_or_default(), Level::Info);
+    }
+
+    #[test]
+    fn a_log_level_round_trips_through_its_own_string() {
+        for level in [Level::Debug, Level::Info, Level::Warn, Level::Error] {
+            assert_eq!(Level::from_str(level.as_str()), Ok(level));
+            assert_eq!(alloc::format!("{level}"), level.as_str());
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn constructor_export_carries_methods() {
+        let export = ApiExport::constructor("records")
+            .lazy("where")
+            .immediate("run");
+        assert!(export.is_constructor());
+        assert!(!export.is_function());
+        let json = serde_json::to_value(&export).unwrap();
+        assert_eq!(json["kind"], "constructor");
+        assert_eq!(
+            json["methods"],
+            json!([
+                {"name": "where", "mode": "lazy"},
+                {"name": "run", "mode": "immediate"}
+            ])
+        );
+    }
+
+    #[test]
+    fn function_export_omits_methods() {
+        let json = serde_json::to_value(ApiExport::function("get")).unwrap();
+        assert!(json.get("methods").is_none());
+        let back: ApiExport = serde_json::from_value(json).unwrap();
+        assert!(back.methods.is_empty());
+    }
+
+    #[test]
+    fn step_is_a_one_key_object() {
+        let step = Step {
+            name: "where".into(),
+            args: vec![json!("a"), json!("="), json!(1)],
+        };
+        assert_eq!(
+            serde_json::to_value(&step).unwrap(),
+            json!({"where": ["a", "=", 1]})
+        );
+        let back: Step = serde_json::from_value(json!({"limit": [20]})).unwrap();
+        assert_eq!(back.name, "limit");
+        assert_eq!(back.args, vec![json!(20)]);
+    }
+
+    #[test]
+    fn step_rejects_zero_or_two_keys() {
+        assert!(serde_json::from_value::<Step>(json!({})).is_err());
+        assert!(serde_json::from_value::<Step>(json!({"a": [], "b": []})).is_err());
+        assert!(serde_json::from_value::<Step>(json!({"a": "not an array"})).is_err());
+    }
+
+    #[test]
+    fn object_call_round_trips() {
+        let doc = json!({
+            "args": ["app.bsky.feed.post"],
+            "steps": [{"where": ["author", "=", "did:plc:abc"]}, {"limit": [20]}],
+            "call": {"name": "run", "args": []}
+        });
+        let call = ObjectCall::from_args(core::slice::from_ref(&doc)).unwrap();
+        assert_eq!(call.args, vec![json!("app.bsky.feed.post")]);
+        assert_eq!(call.steps.len(), 2);
+        assert_eq!(call.call.name, "run");
+        assert_eq!(serde_json::to_value(&call).unwrap(), doc);
+    }
+
+    #[test]
+    fn object_call_needs_exactly_one_document() {
+        let err = ObjectCall::from_args(&[]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+        let err = ObjectCall::from_args(&[json!({}), json!({})]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+        let err = ObjectCall::from_args(&[json!({"args": []})]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn filter_deserialises_conditions_and_groups() {
+        let f: Filter = serde_json::from_value(json!({
+            "combine": "and",
+            "conditions": [
+                {"field": "a", "op": "=", "value": "1"},
+                {"combine": "or", "conditions": [{"field": "b", "op": "LIKE", "value": "%x%"}]}
+            ]
+        }))
+        .unwrap();
+        match f {
+            Filter::Group {
+                combine,
+                conditions,
+            } => {
+                assert_eq!(combine, "and");
+                assert_eq!(conditions.len(), 2);
+                assert!(matches!(conditions[0], Filter::Condition(_)));
+                assert!(matches!(conditions[1], Filter::Group { .. }));
+            }
+            Filter::Condition(_) => panic!("expected a group"),
+        }
+    }
+
+    #[test]
+    fn records_query_defaults() {
+        let q: RecordsQuery = serde_json::from_value(json!({"collection": "c"})).unwrap();
+        assert_eq!(q.collection, "c");
+        assert!(q.did.is_none() && q.filter.is_none() && q.sort.is_none());
+        assert!(q.limit.is_none() && q.cursor.is_none());
+    }
+
+    #[test]
+    fn table_query_count_defaults_false() {
+        let q: TableQuery = serde_json::from_value(json!({"table": "t"})).unwrap();
+        assert!(!q.count);
+    }
+
+    #[test]
+    fn call_context_backend_defaults_to_none() {
+        let ctx: CallContext = serde_json::from_value(json!({})).unwrap();
+        assert!(ctx.db_backend.is_none());
+        let ctx: CallContext = serde_json::from_value(json!({"db_backend": "sqlite"})).unwrap();
+        assert_eq!(ctx.db_backend.as_deref(), Some("sqlite"));
+    }
+
+    #[test]
+    fn records_page_omits_absent_cursor() {
+        let page = RecordsPage {
+            records: vec![json!({"uri": "at://x"})],
+            cursor: None,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert!(json.get("cursor").is_none());
+        assert_eq!(json["records"][0]["uri"], "at://x");
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn record_ref_round_trips() {
+        let r = RecordRef {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            cid: "bafy123".to_string(),
+        };
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["uri"], "at://did:plc:abc/app.bsky.feed.post/1");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(serde_json::from_value::<RecordRef>(value).unwrap(), r);
+    }
+
+    #[test]
+    fn caller_record_create_leaves_validate_to_the_pds_and_omits_optionals() {
+        let create: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.bsky.feed.post",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(create.collection, "app.bsky.feed.post");
+        assert_eq!(create.rkey, None);
+        assert_eq!(create.repo, None);
+        assert_eq!(create.record, json!({"text": "hi"}));
+        assert_eq!(create.validate, None);
+
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("rkey").is_none());
+        assert!(value.get("repo").is_none());
+        assert!(value.get("validate").is_none());
+    }
+
+    #[test]
+    fn caller_record_create_round_trips_with_every_field_set() {
+        let create = CallerRecordCreate {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: Some("abc123".to_string()),
+            repo: Some("did:plc:abc".to_string()),
+            record: json!({"text": "hi"}),
+            validate: Some(false),
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(value["repo"], "did:plc:abc");
+        assert_eq!(value["validate"], false);
+        assert_eq!(
+            serde_json::from_value::<CallerRecordCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn caller_record_put_leaves_validate_to_the_pds_and_omits_swap_cid() {
+        let put: CallerRecordPut = serde_json::from_value(json!({
+            "uri": "at://did:plc:abc/app.bsky.feed.post/1",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.swap_cid, None);
+        assert_eq!(put.validate, None);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+        assert!(value.get("validate").is_none());
+    }
+
+    #[test]
+    fn caller_record_put_round_trips_with_swap_cid_and_validate_false() {
+        let put = CallerRecordPut {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: Some("bafy123".to_string()),
+            validate: Some(false),
+        };
+        let value = serde_json::to_value(&put).unwrap();
+        assert_eq!(value["swap_cid"], "bafy123");
+        assert_eq!(value["validate"], false);
+        assert_eq!(
+            serde_json::from_value::<CallerRecordPut>(value).unwrap(),
+            put
+        );
+    }
+
+    #[test]
+    fn caller_record_delete_round_trips() {
+        let delete = CallerRecordDelete {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["uri"], "at://did:plc:abc/app.bsky.feed.post/1");
+        assert_eq!(
+            serde_json::from_value::<CallerRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn caller_blob_upload_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = CallerBlobUpload {
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(
+            serde_json::from_value::<CallerBlobUpload>(value).unwrap(),
+            text
+        );
+
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
+        let binary = CallerBlobUpload {
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
+        assert_eq!(
+            serde_json::from_value::<CallerBlobUpload>(value).unwrap(),
+            binary
+        );
+
+        // `$bytes` reads with its padding as well as without.
+        let padded: CallerBlobUpload = serde_json::from_value(json!({
+            "bytes": {"$bytes": "//4="},
+            "mime_type": "text/plain",
+        }))
+        .unwrap();
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn caller_xrpc_query_defaults_params_to_empty() {
+        let query: CallerXrpcQuery = serde_json::from_value(json!({
+            "method": "app.bsky.feed.getPosts",
+        }))
+        .unwrap();
+        assert_eq!(query.method, "app.bsky.feed.getPosts");
+        assert!(query.params.is_empty());
+
+        let with_params: CallerXrpcQuery = serde_json::from_value(json!({
+            "method": "app.bsky.feed.getPosts",
+            "params": {"uris": ["at://x"]},
+        }))
+        .unwrap();
+        assert_eq!(with_params.params["uris"], json!(["at://x"]));
+    }
+
+    #[test]
+    fn caller_xrpc_procedure_defaults_params_to_empty() {
+        let procedure: CallerXrpcProcedure = serde_json::from_value(json!({
+            "method": "com.atproto.repo.createRecord",
+            "input": {"collection": "app.bsky.feed.post"},
+        }))
+        .unwrap();
+        assert!(procedure.params.is_empty());
+        assert_eq!(procedure.input["collection"], "app.bsky.feed.post");
+    }
+
+    #[test]
+    fn index_put_defaults_did_and_cid_to_none() {
+        let put: IndexPut = serde_json::from_value(json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "abc123",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.did, None);
+        assert_eq!(put.cid, None);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("did").is_none());
+        assert!(value.get("cid").is_none());
+
+        let full = IndexPut {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+            did: Some("did:plc:abc".to_string()),
+            record: json!({"text": "hi"}),
+            cid: Some("bafy123".to_string()),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(serde_json::from_value::<IndexPut>(value).unwrap(), full);
+    }
+
+    #[test]
+    fn index_delete_round_trips() {
+        let delete = IndexDelete {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(
+            serde_json::from_value::<IndexDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn lexicon_get_round_trips() {
+        let get = LexiconGet {
+            nsid: "app.bsky.feed.post".to_string(),
+        };
+        let value = serde_json::to_value(&get).unwrap();
+        assert_eq!(value["nsid"], "app.bsky.feed.post");
+        assert_eq!(serde_json::from_value::<LexiconGet>(value).unwrap(), get);
+    }
+}
+
+#[cfg(test)]
+mod atproto_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn atproto_resolve_service_round_trips() {
+        let spec = AtprotoResolveService {
+            did: "did:plc:abc".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(
+            serde_json::from_value::<AtprotoResolveService>(value).unwrap(),
+            spec
+        );
+    }
+
+    #[test]
+    fn atproto_resolve_identity_round_trips() {
+        let spec = AtprotoResolveIdentity {
+            identifier: "alice.test".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["identifier"], "alice.test");
+        assert_eq!(
+            serde_json::from_value::<AtprotoResolveIdentity>(value).unwrap(),
+            spec
+        );
+    }
+
+    /// An unconfirmed handle is absent rather than null, and reads back as
+    /// `None` either way.
+    #[test]
+    fn resolved_identity_omits_an_unconfirmed_handle() {
+        let bare = ResolvedIdentity {
+            did: "did:plc:abc".to_string(),
+            handle: None,
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, serde_json::json!({"did": "did:plc:abc"}));
+        assert_eq!(
+            serde_json::from_value::<ResolvedIdentity>(value).unwrap(),
+            bare
+        );
+
+        let named = ResolvedIdentity {
+            did: "did:plc:abc".to_string(),
+            handle: Some("alice.test".to_string()),
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(value["handle"], "alice.test");
+        assert_eq!(
+            serde_json::from_value::<ResolvedIdentity>(value).unwrap(),
+            named
+        );
+    }
+
+    #[test]
+    fn atproto_blob_download_round_trips() {
+        let spec = AtprotoBlobDownload {
+            did: "did:plc:abc".to_string(),
+            cid: "bafy123".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(
+            serde_json::from_value::<AtprotoBlobDownload>(value).unwrap(),
+            spec
+        );
+    }
+
+    #[test]
+    fn blob_data_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = BlobData {
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+            size: 5,
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(value["size"], 5);
+        assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), text);
+
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
+        let binary = BlobData {
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+            size: 2,
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
+        assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), binary);
+
+        // `$bytes` reads with its padding as well as without.
+        let padded: BlobData = serde_json::from_value(json!({
+            "bytes": {"$bytes": "//4="},
+            "mime_type": "text/plain",
+            "size": 2,
+        }))
+        .unwrap();
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn labels_get_spec_round_trips() {
+        let spec = LabelsGet {
+            uris: vec!["at://did:plc:abc/app.bsky.feed.post/1".to_string()],
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            value["uris"],
+            json!(["at://did:plc:abc/app.bsky.feed.post/1"])
+        );
+        assert_eq!(serde_json::from_value::<LabelsGet>(value).unwrap(), spec);
+    }
+
+    #[test]
+    fn label_round_trips() {
+        let label = Label {
+            src: "did:plc:labeler".to_string(),
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            val: "spam".to_string(),
+            cts: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let value = serde_json::to_value(&label).unwrap();
+        assert_eq!(value["val"], "spam");
+        assert_eq!(serde_json::from_value::<Label>(value).unwrap(), label);
+    }
+
+    #[test]
+    fn labels_get_result_is_a_map_with_every_requested_uri_present() {
+        // Every requested URI comes back as a key, even with no labels on it —
+        // the host never omits an entry, so a caller can index the map
+        // directly instead of checking for absence first.
+        let value = json!({
+            "at://did:plc:abc/app.bsky.feed.post/1": [
+                {
+                    "src": "did:plc:labeler",
+                    "uri": "at://did:plc:abc/app.bsky.feed.post/1",
+                    "val": "spam",
+                    "cts": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "at://did:plc:abc/app.bsky.feed.post/2": []
+        });
+        let map: BTreeMap<String, Vec<Label>> = serde_json::from_value(value).unwrap();
+        assert_eq!(map["at://did:plc:abc/app.bsky.feed.post/1"][0].val, "spam");
+        assert!(map["at://did:plc:abc/app.bsky.feed.post/2"].is_empty());
+    }
+
+    #[test]
+    fn attest_sign_spec_round_trips() {
+        let spec = AttestSign {
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["record"]["text"], "hi");
+        assert_eq!(serde_json::from_value::<AttestSign>(value).unwrap(), spec);
+    }
+
+    #[test]
+    fn attest_verify_spec_round_trips() {
+        let spec = AttestVerify {
+            record: json!({"text": "hi"}),
+            signature: json!({"$sig": {"v": 1}}),
+            repo_did: "did:plc:abc".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["repo_did"], "did:plc:abc");
+        assert_eq!(serde_json::from_value::<AttestVerify>(value).unwrap(), spec);
+    }
+}
+
+#[cfg(test)]
+mod linked_repos_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn linked_repo_info_round_trips_with_every_field_set() {
+        let info = LinkedRepoInfo {
+            id: "grant-1".to_string(),
+            did: Some("did:plc:abc".to_string()),
+            handle: Some("alice.test".to_string()),
+            reason: Some("sync".to_string()),
+            status: "linked".to_string(),
+            scopes: "transition:generic".to_string(),
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["id"], "grant-1");
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["handle"], "alice.test");
+        assert_eq!(value["reason"], "sync");
+        assert_eq!(value["status"], "linked");
+        assert_eq!(value["scopes"], "transition:generic");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoInfo>(value).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn linked_repo_info_omits_absent_optionals() {
+        let info: LinkedRepoInfo = serde_json::from_value(json!({
+            "id": "grant-1",
+            "status": "pending",
+            "scopes": "transition:generic",
+        }))
+        .unwrap();
+        assert_eq!(info.did, None);
+        assert_eq!(info.handle, None);
+        assert_eq!(info.reason, None);
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("did").is_none());
+        assert!(value.get("handle").is_none());
+        assert!(value.get("reason").is_none());
+    }
+
+    #[test]
+    fn linked_repo_record_create_omits_absent_rkey() {
+        let create: LinkedRepoRecordCreate = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "collection": "app.bsky.feed.post",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(create.rkey, None);
+
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("rkey").is_none());
+
+        let with_rkey = LinkedRepoRecordCreate {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: Some("abc123".to_string()),
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&with_rkey).unwrap();
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordCreate>(value).unwrap(),
+            with_rkey
+        );
+    }
+
+    #[test]
+    fn linked_repo_record_put_omits_absent_swap_cid() {
+        let put: LinkedRepoRecordPut = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "collection": "app.bsky.feed.post",
+            "rkey": "abc123",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.swap_cid, None);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+
+        let with_swap = LinkedRepoRecordPut {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: Some("bafy123".to_string()),
+        };
+        let value = serde_json::to_value(&with_swap).unwrap();
+        assert_eq!(value["swap_cid"], "bafy123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordPut>(value).unwrap(),
+            with_swap
+        );
+    }
+
+    #[test]
+    fn linked_repo_record_delete_round_trips() {
+        let delete = LinkedRepoRecordDelete {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn linked_repo_blob_upload_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = LinkedRepoBlobUpload {
+            did: "did:plc:abc".to_string(),
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoBlobUpload>(value).unwrap(),
+            text
+        );
+
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
+        let binary = LinkedRepoBlobUpload {
+            did: "did:plc:abc".to_string(),
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoBlobUpload>(value).unwrap(),
+            binary
+        );
+
+        // `$bytes` reads with its padding as well as without.
+        let padded: LinkedRepoBlobUpload = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "bytes": {"$bytes": "//4="},
+            "mime_type": "text/plain",
+        }))
+        .unwrap();
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn linked_repo_call_omits_absent_params_and_input() {
+        let call: LinkedRepoCall = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "method": "com.atproto.repo.describeRepo",
+        }))
+        .unwrap();
+        assert_eq!(call.params, None);
+        assert_eq!(call.input, None);
+
+        let value = serde_json::to_value(&call).unwrap();
+        assert!(value.get("params").is_none());
+        assert!(value.get("input").is_none());
+    }
+
+    #[test]
+    fn linked_repo_call_round_trips_with_params_and_input_set() {
+        let call = LinkedRepoCall {
+            did: "did:plc:abc".to_string(),
+            method: "com.atproto.repo.createRecord".to_string(),
+            params: Some(json!({"foo": "bar"})),
+            input: Some(json!({"collection": "app.bsky.feed.post"})),
+        };
+        let value = serde_json::to_value(&call).unwrap();
+        assert_eq!(value["params"]["foo"], "bar");
+        assert_eq!(value["input"]["collection"], "app.bsky.feed.post");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoCall>(value).unwrap(),
+            call
+        );
+    }
+}
+
+#[cfg(test)]
+mod jobs_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn job_list_any_defaults_every_filter_when_absent() {
+        let spec: JobListAny = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec, JobListAny::default());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), "{}");
+    }
+
+    #[test]
+    fn job_view_round_trips_and_omits_absent_optionals() {
+        let view = JobView {
+            id: "j1".into(),
+            job_type: "instance.operation".into(),
+            status: "running".into(),
+            input: json!({"operationId": "o1"}),
+            progress: json!({"step": "apply"}),
+            result: None,
+            error: None,
+            created_by: "did:plc:a".into(),
+            created_at: "2026-10-07T00:00:00Z".into(),
+            started_at: None,
+            completed_at: None,
+        };
+        let text = serde_json::to_string(&view).unwrap();
+        assert!(!text.contains("result") && !text.contains("completed_at"));
+        assert_eq!(serde_json::from_str::<JobView>(&text).unwrap(), view);
+    }
+
+    #[test]
+    fn job_view_has_no_session_fields() {
+        let text = serde_json::to_string(&JobView {
+            id: "j".into(),
+            job_type: "t".into(),
+            status: "pending".into(),
+            input: json!({}),
+            progress: json!({}),
+            result: None,
+            error: None,
+            created_by: "did:plc:a".into(),
+            created_at: "x".into(),
+            started_at: None,
+            completed_at: None,
+        })
+        .unwrap();
+        for field in ["inherit_auth", "api_client_id", "dpop_key_id"] {
+            assert!(!text.contains(field), "{field} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn job_create_defaults_input_and_auth_when_absent() {
+        let create: JobCreate = serde_json::from_value(json!({
+            "job_type": "example.sync",
+        }))
+        .unwrap();
+        assert_eq!(create.input, Value::Null);
+        assert!(!create.auth);
+    }
+
+    #[test]
+    fn job_create_round_trips_with_every_field_set() {
+        let create = JobCreate {
+            job_type: "example.sync".to_string(),
+            input: json!({"n": 1}),
+            auth: true,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["job_type"], "example.sync");
+        assert_eq!(value["input"]["n"], 1);
+        assert_eq!(value["auth"], true);
+        assert_eq!(serde_json::from_value::<JobCreate>(value).unwrap(), create);
+    }
+}
+
+#[cfg(test)]
+mod spaces_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    fn space_info() -> SpaceInfo {
+        SpaceInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            id: "space-1".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:authority".to_string(),
+            creator_did: "did:plc:creator".to_string(),
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: Some("Main board".to_string()),
+            description: Some("The default board".to_string()),
+            read_policy: json!({"kind": "members"}),
+            write_policy: json!({"kind": "members"}),
+            app_access: json!({"kind": "open"}),
+            config: json!({}),
+            revision: Some("rev-1".to_string()),
+            created_at: "2026-09-15T00:00:00Z".to_string(),
+            updated_at: "2026-09-15T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn space_info_round_trips_with_every_field_set() {
+        let info = space_info();
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["spaceType"], "dev.happyview.board");
+        assert_eq!(value["display_name"], "Main board");
+        assert_eq!(serde_json::from_value::<SpaceInfo>(value).unwrap(), info);
+    }
+
+    /// The protocol, the HTTP surface and the library all name a space's
+    /// type `spaceType`; a script author who meets it in one place must find
+    /// the same word in the others, so the three structs that carry it are
+    /// pinned together rather than one test each.
+    #[test]
+    fn every_space_type_field_is_spelled_spacetype_on_the_wire() {
+        let script_space = ScriptSpace {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            id: "space-1".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:authority".to_string(),
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+        };
+        let create = SpacesCreate {
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: None,
+            description: None,
+            read_policy: None,
+            write_policy: None,
+            app_access: None,
+            config: None,
+        };
+        for value in [
+            serde_json::to_value(space_info()).unwrap(),
+            serde_json::to_value(&create).unwrap(),
+            serde_json::to_value(&script_space).unwrap(),
+        ] {
+            assert_eq!(value["spaceType"], "dev.happyview.board", "{value}");
+            assert!(value.get("type").is_none(), "{value}");
+            assert!(value.get("type_nsid").is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn space_info_omits_absent_optionals() {
+        let mut info = space_info();
+        info.display_name = None;
+        info.description = None;
+        info.revision = None;
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("display_name").is_none());
+        assert!(value.get("description").is_none());
+        assert!(value.get("revision").is_none());
+        assert_eq!(serde_json::from_value::<SpaceInfo>(value).unwrap(), info);
+    }
+
+    #[test]
+    fn space_member_info_round_trips() {
+        let member = SpaceMemberInfo {
+            did: "did:plc:member".to_string(),
+            access: "write".to_string(),
+            read: true,
+            write: true,
+        };
+        let value = serde_json::to_value(&member).unwrap();
+        assert_eq!(value["did"], "did:plc:member");
+        assert_eq!(value["access"], "write");
+        assert_eq!(value["read"], true);
+        assert_eq!(value["write"], true);
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberInfo>(value).unwrap(),
+            member
+        );
+    }
+
+    #[test]
+    fn space_invite_info_omits_absent_optionals() {
+        let invite = SpaceInviteInfo {
+            invite_id: "invite-1".to_string(),
+            token: "tok".to_string(),
+            access: "read".to_string(),
+            read: true,
+            write: false,
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&invite).unwrap();
+        assert!(value.get("max_uses").is_none());
+        assert!(value.get("expires_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteInfo>(value).unwrap(),
+            invite
+        );
+    }
+
+    #[test]
+    fn space_record_info_round_trips() {
+        let record = SpaceRecordInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main/did:plc:author/dev.happyview.post/abc".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            cid: "bafyabc".to_string(),
+            author_did: "did:plc:author".to_string(),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["author_did"], "did:plc:author");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordInfo>(value).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn space_records_page_without_cursor_omits_the_key() {
+        let record = SpaceRecordInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main/did:plc:author/dev.happyview.post/abc".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            cid: "bafyabc".to_string(),
+            author_did: "did:plc:author".to_string(),
+        };
+        let page = SpaceRecordsPage {
+            records: alloc::vec![record],
+            cursor: None,
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert!(value.get("cursor").is_none());
+        assert_eq!(value["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordsPage>(value).unwrap(),
+            page
+        );
+    }
+
+    #[test]
+    fn space_records_page_round_trips_with_cursor_set() {
+        let page = SpaceRecordsPage {
+            records: alloc::vec![],
+            cursor: Some("cursor-1".to_string()),
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(value["cursor"], "cursor-1");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordsPage>(value).unwrap(),
+            page
+        );
+    }
+
+    #[test]
+    fn spaces_info_round_trips() {
+        let info = SpacesInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(serde_json::from_value::<SpacesInfo>(value).unwrap(), info);
+    }
+
+    #[test]
+    fn spaces_query_defaults_optionals_when_absent() {
+        let query: SpacesQuery = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+        }))
+        .unwrap();
+        assert_eq!(query.collection, None);
+        assert_eq!(query.limit, None);
+        assert_eq!(query.cursor, None);
+    }
+
+    #[test]
+    fn spaces_query_round_trips_with_every_field_set() {
+        let query = SpacesQuery {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: Some("dev.happyview.post".to_string()),
+            limit: Some(25),
+            cursor: Some("cursor-1".to_string()),
+        };
+        let value = serde_json::to_value(&query).unwrap();
+        assert_eq!(value["collection"], "dev.happyview.post");
+        assert_eq!(value["limit"], 25);
+        assert_eq!(serde_json::from_value::<SpacesQuery>(value).unwrap(), query);
+    }
+
+    #[test]
+    fn spaces_members_and_access_round_trip() {
+        let members = SpacesMembers {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&members).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesMembers>(value).unwrap(),
+            members
+        );
+
+        let access = SpacesAccess {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+        };
+        let value = serde_json::to_value(&access).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesAccess>(value).unwrap(),
+            access
+        );
+    }
+
+    #[test]
+    fn spaces_create_accepts_only_the_two_required_keys() {
+        let create: SpacesCreate = serde_json::from_value(json!({
+            "spaceType": "dev.happyview.board",
+            "skey": "main",
+        }))
+        .unwrap();
+        assert_eq!(create.type_nsid, "dev.happyview.board");
+        assert_eq!(create.skey, "main");
+        assert_eq!(create.display_name, None);
+        assert_eq!(create.description, None);
+        assert_eq!(create.read_policy, None);
+        assert_eq!(create.write_policy, None);
+        assert_eq!(create.app_access, None);
+        assert_eq!(create.config, None);
+    }
+
+    #[test]
+    fn spaces_create_round_trips_with_every_field_set() {
+        let create = SpacesCreate {
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: Some("Main board".to_string()),
+            description: Some("desc".to_string()),
+            read_policy: Some(json!({"kind": "members"})),
+            write_policy: Some(json!({"kind": "members"})),
+            app_access: Some(json!({"kind": "open"})),
+            config: Some(json!({"foo": "bar"})),
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["spaceType"], "dev.happyview.board");
+        assert_eq!(
+            serde_json::from_value::<SpacesCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn spaces_accept_invite_round_trips() {
+        let accept = SpacesAcceptInvite {
+            token: "tok".to_string(),
+        };
+        let value = serde_json::to_value(&accept).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesAcceptInvite>(value).unwrap(),
+            accept
+        );
+    }
+
+    #[test]
+    fn space_record_write_round_trips() {
+        let write = SpaceRecordWrite {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&write).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordWrite>(value).unwrap(),
+            write
+        );
+    }
+
+    #[test]
+    fn space_record_put_omits_absent_swap_cid() {
+        let put = SpaceRecordPut {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: None,
+        };
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordPut>(value).unwrap(),
+            put
+        );
+    }
+
+    #[test]
+    fn space_record_delete_round_trips_with_swap_cid_set() {
+        let delete = SpaceRecordDelete {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            swap_cid: Some("bafyabc".to_string()),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["swap_cid"], "bafyabc");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn space_member_add_defaults_every_optional_when_absent() {
+        let add: SpaceMemberAdd = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "did": "did:plc:member",
+        }))
+        .unwrap();
+        assert_eq!(add.access, None);
+        assert_eq!(add.read, None);
+        assert_eq!(add.write, None);
+        assert_eq!(add.is_delegation, None);
+    }
+
+    #[test]
+    fn space_member_add_round_trips_with_every_field_set() {
+        let add = SpaceMemberAdd {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+            access: Some("write".to_string()),
+            read: None,
+            write: None,
+            is_delegation: Some(true),
+        };
+        let value = serde_json::to_value(&add).unwrap();
+        assert_eq!(value["access"], "write");
+        assert!(value.get("read").is_none());
+        assert!(value.get("write").is_none());
+        assert_eq!(value["is_delegation"], true);
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberAdd>(value).unwrap(),
+            add
+        );
+    }
+
+    /// The pair the `access` word cannot name: `as_wire_str` renders any
+    /// write as `"write"`, which reads back as read and write both.
+    #[test]
+    fn space_member_add_carries_a_write_only_pair() {
+        let add = SpaceMemberAdd {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+            access: None,
+            read: Some(false),
+            write: Some(true),
+            is_delegation: None,
+        };
+        let value = serde_json::to_value(&add).unwrap();
+        assert_eq!(value["read"], false);
+        assert_eq!(value["write"], true);
+        assert!(value.get("access").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberAdd>(value).unwrap(),
+            add
+        );
+    }
+
+    #[test]
+    fn space_member_remove_round_trips() {
+        let remove = SpaceMemberRemove {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+        };
+        let value = serde_json::to_value(&remove).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberRemove>(value).unwrap(),
+            remove
+        );
+    }
+
+    #[test]
+    fn space_delete_round_trips() {
+        let delete = SpaceDelete {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn space_invite_create_omits_absent_optionals() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: None,
+            read: None,
+            write: None,
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("access").is_none());
+        assert!(value.get("read").is_none());
+        assert!(value.get("write").is_none());
+        assert!(value.get("max_uses").is_none());
+        assert!(value.get("expires_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn space_invite_create_round_trips_with_every_field_set() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: Some("read".to_string()),
+            read: None,
+            write: None,
+            max_uses: Some(5),
+            expires_at: Some("2026-10-01T00:00:00Z".to_string()),
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["access"], "read");
+        assert_eq!(value["max_uses"], 5);
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    /// As for a member: the pair the `access` word cannot name.
+    #[test]
+    fn space_invite_create_carries_a_write_only_pair() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: None,
+            read: Some(false),
+            write: Some(true),
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["read"], false);
+        assert_eq!(value["write"], true);
+        assert!(value.get("access").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    fn base_update() -> SpaceUpdate {
+        SpaceUpdate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            display_name: Patch::Unchanged,
+            description: Patch::Unchanged,
+            read_policy: None,
+            write_policy: None,
+            app_access: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn space_update_absent_patch_fields_deserialize_to_unchanged() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Unchanged);
+        assert_eq!(update.description, Patch::Unchanged);
+    }
+
+    #[test]
+    fn space_update_false_patch_field_deserializes_to_clear() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": false,
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Clear);
+    }
+
+    #[test]
+    fn space_update_null_patch_field_deserializes_to_clear() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": null,
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Clear);
+    }
+
+    #[test]
+    fn space_update_string_patch_field_deserializes_to_set() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": "New name",
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Set("New name".to_string()));
+    }
+
+    #[test]
+    fn space_update_true_patch_field_is_rejected() {
+        let err = serde_json::from_value::<SpaceUpdate>(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": true,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("patch field"), "{err}");
+    }
+
+    #[test]
+    fn space_update_unchanged_fields_are_absent_on_the_wire() {
+        let update = base_update();
+        let value = serde_json::to_value(&update).unwrap();
+        assert!(value.get("display_name").is_none());
+        assert!(value.get("description").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_clear_serializes_to_null_and_round_trips() {
+        let mut update = base_update();
+        update.display_name = Patch::Clear;
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(value["display_name"], Value::Null);
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_set_serializes_to_the_string_and_round_trips() {
+        let mut update = base_update();
+        update.description = Patch::Set("New description".to_string());
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(value["description"], "New description");
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_round_trips_with_policy_fields_set() {
+        let mut update = base_update();
+        update.read_policy = Some(json!({"kind": "members"}));
+        update.write_policy = Some(json!({"kind": "members"}));
+        update.app_access = Some(json!({"kind": "open"}));
+        update.config = Some(json!({"foo": "bar"}));
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+}
+
+#[cfg(test)]
+mod interpreter_tests {
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn full_context(kind: ScriptKind) -> ExecuteContext {
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".to_string(), "k".to_string());
+        let mut ctx = ExecuteContext {
+            trigger: "xrpc.query:app.test.q".to_string(),
+            caller_did: Some("did:plc:me".to_string()),
+            has_pds_auth: true,
+            env,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        };
+        let mut params = Map::new();
+        params.insert("q".to_string(), json!("x"));
+        match kind {
+            ScriptKind::XrpcQuery => {
+                ctx.method = Some("app.test.q".to_string());
+                ctx.collection = Some("app.test.rec".to_string());
+                ctx.space = Some(space());
+            }
+            ScriptKind::XrpcProcedure => {
+                ctx.trigger = "xrpc.procedure:app.test.p".to_string();
+                ctx.method = Some("app.test.p".to_string());
+                ctx.collection = Some("app.test.rec".to_string());
+                ctx.params = Some(params);
+                ctx.delegate_did = Some("did:plc:delegate".to_string());
+                ctx.space = Some(space());
+            }
+            ScriptKind::RecordEvent => {
+                ctx.trigger = "record.created:app.test.rec".to_string();
+                ctx.collection = Some("app.test.rec".to_string());
+            }
+            ScriptKind::Label => {
+                ctx.trigger = "label.applied:spam".to_string();
+            }
+            ScriptKind::Job => {
+                ctx.trigger = "job.run:export".to_string();
+                ctx.job = Some(ScriptJob {
+                    id: "job-1".to_string(),
+                });
+            }
+            ScriptKind::Test => {
+                ctx.trigger = "test:src/lib/format.test.lua".to_string();
+            }
+        }
+        ctx
+    }
+
+    fn space() -> ScriptSpace {
+        ScriptSpace {
+            uri: "at://did:plc:owner/space/com.example.forum/main".to_string(),
+            id: "space-123".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:owner".to_string(),
+            type_nsid: "com.example.forum".to_string(),
+            skey: "main".to_string(),
+        }
+    }
+
+    fn full_input(kind: ScriptKind) -> ExecuteInput {
+        ExecuteInput {
+            source: "function handle(input, ctx) return input end".to_string(),
+            kind,
+            input: json!({"q": "x", "limit": 5}),
+            context: full_context(kind),
+            libraries: vec![LibraryRef {
+                namespace: "happyview.db".to_string(),
+                id: "happyview-db".to_string(),
+            }],
+            limits: ExecuteLimits {
+                instructions: if matches!(kind, ScriptKind::Job | ScriptKind::Test) {
+                    None
+                } else {
+                    Some(1_000_000)
+                },
+                memory_bytes: 64 * 1024 * 1024,
+            },
+            removed_globals: vec!["Record".to_string(), "xrpc".to_string()],
+            chunk_name: DEFAULT_CHUNK_NAME.to_string(),
+            artifact: None,
+        }
+    }
+
+    #[test]
+    fn execute_input_round_trips_for_every_script_kind() {
+        for kind in ScriptKind::ALL {
+            let input = full_input(kind);
+            let text = serde_json::to_string(&input).unwrap();
+            std::eprintln!("{}: {text}", kind.as_str());
+            let back: ExecuteInput = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, input, "{}", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn an_absent_context_field_is_missing_from_the_json_not_null() {
+        let query = serde_json::to_value(full_context(ScriptKind::XrpcQuery)).unwrap();
+        let query = query.as_object().unwrap();
+        for absent in ["params", "delegate_did", "job"] {
+            assert!(!query.contains_key(absent), "{absent} should be absent");
+        }
+        for present in [
+            "trigger",
+            "caller_did",
+            "has_pds_auth",
+            "env",
+            "method",
+            "collection",
+            "space",
+        ] {
+            assert!(query.contains_key(present), "{present} should be present");
+        }
+
+        let label = serde_json::to_value(full_context(ScriptKind::Label)).unwrap();
+        let label = label.as_object().unwrap();
+        for absent in [
+            "method",
+            "collection",
+            "params",
+            "delegate_did",
+            "space",
+            "job",
+        ] {
+            assert!(!label.contains_key(absent), "{absent} should be absent");
+        }
+
+        let anonymous = ExecuteContext {
+            trigger: "xrpc.query:app.test.q".to_string(),
+            ..ExecuteContext::default()
+        };
+        let anonymous = serde_json::to_value(anonymous).unwrap();
+        assert!(anonymous.get("caller_did").is_none());
+        assert_eq!(anonymous["has_pds_auth"], false);
+        assert_eq!(anonymous["env"], json!({}));
+    }
+
+    #[test]
+    fn a_missing_context_field_parses_as_absent() {
+        let ctx: ExecuteContext =
+            serde_json::from_value(json!({"trigger": "label.applied:spam"})).unwrap();
+        assert_eq!(ctx.caller_did, None);
+        assert!(!ctx.has_pds_auth);
+        assert!(ctx.env.is_empty());
+        assert_eq!(ctx.space, None);
+        assert_eq!(ctx.job, None);
+    }
+
+    #[test]
+    fn no_instruction_budget_is_emitted_as_null_and_an_omitted_key_is_refused() {
+        let unbounded = serde_json::to_value(ExecuteLimits {
+            instructions: None,
+            memory_bytes: 1,
+        })
+        .unwrap();
+        assert!(unbounded.as_object().unwrap().contains_key("instructions"));
+        assert_eq!(unbounded["instructions"], Value::Null);
+
+        let bounded = serde_json::to_value(ExecuteLimits {
+            instructions: Some(10),
+            memory_bytes: 1,
+        })
+        .unwrap();
+        assert_eq!(bounded["instructions"], 10);
+
+        let parsed: ExecuteLimits =
+            serde_json::from_value(json!({"instructions": null, "memory_bytes": 1})).unwrap();
+        assert_eq!(parsed.instructions, None);
+
+        let err = serde_json::from_value::<ExecuteLimits>(json!({"memory_bytes": 1})).unwrap_err();
+        assert!(
+            err.to_string().contains("instructions"),
+            "an omitted key must be refused by name: {err}"
+        );
+    }
+
+    #[test]
+    fn libraries_and_removed_globals_default_to_empty() {
+        let input: ExecuteInput = serde_json::from_value(json!({
+            "source": "",
+            "kind": "label",
+            "input": null,
+            "context": {"trigger": "label.applied:spam"},
+            "limits": {"instructions": 1, "memory_bytes": 1},
+        }))
+        .unwrap();
+        assert!(input.libraries.is_empty());
+        assert!(input.removed_globals.is_empty());
+
+        // An empty guard goes back out absent rather than as `[]`, the same
+        // way `ValidateInput` spells it.
+        let out = serde_json::to_value(&input).unwrap();
+        assert!(out.get("removed_globals").is_none(), "{out}");
+    }
+
+    #[test]
+    fn the_test_runner_types_carry_their_wire_names() {
+        let trigger: TestTrigger = serde_json::from_value(json!({
+            "kind": "record_create", "target": "app.test.rec", "input": {"a": 1},
+            "did": "did:plc:alice", "rkey": "3k", "as": "did:plc:bob",
+        }))
+        .unwrap();
+        assert_eq!(trigger.kind, TestTriggerKind::RecordCreate);
+        assert_eq!(trigger.as_did.as_deref(), Some("did:plc:bob"));
+        assert_eq!(
+            serde_json::to_value(&trigger).unwrap()["as"],
+            json!("did:plc:bob")
+        );
+
+        let bare: TestTrigger =
+            serde_json::from_value(json!({"kind": "query", "target": "app.test.q"})).unwrap();
+        assert_eq!(bare.input, Value::Null);
+        assert!(bare.did.is_none() && bare.rkey.is_none() && bare.as_did.is_none());
+
+        let kinds: Vec<Value> = TestTriggerKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("query"),
+                json!("procedure"),
+                json!("record_create"),
+                json!("record_update"),
+                json!("record_delete"),
+                json!("job"),
+                json!("label"),
+            ]
+        );
+
+        let report: TestReport = serde_json::from_value(json!({
+            "path": "src/lib/a.test.lua", "name": "a > b", "status": "fail",
+            "message": "expected 1, got 2", "file": "src/lib/a.test.lua", "line": 3, "duration_ms": 4,
+        }))
+        .unwrap();
+        assert_eq!(report.status, TestStatus::Fail);
+        assert_eq!(report.line, Some(3));
+        let minimal: TestReport = serde_json::from_value(json!({
+            "path": "p", "name": "n", "status": "skip", "duration_ms": 0,
+        }))
+        .unwrap();
+        assert!(minimal.message.is_none() && minimal.file.is_none() && minimal.line.is_none());
+
+        let write: TestPdsWrite = serde_json::from_value(json!({
+            "action": "delete", "repo": "did:plc:a", "collection": "c", "rkey": "r",
+        }))
+        .unwrap();
+        assert!(write.record.is_none() && write.cid.is_none());
+    }
+
+    #[test]
+    fn script_enums_serialize_snake_case() {
+        let kinds: Vec<Value> = ScriptKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("xrpc_query"),
+                json!("xrpc_procedure"),
+                json!("record_event"),
+                json!("label"),
+                json!("job"),
+                json!("test")
+            ]
+        );
+        for kind in ScriptKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+        }
+
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::None).unwrap(),
+            json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::Object).unwrap(),
+            json!("object")
+        );
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::Other).unwrap(),
+            json!("other")
+        );
+
+        let errors: Vec<Value> = ScriptErrorKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                json!("syntax"),
+                json!("runtime"),
+                json!("timeout"),
+                json!("memory"),
+                json!("missing_handle")
+            ]
+        );
+        for kind in ScriptErrorKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+            assert_eq!(kind.as_str().parse::<ScriptErrorKind>().unwrap(), kind);
+        }
+        assert!("internal".parse::<ScriptErrorKind>().is_err());
+    }
+
+    #[test]
+    fn an_execute_output_parses_from_the_shape_the_prototype_emitted() {
+        let error: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error",
+            "kind": "runtime",
+            "message": "attempt to index a nil value",
+            "line": 12,
+            "raw": "[string \"script\"]:12: attempt to index a nil value",
+        }))
+        .unwrap();
+        assert_eq!(
+            error,
+            ExecuteOutput::Error {
+                kind: ScriptErrorKind::Runtime,
+                message: "attempt to index a nil value".to_string(),
+                line: Some(12),
+                raw: "[string \"script\"]:12: attempt to index a nil value".to_string(),
+                chunk: None,
+            }
+        );
+
+        let no_line: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error",
+            "kind": "missing_handle",
+            "message": "script does not define a handle() function",
+            "line": null,
+            "raw": "script does not define a handle() function",
+        }))
+        .unwrap();
+        let ExecuteOutput::Error { kind, line, .. } = no_line else {
+            panic!("expected an error");
+        };
+        assert_eq!(kind, ScriptErrorKind::MissingHandle);
+        assert_eq!(line, None);
+
+        let returned: ExecuteOutput = serde_json::from_value(json!({
+            "status": "returned",
+            "value": {"a": 1},
+            "value_kind": "object",
+        }))
+        .unwrap();
+        assert_eq!(
+            returned,
+            ExecuteOutput::Returned {
+                value: json!({"a": 1}),
+                value_kind: ScriptValueKind::Object,
+            }
+        );
+    }
+
+    #[test]
+    fn execute_output_round_trips_and_is_tagged_on_status() {
+        let returned = ExecuteOutput::Returned {
+            value: Value::Null,
+            value_kind: ScriptValueKind::None,
+        };
+        let value = serde_json::to_value(&returned).unwrap();
+        assert_eq!(value["status"], "returned");
+        assert_eq!(value["value_kind"], "none");
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(value).unwrap(),
+            returned
+        );
+
+        let error = ExecuteOutput::Error {
+            kind: ScriptErrorKind::Timeout,
+            message: "script exceeded execution limit".to_string(),
+            line: None,
+            raw: "instruction limit".to_string(),
+            chunk: None,
+        };
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["kind"], "timeout");
+        // An error with no line omits the key, the spelling `ValidateError`
+        // uses; a null parses back to the same thing either way.
+        assert!(value.get("line").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(value).unwrap(),
+            error
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(
+                json!({"status": "error", "kind": "timeout", "message": "script exceeded execution limit",
+                       "line": null, "raw": "instruction limit"})
+            )
+            .unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn validate_types_round_trip_in_both_shapes() {
+        let input = ValidateInput {
+            source: "function handle() end".to_string(),
+            removed_globals: vec!["env".to_string(), "Record".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            json!({"source": "function handle() end", "removed_globals": ["env", "Record"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(serde_json::to_value(&input).unwrap()).unwrap(),
+            input
+        );
+
+        // A host that names no removed globals is an empty guard, not a
+        // parse error, and an empty guard is absent rather than `[]`.
+        let bare = ValidateInput {
+            source: "function handle() end".to_string(),
+            removed_globals: Vec::new(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, json!({"source": "function handle() end"}));
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(value).unwrap(),
+            bare
+        );
+
+        let valid = ValidateOutput::valid();
+        let value = serde_json::to_value(&valid).unwrap();
+        assert_eq!(value, json!({"valid": true}));
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            valid
+        );
+
+        let invalid = ValidateOutput::invalid(vec![ValidateError {
+            kind: ScriptErrorKind::Syntax,
+            line: Some(3),
+            message: "unexpected symbol".to_string(),
+        }]);
+        let value = serde_json::to_value(&invalid).unwrap();
+        assert_eq!(
+            value,
+            json!({"valid": false, "errors": [{"kind": "syntax", "line": 3, "message": "unexpected symbol"}]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            invalid
+        );
+
+        let prototype: ValidateOutput = serde_json::from_value(json!({
+            "valid": false,
+            "errors": [{"kind": "missing_handle", "message": "script must define a handle() function"}],
+        }))
+        .unwrap();
+        assert_eq!(prototype.errors[0].line, None);
+    }
+
+    fn artifact() -> PreparedArtifact {
+        PreparedArtifact {
+            interpreter: "lua".to_string(),
+            version: "1.4.0+0123456789abcdef".to_string(),
+            engine: "puc-lua-5.4.7".to_string(),
+            format: "lua-bytecode".to_string(),
+            bytes: vec![0x1b, 0x4c, 0x75, 0x61, 0x00, 0xff],
+            source_map: None,
+        }
+    }
+
+    #[test]
+    fn artifact_bytes_travel_as_base64_and_an_absent_source_map_is_omitted() {
+        let value = serde_json::to_value(artifact()).unwrap();
+        assert_eq!(value["bytes"], "G0x1YQD/");
+        assert!(value.get("source_map").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<PreparedArtifact>(value).unwrap(),
+            artifact()
+        );
+
+        let with_map = PreparedArtifact {
+            source_map: Some("{\"version\":3}".to_string()),
+            ..artifact()
+        };
+        let value = serde_json::to_value(&with_map).unwrap();
+        assert_eq!(value["source_map"], "{\"version\":3}");
+        assert_eq!(
+            serde_json::from_value::<PreparedArtifact>(value).unwrap(),
+            with_map
+        );
+
+        let err = serde_json::from_value::<PreparedArtifact>(json!({
+            "interpreter": "lua", "version": "1", "engine": "e", "format": "f",
+            "bytes": "not base64!",
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bytes") || err.to_string().contains("base64"),
+            "{err}"
+        );
+    }
+
+    /// An interpreter built before artifacts existed sends none of the new
+    /// fields, and a host that sends none of them is talking to it; both must
+    /// parse as "nothing prepared".
+    #[test]
+    fn the_new_fields_default_so_either_side_may_predate_them() {
+        let validate_in: ValidateInput = serde_json::from_value(json!({"source": "x"})).unwrap();
+        assert_eq!(validate_in.chunk_name, None);
+        assert!(!validate_in.prepare);
+        assert_eq!(validate_in.role, ChunkRole::Handler);
+        assert_eq!(
+            serde_json::to_value(&validate_in).unwrap(),
+            json!({"source": "x"})
+        );
+
+        let validate_out: ValidateOutput = serde_json::from_value(json!({"valid": true})).unwrap();
+        assert_eq!(validate_out.artifact, None);
+        assert!(validate_out.imports.is_empty());
+        assert_eq!(
+            serde_json::to_value(&validate_out).unwrap(),
+            json!({"valid": true})
+        );
+
+        let execute_in: ExecuteInput = serde_json::from_value(json!({
+            "source": "s", "kind": "job", "input": null,
+            "context": {"trigger": "job.run:x"},
+            "limits": {"instructions": null, "memory_bytes": 1},
+        }))
+        .unwrap();
+        assert_eq!(execute_in.chunk_name, DEFAULT_CHUNK_NAME);
+        assert_eq!(execute_in.artifact, None);
+
+        let error: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error", "kind": "runtime", "message": "m", "raw": "r",
+        }))
+        .unwrap();
+        let ExecuteOutput::Error { chunk, .. } = &error else {
+            panic!("expected an error, got {error:?}");
+        };
+        assert_eq!(*chunk, None);
+        assert!(serde_json::to_value(&error).unwrap().get("chunk").is_none());
+    }
+
+    #[test]
+    fn a_prepare_request_and_its_answer_round_trip() {
+        let input = ValidateInput {
+            source: "return {}".to_string(),
+            removed_globals: Vec::new(),
+            chunk_name: Some("src/lib/format.lua".to_string()),
+            prepare: true,
+            role: ChunkRole::Module,
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            value,
+            json!({"source": "return {}", "chunk_name": "src/lib/format.lua",
+                   "prepare": true, "role": "module"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(value).unwrap(),
+            input
+        );
+
+        let output = ValidateOutput {
+            artifact: Some(artifact()),
+            imports: vec![ImportRef {
+                specifier: "./lib/format".to_string(),
+                line: 3,
+            }],
+            ..ValidateOutput::valid()
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            value["imports"],
+            json!([{"specifier": "./lib/format", "line": 3}])
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            output
+        );
+
+        for (role, name) in [
+            (ChunkRole::Handler, "handler"),
+            (ChunkRole::Module, "module"),
+            (ChunkRole::Test, "test"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), json!(name));
+        }
+    }
+
+    #[test]
+    fn module_resolution_types_round_trip() {
+        let request = ModuleResolve {
+            specifier: "../lib/format".to_string(),
+            referrer: "src/jobs/tick.lua".to_string(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            json!({"specifier": "../lib/format", "referrer": "src/jobs/tick.lua"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ModuleResolve>(value).unwrap(),
+            request
+        );
+
+        let resolved = ResolvedModule {
+            id: "src/lib/format.lua".to_string(),
+            source: "return {}".to_string(),
+            artifact: None,
+        };
+        let value = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(
+            value,
+            json!({"id": "src/lib/format.lua", "source": "return {}"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ResolvedModule>(value).unwrap(),
+            resolved
+        );
+
+        let with_artifact = ResolvedModule {
+            artifact: Some(artifact()),
+            ..resolved
+        };
+        assert_eq!(
+            serde_json::from_value::<ResolvedModule>(serde_json::to_value(&with_artifact).unwrap())
+                .unwrap(),
+            with_artifact
+        );
+    }
+
+    #[test]
+    fn an_execute_input_carries_its_chunk_and_artifact() {
+        let input = ExecuteInput {
+            source: String::new(),
+            chunk_name: "src/jobs/tick.lua".to_string(),
+            artifact: Some(artifact()),
+            ..full_input(ScriptKind::Job)
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["chunk_name"], "src/jobs/tick.lua");
+        assert_eq!(value["artifact"]["format"], "lua-bytecode");
+        assert_eq!(
+            serde_json::from_value::<ExecuteInput>(value).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn script_host_requests_round_trip() {
+        let log = ScriptLogRequest {
+            level: Level::Warn,
+            message: "careful".to_string(),
+            fields: Some(json!({"n": 1})),
+        };
+        let value = serde_json::to_value(&log).unwrap();
+        assert_eq!(
+            value,
+            json!({"level": "warn", "message": "careful", "fields": {"n": 1}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ScriptLogRequest>(value).unwrap(),
+            log
+        );
+
+        let bare = ScriptLogRequest {
+            level: Level::Info,
+            message: "hi".to_string(),
+            fields: None,
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, json!({"level": "info", "message": "hi"}));
+        assert_eq!(
+            serde_json::from_value::<ScriptLogRequest>(value).unwrap(),
+            bare
+        );
+        let lenient: ScriptLogRequest =
+            serde_json::from_value(json!({"level": "WARNING", "message": "m"})).unwrap();
+        assert_eq!(lenient.level, Level::Warn);
+        assert!(serde_json::from_value::<ScriptLogRequest>(
+            json!({"level": "loud", "message": "m"})
+        )
+        .is_err());
+
+        let progress = JobProgressRequest {
+            data: json!({"done": 3}),
+        };
+        let value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value, json!({"data": {"done": 3}}));
+        assert_eq!(
+            serde_json::from_value::<JobProgressRequest>(value).unwrap(),
+            progress
+        );
+
+        let value = serde_json::to_value(JobShouldStopRequest {}).unwrap();
+        assert_eq!(value, json!({}));
+        serde_json::from_value::<JobShouldStopRequest>(value).unwrap();
+
+        let wait = JobWaitRequest { seconds: 0.5 };
+        let value = serde_json::to_value(wait).unwrap();
+        assert_eq!(value, json!({"seconds": 0.5}));
+        assert_eq!(
+            serde_json::from_value::<JobWaitRequest>(value).unwrap(),
+            wait
+        );
+    }
+
+    #[test]
+    fn a_panic_report_round_trips_with_its_location() {
+        let report = PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 7,
+            column: 5,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"message": "boom", "file": "src/lib.rs", "line": 7, "column": 5})
+        );
+        assert_eq!(serde_json::from_value::<PanicReport>(json).unwrap(), report);
+    }
+}

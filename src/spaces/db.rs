@@ -1029,53 +1029,49 @@ pub async fn get_or_create_repo_state(
     space_id: &str,
     author_did: &str,
 ) -> Result<RepoState, AppError> {
+    if let Some(state) = read_repo_state(conn, backend, space_id, author_did).await? {
+        return Ok(state);
+    }
+
+    // Callers outside a transaction can race to create the same author's
+    // state, so the insert yields to whichever lands first and the row is
+    // read back rather than assumed.
+    let insert_sql = adapt_sql(
+        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, host_mode, sync_cursor, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'polyfill', NULL, ?) ON CONFLICT (space_id, author_did) DO NOTHING",
+        backend,
+    );
+    crate::db::query(&insert_sql)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(space_id)
+        .bind(author_did)
+        .bind(vec![0u8; 2048])
+        .bind(now_rfc3339())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create repo state: {e}")))?;
+
+    read_repo_state(conn, backend, space_id, author_did)
+        .await?
+        .ok_or_else(|| AppError::Internal("repo state missing after insert".into()))
+}
+
+async fn read_repo_state(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<Option<RepoState>, AppError> {
     let sql = adapt_sql(
         "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, host_mode, sync_cursor, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
         backend,
     );
-
     let row: Option<RepoStateRow> = crate::db::query_as(&sql)
         .bind(space_id)
         .bind(author_did)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get repo state: {e}")))?;
-
-    if let Some(r) = row {
-        return parse_repo_state_row(r);
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_rfc3339();
-    let default_lthash = vec![0u8; 2048];
-    let insert_sql = adapt_sql(
-        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, host_mode, sync_cursor, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'polyfill', NULL, ?)",
-        backend,
-    );
-    crate::db::query(&insert_sql)
-        .bind(&id)
-        .bind(space_id)
-        .bind(author_did)
-        .bind(&default_lthash)
-        .bind(&now)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to create repo state: {e}")))?;
-
-    Ok(RepoState {
-        id,
-        space_id: space_id.to_string(),
-        author_did: author_did.to_string(),
-        lthash_state: default_lthash,
-        rev: None,
-        hash: None,
-        ikm: None,
-        sig: None,
-        mac: None,
-        host_mode: crate::spaces::host_mode::HostMode::Polyfill,
-        sync_cursor: None,
-        updated_at: now,
-    })
+    row.map(parse_repo_state_row).transpose()
 }
 
 pub async fn update_repo_state(

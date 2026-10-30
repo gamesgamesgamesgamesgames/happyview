@@ -5,10 +5,8 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::auth::Claims;
 use crate::auth::ServiceAuthClaims;
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lexicon::ProcedureAction;
-use crate::record_refs::sync_refs;
 use crate::repo;
 
 /// Resolve where a put/delete writes in the local index.
@@ -45,7 +43,12 @@ pub(crate) async fn handle_procedure(
 ) -> Result<Response, AppError> {
     // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
     // overrides the default PDS-write flow.
-    let trigger = format!("xrpc.procedure:{}", lexicon.id);
+    let trigger =
+        crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcProcedure, &lexicon.id);
+    // One lookup for the whole call: the scope check below and the run after
+    // it must describe the same script, whatever the snapshot does meanwhile.
+    let project = state.project.load_full();
+    let resolved = state.scripts.resolve_in(&project, &trigger).await;
 
     // Service auth access and scope checks
     if let Some(sa) = &service_auth {
@@ -81,18 +84,10 @@ pub(crate) async fn handle_procedure(
         }
 
         // Check token scope against outbound XRPCs declared by the script
-        let outbound_sql = adapt_sql(
-            "SELECT outbound_xrpcs FROM happyview_scripts WHERE id = ?",
-            state.db_backend,
-        );
-        if let Ok(Some((Some(json_str),))) = crate::db::query_as::<(Option<String>,)>(&outbound_sql)
-            .bind(&trigger)
-            .fetch_optional(&state.db)
-            .await
-            && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
-        {
+        if let Some(script) = &resolved {
             let token_scope: Vec<&str> = vec![&method];
-            let missing: Vec<&String> = outbound_list
+            let missing: Vec<&String> = script
+                .outbound_xrpcs
                 .iter()
                 .filter(|x| !token_scope.contains(&x.as_str()))
                 .collect();
@@ -106,7 +101,19 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
-    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
+    // A forged caller holds no DPoP session, so the delegation guard below
+    // would refuse it for missing authentication, and the scriptless path
+    // would write `delegateDid` into the record. A test acts as an account
+    // by naming it.
+    if state.test.is_some() && input.get("delegateDid").is_some() {
+        return Err(AppError::BadRequest(
+            "a test run does not support delegateDid; fire the trigger `as` the \
+             delegated account instead"
+                .into(),
+        ));
+    }
+
+    if let Some(resolved) = resolved {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
         // active write-capable delegate of that account, scoped to the
@@ -163,7 +170,7 @@ pub(crate) async fn handle_procedure(
             &script_input,
             params,
             lexicon,
-            &resolved.body,
+            &resolved,
             None,
             delegate_did.as_deref(),
         )
@@ -174,9 +181,14 @@ pub(crate) async fn handle_procedure(
         AppError::BadRequest(format!("{method} has no target_collection configured"))
     })?;
 
+    // A test run writes through its in-process PDS whatever the caller holds.
+    let test_auth = repo::test_pds_auth(state);
+
     // If the user authenticated via a DPoP session (has a client_key from DPoP auth),
     // use the DPoP PDS write path. Otherwise, fall back to the atrium OAuth session.
-    if let Some(client_key) = claims.client_key() {
+    if test_auth.is_none()
+        && let Some(client_key) = claims.client_key()
+    {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -203,7 +215,20 @@ pub(crate) async fn handle_procedure(
         .await;
     }
 
-    let session = repo::get_oauth_session(state, claims.did()).await?;
+    // Only the DPoP path can act for another account. Here the write goes out
+    // as the caller, with `delegateDid` inside the record.
+    if input.get("delegateDid").is_some() {
+        return Err(AppError::Auth(
+            "delegation requires DPoP authentication".into(),
+        ));
+    }
+
+    let session = match test_auth {
+        Some(auth) => auth,
+        None => repo::PdsAuth::OAuth(std::sync::Arc::new(
+            repo::get_oauth_session(state, claims.did()).await?,
+        )),
+    };
 
     match &lexicon.action {
         ProcedureAction::Create => {
@@ -232,7 +257,7 @@ async fn handle_create_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     // Build record from input, adding $type
     let mut record = input.clone();
@@ -248,8 +273,14 @@ async fn handle_create_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.createRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.createRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -264,33 +295,25 @@ async fn handle_create_record(
             pds_result.get("uri").and_then(|v| v.as_str()),
             pds_result.get("cid").and_then(|v| v.as_str()),
         ) {
-            let backend = state.db_backend;
             let rkey = uri.split('/').next_back().unwrap_or_default();
-            let record_str = serde_json::to_string(&record).unwrap_or_default();
-            let sql = adapt_sql(
-                r#"
-                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (uri) DO UPDATE
-                    SET record = EXCLUDED.record,
-                        cid = EXCLUDED.cid
-                "#,
-                backend,
-            );
-            let now = now_rfc3339();
-            let _ = crate::db::query(&sql)
-                .bind(uri)
-                .bind(claims.did())
-                .bind(collection)
-                .bind(rkey)
-                .bind(&record_str)
-                .bind(cid)
-                .bind(crate::db::NO_INDEXED_AT)
-                .bind(&now)
-                .execute(&state.db)
-                .await;
-
-            let _ = sync_refs(&state.db, uri, collection, &record, backend).await;
+            let prepared = crate::record_store::PreparedRecord {
+                did: claims.did().to_string(),
+                collection: collection.to_string(),
+                rkey: rkey.to_string(),
+                record_json: serde_json::to_string(&record).unwrap_or_default(),
+                cid: cid.to_string(),
+                rev: None,
+            };
+            if let Err(e) = state
+                .records
+                .write_local(crate::record_store::WriteKind::Echoed, &prepared)
+                .await
+            {
+                state
+                    .records
+                    .report_index_failure(&prepared.uri(), &e)
+                    .await;
+            }
         }
 
         Ok((
@@ -309,7 +332,7 @@ async fn handle_put_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -335,8 +358,9 @@ async fn handle_put_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.putRecord", &pds_body).await?;
+    let resp = session
+        .post_json(state, claims.did(), "com.atproto.repo.putRecord", &pds_body)
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -352,32 +376,21 @@ async fn handle_put_record(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        let backend = state.db_backend;
-        let record_str = serde_json::to_string(&record).unwrap_or_default();
-        let now = now_rfc3339();
-        let sql = adapt_sql(
-            r#"
-            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (uri) DO UPDATE
-                SET record = EXCLUDED.record,
-                    cid = EXCLUDED.cid
-            "#,
-            backend,
-        );
-        let _ = crate::db::query(&sql)
-            .bind(&uri)
-            .bind(claims.did())
-            .bind(collection)
-            .bind(&rkey)
-            .bind(&record_str)
-            .bind(cid)
-            .bind(crate::db::NO_INDEXED_AT)
-            .bind(&now)
-            .execute(&state.db)
-            .await;
-
-        let _ = sync_refs(&state.db, &uri, collection, &record, backend).await;
+        let prepared = crate::record_store::PreparedRecord {
+            did: claims.did().to_string(),
+            collection: collection.to_string(),
+            rkey: rkey.clone(),
+            record_json: serde_json::to_string(&record).unwrap_or_default(),
+            cid: cid.to_string(),
+            rev: None,
+        };
+        if let Err(e) = state
+            .records
+            .write_local(crate::record_store::WriteKind::Echoed, &prepared)
+            .await
+        {
+            state.records.report_index_failure(&uri, &e).await;
+        }
 
         Ok((
             StatusCode::OK,
@@ -395,7 +408,7 @@ async fn handle_delete_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -412,8 +425,14 @@ async fn handle_delete_record(
         "rkey": rkey,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.deleteRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.deleteRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -421,9 +440,9 @@ async fn handle_delete_record(
             .await
             .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
 
-        let backend = state.db_backend;
-        let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-        let _ = crate::db::query(&sql).bind(&uri).execute(&state.db).await;
+        if let Err(e) = state.records.delete(&uri).await {
+            state.records.report_index_failure(&uri, &e).await;
+        }
 
         Ok((
             StatusCode::OK,

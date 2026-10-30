@@ -1,17 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { deleteScript, getScript, patchScript } from "@/lib/api";
-import type { Script, TriggerFamily } from "@/types/scripts";
 import {
-  TRIGGER_KIND_LABELS,
-  familyOf,
-  parseTriggerId,
-} from "@/types/scripts";
+  deleteScript,
+  getScript,
+  isUnmigratedRefusal,
+  patchScript,
+} from "@/lib/api";
+import type { Script, TriggerFamily } from "@/types/scripts";
+import { TRIGGER_KIND_LABELS, familyOf, parseTriggerId } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -33,6 +35,8 @@ import {
   scriptsReturnHref,
   stateFromScript,
 } from "../script-form";
+import { MigrateScriptDialog } from "../migrate-dialog";
+import { ScriptModulePanel } from "./script-module-panel";
 
 export default function ScriptDetail() {
   const pathname = usePathname();
@@ -47,6 +51,7 @@ export default function ScriptDetail() {
   const returnHref = scriptsReturnHref(useSearchParams());
   const [script, setScript] = useState<Script | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -61,6 +66,7 @@ export default function ScriptDetail() {
           id: s.id,
           description: s.description,
           body: s.body,
+          language: s.script_type,
         });
         setState(next);
         setOriginal(next);
@@ -75,8 +81,7 @@ export default function ScriptDetail() {
   const isDirty = useMemo(() => {
     if (!state || !original) return false;
     return (
-      state.body !== original.body ||
-      state.description !== original.description
+      state.body !== original.body || state.description !== original.description
     );
   }, [state, original]);
 
@@ -91,21 +96,27 @@ export default function ScriptDetail() {
   }, [isDirty]);
 
   const handleSave = useCallback(async () => {
-    if (!state || !script || !isDirty || saving) return;
+    if (!state || !script || !original || !isDirty || saving) return;
+    if (script.layer === "project") return;
     setSaving(true);
     setError(null);
+    setRefused(false);
     try {
       await patchScript(script.id, {
-        body: state.body,
+        // The server checks the body a request submits, so a stored script
+        // awaiting migration keeps an editable description only if an
+        // untouched body stays out of the request.
+        ...(state.body !== original.body && { body: state.body }),
         description: state.description.trim() || null,
       });
       load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setRefused(isUnmigratedRefusal(e));
     } finally {
       setSaving(false);
     }
-  }, [state, script, isDirty, saving, load]);
+  }, [state, script, original, isDirty, saving, load]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -153,6 +164,9 @@ export default function ScriptDetail() {
   }
 
   const canManage = hasPermission("scripts:manage");
+  // A project file owns this script: it changes by editing the file, so the
+  // page offers nothing that would write.
+  const projectPath = script?.layer === "project" ? script.path : null;
   const parsed = parseTriggerId(id);
   const familyLabel: Record<TriggerFamily, string> = {
     record: "Record event",
@@ -161,17 +175,78 @@ export default function ScriptDetail() {
     job: "Job runner",
   };
 
+  if (script?.module) {
+    return (
+      <>
+        <SiteHeader title={`Script: ${id}`} backHref={returnHref} />
+        <div className="flex flex-col gap-6 p-4 md:p-6">
+          {parsed && (
+            <div className="flex gap-2 items-baseline">
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[parsed.kind]}
+              </Badge>
+            </div>
+          )}
+          <ScriptModulePanel module={script.module} />
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <SiteHeader title={`Script: ${id}`} backHref={returnHref} />
 
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">
-          {error && <p className="text-destructive text-sm">{error}</p>}
+          {error && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-destructive text-sm">{error}</p>
+              {refused && (
+                <MigrateScriptDialog
+                  scriptId={id}
+                  currentBody={state.body}
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      <Wand2 className="size-4" />
+                      Migrate this script
+                    </Button>
+                  }
+                  onRewritten={(source) => {
+                    setState({ ...state, body: source });
+                    setError(null);
+                    setRefused(false);
+                  }}
+                />
+              )}
+            </div>
+          )}
+
+          {script?.runnable === false && (
+            <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+              <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-500">
+                No interpreter is installed for{" "}
+                <span className="font-mono">{script.script_type}</span> scripts,
+                so this one does not run — every trigger it is bound to fails
+                until one is. It is otherwise intact and still editable. Install
+                an interpreter from the{" "}
+                <Link
+                  href="/dashboard/settings/plugins"
+                  className="underline font-medium"
+                >
+                  plugins page
+                </Link>
+                .
+              </p>
+            </div>
+          )}
 
           {parsed && (
             <div className="flex gap-2 items-baseline">
-              <Badge variant="outline">{TRIGGER_KIND_LABELS[parsed.kind]}</Badge>
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[parsed.kind]}
+              </Badge>
               <span className="text-muted-foreground text-xs">
                 ({familyLabel[familyOf(parsed.kind)]})
               </span>
@@ -194,72 +269,101 @@ export default function ScriptDetail() {
             </div>
           )}
 
-          <ScriptForm state={state} onChange={setState} idLocked />
+          {projectPath && script?.shadows_stored && (
+            <p className="text-muted-foreground text-xs">
+              A dashboard version of this script is kept and runs again if the
+              file is removed.
+            </p>
+          )}
+
+          <ScriptForm
+            state={state}
+            onChange={setState}
+            idLocked
+            readOnly={projectPath !== null}
+          />
         </div>
 
-        <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
-          {canManage && (
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button variant="destructive" disabled={deleting}>
-                  {deleting ? "Deleting..." : "Delete script"}
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete script?</AlertDialogTitle>
-                  <AlertDialogDescription asChild>
-                    <div className="flex flex-col gap-3">
-                      <p>
-                        This will permanently remove the script. This action
-                        cannot be undone.
-                      </p>
-                      {script?.recreatable === false && (
-                        <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
-                          <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
-                          <p className="text-xs text-amber-500">
-                            This script&rsquo;s trigger id no longer satisfies
-                            current NSID rules. It will keep firing and can
-                            still be edited in place — but once deleted, it{" "}
-                            <span className="font-medium">
-                              cannot be recreated
-                            </span>{" "}
-                            with the same id. Deletion is not required to
-                            change it.
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel disabled={deleting}>
-                    Cancel
-                  </AlertDialogCancel>
-                  <AlertDialogAction
-                    variant="destructive"
-                    disabled={deleting}
-                    onClick={handleDelete}
-                  >
-                    {script?.recreatable === false
-                      ? "Delete anyway"
-                      : "Delete"}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          )}
-          <div className="flex gap-2">
+        {projectPath ? (
+          <footer className="bg-sidebar-accent flex gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
+            <p className="text-muted-foreground text-sm">
+              Defined by <span className="font-mono">{projectPath}</span>. Edit
+              that file to change this script.
+            </p>
+          </footer>
+        ) : (
+          <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
             {canManage && (
-              <Button onClick={handleSave} disabled={!isDirty || saving}>
-                {saving ? "Saving..." : "Save"}
-                <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
-                  ⌘↵
-                </kbd>
-              </Button>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button variant="destructive" disabled={deleting}>
+                    {deleting ? "Deleting..." : "Delete script"}
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete script?</AlertDialogTitle>
+                    <AlertDialogDescription asChild>
+                      <div className="flex flex-col gap-3">
+                        <p>
+                          This will permanently remove the script. This action
+                          cannot be undone.
+                        </p>
+                        {script?.recreatable === false && (
+                          <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+                            <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                            <p className="text-xs text-amber-500">
+                              This script&rsquo;s trigger id no longer satisfies
+                              current NSID rules. It will keep firing and can
+                              still be edited in place — but once deleted, it{" "}
+                              <span className="font-medium">
+                                cannot be recreated
+                              </span>{" "}
+                              with the same id. Deletion is not required to
+                              change it.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel disabled={deleting}>
+                      Cancel
+                    </AlertDialogCancel>
+                    <AlertDialogAction
+                      variant="destructive"
+                      disabled={deleting}
+                      onClick={handleDelete}
+                    >
+                      {script?.recreatable === false
+                        ? "Delete anyway"
+                        : "Delete"}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             )}
-          </div>
-        </footer>
+            <div className="flex gap-2">
+              {script?.script_type === "lua" && (
+                <MigrateScriptDialog
+                  scriptId={id}
+                  currentBody={script.body}
+                  canApply={canManage}
+                  onApplied={load}
+                />
+              )}
+              {canManage && (
+                <Button onClick={handleSave} disabled={!isDirty || saving}>
+                  {saving ? "Saving..." : "Save"}
+                  <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
+                    ⌘↵
+                  </kbd>
+                </Button>
+              )}
+            </div>
+          </footer>
+        )}
       </div>
     </>
   );

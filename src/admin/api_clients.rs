@@ -298,6 +298,7 @@ pub(super) async fn update_api_client(
     Json(body): Json<UpdateApiClientBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::ApiClientsEdit).await?;
+    crate::auth::cli_client::refuse_change(&id)?;
 
     // Read current values
     let select_sql = adapt_sql(
@@ -490,6 +491,7 @@ pub(super) async fn provision_auth_key(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::ApiClientsEdit).await?;
+    crate::auth::cli_client::refuse_change(&id)?;
 
     let existing = crate::oauth::client_keys::load_keys(
         &state.db,
@@ -711,6 +713,7 @@ pub(super) async fn rotate_auth_key(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::ApiClientsEdit).await?;
+    crate::auth::cli_client::refuse_change(&id)?;
 
     let key = crate::oauth::client_keys::rotate_key(
         &state.db,
@@ -941,6 +944,7 @@ pub(super) async fn delete_api_client(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::ApiClientsDelete).await?;
+    crate::auth::cli_client::refuse_change(&id)?;
 
     // Revoke any client-authentication key before the row is deleted, so a
     // deleted client's key cannot keep signing or appearing in its JWKS.

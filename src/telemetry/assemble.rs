@@ -1,8 +1,6 @@
 //! Snapshot assembly.
 
-use sqlx::AnyPool;
-
-use crate::db::{DatabaseBackend, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::telemetry::collect::{database, features, health, host};
 use crate::telemetry::consent::Consent;
 use crate::telemetry::counters::Counters;
@@ -23,17 +21,49 @@ where
     }
 }
 
+/// A record source's metrics: `feature.<name>.ever` and
+/// `feature.<name>.active` (non-zero for true) go to `features`, anything
+/// else to `totals`.
+fn add_source_metrics(
+    totals: &mut crate::telemetry::payload::Counters,
+    features: &mut std::collections::BTreeMap<String, crate::telemetry::payload::FeatureUsage>,
+    metrics: Vec<(String, i64)>,
+) {
+    for (key, value) in metrics {
+        let feature = key.strip_prefix("feature.").and_then(|rest| {
+            rest.strip_suffix(".ever")
+                .map(|name| (name, true))
+                .or_else(|| rest.strip_suffix(".active").map(|name| (name, false)))
+        });
+        match feature {
+            Some((name, ever)) => {
+                let usage = features.entry(name.to_string()).or_default();
+                if ever {
+                    usage.ever = value != 0;
+                } else {
+                    usage.active = value != 0;
+                }
+            }
+            None => {
+                totals.insert(key, value);
+            }
+        }
+    }
+}
+
 pub async fn assemble(
-    pool: &AnyPool,
-    backend: DatabaseBackend,
+    records: &crate::record_store::RecordStore,
     db_url: &str,
     consent: &Consent,
     counters: &Counters,
+    lexicons: &crate::catalog::LexiconCatalog,
+    source: &dyn happyview_provider::RecordSource,
 ) -> Option<Snapshot> {
     let instance_id = consent.instance_id.clone()?;
+    let (pool, backend) = (records.db(), records.backend());
 
     let totals_fut = async {
-        budgeted("totals", database::totals(pool, backend))
+        budgeted("totals", database::totals(records))
             .await
             .unwrap_or_default()
     };
@@ -43,20 +73,13 @@ pub async fn assemble(
             .unwrap_or_default()
     };
     let shares_fut = async {
-        budgeted(
-            "collection_shares",
-            database::collection_shares(pool, backend),
-        )
-        .await
-        .unwrap_or_default()
+        budgeted("collection_shares", database::collection_shares(records))
+            .await
+            .unwrap_or_default()
     };
     let names_fut = async {
         if consent.lexicon_names {
-            budgeted(
-                "collection_names",
-                database::collection_names(pool, backend),
-            )
-            .await
+            budgeted("collection_names", database::collection_names(records)).await
         } else {
             None
         }
@@ -118,6 +141,23 @@ pub async fn assemble(
         .await
         .flatten()
     };
+    // Through the catalog rather than the table, since a project's lexicons
+    // have no rows.
+    let lexicon_count_fut = async {
+        match budgeted("lexicon_count", lexicons.list(pool, backend)).await {
+            Some(Ok(listed)) => Some(i64::try_from(listed.len()).unwrap_or(i64::MAX)),
+            Some(Err(e)) => {
+                tracing::warn!(metric = "lexicon_count", error = %e, "telemetry metric failed, omitting");
+                None
+            }
+            None => None,
+        }
+    };
+    let source_metrics_fut = async {
+        budgeted("source_metrics", source.metrics())
+            .await
+            .unwrap_or_default()
+    };
     let job_runtime_seconds_fut = async {
         budgeted(
             "job_runtime_seconds",
@@ -140,6 +180,8 @@ pub async fn assemble(
         vacuum_result,
         postgres_db_bytes,
         job_runtime_seconds,
+        lexicon_count,
+        source_metrics,
     ) = tokio::join!(
         totals_fut,
         features_fut,
@@ -153,9 +195,13 @@ pub async fn assemble(
         vacuum_fut,
         postgres_db_bytes_fut,
         job_runtime_seconds_fut,
+        lexicon_count_fut,
+        source_metrics_fut,
     );
 
     let mut totals = totals;
+    let mut feature_usage = feature_usage;
+    add_source_metrics(&mut totals, &mut feature_usage, source_metrics);
     totals.extend(health_counters);
     if let Some(count) = restart_count {
         totals.insert("restarts".to_string(), count);
@@ -166,10 +212,21 @@ pub async fn assemble(
 
     let mut host_report = host_report;
     if let Some(keys) = configured_keys {
+        // An operator may name a setting anything, so a managed instance
+        // reports such keys only as a count.
+        let (keys, other): (Vec<_>, Vec<_>) = keys
+            .into_iter()
+            .partition(|k| consent.managed_by.is_none() || health::is_known_setting_key(k));
         host_report.insert(
             "configured_setting_keys".to_string(),
             serde_json::json!(keys),
         );
+        if consent.managed_by.is_some() {
+            host_report.insert(
+                "configured_other_setting_keys".to_string(),
+                serde_json::json!(other.len()),
+            );
+        }
     }
     if let Some(since) = version_since {
         host_report.insert("version_seen_since".to_string(), serde_json::json!(since));
@@ -183,7 +240,15 @@ pub async fn assemble(
             .or_insert_with(|| serde_json::json!(bytes));
     }
 
-    let lexicon_count = totals.get("lexicons").copied().unwrap_or(0);
+    let lexicon_count = lexicon_count
+        .or_else(|| totals.get("lexicons").copied())
+        .unwrap_or(0);
+    if lexicon_count > 0 {
+        feature_usage
+            .entry("lexicons".to_string())
+            .or_default()
+            .ever = true;
+    }
 
     Some(Snapshot {
         schema_version: SCHEMA_VERSION,
@@ -193,6 +258,7 @@ pub async fn assemble(
         happyview_version: crate::version::version().to_string(),
         process_started_at: counters.process_started_at().to_string(),
         contact: consent.contact.clone(),
+        managed: consent.managed_by.clone(),
         totals,
         since_start: counters.snapshot(),
         features: feature_usage,
@@ -210,48 +276,14 @@ pub async fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::LexiconCatalog;
     use crate::db::DatabaseBackend;
     use crate::telemetry::consent::{Consent, TelemetryMode};
     use crate::telemetry::counters::Counters;
-    use crate::test_support::memory_pool;
+    use crate::test_support::migrated_memory_pool;
 
     async fn pool_for_assembly() -> sqlx::AnyPool {
-        let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_records (
-                uri TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                rkey TEXT NOT NULL,
-                record TEXT NOT NULL,
-                cid TEXT NOT NULL,
-                indexed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create records");
-        crate::db::query(
-            "CREATE TABLE happyview_spaces (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create spaces");
-        crate::db::query(
-            "CREATE TABLE happyview_instance_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create instance_settings");
-        pool
+        migrated_memory_pool().await
     }
 
     fn consent(mode: TelemetryMode) -> Consent {
@@ -263,6 +295,7 @@ mod tests {
             lexicon_documents: false,
             instance_id: Some("11111111-2222-3333-4444-555555555555".into()),
             prompted: true,
+            managed_by: None,
         }
     }
 
@@ -273,11 +306,12 @@ mod tests {
         c.instance_id = None;
 
         let out = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await;
         assert!(out.is_none());
@@ -287,11 +321,12 @@ mod tests {
     async fn builds_a_snapshot_with_shape_data_and_no_consented_extras() {
         let pool = pool_for_assembly().await;
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -313,11 +348,12 @@ mod tests {
     async fn report_mode_reflects_manual() {
         let pool = pool_for_assembly().await;
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Manual),
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -332,11 +368,12 @@ mod tests {
         c.contact = Some("tre@trezy.com".into());
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -350,11 +387,12 @@ mod tests {
         c.lexicon_names = true;
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -363,6 +401,96 @@ mod tests {
             snap.lexicons.structures.is_none(),
             "names must not imply structure"
         );
+    }
+
+    async fn put_setting(pool: &sqlx::AnyPool, key: &str, value: &str) {
+        crate::admin::settings::put_setting(pool, key, value, DatabaseBackend::Sqlite)
+            .await
+            .unwrap();
+    }
+
+    async fn assemble_with(pool: &sqlx::AnyPool, c: &Consent) -> Snapshot {
+        assemble(
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
+            "sqlite::memory:",
+            c,
+            &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Every string in `value`, keys included.
+    fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    out.push(k.clone());
+                    strings(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_managed_snapshot_carries_only_instance_level_data() {
+        let pool = pool_for_assembly().await;
+        crate::db::query(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+             VALUES ('at://did:plc:alice/com.example.post/1', 'did:plc:alice', 'com.example.post', '1',
+                     '{\"text\":\"hello from alice\"}', 'bafy', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        put_setting(&pool, "app_name", "Example").await;
+        put_setting(&pool, "alice@example.com", "x").await;
+
+        let mut c = consent(TelemetryMode::Off);
+        c.contact = Some("operator@example.com".into());
+        c.lexicon_names = true;
+        let snap = assemble_with(&pool, &c.managed_by(Some("acme"))).await;
+
+        assert_eq!(snap.managed.as_deref(), Some("acme"));
+        assert_eq!(snap.report_mode, "auto");
+        assert!(snap.contact.is_none());
+        assert!(snap.lexicons.names.is_none());
+        assert_eq!(
+            snap.host["configured_setting_keys"],
+            serde_json::json!(["app_name"])
+        );
+        assert_eq!(snap.host["configured_other_setting_keys"], 1);
+        assert_eq!(snap.totals["records"], 1);
+
+        let mut seen = Vec::new();
+        strings(&serde_json::to_value(&snap).unwrap(), &mut seen);
+        for s in &seen {
+            assert!(
+                !s.contains('@') && !s.contains("did:") && !s.contains("alice"),
+                "a managed snapshot carried {s:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_snapshot_names_every_configured_key() {
+        let pool = pool_for_assembly().await;
+        put_setting(&pool, "app_name", "Example").await;
+        put_setting(&pool, "my_custom_key", "x").await;
+
+        let snap = assemble_with(&pool, &consent(TelemetryMode::Auto)).await;
+
+        assert!(snap.managed.is_none());
+        assert_eq!(
+            snap.host["configured_setting_keys"],
+            serde_json::json!(["app_name", "my_custom_key"])
+        );
+        assert!(!snap.host.contains_key("configured_other_setting_keys"));
     }
 
     #[tokio::test]
@@ -374,11 +502,12 @@ mod tests {
             .unwrap();
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await;
 
@@ -395,11 +524,12 @@ mod tests {
         let recorded = health::note_restart(&pool, DatabaseBackend::Sqlite).await;
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -410,20 +540,6 @@ mod tests {
     #[tokio::test]
     async fn job_runtime_seconds_round_trips_into_totals() {
         let pool = pool_for_assembly().await;
-        crate::db::query(
-            "CREATE TABLE happyview_jobs (
-                id TEXT PRIMARY KEY,
-                job_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_by TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create jobs");
         crate::db::query(
             "INSERT INTO happyview_jobs
                (id, job_type, status, created_by, started_at, completed_at, created_at)
@@ -436,15 +552,103 @@ mod tests {
         .expect("insert completed job");
 
         let snap = assemble(
-            &pool,
-            DatabaseBackend::Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
 
         assert_eq!(snap.totals.get("job_runtime_seconds"), Some(&60));
+    }
+
+    #[tokio::test]
+    async fn a_project_lexicon_is_counted_though_it_has_no_row() {
+        use crate::lexicon::{ParsedLexicon, ProcedureAction};
+        use crate::project::snapshot::{ProjectLexicon, ProjectSnapshot};
+
+        let parsed = ParsedLexicon::parse(
+            serde_json::json!({
+                "lexicon": 1,
+                "id": "com.example.project.thing",
+                "defs": { "main": { "type": "record", "key": "tid",
+                    "record": { "type": "object", "properties": {} } } }
+            }),
+            0,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        let mut project = ProjectSnapshot::empty();
+        project.lexicons.insert(
+            parsed.id.clone(),
+            ProjectLexicon {
+                parsed,
+                path: "lexicons/thing.json".into(),
+                backfill: false,
+                indexed: true,
+            },
+        );
+        let catalog = LexiconCatalog::new(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            project,
+        )));
+
+        let pool = pool_for_assembly().await;
+        let snap = assemble(
+            &crate::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Sqlite),
+            "sqlite::memory:",
+            &consent(TelemetryMode::Auto),
+            &Counters::new(),
+            &catalog,
+            &*happyview_source_jetstream::JetstreamSource::detached(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snap.lexicons.count, 1);
+        assert!(snap.features["lexicons"].ever);
+    }
+
+    /// The backfill tables and the `backfill` feature come from the record
+    /// source, under the keys the payload has always had.
+    #[tokio::test]
+    async fn the_record_source_reports_its_tables_and_features() {
+        let state = crate::test_support::test_state_with_pool(pool_for_assembly().await);
+        crate::db::query(
+            "INSERT INTO happyview_backfill_jobs (id, collection, status, created_at) \
+             VALUES ('job', 'com.example.thing', 'completed', ?)",
+        )
+        .bind(crate::db::now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let snap = assemble(
+            &state.records,
+            "sqlite::memory:",
+            &consent(TelemetryMode::Auto),
+            &Counters::new(),
+            &LexiconCatalog::detached(),
+            state.source.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        for key in [
+            "backfill_repos",
+            "backfill_queue",
+            "backfill_completions",
+            "backfill_pds_stats",
+            "backfill_cursors",
+        ] {
+            assert_eq!(snap.totals.get(key), Some(&0), "{key}");
+        }
+        assert!(!snap.totals.keys().any(|k| k.starts_with("feature.")));
+        let backfill = snap.features["backfill"];
+        assert!(backfill.ever && backfill.active);
     }
 }

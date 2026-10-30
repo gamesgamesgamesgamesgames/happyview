@@ -88,7 +88,19 @@ async fn seed_procedure_lexicon(app: &TestApp) {
         .unwrap();
 }
 
+/// The interpreter `lua` names, which a save consults and a run goes
+/// through. The subject of every test here is the access check in front of
+/// the script, so the echo fixture is enough: it accepts any body and answers
+/// any run.
+async fn install_lua_interpreter(app: &TestApp) {
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
+}
+
 async fn seed_procedure_script(app: &TestApp, body: &str) {
+    install_lua_interpreter(app).await;
     let resp = app
         .router
         .clone()
@@ -467,7 +479,7 @@ async fn service_auth_procedure_allowed() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     let entry_id = app
         .create_service_entry("#chess", "ChessAppView", "specific")
@@ -509,7 +521,7 @@ async fn service_auth_procedure_denied() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "specific")
         .await;
@@ -553,7 +565,7 @@ async fn token_scope_enforcement() {
 
     seed_procedure_script(
         &app,
-        "function handle(input, params)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
+        "local xrpc = require('happyview.xrpc')\nfunction handle(input, ctx)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
     ).await;
 
     let entry_id = app
@@ -593,6 +605,64 @@ async fn token_scope_enforcement() {
     );
 }
 
+/// The scope check reads the outbound list of the script that will answer, so
+/// a project file's list is enforced even though no row declares one.
+#[tokio::test]
+#[serial]
+async fn token_scope_is_checked_against_a_project_scripts_outbound_list() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_procedure_lexicon(&app).await;
+    seed_procedure_script(&app, "function handle() return {} end").await;
+
+    let trigger = "xrpc.procedure:games.gamesgamesgamesgames.createGame";
+    let mut snap = common::project::snapshot();
+    common::project::add_script(&mut snap, trigger, "project", "src/lexicons/createGame.lua");
+    snap.scripts.get_mut(trigger).unwrap().outbound_xrpcs =
+        vec!["games.birb.chess.getGame".to_string()];
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let entry_id = app
+        .create_service_entry("#chess", "ChessAppView", "specific")
+        .await;
+    app.add_entry_xrpcs(entry_id, &["games.gamesgamesgamesgames.createGame"])
+        .await;
+    let auth = app
+        .service_auth_jwt(&plc_store, "did:plc:scopecheck", &did, "#chess")
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/games.gamesgamesgamesgames.createGame")
+                .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"title": "test"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("games.birb.chess.getGame"),
+        "error should list the project script's outbound XRPC"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Edge cases — identity modes, invalid JWTs, missing fragments
 // ---------------------------------------------------------------------------
@@ -606,7 +676,7 @@ async fn not_exposed_rejects_service_auth() {
     app.setup_not_exposed().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     let auth = app
         .raw_service_auth_jwt(
@@ -650,7 +720,7 @@ async fn wrong_aud_rejects_service_auth() {
     let _did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -697,7 +767,7 @@ async fn expired_jwt_rejects_service_auth() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -863,7 +933,7 @@ async fn scope_check_applies_with_access_mode_all() {
     seed_procedure_lexicon(&app).await;
     seed_procedure_script(
         &app,
-        "function handle(input, params)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
+        "local xrpc = require('happyview.xrpc')\nfunction handle(input, ctx)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
     ).await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
@@ -909,7 +979,7 @@ async fn aud_missing_fragment_rejects() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -985,6 +1055,7 @@ async fn anonymous_access_still_works() {
 async fn static_analysis_persistence() {
     common::require_db!();
     let app = TestApp::new().await;
+    install_lua_interpreter(&app).await;
 
     app.router
         .clone()
@@ -1021,7 +1092,7 @@ async fn static_analysis_persistence() {
             &json!({
                 "id": "xrpc.procedure:games.gamesgamesgamesgames.createGame",
                 "script_type": "lua",
-                "body": "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
+                "body": "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend",
                 "description": "test procedure"
             }),
         ))
@@ -1053,7 +1124,7 @@ async fn static_analysis_persistence() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "body": "function handle(input, params)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend"
+                        "body": "local xrpc = require('happyview.xrpc')\nfunction handle(input, ctx)\nlocal x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend"
                     }))
                     .unwrap(),
                 ))
@@ -1085,7 +1156,7 @@ async fn static_analysis_persistence() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "body": "function handle(input, params)\n-- local x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend"
+                        "body": "local xrpc = require('happyview.xrpc')\nfunction handle(input, ctx)\n-- local x = xrpc.query('games.birb.chess.getGame', {})\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend"
                     }))
                     .unwrap(),
                 ))
@@ -1122,7 +1193,7 @@ async fn forbidden_jwt_typ_rejected() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -1176,7 +1247,7 @@ async fn unsupported_did_method_rejected() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -1228,7 +1299,7 @@ async fn jwt_without_aud_field_rejected() {
     let _did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -1710,7 +1781,7 @@ async fn anonymous_procedure_rejected() {
     app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     let resp = app
         .router
@@ -1880,7 +1951,7 @@ async fn unsupported_jwt_algorithm_rejected() {
     let did = app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     app.create_service_entry("#chess", "ChessAppView", "all")
         .await;
@@ -1993,7 +2064,7 @@ async fn get_to_procedure_endpoint_rejected() {
     app.setup_did_web().await;
 
     seed_procedure_lexicon(&app).await;
-    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
 
     let resp = app
         .router
@@ -2272,7 +2343,8 @@ async fn seed_super_user(app: &TestApp, did: &str) {
         .expect("seed super user");
 }
 
-/// A service-auth JWT addressed to THIS instance authenticates on an admin route.
+/// A service-auth JWT addressed to THIS instance and bound to the admin method
+/// authenticates on an admin route.
 #[tokio::test]
 #[serial]
 async fn service_auth_correct_aud_accepted_on_admin_route() {
@@ -2284,9 +2356,18 @@ async fn service_auth_correct_aud_accepted_on_admin_route() {
     let issuer = "did:plc:h6-good-issuer";
     seed_super_user(&app, issuer).await;
 
-    let exp = chrono::Utc::now().timestamp() as u64 + 60;
     let auth = app
-        .raw_service_auth_jwt(&plc_store, issuer, &format!("{instance_did}#appview"), exp)
+        .custom_service_auth_jwt(
+            &plc_store,
+            issuer,
+            json!({"alg": "ES256"}),
+            json!({
+                "iss": issuer,
+                "aud": format!("{instance_did}#appview"),
+                "exp": chrono::Utc::now().timestamp() as u64 + 60,
+                "lxm": happyview::auth::admin_scope::ADMIN_LXM,
+            }),
+        )
         .await;
 
     let resp = app

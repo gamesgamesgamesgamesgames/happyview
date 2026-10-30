@@ -11,10 +11,14 @@ fn domain_scopes() -> Vec<Scope> {
     vec![Scope::Known(KnownScope::Atproto)]
 }
 
-fn instance_scopes() -> Vec<Scope> {
+/// What the instance client advertises. The attached account signs in through
+/// it and publishes the instance's lexicons with the schema scope; the plain
+/// dashboard login asks for less.
+pub fn instance_scopes() -> Vec<Scope> {
     vec![
         Scope::Known(KnownScope::Atproto),
         Scope::Unknown("identity:*".to_string()),
+        Scope::Unknown(crate::lexicon_publishing::SCHEMA_WRITE_SCOPE.to_string()),
     ]
 }
 

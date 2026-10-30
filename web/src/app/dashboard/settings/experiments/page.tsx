@@ -1,45 +1,45 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useState } from "react"
-import { IconAlertTriangle } from "@tabler/icons-react"
+import { useCallback, useEffect, useState } from "react";
+import { IconAlertTriangle } from "@tabler/icons-react";
 
-import { useCurrentUser } from "@/hooks/use-current-user"
-import { getFeatureFlags, setFeatureFlag, type FeatureFlag } from "@/lib/api"
-import { SiteHeader } from "@/components/site-header"
-import { Switch } from "@/components/ui/switch"
-import { Label } from "@/components/ui/label"
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { getFeatureFlags, setFeatureFlag, type FeatureFlag } from "@/lib/api";
+import { SiteHeader } from "@/components/site-header";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 
 export default function ExperimentsPage() {
-  const { hasPermission } = useCurrentUser()
-  const canManage = hasPermission("settings:manage")
+  const { hasPermission } = useCurrentUser();
+  const canManage = hasPermission("settings:manage");
 
-  const [flags, setFlags] = useState<FeatureFlag[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [toggling, setToggling] = useState<string | null>(null)
+  const [flags, setFlags] = useState<FeatureFlag[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const data = await getFeatureFlags()
-      setFlags(data)
+      const data = await getFeatureFlags();
+      setFlags(data);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    load()
-  }, [load])
+    load();
+  }, [load]);
 
   async function handleToggle(flag: FeatureFlag) {
-    setError(null)
-    setToggling(flag.key)
+    setError(null);
+    setToggling(flag.key);
     try {
-      await setFeatureFlag(flag.key, !flag.enabled)
-      await load()
+      await setFeatureFlag(flag.key, !flag.enabled);
+      await load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setToggling(null)
+      setToggling(null);
     }
   }
 
@@ -92,5 +92,5 @@ export default function ExperimentsPage() {
         )}
       </div>
     </>
-  )
+  );
 }
