@@ -225,8 +225,11 @@ fn load_one(
             )]);
         }
     }
-    // Fuel is not reliably charged in a frame that catches a throw, so a
-    // module that could catch one could run past its instruction budget.
+    // A module is bounded by fuel. Wasmtime 49.0.0 dropped the fuel a callee
+    // spent when it returned by a caught `throw`; 49.0.1 fixed that
+    // (GHSA-m63x-6p34-q65x), and HappyView requires 49.0.4. A module that
+    // catches its own throws is still refused until fuel across a catch is
+    // something HappyView tests rather than takes from wasmtime's changelog.
     if sections.uses_exceptions {
         return Err(vec![error(
             &artifact,
