@@ -62,6 +62,7 @@ export default defineConfig({
         "lexicon-publishing.spec.ts",
         "plugin-readme-highlighting.spec.ts",
         "dynamic-route-navigation.spec.ts",
+        "instance-unavailable.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
