@@ -13,7 +13,6 @@ use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
 use crate::script::{DispatchError, Invocation, ScriptOrigin, dispatch};
-use crate::telemetry::counters::Counters;
 
 use super::context;
 use super::scripts::{ResolvedScript, trigger_of};
@@ -22,21 +21,6 @@ use super::scripts::{ResolvedScript, trigger_of};
 /// host's, so the sentence is the host's rather than whatever text the
 /// interpreter raised on its way out.
 const EXECUTION_LIMIT_MESSAGE: &str = "script exceeded execution time limit";
-
-struct ScriptTimingGuard {
-    counters: Arc<Counters>,
-    start: Instant,
-}
-
-impl Drop for ScriptTimingGuard {
-    fn drop(&mut self) {
-        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
-        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_us, elapsed_us);
-        self.counters
-            .script_executions
-            .fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 /// The text after the auth-error prefix, wherever it sits in the message.
 /// An interpreter wraps a raised error in context of its own, so the prefix is
@@ -184,10 +168,6 @@ pub async fn execute_procedure_script(
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
-    let _script_timing = ScriptTimingGuard {
-        counters: state.telemetry_counters.clone(),
-        start,
-    };
     let backend = state.db_backend;
     let span = tracing::info_span!(
         "script.execute",
@@ -369,10 +349,6 @@ pub async fn execute_query_script(
     space_ctx: Option<&context::SpaceContext>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
-    let _script_timing = ScriptTimingGuard {
-        counters: state.telemetry_counters.clone(),
-        start,
-    };
     let backend = state.db_backend;
     let span = tracing::info_span!("script.execute", method = method, script_type = "query",);
     span.in_scope(|| tracing::info!("script execution started"));
@@ -802,8 +778,8 @@ mod tests {
         assert!(message.contains("plugins page"), "{body}");
     }
 
-    /// The guard reports a run whatever became of it, so a counter cannot be
-    /// lost to a path that returns early.
+    /// Dispatch counts a run whatever became of it, so a counter cannot be
+    /// lost to a path that returns early, and counts it once.
     #[tokio::test]
     async fn a_run_that_reached_no_interpreter_still_moves_the_script_counters() {
         let state = test_state_with_pool(memory_pool().await);
@@ -823,6 +799,9 @@ mod tests {
         .expect_err("no interpreter is installed, so the run cannot happen");
 
         assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+        let rows = state.metrics.scripts(crate::metrics::Window::Hour);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stats.outcomes.get("no_interpreter"), Some(&1));
     }
 
     async fn executed_event_count(state: &AppState) -> i64 {

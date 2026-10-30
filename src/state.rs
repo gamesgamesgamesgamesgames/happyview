@@ -124,6 +124,7 @@ pub fn state_with_pool_on(
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
+        metrics: Arc::new(crate::metrics::ScriptMetrics::new()),
         integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };

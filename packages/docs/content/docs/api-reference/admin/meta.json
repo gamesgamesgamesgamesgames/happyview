@@ -12,6 +12,7 @@
     "backfill",
     "jobs",
     "events",
+    "metrics",
     "api-keys",
     "users",
     "identity",

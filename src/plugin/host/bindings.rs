@@ -1281,6 +1281,10 @@ impl<'l> HostImports<'l> {
     /// charged to the script. A job run whose worker lost its lease traps on
     /// entry instead, so the import's side effect does not happen alongside
     /// the run that took the job over.
+    ///
+    /// A measured script run is told how long the import took. That span
+    /// includes the guest allocation `write_guest_response` makes for the
+    /// answer, a few microseconds of guest time counted as host time.
     pub(crate) fn define<Params, R, F>(
         &mut self,
         name: &'static str,
@@ -1308,7 +1312,17 @@ impl<'l> HostImports<'l> {
                         return Err(wasmtime::Error::msg(LEASE_LOST));
                     }
                     suspend_guest_deadline(&mut caller);
+                    let started = std::time::Instant::now();
                     let out = f(&mut caller, params).await;
+                    let elapsed = started.elapsed();
+                    if let Some(metrics) = caller
+                        .data()
+                        .script_run
+                        .as_ref()
+                        .and_then(|run| run.metrics.as_ref())
+                    {
+                        metrics.record_host(name, elapsed);
+                    }
                     resume_guest_deadline(&mut caller);
                     Ok(out)
                 })

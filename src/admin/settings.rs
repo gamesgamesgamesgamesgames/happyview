@@ -38,6 +38,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("tos_uri", "TOS_URI"),
     ("policy_uri", "POLICY_URI"),
     ("script_instruction_limit", "SCRIPT_INSTRUCTION_LIMIT"),
+    (crate::metrics::ENABLED_KEY, "SCRIPT_METRICS_ENABLED"),
     ("script_wall_clock_seconds", "SCRIPT_WALL_CLOCK_SECONDS"),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
@@ -107,15 +108,18 @@ pub async fn try_get_setting(
     Ok(env_var_for(key).and_then(vars::var))
 }
 
-/// The script budgets are read from a cache rather than the database on
-/// every run, so a write to one of them is folded in here instead of waiting
-/// for the next poll.
-async fn refresh_script_limits(state: &AppState, key: &str) {
+/// The script budgets and the metrics switch are read from a cache rather
+/// than the database on every run, so a write to one of them is folded in
+/// here instead of waiting for the next poll.
+async fn refresh_cached_setting(state: &AppState, key: &str) {
     if script_limits::is_limit_key(key) {
         state
             .script_limits
             .refresh(&state.db, state.db_backend)
             .await;
+    }
+    if key == crate::metrics::ENABLED_KEY {
+        state.metrics.refresh(&state.db, state.db_backend).await;
     }
 }
 
@@ -180,6 +184,7 @@ pub(super) async fn upsert(
         super::telemetry::refuse_if_managed(&state)?;
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
         crate::csrf::validate_origins(&body.value).map_err(AppError::BadRequest)?;
     }
@@ -187,7 +192,7 @@ pub(super) async fn upsert(
     put_setting(&state.db, &key, &body.value, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
-    refresh_script_limits(&state, &key).await;
+    refresh_cached_setting(&state, &key).await;
     if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
         state.integration_origins.forget().await;
     }
@@ -233,7 +238,7 @@ pub(super) async fn delete(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
-    refresh_script_limits(&state, &key).await;
+    refresh_cached_setting(&state, &key).await;
     if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
         state.integration_origins.forget().await;
     }

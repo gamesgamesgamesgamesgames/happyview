@@ -148,6 +148,7 @@ It also covers reading what is deployed. A deploy can add, change and remove eve
 | `stats:read` | View collection statistics and record counts |
 | `events:read` | View the event log                      |
 | `events:purge` | Bulk-delete event log entries matching a filter |
+| `metrics:read` | View script run counts, latency, errors and resource use |
 
 ## Permission templates
 
@@ -155,9 +156,9 @@ Templates are predefined sets of permissions that simplify user creation. Pass a
 
 ### Viewer
 
-Read-only access. Can browse lexicons, records, scripts, stats, events, dead letters, and user lists but cannot modify anything.
+Read-only access. Can browse lexicons, records, scripts, stats, events, metrics, dead letters, and user lists but cannot modify anything.
 
-Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `dead-letters:read`
+Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `metrics:read`, `dead-letters:read`
 
 ### Operator
 

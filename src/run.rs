@@ -1061,6 +1061,8 @@ async fn boot(
 
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
+    let metrics = std::sync::Arc::new(crate::metrics::ScriptMetrics::new());
+    metrics.refresh(&db_pool, db_backend).await;
 
     let mut records = crate::record_store::RecordStore::shared(db_pool.clone(), db_backend)
         .await
@@ -1101,6 +1103,7 @@ async fn boot(
         client_jwks,
         telemetry_counters,
         script_limits,
+        metrics,
         integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };
@@ -1190,6 +1193,11 @@ async fn boot(
 
     tokio::spawn(crate::lua::limits::run_refresh_loop(
         state.script_limits.clone(),
+        state.db.clone(),
+        state.db_backend,
+    ));
+    tokio::spawn(crate::metrics::run_refresh_loop(
+        state.metrics.clone(),
         state.db.clone(),
         state.db_backend,
     ));
