@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ADMIN_GRANT: &str = "atproto rpc:dev.happyview.admin.manage?aud=*";
@@ -49,16 +49,7 @@ async fn authorization_server(
     listed: bool,
     responses: &[Value],
 ) -> MockServer {
-    let server = MockServer::start().await;
-    let issuer = server.uri();
-    Mock::given(method("GET"))
-        .and(path("/.well-known/oauth-authorization-server"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "issuer": issuer,
-            "token_endpoint": format!("{issuer}/oauth/token"),
-        })))
-        .mount(&server)
-        .await;
+    let server = issuer(app, did, listed).await;
     let (last, first) = responses.split_last().unwrap();
     for response in first {
         Mock::given(method("POST"))
@@ -71,6 +62,47 @@ async fn authorization_server(
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(last))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// An authorization server whose token endpoint answers a refresh by the
+/// session it comes from: each of `responses` is keyed to the access token
+/// a session was registered with, through [`refresh_token_for`].
+async fn keyed_authorization_server(
+    app: &common::app::TestApp,
+    did: &str,
+    responses: &[(&str, Value)],
+) -> MockServer {
+    let server = issuer(app, did, true).await;
+    for (access_token, response) in responses {
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains(refresh_token_for(access_token)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+/// The refresh token a session registered with `access_token` holds.
+fn refresh_token_for(access_token: &str) -> String {
+    format!("{access_token}-refresh")
+}
+
+/// An issuer with metadata and no token endpoint, listed by `did`'s PDS when
+/// `listed`.
+async fn issuer(app: &common::app::TestApp, did: &str, listed: bool) -> MockServer {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/oauth/token"),
+        })))
         .mount(&server)
         .await;
 
@@ -191,7 +223,7 @@ async fn sign_in_as(
                 "pkce_verifier": verifier,
                 "did": did,
                 "access_token": access_token,
-                "refresh_token": "registered-refresh-token",
+                "refresh_token": refresh_token_for(access_token),
                 "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "scopes": claimed_scope,
                 "issuer": issuer,
@@ -299,21 +331,24 @@ async fn any_apps_session_is_held_to_the_grant() {
         origin: Some(origin),
     };
 
-    // One session per grant, in order: the server answers each one's first
-    // refresh with the next response.
+    // One session per grant, each answered by its own refresh token, so the
+    // order the sessions refresh in does not matter.
     let cases = [
-        ("atproto transition:generic", StatusCode::FORBIDDEN),
-        (ADMIN_GRANT, StatusCode::OK),
+        (
+            "generic-token",
+            "atproto transition:generic",
+            StatusCode::FORBIDDEN,
+        ),
+        ("granted-token", ADMIN_GRANT, StatusCode::OK),
     ];
-    let responses: Vec<Value> = cases
+    let responses: Vec<(&str, Value)> = cases
         .iter()
-        .map(|(granted, _)| token_response(&did, granted, 3600))
+        .map(|(token, granted, _)| (*token, token_response(&did, granted, 3600)))
         .collect();
-    let server = authorization_server(&app, &did, true, &responses).await;
-    for (i, (granted, expected)) in cases.into_iter().enumerate() {
-        let token = format!("app-token-{i}");
-        let (_, dpop_key) = sign_in_as(&app, &client, &did, &server.uri(), "atproto", &token).await;
-        let (status, body) = dpop_get_as(&app, &client, "/admin/plugins", &dpop_key, &token).await;
+    let server = keyed_authorization_server(&app, &did, &responses).await;
+    for (token, granted, expected) in cases.into_iter().rev() {
+        let (_, dpop_key) = sign_in_as(&app, &client, &did, &server.uri(), "atproto", token).await;
+        let (status, body) = dpop_get_as(&app, &client, "/admin/plugins", &dpop_key, token).await;
         assert_eq!(status, expected, "granted {granted}: {body}");
     }
 }
