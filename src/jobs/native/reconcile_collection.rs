@@ -3,15 +3,21 @@
 //!
 //! A delete that arrives while a collection isn't tracked never reaches the
 //! index, so the record stays served after its owner deleted it (HAP-245).
-//! This checks each account's stored rows against its PDS and sends each
-//! one the PDS no longer has through the normal delete path, so a delete
-//! hook still has its say (a keep-on-delete hook keeps the record).
+//! This checks each account's stored rows against its PDS and deletes each
+//! one the PDS no longer has. A delete hook still has its say: a
+//! keep-on-delete hook keeps the record, and so does a hook that fails,
+//! because this job infers the delete rather than hearing it from the
+//! network.
 //!
 //! It deletes nothing it can't be sure of:
 //!
 //! - The stored rows are read before the PDS is asked, so a record created
 //!   meanwhile is never a candidate, and each candidate is confirmed missing
-//!   with `getRecord` before anything is done.
+//!   with `getRecord` before anything is done. Only a `RecordNotFound`
+//!   answer confirms a miss; a bare 404 is what a proxy gives too.
+//! - A delete removes the row only while it still has the CID and rev it
+//!   had when it was read, so a record recreated at the same key meanwhile
+//!   stays.
 //! - Only a complete, all-2xx listing counts. A failed page, a missing or
 //!   deactivated repo, or a PDS that can't be reached skips the account.
 //! - A listing that is empty, or misses most of what is stored, skips the
@@ -26,11 +32,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use happyview_provider::{Action, Origin, RecordEvent, RecordKey, SourceEvent};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::AppState;
+use crate::event_log::{EventLog, Severity, log_event};
+use crate::lua::{RecordEventPayload, RecordHookOutcome};
 
 use super::super::{Job, db as jobs_db};
 use super::NativeOutcome;
@@ -92,9 +99,14 @@ pub struct Report {
     pub missing_total: usize,
     /// Candidates `getRecord` didn't confirm missing, and left alone.
     pub unconfirmed_total: usize,
-    /// In an apply: missing records deleted, and those a delete hook kept.
+    /// In an apply: missing records deleted, those a delete hook kept, those
+    /// kept because the hook failed, those changed or removed since they
+    /// were read, and those whose delete failed.
     pub deleted: usize,
     pub kept_by_hook: usize,
+    pub hook_failed: usize,
+    pub changed_since_check: usize,
+    pub failed: usize,
     /// Records whose stored CID isn't the PDS's (the first
     /// [`STALE_LISTED`]). Reported only.
     pub stale_cid: Vec<StaleCid>,
@@ -117,6 +129,9 @@ pub struct Skipped {
 pub struct Missing {
     pub uri: String,
     pub cid: Option<String>,
+    /// `missing` in a dry run; in an apply `deleted`, `kept_by_hook`,
+    /// `hook_failed`, `changed_since_check` or `failed`.
+    pub outcome: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,9 +157,19 @@ pub fn refusal(state: &AppState, collection: &str) -> Option<String> {
     if collection.trim().is_empty() {
         return Some("collection is required".into());
     }
-    state.records.external_route(collection).is_some().then(|| {
-        format!(
+    if collection == crate::record_handler::LEXICON_SCHEMA_COLLECTION {
+        return Some(format!(
+            "'{collection}' records are lexicon schemas this instance tracks, not indexed records, so they cannot be reconciled"
+        ));
+    }
+    if state.records.external_route(collection).is_some() {
+        return Some(format!(
             "'{collection}' is served from a shared record store, so this instance cannot reconcile its records: a stale record there belongs to every instance reading that store. Reconcile it on the store."
+        ));
+    }
+    (!state.lexicons.is_indexed(collection)).then(|| {
+        format!(
+            "'{collection}' is not an indexed record collection here, so nothing would apply its deletes. Index it first."
         )
     })
 }
@@ -179,20 +204,22 @@ pub async fn reconcile(
         None => held_dids(state, &options.collection).await?,
     };
     let total = dids.len();
-    for (done, did) in dids.iter().enumerate() {
-        if let Some(id) = job_id
-            && let Some(reason) = jobs_db::should_stop(state, id).await
-        {
-            report.stopped = Some(reason.to_string());
+    let mut done = 0;
+    for did in &dids {
+        if stop_asked(state, job_id, &mut report).await {
             break;
         }
         check(state, &mut pacer, options, job_id, did, &mut report).await;
+        if report.stopped.is_some() {
+            break;
+        }
+        done += 1;
         if let Some(id) = job_id {
             let _ = jobs_db::update_progress(
                 state,
                 id,
                 &serde_json::json!({
-                    "dids_done": done + 1,
+                    "dids_done": done,
                     "dids_total": total,
                     "missing": report.missing_total,
                     "deleted": report.deleted,
@@ -201,7 +228,37 @@ pub async fn reconcile(
             .await;
         }
     }
+    // A stopped job's result is not kept, so what it already did goes in
+    // its progress.
+    if let (Some(id), Some(_)) = (job_id, &report.stopped) {
+        let _ = jobs_db::update_progress(
+            state,
+            id,
+            &serde_json::json!({
+                "dids_done": done,
+                "dids_total": total,
+                "missing": report.missing_total,
+                "deleted": report.deleted,
+                "report": &report,
+            }),
+        )
+        .await;
+    }
     Ok(report)
+}
+
+/// Whether the job has been paused or cancelled; notes it in `report`.
+async fn stop_asked(state: &AppState, job_id: Option<&str>, report: &mut Report) -> bool {
+    let Some(id) = job_id else {
+        return false;
+    };
+    match jobs_db::should_stop(state, id).await {
+        Some(reason) => {
+            report.stopped = Some(reason.to_string());
+            true
+        }
+        None => false,
+    }
 }
 
 /// Every account holding network rows of `collection`.
@@ -246,7 +303,7 @@ async fn check(
     };
     // Read before the PDS is asked: a record created after this can't be a
     // candidate.
-    let stored = match state.records.network_rows_of(did, collection).await {
+    let stored = match state.records.network_keys_of(did, collection).await {
         Ok(stored) => stored,
         Err(e) => return skip(report, "store_read_failed", e.to_string()),
     };
@@ -266,7 +323,7 @@ async fn check(
     };
 
     let mut misses = Vec::new();
-    for (rkey, cid, body) in &stored {
+    for (rkey, cid, rev) in &stored {
         match listing.get(rkey) {
             Some(pds_cid) => {
                 if cid.as_deref() != Some(pds_cid.as_str()) {
@@ -280,7 +337,7 @@ async fn check(
                     }
                 }
             }
-            None => misses.push((rkey, cid, body)),
+            None => misses.push((rkey, cid, rev)),
         }
     }
     if misses.is_empty() {
@@ -302,7 +359,10 @@ async fn check(
     }
     report.dids_checked += 1;
 
-    for (rkey, cid, body) in misses {
+    for (rkey, cid, rev) in misses {
+        if stop_asked(state, job_id, report).await {
+            return;
+        }
         match confirm_missing(state, pacer, &pds, did, collection, rkey).await {
             Confirmed::Missing => {}
             Confirmed::Present | Confirmed::Unknown => {
@@ -312,42 +372,148 @@ async fn check(
         }
         let at = uri(did, collection, rkey);
         report.missing_total += 1;
+        let outcome = if options.dry_run {
+            "missing"
+        } else {
+            delete(state, job_id, &at, did, collection, rkey, cid, rev).await
+        };
+        match outcome {
+            "deleted" => report.deleted += 1,
+            "kept_by_hook" => report.kept_by_hook += 1,
+            "hook_failed" => report.hook_failed += 1,
+            "changed_since_check" => report.changed_since_check += 1,
+            "failed" => report.failed += 1,
+            _ => {}
+        }
         if report.missing.len() < MISSING_LISTED {
             report.missing.push(Missing {
-                uri: at.clone(),
+                uri: at,
                 cid: cid.clone(),
+                outcome,
             });
         }
-        if options.dry_run {
-            continue;
+    }
+}
+
+/// Delete one confirmed-missing record, after its delete hook, while it
+/// still has the `cid` and `rev` it was read with. Says what happened, as
+/// [`Missing::outcome`] names it. Every delete is logged, whatever the
+/// event-logging setting, so what an apply removed can be found later.
+#[allow(clippy::too_many_arguments)]
+async fn delete(
+    state: &AppState,
+    job_id: Option<&str>,
+    at: &str,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    cid: &Option<String>,
+    rev: &Option<String>,
+) -> &'static str {
+    let body = match state.records.get(at).await {
+        Ok(Some(row)) => serde_json::from_str::<serde_json::Value>(&row.record).ok(),
+        Ok(None) => return "changed_since_check",
+        Err(e) => {
+            tracing::warn!(uri = %at, error = %e, "reconcile could not read a record to delete");
+            return "failed";
         }
-        let event = RecordEvent {
-            key: RecordKey {
-                did: did.to_string(),
-                collection: collection.clone(),
-                rkey: rkey.clone(),
-            },
-            action: Action::Delete,
-            cid: cid.clone(),
-            rev: None,
-            body: serde_json::from_str(body).ok(),
-            time_us: None,
-            origin: Origin::Backfill {
-                job_id: job_id.unwrap_or(JOB_TYPE).to_string(),
-            },
-            stored: false,
-        };
-        // Its outcome doesn't say whether a delete hook kept the record;
-        // what is stored now does.
-        let _ = crate::ingest::apply(state, SourceEvent::Record(event)).await;
-        match state.records.get(&at).await {
-            Ok(None) => report.deleted += 1,
-            Ok(Some(_)) => report.kept_by_hook += 1,
-            Err(e) => {
-                tracing::warn!(uri = %at, error = %e, "reconcile could not read back a delete")
-            }
+    };
+    let hook = crate::lua::scripts::run_record_event_script_strict(
+        state,
+        RecordEventPayload {
+            nsid: collection,
+            action: "delete",
+            uri: at,
+            did,
+            rkey,
+            record: body.as_ref(),
+        },
+    )
+    .await;
+    let job = job_id.unwrap_or(JOB_TYPE);
+    match hook {
+        Ok(RecordHookOutcome::Skip) => return "kept_by_hook",
+        Ok(_) => {}
+        Err(error) => {
+            reconcile_log(
+                state,
+                "record.delete_hook_failed",
+                Severity::Warn,
+                at,
+                job,
+                cid,
+                Some(&error),
+            )
+            .await;
+            return "hook_failed";
         }
     }
+    let now = crate::db::now_rfc3339();
+    let deleted = crate::db::with_change_reason(
+        Some("backfill".to_string()),
+        crate::db::retry_on_busy(|| {
+            state.records.delete_network_if_unchanged(
+                &state.db,
+                at,
+                did,
+                collection,
+                cid.as_deref(),
+                rev.as_deref(),
+                &now,
+            )
+        }),
+    )
+    .await;
+    match deleted {
+        Ok(true) => {
+            reconcile_log(state, "record.deleted", Severity::Info, at, job, cid, None).await;
+            "deleted"
+        }
+        Ok(false) => "changed_since_check",
+        Err(e) => {
+            let error = e.to_string();
+            tracing::warn!(uri = %at, %error, "reconcile could not delete a record");
+            reconcile_log(
+                state,
+                "record.deleted",
+                Severity::Error,
+                at,
+                job,
+                cid,
+                Some(&error),
+            )
+            .await;
+            "failed"
+        }
+    }
+}
+
+async fn reconcile_log(
+    state: &AppState,
+    event_type: &str,
+    severity: Severity,
+    at: &str,
+    job_id: &str,
+    cid: &Option<String>,
+    error: Option<&str>,
+) {
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: event_type.to_string(),
+            severity,
+            actor_did: None,
+            subject: Some(at.to_string()),
+            detail: serde_json::json!({
+                "origin": JOB_TYPE,
+                "job_id": job_id,
+                "cid": cid,
+                "error": error,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
 }
 
 fn uri(did: &str, collection: &str, rkey: &str) -> String {
@@ -387,7 +553,9 @@ async fn list_records(
     let mut seen_cursors = HashSet::new();
     loop {
         let mut url = format!(
-            "{base}/xrpc/com.atproto.repo.listRecords?repo={did}&collection={collection}&limit=100"
+            "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
+            urlencoding::encode(did),
+            urlencoding::encode(collection)
         );
         if let Some(c) = &cursor {
             url.push_str("&cursor=");
@@ -408,7 +576,15 @@ async fn list_records(
             }
         }
         match page.cursor {
-            Some(next) if !empty => {
+            // A PDS that pages on must have listed something; an empty page
+            // that claims more can't be trusted to have shown everything.
+            Some(_) if empty => {
+                return Err(Unusable {
+                    reason: "listing_failed",
+                    detail: "listRecords answered an empty page with a cursor".into(),
+                });
+            }
+            Some(next) => {
                 if !seen_cursors.insert(next.clone()) {
                     return Err(Unusable {
                         reason: "listing_failed",
@@ -417,7 +593,7 @@ async fn list_records(
                 }
                 cursor = Some(next);
             }
-            _ => return Ok(listing),
+            None => return Ok(listing),
         }
     }
 }
@@ -456,8 +632,10 @@ enum Confirmed {
     Unknown,
 }
 
-/// Whether `getRecord` says the record is gone: a 404, or a 400 naming
-/// `RecordNotFound`. Anything else leaves it alone.
+/// Whether `getRecord` says the record is gone: a 400 or 404 whose JSON
+/// names `RecordNotFound`. A bare 404 is what a proxy or a PDS that doesn't
+/// route the method answers too, so it, like anything else, leaves the
+/// record alone.
 async fn confirm_missing(
     state: &AppState,
     pacer: &mut Pacer,
@@ -467,24 +645,32 @@ async fn confirm_missing(
     rkey: &str,
 ) -> Confirmed {
     let url = format!(
-        "{}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={}",
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
         pds.trim_end_matches('/'),
+        urlencoding::encode(did),
+        urlencoding::encode(collection),
         urlencoding::encode(rkey)
     );
     match get(state, pacer, &url).await {
-        Ok((status, _)) if status.is_success() => Confirmed::Present,
-        Ok((status, _)) if status == reqwest::StatusCode::NOT_FOUND => Confirmed::Missing,
-        Ok((status, body)) if status == reqwest::StatusCode::BAD_REQUEST => {
-            let error = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string));
-            if error.as_deref() == Some("RecordNotFound") {
-                Confirmed::Missing
-            } else {
-                Confirmed::Unknown
-            }
-        }
-        _ => Confirmed::Unknown,
+        Ok((status, body)) => getrecord_answer(status, &body),
+        Err(_) => Confirmed::Unknown,
+    }
+}
+
+fn getrecord_answer(status: reqwest::StatusCode, body: &str) -> Confirmed {
+    if status.is_success() {
+        return Confirmed::Present;
+    }
+    if status != reqwest::StatusCode::BAD_REQUEST && status != reqwest::StatusCode::NOT_FOUND {
+        return Confirmed::Unknown;
+    }
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string));
+    if error.as_deref() == Some("RecordNotFound") {
+        Confirmed::Missing
+    } else {
+        Confirmed::Unknown
     }
 }
 
@@ -612,6 +798,34 @@ mod tests {
             listing_error(reqwest::StatusCode::BAD_GATEWAY, "upstream").reason,
             "listing_failed"
         );
+    }
+
+    #[test]
+    fn only_record_not_found_confirms_a_miss() {
+        use reqwest::StatusCode;
+        let not_found = r#"{"error":"RecordNotFound","message":"Could not locate record"}"#;
+        for status in [StatusCode::BAD_REQUEST, StatusCode::NOT_FOUND] {
+            assert!(matches!(
+                getrecord_answer(status, not_found),
+                Confirmed::Missing
+            ));
+        }
+        for (status, body) in [
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::NOT_FOUND, "<html>404 Not Found</html>"),
+            (StatusCode::NOT_FOUND, r#"{"error":"MethodNotImplemented"}"#),
+            (StatusCode::BAD_REQUEST, r#"{"error":"InvalidRequest"}"#),
+            (StatusCode::BAD_GATEWAY, not_found),
+        ] {
+            assert!(
+                matches!(getrecord_answer(status, body), Confirmed::Unknown),
+                "{status} {body}"
+            );
+        }
+        assert!(matches!(
+            getrecord_answer(StatusCode::OK, "{}"),
+            Confirmed::Present
+        ));
     }
 
     #[test]

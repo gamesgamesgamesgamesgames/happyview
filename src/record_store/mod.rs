@@ -1107,32 +1107,79 @@ impl RecordStore {
             .collect())
     }
 
-    /// Every network row `did` holds in `collection` in this instance's own
-    /// tables, by rkey: its rkey, CID and body. A local write not yet seen on
-    /// the network (`indexed_at` unset) isn't one. Not routed: a collection
-    /// external storage claims has none here.
-    pub async fn network_rows_of(
+    /// The `(rkey, cid, rev)` of every network row `did` holds in
+    /// `collection` in this instance's own tables, by rkey. Rows a local write
+    /// stored and the network has not echoed (`indexed_at` unset) are left
+    /// out. Not routed: a collection external storage claims has none here.
+    pub async fn network_keys_of(
         &self,
         did: &str,
         collection: &str,
-    ) -> Result<Vec<(String, Option<String>, String)>, sqlx::Error> {
-        let body = match self.backend {
-            DatabaseBackend::Sqlite => "hv_record(r.body, r.body_dict)",
-            DatabaseBackend::Postgres => "r.record",
-        };
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, sqlx::Error> {
         let sql = adapt_sql(
             &format!(
-                "SELECT r.rkey, hv_cid_text(r.cid), {body} FROM happyview_records_v2 r \
+                "SELECT r.rkey, hv_cid_text(r.cid), r.rev FROM happyview_records_v2 r \
                  WHERE r.did_id = {DID_ID} AND r.collection_id = {COLLECTION_ID} \
                    AND r.indexed_at IS NOT NULL ORDER BY r.rkey"
             ),
             self.backend,
         );
-        crate::db::query_as::<(String, Option<String>, String)>(&sql)
+        crate::db::query_as::<(String, Option<String>, Option<String>)>(&sql)
             .bind(did)
             .bind(collection)
             .fetch_all(&self.db)
             .await
+    }
+
+    /// [`Self::delete_network`] without a rev, but only while the stored row
+    /// still has the CID and rev it had when `expected_cid` and
+    /// `expected_rev` were read: a record recreated at the same key since
+    /// then is left alone. The check and the delete run in one transaction
+    /// under the record's locks. Returns whether a row was removed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_network_if_unchanged(
+        &self,
+        pool: &AnyPool,
+        uri: &str,
+        did: &str,
+        collection: &str,
+        expected_cid: Option<&str>,
+        expected_rev: Option<&str>,
+        now: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let backend = self.backend;
+        let Some((_, _, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(false);
+        };
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
+        crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
+        let sql = adapt_sql(
+            &format!(
+                "SELECT id, hv_cid_text(cid), rev FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ? \
+                   AND indexed_at IS NOT NULL"
+            ),
+            backend,
+        );
+        let found = crate::db::query_as::<(i64, Option<String>, Option<String>)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((id, cid, rev)) = found else {
+            return Ok(false);
+        };
+        if cid.as_deref() != expected_cid || rev.as_deref() != expected_rev {
+            return Ok(false);
+        }
+        self.delete_ids(&mut tx, &[id]).await?;
+        if let Some(rev) = rev {
+            crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &rev, now).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// [`Self::holds_local_network_records`], counting only rows older than

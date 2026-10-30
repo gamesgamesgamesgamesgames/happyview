@@ -12,9 +12,11 @@ use happyview::db::adapt_sql;
 use happyview::jobs::native::reconcile_collection::{self as reconcile, Options, Report};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
+
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Respond, ResponseTemplate};
 
 use common::app::TestApp;
 use common::fixtures;
@@ -145,6 +147,59 @@ fn options(dry_run: bool) -> Options {
     }
 }
 
+/// Answers `response`, but on its `nth` call first runs `sql` against the
+/// app's database and waits for it: what Jetstream or an operator does while
+/// the job is waiting on the PDS.
+struct Meanwhile {
+    pool: sqlx::AnyPool,
+    sql: String,
+    nth: usize,
+    calls: AtomicUsize,
+    response: ResponseTemplate,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Meanwhile {
+    fn new(app: &TestApp, sql: &str, nth: usize, response: ResponseTemplate) -> Self {
+        Self {
+            pool: app.state.db.clone(),
+            sql: adapt_sql(sql, app.state.db_backend),
+            nth,
+            calls: AtomicUsize::new(0),
+            response,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl Respond for Meanwhile {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+            let (pool, sql, runtime) = (self.pool.clone(), self.sql.clone(), self.runtime.clone());
+            std::thread::spawn(move || {
+                runtime.block_on(async {
+                    happyview::db::query(&sql)
+                        .execute(&pool)
+                        .await
+                        .expect("run the statement")
+                })
+            })
+            .join()
+            .expect("the statement's thread");
+        }
+        self.response.clone()
+    }
+}
+
+fn record_not_found() -> ResponseTemplate {
+    ResponseTemplate::new(400)
+        .set_body_json(json!({ "error": "RecordNotFound", "message": "Could not locate record" }))
+}
+
+fn get_record_path(did: &str) -> String {
+    format!("{}/xrpc/com.atproto.repo.getRecord", pds(did))
+}
+
 async fn run(app: &TestApp, options: &Options) -> Report {
     reconcile::reconcile(&app.state, options, None)
         .await
@@ -166,6 +221,7 @@ async fn a_dry_run_reports_what_an_apply_then_deletes() {
     assert_eq!(report.dids_checked, 1);
     assert_eq!(report.missing_total, 1);
     assert_eq!(report.missing[0].uri, uri(ALICE, "g1"));
+    assert_eq!(report.missing[0].outcome, "missing");
     assert_eq!(report.deleted, 0);
     assert_eq!(report.stale_cid_total, 1);
     assert_eq!(report.stale_cid[0].pds_cid, "bafynew");
@@ -173,8 +229,21 @@ async fn a_dry_run_reports_what_an_apply_then_deletes() {
 
     let report = run(&app, &options(false)).await;
     assert_eq!(report.deleted, 1);
+    assert_eq!(report.missing[0].outcome, "deleted");
     assert!(!stored(&app, ALICE, "g1").await);
     assert!(stored(&app, ALICE, "g2").await);
+    // Logged whatever the event-logging setting, so it can be found later.
+    let logged = app
+        .get_json(&format!(
+            "/admin/events?event_type=record.deleted&subject={}",
+            urlencoding::encode(&uri(ALICE, "g1"))
+        ))
+        .await;
+    assert_eq!(
+        logged["events"][0]["detail"]["origin"],
+        reconcile::JOB_TYPE,
+        "{logged}"
+    );
     assert!(
         stored(&app, ALICE, "g3").await,
         "a stale CID is only reported"
@@ -355,8 +424,259 @@ async fn a_delete_hook_that_keeps_the_record_is_honoured() {
     let report = run(&app, &options(false)).await;
     assert_eq!(report.missing_total, 1);
     assert_eq!(report.kept_by_hook, 1);
+    assert_eq!(report.missing[0].outcome, "kept_by_hook");
     assert_eq!(report.deleted, 0);
     assert!(stored(&app, ALICE, "g1").await, "the hook kept it");
+}
+
+#[tokio::test]
+async fn a_bare_404_does_not_confirm_a_miss() {
+    let app = app().await;
+    for rkey in ["g1", "g2", "g3"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    listing(&app, ALICE, &[("g3", "bafyg3")]).await;
+    // A proxy's 404, and a PDS that doesn't route getRecord.
+    for (rkey, response) in [
+        (
+            "g1",
+            ResponseTemplate::new(404).set_body_string("Not Found"),
+        ),
+        (
+            "g2",
+            ResponseTemplate::new(404).set_body_json(json!({ "error": "MethodNotImplemented" })),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(get_record_path(ALICE)))
+            .and(query_param("rkey", rkey))
+            .respond_with(response)
+            .mount(&app.mock_server)
+            .await;
+    }
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.missing_total, 0);
+    assert_eq!(report.unconfirmed_total, 2);
+    assert_eq!(report.deleted, 0);
+    assert!(stored(&app, ALICE, "g1").await);
+    assert!(stored(&app, ALICE, "g2").await);
+}
+
+#[tokio::test]
+async fn a_404_naming_record_not_found_confirms_a_miss() {
+    let app = app().await;
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    listing(&app, ALICE, &[("g2", "bafyg2")]).await;
+    Mock::given(method("GET"))
+        .and(path(get_record_path(ALICE)))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({ "error": "RecordNotFound" })),
+        )
+        .mount(&app.mock_server)
+        .await;
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.deleted, 1);
+    assert!(!stored(&app, ALICE, "g1").await);
+}
+
+#[tokio::test]
+async fn an_empty_page_that_carries_a_cursor_fails_the_listing() {
+    let app = app().await;
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    let list = format!("{}/xrpc/com.atproto.repo.listRecords", pds(ALICE));
+    Mock::given(method("GET"))
+        .and(path(list.clone()))
+        .and(query_param("cursor", "next"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(ALICE, &[], Some("more"))))
+        .mount(&app.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(list))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            ALICE,
+            &[("g2", "bafyg2")],
+            Some("next"),
+        )))
+        .mount(&app.mock_server)
+        .await;
+    get_record(&app, ALICE, "g1", true).await;
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.dids_skipped[0].reason, "listing_failed");
+    assert_eq!(report.deleted, 0);
+    assert!(stored(&app, ALICE, "g1").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_recreated_after_its_check_is_kept() {
+    let app = app().await;
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    listing(&app, ALICE, &[("g2", "bafyg2")]).await;
+    // The PDS says g1 is gone; before the job acts, its owner recreates it
+    // and Jetstream stores the new one at the same key.
+    Mock::given(method("GET"))
+        .and(path(get_record_path(ALICE)))
+        .and(query_param("rkey", "g1"))
+        .respond_with(Meanwhile::new(
+            &app,
+            "UPDATE happyview_records_v2 SET rev = '3recreated' WHERE rkey = 'g1'",
+            1,
+            record_not_found(),
+        ))
+        .mount(&app.mock_server)
+        .await;
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.missing_total, 1);
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.changed_since_check, 1);
+    assert_eq!(report.missing[0].outcome, "changed_since_check");
+    assert!(
+        stored(&app, ALICE, "g1").await,
+        "the recreated record stays"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_stops_inside_an_account_and_keeps_what_it_did() {
+    let app = app().await;
+    let rkeys: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+    for rkey in &rkeys {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    listing(
+        &app,
+        ALICE,
+        &[("c5", "bafyc5"), ("c6", "bafyc6"), ("c7", "bafyc7")],
+    )
+    .await;
+    let (status, created) = post(&app, json!({ "collection": GAME, "dry_run": false }), None).await;
+    assert_eq!(status, 202, "{created}");
+    let job_id = created["job_id"].as_str().expect("a job id").to_string();
+    // The operator cancels while the second record is being checked.
+    Mock::given(method("GET"))
+        .and(path(get_record_path(ALICE)))
+        .respond_with(Meanwhile::new(
+            &app,
+            &format!("UPDATE happyview_jobs SET status = 'cancelling' WHERE id = '{job_id}'"),
+            2,
+            record_not_found(),
+        ))
+        .mount(&app.mock_server)
+        .await;
+
+    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
+        .await
+        .expect("reconcile runs");
+    assert_eq!(report.stopped.as_deref(), Some("cancelling"));
+    assert_eq!(report.deleted, 2, "{:?}", report.missing);
+    assert!(!stored(&app, ALICE, "c1").await);
+    assert!(stored(&app, ALICE, "c2").await, "nothing after the cancel");
+
+    let job = app.get_json(&format!("/admin/jobs/{job_id}")).await;
+    assert_eq!(job["progress"]["report"]["deleted"], 2, "{job}");
+    assert_eq!(
+        job["progress"]["report"]["missing"][1]["uri"],
+        uri(ALICE, "c1")
+    );
+}
+
+#[tokio::test]
+async fn a_listing_still_rate_limited_after_its_tries_skips_the_account() {
+    let app = app().await;
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "{}/xrpc/com.atproto.repo.listRecords",
+            pds(ALICE)
+        )))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .expect(5)
+        .mount(&app.mock_server)
+        .await;
+    get_record(&app, ALICE, "g1", true).await;
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.dids_skipped[0].reason, "rate_limited");
+    assert_eq!(report.deleted, 0);
+    assert!(stored(&app, ALICE, "g1").await);
+}
+
+#[tokio::test]
+async fn a_collection_that_is_not_indexed_is_refused() {
+    let app = TestApp::new().await;
+    let (status, body) = app
+        .post_json_status(
+            "/admin/lexicons",
+            json!({ "lexicon_json": fixtures::game_record_lexicon(), "backfill": false, "indexed": false }),
+        )
+        .await;
+    assert!(status == 201 || status == 200, "{status}: {body}");
+
+    let refused = reconcile::reconcile(&app.state, &options(false), None)
+        .await
+        .expect_err("refused");
+    assert!(refused.contains("not an indexed"), "{refused}");
+    let (status, body) = post(&app, json!({ "collection": GAME }), None).await;
+    assert_eq!(status, 400, "{body}");
+
+    let schemas = reconcile::refusal(&app.state, "com.atproto.lexicon.schema").expect("refused");
+    assert!(schemas.contains("lexicon schemas"), "{schemas}");
+}
+
+#[tokio::test]
+async fn a_delete_hook_that_fails_keeps_the_record() {
+    if !common::echo_interpreter::is_built() {
+        eprintln!("skipping: {}", common::echo_interpreter::BUILD);
+        return;
+    }
+    let app = app().await;
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
+    app.state
+        .scripts
+        .put_manual(
+            &app.state.db,
+            app.state.db_backend,
+            happyview::catalog::ScriptWrite {
+                id: format!("record.delete:{GAME}"),
+                script_type: "lua".to_string(),
+                body: "error:runtime".to_string(),
+                description: None,
+            },
+        )
+        .await
+        .expect("install the delete hook");
+    for rkey in ["g1", "g2"] {
+        seed(&app, ALICE, rkey, &format!("bafy{rkey}")).await;
+    }
+    document(&app, ALICE).await;
+    listing(&app, ALICE, &[("g2", "bafyg2")]).await;
+    get_record(&app, ALICE, "g1", true).await;
+
+    let report = run(&app, &options(false)).await;
+    assert_eq!(report.hook_failed, 1);
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.missing[0].outcome, "hook_failed");
+    assert!(stored(&app, ALICE, "g1").await, "a failed hook keeps it");
 }
 
 /// POSTs `body` to the reconcile route, as the admin or with `key`.

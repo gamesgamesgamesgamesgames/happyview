@@ -126,7 +126,7 @@ Checks a collection's stored records against each account's PDS and, unless it i
 
 | Field                     | Type     | Required | Description |
 | ------------------------- | -------- | -------- | ----------- |
-| `collection`              | string   | yes      | A record collection this instance has a lexicon for |
+| `collection`              | string   | yes      | A record collection this instance indexes |
 | `dry_run`                 | boolean  | no       | Report only. Defaults to `true` |
 | `dids`                    | string[] | no       | Check only these accounts. Defaults to every account holding records of the collection |
 | `pds_requests_per_second` | integer  | no       | Pace of PDS requests, 1–20. Defaults to 5 |
@@ -144,13 +144,15 @@ curl -X POST http://127.0.0.1:3000/admin/records/collection/reconcile -H "$AUTH"
 { "job_id": "0b9a7c1e-..." }
 ```
 
-For each account, the job reads the records it stores, resolves the account's PDS from its DID document, lists the collection there with `com.atproto.repo.listRecords`, and confirms each stored record the listing lacks with `com.atproto.repo.getRecord`. Only a record the PDS confirms is gone counts as missing. An account is skipped, and nothing of it is deleted, when:
+For each account, the job reads the records it stores, resolves the account's PDS from its DID document, lists the collection there with `com.atproto.repo.listRecords`, and confirms each stored record the listing lacks with `com.atproto.repo.getRecord`. Only a record the PDS confirms is gone counts as missing: a `400` or `404` naming `RecordNotFound`. A bare `404`, which a proxy or a PDS that doesn't route the method gives too, leaves the record alone. An account is skipped, and nothing of it is deleted, when:
 
-- its PDS can't be resolved, a listing page fails, or the PDS is still rate limiting after five tries (`pds_unresolved`, `listing_failed`, `rate_limited`);
+- its PDS can't be resolved, a listing page fails or is empty while still offering a cursor, or the PDS is still rate limiting after five tries (`pds_unresolved`, `listing_failed`, `rate_limited`);
 - the PDS says the repo is missing, deactivated or taken down (`repo_unavailable`);
 - the listing is suspicious: empty while records are stored, or missing at least 10 stored records and more than half of them, as an account's old PDS or a broken one can answer. Name the account in `allow_suspicious` to act on it (`suspicious_listing`).
 
-In a run that deletes, each missing record goes through the normal delete path, so the collection's delete hook runs and can keep the record. A record whose stored CID differs from its PDS's is reported and left alone. The job's result:
+In a run that deletes, the collection's delete hook runs for each missing record and can keep it. A hook that fails or times out keeps the record too: the job is inferring the delete, not hearing it from the network, so it doesn't act without the hook's answer. A record is deleted only while it still has the CID and rev it was read with, so one recreated at the same key during the run stays. Every delete is written to the event log as `record.deleted` with `detail.origin` set to `happyview.reconcile-collection`, whatever the event-logging setting, and a failed hook as `record.delete_hook_failed`. A record whose stored CID differs from its PDS's is reported and left alone.
+
+Pausing or cancelling stops the job before its next record. A stopped job has no result, so the report of what it did so far is kept in its `progress` under `report`. A resumed job starts again from the first account, which is safe: what it already deleted is no longer stored. The job's result:
 
 ```json
 {
@@ -160,14 +162,21 @@ In a run that deletes, each missing record goes through the normal delete path, 
   "dids_skipped": [
     { "did": "did:plc:abc", "reason": "repo_unavailable", "detail": "listRecords answered 400 Bad Request: ..." }
   ],
-  "missing": [{ "uri": "at://did:plc:def/xyz.statusphere.status/3k...", "cid": "bafyrei..." }],
+  "missing": [
+    { "uri": "at://did:plc:def/xyz.statusphere.status/3k...", "cid": "bafyrei...", "outcome": "missing" }
+  ],
   "missing_total": 1,
   "unconfirmed_total": 0,
   "deleted": 0,
   "kept_by_hook": 0,
+  "hook_failed": 0,
+  "changed_since_check": 0,
+  "failed": 0,
   "stale_cid": [],
   "stale_cid_total": 0
 }
 ```
 
-`missing` lists the first 1,000 and `stale_cid` the first 100; the totals count them all. On an instance whose collection is served from a shared record store, the route answers `400`: a stale record there belongs to the store.
+Each `missing` entry's `outcome` is `missing` in a dry run, and in a run that deletes one of `deleted`, `kept_by_hook`, `hook_failed`, `changed_since_check` (changed or removed since it was read) or `failed`, counted by the fields of the same names. `missing` lists the first 1,000 and `stale_cid` the first 100; the totals count them all.
+
+The route answers `400` for a collection this instance doesn't index, since nothing would apply its deletes, for `com.atproto.lexicon.schema`, and on an instance whose collection is served from a shared record store: a stale record there belongs to the store.
