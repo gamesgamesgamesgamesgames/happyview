@@ -137,7 +137,6 @@ wasmtime = { version = ">=49.0.5, <50", default-features = false, features = [
     "debug-builtins",
     "runtime",
     "component-model",
-    "component-model-async",
     "threads",
     "stack-switching",
     "std",
