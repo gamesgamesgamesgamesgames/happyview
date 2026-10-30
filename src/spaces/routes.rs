@@ -170,6 +170,7 @@ struct DeleteRecordInput {
 #[serde(rename_all = "camelCase")]
 struct GetRecordQuery {
     space: String,
+    repo: Option<String>,
     collection: String,
     rkey: String,
 }
@@ -941,10 +942,19 @@ async fn get_record(
     )
     .await?;
 
+    // A credential is addressed to the repo it reads, and a read_self member
+    // can read only their own, so either names the repo when the query does not.
+    let repo = match (query.repo.as_deref(), xrpc_claims.space_audience.as_deref()) {
+        (Some(repo), _) => db::RecordRepo::Author(repo),
+        (None, Some(audience)) if has_credential => db::RecordRepo::Author(audience),
+        (None, _) if membership.restricted_to_own_records() => db::RecordRepo::Author(&did),
+        (None, _) => db::RecordRepo::Prefer(&did),
+    };
     let record = db::get_space_record_by_parts(
         &state.db,
         state.db_backend,
         &space.id,
+        repo,
         &query.collection,
         &query.rkey,
     )
@@ -1001,6 +1011,16 @@ async fn list_records(
             Some(did.as_str())
         })
     };
+    authorize_space_read(
+        &state,
+        &xrpc_claims,
+        &did,
+        repo.unwrap_or(&space.authority_did),
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     let limit = query.limit.unwrap_or(50).min(100);
     let reverse = query.reverse.unwrap_or(false);
@@ -1096,7 +1116,8 @@ async fn revoke_invite(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, claims.did()).await?;
 
-    let revoked = db::revoke_invite(&state.db, state.db_backend, &input.invite_id).await?;
+    let revoked =
+        db::revoke_invite(&state.db, state.db_backend, &space.id, &input.invite_id).await?;
     if !revoked {
         return Err(AppError::NotFound("Invite not found".into()));
     }
@@ -1571,6 +1592,28 @@ async fn register_notify(
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
     require_audience(&claims, &space.authority_did)?;
+
+    // A registration is told every writer's DID and revision, so it needs the
+    // whole-space read that listing across repos does.
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     if let Some(service) = &input.service {
         let endpoint = crate::spaces::auth::resolve_service_identifier(
