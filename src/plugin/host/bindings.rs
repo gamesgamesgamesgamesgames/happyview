@@ -1282,10 +1282,21 @@ fn suspend_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     caller.data_mut().deadline.suspend();
 }
 
-/// The guest is about to run again: re-arm the store with what is left.
+/// The guest is about to run again: re-arm the store with what is left. A
+/// job run whose worker lost its lease gets nothing left, so it is
+/// interrupted as soon as it resumes rather than repeating the job's side
+/// effects alongside the run that took the job over.
 fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     let remaining = caller.data_mut().deadline.resume();
-    caller.as_context_mut().set_epoch_deadline(remaining);
+    let lost = caller
+        .data()
+        .script_run
+        .as_ref()
+        .and_then(|run| run.lease_lost.as_ref())
+        .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::Acquire));
+    caller
+        .as_context_mut()
+        .set_epoch_deadline(if lost { 0 } else { remaining });
 }
 
 /// One entry point for the five imports that act on the script run in

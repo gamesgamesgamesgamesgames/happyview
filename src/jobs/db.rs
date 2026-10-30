@@ -19,7 +19,8 @@ pub const LEASE: Duration = Duration::from_secs(60);
 pub const RENEW_EVERY: Duration = Duration::from_secs(20);
 /// How many times a job may lose its worker before it is failed rather than
 /// queued again: a job that takes its process down with it would otherwise
-/// do so forever.
+/// do so forever. Counted in `lost_leases`, not `attempt`: a job paused and
+/// resumed is claimed again without having lost anything.
 pub const MAX_LOST_LEASES: i64 = 3;
 
 /// The claim a worker holds on a job: who it is, and which run of the job
@@ -241,85 +242,112 @@ pub async fn list_jobs(
     Ok((jobs, next_cursor))
 }
 
-pub async fn set_status(state: &AppState, id: &str, status: &str) -> Result<(), AppError> {
-    let now = now_rfc3339();
-    let sql = match status {
-        "running" => adapt_sql(
-            "UPDATE happyview_jobs SET status = ?, started_at = ? WHERE id = ?",
-            state.db_backend,
-        ),
-        "completed" | "failed" | "cancelled" => adapt_sql(
-            "UPDATE happyview_jobs SET status = ?, completed_at = ? WHERE id = ?",
-            state.db_backend,
-        ),
-        _ => adapt_sql(
-            "UPDATE happyview_jobs SET status = ? WHERE id = ? AND 1=1",
-            state.db_backend,
-        ),
-    };
-
-    match status {
-        "running" | "completed" | "failed" | "cancelled" => {
-            crate::db::query(&sql)
-                .bind(status)
-                .bind(&now)
-                .bind(id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to update job status: {e}")))?;
-        }
-        _ => {
-            let sql = adapt_sql(
-                "UPDATE happyview_jobs SET status = ? WHERE id = ?",
-                state.db_backend,
-            );
-            crate::db::query(&sql)
-                .bind(status)
-                .bind(id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to update job status: {e}")))?;
-        }
-    }
-
-    Ok(())
-}
-
+/// Store a running job's progress. When this process holds the job's lease,
+/// only while it still does: a run whose lease was lost, and whose job was
+/// queued again or claimed elsewhere, writes nothing, and the loss is
+/// recorded so the run stops. Without a lease here (a job this process is
+/// not running), as unconditionally as before leases.
 pub async fn update_progress(state: &AppState, id: &str, progress: &Value) -> Result<(), AppError> {
     let progress_str = serde_json::to_string(progress)
         .map_err(|e| AppError::Internal(format!("failed to serialize progress: {e}")))?;
+    let Some(held) = super::held::get(id) else {
+        let sql = adapt_sql(
+            "UPDATE happyview_jobs SET progress = ? WHERE id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(&progress_str)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update job progress: {e}")))?;
+        return Ok(());
+    };
+    if held.is_lost() {
+        return Ok(());
+    }
     let sql = adapt_sql(
-        "UPDATE happyview_jobs SET progress = ? WHERE id = ?",
+        "UPDATE happyview_jobs SET progress = ? \
+          WHERE id = ? AND claimed_by = ? AND attempt = ? \
+            AND status IN ('running', 'cancelling', 'pausing')",
         state.db_backend,
     );
-    crate::db::query(&sql)
+    let written = crate::db::query(&sql)
         .bind(&progress_str)
         .bind(id)
+        .bind(&held.lease.owner)
+        .bind(held.lease.attempt)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update job progress: {e}")))?;
+    if written.rows_affected() == 0 {
+        held.mark_lost();
+    }
     Ok(())
 }
 
-/// Check if a job should stop (status changed to cancelling or pausing).
-/// Same cooperative cancellation pattern as the backfill system.
+/// Whether a running job should stop: it was asked to pause or cancel, or
+/// (when this process holds its lease) the lease was lost to another claim,
+/// which answers `"lost"`. Same cooperative pattern as the backfill system.
 pub async fn should_stop(state: &AppState, id: &str) -> Option<&'static str> {
+    let held = super::held::get(id);
+    if held.as_ref().is_some_and(super::held::Held::is_lost) {
+        return Some("lost");
+    }
     let sql = adapt_sql(
-        "SELECT status FROM happyview_jobs WHERE id = ?",
+        "SELECT status, claimed_by, CAST(attempt AS BIGINT) FROM happyview_jobs WHERE id = ?",
         state.db_backend,
     );
-    let status = crate::db::query_as::<(String,)>(&sql)
+    let row = crate::db::query_as::<(String, Option<String>, i64)>(&sql)
         .bind(id)
         .fetch_optional(&state.db)
         .await
         .ok()
-        .flatten()
-        .map(|(s,)| s);
-    match status.as_deref() {
+        .flatten();
+    if let (Some(held), Some((_, owner, attempt))) = (&held, &row)
+        && (owner.as_deref() != Some(held.lease.owner.as_str()) || *attempt != held.lease.attempt)
+    {
+        held.mark_lost();
+        return Some("lost");
+    }
+    match row.as_ref().map(|(status, ..)| status.as_str()) {
         Some("cancelling") => Some("cancelling"),
         Some("pausing") => Some("pausing"),
         _ => None,
     }
+}
+
+/// Move job `id` from status `from` to `to`, only if it is still in `from`:
+/// for an operator's request read against one status and written later,
+/// which must not land on a job that moved on meanwhile (a pause landing on
+/// a just-completed job would have recovery settle it as paused, and a
+/// resume run it again). `false` when the job had moved on.
+pub async fn change_status(
+    state: &AppState,
+    id: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool, AppError> {
+    let completed = if matches!(to, "completed" | "failed" | "cancelled") {
+        ", completed_at = ?"
+    } else {
+        ""
+    };
+    let sql = adapt_sql(
+        &format!("UPDATE happyview_jobs SET status = ?{completed} WHERE id = ? AND status = ?"),
+        state.db_backend,
+    );
+    let mut query = crate::db::query(&sql).bind(to);
+    if !completed.is_empty() {
+        query = query.bind(now_rfc3339());
+    }
+    let changed = query
+        .bind(id)
+        .bind(from)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to update job status: {e}")))?;
+    Ok(changed.rows_affected() > 0)
 }
 
 /// Settle every job whose worker's lease ran out: its worker stopped, by a
@@ -356,8 +384,9 @@ pub async fn recover_expired_jobs(state: &AppState) -> Result<u64, AppError> {
         ),
         (
             format!(
-                "UPDATE happyview_jobs SET status = 'failed', error = ?, completed_at = ?, claimed_by = NULL, lease_until = NULL \
-                  WHERE status = 'running' AND {expired} AND attempt >= ?"
+                "UPDATE happyview_jobs SET status = 'failed', error = ?, completed_at = ?, \
+                        lost_leases = lost_leases + 1, claimed_by = NULL, lease_until = NULL \
+                  WHERE status = 'running' AND {expired} AND lost_leases + 1 >= ?"
             ),
             vec![
                 Bind::Text(failure),
@@ -368,7 +397,8 @@ pub async fn recover_expired_jobs(state: &AppState) -> Result<u64, AppError> {
         ),
         (
             format!(
-                "UPDATE happyview_jobs SET status = 'pending', claimed_by = NULL, lease_until = NULL \
+                "UPDATE happyview_jobs SET status = 'pending', lost_leases = lost_leases + 1, \
+                        claimed_by = NULL, lease_until = NULL \
                   WHERE status = 'running' AND {expired}"
             ),
             vec![Bind::Int(now)],
@@ -742,12 +772,198 @@ mod lease_tests {
             for (asked, settled) in [("cancelling", "cancelled"), ("pausing", "paused")] {
                 let id = new_job(&a).await;
                 hold_job(&a, &id, "a").await.unwrap().unwrap();
-                set_status(&a, &id, asked).await.unwrap();
+                assert!(change_status(&a, &id, "running", asked).await.unwrap());
                 expire(&a, &id).await;
                 recover_expired_jobs(&a).await.unwrap();
                 assert_eq!(job(&a, &id).await.status, settled, "{:?}", a.db_backend);
             }
         }
+    }
+
+    async fn progress_of(state: &AppState, id: &str) -> Value {
+        job(state, id).await.progress
+    }
+
+    /// The other instance took the job over: `a`'s run is stale.
+    async fn taken_over(a: &AppState, b: &AppState, id: &str) -> Job {
+        expire(a, id).await;
+        recover_expired_jobs(b).await.unwrap();
+        hold_job(b, id, "b")
+            .await
+            .unwrap()
+            .expect("b takes the job")
+    }
+
+    /// A stale run's progress lands nowhere, and the loss stops it.
+    #[tokio::test]
+    async fn a_run_that_lost_its_lease_writes_no_progress_and_is_told_to_stop() {
+        for (a, b) in instances().await {
+            let id = new_job(&a).await;
+            let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let guard = super::super::held::hold(&id, lease("a", &first));
+            update_progress(&a, &id, &serde_json::json!({ "step": 1 }))
+                .await
+                .unwrap();
+            assert_eq!(progress_of(&a, &id).await, serde_json::json!({ "step": 1 }));
+
+            taken_over(&a, &b, &id).await;
+            update_progress(&a, &id, &serde_json::json!({ "step": "stale" }))
+                .await
+                .unwrap();
+            assert_eq!(
+                progress_of(&a, &id).await,
+                serde_json::json!({ "step": 1 }),
+                "{:?}",
+                a.db_backend
+            );
+            assert!(guard.held().is_lost());
+            assert_eq!(should_stop(&a, &id).await, Some("lost"));
+            drop(guard);
+        }
+    }
+
+    /// `should_stop` finds the loss itself, before any write has.
+    #[tokio::test]
+    async fn should_stop_answers_lost_once_the_job_is_taken_over() {
+        for (a, b) in instances().await {
+            let id = new_job(&a).await;
+            let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let guard = super::super::held::hold(&id, lease("a", &first));
+            assert_eq!(should_stop(&a, &id).await, None);
+            taken_over(&a, &b, &id).await;
+            assert_eq!(
+                should_stop(&a, &id).await,
+                Some("lost"),
+                "{:?}",
+                a.db_backend
+            );
+            assert!(guard.held().is_lost());
+            drop(guard);
+        }
+    }
+
+    /// The renewal loop is what notices a lease lost while the run makes no
+    /// writes at all.
+    #[tokio::test]
+    async fn renewal_marks_a_lease_lost_once_the_job_is_taken_over() {
+        for (a, b) in instances().await {
+            let id = new_job(&a).await;
+            let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let guard = super::super::held::hold(&id, lease("a", &first));
+            let renewal = tokio::spawn(super::super::worker::renew_every(
+                a.clone(),
+                id.clone(),
+                guard.held().clone(),
+                Duration::from_millis(20),
+            ));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(!guard.held().is_lost(), "a live lease renews");
+            assert_eq!(job(&a, &id).await.status, "running");
+
+            taken_over(&a, &b, &id).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !guard.held().is_lost() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "renewal never noticed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            renewal.abort();
+            drop(guard);
+        }
+    }
+
+    /// Each half of the fence holds on its own: another owner at the same
+    /// attempt, and the same owner at another attempt, are both refused.
+    #[tokio::test]
+    async fn the_fence_needs_both_owner_and_attempt() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let done = serde_json::json!({ "ok": true });
+            let other_owner = Lease {
+                owner: "b".into(),
+                attempt: held.attempt,
+            };
+            let other_attempt = Lease {
+                owner: "a".into(),
+                attempt: held.attempt + 1,
+            };
+            assert!(
+                !finish(&a, &id, &other_owner, Finish::Completed(&done))
+                    .await
+                    .unwrap()
+            );
+            assert!(!renew_lease(&a, &id, &other_owner).await.unwrap());
+            assert!(
+                !finish(&a, &id, &other_attempt, Finish::Completed(&done))
+                    .await
+                    .unwrap()
+            );
+            assert!(!renew_lease(&a, &id, &other_attempt).await.unwrap());
+            assert_eq!(job(&a, &id).await.status, "running", "{:?}", a.db_backend);
+            assert!(
+                finish(&a, &id, &lease("a", &held), Finish::Completed(&done))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    /// Pausing and resuming claims the job again without losing anything,
+    /// so it never counts toward the limit on lost workers.
+    #[tokio::test]
+    async fn pausing_and_resuming_does_not_count_as_a_lost_worker() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            for _ in 0..MAX_LOST_LEASES + 1 {
+                let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
+                assert!(change_status(&a, &id, "running", "pausing").await.unwrap());
+                assert!(
+                    finish(&a, &id, &lease("a", &held), Finish::Paused)
+                        .await
+                        .unwrap()
+                );
+                assert!(change_status(&a, &id, "paused", "pending").await.unwrap());
+            }
+            hold_job(&a, &id, "a").await.unwrap().unwrap();
+            expire(&a, &id).await;
+            recover_expired_jobs(&a).await.unwrap();
+            assert_eq!(job(&a, &id).await.status, "pending", "{:?}", a.db_backend);
+        }
+    }
+
+    /// An operator's pause read against a running job doesn't land on one
+    /// that finished meanwhile.
+    #[tokio::test]
+    async fn a_status_change_lands_only_on_the_status_it_was_read_against() {
+        for (a, _) in instances().await {
+            let id = new_job(&a).await;
+            let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
+            let done = serde_json::json!({});
+            assert!(
+                finish(&a, &id, &lease("a", &held), Finish::Completed(&done))
+                    .await
+                    .unwrap()
+            );
+            assert!(!change_status(&a, &id, "running", "pausing").await.unwrap());
+            assert_eq!(job(&a, &id).await.status, "completed", "{:?}", a.db_backend);
+        }
+    }
+
+    /// Two workers claiming at once: one gets the job. On the SQLite pool
+    /// alone, which no other test shares.
+    #[tokio::test]
+    async fn two_workers_racing_for_one_job_claim_it_once() {
+        let (pool, backend) = test_pools().await.remove(0);
+        let state = test_state_with_pool_on(pool, backend);
+        let id = new_job(&state).await;
+        let (x, y) = tokio::join!(claim_next_job(&state, "x"), claim_next_job(&state, "y"));
+        let claimed: Vec<Job> = [x.unwrap(), y.unwrap()].into_iter().flatten().collect();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, id);
+        assert_eq!(claimed[0].attempt, 1);
     }
 
     /// One instance, as before leases: the worker's claim runs the job and

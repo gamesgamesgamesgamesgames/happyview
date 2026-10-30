@@ -212,7 +212,14 @@ Jobs survive server restarts. A worker holds the job it runs under a lease, whic
 - **Cancelling** jobs are finalised as `cancelled`.
 - **Pausing** jobs are finalised as `paused`.
 
-Only expired leases are touched, so instances sharing one database recover each other's jobs only when the instance running them has actually stopped. A worker whose lease ran out while its job was still running can no longer record that job's outcome: the run that took the job over does.
+Only expired leases are touched, so instances sharing one database recover each other's jobs only when the instance running them has actually stopped. A worker whose lease ran out while its job was still running can no longer record that job's outcome, or its progress: the run that took the job over does. The stale run is told to stop (`ctx.job.should_stop()` returns `true`) and is interrupted at its next host call, so it stops repeating the job's side effects alongside the new run.
+
+A job that loses its worker three times is marked `failed`. Pausing and resuming a job doesn't count toward that.
+
+Two things to know when running several instances on one database:
+
+- **Clocks.** A lease is compared against the clock of whichever instance is checking it. If instances' clocks drift more than about 40 seconds apart, a live job can look expired to another instance and run twice. Keep the hosts on NTP.
+- **Rolling upgrades.** An instance running a version from before leases claims jobs without one, and an upgraded instance treats a running job with no lease as interrupted and queues it again. Upgrade every instance at once, or let running jobs finish before upgrading.
 
 ## Worker
 

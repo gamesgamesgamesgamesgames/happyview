@@ -49,6 +49,11 @@ pub struct ScriptRun {
     /// Set for a job run, whose log lines also land in the job's own log and
     /// whose progress, stop flag and waits the three controls act on.
     pub job_id: Option<String>,
+    /// Set once the worker running this job lost its lease to another claim:
+    /// the run is interrupted at its next host import (see
+    /// `bindings::HostImports::define`), so it repeats no more of the job's
+    /// side effects alongside the run that took it over.
+    pub lease_lost: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this run is a test file. The five test imports answer only
     /// when it is, whatever the plugin declared.
     pub test: bool,

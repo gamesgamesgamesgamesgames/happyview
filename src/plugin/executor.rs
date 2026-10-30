@@ -1168,6 +1168,12 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            lease_lost: input
+                .context
+                .job
+                .as_ref()
+                .and_then(|job| crate::jobs::held::get(&job.id))
+                .map(|held| held.lost),
             test: input.kind == ScriptKind::Test,
             language_id,
             extensions,
