@@ -450,6 +450,50 @@ async fn a_running_job_is_not_asked_to_stop() {
     assert_eq!(result_of(&row), json!({ "ok": false }));
 }
 
+/// The worker renews a running job's lease while the job runs, so a job
+/// that outlasts its lease is not taken for one whose worker stopped. With
+/// renewal shortened, a run of about a second sees its lease pushed forward.
+#[tokio::test]
+#[serial]
+async fn a_running_jobs_lease_is_renewed_while_it_runs() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    seed_script(&app, TYPE, "host:job_wait").await;
+    let id = seed_job(&app, TYPE, &json!({ "seconds": 1.0 })).await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker_renewing(
+        app.state.clone(),
+        "renewing".into(),
+        Duration::from_millis(100),
+    ));
+    await_running(&app, &id).await;
+    let claimed = lease_until(&app, &id).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let renewed = lease_until(&app, &id).await;
+    let row = await_terminal(&app, &id).await;
+    worker.abort();
+
+    assert!(
+        renewed > claimed,
+        "the lease was not renewed: {claimed:?} then {renewed:?}"
+    );
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+}
+
+async fn lease_until(app: &TestApp, id: &str) -> Option<i64> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT CAST(lease_until AS BIGINT) FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let (until,): (Option<i64>,) = happyview::db::query_as(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("read the job's lease");
+    until
+}
+
 /// A cooperative exit is not a failure: the job lands in the state that was
 /// asked for and records neither a result nor an error.
 #[tokio::test]

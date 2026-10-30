@@ -1268,6 +1268,7 @@ async fn native_delete_collection_stops_on_cancelling_without_failing() {
         inherit_auth: false,
         api_client_id: None,
         dpop_key_id: None,
+        attempt: 1,
     };
 
     let outcome = happyview::jobs::native::delete_collection::run(&app.state, &job).await;
@@ -1316,6 +1317,7 @@ async fn native_delete_collection_stops_on_pausing_without_failing() {
         inherit_auth: false,
         api_client_id: None,
         dpop_key_id: None,
+        attempt: 1,
     };
 
     let outcome = happyview::jobs::native::delete_collection::run(&app.state, &job).await;

@@ -169,8 +169,8 @@ fn returned(output: ScriptExecuteOutput) -> (Value, ScriptValueKind) {
 async fn seeded_job(app: &TestApp) -> String {
     let id = Uuid::new_v4().to_string();
     happyview::db::query(&happyview::db::adapt_sql(
-        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth)
-         VALUES (?, 'test.interpreter', 'running', '{}', '{}', ?, ?, ?)",
+        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth, claimed_by, attempt)
+         VALUES (?, 'test.interpreter', 'running', '{}', '{}', ?, ?, ?, 'runner', 1)",
         app.state.db_backend,
     ))
     .bind(&id)
@@ -526,7 +526,15 @@ async fn job_progress_updates_the_row_and_should_stop_reads_both_stop_states() {
     let mut sent = input("host:job_progress", ScriptKind::Job);
     sent.context.job = Some(ScriptJob { id: job.clone() });
     sent.input = json!({"processed": 42});
-    let (value, _) = returned(executor.execute_script(id, &sent).await.unwrap());
+    // Progress is written under the lease of the claim the run holds, as a
+    // worker runs it.
+    let lease = happyview::jobs::held::Lease {
+        owner: "runner".into(),
+        attempt: 1,
+    };
+    let run = happyview::jobs::held::Held::new(&job, lease);
+    let ran = happyview::jobs::held::run_under(run, executor.execute_script(id, &sent)).await;
+    let (value, _) = returned(ran.unwrap());
     assert!(value.get("error").is_none(), "{value}");
 
     let (stored,): (String,) = happyview::db::query_as(&happyview::db::adapt_sql(
