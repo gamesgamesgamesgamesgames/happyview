@@ -20,6 +20,10 @@ A backfill job starts with a discovery phase and then pipelines resolution and f
 
 Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_records`) and the current `stage` are updated in real time. The repo counters count work units, so a repo discovered under two collections counts twice. The dashboard's Backfill page shows live progress, and clicking a job opens a detail sheet with a stage-by-stage progress log.
 
+### Record hooks run concurrently
+
+A backfill runs the collection's record hook over several records at once: up to `BACKFILL_HOOK_CONCURRENCY` (4 by default) from each page of records it fetches, on top of the repos it fetches at once. Live records from the firehose are still hooked one at a time and in order. During a backfill, a hook can't rely on running alone or on the order of other records' hooks. A page never holds two versions of one record, and a page that did would be hooked one record at a time. The records themselves are written in the page's order, whichever hook finishes first. Set `BACKFILL_HOOK_CONCURRENCY=1` to hook a backfill's records one at a time.
+
 ## Replay and crawl
 
 A backfill job reads records from one of two sources:
