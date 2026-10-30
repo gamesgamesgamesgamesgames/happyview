@@ -1,4 +1,3 @@
-import { execSync } from "child_process";
 import { test, expect, type Page } from "@playwright/test";
 import {
   awaitConsentOrCallback,
@@ -15,7 +14,6 @@ import {
 
 const PDS_URL = "http://localhost:3100";
 const PDS_PASSWORD = "Test-password-e2e-123";
-const HAPPYVIEW_CONTAINER = "happyview-e2e-happyview-1";
 
 async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   const suffix =
@@ -154,23 +152,8 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
 
     expect(
       triggerResp.status(),
-      `expected a 500 wrapping the PDS unit-deserialization failure (an authenticated-and-reached-the-PDS signature), got: ${triggerResp.status()} ${triggerBody}`,
-    ).toBe(500);
-    const correlationId = (
-      JSON.parse(triggerBody) as { correlationId?: string }
-    ).correlationId;
-    expect(
-      correlationId,
-      `expected an AppError::Internal body with a correlationId, got: ${triggerBody}`,
-    ).toBeTruthy();
-
-    const logLine = execSync(
-      `docker logs ${HAPPYVIEW_CONTAINER} 2>&1 | grep -F ${JSON.stringify(correlationId)} || true`,
-    ).toString();
-    expect(
-      logLine,
-      `expected the logged internal error for correlationId ${correlationId} to be the PDS unit-deserialization failure, got: ${logLine || "(no matching log line found)"}`,
-    ).toContain("invalid type: map, expected unit");
+      `expected the PDS to accept the signature request through the refreshed session, got: ${triggerResp.status()} ${triggerBody}`,
+    ).toBe(204);
 
     const after = await getOauthSessionTokenState(accountA.did);
     expect(after.accessToken).not.toBe(accessTokenBefore);
