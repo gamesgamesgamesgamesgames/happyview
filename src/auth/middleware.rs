@@ -87,6 +87,17 @@ impl Claims {
             service_auth_lxm: None,
         }
     }
+
+    /// Claims as a service-auth JWT bound to `lxm` produces them.
+    #[cfg(test)]
+    pub fn service_auth_for_test(did: String, lxm: Option<String>) -> Self {
+        Self {
+            did,
+            client_key: None,
+            dpop_key_id: None,
+            service_auth_lxm: Some(lxm),
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for Claims {

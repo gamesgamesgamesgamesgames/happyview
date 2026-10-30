@@ -197,6 +197,88 @@ this was an upsert rather than a first upload, because the lexicon is not a
 record type, or because the caller lacks `backfill:create`. Poll it via
 `GET /admin/backfill/status`.
 
+### When the lexicon is not valid
+
+The document is checked against the lexicon spec before anything is stored. A
+document that cannot work is refused with `400 Bad Request` and **one entry per
+field**, so an editor can point at each place rather than showing one sentence:
+
+    {
+      "error": "the lexicon is not valid: defs.main.key: unknown record key 'uuid': must be tid, nsid, any, or literal:<value> (and 2 more)",
+      "issues": [
+        {
+          "path": "defs.main.key",
+          "message": "unknown record key 'uuid': must be tid, nsid, any, or literal:<value>",
+          "severity": "error"
+        },
+        {
+          "path": "defs.main.record.properties.a.ref",
+          "message": "'#missing' names no def in this lexicon ('missing' is not defined)",
+          "severity": "error"
+        }
+      ]
+    }
+
+`path` is a dotted path into the submitted document, with array entries as
+`required[0]`; it is the empty string for a problem with the document as a
+whole, such as its size. `error` still carries one sentence for anything that
+reads only that field.
+
+**`severity` matters.** Only an `error` refuses the upload. A `warning` is a
+document that works but reads oddly — an `array` with no `items`, a
+`minLength` above its `maxLength`, a def name that is not camelCase — and it is
+reported alongside the errors so one answer says everything.
+
+An upload whose only issues are warnings **succeeds**, and carries them in
+`issues` on the success response, so nothing is accepted in silence:
+
+    {
+      "id": "com.example.events",
+      "revision": 1,
+      "backfill_job_id": null,
+      "issues": [
+        {
+          "path": "defs.main.type",
+          "message": "this is a valid 'subscription' lexicon, but HappyView does not serve subscriptions yet: it will be stored and no endpoint will be generated for it",
+          "severity": "warning"
+        }
+      ]
+    }
+
+That example is the warning most worth knowing about. A `subscription` lexicon
+is valid, and HappyView serves no subscriptions
+([#7](https://github.com/gamesgamesgamesgamesgames/happyview/issues/7)): it is
+stored and no endpoint is generated. Accepting one quietly would read as
+support, so the upload says what will happen instead. `record`, `query` and
+`procedure` warn about nothing.
+
+What is checked: the `lexicon` version and the `id` NSID; that `defs` is a
+non-empty object; that every def names a known type; that `record`, `query`,
+`procedure` and `subscription` appear only as `main`; that a record says how
+its rkey is chosen (`tid`, `nsid`, `any` or `literal:<value>`) and carries an
+object schema; that a `ref` or a `union` member resolves to a def this document
+defines, when it names one (a ref into another lexicon is checked only for
+shape, since that document is not here); that an object's `required` and
+`nullable` name properties it actually has; and that the document is at most
+256 KiB.
+
+### The same rules in a project
+
+A project's lexicon files go through the same function, so a file under `src/`
+cannot carry a lexicon this endpoint would accept and then fail on. It renders
+them as build diagnostics rather than per field.
+
+**Boot is deliberately more forgiving than a deploy.** `happyview check`, a
+project deploy and `happyview test` refuse a lexicon that violates the spec.
+Boot only *warns* about it, names the file, and goes on to serve, because
+upgrading HappyView must never turn an instance that served yesterday into one
+that exits 1 over a file it already accepted. The next check or deploy refuses
+it, which is where someone is watching.
+
+Two things stay fatal at boot, because neither is new behaviour and the build
+cannot proceed without them: an `id` that is missing or is not an NSID, and an
+unsupported `lexicon` version.
+
 ## List lexicons
 
 ```

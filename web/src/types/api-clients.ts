@@ -40,13 +40,18 @@ export interface ApiClientAuthProbe {
 
 export interface KeyRotationResult {
   kid: string;
+  /** `pending` until it takes over at `activates_at`; `current` when switched immediately. */
+  status: "pending" | "current";
+  activates_at: string | null;
   orphaned_sessions: number;
 }
 
 export interface ApiClientAuthKeyListEntry {
   kid: string;
-  status: "current" | "retiring" | "revoked";
+  status: "pending" | "current" | "retiring" | "revoked";
   created_at: string;
+  /** When a `pending` key takes over. */
+  activates_at: string | null;
   session_count: number;
 }
 
@@ -88,8 +93,10 @@ export interface RevokeApiClientSecretResult {
 
 export interface InstanceOauthKey {
   kid: string;
-  status: "current" | "retiring" | "revoked";
+  status: "pending" | "current" | "retiring" | "revoked";
   created_at: string;
+  /** When a `pending` key takes over. */
+  activates_at: string | null;
   session_count: number;
 }
 

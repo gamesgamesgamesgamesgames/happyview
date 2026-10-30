@@ -92,4 +92,20 @@ test.describe("Script editor completions", () => {
 
     await completes(page, "ctx.", "caller_did");
   });
+
+  // Every key reaches the editor while the page is too busy to render each
+  // one back before the next arrives. The throttle is what opens that gap on
+  // a fast machine; a slow CI runner opens it unaided.
+  test("keeps every key typed while the page is busy", async ({ page }) => {
+    await page.goto(`/dashboard/settings/scripts/${encodeURIComponent(ID)}`);
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
+
+    const typed = "local every_key_arrives_abcdefghijklmnopqrstuvwxyz";
+    await typeAtEnd(page, typed);
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".monaco-editor .view-lines")).toContainText(
+      typed.replace(" ", "\u00a0"),
+    );
+  });
 });

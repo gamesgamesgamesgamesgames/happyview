@@ -26,16 +26,17 @@ use serde_json::{Map, Value};
 use crate::abi::read_packed;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData, BlobInfo,
-    CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
-    JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
-    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PanicReport, PluginError,
-    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity,
-    ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd,
-    SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite,
-    SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo,
-    SpacesMembers, SpacesQuery, StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite,
-    TestReport, TestTrigger, TestTriggerResult,
+    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
+    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, JobCreate,
+    JobGet, JobListAny, JobProgressRequest, JobView, Label, LabelsGet, LinkedRepoBlobUpload,
+    LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
+    LinkedRepoRecordPut, PanicReport, PluginError, RecordRef, RecordsCount, RecordsPage,
+    RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest, SpaceDelete, SpaceInfo,
+    SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove,
+    SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate,
+    SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery,
+    StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite, TestReport, TestTrigger,
+    TestTriggerResult,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{
@@ -92,6 +93,8 @@ extern "C" {
     fn host_caller_delete_record(req_ptr: i32, req_len: i32) -> i64;
     fn host_caller_upload_blob(req_ptr: i32, req_len: i32) -> i64;
     fn host_caller_xrpc_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_get_session(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_get_email(req_ptr: i32, req_len: i32) -> i64;
     fn host_caller_xrpc_procedure(req_ptr: i32, req_len: i32) -> i64;
     fn host_records_index_put(req_ptr: i32, req_len: i32) -> i64;
     fn host_records_index_delete(req_ptr: i32, req_len: i32) -> i64;
@@ -545,6 +548,34 @@ pub fn caller_xrpc_query(spec: &CallerXrpcQuery) -> Result<Value, PluginError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// The calling user's account as their PDS reports it: their DID and handle.
+/// Needs `caller:read` and a session to act as.
+pub fn caller_get_session() -> Result<CallerAccount, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_get_session, &serde_json::json!({}))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// The calling user's email address and whether it is confirmed, as their PDS
+/// reports it. Both are absent unless the user's sign-in granted the address,
+/// under `transition:email` or `account:email`. Needs `caller:email` and a
+/// session to act as.
+pub fn caller_get_email() -> Result<CallerEmail, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_get_email, &serde_json::json!({}))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         Err(HostError::NotWasm.into())
     }
 }

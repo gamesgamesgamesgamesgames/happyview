@@ -10,6 +10,7 @@ import { CodePanels } from "@/components/code-panels";
 import { LexiconServicesSheet } from "@/components/lexicon-services-sheet";
 import { PublishingPanel } from "@/components/lexicon-publishing/publishing-panel";
 import {
+  addNetworkLexicon,
   deleteLexicon,
   deleteNetworkLexicon,
   getLexicon,
@@ -23,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 
 export default function LexiconDetailPage() {
   const pathname = usePathname();
@@ -39,6 +41,7 @@ export default function LexiconDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savingIndexed, setSavingIndexed] = useState(false);
   const [servicesSheetOpen, setServicesSheetOpen] = useState(false);
 
   const [jsonText, setJsonText] = useState("");
@@ -88,6 +91,41 @@ export default function LexiconDetailPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  // Changing one setting writes the lexicon again with every other setting
+  // as stored. A network lexicon is written by tracking it again, which
+  // fetches its current version; a manual one keeps its stored document, so
+  // unsaved edits in the editor are neither sent nor discarded.
+  async function handleIndexedChange(indexed: boolean) {
+    if (!lexicon) return;
+    setSavingIndexed(true);
+    setError(null);
+    try {
+      if (lexicon.source === "network") {
+        await addNetworkLexicon({
+          nsid: lexicon.id,
+          backfill: lexicon.backfill,
+          indexed,
+          target_collection: lexicon.target_collection ?? undefined,
+        });
+        load();
+      } else {
+        await uploadLexicon({
+          lexicon_json: lexicon.lexicon_json,
+          backfill: lexicon.backfill,
+          indexed,
+          target_collection: lexicon.target_collection ?? undefined,
+          action: lexicon.action ?? undefined,
+          token_cost: lexicon.token_cost,
+        });
+        setLexicon(await getLexicon(id));
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingIndexed(false);
     }
   }
 
@@ -185,8 +223,25 @@ export default function LexiconDetailPage() {
             </div>
             {lexicon.lexicon_type === "record" && (
               <div>
-                <Label className="text-muted-foreground">Indexed</Label>
-                <p className="mt-1">{lexicon.indexed ? "Yes" : "No"}</p>
+                {projectPath === null && hasPermission("lexicons:create") ? (
+                  <>
+                    <Label htmlFor="indexed" className="text-muted-foreground">
+                      Indexed
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      className="mt-2"
+                      checked={lexicon.indexed}
+                      disabled={savingIndexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Label className="text-muted-foreground">Indexed</Label>
+                    <p className="mt-1">{lexicon.indexed ? "Yes" : "No"}</p>
+                  </>
+                )}
               </div>
             )}
             {lexicon.lexicon_type === "record" && (

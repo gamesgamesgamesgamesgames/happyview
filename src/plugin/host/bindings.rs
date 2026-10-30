@@ -332,6 +332,42 @@ pub(crate) fn define_host_functions(
     )?;
 
     imports.define(
+        "host_caller_get_session",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_caller_impl(
+                    caller,
+                    "host_caller_get_session",
+                    req_ptr,
+                    req_len,
+                    |session, spec: serde_json::Value| async move {
+                        super::get_session(&session, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_caller_get_email",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_caller_impl(
+                    caller,
+                    "host_caller_get_email",
+                    req_ptr,
+                    req_len,
+                    |session, spec: serde_json::Value| async move {
+                        super::get_email(&session, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
         "host_caller_xrpc_procedure",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {

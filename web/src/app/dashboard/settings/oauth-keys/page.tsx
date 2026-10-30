@@ -76,18 +76,22 @@ export default function OauthKeysPage() {
     loadKeys();
   }, [loadKeys]);
 
-  async function handleRotate() {
+  async function handleRotate(immediate: boolean) {
     setRotating(true);
     try {
-      const result = await rotateInstanceOauthKey();
+      const result = await rotateInstanceOauthKey(immediate);
       setLastRotation(result);
       setConfirmOpen(false);
+      const title =
+        result.status === "pending"
+          ? `Published a new instance signing key; it takes over ${formatActivation(result.activates_at)}`
+          : "Switched to a new instance signing key";
       if (result.orphaned_sessions > 0) {
-        toast.success("Generated a new instance signing key", {
+        toast.success(title, {
           description: `${result.orphaned_sessions} session${result.orphaned_sessions === 1 ? "" : "s"} predate key pinning and cannot be protected by this or any future rotation.`,
         });
       } else {
-        toast.success("Generated a new instance signing key");
+        toast.success(title);
       }
       loadKeys();
     } catch (e: unknown) {
@@ -119,6 +123,8 @@ export default function OauthKeysPage() {
 
   function statusBadge(status: InstanceOauthKey["status"]) {
     switch (status) {
+      case "pending":
+        return <Badge variant="secondary">Pending</Badge>;
       case "current":
         return <Badge>Current</Badge>;
       case "retiring":
@@ -146,9 +152,12 @@ export default function OauthKeysPage() {
           <CardHeader>
             <CardTitle>Generate a new key</CardTitle>
             <CardDescription>
-              This costs nothing. The current key keeps signing every session
-              already established with it — nothing already logged in is
-              affected. New sessions use the new key from now on.
+              This costs nothing. The new key is published straight away and
+              starts signing new sessions about 75 minutes later, once every
+              authorization server&rsquo;s cached copy of this instance&rsquo;s
+              keys includes it. The current key keeps signing until then, and
+              keeps signing refreshes for every session already established with
+              it — nothing already logged in is affected.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -168,19 +177,32 @@ export default function OauthKeysPage() {
                       Generate a new instance signing key?
                     </AlertDialogTitle>
                     <AlertDialogDescription>
-                      The current key becomes retiring: it keeps signing
-                      refreshes for every session already established with it,
-                      but no new session will use it. This does not log anyone
-                      out.
+                      The new key is published now and takes over in about 75
+                      minutes. Then the current key becomes retiring: it keeps
+                      signing refreshes for every session already established
+                      with it, but no new session will use it. This does not log
+                      anyone out.
+                    </AlertDialogDescription>
+                    <AlertDialogDescription>
+                      If the current key has leaked, switch now instead.
+                      Sign-ins through a PDS that cached the old keys can fail
+                      for up to an hour.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel disabled={rotating}>
                       Cancel
                     </AlertDialogCancel>
+                    <Button
+                      variant="outline"
+                      disabled={rotating}
+                      onClick={() => handleRotate(true)}
+                    >
+                      Switch now
+                    </Button>
                     <AlertDialogAction
                       disabled={rotating}
-                      onClick={handleRotate}
+                      onClick={() => handleRotate(false)}
                     >
                       {rotating ? "Generating..." : "Generate new key"}
                     </AlertDialogAction>
@@ -192,9 +214,14 @@ export default function OauthKeysPage() {
             {lastRotation && (
               <div className="flex flex-col gap-1.5 rounded-lg border p-3">
                 <div className="flex items-center gap-2">
-                  <Badge>Current</Badge>
+                  {statusBadge(lastRotation.status)}
                   <span className="font-mono text-sm">{lastRotation.kid}</span>
                 </div>
+                {lastRotation.status === "pending" && (
+                  <p className="text-xs text-muted-foreground">
+                    Takes over {formatActivation(lastRotation.activates_at)}.
+                  </p>
+                )}
                 {lastRotation.orphaned_sessions > 0 && (
                   <p className="text-xs text-muted-foreground">
                     {lastRotation.orphaned_sessions} session
@@ -220,11 +247,11 @@ export default function OauthKeysPage() {
           <CardHeader>
             <CardTitle>Retiring and revoked keys</CardTitle>
             <CardDescription>
-              To contain a leaked key: generate a new key first (the leaked one
-              becomes retiring, so the instance keeps working), then revoke the
-              retiring key below. Revoking is immediate and destroys every
-              session pinned to that key — it is the correct response to a leak,
-              not routine cleanup.
+              To contain a leaked key: generate a new key and choose{" "}
+              <em>Switch now</em> (the leaked one becomes retiring, so the
+              instance keeps working), then revoke the retiring key below.
+              Revoking is immediate and destroys every session pinned to that
+              key — it is the correct response to a leak, not routine cleanup.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
@@ -261,7 +288,9 @@ export default function OauthKeysPage() {
                     </div>
                     <p className="text-xs text-muted-foreground">
                       Created {new Date(key.created_at).toLocaleString()} ·{" "}
-                      {key.status === "revoked" ? (
+                      {key.status === "pending" ? (
+                        <>Takes over {formatActivation(key.activates_at)}</>
+                      ) : key.status === "revoked" ? (
                         <>
                           {key.session_count} session
                           {key.session_count === 1 ? "" : "s"} destroyed when
@@ -345,4 +374,9 @@ export default function OauthKeysPage() {
       </div>
     </>
   );
+}
+
+/** "at 14:05:00", or "shortly" when the server gave no time. */
+function formatActivation(at: string | null): string {
+  return at ? `at ${new Date(at).toLocaleString()}` : "shortly";
 }
