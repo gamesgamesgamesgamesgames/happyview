@@ -6,3 +6,14 @@ CREATE OR REPLACE FUNCTION hv_collection_id(nsid text) RETURNS bigint
 LANGUAGE sql STABLE STRICT PARALLEL SAFE AS $$
     SELECT c.id FROM happyview_collections c WHERE c.nsid = $1
 $$;
+
+-- Read happyview_collections from the schema HappyView's tables are in,
+-- whatever the caller's search path puts first: a role whose path leads
+-- with another schema could otherwise point it at a table of its own.
+DO $$
+BEGIN
+    EXECUTE format(
+        'ALTER FUNCTION hv_collection_id(text) SET search_path = %I, pg_temp',
+        current_schema()
+    );
+END $$;
