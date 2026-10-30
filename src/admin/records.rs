@@ -190,6 +190,12 @@ pub(super) struct DeleteCollectionParams {
 /// Returns `202` with a job id rather than deleting inline: a large collection
 /// takes long enough that a synchronous request would time out, and running it
 /// as a job gives progress, pause and cancel through the existing jobs UI.
+///
+/// A collection a shared record store serves is refused — see
+/// [`super::lexicons::records_not_locally_deletable`] for why. This is a
+/// change in behaviour: it used to answer `202`, run, and report success
+/// having emptied only this instance's overlay while the shared records it
+/// unions with stayed where they were.
 pub(super) async fn delete_collection_records(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -198,8 +204,12 @@ pub(super) async fn delete_collection_records(
     auth.require(Permission::RecordsDeleteCollection).await?;
     auth.require(Permission::RecordsDelete).await?;
 
-    if params.collection.trim().is_empty() {
+    let collection = params.collection.trim();
+    if collection.is_empty() {
         return Err(AppError::BadRequest("collection is required".into()));
+    }
+    if let Some(reason) = super::lexicons::records_not_locally_deletable(&state, collection) {
+        return Err(AppError::BadRequest(reason));
     }
 
     let job_id = crate::jobs::db::create_job(
@@ -247,7 +257,18 @@ pub(super) async fn list_collections(
     auth.require(Permission::RecordsRead).await?;
 
     let collections = state.lexicons.get_record_lexicon_ids().await;
-    Ok(Json(serde_json::json!({ "collections": collections })))
+    // Which of them a shared record store serves, so a caller can tell
+    // before it asks that `DELETE /admin/records/collection` will refuse.
+    // Additive rather than a shape change: `collections` stays a plain list
+    // of names, as every existing caller reads it.
+    let shared: Vec<&String> = collections
+        .iter()
+        .filter(|c| state.records.external_route(c).is_some())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "collections": collections,
+        "shared": shared,
+    })))
 }
 
 /// A failed record call on `collection`: 503 when the external storage that

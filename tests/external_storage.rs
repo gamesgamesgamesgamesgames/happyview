@@ -933,7 +933,13 @@ fn sql_library() -> LoadedPlugin {
         wasm_bytes: std::fs::read(
             "tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm",
         )
-        .expect("test_library fixture not built"),
+        .expect(
+            "test_library fixture not built. Run: bash scripts/build-plugin-fixtures.sh \
+             (or cargo build --manifest-path tests/fixtures/test_library/Cargo.toml \
+             --target wasm32-unknown-unknown --release). This target panics rather than \
+             skipping, so a missing fixture fails several tests at once and reads like a \
+             regression.",
+        ),
         manifest: Some(manifest),
     }
 }

@@ -143,8 +143,21 @@ summaries in the pull request. The storage settings it exercises
 `BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
 `packages/docs/content/docs/getting-started/configuration.md`.
 
-A test whose plugin module is missing skips rather than fails, so this job
-asserts the fixtures are there before running them:
+A test whose plugin module is missing usually skips rather than fails — but
+not everywhere. A few targets read a fixture directly and panic, `external_storage`
+among them, where an unbuilt `test_library` fails eleven tests at once and
+reads like a regression in whatever you were changing. If a run fails in a way
+you cannot explain, build the fixtures first:
+
+```bash
+bash scripts/build-plugin-fixtures.sh
+```
+
+That is also the fix for a fresh worktree, which has no fixture artefacts at
+all until you build them.
+
+Because a skip is easy to miss, this job asserts the fixtures are there before
+running them:
 
 ```bash
 bash scripts/check-plugin-fixtures.sh --require
