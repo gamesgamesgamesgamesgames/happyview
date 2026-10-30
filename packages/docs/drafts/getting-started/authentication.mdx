@@ -1,0 +1,199 @@
+---
+title: Authentication
+description: Sign users in with atproto OAuth, call your instance from your own app with DPoP, and use API keys for the admin API.
+type: how-to
+prerequisites:
+  - /docs/getting-started/scripts
+  - /docs/getting-started/plugins-and-libraries
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page shows you the ways a person or a program proves who it is to HappyView, and what each one can reach.
+
+There are two sides to it. Your app's users call your XRPC endpoints under `/xrpc/`. Operators and automation call the admin API under `/admin/`. They take different credentials:
+
+| Who | Calls | With |
+| --- | --- | --- |
+| Anyone | XRPC queries | Nothing. The request is anonymous |
+| A signed-in user, through your app | XRPC queries and procedures | A DPoP session and an API client key |
+| You, in the dashboard | The admin API | The session cookie from signing in |
+| Scripts, CI and cron jobs | The admin API | An admin API key |
+| hpy, or another app you allow | The admin API | A DPoP session granted `dev.happyview.adminFull` |
+
+## Sign in to the dashboard
+
+You sign in to the dashboard with your atproto account. Open your instance, enter your handle, and approve the sign-in on your PDS. HappyView sets a signed session cookie, and the dashboard uses it for every admin call it makes for you.
+
+On a new instance, the first account to sign in becomes the super user, with every permission. To choose that account in advance, set `SUPERADMIN_DID`. HappyView then makes that DID a super user at boot and does not promote whoever signs in first.
+
+Signing in needs a secure `SESSION_SECRET` of at least 32 bytes. With a missing or weak one, HappyView refuses to start a sign-in.
+
+To let more people into the dashboard, add them as users and give them permissions. See [Permissions](/docs/guides/permissions).
+
+## Let your app's users sign in
+
+Your users sign in to your app, not to HappyView. Your app runs an atproto OAuth flow with the user's PDS, and HappyView holds a copy of the session so it can act for that user.
+
+### Register an API client
+
+Every app that signs users in needs an API client. Open **API Clients** in the dashboard, under **Access**, and click **Create API Client**, or call `POST /admin/api-clients`. You give it:
+
+- your app's `client_id_url` (where its OAuth client metadata lives), `client_uri` and `redirect_uris`;
+- the `scopes` it may ask for. The default is `atproto`;
+- a `client_type`: `confidential` (the default) for a server that can keep a secret, or `public` for a browser app;
+- for a public client, its `allowed_origins`.
+
+You get back a client key starting with `hvc_`. A confidential client also gets a secret starting with `hvs_`. The secret is shown once, so save it.
+
+### Sign in with the SDK
+
+The [JavaScript SDK](/docs/reference/sdk) runs the whole flow. In a browser app:
+
+```ts
+import { HappyViewBrowserClient } from "@happyview/oauth-client-browser";
+
+const client = new HappyViewBrowserClient({
+  instanceUrl: "https://happyview.example.com",
+  clientId: "https://app.example.com/oauth-client-metadata.json",
+  clientKey: "hvc_your_client_key",
+});
+
+// Restores a saved session, or finishes a sign-in when the user returns.
+const result = await client.init();
+
+if (!result) {
+  // Sends the user to their PDS to approve the sign-in.
+  await client.signIn("alice.example.com");
+} else {
+  // Signed in: calls carry the DPoP proof and the client key for you.
+  const response = await result.session.fetchHandler(
+    "/xrpc/xyz.statusphere.getStatuses",
+    { method: "GET" },
+  );
+  console.log(result.session.did, await response.json());
+}
+```
+
+### What happens underneath
+
+You only need this if you aren't using the SDK. The full protocol is in [OAuth](/docs/reference/oauth).
+
+1. Your app asks HappyView for a DPoP key with `POST /oauth/dpop-keys`. A confidential client sends `X-Client-Key` and `X-Client-Secret`. A public client sends `X-Client-Key`, a matching `Origin`, and a PKCE `pkce_challenge` in the body. HappyView returns a `provision_id` and the private key.
+2. Your app runs OAuth with the user's PDS, signing its DPoP proofs with that key.
+3. Your app hands the tokens back with `POST /oauth/sessions`. The granted scope must include `atproto`, and every scope in it must be one the API client registered. A public client also sends its `pkce_verifier`.
+4. From then on, each XRPC call carries `Authorization: DPoP <access token>`, a `DPoP` proof header and `X-Client-Key`.
+
+Because HappyView and your app hold the same key, HappyView can sign its own proofs and write to the user's PDS for them. Each device gets its own key and its own session.
+
+:::caution[API keys don't work on XRPC]
+`/xrpc/` routes refuse `Authorization: Bearer`, so an `hv_` admin API key is rejected there. Use a DPoP session, or send no `Authorization` header for an anonymous call.
+:::
+
+## Who is calling, inside a script
+
+A script sees the caller in `ctx`:
+
+- `ctx.caller_did` is the signed-in user's DID. It is absent when the request is anonymous.
+- `ctx.has_pds_auth` is `true` when HappyView holds a session it can use to write to that user's PDS.
+
+Queries may be anonymous. Procedures may not: a procedure called with no credentials gets `401` before the script runs. In a query, `ctx.has_pds_auth` is always `false`, so write to the PDS from a procedure.
+
+This query answers differently for signed-in and anonymous callers:
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+function handle(input, ctx)
+  if ctx.caller_did == nil then
+    return { signedIn = false }
+  end
+
+  return { signedIn = true, did = ctx.caller_did }
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+export default function handle(input, ctx) {
+  if (ctx.caller_did === undefined) {
+    return { signedIn: false };
+  }
+
+  return { signedIn: true, did: ctx.caller_did };
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+interface Ctx {
+  caller_did?: string;
+  has_pds_auth: boolean;
+}
+
+export default function handle(input: Record<string, unknown>, ctx: Ctx) {
+  if (ctx.caller_did === undefined) {
+    return { signedIn: false };
+  }
+
+  return { signedIn: true, did: ctx.caller_did };
+}
+```
+
+</TabItem>
+</Tabs>
+
+Other AppViews and services can also call your XRPC endpoints with an atproto service-auth JWT, if you register them. See [Service identity](/docs/guides/service-identity).
+
+## Use the admin API with an API key
+
+For automation, create an admin API key. Open **API Keys** in the dashboard, under **Access**, and click **Create API Key**, or call the admin API:
+
+```sh
+curl -X POST "http://127.0.0.1:3000/admin/api-keys" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "ci", "permissions": ["lexicons:read", "records:read"] }'
+```
+
+The response's `key` starts with `hv_`. It is shown once. Send it as a bearer token:
+
+```sh
+curl "http://127.0.0.1:3000/admin/lexicons" \
+  -H "Authorization: Bearer hv_your_api_key"
+```
+
+A key carries only the permissions you picked, and only those its owner still holds. A key is never a super user, even when its owner is, so super-user-only actions aren't available through keys. Creating a key needs `api-keys:create`, and you can't give a key a permission you don't have. See [API keys](/docs/guides/api-keys).
+
+## Let an app manage your instance
+
+An app's DPoP session belongs to the app. Signing in to an app as an admin does not, by default, let that app use the admin API. The app must ask for the `dev.happyview.adminFull` permission set, and you must approve it at sign-in.
+
+`dev.happyview.adminFull` is a permission set titled "Manage your HappyView instances". It holds one permission: `rpc` on `dev.happyview.admin.manage`, for any audience. To use it:
+
+1. Add `include:dev.happyview.adminFull` to the API client's scopes.
+2. Have the app request that scope when the user signs in.
+3. The user approves it on their PDS's consent screen.
+
+The session then reaches `/admin/` with the user's own permissions, no more. HappyView checks the scope the user's authorization server actually granted, not the scope the app registered, and checks again each time the access token expires. Revoking the grant at the PDS ends admin access within one token lifetime. A session without the grant gets `403`.
+
+hpy, the HappyView CLI, works this way. Every instance has a built-in public API client for it, `hvc_hpy`, whose scopes are `atproto include:dev.happyview.adminFull`. `GET /config` publishes the key as `cli_client_key`.
+
+:::note[Service-auth tokens can't reach the admin API]
+The admin API refuses every atproto service-auth JWT with `403`, whatever method it names. A PDS mints those tokens for most apps on request, so one says nothing about whether you meant to let that app manage your instance. Use an API key or an app granted `dev.happyview.adminFull`.
+:::
+
+## Next steps
+
+- [Testing](/docs/getting-started/testing): run your scripts against forged callers
+- [API clients](/docs/guides/api-clients): register and manage the apps that sign users in
+- [API keys](/docs/guides/api-keys)
+- [Permissions](/docs/guides/permissions): every permission and what it grants
+- [Service identity](/docs/guides/service-identity)
+- [OAuth](/docs/reference/oauth): the DPoP provisioning and session endpoints
+- [XRPC](/docs/reference/xrpc)
+- [JavaScript SDK](/docs/reference/sdk)

@@ -1,0 +1,229 @@
+---
+title: Plugins and libraries
+description: Install the interpreter your scripts run in and the libraries they load, and read the capabilities each one asks for.
+type: how-to
+prerequisites:
+  - /docs/getting-started/scripts
+  - /docs/getting-started/background-jobs
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page shows you how to install the plugins your scripts need, load a library from a script, and decide what each plugin is allowed to do.
+
+You'll install an interpreter and a library from the registry, use the library in a query, and read the capabilities on the consent screen. The examples use the `happyview.db` library and the `xyz.statusphere.status` collection.
+
+## Interpreters and libraries
+
+HappyView runs your scripts inside WebAssembly plugins. Two kinds matter for scripts:
+
+- An **interpreter** runs scripts in one language. The official ones are `happyview-lua`, `happyview-javascript` and `happyview-typescript`. A script's language is whichever interpreter runs it.
+- A **library** gives scripts a set of functions under a `happyview.*` name, such as `happyview.db` for reading indexed records or `happyview.jobs` for queuing background jobs. A script loads a library with `require` in Lua or `import` in JavaScript and TypeScript.
+
+HappyView itself ships with no interpreter and no library. Everything a script can reach beyond the built-in `internal.*` modules comes from a library you install.
+
+:::note[Self-hosted instances start with no interpreter]
+A self-hosted instance has no interpreter until you install one. At boot it logs a warning: "no interpreter plugin is installed, so no script can be saved or run". Saving a script is refused until an interpreter for its language is installed. HappyProto-managed instances have Lua preinstalled.
+:::
+
+## Install from the registry
+
+HappyView reads its plugin catalogue from the HappyProto registry. The official plugins are published there under `did:plc:mo7vq4jbioxwafy5zkcc3eux`. The catalogue refreshes every 15 minutes.
+
+Each plugin publishes up to three channels: `latest`, `beta` and `alpha`. HappyView v3 is in alpha, so install from the `alpha` channel for now.
+
+1. Open **Plugins** in the dashboard, under **Integrations**, and click **Add plugin**.
+2. Pick a plugin from the catalogue, for example **Lua**.
+3. Set **Channel** to `alpha`. The picker starts on `latest` when the plugin publishes one.
+4. Open the **Permissions** tab and read what the plugin asks for. See [Capabilities](#capabilities) below.
+5. Click **Install**.
+
+The plugin loads straight away. You don't need to restart HappyView. Repeat for each library your scripts use, such as **DB** (`happyview-db`) for the example below, or **Jobs** (`happyview-jobs`) for [background jobs](/docs/getting-started/background-jobs).
+
+An installed plugin follows its channel. When the channel moves to a new version, the dashboard offers you the update. **Switch channel** moves a plugin to another channel and follows that one from then on.
+
+You can also install with the admin API. Name the registry project and the channel, and list the capabilities you accept:
+
+```sh
+curl -X POST "http://127.0.0.1:3000/admin/plugins" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "registry": {
+      "did": "did:plc:mo7vq4jbioxwafy5zkcc3eux",
+      "name": "happyview-db",
+      "channel": "alpha"
+    },
+    "accepted_capabilities": ["records:read"]
+  }'
+```
+
+Installing needs the `plugins:create` permission. If the plugin would be granted a capability missing from `accepted_capabilities`, the request fails with `capability consent missing`. For installs from a URL, the file system or environment variables, see [Plugins](/docs/guides/plugins).
+
+## Use a library in a script
+
+Once `happyview-db` is installed, any script can load `happyview.db`. This query lists one account's statuses, newest first:
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local db = require("happyview.db")
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  local page = db.records("xyz.statusphere.status")
+    :did(input.did)
+    :sort("createdAt", "desc")
+    :limit(input.limit)
+    :run()
+
+  log.info("statuses read", { did = input.did, count = #page.records })
+  return { statuses = page.records, cursor = page.cursor }
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import db from "happyview.db";
+import log from "internal.logging";
+
+export default async function handle(input, ctx) {
+  const page = await db
+    .records("xyz.statusphere.status")
+    .did(input.did)
+    .sort("createdAt", "desc")
+    .limit(input.limit)
+    .run();
+
+  log.info("statuses read", { did: input.did, count: page.records.length });
+  return { statuses: page.records, cursor: page.cursor };
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import db from "happyview.db";
+import log from "internal.logging";
+
+interface Params {
+  did: string;
+  limit?: number;
+}
+
+export default async function handle(input: Params) {
+  const page = await db
+    .records("xyz.statusphere.status")
+    .did(input.did)
+    .sort("createdAt", "desc")
+    .limit(input.limit)
+    .run();
+
+  log.info("statuses read", { did: input.did, count: page.records.length });
+  return { statuses: page.records, cursor: page.cursor };
+}
+```
+
+</TabItem>
+</Tabs>
+
+`require` looks for a built-in `internal.*` module first, then for an installed library with that name. In JavaScript and TypeScript, every library call returns a promise, so `await` it. In Lua, a library call returns its result directly.
+
+If the library isn't installed, the script fails when it runs, with an error such as `module 'happyview.db' not found -- is the 'happyview.db' library plugin installed?`. Saving the script doesn't catch this, so install the library before you rely on it.
+
+### Handle a library error
+
+A library that fails raises an error in your script. The message carries an error code, such as `BAD_INPUT` or `NO_SESSION`. Each library's README lists its codes. Catch the error when you expect it:
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  local ok, result = pcall(db.get, input.uri)
+  if not ok then
+    return { error = tostring(result) }
+  end
+  return { record = result }
+end
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import db from "happyview.db";
+
+export default async function handle(input, ctx) {
+  try {
+    return { record: await db.get(input.uri) };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import db from "happyview.db";
+
+export default async function handle(input: { uri: string }) {
+  try {
+    return { record: await db.get(input.uri) };
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
+The full list of libraries, with what each one does, is in [Libraries](/docs/reference/scripts/libraries).
+
+## Capabilities
+
+Every plugin declares the capabilities it needs, and HappyView grants it exactly those and nothing more. A capability is a group of things the plugin may do through HappyView, such as `records:read` to look up indexed records or `database:write` to run any SQL.
+
+The **Permissions** tab on the install screen is the consent screen. It lists each capability with its risk level (**Low risk**, **Medium risk**, **High risk** or **Critical**) and a sentence that says what it allows. The riskiest are listed first. Clicking **Install** grants what is shown there.
+
+Some examples from the official plugins:
+
+| Plugin | Capabilities |
+| --- | --- |
+| `happyview-lua`, `happyview-javascript`, `happyview-typescript` | `library:call`, `script:host`, `script:test`, `wasi:clock`, `wasi:random`, `wasi:stdio` |
+| `happyview-db` | `records:read` |
+| `happyview-sql` | `database:read`, `database:write` |
+| `happyview-jobs` | `jobs:create`, `jobs:read`, `jobs:read_any` |
+| `happyview-http` | `network:request:unrestricted` |
+
+A library's capabilities bound what every script can do through it. With `happyview-sql` installed, any script can run any SQL statement. With `happyview-http`, any script can call any host. Install only the libraries your scripts use.
+
+An interpreter's `library:call` lets scripts call installed libraries. Each library runs with its own capabilities, not the interpreter's.
+
+When an update or a channel switch asks for a capability the installed version doesn't have, the dashboard shows **This version asks for new permissions**. Check **Allow these permissions** to go ahead. If you don't, the installed version keeps running.
+
+### Capabilities don't replace a caller
+
+Some library calls also need a user to act as, whatever capabilities the library has. A library acts as `ctx.caller_did`, and some scripts have none.
+
+:::caution[A label script can't queue a job]
+A label script runs with no caller. In a label script, `create` from `happyview.jobs` raises a `BAD_INPUT` error with the message "this call requires an authenticated caller". If your script doesn't catch it, the run fails. HappyView retries it, moves it to **Dead Letters**, and stores the label as it arrived.
+:::
+
+The same holds for an anonymous request to a query. Record scripts act as the record's author, so they can queue jobs. See [Background jobs](/docs/getting-started/background-jobs#queue-a-job).
+
+## Next steps
+
+- [Authentication](/docs/getting-started/authentication): sign users in, so scripts have a caller
+- [Plugins](/docs/guides/plugins): channels, updates, and installing from a URL or the file system
+- [Libraries](/docs/reference/scripts/libraries): every library and the capabilities it asks for
+- [Plugins admin API](/docs/reference/admin/plugins)
+- [Developing plugins](/docs/guides/developing-plugins): build your own library

@@ -1,0 +1,389 @@
+---
+title: Testing
+description: Write test files next to your scripts and run them with happyview test, with mocks, forged callers and no network.
+type: how-to
+prerequisites:
+  - /docs/getting-started/scripts
+  - /docs/getting-started/reacting-to-records
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page shows you how to test the scripts in a HappyView project. You'll write a test file, run it, fire triggers at your handlers, mock a library and act as a signed-in user.
+
+Tests run against a project on disk: a directory with a `happyview.toml` and a `src/` directory. `hpy happyview create` scaffolds one. Scripts saved only in the dashboard can't be tested this way.
+
+:::note[You need an interpreter that supports tests]
+Test files run in the same interpreter plugins as your scripts. An interpreter built before test runs existed refuses a test file, and the run says it needs `happyview-plugin-sdk` 0.3.0 or later. Update the plugin to fix it.
+:::
+
+## Write a test file
+
+A test file is any file under `src/` named `*.test.<ext>`, where `<ext>` is an extension an installed interpreter claims. For example, `src/lib/format.test.lua` tests `src/lib/format.lua`. A test file can sit anywhere under `src/`, next to the code it tests.
+
+A test file defines no `handle`. It declares tests, and each test passes, fails or is skipped. Lua uses busted-style globals: `describe`, `it`, `pending`, `before_each`, `after_each` and `assert`. JavaScript and TypeScript use Vitest-style functions imported from `internal.test`: `describe`, `it`, `it.skip`, `beforeEach`, `afterEach` and `expect`.
+
+This test checks a module directly, without firing anything. It assumes `src/lib/format.lua` (or `.js`, `.ts`) exports a `shout` function.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local format = require("./format")
+
+describe("format.shout", function()
+  it("upper-cases and adds a bang", function()
+    assert.are.equal("HELLO!", format.shout("hello"))
+  end)
+
+  it("leaves an empty string alone", function()
+    assert.are.equal("", format.shout(""))
+  end)
+end)
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import { describe, it, expect } from "internal.test";
+import { shout } from "./format";
+
+describe("format.shout", () => {
+  it("upper-cases and adds a bang", () => {
+    expect(shout("hello")).toBe("HELLO!");
+  });
+
+  it("leaves an empty string alone", () => {
+    expect(shout("")).toBe("");
+  });
+});
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { describe, it, expect } from "internal.test";
+import { shout } from "./format";
+
+describe("format.shout", () => {
+  it("upper-cases and adds a bang", () => {
+    expect(shout("hello")).toBe("HELLO!");
+  });
+
+  it("leaves an empty string alone", () => {
+    expect(shout("")).toBe("");
+  });
+});
+```
+
+</TabItem>
+</Tabs>
+
+A test file imports the project's own modules by a path relative to itself, as a handler does.
+
+The Lua assertions are `assert(value, message)`, `assert.are.equal`, `assert.are.same` (deep), `assert.is_true`, `assert.is_false`, `assert.is_nil` and `assert.has_error`. The JavaScript and TypeScript matchers are `toBe`, `toEqual`, `toBeTruthy`, `toBeNull`, `toContain`, `toMatchObject` and `toThrow`, plus `.resolves` and `.rejects` for a promise.
+
+## Run the tests
+
+From the project root:
+
+```sh
+hpy happyview test                # every test file
+hpy happyview test format         # only files whose path contains "format"
+hpy happyview test --watch        # run, then rerun on every save
+```
+
+`hpy happyview test` builds the project's compiled modules, then runs `happyview test` with the HappyView version the project pins and the plugins in `happyview.lock`. Add `--locked` to fail instead of updating `happyview.lock` when it no longer matches `happyview.toml`, as CI should.
+
+You can also call the HappyView binary yourself. It takes the project root as its first argument:
+
+```sh
+happyview test .
+happyview test . format
+happyview test . --watch
+happyview test . --plugin ./plugins/lua   # load this interpreter instead
+```
+
+`happyview test` loads interpreters from each `--plugin <dir>`, else from `$PLUGIN_DIR`, else from the project's `.happyview/plugins`.
+
+### Read the output
+
+Each file gets a line. Then each failing test is listed with the place of the assertion that failed:
+
+```
+ PASS  src/lib/format.test.lua (2 tests) 12ms
+ FAIL  src/lib/status.test.lua (2 tests, 1 failed) 48ms
+
+ FAIL  src/lib/status.test.lua > status record script > indexes a status from alice
+       src/lib/status.test.lua:10: expected 200, got 500
+
+Test files  1 failed, 1 passed (2)
+     Tests  1 failed, 3 passed (4)
+  Duration  0.31s
+```
+
+A whole file fails if it won't load, raises an error outside a test, reports no tests, or runs past its time limit. The error is printed under the file's line.
+
+### Exit codes
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Every test file ran and passed |
+| `1` | A test or a file failed, or no test file ran (there are none, or the filter matched none) |
+| `2` | The tests couldn't run: a usage error, a plugin that wouldn't load, or a build error in the project |
+
+`hpy happyview test` exits with the same code.
+
+## Fire a trigger
+
+The `test` object from `internal.test` fires triggers at your handlers. Each trigger goes in through the same entry point as the real event, so your handler runs as it would in production, with auth and indexing around it. Each one returns `{ status, body }`.
+
+This test fires a record create at the `xyz.statusphere.status` record script from [Reacting to records](/docs/getting-started/reacting-to-records):
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local test = require("internal.test")
+
+describe("status record script", function()
+  it("indexes a status from alice", function()
+    local res = test.record_create("xyz.statusphere.status", {
+      as = "did:plc:alice",
+      record = { status = "👍", createdAt = "2026-10-30T12:00:00Z" },
+    })
+
+    assert.are.equal(200, res.status)
+    assert.are.same({}, res.body.errors)
+    assert.is_true(res.body.uri:find("at://did:plc:alice/", 1, true) == 1)
+  end)
+end)
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import { describe, it, expect, test } from "internal.test";
+
+describe("status record script", () => {
+  it("indexes a status from alice", async () => {
+    const res = await test.recordCreate("xyz.statusphere.status", {
+      as: "did:plc:alice",
+      record: { status: "👍", createdAt: "2026-10-30T12:00:00Z" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toEqual([]);
+    expect(res.body.uri.startsWith("at://did:plc:alice/")).toBe(true);
+  });
+});
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { describe, it, expect, test } from "internal.test";
+
+interface RecordResult {
+  status: number;
+  body: { outcome: string; uri: string; cid: string | null; errors: string[] };
+}
+
+describe("status record script", () => {
+  it("indexes a status from alice", async () => {
+    const res: RecordResult = await test.recordCreate("xyz.statusphere.status", {
+      as: "did:plc:alice",
+      record: { status: "👍", createdAt: "2026-10-30T12:00:00Z" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toEqual([]);
+    expect(res.body.uri.startsWith("at://did:plc:alice/")).toBe(true);
+  });
+});
+```
+
+</TabItem>
+</Tabs>
+
+The triggers are named in snake case in Lua and camel case in JavaScript and TypeScript:
+
+| Lua | JavaScript and TypeScript | What it does | `body` |
+| --- | --- | --- | --- |
+| `query(nsid, params, opts)` | `query` | Sends a GET through HappyView's XRPC router, in process. A list in `params` becomes a repeated parameter | The response JSON |
+| `procedure(nsid, input, opts)` | `procedure` | Sends a POST with `input` as the JSON body | The response JSON |
+| `record_create(collection, opts)` | `recordCreate` | Hands the record handler a create event, so the collection's record scripts run and the record is indexed | `outcome`, `uri`, `cid`, `errors` |
+| `record_update(collection, opts)` | `recordUpdate` | The same, for an update. Needs `opts.rkey` | As above |
+| `record_delete(collection, opts)` | `recordDelete` | The same, for a delete. Needs `opts.rkey` | As above |
+| `job(type, input, opts)` | `job` | Creates a job of that type and runs its script once, to the end | `id`, `status`, `result`, `error`, `progress` |
+| `label(uri, label)` | `label` | Applies a label to `uri` and runs the label script. `label` is `val`, with optional `src`, `neg`, `cts` and `exp` | `applied`, `errors` |
+
+A few details:
+
+- The record triggers take `record`, `did`, `rkey` and `as` in `opts`. The author is `did`, else `as`, else `did:plc:test`. The collection needs an indexed record lexicon in the project, or the call raises an error.
+- A record or label script that fails sets `status` to `500`, with the error in `errors`. A test run tries a failed script once. It doesn't retry.
+- A job trigger's `status` is `200` when the job completed and `500` otherwise.
+- No job worker runs during a test. A job that a script queues stays pending until you fire it with `job`.
+
+### Lexicon validation
+
+:::caution[Pending happyview#276]
+Until happyview#276 is released, query and procedure parameters aren't checked against the lexicon. A value past a `maxLength`, for example, still reaches your script and usually answers `200`, in a test run and on a served instance alike. The rules below apply once #276 ships.
+
+- A call whose parameters or input break the method's lexicon gets `400 {"error":"InvalidRequest"}` with a message naming the first problem, and the script doesn't run.
+- A parameter the lexicon declares as an array, sent once, arrives as a one-item array.
+- A missing parameter with a `default` arrives as that default.
+- `knownValues` isn't enforced, and parameters the lexicon doesn't declare pass through untouched.
+:::
+
+## Act as a user
+
+`as` sets the caller a trigger runs as: `{ as = "did:plc:alice" }` in Lua, `{ as: "did:plc:alice" }` in JavaScript and TypeScript. `as` takes a DID. `query`, `procedure`, the record triggers and `job` accept it. `label` doesn't.
+
+A forged caller only exists in a test run. HappyView honours it only when the request comes from the test harness, and nothing arriving over the network can claim one.
+
+- A procedure fired with no `as` is refused with `401`, as every unauthenticated procedure is.
+- A procedure whose input has a `delegateDid` is refused with `400`. To act as another account, fire the trigger `as` that account.
+- A test run makes up identities instead of resolving them. The handle `alice.test` resolves to `did:plc:alice` and back. Handles are lowercased, so `Alice.test` is also `did:plc:alice`.
+
+## Mock a library
+
+A library you don't mock runs for real, network included. To answer a library from data instead, call `mock` with the library's namespace and a response for each method. This test answers every `get` from `happyview.http`, then checks the handler made one call. `com.example.getWeather` stands in for a query your project defines.
+
+<Tabs syncKey="lang">
+<TabItem label="Lua">
+
+```lua
+local test = require("internal.test")
+
+describe("com.example.getWeather", function()
+  before_each(function()
+    test.mock("happyview.http", {
+      get = { status = 200, body = '{"temp":21}', headers = {} },
+    })
+  end)
+
+  it("answers a signed-in caller", function()
+    local res = test.query("com.example.getWeather", { city = "Paris" }, { as = "did:plc:alice" })
+
+    assert.are.equal(200, res.status)
+
+    local calls = test.calls("happyview.http")
+    assert.are.equal(1, #calls)
+    assert.are.equal("get", calls[1].method)
+  end)
+end)
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import { describe, it, expect, beforeEach, test } from "internal.test";
+
+describe("com.example.getWeather", () => {
+  beforeEach(() => {
+    test.mock("happyview.http", {
+      get: { status: 200, body: '{"temp":21}', headers: {} },
+    });
+  });
+
+  it("answers a signed-in caller", async () => {
+    const res = await test.query("com.example.getWeather", { city: "Paris" }, { as: "did:plc:alice" });
+
+    expect(res.status).toBe(200);
+
+    const calls = test.calls("happyview.http");
+    expect(calls.length).toBe(1);
+    expect(calls[0].method).toBe("get");
+  });
+});
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { describe, it, expect, beforeEach, test } from "internal.test";
+
+interface Call {
+  method: string;
+  args: unknown[];
+}
+
+describe("com.example.getWeather", () => {
+  beforeEach(() => {
+    test.mock("happyview.http", {
+      get: { status: 200, body: '{"temp":21}', headers: {} },
+    });
+  });
+
+  it("answers a signed-in caller", async () => {
+    const res: { status: number; body: unknown } = await test.query(
+      "com.example.getWeather",
+      { city: "Paris" },
+      { as: "did:plc:alice" },
+    );
+
+    expect(res.status).toBe(200);
+
+    const calls: Call[] = test.calls("happyview.http");
+    expect(calls.length).toBe(1);
+    expect(calls[0].method).toBe("get");
+  });
+});
+```
+
+</TabItem>
+</Tabs>
+
+How mocks behave:
+
+- **A single response** answers every call to that method.
+- **A list of responses** answers in order. A call after the last one fails.
+- **An error response**, `{ ["$error"] = { code = "HTTP_ERROR", message = "timed out" } }` in Lua, makes the call fail with that code and message.
+- **A method the mock doesn't list** fails, naming the methods it does list.
+- **A namespace no installed library serves** is refused when you set the mock, so a typo can't leave the real call running. Use the full namespace, such as `happyview.http`.
+- **A mock lasts for the rest of the file** once it's set. Set mocks in `before_each` (`beforeEach`) when tests need different ones.
+
+`calls(namespace)` returns the calls the current test made to that namespace, each with its `method` and `args`, whether the namespace is mocked or not. The list starts empty for each test.
+
+## What stands in for the outside world
+
+HappyView itself reaches no real network during a test run: no PLC directory, relay, Jetstream or telemetry collector.
+
+- **Each test file gets its own database.** HappyView migrates one database at the start of the run, and each file starts from a fresh copy. Nothing one file writes is seen by another. The tests in one file share theirs and run in order.
+- **Test files run in parallel**, as many at a time as the machine has cores.
+- **`ctx.env` comes from `.env.test`** in the project root. `happyview test` never loads the project's `.env`, since that file holds a real instance's secrets. Setting `HAPPYVIEW_SCRIPT_ENV_FILE` in the environment overrides `.env.test`.
+- **The PDS is in process.** Writes made as the caller go to a PDS inside the test run. It answers `createRecord`, `putRecord`, `deleteRecord` and `uploadBlob` with real CIDs, and `501` to anything else. It refuses writes to another account's repo and doesn't check `swapRecord`. `pds_writes()` (`pdsWrites()`) returns the record writes the current test made.
+
+## Time limits
+
+- **A test file** can spend 60 seconds running its own code. Time spent inside a trigger doesn't count. A file that runs past its limit fails, and the other files carry on.
+- **A handler** behind a trigger gets a served instance's limits: 10 seconds and 1,000,000 instructions by default. A test run has no dashboard settings, so set `SCRIPT_WALL_CLOCK_SECONDS` and `SCRIPT_INSTRUCTION_LIMIT` in the environment to match an instance that raised them.
+- **A job** gets 60 seconds for its own code and another 60 seconds shared across its `ctx.job.wait` calls. A served job has no such limit.
+- **An unmocked library call** fails with a timeout after 60 seconds, network time included.
+
+## Watch mode
+
+`--watch` runs the tests, then waits for changes and reruns:
+
+- A change to test files only reruns those files.
+- Any other change, to a handler, a module, a lexicon or `happyview.toml`, reruns every test file.
+- A change to `happyview.toml` or `.env.test` is loaded before the rerun.
+- A save that breaks the build prints the error and keeps watching. The next save that builds reruns everything the broken saves touched.
+- A save made while tests are running waits for the run to finish.
+
+If the first build fails, the command exits with `2` instead of watching. When a watch ends, the command exits with the code of the last run. Under `hpy happyview test --watch`, hpy also rebuilds the project's compiled modules on save.
+
+`HAPPYVIEW_WATCH_POLL_MS` switches the watch to polling. An invalid value exits with `2`.
+
+## Next steps
+
+- [Local development](/docs/getting-started/local-development): run your project on your own machine
+- [The CLI](/docs/reference/cli): every `happyview` and `hpy` command
+- [Script types and triggers](/docs/reference/scripts/types-and-triggers)
+- [Limits](/docs/reference/scripts/limits)
