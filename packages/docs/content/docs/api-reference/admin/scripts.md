@@ -145,6 +145,49 @@ curl "http://127.0.0.1:3000/admin/scripts?suffix=xyz.statusphere.status" -H "$AU
 ]
 ```
 
+## List script languages
+
+```
+GET /admin/scripts/languages
+```
+
+The languages a script can be written in on this instance: the `language_id` of each installed interpreter plugin, sorted. A create or update with any other `script_type` is refused, so this is the list to offer.
+
+```ts tab="TypeScript" tab-group="language"
+const response = await fetch("http://127.0.0.1:3000/admin/scripts/languages", {
+  headers,
+});
+const languages: string[] = await response.json();
+```
+```js tab="JavaScript" tab-group="language"
+const response = await fetch("http://127.0.0.1:3000/admin/scripts/languages", {
+  headers,
+});
+const languages = await response.json();
+```
+```rust tab="Rust" tab-group="language"
+let response = client
+    .get("http://127.0.0.1:3000/admin/scripts/languages")
+    .bearer_auth(token)
+    .send()
+    .await?;
+let languages: Vec<String> = response.json().await?;
+```
+```go tab="Go" tab-group="language"
+req, _ := http.NewRequest("GET", "http://127.0.0.1:3000/admin/scripts/languages", nil)
+req.Header.Set("Authorization", "Bearer "+token)
+resp, err := http.DefaultClient.Do(req)
+```
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/scripts/languages -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+```json
+["javascript", "lua", "typescript"]
+```
+
 ## Get a script
 
 ```

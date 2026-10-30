@@ -244,3 +244,64 @@ async fn runnable_follows_the_installed_interpreters_rather_than_the_row() {
         [("typescript", &json!(false)), ("lua", &json!(true))]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Which languages a new script can be written in
+// ---------------------------------------------------------------------------
+
+async fn list_languages(app: &TestApp) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/scripts/languages")
+                .header(cookie.0, cookie.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// An interpreter claiming `language` under an id of its own, since the
+/// registry holds one plugin per id.
+fn interpreter_for(language: &str) -> happyview::plugin::LoadedPlugin {
+    let mut plugin = echo_interpreter::claiming(language);
+    plugin.info.id = format!("interpreter_{language}");
+    plugin
+}
+
+/// The script editor offers exactly what a save would accept, so the list is
+/// the installed interpreters' languages, in an order that doesn't move.
+#[tokio::test]
+#[serial]
+async fn languages_are_the_installed_interpreters_sorted() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    for language in ["typescript", "lua", "javascript"] {
+        app.state
+            .plugin_registry
+            .register(interpreter_for(language))
+            .await;
+    }
+
+    let resp = list_languages(&app).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await,
+        json!(["javascript", "lua", "typescript"])
+    );
+}
+
+/// With nothing installed, nothing can be saved, so nothing is offered.
+#[tokio::test]
+#[serial]
+async fn languages_is_empty_with_no_interpreter_installed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = list_languages(&app).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!([]));
+}
