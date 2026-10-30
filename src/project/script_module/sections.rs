@@ -40,9 +40,9 @@ pub struct ModuleSections {
     pub handlers: Vec<ModuleHandler>,
     pub interface: Option<String>,
     /// A `throw` needs a tag, defined or imported, so a module without one
-    /// cannot catch its own exceptions and erase the fuel it spent. Handler
-    /// instructions such as `try_table` with no tag are not reported: they
-    /// cannot catch a throw the module can never create.
+    /// cannot throw or catch an exception. Handler instructions such as
+    /// `try_table` with no tag are not reported: they cannot catch a throw
+    /// the module can never create.
     pub uses_exceptions: bool,
 }
 

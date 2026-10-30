@@ -219,7 +219,7 @@ async fn test_plugin_not_found() {
 async fn test_steam_get_secret_json_envelope() {
     let wasm_path = "tests/fixtures/steam.wasm";
     if !std::path::Path::new(wasm_path).exists() {
-        eprintln!("Skipping test: {} not found", wasm_path);
+        happyview::test_support::unavailable(&format!("{wasm_path} not found"));
         return;
     }
 

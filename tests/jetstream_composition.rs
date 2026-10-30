@@ -26,7 +26,9 @@ use happyview_source_jetstream::archive::ArchiveConfig;
 use happyview_source_jetstream::consumer::config::{
     DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
 };
-use happyview_source_jetstream::{BackfillExecutor, JetstreamSource, JobHandle, JobTotals};
+use happyview_source_jetstream::{
+    BackfillExecutor, CollectionSummary, JetstreamSource, JobHandle, JobTotals, SummaryState,
+};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -71,7 +73,7 @@ fn record_lexicon(id: &str) -> Value {
 /// host over the returned state reads, which the test drives.
 async fn app(collections: &[&str]) -> Option<(TestApp, watch::Sender<Vec<String>>)> {
     if std::env::var("TEST_DATABASE_URL").is_err() {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
         return None;
     }
     let mut app = TestApp::new().await;
@@ -400,6 +402,121 @@ async fn an_executor_runs_backfills_for_its_collections() {
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
+/// Notes what its run found once `go` is notified, and describes the
+/// collections it backfills.
+struct Describing {
+    go: Notify,
+}
+
+#[async_trait::async_trait]
+impl BackfillExecutor for Describing {
+    fn name(&self) -> &'static str {
+        "store-pass"
+    }
+
+    async fn run(&self, job: JobHandle, _collection: &str) -> Result<JobTotals, String> {
+        self.go.notified().await;
+        job.note("Nothing to run for this collection.").await;
+        Ok(JobTotals { records: 0 })
+    }
+
+    async fn describe(&self, collection: &str) -> Option<CollectionSummary> {
+        Some(CollectionSummary {
+            message: format!("{collection} is still being filled."),
+            records: Some(42),
+            state: Some(SummaryState::Running),
+        })
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn an_executor_notes_its_job_and_describes_its_collections() {
+    let Some((app, _tracked)) = app(&[A, B]).await else {
+        return;
+    };
+    let executor = Arc::new(Describing { go: Notify::new() });
+    let routed = executor.clone();
+    let source = JetstreamSource::builder()
+        .executor_for(move |c| (c == B).then(|| routed.clone() as Arc<dyn BackfillExecutor>))
+        .build_detached();
+    let router = attach_routed(&app.state, source.clone());
+
+    let id = start_backfill(&source, B).await;
+    let response = router
+        .clone()
+        .oneshot(request(
+            &app,
+            "GET",
+            &format!("/admin/backfill/{id}/events"),
+        ))
+        .await
+        .unwrap();
+    let reader = tokio::spawn(read_events_until(response.into_body(), |e| {
+        e["type"] == "job_note"
+    }));
+    executor.go.notify_one();
+    let note = reader.await.unwrap().pop().unwrap();
+    assert_eq!(
+        note,
+        json!({
+            "type": "job_note",
+            "job_id": id,
+            "note": "Nothing to run for this collection.",
+        })
+    );
+    wait_until!(
+        "the job to complete",
+        job(&app, &id).await.status == "completed"
+    );
+
+    let (status, jobs) = send(&app, &router, "GET", "/admin/backfill/status").await;
+    assert_eq!(status, 200);
+    let listed = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == id)
+        .expect("the job is listed");
+    assert_eq!(listed["note"], "Nothing to run for this collection.");
+    assert_eq!(listed["total_records"], 0);
+
+    let (status, body) = send(
+        &app,
+        &router,
+        "GET",
+        &format!("/admin/backfill/collections/{B}"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({
+            "collection": B,
+            "executor": "store-pass",
+            "summary": {
+                "message": format!("{B} is still being filled."),
+                "records": 42,
+                "state": "running",
+            },
+        })
+    );
+
+    // A crawled collection has neither.
+    let (status, body) = send(
+        &app,
+        &router,
+        "GET",
+        &format!("/admin/backfill/collections/{A}"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({ "collection": A, "executor": null, "summary": null })
+    );
+}
+
 /// Checkpoints, then waits to be stopped; run again, finishes from its
 /// checkpoint.
 struct Checkpointing {
@@ -626,7 +743,7 @@ async fn an_executor_job_lists_in_the_admin_json() {
             r#""processed_repos":3,"total_records":7,"error":null,"#,
             r#""started_at":"2026-10-16T00:00:00Z","completed_at":null,"#,
             r#""created_at":"2026-10-16T00:00:00Z","discovery_complete":true,"#,
-            r#""recent_completions_limit":1000,"source":"store-pass","replay":null}"#,
+            r#""recent_completions_limit":1000,"source":"store-pass","note":null,"replay":null}"#,
             "]",
         )
     );

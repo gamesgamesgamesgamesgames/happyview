@@ -1,8 +1,6 @@
 import { test, expect } from "@playwright/test";
 import pg from "pg";
-import { loginAsTestAdmin } from "./auth-helper";
-
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
+import { loginAsTestAdmin, DB_URL } from "./auth-helper";
 
 const TEST_NSID = "test.e2e.linkedrepos.item";
 const TEST_LEXICON = {

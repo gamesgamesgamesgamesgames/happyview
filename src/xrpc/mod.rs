@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::auth::{Claims, XrpcClaims};
 use crate::error::AppError;
 use crate::lexicon::LexiconType;
-use crate::rate_limit::CheckResult;
+use crate::rate_limit::{CheckResult, RateLimiter};
 use crate::resolve::resolve_nsid_authority;
 
 /// Decode one query-string component.
@@ -327,15 +327,18 @@ pub(crate) async fn proxy_to_authority(
         .unwrap())
 }
 
+/// The rate key of a request that names no client.
+const ANONYMOUS_CLIENT_KEY: &str = "anonymous";
+
 /// Find the client key from claims, headers, or query params.
 ///
 /// Authenticated requests (claims present) must provide one — returns Err
-/// if missing.  Anonymous requests fall back to `"anonymous"`.
+/// if missing. An anonymous request that names none is `None`.
 fn extract_client_key(
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     let found = claims
         .and_then(|c| c.client_key().map(|k| k.to_string()))
         .or_else(|| {
@@ -353,25 +356,31 @@ fn extract_client_key(
         });
 
     match found {
-        Some(k) => Ok(k),
+        Some(k) => Ok(Some(k)),
         None if claims.is_some() => Err(AppError::Auth(
             "Missing client identification. Provide an X-Client-Key header or client_key query parameter.".into(),
         )),
-        None => Ok("anonymous".to_string()),
+        None => Ok(None),
     }
 }
 
 /// Resolve the client key and run origin/secret validation.
+///
+/// A request that names no client is rate limited as `anonymous` and logs
+/// nothing: it is the ordinary case for a public query. A key that is named
+/// but not registered is warned about.
 fn resolve_client_key(
-    state: &AppState,
+    rate_limiter: &RateLimiter,
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, AppError> {
-    let client_key = extract_client_key(claims, parts, query_params)?;
+    let Some(client_key) = extract_client_key(claims, parts, query_params)? else {
+        return Ok(ANONYMOUS_CLIENT_KEY.to_string());
+    };
 
     // Log validation warnings but always return the key for rate limiting.
-    if !state.rate_limiter.is_valid_client_key(&client_key) {
+    if !rate_limiter.is_valid_client_key(&client_key) {
         tracing::warn!("Unknown client key: {client_key}");
         return Ok(client_key);
     }
@@ -386,10 +395,7 @@ fn resolve_client_key(
         let origin = parts.headers.get("origin").and_then(|v| v.to_str().ok());
 
         if let Some(origin) = origin {
-            if !state
-                .rate_limiter
-                .validate_client_origin(&client_key, origin)
-            {
+            if !rate_limiter.validate_client_origin(&client_key, origin) {
                 tracing::warn!("Origin mismatch for client {client_key}: got {origin}");
             }
         } else {
@@ -399,7 +405,7 @@ fn resolve_client_key(
                 .and_then(|v| v.to_str().ok());
 
             match secret {
-                Some(s) if state.rate_limiter.validate_client_secret(&client_key, s) => {}
+                Some(s) if rate_limiter.validate_client_secret(&client_key, s) => {}
                 Some(_) => {
                     tracing::warn!("Invalid client secret for {client_key}");
                 }
@@ -477,7 +483,7 @@ pub async fn xrpc_get(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
     };
 
     let lexicon = state.lexicons.get(&method).await;
@@ -652,7 +658,7 @@ pub async fn xrpc_post(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
     };
 
     if claims.is_none()
@@ -970,11 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_request_gets_anonymous_rate_key() {
+    fn anonymous_request_names_no_client_key() {
         let parts = empty_parts();
         let params = HashMap::new();
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "anonymous");
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
@@ -992,7 +998,7 @@ mod tests {
         let params = HashMap::new();
         let claims = crate::auth::Claims::with_client_key("did:plc:test".into(), "hvc_abc".into());
         let result = extract_client_key(Some(&claims), &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_abc");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_abc"));
     }
 
     #[test]
@@ -1005,7 +1011,7 @@ mod tests {
             .into_parts();
         let params = HashMap::new();
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_from_header");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_from_header"));
     }
 
     #[test]
@@ -1014,7 +1020,72 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("client_key".into(), json!("hvc_from_query"));
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_from_query");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_from_query"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_client_key
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `resolve_client_key` answers for `parts`, and what it logged at
+    /// warn level or above.
+    fn resolve_logging_warnings(parts: &Parts) -> (String, String) {
+        let rate_limiter =
+            crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
+                query_cost: 1,
+                procedure_cost: 1,
+                proxy_cost: 1,
+            });
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let key = tracing::subscriber::with_default(subscriber, || {
+            resolve_client_key(&rate_limiter, None, parts, &HashMap::new()).unwrap()
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        (key, log)
+    }
+
+    #[test]
+    fn an_anonymous_request_is_rate_limited_as_anonymous_and_warns_about_nothing() {
+        let (key, log) = resolve_logging_warnings(&empty_parts());
+        assert_eq!(key, "anonymous");
+        assert_eq!(log, "", "an anonymous request logged at warn level");
+    }
+
+    #[test]
+    fn a_client_key_nobody_registered_is_still_warned_about() {
+        for named in ["hvc_nobody", "anonymous"] {
+            let (parts, _) = axum::http::Request::builder()
+                .uri("/xrpc/test")
+                .header("x-client-key", named)
+                .body(())
+                .unwrap()
+                .into_parts();
+            let (key, log) = resolve_logging_warnings(&parts);
+            assert_eq!(key, named);
+            assert!(
+                log.contains(&format!("Unknown client key: {named}")),
+                "got: {log}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1101,6 +1172,6 @@ mod tests {
         let params = HashMap::new();
         let claims = crate::auth::Claims::new_for_test("did:plc:test".into());
         let result = extract_client_key(Some(&claims), &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_fallback");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_fallback"));
     }
 }

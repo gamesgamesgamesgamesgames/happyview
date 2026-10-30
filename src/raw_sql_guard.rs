@@ -29,6 +29,7 @@ const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     // Public AppView data.
     "happyview_records",
     "happyview_record_refs",
+    "happyview_records_by_collection",
     "happyview_labels",
     crate::catalog::lexicon_rows::TABLE,
     // Background jobs.
@@ -262,7 +263,11 @@ pub const RAW_MIXED_REFUSED: &str =
     "this query reads claimed records and local tables together; split it into two queries";
 
 /// The compat views that serve record reads.
-const RECORD_VIEWS: [&str; 2] = ["happyview_records", "happyview_record_refs"];
+const RECORD_VIEWS: [&str; 3] = [
+    "happyview_records",
+    "happyview_record_refs",
+    "happyview_records_by_collection",
+];
 
 /// True when `table`, an unquoted identifier, names a record view.
 pub fn is_record_view(table: &str) -> bool {
@@ -668,6 +673,30 @@ mod tests {
             Ok(false)
         );
         assert_eq!(is_read_only("SELECT * FROM t"), Ok(true));
+    }
+
+    #[test]
+    fn the_by_collection_view_is_a_record_view_raw_sql_may_read() {
+        let sql = "SELECT uri, record FROM happyview_records_by_collection \
+                   WHERE collection_id = hv_collection_id('app.test.post') \
+                   ORDER BY created_at_us DESC, id DESC LIMIT 50";
+        assert_eq!(check_raw_sql_tables(sql), Ok(()));
+        assert_eq!(record_view_use(sql), Ok(RecordViews::Only));
+        // The function reads no relation of the query's own.
+        assert_eq!(
+            record_view_use(
+                "SELECT uri FROM happyview_records_by_collection r \
+                 JOIN happyview_jobs j ON j.id = r.uri"
+            ),
+            Ok(RecordViews::Mixed("happyview_jobs".into()))
+        );
+        // happyview_collections stays refused: hv_collection_id is the way in.
+        assert!(
+            check_raw_sql_tables(
+                "SELECT id FROM happyview_collections WHERE nsid = 'app.test.post'"
+            )
+            .is_err()
+        );
     }
 
     #[test]

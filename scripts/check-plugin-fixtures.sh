@@ -2,10 +2,9 @@
 #
 # Whether every plugin wasm fixture's module is where the tests open it.
 #
-# Tests that load a fixture skip when its module is absent rather than
-# panicking, so a build step that stopped producing one would otherwise leave
-# them skipping inside a green run. This is what turns that back into a
-# failure in the job that builds them.
+# A test that loads a fixture fails when its module is absent, unless
+# HAPPYVIEW_ALLOW_SKIPS=1, as the unit-tests job sets. This names every
+# missing module up front, before a run fails on them one test at a time.
 #
 #   --require [name...]
 #               exit non-zero on anything missing, for a job that builds
@@ -52,7 +51,7 @@ missing=0
 while IFS= read -r artefact; do
   [ -n "$artefact" ] || continue
   if [ ! -f "$artefact" ]; then
-    echo "not built, so tests needing it skip: $artefact"
+    echo "not built: $artefact"
     missing=$((missing + 1))
     status=1
   fi
@@ -69,5 +68,5 @@ if [ "$require" = 1 ]; then
   exit "$status"
 fi
 
-echo "(not a failure here: this job builds no fixtures and those tests skip)"
+echo "(not a failure here: this job builds no fixtures, and HAPPYVIEW_ALLOW_SKIPS=1 lets those tests skip)"
 exit 0

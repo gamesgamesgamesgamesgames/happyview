@@ -570,7 +570,7 @@ const CLEAN_SOURCE: &str = "function handle(input, ctx)\n  return input.q\nend\n
 /// is not built.
 async fn with_an_interpreter(app: &TestApp) -> bool {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return false;
     }
     app.state

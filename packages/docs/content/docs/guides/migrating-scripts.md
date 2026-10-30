@@ -169,6 +169,18 @@ happyview-codemod --database-url "$DATABASE_URL" --apply
 happyview-codemod --database-url "$DATABASE_URL" --apply --allow-markers
 ```
 
+The Docker image ships the CLI too. In a running container:
+
+```sh
+docker exec <container> happyview-codemod --database-url "$DATABASE_URL"
+```
+
+Or in a container of its own, where the image's entrypoint runs it in place of the server:
+
+```sh
+cat script.lua | docker run --rm -i <image> happyview-codemod --stdin --kind query
+```
+
 File and stdin modes print the rewritten source to stdout and any notes to stderr. Database mode prints notes per script and, without `--apply`, changes nothing — it's a dry run by default. Exit code is `2` if any script still has markers after the rewrite, `1` on error, `0` otherwise. A `0` on a re-run does not mean the markers are gone, for the reason above.
 
 ## Before / after

@@ -152,6 +152,7 @@ impl Runner {
             &self.root,
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await?;

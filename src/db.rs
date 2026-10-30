@@ -867,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_serialization_and_deadlock_codes_are_retryable() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
@@ -931,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_connection_and_shutdown_codes_are_unavailable() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
@@ -1041,6 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_connection_postgres_boot_upgrades_the_record_store() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {

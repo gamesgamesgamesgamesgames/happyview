@@ -115,6 +115,29 @@ struct Session {
     logged_gaps: HashSet<(&'static str, Option<i64>)>,
 }
 
+/// The TLS a `wss://` endpoint is reached over: rustls with the Mozilla roots
+/// from webpki-roots 1, the same roots HappyView's labeler subscriptions
+/// trust. Passed in rather than left to tokio-tungstenite, whose own
+/// webpki-roots feature brings in the 0.26 shim (RUSTSEC-2026-0381). A
+/// `ws://` endpoint ignores it.
+fn tls_connector() -> tokio_tungstenite::Connector {
+    static CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        std::sync::Arc::new(config)
+    });
+    tokio_tungstenite::Connector::Rustls(config.clone())
+}
+
 /// Limits for the Jetstream socket: no frame or message larger than the
 /// biggest frame a v2 server sends decoded (the Go client's read limit),
 /// in place of tungstenite's 16 MiB frames and 64 MiB messages.
@@ -662,7 +685,12 @@ async fn run_session(
     tracing::info!(%url, protocol = protocol.as_str(), "connecting to jetstream");
     let ws = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async_with_config(url.as_str(), Some(socket_config()), false),
+        tokio_tungstenite::connect_async_tls_with_config(
+            url.as_str(),
+            Some(socket_config()),
+            false,
+            Some(tls_connector()),
+        ),
     )
     .await
     {
@@ -1074,5 +1102,27 @@ mod tests {
             },
             "an error name this version does not know"
         );
+    }
+
+    /// The TLS a `wss://` endpoint is reached over trusts a public Jetstream.
+    /// Ignored because it needs the network: run with
+    /// `cargo test -p happyview-source-jetstream -- --ignored tls`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_public_jetstream_is_reached_over_tls() {
+        let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post",
+            Some(socket_config()),
+            false,
+            Some(tls_connector()),
+        )
+        .await
+        .expect("a TLS connection to a public jetstream");
+        let first = tokio::time::timeout(Duration::from_secs(30), ws.next())
+            .await
+            .expect("an event within 30s")
+            .expect("a message")
+            .expect("not an error");
+        assert!(first.is_text() || first.is_binary(), "{first:?}");
     }
 }

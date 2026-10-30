@@ -798,6 +798,32 @@ pub struct CallerBlobUpload {
     pub mime_type: String,
 }
 
+/// The calling user's account as their PDS reports it, from
+/// `com.atproto.server.getSession`. Needs `caller:read`. The email address is
+/// not here: it needs its own capability, `caller:email`, and
+/// [`CallerEmail`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerAccount {
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
+/// The calling user's email address as their PDS reports it, from
+/// `com.atproto.server.getSession`. Needs `caller:email`.
+///
+/// Both fields are present only when the account has an address and the
+/// user's sign-in granted it: the reference PDS releases it under
+/// `transition:email` or the granular `account:email`. A PDS that withholds
+/// it is not an error; both fields are then absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallerEmail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_confirmed: Option<bool>,
+}
+
 /// An XRPC query issued as the calling script's user. Needs `caller:read`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallerXrpcQuery {

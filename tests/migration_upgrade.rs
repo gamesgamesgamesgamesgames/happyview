@@ -283,7 +283,10 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let base_url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let Ok(base_url) = std::env::var("TEST_DATABASE_URL") else {
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
+        return None;
+    };
     happyview::db::install_drivers();
     if happyview::db::DatabaseBackend::from_url(&base_url)
         != happyview::db::DatabaseBackend::Postgres

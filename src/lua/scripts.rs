@@ -359,6 +359,38 @@ pub async fn run_record_event_script(
     RecordHookOutcome::Proceed
 }
 
+/// [`run_record_event_script`] for a caller that must not act on a hook it
+/// could not hear from: a script that keeps failing, or has no interpreter,
+/// is an `Err` rather than a fail-open `Proceed`, and nothing is
+/// dead-lettered, since the caller decides what a failure means.
+pub async fn run_record_event_script_strict(
+    state: &AppState,
+    payload: RecordEventPayload<'_>,
+) -> Result<RecordHookOutcome, String> {
+    let project = state.project.load_full();
+    let Some(resolved) = state
+        .scripts
+        .resolve_record_event_in(&project, payload.nsid, payload.action)
+        .await
+    else {
+        return Ok(RecordHookOutcome::Proceed);
+    };
+    if no_interpreter_for(state, &resolved).await {
+        return Err(crate::script::no_interpreter_message(&resolved.script_type));
+    }
+    let mut last_error = String::new();
+    for attempt in 0..attempts(state) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+        }
+        match run_record_event_once(state, &resolved, payload).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
+}
+
 /// Single attempt at the record-event script. Used internally by the retry
 /// loop and externally by admin retry endpoints.
 ///

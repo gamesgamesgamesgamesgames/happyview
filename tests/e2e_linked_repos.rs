@@ -1112,6 +1112,7 @@ async fn take_pending_grant_returns_the_grant_and_is_single_use() {
         PendingGrant::Grant {
             grant_id: grant.id.clone(),
             origin: flow::AuthOrigin::Admin,
+            kid: None,
         }
     );
     // The DELETE is the claim, so a replay finds nothing at all.

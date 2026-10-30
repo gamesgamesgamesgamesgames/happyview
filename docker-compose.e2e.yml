@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: happyview
       POSTGRES_DB: happyview_test
     ports:
-      - "5434:5432"
+      # E2E_POSTGRES_PORT moves it off a port another stack already holds;
+      # the specs read the same variable.
+      - "${E2E_POSTGRES_PORT:-5434}:5432"
     volumes:
       - ./scripts/init-e2e-dbs.sql:/docker-entrypoint-initdb.d/init-e2e-dbs.sql:ro
     healthcheck:
