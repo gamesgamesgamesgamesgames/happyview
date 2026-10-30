@@ -233,9 +233,12 @@ async fn login(
         ..Default::default()
     };
 
-    let url = oauth_client
-        .authorize(&query.handle, options)
+    let url = crate::auth::atrium_panic::catch(oauth_client.authorize(&query.handle, options))
         .await
+        .map_err(|panic| {
+            tracing::warn!(handle = %query.handle, panic = %panic, "OAuth authorize panicked");
+            AppError::BadGateway(crate::auth::atrium_panic::NO_PAR_ENDPOINT.into())
+        })?
         .map_err(|e| AppError::Internal(format!("OAuth authorize failed: {e}")))?;
 
     // Capture the state key immediately after authorize(). We can't parse it from the URL
@@ -359,9 +362,12 @@ async fn callback(
         iss: query.iss,
     };
 
-    let (session, _app_state) = oauth_client
-        .callback(params)
+    let (session, _app_state) = crate::auth::atrium_panic::catch(oauth_client.callback(params))
         .await
+        .map_err(|panic| {
+            tracing::warn!(panic = %panic, "OAuth token exchange failed");
+            AppError::BadGateway(crate::auth::atrium_panic::EXCHANGE_REFUSED.into())
+        })?
         .map_err(|e| AppError::Internal(format!("OAuth callback failed: {e}")))?;
 
     use atrium_api::agent::SessionManager;
@@ -527,10 +533,16 @@ async fn linked_repo_callback(
         iss: query.iss,
     };
 
-    let (session, _app_state) = match client.callback(params).await {
-        Ok(v) => v,
-        Err(e) => {
+    let (session, _app_state) = match crate::auth::atrium_panic::catch(client.callback(params))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             tracing::warn!(%grant_id, error = %e, "linked repo OAuth callback failed");
+            return Ok(finish("failed", None));
+        }
+        Err(panic) => {
+            tracing::warn!(%grant_id, panic = %panic, "linked repo OAuth token exchange failed");
             return Ok(finish("failed", None));
         }
     };
