@@ -114,7 +114,7 @@ export default function ApiKeysPage() {
                 <TableHead>Permissions</TableHead>
                 <TableHead>Created</TableHead>
                 <TableHead>Last Used</TableHead>
-                <TableHead className="w-10 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -155,7 +155,7 @@ export default function ApiKeysPage() {
                       ? new Date(key.last_used_at).toLocaleString()
                       : "Never"}
                   </TableCell>
-                  <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     {!key.revoked_at && hasPermission("api-keys:delete") && (
                       <AlertDialog>
                         <AlertDialogTrigger asChild>
