@@ -226,6 +226,13 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
     raw[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("a valid P-256 scalar");
     let did_key = happyview_plc::private_key_to_did_key(&raw).unwrap();
+    // A second key for `#atproto_kem`, which a host proves its space commits
+    // against with a MAC. pds.js takes it at `/init`; without it, the account
+    // has a key its DID document never names, and no commit verifies.
+    let mut kem_raw = [0u8; 32];
+    kem_raw[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    kem_raw[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let kem_did_key = happyview_plc::private_key_to_did_key(&kem_raw).unwrap();
 
     let handle = "alice.localhost";
     let mut genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
@@ -238,6 +245,7 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
         )],
     });
     genesis["alsoKnownAs"] = json!([format!("at://{handle}")]);
+    genesis["verificationMethods"]["atproto_kem"] = json!(kem_did_key);
     let signed = happyview_plc::sign_operation(&genesis, &key).unwrap();
     let did = happyview_plc::derive_did(&signed).unwrap();
 
@@ -258,6 +266,7 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
         .json(&json!({
             "did": did,
             "privateKey": raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "kemKey": kem_raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "handle": handle,
             "curve": "p256",
             "password": password,
