@@ -24,7 +24,7 @@ There are two sides to it. Your app's users call your XRPC endpoints under `/xrp
 
 You sign in to the dashboard with your atproto account. Open your instance, enter your handle, and approve the sign-in on your PDS. HappyView sets a signed session cookie, and the dashboard uses it for every admin call it makes for you.
 
-On a new instance, the first account to sign in becomes the super user, with every permission. To choose that account in advance, set `SUPERADMIN_DID`. HappyView then makes that DID a super user at boot and does not promote whoever signs in first.
+On a new instance, the first account to sign in becomes the operator, with the superadmin privilege and every permission. To choose that account in advance, set `SUPERADMIN_DID`. HappyView then gives that DID superadmin at boot and does not promote whoever signs in first.
 
 Signing in needs a secure `SESSION_SECRET` of at least 32 bytes. With a missing or weak one, HappyView refuses to start a sign-in.
 
@@ -147,7 +147,7 @@ export default function handle(input: Record<string, unknown>, ctx: Ctx) {
 </TabItem>
 </Tabs>
 
-Other AppViews and services can also call your XRPC endpoints with an atproto service-auth JWT, if you register them. See [Service identity](/docs/guides/service-identity).
+Other AppViews and services can also call your XRPC endpoints with an atproto service-auth JWT. They don't need to be registered: when your instance exposes a service identity, any valid service-auth JWT is accepted. See [Service identity](/docs/guides/service-identity).
 
 ## Use the admin API with an API key
 
@@ -167,7 +167,7 @@ curl "http://127.0.0.1:3000/admin/lexicons" \
   -H "Authorization: Bearer hv_your_api_key"
 ```
 
-A key carries only the permissions you picked, and only those its owner still holds. A key is never a super user, even when its owner is, so super-user-only actions aren't available through keys. Creating a key needs `api-keys:create`, and you can't give a key a permission you don't have. See [API keys](/docs/guides/api-keys).
+A key carries only the permissions you picked, and only those its owner still holds. A key never holds superadmin, even when its owner does, so superadmin-only actions aren't available through keys. Creating a key needs `api-keys:create`, and you can't give a key a permission you don't have. See [API keys](/docs/guides/api-keys).
 
 ## Let an app manage your instance
 

@@ -93,9 +93,9 @@ A script that returns nothing tells HappyView to skip the record, so it is never
 
 Create a record in the collection, for example by posting a status from a Statusphere client, or wait for one to arrive from the network.
 
-Then open **Event Logs** in the dashboard and set **Category** to **Script**. Each `log.info` call appears as a `script.log` event whose subject is the script's trigger, `record.create:xyz.statusphere.status`. `info`, `warn` and `error` lines are recorded here. `debug` lines go to the server log only.
+Then open **Event Logs** in the dashboard and set **Category** to **Script**. Each `log.info` call appears as a `script.log` event whose subject is the script's trigger, `record.create:xyz.statusphere.status`. `info`, `warn` and `error` lines are recorded here. `debug` lines aren't recorded as events.
 
-To see every script run, not just the lines your script logs, turn on **Verbose Event Logging** under **Settings > General**. It logs a `script.executed` event for each run. It writes a lot, so turn it off again when you're done.
+To see every script run, not just the lines your script logs, turn on **Verbose Event Logging** under **System > General**. It logs a `script.executed` event for each run. It writes a lot, so turn it off again when you're done.
 
 If the script fails, HappyView retries it and then moves the event to **Dead Letters**. The record is still indexed, so a broken script never stops indexing.
 
