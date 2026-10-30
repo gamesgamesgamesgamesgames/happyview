@@ -24,6 +24,26 @@ use common::fixtures;
 const GAME: &str = "games.gamesgamesgamesgames.game";
 const ALICE: &str = "did:plc:reconcilealice";
 
+/// Run `run` as job `job_id`'s run, as a worker would: claimed, and under
+/// the claim's lease. A job's progress is written only from its run.
+async fn as_the_jobs_run<F: std::future::Future>(app: &TestApp, job_id: &str, run: F) -> F::Output {
+    const OWNER: &str = "reconcile-test";
+    happyview::db::query(&adapt_sql(
+        "UPDATE happyview_jobs SET status = 'running', claimed_by = ?, attempt = 1 WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(OWNER)
+    .bind(job_id)
+    .execute(&app.state.db)
+    .await
+    .expect("claim the job");
+    let lease = happyview::jobs::held::Lease {
+        owner: OWNER.into(),
+        attempt: 1,
+    };
+    happyview::jobs::held::run_under(happyview::jobs::held::Held::new(job_id, lease), run).await
+}
+
 async fn app() -> TestApp {
     let app = TestApp::new().await;
     let (status, body) = app
@@ -611,9 +631,13 @@ async fn a_pause_stops_a_listing_between_pages() {
         .await;
     get_record(&app, ALICE, "g1", true).await;
 
-    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
-        .await
-        .expect("reconcile runs");
+    let report = as_the_jobs_run(
+        &app,
+        &job_id,
+        reconcile::reconcile(&app.state, &options(false), Some(&job_id)),
+    )
+    .await
+    .expect("reconcile runs");
     assert_eq!(report.stopped.as_deref(), Some("pausing"));
     assert!(report.dids_skipped.is_empty(), "{:?}", report.dids_skipped);
     assert_eq!(report.deleted, 0);
@@ -651,9 +675,13 @@ async fn a_cancel_stops_inside_an_account_and_keeps_what_it_did() {
         .mount(&app.mock_server)
         .await;
 
-    let report = reconcile::reconcile(&app.state, &options(false), Some(&job_id))
-        .await
-        .expect("reconcile runs");
+    let report = as_the_jobs_run(
+        &app,
+        &job_id,
+        reconcile::reconcile(&app.state, &options(false), Some(&job_id)),
+    )
+    .await
+    .expect("reconcile runs");
     assert_eq!(report.stopped.as_deref(), Some("cancelling"));
     assert_eq!(report.deleted, 2, "{:?}", report.missing);
     assert!(!stored(&app, ALICE, "c1").await);
