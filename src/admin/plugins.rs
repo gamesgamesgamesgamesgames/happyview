@@ -1791,6 +1791,7 @@ mod tests {
                 .collect(),
             latest_version: Some(versions[0].into()),
             lifecycle_state: "active".into(),
+            fingerprint: String::new(),
             releases: versions.iter().map(|v| release(v)).collect(),
             sections: Default::default(),
             banner_url: None,
