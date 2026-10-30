@@ -504,6 +504,7 @@ async fn a_query_reaches_the_module_through_the_xrpc_router() {
         root,
         happyview::project::build::BuildOptions {
             include_tests: false,
+            ..Default::default()
         },
     )
     .await

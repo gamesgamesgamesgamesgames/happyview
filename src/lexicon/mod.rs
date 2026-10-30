@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod validate;
+
 /// The type of a lexicon's `main` definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,24 +188,30 @@ impl ParsedLexicon {
     }
 }
 
-/// The structural checks every lexicon passes before it is stored or served:
-/// lexicon version 1 and a string `id` that is a valid NSID. Returns the id.
-/// The admin upload and the project build both call this, so a file cannot
-/// carry a lexicon the upload would refuse.
+/// The checks every lexicon passes before it is stored or served, as one
+/// message per line. Returns the id.
+///
+/// The admin upload and the project build share [`validate::validate`], so a
+/// file cannot carry a lexicon the upload would refuse. They differ only in
+/// how they render it: this joins the errors for a build diagnostic, while the
+/// upload answers one entry per field. Warnings are not refusals and are left
+/// out here.
 pub fn check_document(raw: &Value) -> Result<String, String> {
-    let version = raw
-        .get("lexicon")
-        .and_then(|v| v.as_i64())
-        .ok_or("lexicon JSON must have a numeric 'lexicon' field")?;
-    if version != 1 {
-        return Err(format!("unsupported lexicon version: {version}"));
+    let issues = validate::validate(raw);
+    let errors: Vec<String> = issues
+        .iter()
+        .filter(|i| i.severity == validate::Severity::Error)
+        .map(validate::Issue::render)
+        .collect();
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
-    let id = raw
+    // Valid, so the id is a string and an NSID; validate() proved both.
+    Ok(raw
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or("lexicon JSON must have a string 'id' field")?;
-    happyview_nsid::validate_nsid(id).map_err(|e| e.to_string())?;
-    Ok(id.to_string())
+        .unwrap_or_default()
+        .to_string())
 }
 
 #[cfg(test)]
