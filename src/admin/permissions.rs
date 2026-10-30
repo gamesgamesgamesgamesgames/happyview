@@ -644,7 +644,10 @@ pub fn is_valid(key: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum Template {
     Viewer,
-    Operator,
+    // Was called Operator, which the docs use for the person running the
+    // instance. The old name is still accepted wherever a template is sent.
+    #[serde(alias = "operator")]
+    Maintainer,
     Manager,
     FullAccess,
 }
@@ -659,7 +662,7 @@ pub struct TemplateInfo {
 impl Template {
     pub const ALL: &[Template] = &[
         Template::Viewer,
-        Template::Operator,
+        Template::Maintainer,
         Template::Manager,
         Template::FullAccess,
     ];
@@ -667,7 +670,7 @@ impl Template {
     pub fn key(&self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
-            Self::Operator => "operator",
+            Self::Maintainer => "maintainer",
             Self::Manager => "manager",
             Self::FullAccess => "full_access",
         }
@@ -676,7 +679,7 @@ impl Template {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Viewer => "Viewer",
-            Self::Operator => "Operator",
+            Self::Maintainer => "Maintainer",
             Self::Manager => "Manager",
             Self::FullAccess => "Full Access",
         }
@@ -704,7 +707,7 @@ impl Template {
                 Permission::EventsRead,
                 Permission::DeadLettersRead,
             ]),
-            Self::Operator => {
+            Self::Maintainer => {
                 let mut perms = Self::Viewer.permissions();
                 perms.insert(Permission::BackfillCreate);
                 perms.insert(Permission::ApiKeysCreate);
@@ -713,7 +716,7 @@ impl Template {
                 perms
             }
             Self::Manager => {
-                let mut perms = Self::Operator.permissions();
+                let mut perms = Self::Maintainer.permissions();
                 perms.insert(Permission::LexiconsCreate);
                 perms.insert(Permission::LexiconsDelete);
                 perms.insert(Permission::LexiconsPublish);
@@ -816,17 +819,29 @@ mod tests {
     }
 
     #[test]
-    fn template_viewer_is_subset_of_operator() {
+    fn template_viewer_is_subset_of_maintainer() {
         let viewer = Template::Viewer.permissions();
-        let operator = Template::Operator.permissions();
-        assert!(viewer.is_subset(&operator));
+        let maintainer = Template::Maintainer.permissions();
+        assert!(viewer.is_subset(&maintainer));
     }
 
     #[test]
-    fn template_operator_is_subset_of_manager() {
-        let operator = Template::Operator.permissions();
+    fn template_maintainer_is_subset_of_manager() {
+        let maintainer = Template::Maintainer.permissions();
         let manager = Template::Manager.permissions();
-        assert!(operator.is_subset(&manager));
+        assert!(maintainer.is_subset(&manager));
+    }
+
+    #[test]
+    fn template_operator_is_still_read_as_maintainer() {
+        for key in ["maintainer", "operator"] {
+            let template: Template = serde_json::from_value(serde_json::json!(key)).unwrap();
+            assert_eq!(template.key(), "maintainer", "{key}");
+        }
+        assert_eq!(
+            serde_json::to_value(Template::Maintainer).unwrap(),
+            "maintainer"
+        );
     }
 
     #[test]
@@ -856,7 +871,7 @@ mod tests {
     fn events_purge_is_registered_and_not_granted_by_default_templates() {
         assert_eq!(Permission::EventsPurge.as_str(), "events:purge");
         assert!(Permission::all().contains(&Permission::EventsPurge));
-        for template in [Template::Viewer, Template::Operator, Template::Manager] {
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
             assert!(
                 !template.permissions().contains(&Permission::EventsPurge),
                 "purging the audit log must not come with a built-in role template"

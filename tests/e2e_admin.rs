@@ -1419,6 +1419,48 @@ async fn admin_created_did_authenticates() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// The Maintainer template was called Operator. A client still sending the old
+/// name gets the same permissions as one sending the new name.
+#[tokio::test]
+#[serial]
+async fn admin_create_accepts_the_operator_template_as_maintainer() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let mut granted = Vec::new();
+    for (did, template) in [
+        ("did:plc:maintainer", "maintainer"),
+        ("did:plc:oldoperator", "operator"),
+    ] {
+        let body = json!({ "did": did, "template": template });
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "{template}");
+        let id = json_body(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_get(&format!("/admin/users/{id}"), app.admin_cookie()))
+            .await
+            .unwrap();
+        let mut perms: Vec<String> =
+            serde_json::from_value(json_body(resp).await["permissions"].clone()).unwrap();
+        perms.sort();
+        granted.push(perms);
+    }
+
+    assert!(
+        granted[0].contains(&"dead-letters:manage".to_string()),
+        "{granted:?}"
+    );
+    assert_eq!(granted[0], granted[1]);
+}
+
 #[tokio::test]
 #[serial]
 async fn admin_list_returns_dids() {
