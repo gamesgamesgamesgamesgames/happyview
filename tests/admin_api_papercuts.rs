@@ -6,7 +6,7 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{Method, Request};
+use axum::http::Method;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
