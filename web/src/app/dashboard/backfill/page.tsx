@@ -8,7 +8,12 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
 import { RecordsProgress } from "./records-progress-bar";
-import { runByExecutor, runningLabel } from "./records-progress";
+import {
+  hookDetail,
+  hookStatsOf,
+  runByExecutor,
+  runningLabel,
+} from "./records-progress";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
@@ -33,6 +38,7 @@ import type {
   BackfillEvent,
   BackfillSource,
   ReplayProgress,
+  HookStats,
   BackfillErrorCount,
   BackfillErrorEntry,
   BlueskyProfile,
@@ -504,6 +510,23 @@ function ProfileRow({
         </span>
       )}
     </div>
+  );
+}
+
+/** A job's hook rate, time left and failures, and its script's share. */
+function HookDetailRow({
+  stats,
+  finished,
+}: {
+  stats: HookStats;
+  finished: boolean;
+}) {
+  const { progress, scriptShare } = hookDetail(stats, finished);
+  return (
+    <>
+      <span>{progress.join(" · ")}</span>
+      {scriptShare && <span>{scriptShare}</span>}
+    </>
   );
 }
 
@@ -1079,6 +1102,8 @@ function JobDetail({
 
   // A replay job has no repos or PDSes to list; its progress is a seq range.
   const replayView = job.source === "replay" || isReplayStage(job.stage);
+  // Live while this instance holds the job; what it kept once it ended.
+  const hookStats = job.hooks ?? job.hook_stats ?? null;
 
   const discoveredReached = hasReached("discovering_repos");
   const pdsReached = hasReached("resolving_pds");
@@ -1210,6 +1235,9 @@ function JobDetail({
         update((j) => ({ ...j, status: e.status!, error: e.error ?? null }));
       } else if (e.type === "job_note" && e.note != null) {
         update((j) => ({ ...j, note: e.note! }));
+      } else if (e.type === "hook_stats") {
+        const hooks = hookStatsOf(e);
+        if (hooks) update((j) => ({ ...j, hooks }));
       }
     }
   }, []);
@@ -1369,6 +1397,22 @@ function JobDetail({
                 total={job.total_repos}
                 estimated
                 active={isActive && !isPaused}
+                detail={
+                  hookStats && (
+                    <HookDetailRow stats={hookStats} finished={!isActive} />
+                  )
+                }
+              />
+            )}
+            {!byExecutor && hookStats && (
+              <RecordsProgress
+                label="Running hooks"
+                done={hookStats.done}
+                noun="records hooked"
+                active={isActive && !isPaused}
+                detail={
+                  <HookDetailRow stats={hookStats} finished={!isActive} />
+                }
               />
             )}
             {!replayView && !byExecutor && (
