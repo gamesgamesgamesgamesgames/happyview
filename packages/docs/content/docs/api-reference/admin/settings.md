@@ -73,6 +73,7 @@ Returns all key/value pairs stored in the `happyview_instance_settings` table, p
 | `backfill_concurrent_dids_per_pds` | `BACKFILL_CONCURRENT_DIDS_PER_PDS` | `3` | How many repos to fetch concurrently from each PDS |
 | `backfill_concurrent_resolution` | `BACKFILL_CONCURRENT_RESOLUTION` | `100` | How many DID document lookups to run in parallel during PDS resolution |
 | `backfill_retention_days` | `BACKFILL_RETENTION_DAYS` | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` = keep indefinitely |
+| `event_log_retention_days` | `EVENT_LOG_RETENTION_DAYS` | `30` | Days to keep event logs. `0` = keep indefinitely |
 | `verbose_event_logging` | `VERBOSE_EVENT_LOGGING` | `false` | Log every record index, record skip, and successful script run (record, label, and XRPC) to the event log. High write volume — recommended only for debugging |
 | `feature.spaces_enabled` | `FEATURE_SPACES_ENABLED` | --- | Enables the experimental Permissioned Spaces API. When `"true"`, space endpoints are available. When absent or any other value, space endpoints return `404 FeatureDisabled` |
 
@@ -81,6 +82,8 @@ Returns all key/value pairs stored in the `happyview_instance_settings` table, p
 ```
 PUT /admin/settings/{key}
 ```
+
+The two retention settings, `backfill_retention_days` and `event_log_retention_days`, must be a whole number of days (`0` keeps forever); anything else is refused with `400`.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("http://127.0.0.1:3000/admin/settings/app_name", {

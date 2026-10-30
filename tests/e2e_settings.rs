@@ -183,6 +183,45 @@ async fn settings_crud() {
 
 #[tokio::test]
 #[serial]
+async fn a_retention_must_be_a_whole_number_of_days() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    for key in ["event_log_retention_days", "backfill_retention_days"] {
+        for bad in ["-1", "a month", "1.5", ""] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+        }
+        for good in ["0", "7", "90"] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": good }),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_success(),
+                "{key}={good:?}: {}",
+                resp.status()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn a_script_budget_must_be_an_integer_inside_its_range() {
     common::require_db!();
     let app = TestApp::new().await;
