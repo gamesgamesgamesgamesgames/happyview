@@ -264,7 +264,7 @@ pub(super) async fn lexicon_record_count(
 /// having removed a fraction of what the operator was looking at. Refusing
 /// says the true thing. The shared rows are safe either way: a tenant holds
 /// `SELECT` on them and nothing more.
-pub(super) fn records_not_locally_deletable(state: &AppState, collection: &str) -> Option<String> {
+pub(crate) fn records_not_locally_deletable(state: &AppState, collection: &str) -> Option<String> {
     state.records.external_route(collection).is_some().then(|| {
         format!(
             "'{collection}' is served from a shared record store, so this instance cannot delete its records: they belong to every instance reading that store, not to this one. Delete the lexicon on its own, or ask whoever runs the store."
