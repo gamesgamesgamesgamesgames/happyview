@@ -1,0 +1,624 @@
+//! `happyview.reconcile-collection`: find the records this instance stores
+//! for a collection that its accounts' PDSes no longer hold, and delete them.
+//!
+//! A delete that arrives while a collection isn't tracked never reaches the
+//! index, so the record stays served after its owner deleted it (HAP-245).
+//! This checks each account's stored rows against its PDS and sends each
+//! one the PDS no longer has through the normal delete path, so a delete
+//! hook still has its say (a keep-on-delete hook keeps the record).
+//!
+//! It deletes nothing it can't be sure of:
+//!
+//! - The stored rows are read before the PDS is asked, so a record created
+//!   meanwhile is never a candidate, and each candidate is confirmed missing
+//!   with `getRecord` before anything is done.
+//! - Only a complete, all-2xx listing counts. A failed page, a missing or
+//!   deactivated repo, or a PDS that can't be reached skips the account.
+//! - A listing that is empty, or misses most of what is stored, skips the
+//!   account as suspicious: a migrated account's old PDS, or a broken one,
+//!   can answer 200 with nothing. An apply can act on it for named accounts.
+//! - The PDS is resolved from the account's DID document, never a stored
+//!   endpoint, so a migrated account is checked against where it lives now.
+//!
+//! A record whose stored CID differs from its PDS's is reported, never acted
+//! on. A dry run (the default) reports and changes nothing.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use happyview_provider::{Action, Origin, RecordEvent, RecordKey, SourceEvent};
+use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
+
+use crate::AppState;
+
+use super::super::{Job, db as jobs_db};
+use super::NativeOutcome;
+
+pub const JOB_TYPE: &str = "happyview.reconcile-collection";
+
+/// PDS requests per second, by default and at most.
+pub const DEFAULT_REQUESTS_PER_SECOND: u32 = 5;
+pub const MAX_REQUESTS_PER_SECOND: u32 = 20;
+
+/// Entries a report lists in full; the totals count them all.
+const MISSING_LISTED: usize = 1000;
+const STALE_LISTED: usize = 100;
+
+/// Tries of one rate-limited request, and the longest wait between two.
+const RATE_LIMIT_TRIES: u32 = 5;
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(120);
+
+/// Accounts read from the index at a time.
+const DIDS_PAGE: i64 = 500;
+
+/// A listing missing at least this many stored rows, and more than half of
+/// them, is suspicious.
+const SUSPICIOUS_MISSES: usize = 10;
+
+/// What to reconcile.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Options {
+    pub collection: String,
+    /// Report only. On unless asked otherwise.
+    #[serde(default = "dry_run_default")]
+    pub dry_run: bool,
+    /// Only these accounts; every account holding rows of the collection
+    /// when absent.
+    #[serde(default)]
+    pub dids: Option<Vec<String>>,
+    #[serde(default)]
+    pub pds_requests_per_second: Option<u32>,
+    /// Accounts whose suspicious listing is acted on anyway.
+    #[serde(default)]
+    pub allow_suspicious: Vec<String>,
+}
+
+fn dry_run_default() -> bool {
+    true
+}
+
+/// What a run found, and in an apply, did.
+#[derive(Debug, Default, Serialize)]
+pub struct Report {
+    pub collection: String,
+    pub dry_run: bool,
+    /// Accounts whose rows were compared with their PDS.
+    pub dids_checked: usize,
+    pub dids_skipped: Vec<Skipped>,
+    /// Stored records confirmed missing from their PDS (the first
+    /// [`MISSING_LISTED`]).
+    pub missing: Vec<Missing>,
+    pub missing_total: usize,
+    /// Candidates `getRecord` didn't confirm missing, and left alone.
+    pub unconfirmed_total: usize,
+    /// In an apply: missing records deleted, and those a delete hook kept.
+    pub deleted: usize,
+    pub kept_by_hook: usize,
+    /// Records whose stored CID isn't the PDS's (the first
+    /// [`STALE_LISTED`]). Reported only.
+    pub stale_cid: Vec<StaleCid>,
+    pub stale_cid_total: usize,
+    /// Set when the job was paused or cancelled before it finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Skipped {
+    pub did: String,
+    /// `pds_unresolved`, `listing_failed`, `repo_unavailable`,
+    /// `rate_limited`, `suspicious_listing` or `store_read_failed`.
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Missing {
+    pub uri: String,
+    pub cid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StaleCid {
+    pub uri: String,
+    pub stored_cid: Option<String>,
+    pub pds_cid: String,
+}
+
+pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
+    let options: Options = match serde_json::from_value(job.input.clone()) {
+        Ok(options) => options,
+        Err(e) => return NativeOutcome::Failed(format!("invalid input: {e}")),
+    };
+    match reconcile(state, &options, Some(&job.id)).await {
+        Ok(report) => NativeOutcome::Completed(serde_json::to_value(report).unwrap_or_default()),
+        Err(e) => NativeOutcome::Failed(e),
+    }
+}
+
+/// Why `collection` can't be reconciled here, or `None` when it can.
+pub fn refusal(state: &AppState, collection: &str) -> Option<String> {
+    if collection.trim().is_empty() {
+        return Some("collection is required".into());
+    }
+    state.records.external_route(collection).is_some().then(|| {
+        format!(
+            "'{collection}' is served from a shared record store, so this instance cannot reconcile its records: a stale record there belongs to every instance reading that store. Reconcile it on the store."
+        )
+    })
+}
+
+/// Reconcile `options.collection`. With `job_id`, reports progress to that
+/// job and stops when it is paused or cancelled.
+pub async fn reconcile(
+    state: &AppState,
+    options: &Options,
+    job_id: Option<&str>,
+) -> Result<Report, String> {
+    if let Some(reason) = refusal(state, &options.collection) {
+        return Err(reason);
+    }
+    let per_second = options
+        .pds_requests_per_second
+        .unwrap_or(DEFAULT_REQUESTS_PER_SECOND)
+        .clamp(1, MAX_REQUESTS_PER_SECOND);
+    let mut pacer = Pacer::new(per_second);
+    let mut report = Report {
+        collection: options.collection.clone(),
+        dry_run: options.dry_run,
+        ..Report::default()
+    };
+    let dids = match &options.dids {
+        Some(dids) => {
+            let mut dids = dids.clone();
+            dids.sort();
+            dids.dedup();
+            dids
+        }
+        None => held_dids(state, &options.collection).await?,
+    };
+    let total = dids.len();
+    for (done, did) in dids.iter().enumerate() {
+        if let Some(id) = job_id
+            && let Some(reason) = jobs_db::should_stop(state, id).await
+        {
+            report.stopped = Some(reason.to_string());
+            break;
+        }
+        check(state, &mut pacer, options, job_id, did, &mut report).await;
+        if let Some(id) = job_id {
+            let _ = jobs_db::update_progress(
+                state,
+                id,
+                &serde_json::json!({
+                    "dids_done": done + 1,
+                    "dids_total": total,
+                    "missing": report.missing_total,
+                    "deleted": report.deleted,
+                }),
+            )
+            .await;
+        }
+    }
+    Ok(report)
+}
+
+/// Every account holding network rows of `collection`.
+async fn held_dids(state: &AppState, collection: &str) -> Result<Vec<String>, String> {
+    let collections = [collection.to_string()];
+    let mut dids = Vec::new();
+    loop {
+        let page = state
+            .records
+            .held_dids_page(
+                &state.db,
+                &collections,
+                dids.last().map(String::as_str),
+                DIDS_PAGE,
+            )
+            .await
+            .map_err(|e| format!("could not list the collection's accounts: {e}"))?;
+        let short = (page.len() as i64) < DIDS_PAGE;
+        dids.extend(page);
+        if short {
+            return Ok(dids);
+        }
+    }
+}
+
+/// One account: compare, confirm, and in an apply, delete.
+async fn check(
+    state: &AppState,
+    pacer: &mut Pacer,
+    options: &Options,
+    job_id: Option<&str>,
+    did: &str,
+    report: &mut Report,
+) {
+    let collection = &options.collection;
+    let skip = |report: &mut Report, reason: &'static str, detail: String| {
+        report.dids_skipped.push(Skipped {
+            did: did.to_string(),
+            reason,
+            detail,
+        });
+    };
+    // Read before the PDS is asked: a record created after this can't be a
+    // candidate.
+    let stored = match state.records.network_rows_of(did, collection).await {
+        Ok(stored) => stored,
+        Err(e) => return skip(report, "store_read_failed", e.to_string()),
+    };
+    if stored.is_empty() {
+        return;
+    }
+    let pds =
+        match crate::profile::resolve_pds_endpoint_once(&state.http, &state.config.plc_url, did)
+            .await
+        {
+            Ok(pds) => pds,
+            Err(e) => return skip(report, "pds_unresolved", e.message),
+        };
+    let listing = match list_records(state, pacer, &pds, did, collection).await {
+        Ok(listing) => listing,
+        Err(Unusable { reason, detail }) => return skip(report, reason, detail),
+    };
+
+    let mut misses = Vec::new();
+    for (rkey, cid, body) in &stored {
+        match listing.get(rkey) {
+            Some(pds_cid) => {
+                if cid.as_deref() != Some(pds_cid.as_str()) {
+                    report.stale_cid_total += 1;
+                    if report.stale_cid.len() < STALE_LISTED {
+                        report.stale_cid.push(StaleCid {
+                            uri: uri(did, collection, rkey),
+                            stored_cid: cid.clone(),
+                            pds_cid: pds_cid.clone(),
+                        });
+                    }
+                }
+            }
+            None => misses.push((rkey, cid, body)),
+        }
+    }
+    if misses.is_empty() {
+        report.dids_checked += 1;
+        return;
+    }
+    let suspicious = listing.is_empty()
+        || (misses.len() >= SUSPICIOUS_MISSES && misses.len() * 2 > stored.len());
+    if suspicious && !options.allow_suspicious.iter().any(|d| d == did) {
+        return skip(
+            report,
+            "suspicious_listing",
+            format!(
+                "the PDS lists {} of the {} records stored for this account; name it in allow_suspicious to act on it",
+                stored.len() - misses.len(),
+                stored.len()
+            ),
+        );
+    }
+    report.dids_checked += 1;
+
+    for (rkey, cid, body) in misses {
+        match confirm_missing(state, pacer, &pds, did, collection, rkey).await {
+            Confirmed::Missing => {}
+            Confirmed::Present | Confirmed::Unknown => {
+                report.unconfirmed_total += 1;
+                continue;
+            }
+        }
+        let at = uri(did, collection, rkey);
+        report.missing_total += 1;
+        if report.missing.len() < MISSING_LISTED {
+            report.missing.push(Missing {
+                uri: at.clone(),
+                cid: cid.clone(),
+            });
+        }
+        if options.dry_run {
+            continue;
+        }
+        let event = RecordEvent {
+            key: RecordKey {
+                did: did.to_string(),
+                collection: collection.clone(),
+                rkey: rkey.clone(),
+            },
+            action: Action::Delete,
+            cid: cid.clone(),
+            rev: None,
+            body: serde_json::from_str(body).ok(),
+            time_us: None,
+            origin: Origin::Backfill {
+                job_id: job_id.unwrap_or(JOB_TYPE).to_string(),
+            },
+            stored: false,
+        };
+        // Its outcome doesn't say whether a delete hook kept the record;
+        // what is stored now does.
+        let _ = crate::ingest::apply(state, SourceEvent::Record(event)).await;
+        match state.records.get(&at).await {
+            Ok(None) => report.deleted += 1,
+            Ok(Some(_)) => report.kept_by_hook += 1,
+            Err(e) => {
+                tracing::warn!(uri = %at, error = %e, "reconcile could not read back a delete")
+            }
+        }
+    }
+}
+
+fn uri(did: &str, collection: &str, rkey: &str) -> String {
+    format!("at://{did}/{collection}/{rkey}")
+}
+
+/// Why an account's listing can't be used.
+struct Unusable {
+    reason: &'static str,
+    detail: String,
+}
+
+#[derive(Deserialize)]
+struct ListRecordsPage {
+    records: Vec<ListedRecord>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListedRecord {
+    uri: String,
+    cid: String,
+}
+
+/// Every record `did`'s PDS lists in `collection`: rkey to CID. Complete or
+/// an error, never partial.
+async fn list_records(
+    state: &AppState,
+    pacer: &mut Pacer,
+    pds: &str,
+    did: &str,
+    collection: &str,
+) -> Result<HashMap<String, String>, Unusable> {
+    let base = pds.trim_end_matches('/');
+    let mut listing = HashMap::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let mut url = format!(
+            "{base}/xrpc/com.atproto.repo.listRecords?repo={did}&collection={collection}&limit=100"
+        );
+        if let Some(c) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding::encode(c));
+        }
+        let (status, body) = get(state, pacer, &url).await?;
+        if !status.is_success() {
+            return Err(listing_error(status, &body));
+        }
+        let page: ListRecordsPage = serde_json::from_str(&body).map_err(|e| Unusable {
+            reason: "listing_failed",
+            detail: format!("invalid listRecords response: {e}"),
+        })?;
+        let empty = page.records.is_empty();
+        for record in page.records {
+            if let Some(rkey) = record.uri.rsplit('/').next() {
+                listing.insert(rkey.to_string(), record.cid);
+            }
+        }
+        match page.cursor {
+            Some(next) if !empty => {
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(Unusable {
+                        reason: "listing_failed",
+                        detail: "listRecords repeated a cursor".into(),
+                    });
+                }
+                cursor = Some(next);
+            }
+            _ => return Ok(listing),
+        }
+    }
+}
+
+/// A failed listing: a missing, deactivated or taken-down repo is the
+/// account's state, which this job leaves to identity events.
+fn listing_error(status: reqwest::StatusCode, body: &str) -> Unusable {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|b| b.get("error"))
+        .and_then(|e| e.as_str())
+        .unwrap_or_default();
+    let message = parsed
+        .as_ref()
+        .and_then(|b| b.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    let unavailable = matches!(
+        error,
+        "RepoNotFound" | "RepoDeactivated" | "RepoTakendown" | "RepoSuspended"
+    ) || message.contains("Could not find repo");
+    Unusable {
+        reason: if unavailable {
+            "repo_unavailable"
+        } else {
+            "listing_failed"
+        },
+        detail: format!("listRecords answered {status}: {}", excerpt(body)),
+    }
+}
+
+enum Confirmed {
+    Missing,
+    Present,
+    Unknown,
+}
+
+/// Whether `getRecord` says the record is gone: a 404, or a 400 naming
+/// `RecordNotFound`. Anything else leaves it alone.
+async fn confirm_missing(
+    state: &AppState,
+    pacer: &mut Pacer,
+    pds: &str,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+) -> Confirmed {
+    let url = format!(
+        "{}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={}",
+        pds.trim_end_matches('/'),
+        urlencoding::encode(rkey)
+    );
+    match get(state, pacer, &url).await {
+        Ok((status, _)) if status.is_success() => Confirmed::Present,
+        Ok((status, _)) if status == reqwest::StatusCode::NOT_FOUND => Confirmed::Missing,
+        Ok((status, body)) if status == reqwest::StatusCode::BAD_REQUEST => {
+            let error = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string));
+            if error.as_deref() == Some("RecordNotFound") {
+                Confirmed::Missing
+            } else {
+                Confirmed::Unknown
+            }
+        }
+        _ => Confirmed::Unknown,
+    }
+}
+
+/// One paced GET, retried on a 429 after the wait the PDS asks for.
+async fn get(
+    state: &AppState,
+    pacer: &mut Pacer,
+    url: &str,
+) -> Result<(reqwest::StatusCode, String), Unusable> {
+    let mut tries = 0;
+    loop {
+        pacer.wait().await;
+        let response = state.http.get(url).send().await.map_err(|e| Unusable {
+            reason: "listing_failed",
+            detail: e.to_string(),
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tries += 1;
+            if tries >= RATE_LIMIT_TRIES {
+                return Err(Unusable {
+                    reason: "rate_limited",
+                    detail: format!("still rate limited after {tries} tries"),
+                });
+            }
+            let wait = rate_limit_wait(response.headers(), tries);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        let body = response.text().await.map_err(|e| Unusable {
+            reason: "listing_failed",
+            detail: e.to_string(),
+        })?;
+        return Ok((status, body));
+    }
+}
+
+/// How long a 429 asks to wait: until `RateLimit-Reset` (a Unix time), else
+/// `Retry-After` seconds, else a doubling backoff; at most
+/// [`MAX_RATE_LIMIT_WAIT`].
+fn rate_limit_wait(headers: &reqwest::header::HeaderMap, tries: u32) -> Duration {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let wait = header("ratelimit-reset")
+        .map(|reset| Duration::from_secs(reset.saturating_sub(now)))
+        .or_else(|| header("retry-after").map(Duration::from_secs))
+        .unwrap_or_else(|| Duration::from_secs(1 << tries.min(6)));
+    wait.min(MAX_RATE_LIMIT_WAIT)
+}
+
+fn excerpt(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
+/// Spaces requests at most `per_second` a second.
+struct Pacer {
+    gap: Duration,
+    next: Instant,
+}
+
+impl Pacer {
+    fn new(per_second: u32) -> Self {
+        Self {
+            gap: Duration::from_secs(1) / per_second.max(1),
+            next: Instant::now(),
+        }
+    }
+
+    async fn wait(&mut self) {
+        tokio::time::sleep_until(self.next).await;
+        self.next = Instant::now().max(self.next) + self.gap;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rate_limit_waits_as_asked_and_no_longer_than_the_cap() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "3".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1), Duration::from_secs(3));
+        headers.insert("retry-after", "100000".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1), MAX_RATE_LIMIT_WAIT);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        headers.insert("ratelimit-reset", (now + 5).to_string().parse().unwrap());
+        let wait = rate_limit_wait(&headers, 1);
+        assert!(
+            wait <= Duration::from_secs(5) && wait >= Duration::from_secs(4),
+            "{wait:?}"
+        );
+        assert_eq!(
+            rate_limit_wait(&reqwest::header::HeaderMap::new(), 2),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_deactivated_repo_is_unavailable_and_anything_else_failed() {
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        for body in [
+            r#"{"error":"InvalidRequest","message":"Could not find repo: did:plc:x"}"#,
+            r#"{"error":"RepoDeactivated","message":"deactivated"}"#,
+            r#"{"error":"RepoTakendown"}"#,
+        ] {
+            assert_eq!(
+                listing_error(bad, body).reason,
+                "repo_unavailable",
+                "{body}"
+            );
+        }
+        assert_eq!(
+            listing_error(reqwest::StatusCode::BAD_GATEWAY, "upstream").reason,
+            "listing_failed"
+        );
+    }
+
+    #[test]
+    fn input_defaults_to_a_dry_run() {
+        let options: Options =
+            serde_json::from_value(serde_json::json!({ "collection": "app.test.post" })).unwrap();
+        assert!(options.dry_run);
+        assert!(options.allow_suspicious.is_empty());
+    }
+}

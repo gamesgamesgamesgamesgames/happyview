@@ -1107,6 +1107,34 @@ impl RecordStore {
             .collect())
     }
 
+    /// Every network row `did` holds in `collection` in this instance's own
+    /// tables, by rkey: its rkey, CID and body. A local write not yet seen on
+    /// the network (`indexed_at` unset) isn't one. Not routed: a collection
+    /// external storage claims has none here.
+    pub async fn network_rows_of(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, sqlx::Error> {
+        let body = match self.backend {
+            DatabaseBackend::Sqlite => "hv_record(r.body, r.body_dict)",
+            DatabaseBackend::Postgres => "r.record",
+        };
+        let sql = adapt_sql(
+            &format!(
+                "SELECT r.rkey, hv_cid_text(r.cid), {body} FROM happyview_records_v2 r \
+                 WHERE r.did_id = {DID_ID} AND r.collection_id = {COLLECTION_ID} \
+                   AND r.indexed_at IS NOT NULL ORDER BY r.rkey"
+            ),
+            self.backend,
+        );
+        crate::db::query_as::<(String, Option<String>, String)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .fetch_all(&self.db)
+            .await
+    }
+
     /// [`Self::holds_local_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(

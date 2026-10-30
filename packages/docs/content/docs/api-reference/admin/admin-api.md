@@ -133,6 +133,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/records/collections`         | `records:read`             |
 | `DELETE /admin/records`                  | `records:delete`           |
 | `DELETE /admin/records/collection`       | `records:delete-collection`|
+| `POST /admin/records/collection/reconcile` | `records:read` (dry run), `records:delete` |
 | `GET /admin/spaces`                      | `spaces:read`              |
 | `GET /admin/spaces/{id}`                 | `spaces:read`              |
 | `GET /admin/spaces/{id}/records`         | `spaces:manage-records`    |

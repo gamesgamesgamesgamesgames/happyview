@@ -701,6 +701,16 @@ export function adminSpaceBlobUrl(id: string, cid: string) {
   return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
 }
 
+// Checks a collection's stored records against its accounts' PDSes. A dry
+// run only reports; otherwise the records the PDSes no longer hold are
+// deleted, through the delete hook.
+export function reconcileCollection(collection: string, dryRun: boolean) {
+  return apiFetch<{ job_id: string }>("/admin/records/collection/reconcile", {
+    method: "POST",
+    body: JSON.stringify({ collection, dry_run: dryRun }),
+  });
+}
+
 export function deleteCollectionRecords(collection: string) {
   return apiFetch<{ job_id: string }>(
     `/admin/records/collection?${new URLSearchParams({ collection })}`,
