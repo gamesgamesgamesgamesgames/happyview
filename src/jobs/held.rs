@@ -15,7 +15,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::db::Lease;
+pub use super::db::Lease;
 
 #[derive(Clone)]
 pub struct Held {

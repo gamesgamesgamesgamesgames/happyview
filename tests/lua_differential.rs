@@ -531,8 +531,8 @@ async fn seed_job(app: &TestApp, id: &str) {
     .execute(&app.state.db)
     .await;
     happyview::db::query(&happyview::db::adapt_sql(
-        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth) \
-         VALUES (?, 'test.export', 'running', '{}', '{}', 'did:plc:alice', ?, ?)",
+        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth, claimed_by, attempt) \
+         VALUES (?, 'test.export', 'running', '{}', '{}', 'did:plc:alice', ?, ?, 'differential', 1)",
         app.state.db_backend,
     ))
     .bind(id)
@@ -541,6 +541,16 @@ async fn seed_job(app: &TestApp, id: &str) {
     .execute(&app.state.db)
     .await
     .expect("the job row should seed");
+}
+
+/// Run `fut` as job `id`'s run, under the lease [`seed_job`] claimed it
+/// with: progress is written only from a job's run.
+async fn as_job<F: std::future::Future>(id: &str, fut: F) -> F::Output {
+    let lease = happyview::jobs::held::Lease {
+        owner: "differential".into(),
+        attempt: 1,
+    };
+    happyview::jobs::held::run_under(happyview::jobs::held::Held::new(id, lease), fut).await
 }
 
 async fn job_progress(app: &TestApp, id: &str) -> Value {
@@ -654,11 +664,15 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
         clear_logs(&app).await;
         clear_transcript(&app).await;
         let sent = input(name, source, Some(job));
-        let from_plugin =
-            match tokio::time::timeout(PER_CASE, executor.execute_script(&id, &sent)).await {
-                Ok(outcome) => outcome.map_err(|e| e.to_string()),
-                Err(_) => Err(format!("the plugin did not finish within {PER_CASE:?}")),
-            };
+        let from_plugin = match as_job(
+            job,
+            tokio::time::timeout(PER_CASE, executor.execute_script(&id, &sent)),
+        )
+        .await
+        {
+            Ok(outcome) => outcome.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("the plugin did not finish within {PER_CASE:?}")),
+        };
         let plugin_logs = log_rows(&app).await;
         let plugin_calls = transcript(&app).await;
         let plugin_progress = if is_job {
@@ -673,9 +687,12 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
             seed_job(&app, job).await;
         }
         let sent = input(name, source, Some(job));
-        let from_native = match tokio::time::timeout(
-            PER_CASE,
-            happyview::lua::run_for_differential(&app.state, &sent),
+        let from_native = match as_job(
+            job,
+            tokio::time::timeout(
+                PER_CASE,
+                happyview::lua::run_for_differential(&app.state, &sent),
+            ),
         )
         .await
         {

@@ -1,5 +1,8 @@
 pub(crate) mod db;
-pub(crate) mod held;
+/// Public for tests that run a job's script outside a worker, as a worker
+/// would: under the lease of the claim it holds.
+#[doc(hidden)]
+pub mod held;
 pub(crate) mod logs;
 pub mod native;
 pub mod worker;
