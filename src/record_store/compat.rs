@@ -44,7 +44,8 @@ pub fn create_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Ve
 
 const SQLITE_RECORD_EXPR: &str = "hv_record(v.body, v.body_dict)";
 
-/// The two read-only compatibility views, records first. A record provider
+/// The read-only compatibility views: records, refs, then records by
+/// collection. A record provider
 /// creates these on its raw read route (see `RecordStorage::raw_route`) with
 /// a search path that resolves `happyview_records_v2` and friends to the
 /// rows this instance may see.
@@ -56,7 +57,49 @@ pub fn view_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<
     vec![
         records_view(names.records, record_expr),
         refs_view(names.refs),
+        by_collection_view(names.records, record_expr, "CREATE VIEW"),
     ]
+}
+
+/// The name of the records view's indexable twin, beside `records` (in its
+/// schema, when qualified).
+pub fn by_collection_name(records: &str) -> String {
+    format!("{records}_by_collection")
+}
+
+/// `happyview_records` plus the columns a query needs to read one
+/// collection through its index on a large store: `collection_id`, and the
+/// raw microsecond timestamps the index orders by. A `collection = '…'`
+/// filter on `happyview_records` can't use the index, because the planner
+/// prices one collection at the table's average share, and the view's
+/// timestamps are rendered text, which no index orders. Read-only, and a
+/// view of its own so the legacy columns of `happyview_records` stay as they
+/// were for `SELECT *` and positional `INSERT`s. Filter it with
+/// `collection_id = hv_collection_id('…')` and order by `created_at_us`.
+fn by_collection_view(records: &str, record_expr: &str, create: &str) -> String {
+    let view = by_collection_name(records);
+    format!(
+        "{create} {view} AS \
+         SELECT 'at://' || d.did || '/' || c.nsid || '/' || v.rkey AS uri, \
+                d.did AS did, c.nsid AS collection, v.rkey AS rkey, \
+                {record_expr} AS record, hv_cid_text(v.cid) AS cid, \
+                hv_ts_text(v.indexed_at) AS indexed_at, hv_ts_text(v.created_at) AS created_at, \
+                v.rev AS rev, v.collection_id AS collection_id, \
+                v.created_at AS created_at_us, v.indexed_at AS indexed_at_us, v.id AS id \
+           FROM happyview_records_v2 v \
+           JOIN happyview_dids d ON d.id = v.did_id \
+           JOIN happyview_collections c ON c.id = v.collection_id"
+    )
+}
+
+/// What an instance that upgraded under an older build runs at every boot to
+/// gain the views added since: create each one that is missing.
+pub fn ensure_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<String> {
+    let (record_expr, create) = match backend {
+        DatabaseBackend::Sqlite => (SQLITE_RECORD_EXPR, "CREATE VIEW IF NOT EXISTS"),
+        DatabaseBackend::Postgres => ("v.record", "CREATE OR REPLACE VIEW"),
+    };
+    vec![by_collection_view(names.records, record_expr, create)]
 }
 
 pub fn drop_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<String> {
@@ -66,10 +109,12 @@ pub fn drop_statements(backend: DatabaseBackend, names: CompatNames<'_>) -> Vec<
     } = names;
     match backend {
         DatabaseBackend::Sqlite => vec![
+            format!("DROP VIEW IF EXISTS {}", by_collection_name(r)),
             format!("DROP VIEW IF EXISTS {f}"),
             format!("DROP VIEW IF EXISTS {r}"),
         ],
         DatabaseBackend::Postgres => vec![
+            format!("DROP VIEW IF EXISTS {}", by_collection_name(r)),
             format!("DROP VIEW IF EXISTS {f}"),
             format!("DROP VIEW IF EXISTS {r}"),
             format!("DROP FUNCTION IF EXISTS {f}_write()"),
@@ -373,10 +418,15 @@ mod tests {
     use crate::test_support::pre_upgrade_pools;
 
     #[test]
-    fn view_statements_are_the_two_read_views() {
+    fn view_statements_are_the_read_views() {
         for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
             let s = view_statements(backend, LIVE);
-            assert_eq!(s.len(), 2, "{backend:?}");
+            assert_eq!(s.len(), 3, "{backend:?}");
+            assert!(
+                s[2].starts_with("CREATE VIEW happyview_records_by_collection AS"),
+                "{}",
+                s[2]
+            );
             assert!(
                 s[0].starts_with("CREATE VIEW happyview_records AS"),
                 "{}",
@@ -389,7 +439,7 @@ mod tests {
             );
             let all = create_statements(backend, LIVE);
             assert_eq!(
-                &all[..2],
+                &all[..3],
                 &s[..],
                 "create_statements must start with the read views"
             );
@@ -938,6 +988,87 @@ mod tests {
                     "{backend:?} {legacy}"
                 );
             }
+            db.finish().await;
+        }
+    }
+
+    /// The documented way to read one collection on a large store reads its
+    /// index, in order, through the view.
+    #[tokio::test]
+    async fn the_by_collection_view_reads_a_collection_through_its_index() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let sql = "SELECT uri FROM happyview_records_by_collection \
+                       WHERE collection_id = hv_collection_id('app.test.post') \
+                       ORDER BY created_at_us DESC, id DESC LIMIT 50";
+            let plan = crate::test_support::query_plan(&pool, backend, sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_v2_collection_created_at_id",
+                backend,
+            );
+        }
+    }
+
+    /// `hv_collection_id` answers a collection's id, and NULL for one the
+    /// database doesn't have, on both backends.
+    #[tokio::test]
+    async fn hv_collection_id_answers_a_collections_id() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            crate::db::query(
+                "INSERT INTO happyview_collections (nsid) VALUES ('app.test.hvcollectionid') \
+                 ON CONFLICT (nsid) DO NOTHING",
+            )
+            .execute(&pool)
+            .await
+            .expect("insert a collection");
+            let (id,): (i64,) = crate::db::query_as(
+                "SELECT id FROM happyview_collections WHERE nsid = 'app.test.hvcollectionid'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read its id");
+            let (found, missing, null): (Option<i64>, Option<i64>, Option<i64>) =
+                crate::db::query_as(
+                    "SELECT hv_collection_id('app.test.hvcollectionid'), \
+                            hv_collection_id('app.test.nosuchcollection'), \
+                            hv_collection_id(NULL)",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("call hv_collection_id");
+            assert_eq!(found, Some(id), "{backend:?}");
+            assert_eq!(missing, None, "{backend:?}");
+            assert_eq!(null, None, "{backend:?}");
+        }
+    }
+
+    /// An instance that upgraded before a view existed gains it at its next
+    /// boot.
+    #[tokio::test]
+    async fn a_boot_after_the_upgrade_adds_a_missing_view() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            crate::record_store::upgrade::run(pool, backend)
+                .await
+                .expect("upgrade");
+            crate::db::query("DROP VIEW happyview_records_by_collection")
+                .execute(pool)
+                .await
+                .expect("drop the view, as an older build never made it");
+            let outcome = crate::record_store::upgrade::run(pool, backend)
+                .await
+                .expect("boot again");
+            assert_eq!(
+                outcome,
+                crate::record_store::upgrade::UpgradeOutcome::AlreadyDone,
+                "{backend:?}"
+            );
+            let (n,): (i64,) =
+                crate::db::query_as("SELECT COUNT(*) FROM happyview_records_by_collection")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{backend:?}: the view is back: {e}"));
+            assert_eq!(n, 0, "{backend:?}");
             db.finish().await;
         }
     }
