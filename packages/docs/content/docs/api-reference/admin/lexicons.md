@@ -240,9 +240,22 @@ shape, since that document is not here); that an object's `required` and
 `nullable` name properties it actually has; and that the document is at most
 256 KiB.
 
-The project build applies the same rules through the same function, so a file
-under `src/` cannot carry a lexicon this endpoint would refuse. It renders them
-as build diagnostics rather than per field.
+### The same rules in a project
+
+A project's lexicon files go through the same function, so a file under `src/`
+cannot carry a lexicon this endpoint would accept and then fail on. It renders
+them as build diagnostics rather than per field.
+
+**Boot is deliberately more forgiving than a deploy.** `happyview check`, a
+project deploy and `happyview test` refuse a lexicon that violates the spec.
+Boot only *warns* about it, names the file, and goes on to serve, because
+upgrading HappyView must never turn an instance that served yesterday into one
+that exits 1 over a file it already accepted. The next check or deploy refuses
+it, which is where someone is watching.
+
+Two things stay fatal at boot, because neither is new behaviour and the build
+cannot proceed without them: an `id` that is missing or is not an NSID, and an
+unsupported `lexicon` version.
 
 ## List lexicons
 
