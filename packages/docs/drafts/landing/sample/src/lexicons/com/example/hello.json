@@ -1,0 +1,26 @@
+{
+  "lexicon": 1,
+  "id": "com.example.hello",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Says hello. The file's path is its route: rename the file and this id together.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "name": { "type": "string", "maxLength": 64 }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["message"],
+          "properties": {
+            "message": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+# A HappyView project. `hpy happyview dev` runs it; happyview.lock pins
+# the exact plugin versions, and `hpy happyview add` edits both files.
+
+[happyview]
+version = "3.0.0-alpha.42"
+
+[instance]
+app_name = "statusboard"
+superadmin = "did:plc:your-did-here"
+
+[interpreters]
+lua = { did = "did:plc:mo7vq4jbioxwafy5zkcc3eux", name = "happyview-lua", channel = "alpha" }
+
+[libraries]
+
+[dev]
+backfill = false
