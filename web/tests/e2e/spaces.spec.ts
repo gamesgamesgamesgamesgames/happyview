@@ -1,10 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
 import pg from "pg";
-import { loginAsTestAdmin } from "./auth-helper";
+import { loginAsTestAdmin, DB_URL } from "./auth-helper";
 
 const TEST_TYPE_NSID = "com.example.testspace";
 const TEST_SKEY = "e2e-test-space";
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 
 async function enableSpacesFeature(): Promise<void> {
   const client = new pg.Client(DB_URL);
