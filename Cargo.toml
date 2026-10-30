@@ -87,7 +87,7 @@ p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
 # rustls rather than the default native-tls: OpenSSL cannot link into a static
-# musl binary and is absent on Windows. Native roots keep the platform's trust
+# musl binary. Native roots keep the platform's trust
 # store, which is how an operator (and the e2e stack) adds a private CA.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
