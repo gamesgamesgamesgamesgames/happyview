@@ -1094,6 +1094,7 @@ async fn boot(
         client_jwks,
         telemetry_counters,
         script_limits,
+        integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };
 
