@@ -1640,3 +1640,26 @@ async fn a_batch_reports_a_claimed_delta_that_applied_as_a_change() {
     );
     assert_eq!(local_rows(&state).await, 0);
 }
+
+/// HAP-270: a collection external storage claims isn't this instance's to
+/// reconcile; a stale record there is the store's.
+#[tokio::test]
+async fn a_claimed_collection_is_not_reconciled_here() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let options = happyview::jobs::native::reconcile_collection::Options {
+        collection: CLAIMED.into(),
+        dry_run: false,
+        dids: None,
+        pds_requests_per_second: None,
+        allow_suspicious: vec![],
+    };
+    let refused = happyview::jobs::native::reconcile_collection::reconcile(&state, &options, None)
+        .await
+        .expect_err("a claimed collection is refused");
+    assert!(refused.contains("shared record store"), "{refused}");
+    assert!(
+        happyview::jobs::native::reconcile_collection::refusal(&state, LOCAL).is_none(),
+        "a local collection is reconciled here"
+    );
+}
