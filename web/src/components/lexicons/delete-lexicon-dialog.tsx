@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { Trash2 } from "lucide-react";
 
 import {
@@ -25,12 +25,19 @@ type Props = {
   /** Whether this user may also delete the collection's records. */
   canDeleteRecords: boolean;
   onConfirm: (lexicon: LexiconSummary, deleteRecords: boolean) => void;
+  /**
+   * What opens the dialog. The lexicons table's row action by default; the
+   * detail page passes its own full-width button. Both share this dialog so
+   * the two entry points cannot drift apart again.
+   */
+  trigger?: ReactNode;
 };
 
 export function DeleteLexiconDialog({
   lexicon,
   canDeleteRecords,
   onConfirm,
+  trigger,
 }: Props) {
   const [deleteRecords, setDeleteRecords] = useState(false);
   const [count, setCount] = useState<number | null>(null);
@@ -40,7 +47,11 @@ export function DeleteLexiconDialog({
   // lexicon reads another lexicon's collection through target_collection, so
   // offering to delete "its" records would delete someone else's.
   const hasRecords = lexicon.lexicon_type === "record";
-  const offerRecords = hasRecords && canDeleteRecords;
+  // A network lexicon is removed through its own endpoint, which takes no
+  // such option. Better to say so than to show a checkbox that is quietly
+  // ignored.
+  const network = lexicon.source === "network";
+  const offerRecords = hasRecords && canDeleteRecords && !network;
 
   // Counting is a COUNT(*) over the collection, so it waits for the dialog
   // rather than loading with the table.
@@ -67,17 +78,19 @@ export function DeleteLexiconDialog({
   return (
     <AlertDialog onOpenChange={onOpenChange}>
       <AlertDialogTrigger asChild>
-        <Button
-          variant="destructive"
-          size="icon"
-          className="size-8 text-muted-foreground hover:text-destructive"
-          title="Delete lexicon"
-          aria-label="Delete lexicon"
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
-        >
-          <Trash2 className="size-4" />
-        </Button>
+        {trigger ?? (
+          <Button
+            variant="destructive"
+            size="icon"
+            className="size-8 text-muted-foreground hover:text-destructive"
+            title="Delete lexicon"
+            aria-label="Delete lexicon"
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <Trash2 className="size-4" />
+          </Button>
+        )}
       </AlertDialogTrigger>
       <AlertDialogContent onClick={(e) => e.stopPropagation()}>
         <AlertDialogHeader>
@@ -110,10 +123,11 @@ export function DeleteLexiconDialog({
             </p>
           </div>
         )}
-        {hasRecords && !canDeleteRecords && (
+        {hasRecords && !offerRecords && (
           <p className="text-muted-foreground text-xs">
-            The collection&apos;s indexed records will stay. Deleting them needs
-            the <code>records:delete-collection</code> permission.
+            {network
+              ? "The collection's indexed records will stay. Delete them from the Records page if you want them gone."
+              : "The collection's indexed records will stay. Deleting them needs the records:delete-collection permission."}
           </p>
         )}
 
