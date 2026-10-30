@@ -8,10 +8,11 @@
 //! what it received, matched and skipped itself (ruling F1).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde_json::Value;
 
 pub use happyview_provider::{
@@ -177,15 +178,127 @@ pub(crate) async fn apply_batch_in(
     state: &AppState,
     events: Vec<SourceEvent>,
 ) -> (BatchOutcome, Option<String>) {
+    crate::catalog::ScriptCatalog::for_one_batch(apply_events(state, events)).await
+}
+
+/// Hooks of one backfill batch run at once unless `BACKFILL_HOOK_CONCURRENCY`
+/// says otherwise.
+const DEFAULT_BACKFILL_HOOK_CONCURRENCY: usize = 4;
+/// The most `BACKFILL_HOOK_CONCURRENCY` may ask for.
+const MAX_BACKFILL_HOOK_CONCURRENCY: usize = 32;
+
+/// How many of a backfill batch's records are hooked at once, as configured.
+fn backfill_hook_concurrency() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        parse_hook_concurrency(crate::config::vars::var("BACKFILL_HOOK_CONCURRENCY").as_deref())
+    })
+}
+
+fn parse_hook_concurrency(value: Option<&str>) -> usize {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_BACKFILL_HOOK_CONCURRENCY;
+    };
+    match value.parse::<usize>() {
+        Ok(n) if (1..=MAX_BACKFILL_HOOK_CONCURRENCY).contains(&n) => n,
+        Ok(n) => {
+            let clamped = n.clamp(1, MAX_BACKFILL_HOOK_CONCURRENCY);
+            tracing::warn!(
+                value = n,
+                used = clamped,
+                "BACKFILL_HOOK_CONCURRENCY is outside 1 to {MAX_BACKFILL_HOOK_CONCURRENCY}"
+            );
+            clamped
+        }
+        Err(_) => {
+            tracing::warn!(
+                value,
+                used = DEFAULT_BACKFILL_HOOK_CONCURRENCY,
+                "BACKFILL_HOOK_CONCURRENCY is not a number"
+            );
+            DEFAULT_BACKFILL_HOOK_CONCURRENCY
+        }
+    }
+}
+
+/// How many of `events`' hooks may run at once. More than one only for a
+/// batch of backfill records with no key twice: their hooks are independent,
+/// while a live batch can carry several versions of one key, whose order
+/// matters. A storage that claims one of the collections can lower it to
+/// what it can apply at once.
+fn batch_concurrency(state: &AppState, events: &[SourceEvent]) -> usize {
+    let configured = backfill_hook_concurrency();
+    if configured == 1 {
+        return 1;
+    }
+    let mut uris = HashSet::with_capacity(events.len());
+    let mut limit = configured;
+    for event in events {
+        let SourceEvent::Record(ev) = event else {
+            return 1;
+        };
+        if !matches!(ev.origin, Origin::Backfill { .. }) || !uris.insert(ev.key.uri()) {
+            return 1;
+        }
+        if let Some(max) = state
+            .records
+            .external_route(&ev.key.collection)
+            .and_then(|ext| ext.max_concurrent_deltas())
+            && max < limit
+        {
+            limit = max.max(1);
+        }
+    }
+    if limit < configured {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            tracing::warn!(
+                configured,
+                used = limit,
+                "BACKFILL_HOOK_CONCURRENCY is more than the record storage can apply at once; \
+                 raise its connection limit to use it"
+            );
+        });
+    }
+    limit
+}
+
+/// [`apply_batch_in`], within its batch's lookups.
+async fn apply_events(
+    state: &AppState,
+    events: Vec<SourceEvent>,
+) -> (BatchOutcome, Option<String>) {
     let total = events.len();
     let mut out = BatchOutcome {
         outcomes: Vec::with_capacity(total),
         changed: Vec::with_capacity(total),
     };
+    let concurrency = batch_concurrency(state, &events);
+    // A batch a storage claims whole is applied a record at a time, so it
+    // runs as many records at once as it may. Each has its own key, and the
+    // outcomes keep the batch's order.
+    if concurrency > 1
+        && events.iter().all(|event| match event {
+            SourceEvent::Record(ev) => state.records.external_route(&ev.key.collection).is_some(),
+            _ => false,
+        })
+    {
+        let applied: Vec<Applied> = futures_util::stream::iter(events)
+            .map(|event| apply_in(state, event))
+            .buffered(concurrency)
+            .collect()
+            .await;
+        for applied in applied {
+            out.outcomes.push(applied.outcome);
+            out.changed.push(applied.changed);
+        }
+        return (out, None);
+    }
     let mut run: Vec<(usize, RecordEvent, PreparedRecord)> = Vec::new();
     let mut tracked: HashMap<String, bool> = HashMap::new();
+    let mut hooked_ahead = hook_ahead(state, &events, concurrency, &mut tracked).await;
 
-    for event in events {
+    for (index, event) in events.into_iter().enumerate() {
         // A claimed collection's events are written as deltas, one by one,
         // through `apply_in`.
         if let SourceEvent::Record(ev) = &event
@@ -203,7 +316,10 @@ pub(crate) async fn apply_batch_in(
                 }
             };
             if is_tracked {
-                let hooked = hook_body(state, ev, body).await;
+                let hooked = match hooked_ahead.remove(&index) {
+                    Some(hooked) => hooked,
+                    None => hook_body(state, ev, body).await,
+                };
                 let SourceEvent::Record(ev) = event else {
                     unreachable!()
                 };
@@ -247,6 +363,104 @@ pub(crate) async fn apply_batch_in(
         return (out, Some(error));
     }
     (out, None)
+}
+
+/// Runs the hooks of `events` this instance stores itself, `concurrency` at
+/// once, ahead of the batch's writes, which then go in order as before. Only
+/// for more than one at once; keyed by the event's place in the batch.
+async fn hook_ahead(
+    state: &AppState,
+    events: &[SourceEvent],
+    concurrency: usize,
+    tracked: &mut HashMap<String, bool>,
+) -> HashMap<usize, HookedBody> {
+    if concurrency <= 1 {
+        return HashMap::new();
+    }
+    let mut hookable = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if let SourceEvent::Record(ev) = event
+            && matches!(ev.action, Action::Create | Action::Update)
+            && ev.key.collection != LEXICON_SCHEMA_COLLECTION
+            && state.records.external_route(&ev.key.collection).is_none()
+            && let Some(body) = &ev.body
+        {
+            let is_tracked = match tracked.get(&ev.key.collection) {
+                Some(known) => *known,
+                None => {
+                    let known = is_tracked(state, &ev.key.collection).await;
+                    tracked.insert(ev.key.collection.clone(), known);
+                    known
+                }
+            };
+            if is_tracked {
+                hookable.push((index, ev, body));
+            }
+        }
+    }
+    let mut hooked = HashMap::with_capacity(hookable.len());
+    let mut waiting = hookable.into_iter();
+    let mut running = futures_util::stream::FuturesUnordered::new();
+    for (index, ev, body) in waiting.by_ref().take(concurrency) {
+        running.push(hook_one(state, index, ev, body));
+    }
+    while let Some((index, outcome)) = running.next().await {
+        hooked.insert(index, outcome);
+        if let Some((index, ev, body)) = waiting.next() {
+            running.push(hook_one(state, index, ev, body));
+        }
+    }
+    hooked
+}
+
+/// One record's hook, with its place in the batch.
+async fn hook_one<'a>(
+    state: &'a AppState,
+    index: usize,
+    ev: &'a RecordEvent,
+    body: &'a Value,
+) -> (usize, HookedBody) {
+    (index, hook_body(state, ev, body).await)
+}
+
+/// How many record hooks a test's task has running at once, and the most it
+/// has had.
+#[cfg(test)]
+pub(crate) mod hooks_in_flight {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct Count {
+        now: AtomicUsize,
+        pub(crate) most: AtomicUsize,
+    }
+
+    tokio::task_local! {
+        pub(crate) static COUNT: Arc<Count>;
+    }
+
+    /// One hook running, counted until dropped.
+    pub(crate) struct Running(Option<Arc<Count>>);
+
+    impl Running {
+        pub(crate) fn start() -> Self {
+            let count = COUNT.try_with(Arc::clone).ok();
+            if let Some(count) = &count {
+                let now = count.now.fetch_add(1, Ordering::SeqCst) + 1;
+                count.most.fetch_max(now, Ordering::SeqCst);
+            }
+            Self(count)
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if let Some(count) = &self.0 {
+                count.now.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 /// Give the not-yet-applied tail of a batch the failure's outcome.
@@ -421,6 +635,8 @@ async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: H
     // `record.index:<nsid>`; failures are dead-lettered fail-open.
     let outcome = match hook {
         Hook::Run => {
+            #[cfg(test)]
+            let _running = hooks_in_flight::Running::start();
             crate::lua::run_record_event_script(
                 state,
                 RecordEventPayload {
@@ -1388,5 +1604,21 @@ mod ignored_keep_tests {
             "the two held back, and this one"
         );
         assert_eq!(keeps.note("app.a", start + Duration::from_secs(3601)), None);
+    }
+}
+
+#[cfg(test)]
+mod hook_concurrency_tests {
+    use super::parse_hook_concurrency;
+
+    #[test]
+    fn backfill_hook_concurrency_is_read_and_bounded() {
+        assert_eq!(parse_hook_concurrency(None), 4);
+        assert_eq!(parse_hook_concurrency(Some("")), 4);
+        assert_eq!(parse_hook_concurrency(Some(" 8 ")), 8);
+        assert_eq!(parse_hook_concurrency(Some("1")), 1);
+        assert_eq!(parse_hook_concurrency(Some("0")), 1);
+        assert_eq!(parse_hook_concurrency(Some("500")), 32);
+        assert_eq!(parse_hook_concurrency(Some("many")), 4);
     }
 }
