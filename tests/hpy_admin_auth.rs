@@ -113,11 +113,54 @@ async fn token_requests(server: &MockServer) -> usize {
         .count()
 }
 
+/// The client an app signs in through: its key, and the Origin it sends, if any.
+struct Client {
+    key: String,
+    origin: Option<String>,
+}
+
+impl Client {
+    fn hpy() -> Self {
+        Self {
+            key: cli_client::CLIENT_KEY.to_string(),
+            origin: None,
+        }
+    }
+
+    fn headers(&self) -> Vec<(&str, &str)> {
+        let mut headers = vec![("x-client-key", self.key.as_str())];
+        if let Some(origin) = &self.origin {
+            headers.push(("origin", origin.as_str()));
+        }
+        headers
+    }
+}
+
 /// Signs in through the built-in client as hpy does: a DPoP key provisioned
 /// with PKCE and no Origin, then a session registered with the verifier and
 /// whatever scope the app claims. Returns the provision id and the DPoP key.
 async fn sign_in(
     app: &common::app::TestApp,
+    did: &str,
+    issuer: &str,
+    claimed_scope: &str,
+    access_token: &str,
+) -> (String, Value) {
+    sign_in_as(
+        app,
+        &Client::hpy(),
+        did,
+        issuer,
+        claimed_scope,
+        access_token,
+    )
+    .await
+}
+
+/// [`sign_in`] through any public client.
+async fn sign_in_as(
+    app: &common::app::TestApp,
+    client: &Client,
     did: &str,
     issuer: &str,
     claimed_scope: &str,
@@ -131,7 +174,7 @@ async fn sign_in(
         .oneshot(post_json(
             "/oauth/dpop-keys",
             &json!({ "pkce_challenge": challenge }),
-            &[("x-client-key", cli_client::CLIENT_KEY)],
+            &client.headers(),
         ))
         .await
         .unwrap();
@@ -153,7 +196,7 @@ async fn sign_in(
                 "scopes": claimed_scope,
                 "issuer": issuer,
             }),
-            &[("x-client-key", cli_client::CLIENT_KEY)],
+            &client.headers(),
         ))
         .await
         .unwrap();
@@ -171,13 +214,23 @@ async fn dpop_get(
     dpop_key: &Value,
     access_token: &str,
 ) -> (StatusCode, Value) {
+    dpop_get_as(app, &Client::hpy(), path, dpop_key, access_token).await
+}
+
+async fn dpop_get_as(
+    app: &common::app::TestApp,
+    client: &Client,
+    path: &str,
+    dpop_key: &Value,
+    access_token: &str,
+) -> (StatusCode, Value) {
     let url = format!("http://127.0.0.1{path}");
     let proof = generate_dpop_proof(dpop_key, "GET", &url, access_token, None).unwrap();
     let req = Request::builder()
         .method("GET")
         .uri(path)
         .header("host", "127.0.0.1")
-        .header("x-client-key", cli_client::CLIENT_KEY)
+        .header("x-client-key", &client.key)
         .header("authorization", format!("DPoP {access_token}"))
         .header("dpop", proof)
         .body(Body::empty())
@@ -226,6 +279,43 @@ async fn the_scope_an_app_claims_grants_nothing() {
 
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Nothing about the rule is particular to hpy: an ordinary registered app's
+/// session reaches the admin API only with the grant its authorization server
+/// reports, and `transition:generic` is not it.
+#[tokio::test]
+#[serial]
+async fn any_apps_session_is_held_to_the_grant() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let origin = "https://app.example".to_string();
+    let (key, _, _) = app
+        .create_api_client("public", Some(vec![origin.clone()]))
+        .await;
+    let client = Client {
+        key,
+        origin: Some(origin),
+    };
+
+    // One session per grant, in order: the server answers each one's first
+    // refresh with the next response.
+    let cases = [
+        ("atproto transition:generic", StatusCode::FORBIDDEN),
+        (ADMIN_GRANT, StatusCode::OK),
+    ];
+    let responses: Vec<Value> = cases
+        .iter()
+        .map(|(granted, _)| token_response(&did, granted, 3600))
+        .collect();
+    let server = authorization_server(&app, &did, true, &responses).await;
+    for (i, (granted, expected)) in cases.into_iter().enumerate() {
+        let token = format!("app-token-{i}");
+        let (_, dpop_key) = sign_in_as(&app, &client, &did, &server.uri(), "atproto", &token).await;
+        let (status, body) = dpop_get_as(&app, &client, "/admin/plugins", &dpop_key, &token).await;
+        assert_eq!(status, expected, "granted {granted}: {body}");
+    }
 }
 
 #[tokio::test]
