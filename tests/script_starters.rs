@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use common::app::TestApp;
 use common::quickjs_plugins::{JAVASCRIPT_DIR, TYPESCRIPT_DIR, plugin_dir};
+use common::workers::Workers;
 use happyview::plugin::{
     ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits, ScriptExecuteOutput, ScriptKind,
     ScriptValueKind, loader,
@@ -246,7 +247,7 @@ async fn job_completes(app: &TestApp, language: &str, ext: &str) {
         .await
         .expect("enqueue a job");
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let sql = happyview::db::adapt_sql(
         "SELECT status, result, error, progress FROM happyview_jobs WHERE id = ?",
         app.state.db_backend,
@@ -263,7 +264,7 @@ async fn job_completes(app: &TestApp, language: &str, ext: &str) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    worker.abort();
+    workers.stop().await;
 
     let (status, result, error, progress) = row;
     assert_eq!(status, "completed", "{language}: {error:?}");
