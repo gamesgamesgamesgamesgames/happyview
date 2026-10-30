@@ -28,6 +28,10 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ),
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
+    (
+        crate::csrf::INTEGRATION_ORIGINS_SETTING,
+        "COOKIE_INTEGRATION_ORIGINS",
+    ),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
@@ -176,6 +180,9 @@ pub(super) async fn upsert(
         super::telemetry::refuse_if_managed(&state)?;
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
+        crate::csrf::validate_origins(&body.value).map_err(AppError::BadRequest)?;
+    }
 
     put_setting(&state.db, &key, &body.value, state.db_backend)
         .await

@@ -122,6 +122,29 @@ The consequence worth internalising: **the PDS will mint an identity-bearing ass
 
 There is no destination allowlist in HappyView for this, and that is deliberate — the decision of whether to sign for a given audience belongs to the party holding the key, which is the PDS. What *is* in your hands is who gets to make such a request at all: registering a third-party API client is the act that grants it. Register clients deliberately, and scope them as above.
 
+## Cross-site requests with the session cookie
+
+On an https instance the dashboard session cookie is `SameSite=None`, so that integrations on other sites can call the instance as the signed-in user. A browser therefore attaches it to a request any site starts, including a form another page submits. CORS stops that page from reading the answer, but not the request from running.
+
+So HappyView refuses a request that changes something (`POST`, `PUT`, `PATCH` or `DELETE`), carries the session cookie, and comes from another site. It answers `403`. A request is allowed when:
+
+- the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
+- its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md);
+- its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
+- or it carries neither header, because then it did not come from a browser.
+
+Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
+
+If an integration calls the instance from another site with the cookie, list its origin once, as the scheme, host and port only:
+
+```sh
+curl -X PUT "http://127.0.0.1:3000/admin/settings/cookie_integration_origins" \
+  -H "$AUTH" -H "content-type: application/json" \
+  -d '{"value": "https://pentaract.example"}'
+```
+
+A value that is not a list of origins is refused with `400`. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
+
 ## A checklist
 
 - [ ] Every API client registered with granular scopes, or a permission set, rather than `transition:generic`
@@ -130,6 +153,7 @@ There is no destination allowlist in HappyView for this, and that is deliberate 
 - [ ] XRPC proxy set explicitly — allowlist if you can enumerate your NSIDs, disabled if you serve only your own
 - [ ] Linked-repo grants scoped before the invite goes out, not after
 - [ ] Third-party API clients reviewed: each one can ask the PDS to sign for an audience of its choosing
+- [ ] `cookie_integration_origins` lists only sites you control
 - [ ] Database backups cover `happyview_oauth_client_keys` — losing a row there permanently destroys every session pinned to it
 
 ## Related

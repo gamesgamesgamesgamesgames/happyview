@@ -7,6 +7,7 @@ pub mod cli;
 pub mod codemod;
 pub mod config;
 pub mod constant_time;
+pub mod csrf;
 pub mod dashboard;
 pub mod db;
 pub mod delegation;

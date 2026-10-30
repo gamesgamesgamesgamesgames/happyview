@@ -216,8 +216,14 @@ pub async fn truncate_all(pool: &AnyPool) {
 /// A Cookie header carrying a signed session cookie for `did`: a user who
 /// has completed OAuth.
 pub fn admin_cookie_header(did: &str, cookie_key: &Key) -> (HeaderName, HeaderValue) {
+    session_cookie_header(did, cookie_key)
+}
+
+/// A Cookie header carrying a signed session cookie holding `value`, as the
+/// OAuth callback writes it: a DID, or a DID and an API client key on two lines.
+pub fn session_cookie_header(value: &str, cookie_key: &Key) -> (HeaderName, HeaderValue) {
     let jar = SignedCookieJar::new(cookie_key.clone());
-    let mut cookie = Cookie::new(crate::auth::COOKIE_NAME, did.to_string());
+    let mut cookie = Cookie::new(crate::auth::COOKIE_NAME, value.to_string());
     cookie.set_path("/");
     let jar = jar.add(cookie);
 
