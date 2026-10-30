@@ -1,7 +1,7 @@
 //! The admin API accepts an app's DPoP session only when the authorization
 //! server granted it `dev.happyview.adminFull`, read from a token response
-//! HappyView received itself, and a service-auth JWT only when it is bound to
-//! the method that set grants. The built-in hpy client is seeded at boot.
+//! HappyView received itself, and never a service-auth JWT. The built-in hpy
+//! client is seeded at boot.
 
 mod common;
 
@@ -343,17 +343,19 @@ async fn signing_in_again_forgets_the_previous_grant() {
 
 #[tokio::test]
 #[serial]
-async fn a_service_auth_token_must_name_the_admin_method() {
+async fn a_service_auth_token_never_reaches_admin() {
     common::require_db!();
     let mut app = common::app::TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance = app.setup_did_web().await;
     let did = app.admin_did.clone();
 
-    for (lxm, expected) in [
-        (None, StatusCode::FORBIDDEN),
-        (Some("com.example.other"), StatusCode::FORBIDDEN),
-        (Some(admin_scope::ADMIN_LXM), StatusCode::OK),
+    // Bound to the admin method or not: a PDS mints that one too, for any
+    // session holding `transition:generic`.
+    for lxm in [
+        None,
+        Some("com.example.other"),
+        Some(admin_scope::ADMIN_LXM),
     ] {
         let auth = app
             .service_auth_jwt_for(&plc_store, &did, &instance, "#happyview", lxm)
@@ -366,7 +368,12 @@ async fn a_service_auth_token_must_name_the_admin_method() {
             .unwrap();
         let resp = app.router.clone().oneshot(req).await.unwrap();
         let status = resp.status();
-        assert_eq!(status, expected, "{lxm:?}: {}", response_json(resp).await);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{lxm:?}: {}",
+            response_json(resp).await
+        );
     }
 }
 
