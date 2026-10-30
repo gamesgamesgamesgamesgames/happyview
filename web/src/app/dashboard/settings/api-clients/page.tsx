@@ -7,6 +7,7 @@ import {
   CopyPlus,
   Check,
   KeyRound,
+  LockKeyhole,
   RefreshCw,
   ShieldAlert,
   Trash2,
@@ -31,6 +32,9 @@ import {
   listApiClientAuthKeys,
   revokeApiClientAuthKey,
   revokeAllApiClientAuthKeys,
+  listApiClientSecrets,
+  createApiClientSecret,
+  revokeApiClientSecret,
 } from "@/lib/api";
 import type {
   ApiClientSummary,
@@ -38,6 +42,8 @@ import type {
   ApiClientAuthKey,
   ApiClientAuthProbe,
   ApiClientAuthKeyListEntry,
+  ApiClientSecret,
+  CreatedApiClientSecret,
 } from "@/types/api-clients";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -235,6 +241,13 @@ export default function ApiClientsPage() {
                   </TableCell>
                   <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
                     <div className="flex gap-1">
+                      {client.client_type === "confidential" &&
+                        hasPermission("api-clients:view") && (
+                          <ApiClientSecretsDialog
+                            client={client}
+                            canEdit={hasPermission("api-clients:edit")}
+                          />
+                        )}
                       {hasPermission("api-clients:edit") && (
                         <ApiClientAuthDialog client={client} />
                       )}
@@ -984,6 +997,272 @@ function EditApiClientDialog({
  * the probe is rendered verbatim; it is authored copy, not something this
  * component should summarise or reword.
  */
+function ApiClientSecretsDialog({
+  client,
+  canEdit,
+}: {
+  client: ApiClientSummary;
+  canEdit: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [secrets, setSecrets] = useState<ApiClientSecret[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [label, setLabel] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState<CreatedApiClientSecret | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<ApiClientSecret | null>(
+    null,
+  );
+  const [revoking, setRevoking] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    listApiClientSecrets(client.id)
+      .then((res) => setSecrets(res.secrets))
+      .catch((e: unknown) => toastError("Failed to load client secrets", e))
+      .finally(() => setLoading(false));
+  }, [client.id]);
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      setCreated(null);
+      setLabel("");
+      load();
+    }
+  }
+
+  async function handleCreate() {
+    setCreating(true);
+    try {
+      const secret = await createApiClientSecret(client.id, label);
+      setCreated(secret);
+      setLabel("");
+      load();
+    } catch (e: unknown) {
+      toastError("Failed to add secret", e);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokeTarget) return;
+    setRevoking(true);
+    try {
+      const result = await revokeApiClientSecret(client.id, revokeTarget.id);
+      setRevokeTarget(null);
+      toast.success(`Revoked “${revokeTarget.label}”`, {
+        description:
+          result.active_secrets === 0
+            ? `“${client.name}” has no working secret left. Add one before anything needs to authenticate.`
+            : `${result.active_secrets} other secret${result.active_secrets === 1 ? "" : "s"} still work${result.active_secrets === 1 ? "s" : ""}.`,
+      });
+      load();
+    } catch (e: unknown) {
+      toastError("Failed to revoke secret", e);
+    } finally {
+      setRevoking(false);
+    }
+  }
+
+  async function handleCopy(value: string) {
+    await navigator.clipboard.writeText(value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  const activeCount = secrets.filter((s) => !s.revoked_at).length;
+
+  return (
+    <>
+      <Sheet open={open} onOpenChange={handleOpenChange}>
+        <SheetTrigger asChild>
+          <Button
+            variant="outline"
+            size="icon"
+            className="size-8"
+            title="Client secrets"
+            aria-label={`Client secrets for ${client.name}`}
+          >
+            <LockKeyhole className="size-4" />
+          </Button>
+        </SheetTrigger>
+        <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
+          <SheetHeader>
+            <SheetTitle>Client Secrets</SheetTitle>
+            <SheetDescription>
+              Every secret here authenticates &ldquo;{client.name}&rdquo; on its
+              own. Give each place it runs its own secret. To rotate one, add a
+              new secret, move to it, then revoke the old one.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
+            {created && (
+              <div className="flex flex-col gap-2 rounded-lg border p-4 bg-muted/50">
+                <Label htmlFor="created-secret">
+                  New secret &ldquo;{created.label}&rdquo;
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="created-secret"
+                    readOnly
+                    value={created.client_secret}
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => handleCopy(created.client_secret)}
+                    title="Copy to clipboard"
+                    aria-label="Copy the new secret"
+                  >
+                    {copied ? (
+                      <Check className="size-4" />
+                    ) : (
+                      <Copy className="size-4" />
+                    )}
+                  </Button>
+                </div>
+                <p className="text-muted-foreground text-xs">
+                  Copy it now. It isn&apos;t shown again, and HappyView keeps
+                  only a hash of it.
+                </p>
+              </div>
+            )}
+
+            {canEdit && (
+              <form
+                className="flex flex-col gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (label.trim()) handleCreate();
+                }}
+              >
+                <Label htmlFor={`secret-label-${client.id}`}>
+                  Add a secret
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    id={`secret-label-${client.id}`}
+                    placeholder="Where it's used, like staging"
+                    maxLength={100}
+                    value={label}
+                    onChange={(e) => setLabel(e.target.value)}
+                  />
+                  <Button type="submit" disabled={creating || !label.trim()}>
+                    {creating ? "Adding..." : "Add"}
+                  </Button>
+                </div>
+              </form>
+            )}
+
+            {loading && secrets.length === 0 ? (
+              <p className="text-muted-foreground text-sm">Loading…</p>
+            ) : secrets.length === 0 ? (
+              <p className="text-muted-foreground text-sm">
+                This client has no secrets.
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Label</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Last used</TableHead>
+                    <TableHead>Status</TableHead>
+                    {canEdit && <TableHead className="w-10" />}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {secrets.map((secret) => (
+                    <TableRow
+                      key={secret.id}
+                      className={secret.revoked_at ? "opacity-50" : undefined}
+                    >
+                      <TableCell className="font-medium">
+                        {secret.label}
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {new Date(secret.created_at).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {secret.last_used_at
+                          ? new Date(secret.last_used_at).toLocaleString()
+                          : "Never"}
+                      </TableCell>
+                      <TableCell>
+                        {secret.revoked_at ? (
+                          <Badge variant="outline">Revoked</Badge>
+                        ) : (
+                          <Badge>Active</Badge>
+                        )}
+                      </TableCell>
+                      {canEdit && (
+                        <TableCell>
+                          {!secret.revoked_at && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8"
+                              title="Revoke"
+                              aria-label={`Revoke ${secret.label}`}
+                              onClick={() => setRevokeTarget(secret)}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          )}
+                        </TableCell>
+                      )}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      <AlertDialog
+        open={revokeTarget !== null}
+        onOpenChange={(next) => {
+          if (!next) setRevokeTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Revoke &ldquo;{revokeTarget?.label}&rdquo;?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Anything still sending this secret is refused from its next
+              request.{" "}
+              {activeCount <= 1
+                ? `It is the only working secret, so “${client.name}” can't authenticate with a secret until you add another.`
+                : "The client's other secrets keep working."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={revoking}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={revoking}
+              onClick={(e) => {
+                e.preventDefault();
+                handleRevoke();
+              }}
+            >
+              {revoking ? "Revoking..." : "Revoke"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
 function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);

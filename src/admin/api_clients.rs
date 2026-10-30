@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use hex;
 use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -44,17 +44,6 @@ pub(super) async fn create_api_client(
     rand::rng().fill_bytes(&mut random_bytes);
     let client_key = format!("hvc_{}", hex::encode(random_bytes));
 
-    // Generate the client secret for confidential clients only.
-    let (client_secret, client_secret_hash) = if body.client_type == "confidential" {
-        let mut secret_bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret_bytes);
-        let secret = format!("hvs_{}", hex::encode(secret_bytes));
-        let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        (Some(secret), hash)
-    } else {
-        (None, String::new())
-    };
-
     let id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let redirect_uris_json =
@@ -66,14 +55,13 @@ pub(super) async fn create_api_client(
         .map(|origins| serde_json::to_string(origins).unwrap_or_else(|_| "[]".to_string()));
 
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
         state.db_backend,
     );
 
     crate::db::query(&insert_sql)
         .bind(&id)
         .bind(&client_key)
-        .bind(&client_secret_hash)
         .bind(&body.name)
         .bind(&body.client_id_url)
         .bind(&body.client_uri)
@@ -89,6 +77,20 @@ pub(super) async fn create_api_client(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create api client: {e}")))?;
+
+    // A confidential client starts with one secret; a public one has none.
+    let client_secret = if body.client_type == "confidential" {
+        let (_, secret) = crate::oauth::client_secrets::create(
+            &state.db,
+            state.db_backend,
+            &id,
+            crate::oauth::client_secrets::ORIGINAL_LABEL,
+        )
+        .await?;
+        Some(secret)
+    } else {
+        None
+    };
 
     // Register the new client in the OAuth registry so it's usable immediately.
     let oauth_params = crate::auth::client_registry::ApiClientOAuthParams {
@@ -110,13 +112,15 @@ pub(super) async fn create_api_client(
     }
 
     // Register the client identity for request validation.
-    state.rate_limiter.register_client_identity(
-        client_key.clone(),
-        crate::rate_limit::ClientIdentity {
-            secret_hash: client_secret_hash.clone(),
-            client_uri: body.client_uri.clone(),
-        },
-    );
+    crate::oauth::client_secrets::register_identity(
+        &state.rate_limiter,
+        &state.db,
+        state.db_backend,
+        &id,
+        &client_key,
+        &body.client_uri,
+    )
+    .await?;
 
     // Register per-client rate limit config if overrides are set.
     if let (Some(capacity), Some(refill_rate)) =
@@ -302,12 +306,11 @@ pub(super) async fn update_api_client(
 
     // Read current values
     let select_sql = adapt_sql(
-        "SELECT client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM happyview_api_clients WHERE id = ?",
+        "SELECT client_key, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
 
     type UpdateRow = (
-        String,
         String,
         String,
         String,
@@ -327,7 +330,6 @@ pub(super) async fn update_api_client(
 
     let Some((
         client_key,
-        client_secret_hash,
         cur_name,
         client_id_url,
         cur_client_uri,
@@ -413,13 +415,15 @@ pub(super) async fn update_api_client(
 
     // Update client identity and per-client rate limit config.
     if is_active != 0 {
-        state.rate_limiter.register_client_identity(
-            client_key.clone(),
-            crate::rate_limit::ClientIdentity {
-                secret_hash: client_secret_hash,
-                client_uri: client_uri.clone(),
-            },
-        );
+        crate::oauth::client_secrets::register_identity(
+            &state.rate_limiter,
+            &state.db,
+            state.db_backend,
+            &id,
+            &client_key,
+            &client_uri,
+        )
+        .await?;
         if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
             let defaults = state.rate_limiter.defaults();
             state.rate_limiter.register_client_config(

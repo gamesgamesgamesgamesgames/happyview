@@ -378,6 +378,19 @@ impl TestApp {
             .await
             .expect("failed to create test API client");
 
+        let secret_sql = adapt_sql(
+            "INSERT INTO happyview_api_client_secrets (id, client_id, label, secret_hash, created_at) VALUES (?, ?, 'Original', ?, ?)",
+            self.state.db_backend,
+        );
+        happyview::db::query(&secret_sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(&secret_hash)
+            .bind(&now)
+            .execute(&self.state.db)
+            .await
+            .expect("failed to create test API client secret");
+
         (client_key, client_secret, id)
     }
 

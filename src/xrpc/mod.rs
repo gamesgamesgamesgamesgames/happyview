@@ -397,9 +397,17 @@ fn resolve_client_key(
                 .get("x-client-secret")
                 .and_then(|v| v.to_str().ok());
 
-            match secret {
-                Some(s) if state.rate_limiter.validate_client_secret(&client_key, s) => {}
-                Some(_) => {
+            match secret.map(|s| state.rate_limiter.match_client_secret(&client_key, s)) {
+                Some(Some(secret_id)) => {
+                    if state.rate_limiter.note_secret_use(&secret_id) {
+                        let (db, backend) = (state.db.clone(), state.db_backend);
+                        tokio::spawn(async move {
+                            crate::oauth::client_secrets::record_use(&db, backend, &secret_id)
+                                .await;
+                        });
+                    }
+                }
+                Some(None) => {
                     tracing::warn!("Invalid client secret for {client_key}");
                 }
                 None => {

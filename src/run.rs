@@ -590,20 +590,32 @@ async fn boot(
             Option<String>,
         );
         let client_rows: Vec<ClientRow> = crate::db::query_as(
-            "SELECT client_key, client_secret_hash, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
+            "SELECT id, client_key, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
         )
         .fetch_all(&db_pool)
         .await
         .unwrap_or_default();
 
-        for (client_key, secret_hash, client_uri, capacity, refill_rate, _) in &client_rows {
-            rate_limiter.register_client_identity(
-                client_key.clone(),
-                crate::rate_limit::ClientIdentity {
-                    secret_hash: secret_hash.clone(),
-                    client_uri: client_uri.clone(),
-                },
-            );
+        for (client_id, client_key, client_uri, capacity, refill_rate, _) in &client_rows {
+            if let Err(e) = crate::oauth::client_secrets::register_identity(
+                &rate_limiter,
+                &db_pool,
+                db_backend,
+                client_id,
+                client_key,
+                client_uri,
+            )
+            .await
+            {
+                tracing::error!(client_key, error = %e, "could not load an API client's secrets; it is registered with none");
+                rate_limiter.register_client_identity(
+                    client_key.clone(),
+                    crate::rate_limit::ClientIdentity {
+                        secrets: Vec::new(),
+                        client_uri: client_uri.clone(),
+                    },
+                );
+            }
             if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
                 rate_limiter.register_client_config(
                     client_key.clone(),

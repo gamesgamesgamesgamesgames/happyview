@@ -52,6 +52,9 @@ import type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
@@ -119,6 +122,9 @@ export type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKey,
   InstanceOauthKeysResponse,
@@ -1141,6 +1147,26 @@ export function revokeApiClientAuthKey(id: string, kid: string) {
 export function revokeAllApiClientAuthKeys(id: string) {
   return apiFetch<RevokeAllApiClientAuthKeysResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-keys`,
+    { method: "DELETE" },
+  );
+}
+
+export function listApiClientSecrets(id: string) {
+  return apiFetch<{ secrets: ApiClientSecret[] }>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+  );
+}
+
+export function createApiClientSecret(id: string, label: string) {
+  return apiFetch<CreatedApiClientSecret>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+    { method: "POST", body: JSON.stringify({ label }) },
+  );
+}
+
+export function revokeApiClientSecret(id: string, secretId: string) {
+  return apiFetch<RevokeApiClientSecretResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets/${encodeURIComponent(secretId)}`,
     { method: "DELETE" },
   );
 }
