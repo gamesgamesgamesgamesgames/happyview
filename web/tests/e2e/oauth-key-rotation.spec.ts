@@ -95,7 +95,11 @@ async function completeAttachAccountOAuth(
 }
 
 test.describe("OAuth instance key rotation — live proof against a real PDS", () => {
-  test.describe.configure({ timeout: 180_000 });
+  // The tests share the rotation and the accounts the first one sets up, so
+  // they run as one chain: a failure skips the rest, and a retry reruns the
+  // chain from the start rather than a later test alone in a fresh worker,
+  // where it would find nothing set up.
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
 
   let accountA: { did: string; handle: string };
   let accountB: { did: string; handle: string };
@@ -189,11 +193,6 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
   test("a freshly established session after rotation pins to the new current key", async ({
     page,
   }) => {
-    test.skip(
-      !kidAfterRotation,
-      "requires the rotation from the previous test",
-    );
-
     accountB = await createPdsAccount();
     await resetServiceIdentity();
     await loginAsTestAdmin(page);
@@ -211,11 +210,6 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
   test("the same account logging in again after rotation moves the pin to the new key", async ({
     page,
   }) => {
-    test.skip(
-      !kidAfterRotation,
-      "requires the rotation and accountA session from the first test",
-    );
-
     await resetServiceIdentity();
     await loginAsTestAdmin(page);
 
