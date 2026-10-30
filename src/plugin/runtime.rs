@@ -170,6 +170,21 @@ pub struct WasmRuntime {
     epoch: Arc<AtomicU64>,
     ticker_stop: Arc<AtomicBool>,
     modules: Arc<ModuleCache>,
+    /// The linkers every instance on this engine is made with, built once.
+    /// They live here, beside the engine they are bound to, because an
+    /// executor is made per call and would rebuild them every time.
+    linkers: SharedLinkers,
+}
+
+/// One linker without WASI preview 1 and one with it, each built on first
+/// use. Building one registers every host function, which profiled at about
+/// a fifth of a record hook's CPU when it was done per instance. Host
+/// functions reach a run's state only through the store's data, so one
+/// linker serves every store.
+#[derive(Default)]
+pub(crate) struct SharedLinkers {
+    pub(crate) env: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
+    pub(crate) wasi: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
 }
 
 /// The WebAssembly proposal HappyView turns off that `bytes` needs, if one
@@ -265,7 +280,13 @@ impl WasmRuntime {
             epoch: Arc::new(AtomicU64::new(0)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
             modules: Arc::default(),
+            linkers: SharedLinkers::default(),
         })
+    }
+
+    /// The linkers instances on this engine share.
+    pub(crate) fn linkers(&self) -> &SharedLinkers {
+        &self.linkers
     }
 
     /// This runtime, compiling every module it does not hold itself rather

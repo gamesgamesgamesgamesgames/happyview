@@ -621,19 +621,6 @@ pub struct PluginExecutor {
     /// tests under `tests/`) have no full `AppState` to give it and don't
     /// exercise that import.
     app_state: Option<crate::AppState>,
-    /// The linkers every instance is made with, built once: host functions
-    /// reach a run's state only through the store's data, so one linker
-    /// serves every store. Shared by the executor's clones.
-    linkers: Arc<SharedLinkers>,
-}
-
-/// One linker without WASI preview 1 and one with it, each built on first
-/// use. Building one registers every host function, which profiled at about
-/// a fifth of a record hook's CPU when it was done per instance.
-#[derive(Default)]
-struct SharedLinkers {
-    env: std::sync::OnceLock<Arc<Linker<PluginState>>>,
-    wasi: std::sync::OnceLock<Arc<Linker<PluginState>>>,
 }
 
 /// Whether `module` imports WASI preview 1.
@@ -690,7 +677,6 @@ impl PluginExecutor {
             lexicons,
             encryption_key: None,
             app_state: None,
-            linkers: Arc::default(),
         }
     }
 
@@ -1269,18 +1255,16 @@ impl PluginExecutor {
         Ok(linker)
     }
 
-    /// [`Self::build_linker`]'s linker for `module`, built once per kind and
-    /// shared by every instance after.
+    /// [`Self::build_linker`]'s linker for `module`, built once per kind on
+    /// the runtime and shared by every instance after, whichever executor
+    /// makes it.
     fn linker_for(
         &self,
         module: &wasmtime::Module,
     ) -> Result<Arc<Linker<PluginState>>, ExecutionError> {
         let wasi = imports_wasi(module);
-        let cell = if wasi {
-            &self.linkers.wasi
-        } else {
-            &self.linkers.env
-        };
+        let linkers = self.runtime.linkers();
+        let cell = if wasi { &linkers.wasi } else { &linkers.env };
         if let Some(linker) = cell.get() {
             return Ok(Arc::clone(linker));
         }
@@ -2501,28 +2485,37 @@ mod interpreter {
 
     /// Instances share one linker, and each still sees only its own store:
     /// two runs in flight at once, through the same linker, each get back
-    /// the input written into their own instance.
+    /// the input written into their own instance. The second run goes
+    /// through a separate executor over the same runtime, as
+    /// `AppState::plugin_executor` makes one per call.
     #[tokio::test]
     async fn runs_sharing_a_linker_each_see_only_their_own_store() {
         if !fixture_is_built() {
             return;
         }
         let (executor, _, current) = superseded().await;
+        let per_call = PluginExecutor::new(
+            Arc::clone(&executor.runtime),
+            Arc::clone(&executor.registry),
+            executor.db.clone(),
+            executor.db_backend,
+            executor.http_client.clone(),
+            Arc::clone(&executor.lexicons),
+        );
         let module = executor.runtime.module_for(&current).await.unwrap();
         assert!(
             Arc::ptr_eq(
                 &executor.linker_for(&module).unwrap(),
-                &executor.linker_for(&module).unwrap()
+                &per_call.linker_for(&module).unwrap()
             ),
-            "the linker is built once"
+            "the linker is built once per runtime, not per executor"
         );
         let mut first = run_input("echo the first run");
         first.input = serde_json::json!({"run": "first"});
         let mut second = run_input("echo the second run");
         second.input = serde_json::json!({"run": "second"});
 
-        let run = |input| {
-            let executor = executor.clone();
+        let run = |executor: PluginExecutor, input| {
             let current = Arc::clone(&current);
             async move {
                 match executor
@@ -2541,7 +2534,7 @@ mod interpreter {
                 }
             }
         };
-        let (a, b) = tokio::join!(run(first), run(second));
+        let (a, b) = tokio::join!(run(executor.clone(), first), run(per_call, second));
 
         assert_eq!(a["input"], serde_json::json!({"run": "first"}));
         assert_eq!(a["source"], "echo the first run");
