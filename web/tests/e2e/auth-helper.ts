@@ -5,8 +5,10 @@ import pg from "pg";
 const SESSION_SECRET = "e2e-test-secret-that-is-at-least-32-bytes";
 const COOKIE_NAME = "happyview_session";
 const TEST_DID = "did:plc:e2e-test-admin";
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
-const PDS_DB_URL = "postgres://happyview:happyview@localhost:5434/pds";
+// The e2e stack's Postgres, on the host port `docker-compose.e2e.yml` publishes.
+const DB_PORT = process.env.E2E_POSTGRES_PORT || "5434";
+export const DB_URL = `postgres://happyview:happyview@localhost:${DB_PORT}/happyview_test`;
+const PDS_DB_URL = `postgres://happyview:happyview@localhost:${DB_PORT}/pds`;
 
 /**
  * HKDF-Expand (RFC 5869 section 2.3) — used by the cookie crate's
