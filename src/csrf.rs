@@ -19,7 +19,7 @@
 //! credential a browser attaches by itself.
 
 use axum::extract::{Request, State};
-use axum::http::{Method, header};
+use axum::http::{HeaderMap, Method, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -38,27 +38,14 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if is_safe(req.method()) || !carries_session_cookie(&req) {
         return next.run(req).await;
     }
-    let headers = req.headers();
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    let allowed = match (fetch_site, origin.as_deref()) {
-        (Some("same-origin" | "none"), _) => true,
-        (None, None) => true,
-        (_, Some(origin)) => origin_allowed(&state, origin).await,
-        (Some(_), None) => false,
-    };
-    if allowed {
+    if cookie_request_is_first_party(&state, req.headers()).await {
         return next.run(req).await;
     }
 
     tracing::warn!(
         method = %req.method(),
         path = req.uri().path(),
-        origin = origin.as_deref().unwrap_or(""),
+        origin = origin_of(req.headers()).unwrap_or(""),
         "refused a cross-site request carrying the session cookie"
     );
     AppError::Forbidden(format!(
@@ -66,6 +53,25 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
          integration's origin in the {INTEGRATION_ORIGINS_SETTING} setting"
     ))
     .into_response()
+}
+
+/// Whether a request carrying the session cookie may use it: the browser says
+/// it came from this instance, or its `Origin` is one of the instance's
+/// domains or a listed integration, or it sent neither header and so did not
+/// come from a browser. The one rule behind [`guard`] and the cookie identity
+/// XRPC accepts (`auth::XrpcClaims`).
+pub async fn cookie_request_is_first_party(state: &AppState, headers: &HeaderMap) -> bool {
+    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    match (fetch_site, origin_of(headers)) {
+        (Some("same-origin" | "none"), _) => true,
+        (None, None) => true,
+        (_, Some(origin)) => origin_allowed(state, origin).await,
+        (Some(_), None) => false,
+    }
+}
+
+fn origin_of(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
 }
 
 fn is_safe(method: &Method) -> bool {

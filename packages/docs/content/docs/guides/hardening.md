@@ -133,6 +133,8 @@ So HappyView refuses a request that changes something (`POST`, `PUT`, `PATCH` or
 - its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
 - or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
 
+A request that only reads (`GET`) is not refused, but on XRPC routes the same rule decides whether the cookie counts. A cross-site `GET` that carries the cookie runs as anonymous, so a query script never runs as the signed-in admin for a page on another site.
+
 Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
 
 If an integration calls the instance from another site with the cookie, list its origin once, as the scheme, host and port only:

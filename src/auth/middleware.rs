@@ -292,8 +292,12 @@ pub async fn resolve_dpop_claims(
 /// Accepts DPoP auth (`Authorization: DPoP <token>`), space credentials
 /// (`Authorization: Atproto-Space <credential>` with an HTTP Message Signature
 /// by the credential's bound key), or Bearer service auth JWTs
-/// (`Authorization: Bearer <service_jwt>`). Cookie auth and Bearer API keys
-/// are rejected on XRPC routes.
+/// (`Authorization: Bearer <service_jwt>`). Bearer API keys are rejected on
+/// XRPC routes. With no `Authorization` header, the session cookie is the
+/// caller only when the request is first-party
+/// ([`crate::csrf::cookie_request_is_first_party`]); otherwise the request is
+/// anonymous. On https the cookie is `SameSite=None`, so a browser attaches it
+/// to a `GET` another site starts, and the CSRF guard lets every `GET` through.
 #[derive(Debug, Clone)]
 pub struct XrpcClaims {
     pub identity: Option<Claims>,
@@ -427,9 +431,11 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 // Only trust the session cookie when the signing key is secure.
                 // When SESSION_SECRET is insecure we ignore the cookie and treat
                 // the request as anonymous, so public/DPoP reads keep working for
-                // clients that happen to carry a stale cookie.
+                // clients that happen to carry a stale cookie. A cookie on a
+                // request another site started is ignored the same way.
                 if state.config.session_secret_secure()
                     && let Some(cookie) = jar.get(COOKIE_NAME)
+                    && crate::csrf::cookie_request_is_first_party(state, &parts.headers).await
                 {
                     let value = cookie.value().to_string();
                     let (did, client_key) = if let Some((d, k)) = value.split_once(COOKIE_SEP) {
