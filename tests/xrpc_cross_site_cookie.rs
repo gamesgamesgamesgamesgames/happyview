@@ -4,7 +4,7 @@
 //! from a browser too old to send that, an `Origin` that is one of the
 //! instance's domains. Any other request carrying it, including one with
 //! neither header, runs as anonymous, so a query script never acts as the
-//! operator for another site, an integration, or a script outside a browser.
+//! operator for another site or a script outside a browser.
 //!
 //! The query is answered by the echo interpreter, which hands back the
 //! context the script was given, so each test reads the caller the script
@@ -22,10 +22,8 @@ use tower::ServiceExt;
 
 use common::app::TestApp;
 use common::echo_interpreter;
-use happyview::csrf::INTEGRATION_ORIGINS_SETTING;
 
 const QUERY: &str = "games.gamesgamesgamesgames.listGames";
-const INTEGRATION: &str = "https://integration.example";
 /// The instance's own origin in a test instance.
 const INSTANCE: &str = "http://127.0.0.1:0";
 
@@ -170,35 +168,6 @@ async fn a_request_from_the_instances_own_pages_runs_as_its_caller() {
         app.admin_cookie(),
         None,
         Some("https://evil.example"),
-    );
-    assert_eq!(caller(&app, req).await, None);
-}
-
-/// A listed integration origin no longer makes the cookie count here.
-#[tokio::test]
-#[serial]
-async fn a_listed_integration_origin_runs_as_anonymous() {
-    common::require_db!();
-    let app = app().await;
-    let req = app
-        .authed_request()
-        .method("PUT")
-        .uri(format!("/admin/settings/{INTEGRATION_ORIGINS_SETTING}"))
-        .header("host", "127.0.0.1")
-        .header("sec-fetch-site", "same-origin")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "value": INTEGRATION })).unwrap(),
-        ))
-        .unwrap();
-    let (status, body) = send(&app, req).await;
-    assert!((200..300).contains(&status), "{body}");
-
-    let req = get(
-        &query_uri(),
-        app.admin_cookie(),
-        Some("cross-site"),
-        Some(INTEGRATION),
     );
     assert_eq!(caller(&app, req).await, None);
 }

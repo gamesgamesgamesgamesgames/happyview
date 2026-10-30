@@ -124,7 +124,6 @@ pub fn state_with_pool_on(
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
-        integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };
     // Backfills and their admin routes work on this state; nothing is started.
