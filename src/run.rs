@@ -1085,6 +1085,7 @@ async fn boot(
         official_registry_config,
         proxy_config,
         verbose_event_logging,
+        ignored_keeps: Arc::default(),
         client_jwks,
         telemetry_counters,
         script_limits,

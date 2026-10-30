@@ -134,6 +134,8 @@ pub struct AppState {
     pub official_registry_config: RegistryConfig,
     pub proxy_config: Arc<arc_swap::ArcSwap<proxy_config::ProxyConfig>>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Ignored keep-on-delete reports, rate-limited per collection.
+    pub ignored_keeps: Arc<ingest::IgnoredKeeps>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
