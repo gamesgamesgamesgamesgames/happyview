@@ -9,6 +9,7 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { CodePanels } from "@/components/code-panels";
 import { LexiconServicesSheet } from "@/components/lexicon-services-sheet";
 import { PublishingPanel } from "@/components/lexicon-publishing/publishing-panel";
+import { DeleteLexiconDialog } from "@/components/lexicons/delete-lexicon-dialog";
 import {
   addNetworkLexicon,
   deleteLexicon,
@@ -17,7 +18,7 @@ import {
   getScripts,
   uploadLexicon,
 } from "@/lib/api";
-import type { LexiconDetail } from "@/types/lexicons";
+import type { LexiconDetail, LexiconSummary } from "@/types/lexicons";
 import type { Script, TriggerKind } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
@@ -129,14 +130,17 @@ export default function LexiconDetailPage() {
     }
   }
 
-  async function handleDelete() {
+  async function handleDelete(
+    _lexicon: LexiconSummary,
+    deleteRecords: boolean,
+  ) {
     if (!lexicon) return;
     setDeleting(true);
     try {
       if (lexicon.source === "network") {
-        await deleteNetworkLexicon(lexicon.id);
+        await deleteNetworkLexicon(lexicon.id, deleteRecords);
       } else {
-        await deleteLexicon(lexicon.id);
+        await deleteLexicon(lexicon.id, deleteRecords);
       }
       router.push("/dashboard/lexicons");
     } catch (e: unknown) {
@@ -360,13 +364,16 @@ export default function LexiconDetailPage() {
             </p>
           ) : (
             hasPermission("lexicons:delete") && (
-              <Button
-                variant="destructive"
-                onClick={handleDelete}
-                disabled={deleting}
-              >
-                {deleting ? "Deleting..." : "Delete Lexicon"}
-              </Button>
+              <DeleteLexiconDialog
+                lexicon={lexicon}
+                canDeleteRecords={hasPermission("records:delete-collection")}
+                onConfirm={handleDelete}
+                trigger={
+                  <Button variant="destructive" disabled={deleting}>
+                    {deleting ? "Deleting..." : "Delete Lexicon"}
+                  </Button>
+                }
+              />
             )
           )}
 

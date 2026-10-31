@@ -290,10 +290,23 @@ export function uploadLexicon(body: {
   });
 }
 
-export function deleteLexicon(id: string) {
-  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
+export function deleteLexicon(id: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
+}
+
+// How many records are indexed under a record lexicon's collection. Asked
+// for only when the delete confirm opens, because it is a COUNT(*).
+export function getLexiconRecordCount(id: string) {
+  return apiFetch<{
+    collection: string;
+    count: number;
+    /** False when a shared record store serves this collection. */
+    deletable: boolean;
+    not_deletable_reason: string | null;
+  }>(`/admin/lexicons/${encodeURIComponent(id)}/record-count`);
 }
 
 // Lexicon publishing
@@ -373,10 +386,12 @@ export function addNetworkLexicon(body: {
   }>("/admin/network-lexicons", { method: "POST", body: JSON.stringify(body) });
 }
 
-export function deleteNetworkLexicon(nsid: string) {
-  return apiFetch(`/admin/network-lexicons/${encodeURIComponent(nsid)}`, {
-    method: "DELETE",
-  });
+export function deleteNetworkLexicon(nsid: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(
+    `/admin/network-lexicons/${encodeURIComponent(nsid)}${query}`,
+    { method: "DELETE" },
+  );
 }
 
 // Backfill
