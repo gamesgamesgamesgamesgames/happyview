@@ -1971,6 +1971,30 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   // Account backfills always crawl; the server refuses replay for them.
   const accountJob = dids.length > 0;
   const chosenSource = accountJob && source === "replay" ? "default" : source;
+  // The executor that backfills the chosen collection, if one does: its
+  // records come from that executor whatever source is asked for.
+  // Kept with the collection it answers for, so a stale answer is ignored.
+  const [lookup, setLookup] = useState<{
+    collection: string;
+    executor: string | null;
+  } | null>(null);
+  const executor =
+    collection && lookup?.collection === collection ? lookup.executor : null;
+
+  useEffect(() => {
+    if (!collection) return;
+    let current = true;
+    getBackfillCollection(collection)
+      .then((resp) => {
+        if (current) setLookup({ collection, executor: resp.executor });
+      })
+      .catch(() => {
+        /* keep the source select */
+      });
+    return () => {
+      current = false;
+    };
+  }, [collection]);
 
   useEffect(() => {
     if (open) {
@@ -1992,7 +2016,8 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       await createBackfillJob({
         collection: collection || undefined,
         dids: dids.length > 0 ? dids : undefined,
-        source: chosenSource === "default" ? undefined : chosenSource,
+        source:
+          executor || chosenSource === "default" ? undefined : chosenSource,
       });
       toast.success("Backfill created");
       setCollection(null);
@@ -2066,31 +2091,44 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
             </p>
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="bf-source">Source</Label>
-            <Select
-              value={chosenSource}
-              onValueChange={(v) => setSource(v as BackfillSource | "default")}
-            >
-              <SelectTrigger id="bf-source" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">Default</SelectItem>
-                <SelectItem value="replay" disabled={accountJob}>
-                  Replay from Jetstream
-                </SelectItem>
-                <SelectItem value="crawl">Crawl PDSes</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-muted-foreground text-xs">
-              {accountJob
-                ? "Account backfills always crawl each account's PDS."
-                : chosenSource === "replay"
-                  ? "Reads the Jetstream archive. Needs Jetstream v2, and can miss an account's oldest records."
-                  : chosenSource === "crawl"
-                    ? "Lists accounts from the relay and fetches each PDS."
-                    : "Crawl, unless BACKFILL_SOURCE says otherwise."}
-            </p>
+            {executor ? (
+              <>
+                <Label>Source</Label>
+                <p className="text-muted-foreground text-xs">
+                  Records come from the network store.
+                </p>
+              </>
+            ) : (
+              <>
+                <Label htmlFor="bf-source">Source</Label>
+                <Select
+                  value={chosenSource}
+                  onValueChange={(v) =>
+                    setSource(v as BackfillSource | "default")
+                  }
+                >
+                  <SelectTrigger id="bf-source" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Default</SelectItem>
+                    <SelectItem value="replay" disabled={accountJob}>
+                      Replay from Jetstream
+                    </SelectItem>
+                    <SelectItem value="crawl">Crawl PDSes</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  {accountJob
+                    ? "Account backfills always crawl each account's PDS."
+                    : chosenSource === "replay"
+                      ? "Reads the Jetstream archive. Needs Jetstream v2, and can miss an account's oldest records."
+                      : chosenSource === "crawl"
+                        ? "Lists accounts from the relay and fetches each PDS."
+                        : "Crawl, unless BACKFILL_SOURCE says otherwise."}
+                </p>
+              </>
+            )}
           </div>
         </ResponsiveDialogBody>
         <ResponsiveDialogFooter>
