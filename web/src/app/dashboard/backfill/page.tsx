@@ -1088,6 +1088,8 @@ function JobDetail({
     try {
       await onCancel();
       toast.success("Backfill cancelled");
+    } catch (e: unknown) {
+      toastError("Couldn't cancel", e);
     } finally {
       setCancelling(false);
     }
@@ -1098,6 +1100,8 @@ function JobDetail({
     try {
       await onPause();
       toast.success("Backfill paused");
+    } catch (e: unknown) {
+      toastError("Couldn't pause", e);
     } finally {
       setPausing(false);
     }
@@ -1108,6 +1112,8 @@ function JobDetail({
     try {
       await onResume();
       toast.success("Backfill resumed");
+    } catch (e: unknown) {
+      toastError("Couldn't resume", e);
     } finally {
       setResuming(false);
     }
