@@ -553,7 +553,7 @@ pub(crate) async fn finalise_cancel(state: &JobState, job_id: &str) {
     keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'Cancelled by an operator' WHERE id = ?",
         state.db_backend,
     );
     job_write(state, job_id, "cancel", || {
@@ -658,6 +658,17 @@ pub(crate) fn spawn_job(state: &JobState, job_id: &str, collection: Option<Strin
     });
 }
 
+/// What a job notes when every collection it covers was left to an
+/// executor: a backfill of every collection (whose executor collections each
+/// get their own job), or an account backfill of a collection with one
+/// (which an executor backfills whole).
+pub(crate) fn executor_owned_note(collection: Option<&str>) -> String {
+    match collection {
+        Some(col) => format!("{col} is backfilled as a whole, not per account."),
+        None => "Each collection is backfilled by its own job.".to_string(),
+    }
+}
+
 pub(crate) async fn run_backfill_job(state: JobState, job_id: String) {
     let window = parse_discovery_window(
         happyview_provider::vars::var("BACKFILL_DISCOVERY_WINDOW").as_deref(),
@@ -750,14 +761,21 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
     }
 
     if collections.is_empty() {
-        complete_job(
-            &state,
-            &job_id,
-            0,
-            0,
-            Some("no backfill-eligible collections"),
-        )
-        .await;
+        if left_out.is_empty() {
+            complete_job(
+                &state,
+                &job_id,
+                0,
+                0,
+                Some("no backfill-eligible collections"),
+            )
+            .await;
+        } else {
+            // Nothing went wrong: every collection the job covers has an
+            // executor, which backfills it in its own job.
+            set_note(&state, &job_id, &executor_owned_note(collection.as_deref())).await;
+            complete_job(&state, &job_id, 0, 0, None).await;
+        }
         return;
     }
 

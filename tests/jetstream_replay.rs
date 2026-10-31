@@ -1670,7 +1670,9 @@ async fn cancelling_a_replay_stops_it() {
         .await;
     assert_eq!(status, 200);
     mock.release_segment(&segment);
-    assert_eq!(finished(&app, &id).await["status"], "cancelled");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "cancelled");
+    assert_eq!(job["error"], "Cancelled by an operator");
 }
 
 fn settings(mock: &MockJetstream) -> Settings {

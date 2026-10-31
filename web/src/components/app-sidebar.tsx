@@ -72,7 +72,7 @@ const dataItems: NavItem[] = [
     icon: IconLock,
     requiredPermissions: ["spaces:read"],
   },
-  { title: "Backfill", url: "/dashboard/backfill", icon: IconDatabase },
+  { title: "Backfills", url: "/dashboard/backfill", icon: IconDatabase },
   {
     title: "Jobs",
     url: "/dashboard/jobs",
