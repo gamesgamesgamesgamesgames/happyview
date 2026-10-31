@@ -274,6 +274,8 @@ Requires `read` membership (or a valid [space credential](credentials.md)).
 
 Members with `read_self` access can only retrieve their own records. Attempting to read another user's record returns `403 Forbidden`.
 
+Pass `repo` with the author's DID to name whose record to read, since several members can write the same collection and rkey. Without it, a space credential reads the repo it is addressed to, a `read_self` member reads their own, and anyone else gets their own record if they wrote one, otherwise the record whose author DID sorts first.
+
 ```ts tab="TypeScript" tab-group="language"
 const params = new URLSearchParams({
   space: "at://did:web:happyview.example.com/space/com.example.forum/main",
