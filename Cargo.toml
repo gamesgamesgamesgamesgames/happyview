@@ -149,6 +149,7 @@ wasmtime = { version = ">=50.0.1, <51", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = ">=50.0.1, <51", default-features = false, features = ["p1"] }
 regex = "1.12.3"
+unicode-segmentation = "1.12"
 semver = "1.0"
 async-stream = "0.3.6"
 blake3 = "1"
