@@ -8,7 +8,11 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
 import { RecordsProgress } from "./records-progress-bar";
-import { runByExecutor, runningLabel } from "./records-progress";
+import {
+  executorProgress,
+  runByExecutor,
+  runningLabel,
+} from "./records-progress";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
@@ -1364,10 +1368,7 @@ function JobDetail({
             )}
             {byExecutor && (
               <RecordsProgress
-                label="Running the create hook over stored records"
-                done={job.processed_repos ?? 0}
-                total={job.total_repos}
-                estimated
+                {...executorProgress(job)}
                 active={isActive && !isPaused}
               />
             )}

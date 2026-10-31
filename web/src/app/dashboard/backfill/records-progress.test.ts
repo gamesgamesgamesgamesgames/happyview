@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  executorProgress,
   recordsCountText,
   recordsFraction,
   runByExecutor,
@@ -64,5 +65,39 @@ describe("recordsFraction", () => {
   it("is null without a total to measure against", () => {
     expect(recordsFraction({ done: 5, total: null })).toBeNull();
     expect(recordsFraction({ done: 5, total: 0 })).toBeNull();
+  });
+});
+
+describe("executorProgress", () => {
+  it("counts against the store's estimate while the pass runs", () => {
+    const row = executorProgress({
+      status: "running",
+      processed_repos: 1200,
+      total_repos: 5500,
+    });
+    expect(row.label).toBe("Running the create hook over stored records");
+    expect(recordsCountText(row)).toBe(
+      `${(1200).toLocaleString()} of about ${(5500).toLocaleString()} records`,
+    );
+  });
+
+  it("reads a finished pass as finished, however far it fell short of the estimate", () => {
+    const row = executorProgress({
+      status: "completed",
+      processed_repos: 5546055,
+      total_repos: 5549379,
+    });
+    expect(row.label).toBe("Ran the create hook over stored records");
+    expect(recordsFraction(row)).toBe(1);
+    expect(recordsCountText(row)).toBe(`${(5546055).toLocaleString()} records`);
+  });
+
+  it("keeps the estimate for a pass that stopped", () => {
+    const row = executorProgress({
+      status: "cancelled",
+      processed_repos: 10,
+      total_repos: 100,
+    });
+    expect(recordsFraction(row)).toBe(0.1);
   });
 });

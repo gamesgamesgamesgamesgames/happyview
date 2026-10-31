@@ -34,14 +34,19 @@ export interface RecordsCount {
   estimated?: boolean;
 }
 
-/** "1,200 of about 5,500 records", or "1,200 records" with no total. */
+/**
+ * "1,200 of about 5,500 records", or "1,200 records" with no total or once
+ * the count has reached a known one.
+ */
 export function recordsCountText({
   done,
   total,
   noun = "records",
   estimated = false,
 }: RecordsCount): string {
-  if (total == null) return `${done.toLocaleString()} ${noun}`;
+  if (total == null || (total === done && !estimated)) {
+    return `${done.toLocaleString()} ${noun}`;
+  }
   return `${done.toLocaleString()} of ${estimated ? "about " : ""}${total.toLocaleString()} ${noun}`;
 }
 
@@ -49,4 +54,31 @@ export function recordsCountText({
 export function recordsFraction({ done, total }: RecordsCount): number | null {
   if (total == null || total <= 0) return null;
   return Math.min(1, Math.max(0, done / total));
+}
+
+/**
+ * What an executor-run job's progress row says. The total is the estimate
+ * the store took when the pass began, and the pass leaves out records the
+ * live feed delivers itself, so a finished pass routinely hooks a little
+ * fewer than it: once completed, the row counts what was done and fills the
+ * bar rather than reading as a pass that stopped short.
+ */
+export function executorProgress(
+  job: Pick<BackfillJob, "status" | "processed_repos" | "total_repos">,
+): { label: string } & RecordsCount {
+  const done = job.processed_repos ?? 0;
+  if (job.status === "completed") {
+    return {
+      label: "Ran the create hook over stored records",
+      done,
+      total: done,
+      estimated: false,
+    };
+  }
+  return {
+    label: "Running the create hook over stored records",
+    done,
+    total: job.total_repos,
+    estimated: true,
+  };
 }
