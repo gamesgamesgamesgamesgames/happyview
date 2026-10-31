@@ -7,6 +7,12 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
+import { RecordsProgress } from "./records-progress-bar";
+import {
+  executorProgress,
+  runByExecutor,
+  runningLabel,
+} from "./records-progress";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
@@ -200,7 +206,7 @@ function statusBadge(job: BackfillJob) {
     case "running":
       return (
         <Badge className="bg-blue-500/15 text-blue-700 dark:text-blue-400 hover:bg-blue-500/25 border-blue-500/20">
-          {job.stage === "pending" ? "starting" : job.stage.replace(/_/g, " ")}
+          {runningLabel(job)}
         </Badge>
       );
     default:
@@ -920,7 +926,7 @@ function JobDetail({
   const pauseReason = job.status === "paused" ? job.error : null;
   // Any other source names an executor: the record source backfills the
   // collection itself, and says what it holds for it now.
-  const byExecutor = !(job.source in SOURCE_LABELS);
+  const byExecutor = runByExecutor(job.source);
   const [collectionSummary, setCollectionSummary] =
     useState<BackfillCollection["summary"]>(null);
   useEffect(() => {
@@ -1360,7 +1366,13 @@ function JobDetail({
                 active={isActive && !isPaused}
               />
             )}
-            {!replayView && (
+            {byExecutor && (
+              <RecordsProgress
+                {...executorProgress(job)}
+                active={isActive && !isPaused}
+              />
+            )}
+            {!replayView && !byExecutor && (
               <>
                 <ProgressRow
                   label="Discovering repos"
