@@ -165,12 +165,19 @@ function SeriesBody({
               : `Mean ${formatBytes(series.memory_peak_bytes.mean)}`
           }
         />
-        {series.fuel_mean != null && (
-          <Stat
-            label="Fuel per run"
-            value={Math.round(series.fuel_mean).toLocaleString()}
-          />
-        )}
+        <Stat
+          label="Instructions per run"
+          value={
+            series.instructions_mean == null
+              ? "Not reported"
+              : Math.round(series.instructions_mean).toLocaleString()
+          }
+          title={
+            series.instructions_mean == null
+              ? "This script's interpreter doesn't count instructions. Update it to see them."
+              : undefined
+          }
+        />
       </dl>
 
       <section className="flex flex-col gap-2">
