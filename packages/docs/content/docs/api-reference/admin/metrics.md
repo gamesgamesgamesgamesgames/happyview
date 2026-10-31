@@ -8,6 +8,17 @@ Metrics are kept in memory by the process that runs the scripts, for the last ho
 
 The `1h` and `24h` windows are read from memory, and the `7d` and `30d` windows from the table. At startup the last day's rows are read back into memory, so a restart loses at most the minute that was open.
 
+## Several instances on one database
+
+Each row records the instance that wrote it. An instance names itself with `HAPPYVIEW_INSTANCE_ID`, or uses its hostname when that is unset, or a random id for that boot when it has no hostname either. Instances sharing a database each write their own rows, fold only their own minutes into hours, and at startup read only their own rows back.
+
+That makes the two kinds of window answer different questions:
+
+- `1h` and `24h` are the memory of the instance that answered the request, so they cover its runs only. Behind a load balancer, two requests can return different numbers.
+- `7d` and `30d` add up every instance's rows, plus the minutes the answering instance hasn't written yet. Their responses carry `instances`, the number of instances whose runs the window counts.
+
+Give each replica a stable, distinct `HAPPYVIEW_INSTANCE_ID`. A hostname that changes on every deploy, like a container's, or a random id, works for counting, but the replica can't read its own history back after a restart: its last hour and day start empty. Rows written under an id that never comes back are never folded into hours. Retention deletes them like any other row.
+
 ## Retention
 
 Stored metrics follow the event log's retention by design: they are kept for `event_log_retention_days` (the `EVENT_LOG_RETENTION_DAYS` environment variable when no setting is stored, default `30`), and `0` keeps them indefinitely. Once an hour, rows older than that are deleted, and minute rows more than two days old are folded into hour rows. A folded hour answers the same counts and percentiles its minutes would have, so a stored window is read by the minute where it is newer than two days and by the hour before that.
@@ -100,7 +111,7 @@ One row per script that ran inside the window, busiest first. A script is keyed 
 
 `overflow` counts scripts that were not recorded because 1,024 were already held. Scripts with nothing left inside the last day make room for new ones.
 
-A `7d` or `30d` response has the same shape plus `retention_days` ([Retention](#retention)). Its rows add the stored minutes and hours to the minutes memory has not yet written.
+A `7d` or `30d` response has the same shape plus `retention_days` ([Retention](#retention)) and `instances` ([Several instances](#several-instances-on-one-database)). Its rows add every instance's stored minutes and hours to the minutes this instance's memory has not yet written.
 
 ## Get one script
 
@@ -119,7 +130,7 @@ One script's totals for the window and a series of points across it, merged over
 
 **Permission:** `metrics:read`
 
-**Response:** the fields of a row in the list, plus `layers`, `window`, `step`, `enabled` and `points`, and `retention_days` for a stored window. There is one point per step across the window, oldest first (60 for `1h` by the minute, 48 for `24h` by the half hour, 168 for `7d` by the hour, 30 for `30d` by the day, and so on); the newest is the step still open, and days are UTC days. A step with no runs has `runs: 0` and `null` latencies. The example omits the fields a list row also has, and shows the first and last of its 60 points.
+**Response:** the fields of a row in the list, plus `layers`, `window`, `step`, `enabled` and `points`, and `retention_days` and `instances` for a stored window. There is one point per step across the window, oldest first (60 for `1h` by the minute, 48 for `24h` by the half hour, 168 for `7d` by the hour, 30 for `30d` by the day, and so on); the newest is the step still open, and days are UTC days. A step with no runs has `runs: 0` and `null` latencies. The example omits the fields a list row also has, and shows the first and last of its 60 points.
 
 ```json
 {
@@ -179,7 +190,7 @@ The record pipeline: what each record of a collection costs on its way through i
 
 | Parameter | Type   | Description |
 | --------- | ------ | ----------- |
-| `window`  | string | `1h` (default), `24h`, `7d` or `30d`. A stored window adds `retention_days` |
+| `window`  | string | `1h` (default), `24h`, `7d` or `30d`. A stored window adds `retention_days` and `instances` |
 
 **Permission:** `metrics:read`
 

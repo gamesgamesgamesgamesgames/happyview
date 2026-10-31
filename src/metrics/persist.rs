@@ -12,6 +12,13 @@
 //! oldest minute not yet in the table. A read over a stored window takes
 //! the table and, from memory, the minutes from the watermark on, so the
 //! minute still open is counted once and only once.
+//!
+//! Every row carries the [`instance`](super::instance) that wrote it, so
+//! instances sharing a database never write over one another. Each writes,
+//! folds and reads back only its own rows; retention deletes everyone's,
+//! since a delete by cutoff is the same whoever runs it; and a stored
+//! window sums every instance's rows. The 1h and 24h windows are memory,
+//! so they are this instance's alone.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
@@ -421,9 +428,9 @@ fn closed_rows<K: RowKey, B: Stored>(
 fn upsert_sql(backend: DatabaseBackend) -> String {
     adapt_sql(
         "INSERT INTO happyview_script_metrics \
-         (kind, key, variant, resolution, bucket_start, counters, sketches) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (kind, key, variant, resolution, bucket_start) \
+         (kind, key, variant, resolution, bucket_start, counters, sketches, instance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (kind, key, variant, resolution, bucket_start, instance) \
          DO UPDATE SET counters = excluded.counters, sketches = excluded.sketches",
         backend,
     )
@@ -467,6 +474,7 @@ pub async fn write_closed(
                 .bind(rfc3339(row.start))
                 .bind(&row.counters)
                 .bind(&row.sketches)
+                .bind(metrics.instance())
                 .execute(&mut *tx)
                 .await?;
         }
@@ -515,32 +523,45 @@ fn merge_rows<B: Stored>(rows: &[(String, String)]) -> B {
 /// at a time, each in its own transaction: the hour row is written and its
 /// minutes deleted together, so a read never sees both or neither. An hour
 /// row already there is merged in. Returns the minute rows folded.
-pub async fn fold(pool: &AnyPool, backend: DatabaseBackend, now: u64) -> Result<u64, sqlx::Error> {
+///
+/// Only `instance`'s rows are folded, into `instance`'s hour rows, so two
+/// instances folding the same hour at once each merge their own minutes
+/// and neither merges a minute twice. An instance that never comes back,
+/// such as one whose id was random for a boot, leaves its minutes
+/// unfolded: nobody else folds them, and retention deletes them in time.
+pub async fn fold(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    now: u64,
+    instance: &str,
+) -> Result<u64, sqlx::Error> {
     let cutoff = rfc3339(align(now.saturating_sub(FOLD_AFTER_SECS), HOUR_SECS));
     let oldest_sql = adapt_sql(
         "SELECT MIN(bucket_start) FROM happyview_script_metrics \
-         WHERE resolution = ? AND bucket_start < ?",
+         WHERE instance = ? AND resolution = ? AND bucket_start < ?",
         backend,
     );
     let rows_sql = adapt_sql(
         "SELECT kind, key, variant, counters, sketches FROM happyview_script_metrics \
-         WHERE resolution = ? AND bucket_start >= ? AND bucket_start < ?",
+         WHERE instance = ? AND resolution = ? AND bucket_start >= ? AND bucket_start < ?",
         backend,
     );
     let hour_sql = adapt_sql(
         "SELECT counters, sketches FROM happyview_script_metrics \
-         WHERE kind = ? AND key = ? AND variant = ? AND resolution = ? AND bucket_start = ?",
+         WHERE instance = ? AND kind = ? AND key = ? AND variant = ? AND resolution = ? \
+         AND bucket_start = ?",
         backend,
     );
     let delete_sql = adapt_sql(
         "DELETE FROM happyview_script_metrics \
-         WHERE resolution = ? AND bucket_start >= ? AND bucket_start < ?",
+         WHERE instance = ? AND resolution = ? AND bucket_start >= ? AND bucket_start < ?",
         backend,
     );
     let upsert = upsert_sql(backend);
     let mut folded = 0;
     loop {
         let oldest: Option<String> = crate::db::query_scalar(&oldest_sql)
+            .bind(instance)
             .bind(MINUTE)
             .bind(&cutoff)
             .fetch_one(pool)
@@ -558,9 +579,11 @@ pub async fn fold(pool: &AnyPool, backend: DatabaseBackend, now: u64) -> Result<
                 // found first again on every pass.
                 tracing::warn!(bucket_start = %oldest, "dropping script metrics rows with an unreadable bucket_start");
                 crate::db::query(&adapt_sql(
-                    "DELETE FROM happyview_script_metrics WHERE resolution = ? AND bucket_start = ?",
+                    "DELETE FROM happyview_script_metrics \
+                     WHERE instance = ? AND resolution = ? AND bucket_start = ?",
                     backend,
                 ))
+                .bind(instance)
                 .bind(MINUTE)
                 .bind(&oldest)
                 .execute(pool)
@@ -568,8 +591,12 @@ pub async fn fold(pool: &AnyPool, backend: DatabaseBackend, now: u64) -> Result<
                 continue;
             }
         };
-        let mut tx = pool.begin().await?;
+        // Immediate on SQLite: the hour's rows are read and then written, and a
+        // deferred transaction whose read went stale under another writer fails
+        // its first write at once rather than waiting.
+        let mut tx = crate::db::begin_write(pool, backend).await?;
         let rows: Vec<(String, String, String, String, String)> = crate::db::query_as(&rows_sql)
+            .bind(instance)
             .bind(MINUTE)
             .bind(&from)
             .bind(&to)
@@ -585,6 +612,7 @@ pub async fn fold(pool: &AnyPool, backend: DatabaseBackend, now: u64) -> Result<
         }
         for ((kind, key, variant), mut rows) in groups {
             let held: Option<(String, String)> = crate::db::query_as(&hour_sql)
+                .bind(instance)
                 .bind(&kind)
                 .bind(&key)
                 .bind(&variant)
@@ -612,10 +640,12 @@ pub async fn fold(pool: &AnyPool, backend: DatabaseBackend, now: u64) -> Result<
                 .bind(&from)
                 .bind(&encoded.0)
                 .bind(&encoded.1)
+                .bind(instance)
                 .execute(&mut *tx)
                 .await?;
         }
         crate::db::query(&delete_sql)
+            .bind(instance)
             .bind(MINUTE)
             .bind(&from)
             .bind(&to)
@@ -669,7 +699,7 @@ impl Persister {
             Ok(n) => outcome.swept = n,
             Err(e) => tracing::warn!(error = %e, "failed to sweep script metrics"),
         }
-        match fold(pool, backend, now).await {
+        match fold(pool, backend, now, metrics.instance()).await {
             Ok(n) => outcome.folded = n,
             Err(e) => tracing::warn!(error = %e, "failed to fold script metrics"),
         }
@@ -715,8 +745,11 @@ fn restore<K: RowKey, B: Stored>(
     true
 }
 
-/// Read the last day's minute rows back into the rings: the last hour into
-/// the minute rings, the whole day merged into the half-hour rings. Keys are
+/// Read this instance's last day of minute rows back into the rings: the
+/// last hour into the minute rings, the whole day merged into the half-hour
+/// rings. Another instance's rows are never read, so memory holds only the
+/// runs this process made, and a restart under the same id gets its own
+/// history back. Keys are
 /// held up to [`super::MAX_KEYS`] as when they are recorded, a key past it
 /// is not counted as overflow. Moves the watermark to the minute open at
 /// `now`, since everything before it that memory holds is now the table's.
@@ -735,9 +768,10 @@ pub async fn reload(
         crate::db::query_as(&adapt_sql(
             "SELECT kind, key, variant, bucket_start, counters, sketches \
              FROM happyview_script_metrics \
-             WHERE resolution = ? AND bucket_start >= ? AND bucket_start < ?",
+             WHERE instance = ? AND resolution = ? AND bucket_start >= ? AND bucket_start < ?",
             backend,
         ))
+        .bind(metrics.instance())
         .bind(MINUTE)
         .bind(rfc3339(day_from))
         .bind(rfc3339(open))
@@ -776,9 +810,10 @@ pub async fn reload(
     Ok(restored)
 }
 
-/// Every bucket of kind `K` from `from` to `now`: the table's rows, and the
-/// minutes memory holds that the table does not yet. `only` narrows to one
-/// row `key`.
+/// Every bucket of kind `K` from `from` to `now`: every instance's rows in
+/// the table, and the minutes this instance's memory holds that the table
+/// does not yet. `only` narrows to one row `key`. Two instances' buckets for
+/// one key and minute are both returned, for the caller to merge.
 async fn collect<K: RowKey, B: Stored>(
     entries: Vec<(K, Arc<Mutex<History<B>>>)>,
     persisted_to: u64,
@@ -816,15 +851,28 @@ async fn collect<K: RowKey, B: Stored>(
             }
         }
     }
+    out.extend(unwritten(entries, persisted_to, only, from, now));
+    Ok(out)
+}
+
+/// The minutes memory holds from `from` to `now` that the table does not.
+fn unwritten<K: RowKey, B: Stored>(
+    entries: Vec<(K, Arc<Mutex<History<B>>>)>,
+    persisted_to: u64,
+    only: Option<&str>,
+    from: u64,
+    now: u64,
+) -> Vec<(K, u64, B)> {
     let open = align(now, MINUTE_SECS);
     let held = open.saturating_sub((MINUTES_KEPT as u64 - 1) * MINUTE_SECS);
-    let unwritten = align(from.max(persisted_to).max(held), MINUTE_SECS);
+    let first = align(from.max(persisted_to).max(held), MINUTE_SECS);
+    let mut out = Vec::new();
     for (key, history) in entries {
         if only.is_some_and(|only| key.encode().0 != only) {
             continue;
         }
         let history = history.lock().unwrap_or_else(|e| e.into_inner());
-        for start in (unwritten..=open).step_by(MINUTE_SECS as usize) {
+        for start in (first..=open).step_by(MINUTE_SECS as usize) {
             if let Some(bucket) = history.minutes.get(start)
                 && !bucket.is_empty()
             {
@@ -832,7 +880,80 @@ async fn collect<K: RowKey, B: Stored>(
             }
         }
     }
-    Ok(out)
+    out
+}
+
+/// How many instances a read of kind `K` from `from` to `now` sums: those
+/// with a row in the table, and this one when memory adds minutes the table
+/// does not hold yet.
+async fn instances_in<K: RowKey, B: Stored>(
+    metrics: &ScriptMetrics,
+    entries: Vec<(K, Arc<Mutex<History<B>>>)>,
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    only: Option<&str>,
+    from: u64,
+    now: u64,
+) -> Result<u64, sqlx::Error> {
+    let sql = if only.is_some() {
+        "SELECT DISTINCT instance FROM happyview_script_metrics \
+         WHERE kind = ? AND key = ? AND bucket_start >= ? AND bucket_start <= ?"
+    } else {
+        "SELECT DISTINCT instance FROM happyview_script_metrics \
+         WHERE kind = ? AND bucket_start >= ? AND bucket_start <= ?"
+    };
+    let mut query = crate::db::query_scalar(&adapt_sql(sql, backend)).bind(K::KIND);
+    if let Some(key) = only {
+        query = query.bind(key);
+    }
+    let mut seen: HashSet<String> = query
+        .bind(rfc3339(from))
+        .bind(rfc3339(now))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect();
+    if !unwritten(entries, metrics.persisted_to(), only, from, now).is_empty() {
+        seen.insert(metrics.instance().to_string());
+    }
+    Ok(seen.len() as u64)
+}
+
+/// How many instances [`scripts`], or with `trigger` [`series`] at `step`,
+/// sums over a stored window ending at `now`.
+pub async fn script_instances(
+    metrics: &ScriptMetrics,
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    now: u64,
+    window: Window,
+    trigger: Option<(&str, Step)>,
+) -> Result<u64, sqlx::Error> {
+    let (only, from) = match trigger {
+        Some((trigger, step)) => (Some(trigger), first_step(now, window.secs(), step.secs())),
+        None => (None, window_from(now, window)),
+    };
+    instances_in::<Key, Bucket>(metrics, metrics.entries(), pool, backend, only, from, now).await
+}
+
+/// How many instances [`ingest`] sums over a stored window ending at `now`.
+pub async fn ingest_instances(
+    metrics: &ScriptMetrics,
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    now: u64,
+    window: Window,
+) -> Result<u64, sqlx::Error> {
+    instances_in::<IngestKey, IngestBucket>(
+        metrics,
+        metrics.ingest_entries(),
+        pool,
+        backend,
+        None,
+        window_from(now, window),
+        now,
+    )
+    .await
 }
 
 /// The start of the first of the `width`-second steps a window of `secs`
@@ -1159,9 +1280,14 @@ mod tests {
             50
         );
         // Not yet two days old.
-        assert_eq!(fold(&pool, SQLITE, T0 + 47 * 3_600).await.unwrap(), 0);
         assert_eq!(
-            fold(&pool, SQLITE, T0 + FOLD_AFTER_SECS + 3_600)
+            fold(&pool, SQLITE, T0 + 47 * 3_600, m.instance())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fold(&pool, SQLITE, T0 + FOLD_AFTER_SECS + 3_600, m.instance())
                 .await
                 .unwrap(),
             50
@@ -1271,7 +1397,7 @@ mod tests {
         write_closed(&m, &pool, SQLITE, now - 4 * 86_400 + 60)
             .await
             .unwrap();
-        fold(&pool, SQLITE, now).await.unwrap();
+        fold(&pool, SQLITE, now, m.instance()).await.unwrap();
         run(&m, now - 120, 10);
         write_closed(&m, &pool, SQLITE, now - 60).await.unwrap();
         // Still open, so only in memory.
@@ -1303,5 +1429,150 @@ mod tests {
         m.record_ingest_at((now - 5) * 1_000, "a.b.c", "create", None, &record(4));
         let rows = ingest(&m, &pool, SQLITE, now, Window::Month).await.unwrap();
         assert_eq!(rows[0].records, 1);
+    }
+
+    fn runs_at(m: &ScriptMetrics, walls: &[(u64, u64)]) -> Bucket {
+        let mut direct = Bucket::default();
+        for (at, wall) in walls {
+            run(m, *at, *wall);
+            direct.add(&sample(*wall, Outcome::Ok));
+        }
+        direct
+    }
+
+    async fn runs_of(pool: &AnyPool, instance: &str) -> Vec<u64> {
+        let rows: Vec<(String, String)> = crate::db::query_as(
+            "SELECT counters, sketches FROM happyview_script_metrics \
+             WHERE instance = ? ORDER BY resolution, bucket_start",
+        )
+        .bind(instance)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.iter()
+            .map(|(c, s)| Bucket::decode(c, s).unwrap().runs)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn two_instances_keep_their_own_rows_and_a_stored_window_sums_them() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let a = ScriptMetrics::with_instance("replica-a");
+        let b = ScriptMetrics::with_instance("replica-b");
+        let mut direct = runs_at(&a, &[(T0 + 5, 10)]);
+        direct.merge(&runs_at(&b, &[(T0 + 7, 30), (T0 + 9, 50)]));
+        // The same key and minute from both.
+        assert_eq!(write_closed(&a, &pool, SQLITE, T0 + 61).await.unwrap(), 1);
+        assert_eq!(write_closed(&b, &pool, SQLITE, T0 + 61).await.unwrap(), 1);
+        assert_eq!(count(&pool, MINUTE).await, 2);
+        assert_eq!(runs_of(&pool, "replica-a").await, vec![1]);
+        assert_eq!(runs_of(&pool, "replica-b").await, vec![2]);
+
+        // Either instance reads the sum, plus its own unwritten minutes.
+        let now = T0 + 120;
+        for m in [&a, &b] {
+            let week = scripts(m, &pool, SQLITE, now, Window::Week).await.unwrap();
+            assert_eq!(week.len(), 1);
+            assert_eq!(week[0].stats, direct.stats());
+            let read = script_instances(m, &pool, SQLITE, now, Window::Week, None)
+                .await
+                .unwrap();
+            assert_eq!(read, 2);
+        }
+        run(&a, now + 1, 70);
+        let week = scripts(&a, &pool, SQLITE, now + 2, Window::Week)
+            .await
+            .unwrap();
+        assert_eq!(week[0].stats.runs, 4);
+        let week = scripts(&b, &pool, SQLITE, now + 2, Window::Week)
+            .await
+            .unwrap();
+        assert_eq!(week[0].stats.runs, 3, "a's open minute is a's memory");
+        let read = ingest_instances(&a, &pool, SQLITE, now, Window::Week)
+            .await
+            .unwrap();
+        assert_eq!(read, 0, "no ingest rows from either");
+    }
+
+    #[tokio::test]
+    async fn each_instance_folds_only_its_own_minutes() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let a = ScriptMetrics::with_instance("replica-a");
+        let b = ScriptMetrics::with_instance("replica-b");
+        let mut direct = runs_at(&a, &[(T0 + 5, 10), (T0 + 65, 20), (T0 + 125, 30)]);
+        direct.merge(&runs_at(&b, &[(T0 + 6, 40), (T0 + 66, 50)]));
+        write_closed(&a, &pool, SQLITE, T0 + 600).await.unwrap();
+        write_closed(&b, &pool, SQLITE, T0 + 600).await.unwrap();
+        assert_eq!(count(&pool, MINUTE).await, 5);
+
+        let now = T0 + 3 * 86_400;
+        let read = |m: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let reader = ScriptMetrics::with_instance(m);
+                scripts(&reader, &pool, SQLITE, now, Window::Week)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(read("reader").await[0].stats, direct.stats());
+
+        assert_eq!(fold(&pool, SQLITE, now, a.instance()).await.unwrap(), 3);
+        assert_eq!(count(&pool, MINUTE).await, 2, "b's minutes are b's");
+        assert_eq!(count(&pool, HOUR).await, 1);
+        assert_eq!(read("reader").await[0].stats, direct.stats());
+        assert_eq!(fold(&pool, SQLITE, now, a.instance()).await.unwrap(), 0);
+
+        // Both at once: each merges its own, and nothing twice.
+        let (fa, fb) = tokio::join!(
+            fold(&pool, SQLITE, now, a.instance()),
+            fold(&pool, SQLITE, now, b.instance()),
+        );
+        assert_eq!((fa.unwrap(), fb.unwrap()), (0, 2));
+        assert_eq!(count(&pool, MINUTE).await, 0);
+        assert_eq!(count(&pool, HOUR).await, 2);
+        assert_eq!(runs_of(&pool, "replica-a").await, vec![3]);
+        assert_eq!(runs_of(&pool, "replica-b").await, vec![2]);
+        assert_eq!(read("reader").await[0].stats, direct.stats());
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_every_instances_rows() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let a = ScriptMetrics::with_instance("replica-a");
+        let b = ScriptMetrics::with_instance("gone-for-good");
+        run(&a, T0, 10);
+        run(&b, T0, 10);
+        write_closed(&a, &pool, SQLITE, T0 + 60).await.unwrap();
+        write_closed(&b, &pool, SQLITE, T0 + 60).await.unwrap();
+        assert_eq!(sweep(&pool, SQLITE, T0 + 4 * 86_400, 3).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_restart_reads_back_only_its_own_rows() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let now = T0 + 86_400;
+        let a = ScriptMetrics::with_instance("replica-a");
+        let b = ScriptMetrics::with_instance("replica-b");
+        run(&a, now - 600, 10);
+        run(&b, now - 600, 20);
+        run(&b, now - 300, 20);
+        b.record_ingest_at((now - 300) * 1_000, "a.b.c", "create", None, &record(4));
+        write_closed(&a, &pool, SQLITE, now).await.unwrap();
+        write_closed(&b, &pool, SQLITE, now).await.unwrap();
+
+        let restarted = ScriptMetrics::with_instance("replica-a");
+        assert_eq!(reload(&restarted, &pool, SQLITE, now + 5).await.unwrap(), 1);
+        let hour = restarted.scripts_at(now + 5, Window::Hour);
+        assert_eq!(hour.len(), 1);
+        assert_eq!(hour[0].stats.runs, 1);
+        assert_eq!(hour, a.scripts_at(now + 5, Window::Hour));
+        assert!(restarted.ingest_at(now + 5, Window::Hour).is_empty());
+        // The stored window still sums both, and the reload counts nothing
+        // twice.
+        let week = scripts(&restarted, &pool, SQLITE, now + 5, Window::Week)
+            .await
+            .unwrap();
+        assert_eq!(week[0].stats.runs, 3);
     }
 }

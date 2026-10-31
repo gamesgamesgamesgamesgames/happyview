@@ -59,11 +59,16 @@ fn read_failed(e: sqlx::Error) -> AppError {
 }
 
 /// The fields a stored window adds to its response: how long the table
-/// keeps rows, so a window longer than that is read as what exists.
-async fn stored_fields(state: &AppState, window: Window, body: &mut Value) {
+/// keeps rows, so a window longer than that is read as what exists, and how
+/// many instances' rows the window summed. The 1h and 24h windows are this
+/// instance's memory and carry neither.
+async fn stored_fields(state: &AppState, window: Window, instances: Option<u64>, body: &mut Value) {
     if window.is_stored() {
         body["retention_days"] =
             json!(crate::metrics::retention::retention_days(&state.db, state.db_backend).await);
+        if let Some(instances) = instances {
+            body["instances"] = json!(instances);
+        }
     }
 }
 
@@ -75,16 +80,18 @@ pub(super) async fn scripts(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
+    let now = unix_now();
+    let mut instances = None;
     let scripts = if window.is_stored() {
-        persist::scripts(
-            &state.metrics,
-            &state.db,
-            state.db_backend,
-            unix_now(),
-            window,
-        )
-        .await
-        .map_err(read_failed)?
+        let (db, backend) = (&state.db, state.db_backend);
+        instances = Some(
+            persist::script_instances(&state.metrics, db, backend, now, window, None)
+                .await
+                .map_err(read_failed)?,
+        );
+        persist::scripts(&state.metrics, db, backend, now, window)
+            .await
+            .map_err(read_failed)?
     } else {
         state.metrics.scripts(window)
     };
@@ -94,7 +101,7 @@ pub(super) async fn scripts(
         "overflow": state.metrics.overflow(),
         "scripts": scripts,
     });
-    stored_fields(&state, window, &mut body).await;
+    stored_fields(&state, window, instances, &mut body).await;
     Ok(Json(body))
 }
 
@@ -108,18 +115,25 @@ pub(super) async fn script(
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
     let step = step_of(&query, window)?;
+    let now = unix_now();
+    let mut instances = None;
     let series = if window.is_stored() {
-        persist::series(
-            &state.metrics,
-            &state.db,
-            state.db_backend,
-            unix_now(),
-            &trigger,
-            window,
-            step,
-        )
-        .await
-        .map_err(read_failed)?
+        let (db, backend) = (&state.db, state.db_backend);
+        instances = Some(
+            persist::script_instances(
+                &state.metrics,
+                db,
+                backend,
+                now,
+                window,
+                Some((&trigger, step)),
+            )
+            .await
+            .map_err(read_failed)?,
+        );
+        persist::series(&state.metrics, db, backend, now, &trigger, window, step)
+            .await
+            .map_err(read_failed)?
     } else {
         state.metrics.series(&trigger, window, step)
     };
@@ -134,7 +148,7 @@ pub(super) async fn script(
     body["window"] = json!(window.as_str());
     body["step"] = json!(step.as_str());
     body["enabled"] = json!(state.metrics.enabled());
-    stored_fields(&state, window, &mut body).await;
+    stored_fields(&state, window, instances, &mut body).await;
     Ok(Json(body))
 }
 
@@ -146,16 +160,18 @@ pub(super) async fn ingest(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
+    let now = unix_now();
+    let mut instances = None;
     let collections = if window.is_stored() {
-        persist::ingest(
-            &state.metrics,
-            &state.db,
-            state.db_backend,
-            unix_now(),
-            window,
-        )
-        .await
-        .map_err(read_failed)?
+        let (db, backend) = (&state.db, state.db_backend);
+        instances = Some(
+            persist::ingest_instances(&state.metrics, db, backend, now, window)
+                .await
+                .map_err(read_failed)?,
+        );
+        persist::ingest(&state.metrics, db, backend, now, window)
+            .await
+            .map_err(read_failed)?
     } else {
         state.metrics.ingest(window)
     };
@@ -168,7 +184,7 @@ pub(super) async fn ingest(
         "scripts_table_reads": state.scripts.table_reads(),
         "collections": collections,
     });
-    stored_fields(&state, window, &mut body).await;
+    stored_fields(&state, window, instances, &mut body).await;
     Ok(Json(body))
 }
 

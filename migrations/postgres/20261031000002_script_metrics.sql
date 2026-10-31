@@ -4,7 +4,11 @@
 -- `+00:00` offset, so ranges compare as text. For a script `key` is its
 -- trigger and `variant` its kind and layer, `<kind>/<layer>`; for ingest
 -- `key` is the collection and `variant` the action. `counters` and
--- `sketches` are JSON objects whose fields may be missing.
+-- `sketches` are JSON objects whose fields may be missing. `instance` is
+-- the process that wrote the row (`HAPPYVIEW_INSTANCE_ID`, else its
+-- hostname, else a random id for one boot): instances sharing a database
+-- each write, fold and read back only their own rows, and a stored window
+-- sums every instance's.
 CREATE TABLE IF NOT EXISTS happyview_script_metrics (
     kind TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -13,7 +17,8 @@ CREATE TABLE IF NOT EXISTS happyview_script_metrics (
     bucket_start TEXT NOT NULL,
     counters TEXT NOT NULL,
     sketches TEXT NOT NULL,
-    PRIMARY KEY (kind, key, variant, resolution, bucket_start)
+    instance TEXT NOT NULL,
+    PRIMARY KEY (kind, key, variant, resolution, bucket_start, instance)
 );
 
 CREATE INDEX IF NOT EXISTS happyview_script_metrics_bucket_start
