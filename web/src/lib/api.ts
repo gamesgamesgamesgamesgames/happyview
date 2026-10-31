@@ -290,10 +290,19 @@ export function uploadLexicon(body: {
   });
 }
 
-export function deleteLexicon(id: string) {
-  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
+export function deleteLexicon(id: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
+}
+
+// How many records are indexed under a record lexicon's collection. Asked
+// for only when the delete confirm opens, because it is a COUNT(*).
+export function getLexiconRecordCount(id: string) {
+  return apiFetch<{ collection: string; count: number }>(
+    `/admin/lexicons/${encodeURIComponent(id)}/record-count`,
+  );
 }
 
 // Lexicon publishing
