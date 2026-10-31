@@ -36,7 +36,7 @@ HappyView defines 51 permissions organized by category:
 
 | Permission                | Description                                        |
 | ------------------------- | -------------------------------------------------- |
-| `script-variables:create` | Add or update environment variables for Lua scripts |
+| `script-variables:create` | Add or update environment variables for scripts |
 | `script-variables:read`   | View script environment variable keys and values   |
 | `script-variables:delete` | Remove script environment variables                |
 

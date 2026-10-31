@@ -2,6 +2,7 @@ pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
+pub(crate) mod validate;
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
@@ -373,6 +374,7 @@ fn resolve_client_key(
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
+    secret_used: impl FnOnce(String),
 ) -> Result<String, AppError> {
     let Some(client_key) = extract_client_key(claims, parts, query_params)? else {
         return Ok(ANONYMOUS_CLIENT_KEY.to_string());
@@ -403,9 +405,13 @@ fn resolve_client_key(
                 .get("x-client-secret")
                 .and_then(|v| v.to_str().ok());
 
-            match secret {
-                Some(s) if rate_limiter.validate_client_secret(&client_key, s) => {}
-                Some(_) => {
+            match secret.map(|s| rate_limiter.match_client_secret(&client_key, s)) {
+                Some(Some(secret_id)) => {
+                    if rate_limiter.note_secret_use(&secret_id) {
+                        secret_used(secret_id);
+                    }
+                }
+                Some(None) => {
                     tracing::warn!("Invalid client secret for {client_key}");
                 }
                 None => {
@@ -416,6 +422,14 @@ fn resolve_client_key(
     }
 
     Ok(client_key)
+}
+
+/// Record, off the request path, that a client secret authenticated a request.
+fn record_secret_use(state: &AppState, secret_id: String) {
+    let (db, backend) = (state.db.clone(), state.db_backend);
+    tokio::spawn(async move {
+        crate::oauth::client_secrets::record_use(&db, backend, &secret_id).await;
+    });
 }
 
 /// Apply rate limit headers to a response.
@@ -482,7 +496,13 @@ pub async fn xrpc_get(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
 
     let lexicon = state.lexicons.get(&method).await;
@@ -566,6 +586,7 @@ pub async fn xrpc_get(
 
     if let Some(ref param_schema) = lexicon.parameters {
         coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
     }
 
     let mut response =
@@ -656,7 +677,13 @@ pub async fn xrpc_post(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
 
     if claims.is_none()
@@ -755,10 +782,6 @@ pub async fn xrpc_post(
         )));
     }
 
-    if let Some(ref param_schema) = lexicon.parameters {
-        coerce_params(&mut params, param_schema);
-    }
-
     // For service auth, synthesise Claims from the caller's DID so the
     // procedure handler has an identity to work with.
     let service_auth_claims_owned;
@@ -773,6 +796,13 @@ pub async fn xrpc_post(
         (&service_auth_claims_owned, None)
     };
 
+    // After auth, so a caller who may not call the procedure learns nothing
+    // about its lexicon from a validation error.
+    if let Some(ref param_schema) = lexicon.parameters {
+        coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
+    }
+
     // `input.encoding` decides what the script receives. Bytes are stored
     // before the script runs and reach it as an ordinary blob ref, so a script
     // authorizes and records a body without ever carrying it — which is the
@@ -780,7 +810,9 @@ pub async fn xrpc_post(
     let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
         ingest_body(&state, &parts, &lexicon, &raw_body).await?
     } else {
-        json_body(&parts, &raw_body)?
+        let body = json_body(&parts, &raw_body)?;
+        validate::input(&state, &lexicon, &body).await?;
+        body
     };
 
     let mut response =
@@ -1052,7 +1084,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         let key = tracing::subscriber::with_default(subscriber, || {
-            resolve_client_key(&rate_limiter, None, parts, &HashMap::new()).unwrap()
+            resolve_client_key(&rate_limiter, None, parts, &HashMap::new(), |_| {}).unwrap()
         });
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         (key, log)

@@ -52,7 +52,7 @@ To see what is installed:
 curl "http://127.0.0.1:3000/admin/plugins?type=interpreter" -H "$AUTH"
 ```
 
-The scripts list also flags each row: `runnable` is `false` when no installed interpreter claims its `script_type`, and the dashboard marks those rows at **Settings → Scripts**.
+The scripts list also flags each row: `runnable` is `false` when no installed interpreter claims its `script_type`, and the dashboard marks those rows at **Integrations → Scripts**.
 
 ### Which interpreter
 
@@ -68,7 +68,7 @@ An upgrade needs `happyview-lua`: every script a v2 instance stored is Lua. The 
 
 ### Installing it
 
-Go to **Settings → Plugins**, click **Add plugin**, pick the project from the catalogue, choose a channel, review the capabilities it asks for, and install. [Installing plugins](plugins.md#from-the-registry) is the reference; three things about it matter here.
+Go to **Integrations → Plugins**, click **Add plugin**, pick the project from the catalogue, choose a channel, review the capabilities it asks for, and install. [Installing plugins](plugins.md#from-the-registry) is the reference; three things about it matter here.
 
 **It is the `alpha` channel.** A project publishes up to three — `latest`, `beta` and `alpha` — and these have published only `alpha` so far. The dashboard picks it for you, because it is the only one the project has; `POST /admin/plugins` does not, and a `registry` install naming no channel asks for `latest` and resolves to nothing. **Switch channel** moves an install later, once there is somewhere to move it to — see [Channels](plugins.md#channels).
 
@@ -143,7 +143,7 @@ v2 set a one-million-instruction limit and then never enforced it: the hook was 
 
 Jobs are exempt from the first two — running long is what a job is for, and `ctx.job.should_stop()` is its stop.
 
-Both settings resolve database → environment → default, so the **Instruction limit** and **Request wall clock** fields in **Settings → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
+Both settings resolve database → environment → default, so the **Instruction limit** and **Request wall clock** fields in **System → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
 
 The wall clock counts only time the script itself runs. Waiting on the host — an HTTP request, a database read — is not charged to it.
 
