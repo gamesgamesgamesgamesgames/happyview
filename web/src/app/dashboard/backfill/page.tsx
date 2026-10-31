@@ -127,11 +127,20 @@ function isReplayStage(stage: string): boolean {
   return REPLAY_STAGES.includes(stage);
 }
 
-const SOURCE_LABELS: Record<BackfillSource, string> = {
+const SOURCE_LABELS: Record<string, string> = {
   auto: "Auto",
   replay: "Replay",
   crawl: "Crawl",
+  "store-pass": "Network store",
 };
+
+/** A job's source as the Source badge says it; an unknown executor's name reads as words. */
+function sourceLabel(source: string): string {
+  const known = SOURCE_LABELS[source];
+  if (known) return known;
+  const words = source.replace(/[-_]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
 
 const SUMMARY_STATE_LABELS: Record<
   NonNullable<NonNullable<BackfillCollection["summary"]>["state"]>,
@@ -1299,9 +1308,7 @@ function JobDetail({
           <div>
             <span className="text-muted-foreground">Source</span>
             <p className="text-xs">
-              <Badge variant="secondary">
-                {SOURCE_LABELS[job.source] ?? job.source}
-              </Badge>
+              <Badge variant="secondary">{sourceLabel(job.source)}</Badge>
             </p>
           </div>
           <div>
