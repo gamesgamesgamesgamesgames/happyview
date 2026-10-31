@@ -72,6 +72,10 @@ async fn create_space(app: &TestApp, skey: &str, membership_public: bool) -> Str
 }
 
 async fn add_member(app: &TestApp, space_id: &str, did: &str) {
+    add_member_with(app, space_id, did, MemberAccess::READ).await;
+}
+
+async fn add_member_with(app: &TestApp, space_id: &str, did: &str, access: MemberAccess) {
     spaces_db::add_member(
         &app.state.db,
         app.state.db_backend,
@@ -79,7 +83,7 @@ async fn add_member(app: &TestApp, space_id: &str, did: &str) {
             id: Uuid::new_v4().to_string(),
             space_id: space_id.to_string(),
             did: did.to_string(),
-            access: MemberAccess::READ,
+            access,
             is_delegation: false,
             granted_by: Some(AUTHORITY.to_string()),
             created_at: now_rfc3339(),
@@ -140,6 +144,25 @@ async fn list_repos_private_allows_member() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// A member who may read only their own repo cannot list everyone's.
+#[tokio::test]
+#[serial]
+async fn list_repos_rejects_a_read_self_member() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    let id = create_space(&app, "self", false).await;
+    add_member_with(&app, &id, MEMBER, MemberAccess::READ_SELF).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repos_req("self", Some(cookie_for(&app, MEMBER))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Outsiders cannot list repos even when membership is public on the space.
