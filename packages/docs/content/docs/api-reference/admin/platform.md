@@ -21,6 +21,7 @@ The platform principal can:
 
 - list, add, remove and promote [domains](./domains.md); while it's set, it is the only caller that can add, remove or promote one
 - read [stats](./stats.md)
+- read [script metrics](./metrics.md), but not switch them off
 - call the endpoints on this page
 
 Every other admin endpoint refuses it with `403`.

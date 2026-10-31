@@ -322,6 +322,48 @@ async fn platform_key_can_read_stats() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// The HappyProto dashboard's Performance tab reads these through the
+/// platform key; turning metrics off stays the instance's own decision.
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_script_metrics_and_not_switch_them_off() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    for (uri, expected) in [
+        ("/admin/metrics/scripts", StatusCode::OK),
+        ("/admin/metrics/scripts?window=24h", StatusCode::OK),
+        ("/admin/metrics/ingest", StatusCode::OK),
+        ("/admin/metrics/live", StatusCode::OK),
+        // Past the permission check: the trigger has simply never run.
+        (
+            "/admin/metrics/scripts/xrpc.query%3Anever.ran",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(bearer(Method::GET, uri, PLATFORM_KEY, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "GET {uri}");
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::PUT,
+            "/admin/settings/script_metrics_enabled",
+            PLATFORM_KEY,
+            Some(&serde_json::json!({"value": "false"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 async fn counts(app: &TestApp, token: &str) -> (StatusCode, Value) {
     let resp = app
         .router

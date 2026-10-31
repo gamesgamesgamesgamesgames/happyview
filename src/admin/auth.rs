@@ -19,8 +19,10 @@ use super::permissions::Permission;
 pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
-/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately tiny.
-const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
+/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately
+/// tiny, and read-only: counts for usage, and the script metrics the HappyProto
+/// dashboard's Performance tab relays.
+const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead, Permission::MetricsRead];
 
 #[derive(Clone)]
 pub struct UserAuth {
