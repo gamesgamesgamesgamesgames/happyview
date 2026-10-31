@@ -25,6 +25,8 @@ use crate::db::now_rfc3339;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::LexiconType;
 use crate::lua::{RecordEventPayload, RecordHookOutcome, ResolvedScript};
+use crate::metrics::ingest::{RecordDecision, RecordTimer};
+use crate::metrics::stages;
 use crate::record_handler::LEXICON_SCHEMA_COLLECTION;
 use crate::record_store::PreparedRecord;
 
@@ -294,7 +296,7 @@ async fn apply_events(
         }
         return (out, None);
     }
-    let mut run: Vec<(usize, RecordEvent, PreparedRecord)> = Vec::new();
+    let mut run: Vec<RunEntry> = Vec::new();
     let mut tracked: HashMap<String, bool> = HashMap::new();
     let mut hooked_ahead = hook_ahead(state, &events, concurrency, &mut tracked).await;
 
@@ -316,7 +318,7 @@ async fn apply_events(
                 }
             };
             if is_tracked {
-                let hooked = match hooked_ahead.remove(&index) {
+                let (hooked, timer) = match hooked_ahead.remove(&index) {
                     Some(hooked) => hooked,
                     None => hook_body(state, ev, body).await,
                 };
@@ -329,7 +331,7 @@ async fn apply_events(
                         // change reason: a change of origin ends it.
                         if run
                             .last()
-                            .is_some_and(|(_, last, _)| last.origin != ev.origin)
+                            .is_some_and(|(_, last, _, _)| last.origin != ev.origin)
                             && let Err((outcome, error)) =
                                 write_run(state, &mut run, &mut out).await
                         {
@@ -337,12 +339,13 @@ async fn apply_events(
                             return (out, Some(error));
                         }
                         let prepared = prepare(&ev, &body);
-                        run.push((out.outcomes.len(), ev, prepared));
+                        run.push((out.outcomes.len(), ev, prepared, timer));
                         // `changed` is settled when the run is written.
                         out.outcomes.push(IngestOutcome::Matched);
                         out.changed.push(false);
                     }
                     HookedBody::Skip | HookedBody::CidMismatch => {
+                        timer.finish(&state.metrics, None);
                         out.outcomes.push(IngestOutcome::Skipped);
                         out.changed.push(false);
                     }
@@ -373,7 +376,7 @@ async fn hook_ahead(
     events: &[SourceEvent],
     concurrency: usize,
     tracked: &mut HashMap<String, bool>,
-) -> HashMap<usize, HookedBody> {
+) -> HashMap<usize, (HookedBody, RecordTimer)> {
     if concurrency <= 1 {
         return HashMap::new();
     }
@@ -419,7 +422,7 @@ async fn hook_one<'a>(
     index: usize,
     ev: &'a RecordEvent,
     body: &'a Value,
-) -> (usize, HookedBody) {
+) -> (usize, (HookedBody, RecordTimer)) {
     (index, hook_body(state, ev, body).await)
 }
 
@@ -469,19 +472,27 @@ fn fill_failed(out: &mut BatchOutcome, total: usize, outcome: IngestOutcome) {
     out.changed.resize(total, false);
 }
 
+/// A hooked create or update waiting for its run's write: its slot in the
+/// batch's outcomes, and its timer, which the write finishes.
+type RunEntry = (usize, RecordEvent, PreparedRecord, RecordTimer);
+
 /// Write a run of hooked creates and updates in one transaction, settling
 /// their placeholder outcomes in `out` (each run entry carries its slot). On
 /// failure `out` is cut back to the run's first slot and the failure's
 /// outcome and error are returned for the caller to fill the tail with.
 async fn write_run(
     state: &AppState,
-    run: &mut Vec<(usize, RecordEvent, PreparedRecord)>,
+    run: &mut Vec<RunEntry>,
     out: &mut BatchOutcome,
 ) -> Result<(), (IngestOutcome, String)> {
     if run.is_empty() {
         return Ok(());
     }
-    let run = std::mem::take(run);
+    let mut run = std::mem::take(run);
+    let timers: Vec<RecordTimer> = run
+        .iter_mut()
+        .map(|(_, _, _, timer)| std::mem::replace(timer, RecordTimer::off()))
+        .collect();
     // Every event of a run has one origin (`apply_batch_in` splits runs
     // where it changes).
     let backfill = matches!(run[0].1.origin, Origin::Backfill { .. });
@@ -490,12 +501,18 @@ async fn write_run(
     } else {
         &state.db
     };
-    let prepared: Vec<PreparedRecord> = run.iter().map(|(_, _, p)| p.clone()).collect();
+    let prepared: Vec<PreparedRecord> = run.iter().map(|(_, _, p, _)| p.clone()).collect();
+    let started = Instant::now();
     let written = crate::db::with_change_reason(
         backfill.then(|| "backfill".to_string()),
         crate::db::retry_on_busy(|| state.records.write_network(pool, &prepared)),
     )
     .await;
+    // One transaction for the run, so each record's share is an even one.
+    let share = started.elapsed() / u32::try_from(timers.len()).unwrap_or(u32::MAX);
+    for timer in timers {
+        timer.finish(&state.metrics, Some((stages::WRITE, share)));
+    }
     let changed = match written {
         Ok(changed) => changed,
         Err(e) => {
@@ -513,7 +530,7 @@ async fn write_run(
     // A URI written twice in the run counts as changed once, on its last
     // copy (the one stored).
     let mut fresh = Vec::new();
-    for (slot, ev, _) in run.iter().rev() {
+    for (slot, ev, _, _) in run.iter().rev() {
         let uri = ev.key.uri();
         if changed.remove(&uri) {
             out.changed[*slot] = true;
@@ -568,7 +585,14 @@ pub(crate) async fn is_tracked(state: &AppState, collection: &str) -> bool {
 /// Run the record hook for one create/update and say what to store. The CID
 /// check comes first: a body that does not hash to its claimed CID is never
 /// hooked or stored. An event without a CID skips the check.
-pub(crate) async fn hook_body(state: &AppState, ev: &RecordEvent, body: &Value) -> HookedBody {
+///
+/// The timer it answers has measured the record up to its decision; the
+/// caller finishes it once the record is written, or at once when it is not.
+pub(crate) async fn hook_body(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+) -> (HookedBody, RecordTimer) {
     hook_body_with(state, ev, body, Hook::Run).await
 }
 
@@ -577,16 +601,42 @@ async fn hook_body_with(
     ev: &RecordEvent,
     body: &Value,
     hook: Hook,
-) -> HookedBody {
-    match hook_decision(state, ev, body, hook).await {
+) -> (HookedBody, RecordTimer) {
+    let (decision, timer) = hook_decision(state, ev, body, hook).await;
+    let hooked = match decision {
         Decision::Proceed => HookedBody::Store(body.clone()),
         Decision::Replace(v) => HookedBody::Store(v),
         Decision::Skip => HookedBody::Skip,
         Decision::CidMismatch => HookedBody::CidMismatch,
-    }
+    };
+    (hooked, timer)
 }
 
-async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: Hook) -> Decision {
+/// [`decide`], timed.
+async fn hook_decision(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+    hook: Hook,
+) -> (Decision, RecordTimer) {
+    let mut timer = RecordTimer::start(&state.metrics, ev);
+    let decision = decide(state, ev, body, hook, &mut timer).await;
+    timer.decided(match &decision {
+        Decision::Proceed => RecordDecision::Proceed,
+        Decision::Replace(_) => RecordDecision::Replace,
+        Decision::Skip => RecordDecision::Skip,
+        Decision::CidMismatch => RecordDecision::CidMismatch,
+    });
+    (decision, timer)
+}
+
+async fn decide(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+    hook: Hook,
+    timer: &mut RecordTimer,
+) -> Decision {
     let uri = ev.key.uri();
     let cid = ev.cid.as_deref().unwrap_or_default();
 
@@ -595,7 +645,10 @@ async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: H
     // attacker-controllable through the DID document) could otherwise store
     // a record under a mismatched CID. `Skipped` (no/unencodable CID)
     // proceeds unchanged.
-    if crate::cid_verify::verify_record_cid(cid, body) == crate::cid_verify::CidCheck::Mismatch {
+    let checking = Instant::now();
+    let checked = crate::cid_verify::verify_record_cid(cid, body);
+    timer.stage(stages::CID_CHECK, checking.elapsed());
+    if checked == crate::cid_verify::CidCheck::Mismatch {
         if matches!(ev.origin, Origin::Backfill { .. }) {
             tracing::warn!(
                 collection = ev.key.collection,
@@ -637,18 +690,19 @@ async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: H
         Hook::Run => {
             #[cfg(test)]
             let _running = hooks_in_flight::Running::start();
-            crate::lua::run_record_event_script(
-                state,
-                RecordEventPayload {
-                    nsid: &ev.key.collection,
-                    action: ev.action.as_str(),
-                    uri: &uri,
-                    did: &ev.key.did,
-                    rkey: &ev.key.rkey,
-                    record: Some(body),
-                },
-            )
-            .await
+            timer
+                .hooking(crate::lua::run_record_event_script(
+                    state,
+                    RecordEventPayload {
+                        nsid: &ev.key.collection,
+                        action: ev.action.as_str(),
+                        uri: &uri,
+                        did: &ev.key.did,
+                        rkey: &ev.key.rkey,
+                        record: Some(body),
+                    },
+                ))
+                .await
         }
         Hook::Given(outcome) => outcome,
     };
@@ -793,17 +847,23 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             let Some(rec) = &ev.body else {
                 return IngestOutcome::Invalid;
             };
-            let rec_to_store = match hook_body_with(state, ev, rec, hook).await {
+            let (hooked, timer) = hook_body_with(state, ev, rec, hook).await;
+            let rec_to_store = match hooked {
                 HookedBody::Store(v) => v,
                 // The delivery this retries failed open and stored the body
                 // as it arrived; the hook now says it should not be there.
                 HookedBody::Skip if ev.origin == Origin::Retry => {
+                    timer.finish(&state.metrics, None);
                     return remove_failed_open(state, ev, rec, &uri).await;
                 }
-                HookedBody::Skip | HookedBody::CidMismatch => return IngestOutcome::Skipped,
+                HookedBody::Skip | HookedBody::CidMismatch => {
+                    timer.finish(&state.metrics, None);
+                    return IngestOutcome::Skipped;
+                }
             };
 
             let prepared = prepare(ev, &rec_to_store);
+            let started = Instant::now();
             let written = crate::db::with_change_reason(
                 reason,
                 crate::db::retry_on_busy(|| {
@@ -814,6 +874,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             )
             .await
             .map(|changed| !changed.is_empty());
+            timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match written {
                 Ok(changed) => {
                     // An identical redelivery changed nothing, so there is
@@ -843,8 +904,9 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             // Run record-event script (if any) before deleting. Only a
             // script that actually ran and returned `nil` aborts the
             // delete — no script, or a dead-lettered one, proceeds.
-            let hook_result = delete_hook(state, ev, &uri, hook).await;
+            let (hook_result, timer) = delete_hook(state, ev, &uri, hook).await;
             if hook_result == RecordHookOutcome::Skip {
+                timer.finish(&state.metrics, None);
                 // Gated for the same reason as the create path.
                 log_skipped(state, ev, &uri).await;
                 return IngestOutcome::Skipped;
@@ -852,6 +914,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
 
             let now = now_rfc3339();
             let backfill_running = state.source.backfill_running(&ev.key.collection).await;
+            let started = Instant::now();
             let deleted = crate::db::with_change_reason(
                 reason,
                 crate::db::retry_on_busy(|| {
@@ -867,6 +930,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
                 }),
             )
             .await;
+            timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match deleted {
                 Ok(_) => {
                     if state.verbose_event_logging.load(Ordering::Relaxed) {
@@ -884,30 +948,39 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
     }
 }
 
-/// The delete hook's outcome for `ev`.
+/// The delete hook's outcome for `ev`, and the timer that measured it, for
+/// the caller to finish once the delete is applied.
 async fn delete_hook(
     state: &AppState,
     ev: &RecordEvent,
     uri: &str,
     hook: Hook,
-) -> RecordHookOutcome {
-    match hook {
+) -> (RecordHookOutcome, RecordTimer) {
+    let mut timer = RecordTimer::start(&state.metrics, ev);
+    let outcome = match hook {
         Hook::Run => {
-            crate::lua::run_record_event_script(
-                state,
-                RecordEventPayload {
-                    nsid: &ev.key.collection,
-                    action: "delete",
-                    uri,
-                    did: &ev.key.did,
-                    rkey: &ev.key.rkey,
-                    record: ev.body.as_ref(),
-                },
-            )
-            .await
+            timer
+                .hooking(crate::lua::run_record_event_script(
+                    state,
+                    RecordEventPayload {
+                        nsid: &ev.key.collection,
+                        action: "delete",
+                        uri,
+                        did: &ev.key.did,
+                        rkey: &ev.key.rkey,
+                        record: ev.body.as_ref(),
+                    },
+                ))
+                .await
         }
         Hook::Given(outcome) => outcome,
-    }
+    };
+    timer.decided(if outcome == RecordHookOutcome::Skip {
+        RecordDecision::Skip
+    } else {
+        RecordDecision::Proceed
+    });
+    (outcome, timer)
 }
 
 /// How often an ignored keep-on-delete is reported per collection, unless
@@ -1009,12 +1082,13 @@ async fn apply_claimed(
         .await;
         return (IngestOutcome::Invalid, false);
     }
-    let (delta, outcome) = match ev.action {
+    let (delta, outcome, timer) = match ev.action {
         Action::Create | Action::Update => {
             let Some(body) = &ev.body else {
                 return (IngestOutcome::Invalid, false);
             };
-            match hook_decision(state, ev, body, hook).await {
+            let (decision, timer) = hook_decision(state, ev, body, hook).await;
+            let (delta, outcome) = match decision {
                 Decision::Proceed => (Delta::Proceed, IngestOutcome::Matched),
                 Decision::Replace(replaced) => (
                     Delta::Replace {
@@ -1031,15 +1105,20 @@ async fn apply_claimed(
                     IngestOutcome::Matched,
                 ),
                 Decision::Skip | Decision::CidMismatch => (Delta::Hide, IngestOutcome::Skipped),
-            }
+            };
+            (delta, outcome, timer)
         }
         Action::Delete => {
-            if delete_hook(state, ev, &uri, hook).await == RecordHookOutcome::Skip {
+            let (hooked, timer) = delete_hook(state, ev, &uri, hook).await;
+            if hooked == RecordHookOutcome::Skip {
                 report_ignored_keep(state, ev, &uri).await;
             }
-            (Delta::Proceed, IngestOutcome::Matched)
+            (Delta::Proceed, IngestOutcome::Matched, timer)
         }
     };
+    // The storage's own reads and writes for the delta, whatever they come
+    // to: a Hide is a write there as much as a Proceed is.
+    let writing = Instant::now();
     let event_type = match ev.action {
         Action::Delete => "record.deleted",
         Action::Create | Action::Update => "record.created",
@@ -1066,10 +1145,12 @@ async fn apply_claimed(
                 for_rev = rev;
             }
             Ok(_) => {
+                timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
                 tracing::debug!(uri = %uri, "a retried delta's record changed since; dropped");
                 return (outcome, false);
             }
             Err(e) => {
+                timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
                 tracing::warn!(uri = %uri, "failed to read a retried record: {e}");
                 log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
                 return (
@@ -1083,7 +1164,9 @@ async fn apply_claimed(
             }
         }
     }
-    match ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await {
+    let applied = ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await;
+    timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
+    match applied {
         Ok(()) => {
             let stored = outcome == IngestOutcome::Matched && ev.action != Action::Delete;
             if stored {

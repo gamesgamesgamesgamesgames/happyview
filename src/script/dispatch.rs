@@ -100,17 +100,15 @@ pub async fn dispatch(
             ScriptOrigin::Project { .. } => Layer::Project,
             ScriptOrigin::Dashboard => Layer::Dashboard,
         };
-        state.metrics.record(
-            inv.trigger_id,
-            kind,
-            layer,
-            &RunSample {
-                outcome: Outcome::of(&result),
-                wall: started.elapsed(),
-                prepare,
-                timings: collector.snapshot(),
-            },
-        );
+        let sample = RunSample {
+            outcome: Outcome::of(&result),
+            wall: started.elapsed(),
+            prepare,
+            timings: collector.snapshot(),
+        };
+        // A record hook's run is also part of its record's time.
+        crate::metrics::ingest::note_run(sample.outcome, &sample.timings);
+        state.metrics.record(inv.trigger_id, kind, layer, &sample);
     }
     result
 }

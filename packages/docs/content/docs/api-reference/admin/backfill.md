@@ -234,6 +234,24 @@ interface BackfillJob {
   discovery_complete: boolean;
   recent_completions_limit: number | null;
   note: string | null;
+  hooks: HookStats | null;
+  hook_stats: HookStats | null;
+}
+
+interface HookStats {
+  done: number;
+  failed: number;
+  timeouts: number;
+  dead_lettered: number;
+  skipped: number;
+  outcomes: Record<"proceed" | "replace" | "skip" | "cid_mismatch", number>;
+  rate_per_s: number;
+  avg_rate_per_s: number;
+  eta_s: number | null;
+  record_ms_p50: number | null;
+  script_ms_p50: number | null;
+  script_share: number | null;
+  stages: Record<string, { n: number; ms_mean: number | null }>;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/backfill/status", {
@@ -285,7 +303,9 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
     "created_at": "2025-01-01T00:00:00Z",
     "discovery_complete": true,
     "recent_completions_limit": 1000,
-    "note": null
+    "note": null,
+    "hooks": null,
+    "hook_stats": null
   }
 ]
 ```
@@ -333,6 +353,51 @@ The three repo counters count work units. A unit is one repo under one collectio
 `discovery_complete` is `false` while a network job is still listing repos from the relay. Discovery runs alongside resolving and fetching, and until it finishes `total_repos` counts the repos discovered so far. `recent_completions_limit` is set for jobs on the bounded queue (every job created after upgrading to the release that introduced it), which keep only that many completed repos for the `fetched` list. It is `null` for jobs created before that upgrade.
 
 A record source can backfill some collections itself rather than crawl or replay them. Such a job's `source` is the name the record source gives its backfills, its counters are whatever the record source reports, and `note` may carry a sentence from the record source about what the job did or found. `note` is `null` for every other job.
+
+### Hook stats
+
+`hooks` is what the job's records have cost in hooks so far, while this process holds it: from the job's first record until an hour after its last, `null` before and after. `hook_stats` is the same block kept with the job when it completed, failed or was cancelled, and `null` until then, or for a job none of whose records reached a hook decision. Both are left out of the count when metrics are [switched off](./metrics.md).
+
+| Field | Meaning |
+| ----- | ------- |
+| `done` | Records that reached a hook decision, whether or not a hook was set for them |
+| `failed` | Records whose hook failed at least once, retries included |
+| `timeouts` | Records whose hook ran out of time at least once |
+| `dead_lettered` | Records whose hook was given up on. The record was still stored, as hooks fail open |
+| `skipped`, `outcomes` | Records not stored, and every record by what was decided: `proceed`, `replace`, `skip` or `cid_mismatch` |
+| `rate_per_s` | Records a second over about the last 30 seconds; the average until a second has passed |
+| `avg_rate_per_s` | Records a second since the job's first record |
+| `eta_s` | Seconds left, from the job's progress against its total. Only a record source's own backfill reports a total; `null` for a crawl or a replay |
+| `record_ms_p50` | A record's time: its lookup, CID check, hook and its share of the write |
+| `script_ms_p50`, `script_share` | The hook's own time (its code and the host calls it made), and that time over record time |
+| `stages` | Each stage's records and mean, as on [`/admin/metrics/ingest`](./metrics.md#ingest), plus any stage the record source reported itself, such as `page_read`. A stage whose name ends in `_skipped` is a count and its `ms_mean` is `null` |
+
+```json
+{
+  "done": 6,
+  "failed": 1,
+  "timeouts": 1,
+  "dead_lettered": 1,
+  "skipped": 2,
+  "outcomes": { "proceed": 4, "skip": 2 },
+  "rate_per_s": 0.57,
+  "avg_rate_per_s": 0.855,
+  "eta_s": 0.0,
+  "record_ms_p50": 171.074,
+  "script_ms_p50": 0.082,
+  "script_share": 0.00014,
+  "stages": {
+    "resolve": { "n": 6, "ms_mean": 2.36 },
+    "cid_check": { "n": 6, "ms_mean": 0.021 },
+    "hook": { "n": 6, "ms_mean": 1254.153 },
+    "hook.link": { "n": 6, "ms_mean": 0.667 },
+    "hook.allocate": { "n": 6, "ms_mean": 0.257 },
+    "hook.teardown": { "n": 6, "ms_mean": 0.054 },
+    "write": { "n": 4, "ms_mean": 0.504 },
+    "delta": { "n": 2, "ms_mean": 0.001 }
+  }
+}
+```
 
 A job HappyView paused itself, because it ran out of work with repos it could not complete still queued, has `status` `paused` and the reason in `error` (for example `"paused: 3 units could not be completed; resume to retry"`). A job an operator paused has no `error`. Resuming clears it.
 
@@ -522,6 +587,7 @@ Events are sent with `event: event` and a JSON `data` payload. Each event has a 
 | `job_stage_changed`| The job moved to a new processing stage           |
 | `job_completed`    | The job finished (completed, failed, or cancelled) |
 | `job_note`         | The record source set the job's `note`             |
+| `hook_stats`       | The job's [hook stats](#hook-stats), with its `job_id`: at most once a second while records arrive, and once more just before `job_completed` |
 | `job_snapshot`     | The job's current status, stage, counters, error counts and `discovery_complete`, sent on connect and after the stream falls behind |
 
 ## Flush job details

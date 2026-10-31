@@ -19,7 +19,17 @@ use std::time::Duration;
 /// run with no interpreter was never instantiated.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunTimings {
+    /// Everything from asking for an instance to holding one: `link` plus
+    /// `allocate`.
     pub instantiate: Option<Duration>,
+    /// Building the linker the instance's imports are resolved through.
+    pub link: Option<Duration>,
+    /// The rest of `instantiate`: finding the module, building the store's
+    /// state, the store and the instance, its memory and fiber stack, and
+    /// the guest's `_initialize`.
+    pub allocate: Option<Duration>,
+    /// Dropping the store and its instance once the run is over.
+    pub teardown: Option<Duration>,
     /// Whether this run's module came from the runtime's memory rather than
     /// disk or a compile.
     pub module_cache_hit: Option<bool>,
@@ -93,11 +103,18 @@ fn with(f: impl FnOnce(&mut RunTimings)) {
     let _ = RUN.try_with(|collector| f(&mut collector.lock()));
 }
 
-pub fn record_instantiate(elapsed: Duration, module_cache_hit: bool) {
+/// Instantiation took `elapsed`, `link` of it building the linker.
+pub fn record_instantiate(elapsed: Duration, link: Duration, module_cache_hit: bool) {
     with(|t| {
         t.instantiate = Some(elapsed);
+        t.link = Some(link);
+        t.allocate = Some(elapsed.saturating_sub(link));
         t.module_cache_hit = Some(module_cache_hit);
     });
+}
+
+pub fn record_teardown(elapsed: Duration) {
+    with(|t| t.teardown = Some(elapsed));
 }
 
 pub fn record_guest_call(elapsed: Duration) {
@@ -122,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_outside_a_scope_change_nothing() {
-        record_instantiate(Duration::from_millis(1), true);
+        record_instantiate(Duration::from_millis(1), Duration::ZERO, true);
         record_guest_call(Duration::from_millis(1));
         assert!(current().is_none());
     }
@@ -131,19 +148,23 @@ mod tests {
     async fn a_scope_collects_what_the_run_reports() {
         let collector = RunCollector::new();
         run_under(collector.clone(), async {
-            record_instantiate(Duration::from_micros(300), false);
+            record_instantiate(Duration::from_micros(300), Duration::from_micros(80), false);
             record_guest_call(Duration::from_micros(1_000));
             let current = current().expect("inside the scope");
             current.record_host("host_db_query", Duration::from_micros(200));
             current.record_host("host_db_query", Duration::from_micros(100));
             current.record_host("host_http_fetch", Duration::from_micros(50));
             record_settle(Duration::from_micros(20));
+            record_teardown(Duration::from_micros(15));
             record_memory_peak(65_536);
             record_fuel(4_000);
         })
         .await;
         let t = collector.snapshot();
         assert_eq!(t.instantiate, Some(Duration::from_micros(300)));
+        assert_eq!(t.link, Some(Duration::from_micros(80)));
+        assert_eq!(t.allocate, Some(Duration::from_micros(220)));
+        assert_eq!(t.teardown, Some(Duration::from_micros(15)));
         assert_eq!(t.module_cache_hit, Some(false));
         assert_eq!(t.host_total, Duration::from_micros(350));
         assert_eq!(

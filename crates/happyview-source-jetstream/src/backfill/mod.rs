@@ -280,6 +280,74 @@ pub(crate) fn publish_event(state: &JobState, event: types::BackfillEvent) {
     let _ = state.backfill_events_tx.send(event);
 }
 
+/// How often a running job asks its host whether new hook stats are due. The
+/// host decides how often they are, so this only bounds how late they go out.
+const HOOK_STATS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Publishes a running job's hook stats as its host makes them due, until
+/// dropped.
+struct HookStatsPublisher(tokio::task::JoinHandle<()>);
+
+impl HookStatsPublisher {
+    fn spawn(state: &JobState, job_id: &str) -> Self {
+        let state = state.clone();
+        let job_id = job_id.to_string();
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HOOK_STATS_POLL).await;
+                if let Some(stats) = state.host.job_hook_stats_due(&job_id) {
+                    publish_event(
+                        &state,
+                        types::BackfillEvent::HookStats {
+                            job_id: job_id.clone(),
+                            stats,
+                        },
+                    );
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for HookStatsPublisher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keep a job's final hook stats with it as it ends, and publish them ahead
+/// of its completion. A job none of whose records reached a hook keeps none.
+async fn keep_hook_stats(state: &JobState, job_id: &str) {
+    let Some(stats) = state.host.finish_job_hook_stats(job_id) else {
+        return;
+    };
+    let json = match serde_json::to_string(&stats) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "could not encode a job's hook stats");
+            return;
+        }
+    };
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET hook_stats = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "hook_stats", || {
+        happyview_provider::db::query(&sql)
+            .bind(&json)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        types::BackfillEvent::HookStats {
+            job_id: job_id.to_string(),
+            stats,
+        },
+    );
+}
+
 /// Run one bookkeeping write for a job, retrying while the database is busy.
 /// A write that still fails is logged and recorded in the event log rather
 /// than dropped, so a counter or stage that stopped moving can be traced.
@@ -421,6 +489,7 @@ pub(crate) async fn load_max_attempts(state: &JobState) -> u32 {
 }
 
 pub(crate) async fn fail_job(state: &JobState, job_id: &str, error: &str) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
@@ -481,6 +550,7 @@ pub(crate) async fn request_cancel(state: &JobState, job_id: &str) {
 }
 
 pub(crate) async fn finalise_cancel(state: &JobState, job_id: &str) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
@@ -544,6 +614,7 @@ pub(crate) async fn complete_job(
     total_records: i32,
     error: Option<&str>,
 ) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'completed', stage = 'completed', completed_at = ?, processed_repos = ?, total_records = ?, error = ? WHERE id = ?",
@@ -634,6 +705,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         return;
     };
     let _running = state.running.enter(&job_id, collection.clone());
+    let _hook_stats = HookStatsPublisher::spawn(&state, &job_id);
 
     // Determine target collections. A collection with an executor belongs
     // to the provider that composes this source: a crawl or replay of every

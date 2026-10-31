@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use happyview_provider::Host;
 use happyview_provider::db::adapt_sql;
@@ -105,6 +106,7 @@ impl JobHandle {
     /// and `total_repos`, sent to the job's event stream.
     pub async fn progress(&self, processed: i64, total: Option<i64>) {
         self.processed.store(processed, Ordering::Relaxed);
+        self.jobs.host.note_job_progress(&self.id, processed, total);
         let processed = clamp(processed);
         let total = total.map(clamp);
         backfill::update_job_counter(&self.jobs, &self.id, "processed_repos", processed).await;
@@ -121,6 +123,23 @@ impl JobHandle {
                 total_records: None,
             },
         );
+    }
+
+    /// Add `n` records' worth of `elapsed` to this job's stage `stage`, which
+    /// its hook stats report beside the stages HappyView measures: the time
+    /// an executor spends where HappyView cannot see it, such as reading a
+    /// page or writing to its own store. Any name will do.
+    ///
+    /// A stage whose name ends in `_skipped` is a count, and `elapsed` is
+    /// ignored: report work that was skipped as `write_skipped` with
+    /// [`Duration::ZERO`] rather than as a `write` that took no time, so the
+    /// `write` mean stays the mean of real round trips. Neither counts
+    /// towards a record's time or its script share, which are HappyView's
+    /// own measurements.
+    pub fn observe(&self, stage: &'static str, elapsed: Duration, n: u64) {
+        self.jobs
+            .host
+            .observe_job_stage(&self.id, stage, elapsed, n);
     }
 
     /// A sentence for the operator about what this job did or found, shown

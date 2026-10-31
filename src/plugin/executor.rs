@@ -844,10 +844,27 @@ impl PluginExecutor {
         options: RunOptions,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
         let started = std::time::Instant::now();
-        let (mut inst, cache_hit) = self
+        let (mut inst, cache_hit, link) = self
             .instantiate_interpreter_reporting(plugin, Some(input), caller, modules)
             .await?;
-        crate::metrics::run::record_instantiate(started.elapsed(), cache_hit);
+        crate::metrics::run::record_instantiate(started.elapsed(), link, cache_hit);
+        let output = self.call_instance(&mut inst, input, options).await;
+        // The store and its instance go here, fiber stack and all, which is
+        // the run's cost as much as building them was.
+        let started = std::time::Instant::now();
+        drop(inst);
+        crate::metrics::run::record_teardown(started.elapsed());
+        output
+    }
+
+    /// The run itself, on an instance [`execute_loaded`](Self::execute_loaded)
+    /// built and drops.
+    async fn call_instance(
+        &self,
+        inst: &mut PluginInstance,
+        input: &ScriptExecuteInput,
+        options: RunOptions,
+    ) -> Result<ScriptExecuteOutput, ExecutionError> {
         // The guard list is the host's, whatever the caller sent: see
         // `host_removed_globals`.
         let mut input = ScriptExecuteInput {
@@ -879,7 +896,7 @@ impl PluginExecutor {
         let started = std::time::Instant::now();
         let called = inst.call_execute(input).await;
         crate::metrics::run::record_guest_call(started.elapsed());
-        report_run_resources(&mut inst, options.call_fuel);
+        report_run_resources(inst, options.call_fuel);
         let output = match called {
             Ok(output) => output,
             // A guest that reported a panic answered the run; the trap is only
@@ -1151,18 +1168,19 @@ impl PluginExecutor {
     ) -> Result<PluginInstance, ExecutionError> {
         self.instantiate_interpreter_reporting(plugin, input, caller, modules)
             .await
-            .map(|(inst, _)| inst)
+            .map(|(inst, _, _)| inst)
     }
 
     /// As [`instantiate_interpreter`](Self::instantiate_interpreter), saying
-    /// whether the module came from the runtime's memory.
+    /// whether the module came from the runtime's memory and how long its
+    /// linker took to build.
     async fn instantiate_interpreter_reporting(
         &self,
         plugin: &Arc<LoadedPlugin>,
         input: Option<&ScriptExecuteInput>,
         caller: Option<Arc<CallerSession>>,
         modules: ModuleScope,
-    ) -> Result<(PluginInstance, bool), ExecutionError> {
+    ) -> Result<(PluginInstance, bool, std::time::Duration), ExecutionError> {
         let ctx = input
             .map(|input| LibraryCallContext {
                 caller_did: input.context.caller_did.clone(),
@@ -1181,7 +1199,7 @@ impl PluginExecutor {
             .map(str::to_string)
             .collect();
         let stamp = self.registry.artifact_stamp_for(plugin);
-        let (mut inst, cache_hit) = self
+        let (mut inst, cache_hit, link) = self
             .instantiate_loaded_reporting(plugin, &scope, HashMap::new(), serde_json::Value::Null)
             .await?;
         let state = inst.store.data_mut();
@@ -1211,7 +1229,7 @@ impl PluginExecutor {
             waited_ms: Default::default(),
             metrics: crate::metrics::run::current(),
         });
-        Ok((inst, cache_hit))
+        Ok((inst, cache_hit, link))
     }
 
     /// The interpreter registered as `plugin_id`, fetched once so everything
@@ -1382,25 +1400,30 @@ impl PluginExecutor {
     ) -> Result<PluginInstance, ExecutionError> {
         self.instantiate_loaded_reporting(plugin, scope, secrets, config)
             .await
-            .map(|(inst, _)| inst)
+            .map(|(inst, _, _)| inst)
     }
 
     /// As [`instantiate_loaded`](Self::instantiate_loaded), saying whether
-    /// the module came from the runtime's memory.
+    /// the module came from the runtime's memory and how long its linker took
+    /// to build. Answered rather than reported: a library call instantiates
+    /// on the task of the script that made it, and would overwrite the
+    /// script's own figure.
     async fn instantiate_loaded_reporting(
         &self,
         plugin: &Arc<LoadedPlugin>,
         scope: &str,
         secrets: HashMap<String, String>,
         config: serde_json::Value,
-    ) -> Result<(PluginInstance, bool), ExecutionError> {
+    ) -> Result<(PluginInstance, bool, std::time::Duration), ExecutionError> {
         let (module, cache_hit) = self
             .runtime
             .module_lookup(plugin)
             .await
             .map_err(ExecutionError::Instantiation)?;
 
+        let linking = std::time::Instant::now();
         let linker = self.linker_for(&module)?;
+        let link = linking.elapsed();
         let state = self.build_state(plugin, scope, secrets, config).await?;
 
         let mut store = Store::new(self.runtime.engine(), state);
@@ -1472,6 +1495,7 @@ impl PluginExecutor {
                 dealloc,
             },
             cache_hit,
+            link,
         ))
     }
 }

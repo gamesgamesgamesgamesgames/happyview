@@ -17,7 +17,7 @@ pub const MINUTES_KEPT: usize = 60;
 /// The last day, half an hour at a time.
 pub const HALF_HOURS_KEPT: usize = 48;
 
-fn micros(d: std::time::Duration) -> u64 {
+pub(crate) fn micros(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
@@ -31,7 +31,13 @@ pub struct Bucket {
     pub wall_us: u64,
     pub prepare_us: u64,
     pub instantiate_us: u64,
+    /// `link` and `allocate` are summed over the runs that were instantiated,
+    /// as `instantiate` is.
+    pub link_us: u64,
+    pub allocate_us: u64,
     pub instantiated: u64,
+    pub teardown_us: u64,
+    pub torn_down: u64,
     /// Guest and host time are summed over the runs that called the guest.
     pub guest_us: u64,
     pub host_us: u64,
@@ -68,7 +74,17 @@ impl Bucket {
         self.prepare_us = self.prepare_us.saturating_add(micros(sample.prepare));
         if let Some(d) = t.instantiate {
             self.instantiate_us = self.instantiate_us.saturating_add(micros(d));
+            self.link_us = self
+                .link_us
+                .saturating_add(micros(t.link.unwrap_or_default()));
+            self.allocate_us = self
+                .allocate_us
+                .saturating_add(micros(t.allocate.unwrap_or(d)));
             self.instantiated += 1;
+        }
+        if let Some(d) = t.teardown {
+            self.teardown_us = self.teardown_us.saturating_add(micros(d));
+            self.torn_down += 1;
         }
         if let Some(guest) = t.guest() {
             let guest = micros(guest);
@@ -118,7 +134,11 @@ impl Bucket {
         self.wall_us = self.wall_us.saturating_add(other.wall_us);
         self.prepare_us = self.prepare_us.saturating_add(other.prepare_us);
         self.instantiate_us = self.instantiate_us.saturating_add(other.instantiate_us);
+        self.link_us = self.link_us.saturating_add(other.link_us);
+        self.allocate_us = self.allocate_us.saturating_add(other.allocate_us);
         self.instantiated += other.instantiated;
+        self.teardown_us = self.teardown_us.saturating_add(other.teardown_us);
+        self.torn_down += other.torn_down;
         self.guest_us = self.guest_us.saturating_add(other.guest_us);
         self.host_us = self.host_us.saturating_add(other.host_us);
         self.called += other.called;
@@ -152,14 +172,34 @@ impl Bucket {
     }
 }
 
-/// A bucket ring of `width`-second buckets.
-#[derive(Clone, Debug)]
-pub struct Ring {
-    width: u64,
-    slots: Vec<Option<(u64, Bucket)>>,
+/// What a ring's buckets hold: samples added one at a time, and buckets
+/// merged into a window.
+pub trait Accumulate: Clone + Default {
+    type Sample;
+    fn add_sample(&mut self, sample: &Self::Sample);
+    fn merge_from(&mut self, other: &Self);
 }
 
-impl Ring {
+impl Accumulate for Bucket {
+    type Sample = RunSample;
+
+    fn add_sample(&mut self, sample: &RunSample) {
+        self.add(sample);
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.merge(other);
+    }
+}
+
+/// A bucket ring of `width`-second buckets.
+#[derive(Clone, Debug)]
+pub struct Ring<B = Bucket> {
+    width: u64,
+    slots: Vec<Option<(u64, B)>>,
+}
+
+impl<B: Accumulate> Ring<B> {
     pub fn new(width: u64, len: usize) -> Self {
         Self {
             width,
@@ -179,14 +219,14 @@ impl Ring {
         ((start / self.width) % self.slots.len() as u64) as usize
     }
 
-    pub fn add(&mut self, at: u64, sample: &RunSample) {
+    pub fn add(&mut self, at: u64, sample: &B::Sample) {
         let start = self.start_of(at);
         let i = self.slot_of(start);
         match &mut self.slots[i] {
-            Some((held, bucket)) if *held == start => bucket.add(sample),
+            Some((held, bucket)) if *held == start => bucket.add_sample(sample),
             slot => {
-                let mut bucket = Bucket::default();
-                bucket.add(sample);
+                let mut bucket = B::default();
+                bucket.add_sample(sample);
                 *slot = Some((start, bucket));
             }
         }
@@ -195,7 +235,7 @@ impl Ring {
     /// The bucket starts a window of `secs` ending at `now` covers, oldest
     /// first: every bucket overlapping the window that the ring can still
     /// hold. The newest is the one still open.
-    pub fn starts(&self, now: u64, secs: u64) -> impl Iterator<Item = u64> + use<> {
+    pub fn starts(&self, now: u64, secs: u64) -> impl Iterator<Item = u64> + use<B> {
         let newest = self.start_of(now);
         let held = newest.saturating_sub((self.slots.len() as u64 - 1) * self.width);
         let overlapping = self.start_of(now.saturating_sub(secs.saturating_sub(1)));
@@ -204,7 +244,7 @@ impl Ring {
     }
 
     /// The bucket that started at `start`, if it is still held.
-    pub fn get(&self, start: u64) -> Option<&Bucket> {
+    pub fn get(&self, start: u64) -> Option<&B> {
         match &self.slots[self.slot_of(start)] {
             Some((held, bucket)) if *held == start => Some(bucket),
             _ => None,
@@ -212,14 +252,21 @@ impl Ring {
     }
 
     /// Everything a window of `secs` ending at `now` holds, merged.
-    pub fn merged(&self, now: u64, secs: u64) -> Bucket {
-        let mut out = Bucket::default();
+    pub fn merged(&self, now: u64, secs: u64) -> B {
+        let mut out = B::default();
         for start in self.starts(now, secs) {
             if let Some(bucket) = self.get(start) {
-                out.merge(bucket);
+                out.merge_from(bucket);
             }
         }
         out
+    }
+
+    /// When the oldest bucket a window of `secs` ending at `now` holds
+    /// started, if it holds any.
+    pub fn oldest_in(&self, now: u64, secs: u64) -> Option<u64> {
+        self.starts(now, secs)
+            .find(|start| self.get(*start).is_some())
     }
 
     /// When the newest bucket the ring holds started.
@@ -231,12 +278,12 @@ impl Ring {
 /// One key's history: the last hour by the minute, the last day by the half
 /// hour. Each run is added to both, so neither is derived from the other.
 #[derive(Clone, Debug)]
-pub struct History {
-    pub minutes: Ring,
-    pub half_hours: Ring,
+pub struct History<B = Bucket> {
+    pub minutes: Ring<B>,
+    pub half_hours: Ring<B>,
 }
 
-impl Default for History {
+impl<B: Accumulate> Default for History<B> {
     fn default() -> Self {
         Self {
             minutes: Ring::new(MINUTE_SECS, MINUTES_KEPT),
@@ -245,8 +292,8 @@ impl Default for History {
     }
 }
 
-impl History {
-    pub fn add(&mut self, at: u64, sample: &RunSample) {
+impl<B: Accumulate> History<B> {
+    pub fn add(&mut self, at: u64, sample: &B::Sample) {
         self.minutes.add(at, sample);
         self.half_hours.add(at, sample);
     }
@@ -260,11 +307,11 @@ impl History {
 }
 
 /// Milliseconds, from microseconds.
-fn ms(us: u64) -> f64 {
+pub(crate) fn ms(us: u64) -> f64 {
     us as f64 / 1_000.0
 }
 
-fn mean_ms(sum_us: u64, n: u64) -> Option<f64> {
+pub(crate) fn mean_ms(sum_us: u64, n: u64) -> Option<f64> {
     (n > 0).then(|| ms(sum_us) / n as f64)
 }
 
@@ -278,7 +325,7 @@ pub struct Percentiles {
 }
 
 impl Percentiles {
-    fn of(sketch: &Sketch, sum_us: u64) -> Self {
+    pub(crate) fn of(sketch: &Sketch, sum_us: u64) -> Self {
         let q = |q: f64| sketch.quantile(q).map(ms);
         Self {
             p50: q(0.5),
@@ -318,6 +365,9 @@ pub struct Stats {
     pub guest_ms: Percentiles,
     pub prepare_ms_mean: Option<f64>,
     pub instantiate_ms_mean: Option<f64>,
+    pub link_ms_mean: Option<f64>,
+    pub allocate_ms_mean: Option<f64>,
+    pub teardown_ms_mean: Option<f64>,
     pub host_ms_mean: Option<f64>,
     pub settle_ms_mean: Option<f64>,
     /// Mean per call, sorted by total time spent.
@@ -339,6 +389,9 @@ impl Bucket {
             guest_ms: Percentiles::of(&self.guest, self.guest_us),
             prepare_ms_mean: mean_ms(self.prepare_us, self.runs),
             instantiate_ms_mean: mean_ms(self.instantiate_us, self.instantiated),
+            link_ms_mean: mean_ms(self.link_us, self.instantiated),
+            allocate_ms_mean: mean_ms(self.allocate_us, self.instantiated),
+            teardown_ms_mean: mean_ms(self.teardown_us, self.torn_down),
             host_ms_mean: mean_ms(self.host_us, self.called),
             settle_ms_mean: mean_ms(self.settle_us, self.settled),
             host_imports: imports
@@ -376,6 +429,9 @@ mod tests {
             prepare: Duration::from_millis(1),
             timings: RunTimings {
                 instantiate: Some(Duration::from_millis(1)),
+                link: Some(Duration::from_micros(250)),
+                allocate: Some(Duration::from_micros(750)),
+                teardown: Some(Duration::from_micros(500)),
                 module_cache_hit: Some(true),
                 guest_call: Some(Duration::from_millis(wall_ms.saturating_sub(2))),
                 host_total: Duration::from_millis(1),
@@ -392,7 +448,7 @@ mod tests {
 
     #[test]
     fn a_new_minute_opens_a_new_bucket() {
-        let mut ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
+        let mut ring: Ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
         ring.add(T0 + 5, &sample(10, Outcome::Ok));
         ring.add(T0 + 59, &sample(10, Outcome::Ok));
         ring.add(T0 + 60, &sample(10, Outcome::Runtime));
@@ -404,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_window_merges_the_buckets_inside_it() {
-        let mut ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
+        let mut ring: Ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
         for minute in 0..10 {
             ring.add(T0 + minute * 60, &sample(10 + minute, Outcome::Ok));
         }
@@ -419,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_bucket_past_the_window_is_not_read() {
-        let mut ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
+        let mut ring: Ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
         ring.add(T0, &sample(10, Outcome::Ok));
         ring.add(T0 + 30 * 60, &sample(10, Outcome::Ok));
         // Sixty minutes on, the first bucket has left the hour.
@@ -433,7 +489,7 @@ mod tests {
 
     #[test]
     fn the_day_is_kept_by_the_half_hour() {
-        let mut history = History::default();
+        let mut history: History = History::default();
         history.add(T0, &sample(10, Outcome::Ok));
         history.add(T0 + 29 * 60, &sample(10, Outcome::Ok));
         history.add(T0 + 30 * 60, &sample(10, Outcome::Timeout));
@@ -449,13 +505,13 @@ mod tests {
 
     #[test]
     fn a_window_names_every_bucket_start_it_covers() {
-        let ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
+        let ring: Ring = Ring::new(MINUTE_SECS, MINUTES_KEPT);
         let starts: Vec<u64> = ring.starts(T0 + 3_600 + 10, 3_600).collect();
         assert_eq!(starts.len(), 60);
         assert_eq!(starts.last(), Some(&(T0 + 3_600)));
         assert_eq!(starts.first(), Some(&(T0 + 60)));
 
-        let day = Ring::new(HALF_HOUR_SECS, HALF_HOURS_KEPT);
+        let day: Ring = Ring::new(HALF_HOUR_SECS, HALF_HOURS_KEPT);
         assert_eq!(day.starts(T0 + 86_400, 86_400).count(), 48);
         assert_eq!(day.starts(T0 + 10, 3_600).count(), 3);
     }
@@ -473,6 +529,9 @@ mod tests {
         let stats = bucket.stats();
         assert_eq!(stats.runs, 2);
         assert_eq!(stats.instantiate_ms_mean, Some(1.0));
+        assert_eq!(stats.link_ms_mean, Some(0.25));
+        assert_eq!(stats.allocate_ms_mean, Some(0.75));
+        assert_eq!(stats.teardown_ms_mean, Some(0.5));
         assert_eq!(stats.guest_ms.mean, Some(7.0));
         assert_eq!(stats.module_cache, CacheStats { hits: 1, misses: 0 });
         assert_eq!(stats.memory_peak_bytes.max, Some(1 << 20));

@@ -5,8 +5,11 @@
 //! its script's rolling windows. Nothing is written per run: a restart starts
 //! the windows over.
 
+pub mod ingest;
+pub mod job;
 pub mod run;
 pub mod sketch;
+pub mod stages;
 pub mod window;
 
 use std::collections::HashMap;
@@ -22,6 +25,9 @@ use crate::db::DatabaseBackend;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptKind};
 use crate::script::DispatchError;
 
+use happyview_provider::JobHookStats;
+use ingest::{IngestBucket, IngestSummary, RecordSample};
+use job::JobStats;
 use run::RunTimings;
 use window::{Bucket, History, Stats};
 
@@ -200,9 +206,21 @@ fn gauge_index(kind: ScriptKind) -> Option<usize> {
     GAUGED.iter().position(|k| *k == kind)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IngestKey {
+    collection: String,
+    action: &'static str,
+}
+
 pub struct ScriptMetrics {
     enabled: AtomicBool,
     keys: RwLock<HashMap<Key, Arc<Mutex<History>>>>,
+    /// Ingest's records, by collection and action. Bounded by [`MAX_KEYS`]
+    /// as the scripts are, and counted in the same overflow.
+    ingest: RwLock<HashMap<IngestKey, Arc<Mutex<History<IngestBucket>>>>>,
+    /// Backfill jobs' hook stats, by job id. Few jobs run at once, and each
+    /// is dropped an hour after its last record.
+    jobs: Mutex<HashMap<String, JobStats>>,
     overflow: AtomicU64,
     active: [AtomicU64; GAUGED.len()],
 }
@@ -212,10 +230,21 @@ impl Default for ScriptMetrics {
         Self {
             enabled: AtomicBool::new(true),
             keys: RwLock::default(),
+            ingest: RwLock::default(),
+            jobs: Mutex::default(),
             overflow: AtomicU64::new(0),
             active: Default::default(),
         }
     }
+}
+
+/// One job's hook stats in the live view.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct LiveJob {
+    pub job_id: String,
+    /// Seconds since the job's last record or report.
+    pub idle_s: u64,
+    pub hooks: JobHookStats,
 }
 
 /// One script's row in a window.
@@ -237,6 +266,10 @@ pub struct SeriesPoint {
     pub wall_ms: PointPercentiles,
     pub guest_ms: PointPercentiles,
     pub host_ms_mean: Option<f64>,
+    pub instantiate_ms_mean: Option<f64>,
+    pub link_ms_mean: Option<f64>,
+    pub allocate_ms_mean: Option<f64>,
+    pub teardown_ms_mean: Option<f64>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -272,9 +305,13 @@ impl Drop for ActiveRun<'_> {
 }
 
 fn unix_now() -> u64 {
+    unix_now_ms() / 1_000
+}
+
+fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -491,6 +528,10 @@ impl ScriptMetrics {
                     wall_ms: q(&bucket.wall),
                     guest_ms: q(&bucket.guest),
                     host_ms_mean: stats.host_ms_mean,
+                    instantiate_ms_mean: stats.instantiate_ms_mean,
+                    link_ms_mean: stats.link_ms_mean,
+                    allocate_ms_mean: stats.allocate_ms_mean,
+                    teardown_ms_mean: stats.teardown_ms_mean,
                 }
             })
             .collect();
@@ -501,6 +542,202 @@ impl ScriptMetrics {
             stats: total.stats(),
             points,
         })
+    }
+
+    pub fn record_ingest(
+        &self,
+        collection: &str,
+        action: &'static str,
+        job: Option<&str>,
+        sample: &RecordSample,
+    ) {
+        self.record_ingest_at(unix_now_ms(), collection, action, job, sample);
+    }
+
+    /// One record of `collection`'s `action`, finished at `at_ms`, added to
+    /// its windows and to backfill job `job`'s stats.
+    pub fn record_ingest_at(
+        &self,
+        at_ms: u64,
+        collection: &str,
+        action: &'static str,
+        job: Option<&str>,
+        sample: &RecordSample,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let at = at_ms / 1_000;
+        if let Some(job) = job {
+            self.with_job(at_ms, job, |stats| stats.add(at_ms, sample));
+        }
+        let key = IngestKey {
+            collection: collection.to_string(),
+            action,
+        };
+        let held = self
+            .ingest
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let history = match held {
+            Some(history) => history,
+            None => {
+                let mut keys = self.ingest.write().unwrap_or_else(|e| e.into_inner());
+                if !keys.contains_key(&key) && keys.len() >= MAX_KEYS {
+                    keys.retain(|_, history| {
+                        history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_live(at)
+                    });
+                    if keys.len() >= MAX_KEYS {
+                        self.overflow.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                keys.entry(key).or_default().clone()
+            }
+        };
+        history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(at, sample);
+    }
+
+    pub fn ingest(&self, window: Window) -> Vec<IngestSummary> {
+        self.ingest_at(unix_now(), window)
+    }
+
+    /// Every collection and action that saw records inside `window` ending
+    /// at `now`, busiest first.
+    pub fn ingest_at(&self, now: u64, window: Window) -> Vec<IngestSummary> {
+        let entries: Vec<(IngestKey, Arc<Mutex<History<IngestBucket>>>)> = self
+            .ingest
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut out: Vec<IngestSummary> = entries
+            .into_iter()
+            .filter_map(|(key, history)| {
+                let history = history.lock().unwrap_or_else(|e| e.into_inner());
+                let ring = match window {
+                    Window::Hour => &history.minutes,
+                    Window::Day => &history.half_hours,
+                };
+                let bucket = ring.merged(now, window.secs());
+                let oldest = ring.oldest_in(now, window.secs())?;
+                (bucket.records > 0).then(|| {
+                    bucket.summary(&key.collection, key.action, now.saturating_sub(oldest) + 1)
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.records
+                .cmp(&a.records)
+                .then_with(|| a.collection.cmp(&b.collection))
+                .then_with(|| a.action.cmp(b.action))
+        });
+        out
+    }
+
+    /// Run `f` on `job`'s stats, creating them, after dropping every job
+    /// idle past [`job::KEPT_MS`].
+    fn with_job<T>(&self, now_ms: u64, job: &str, f: impl FnOnce(&mut JobStats) -> T) -> T {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|_, stats| stats.is_live(now_ms));
+        f(jobs
+            .entry(job.to_string())
+            .or_insert_with(|| JobStats::new(now_ms)))
+    }
+
+    /// Run `f` on `job`'s stats if they are held.
+    fn held_job<T>(&self, now_ms: u64, job: &str, f: impl FnOnce(&mut JobStats) -> T) -> Option<T> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|_, stats| stats.is_live(now_ms));
+        jobs.get_mut(job).map(f)
+    }
+
+    /// `n` records' worth of `elapsed` in `job`'s stage `stage`, as its
+    /// executor measured it.
+    pub fn observe_job(&self, job: &str, stage: &'static str, elapsed: Duration, n: u64) {
+        self.observe_job_at(unix_now_ms(), job, stage, elapsed, n);
+    }
+
+    pub fn observe_job_at(
+        &self,
+        now_ms: u64,
+        job: &str,
+        stage: &'static str,
+        elapsed: Duration,
+        n: u64,
+    ) {
+        if self.enabled() {
+            self.with_job(now_ms, job, |stats| {
+                stats.observe(now_ms, stage, elapsed, n)
+            });
+        }
+    }
+
+    /// `processed` of `total` done for `job`, for its ETA.
+    pub fn job_progress(&self, job: &str, processed: i64, total: Option<i64>) {
+        if self.enabled() {
+            let now_ms = unix_now_ms();
+            self.with_job(now_ms, job, |stats| {
+                stats.progress(now_ms, processed, total)
+            });
+        }
+    }
+
+    /// `job`'s stats now, while they are held.
+    pub fn job_stats(&self, job: &str) -> Option<JobHookStats> {
+        let now_ms = unix_now_ms();
+        self.held_job(now_ms, job, |stats| stats.stats(now_ms))
+    }
+
+    /// `job`'s stats if they are due to go out ([`JobStats::due`]).
+    pub fn job_stats_due(&self, job: &str) -> Option<JobHookStats> {
+        self.job_stats_due_at(unix_now_ms(), job)
+    }
+
+    pub fn job_stats_due_at(&self, now_ms: u64, job: &str) -> Option<JobHookStats> {
+        self.held_job(now_ms, job, |stats| stats.due(now_ms))
+            .flatten()
+    }
+
+    /// `job`'s final stats. They stay readable until dropped, but are never
+    /// due again.
+    pub fn finish_job(&self, job: &str) -> Option<JobHookStats> {
+        let now_ms = unix_now_ms();
+        self.held_job(now_ms, job, |stats| {
+            stats.finished = true;
+            stats.stats(now_ms)
+        })
+    }
+
+    /// Every held job that has not finished, most recently active first.
+    pub fn live_jobs(&self) -> Vec<LiveJob> {
+        let now_ms = unix_now_ms();
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|_, stats| stats.is_live(now_ms));
+        let mut out: Vec<LiveJob> = jobs
+            .iter()
+            .filter(|(_, stats)| !stats.finished)
+            .map(|(id, stats)| LiveJob {
+                job_id: id.clone(),
+                idle_s: now_ms.saturating_sub(stats.last_ms) / 1_000,
+                hooks: stats.stats(now_ms),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.idle_s
+                .cmp(&b.idle_s)
+                .then_with(|| a.job_id.cmp(&b.job_id))
+        });
+        out
     }
 
     /// Re-read the switch. A stored value is validated on the way in, so an
@@ -771,6 +1008,45 @@ mod tests {
             })),
             Outcome::NoInterpreter
         );
+    }
+
+    #[test]
+    fn a_jobs_stats_are_dropped_an_hour_after_its_last_report() {
+        let m = ScriptMetrics::new();
+        let now = unix_now_ms();
+        m.observe_job_at(
+            now - job::KEPT_MS - 1,
+            "old",
+            "page_read",
+            Duration::ZERO,
+            1,
+        );
+        m.observe_job_at(now, "new", "page_read", Duration::from_millis(1), 1);
+        assert!(m.job_stats("old").is_none());
+        assert_eq!(m.job_stats("new").unwrap().stages["page_read"].n, 1);
+        assert_eq!(m.live_jobs().len(), 1);
+        // A finished job keeps its stats but leaves the live view, and is
+        // never due again.
+        assert!(m.finish_job("new").is_some());
+        assert!(m.live_jobs().is_empty());
+        assert!(m.job_stats("new").is_some());
+        m.observe_job_at(now + 5_000, "new", "page_read", Duration::ZERO, 1);
+        assert!(m.job_stats_due_at(now + 5_000, "new").is_none());
+    }
+
+    #[test]
+    fn a_due_job_goes_out_once_a_second() {
+        let m = ScriptMetrics::new();
+        let now = unix_now_ms();
+        m.observe_job_at(now, "j", "write", Duration::from_millis(3), 1);
+        assert!(m.job_stats_due_at(now, "j").is_some());
+        m.observe_job_at(now + 10, "j", "write", Duration::from_millis(3), 1);
+        assert!(m.job_stats_due_at(now + 10, "j").is_none());
+        assert_eq!(
+            m.job_stats_due_at(now + 1_000, "j").unwrap().stages["write"].n,
+            2
+        );
+        assert!(m.job_stats_due_at(now + 9_000, "nope").is_none());
     }
 
     #[test]

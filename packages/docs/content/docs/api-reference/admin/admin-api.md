@@ -110,6 +110,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/events`                      | `events:read`              |
 | `GET /admin/metrics/scripts`             | `metrics:read`             |
 | `GET /admin/metrics/scripts/{trigger}`   | `metrics:read`             |
+| `GET /admin/metrics/ingest`              | `metrics:read`             |
 | `GET /admin/metrics/live`                | `metrics:read`             |
 | `POST /admin/api-keys`                   | `api-keys:create`          |
 | `GET /admin/api-keys`                    | `api-keys:read`            |

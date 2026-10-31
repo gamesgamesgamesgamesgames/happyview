@@ -747,7 +747,8 @@ async fn an_executor_job_lists_in_the_admin_json() {
             r#""processed_repos":3,"total_records":7,"error":null,"#,
             r#""started_at":"2026-10-16T00:00:00Z","completed_at":null,"#,
             r#""created_at":"2026-10-16T00:00:00Z","discovery_complete":true,"#,
-            r#""recent_completions_limit":1000,"source":"store-pass","note":null,"replay":null}"#,
+            r#""recent_completions_limit":1000,"source":"store-pass","note":null,"replay":null,"#,
+            r#""hooks":null,"hook_stats":null}"#,
             "]",
         )
     );
