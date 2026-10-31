@@ -144,8 +144,6 @@ pub struct AppState {
     /// Per-script run metrics: the last day in memory, longer in
     /// `happyview_script_metrics`.
     pub metrics: Arc<metrics::ScriptMetrics>,
-    /// The origins listed in `cookie_integration_origins`, read briefly cached.
-    pub integration_origins: Arc<csrf::IntegrationOrigins>,
     /// Present only in a state the test command built for one test file.
     /// Every behaviour a test run changes — the in-process PDS, forged
     /// callers, mocks, single-attempt record scripts — is keyed on this, and

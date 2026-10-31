@@ -182,8 +182,7 @@ const CORS_ALLOW_HEADERS_ANON: &str = "content-type, authorization, x-client-key
 ///   HappyView actually serves the dashboard/admin UI on) — get their origin
 ///   reflected *with* `Access-Control-Allow-Credentials: true`, so the
 ///   cookie-authenticated dashboard works cross-origin if ever hosted on a
-///   second registered domain. An origin an admin listed in
-///   `cookie_integration_origins` is trusted the same way.
+///   second registered domain.
 /// - **Any other origin** — e.g. a third-party app or an attacker page — gets a
 ///   credential-*less* grant: its origin is reflected but credentials are never
 ///   allowed. Third-party clients authenticate with explicit DPoP + client-key
@@ -209,10 +208,7 @@ async fn cors(
         return next.run(req).await;
     };
 
-    // A listed integration would otherwise pass the CSRF guard and still be
-    // unable to read a response or send a JSON body.
-    let credentialed = state.domain_cache.is_allowed_origin(&origin).await
-        || state.integration_origins.contains(&state, &origin).await;
+    let credentialed = state.domain_cache.is_allowed_origin(&origin).await;
 
     let is_preflight = req.method() == Method::OPTIONS
         && req

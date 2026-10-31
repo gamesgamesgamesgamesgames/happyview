@@ -1135,7 +1135,6 @@ async fn boot(
         telemetry_counters,
         script_limits,
         metrics,
-        integration_origins: Arc::new(crate::csrf::IntegrationOrigins::default()),
         test: None,
     };
 
