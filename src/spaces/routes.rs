@@ -14,7 +14,7 @@ use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
-use crate::spaces::{db, members, notifications, oplog};
+use crate::spaces::{db, notifications, oplog};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -170,6 +170,7 @@ struct DeleteRecordInput {
 #[serde(rename_all = "camelCase")]
 struct GetRecordQuery {
     space: String,
+    repo: Option<String>,
     collection: String,
     rkey: String,
 }
@@ -508,14 +509,18 @@ pub(crate) async fn get_space(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = service::resolve_space(&state, &query.space).await?;
 
-    // If the space's membership is not public, require auth + membership
-    if !space.config.membership_public {
-        let claims = require_auth(&xrpc_claims)?;
-        let did = claims.did();
-        if space.creator_did != did {
-            members::is_member(&state.db, state.db_backend, &space.id, did)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Space not found".into()))?;
+    // Only the owner or a holder of a space credential may read the space.
+    let is_owner = xrpc_claims
+        .identity
+        .as_ref()
+        .is_some_and(|identity| identity.did() == space.creator_did);
+    if !is_owner {
+        if let Some(token) = &xrpc_claims.space_credential {
+            require_audience(&xrpc_claims, &space.authority_did)?;
+            service::verify_space_credential(&state, &space, token).await?;
+        } else {
+            require_auth(&xrpc_claims)?;
+            return Err(AppError::NotFound("Space not found".into()));
         }
     }
 
@@ -937,10 +942,19 @@ async fn get_record(
     )
     .await?;
 
+    // A credential is addressed to the repo it reads, and a read_self member
+    // can read only their own, so either names the repo when the query does not.
+    let repo = match (query.repo.as_deref(), xrpc_claims.space_audience.as_deref()) {
+        (Some(repo), _) => db::RecordRepo::Author(repo),
+        (None, Some(audience)) if has_credential => db::RecordRepo::Author(audience),
+        (None, _) if membership.restricted_to_own_records() => db::RecordRepo::Author(&did),
+        (None, _) => db::RecordRepo::Prefer(&did),
+    };
     let record = db::get_space_record_by_parts(
         &state.db,
         state.db_backend,
         &space.id,
+        repo,
         &query.collection,
         &query.rkey,
     )
@@ -997,6 +1011,16 @@ async fn list_records(
             Some(did.as_str())
         })
     };
+    authorize_space_read(
+        &state,
+        &xrpc_claims,
+        &did,
+        repo.unwrap_or(&space.authority_did),
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     let limit = query.limit.unwrap_or(50).min(100);
     let reverse = query.reverse.unwrap_or(false);
@@ -1092,7 +1116,8 @@ async fn revoke_invite(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, claims.did()).await?;
 
-    let revoked = db::revoke_invite(&state.db, state.db_backend, &input.invite_id).await?;
+    let revoked =
+        db::revoke_invite(&state.db, state.db_backend, &space.id, &input.invite_id).await?;
     if !revoked {
         return Err(AppError::NotFound("Invite not found".into()));
     }
@@ -1433,17 +1458,27 @@ async fn list_repos(
     let space = service::resolve_space(&state, &params.space).await?;
     require_audience(&claims, &space.authority_did)?;
 
-    if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &claims).await?;
-        service::require_membership(
-            &state,
-            &space,
-            &did,
-            false,
-            claims.space_credential.as_deref(),
-        )
-        .await?;
-    }
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+    // Every writer's DID is a whole-space read, which read_self does not grant.
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let writers = crate::spaces::writers::list(
@@ -1569,6 +1604,28 @@ async fn register_notify(
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
     require_audience(&claims, &space.authority_did)?;
+
+    // A registration is told every writer's DID and revision, so it needs the
+    // whole-space read that listing across repos does.
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     if let Some(service) = &input.service {
         let endpoint = crate::spaces::auth::resolve_service_identifier(
