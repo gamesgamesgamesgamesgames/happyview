@@ -44,7 +44,8 @@ permissions:
 # cut a version (`release`, `release-*`) are never cancelled once started
 # (`release-…` groups, cancel-in-progress false; a newer run can only drop one
 # still pending, which has cut nothing), and the jobs after them (`build`,
-# `dispatch-native-release`, `tag-latest`) have no group. Each job that can be
+# `dispatch-native-release`, `tag-latest`) have no group and follow `release`
+# alone (`always() && needs.release.result == 'success'`). Each job that can be
 # first to cut a version (`release`, `release-oauth-client`, `release-nsid`)
 # needs every cancellable job, so none of those is still running, or
 # cancellable, once a version may have been cut, and refuses to run if any
@@ -1072,7 +1073,13 @@ jobs:
   # whose tag and GitHub release already exist. The PAT needs actions:write.
   dispatch-native-release:
     needs: release
-    if: needs.release.outputs.version != ''
+    # `always()` and an explicit `needs.release.result`: a bare condition is
+    # wrapped in an implicit `success()`, which also requires every job
+    # upstream of `release` to have succeeded. `release` needs every
+    # cancellable job, so an informational one failing (coverage, audit)
+    # would skip this after a version was already cut, leaving a release
+    # with no binaries or images (v3.0.0-alpha.45).
+    if: always() && needs.release.result == 'success' && needs.release.outputs.version != ''
     runs-on: depot-ubuntu-24.04
     permissions: {}
     steps:
@@ -1090,7 +1097,13 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     needs: release
-    if: needs.release.outputs.version != ''
+    # `always()` and an explicit `needs.release.result`: a bare condition is
+    # wrapped in an implicit `success()`, which also requires every job
+    # upstream of `release` to have succeeded. `release` needs every
+    # cancellable job, so an informational one failing (coverage, audit)
+    # would skip these after a version was already cut, leaving a release
+    # with no binaries or images (v3.0.0-alpha.45).
+    if: always() && needs.release.result == 'success' && needs.release.outputs.version != ''
     runs-on: ${{ matrix.runs-on }}
     permissions:
       packages: write
@@ -1250,7 +1263,13 @@ jobs:
   # ---------------------------------------------------------------------------
   tag-latest:
     needs: [release, build]
-    if: needs.release.outputs.version != '' && !contains(needs.release.outputs.version, '-')
+    # As on `build`: only `release` and `build` decide, not what ran before.
+    if: >-
+      always()
+      && needs.release.result == 'success'
+      && needs.build.result == 'success'
+      && needs.release.outputs.version != ''
+      && !contains(needs.release.outputs.version, '-')
     runs-on: depot-ubuntu-24.04
     permissions:
       packages: write
