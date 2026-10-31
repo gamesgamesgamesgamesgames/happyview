@@ -29,6 +29,7 @@ import {
   IconChartBar,
   IconLock,
   IconWorldUpload,
+  IconGauge,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -119,6 +120,12 @@ const integrationItems: NavItem[] = [
     url: "/dashboard/settings/scripts",
     icon: IconCode,
     requiredPermissions: ["scripts:read"],
+  },
+  {
+    title: "Script Performance",
+    url: "/dashboard/settings/scripts/performance",
+    icon: IconGauge,
+    requiredPermissions: ["metrics:read"],
   },
   {
     title: "Plugins",
@@ -255,10 +262,24 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     );
   }
 
+  const allUrls = [
+    ...dataItems,
+    ...accessItems,
+    ...integrationItems,
+    ...systemItems,
+  ].map((item) => item.url);
+
+  // The longest matching entry wins, so a page nested under another entry's
+  // path (Script Performance under Scripts) lights only its own.
   function isActive(url: string) {
-    return url === "/dashboard"
-      ? pathname === "/dashboard"
-      : pathname.startsWith(url);
+    if (url === "/dashboard") return pathname === "/dashboard";
+    if (!pathname.startsWith(url)) return false;
+    return !allUrls.some(
+      (other) =>
+        other.length > url.length &&
+        other.startsWith(url) &&
+        pathname.startsWith(other),
+    );
   }
 
   const visibleData = filterByPermission(dataItems);

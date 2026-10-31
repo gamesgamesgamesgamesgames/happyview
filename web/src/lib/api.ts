@@ -21,6 +21,14 @@ import type {
 } from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
 import type {
+  IngestMetricsResponse,
+  LiveMetricsResponse,
+  MetricsStep,
+  MetricsWindow,
+  ScriptMetricsListResponse,
+  ScriptSeriesResponse,
+} from "@/types/metrics";
+import type {
   CreateLinkedRepoBody,
   LinkedRepo,
   LinkedReposListResponse,
@@ -451,6 +459,35 @@ export function retryFailedBackfill(jobId: string, kinds?: string[]) {
     method: "POST",
     body: JSON.stringify(kinds ? { kinds } : {}),
   });
+}
+
+// Metrics
+export function getScriptMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<ScriptMetricsListResponse>(
+    `/admin/metrics/scripts?window=${window}`,
+  );
+}
+
+export function getScriptSeries(
+  trigger: string,
+  window: MetricsWindow = "1h",
+  step?: MetricsStep,
+) {
+  const qs = new URLSearchParams({ window });
+  if (step) qs.set("step", step);
+  return apiFetch<ScriptSeriesResponse>(
+    `/admin/metrics/scripts/${encodeURIComponent(trigger)}?${qs}`,
+  );
+}
+
+export function getIngestMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<IngestMetricsResponse>(
+    `/admin/metrics/ingest?window=${window}`,
+  );
+}
+
+export function getLiveMetrics() {
+  return apiFetch<LiveMetricsResponse>("/admin/metrics/live");
 }
 
 // Jobs
