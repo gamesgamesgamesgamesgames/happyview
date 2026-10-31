@@ -87,7 +87,7 @@ export default function LexiconsPage() {
   async function handleDelete(lex: LexiconSummary, deleteRecords: boolean) {
     try {
       if (lex.source === "network") {
-        await deleteNetworkLexicon(lex.id);
+        await deleteNetworkLexicon(lex.id, deleteRecords);
       } else {
         await deleteLexicon(lex.id, deleteRecords);
       }

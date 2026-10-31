@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::AnyPool;
@@ -208,11 +208,29 @@ pub(super) async fn list(
 }
 
 /// DELETE /admin/network-lexicons/{nsid} — stop watching a network lexicon.
+/// `?delete_records=true`, as on the dashboard lexicon route.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct RemoveParams {
+    #[serde(default)]
+    delete_records: bool,
+}
+
+/// DELETE /admin/network-lexicons/:nsid — stop tracking a network lexicon,
+/// and with `?delete_records=true` also enqueue deletion of its indexed
+/// records.
+///
+/// Everything about the records half matches `lexicons::delete_lexicon`,
+/// deliberately: the same permission pair, the same record-lexicon-only rule,
+/// the same refusal for a collection a shared store serves, and the same
+/// ordering, so neither door is the lenient one.
 pub(super) async fn remove(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(nsid): Path<String>,
-) -> Result<StatusCode, AppError> {
+    Query(params): Query<RemoveParams>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+
     auth.require(Permission::LexiconsDelete).await?;
 
     // The dashboard's error toast rewrites any message containing "network"
@@ -224,6 +242,29 @@ pub(super) async fn remove(
     }
 
     state.lexicons.check_writable(&nsid)?;
+
+    // Decided while the lexicon still exists, as on the other route: a
+    // refusal must not leave it removed and its records orphaned.
+    let mut counted: Option<i64> = None;
+    if params.delete_records {
+        auth.require(Permission::RecordsDeleteCollection).await?;
+        auth.require(Permission::RecordsDelete).await?;
+        let lexicon = state
+            .lexicons
+            .get(&nsid)
+            .await
+            .ok_or_else(|| AppError::NotFound(format!("network lexicon '{nsid}' not found")))?;
+        if lexicon.lexicon_type != LexiconType::Record {
+            return Err(AppError::BadRequest(super::lexicons::not_a_record_lexicon(
+                &nsid, &lexicon,
+            )));
+        }
+        if let Some(reason) = super::lexicons::records_not_locally_deletable(&state, &nsid) {
+            return Err(AppError::BadRequest(reason));
+        }
+        counted = state.records.count_collection(&nsid).await.ok();
+    }
+
     if !state
         .lexicons
         .remove_network(&state.db, state.db_backend, &nsid)
@@ -234,7 +275,31 @@ pub(super) async fn remove(
         )));
     }
     notify_collections(&state).await;
-    Ok(StatusCode::NO_CONTENT)
+
+    if !params.delete_records {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let job_id = crate::jobs::db::create_job(
+        &state,
+        "happyview.delete-collection",
+        &serde_json::json!({ "collection": nsid }),
+        &auth.did,
+        false,
+        None,
+        None,
+    )
+    .await?;
+    tracing::info!(
+        collection = %nsid,
+        job = %job_id,
+        records = ?counted,
+        "deleting a network lexicon's indexed records"
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(serde_json::json!({ "job_id": job_id, "collection": nsid })),
+    )
+        .into_response())
 }
 
 pub(crate) struct DeclaredPlan {
