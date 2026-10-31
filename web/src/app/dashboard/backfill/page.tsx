@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import Link from "next/link";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -541,10 +542,24 @@ function HookDetailRow({
   stats: HookStats;
   finished: boolean;
 }) {
-  const { progress, scriptShare } = hookDetail(stats, finished);
+  const { progress, scriptShare, deadLettered } = hookDetail(stats, finished);
   return (
     <>
-      <span>{progress.join(" · ")}</span>
+      <span>
+        {progress.join(" · ")}
+        {deadLettered && (
+          <>
+            {progress.length > 0 && " · "}
+            {deadLettered} in{" "}
+            <Link
+              href="/dashboard/dead-letters"
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              Dead Letters
+            </Link>
+          </>
+        )}
+      </span>
       {scriptShare && <span>{scriptShare}</span>}
     </>
   );

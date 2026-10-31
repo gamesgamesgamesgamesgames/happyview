@@ -107,6 +107,11 @@ export interface HookDetail {
   progress: string[];
   /** How much of a record's time its hook's script spent, when known. */
   scriptShare: string | null;
+  /**
+   * How many records went to Dead Letters, as a count to say beside a link
+   * there, or null for none.
+   */
+  deadLettered: string | null;
 }
 
 /**
@@ -124,20 +129,22 @@ export function hookDetail(stats: HookStats, finished: boolean): HookDetail {
   if (!finished && stats.eta_s != null) {
     progress.push(`${etaText(stats.eta_s)} left`);
   }
-  if (stats.failed > 0)
-    progress.push(`${stats.failed.toLocaleString()} failed`);
-  if (stats.timeouts > 0) {
-    progress.push(`${stats.timeouts.toLocaleString()} timed out`);
-  }
-  if (stats.dead_lettered > 0) {
-    progress.push(`${stats.dead_lettered.toLocaleString()} dead-lettered`);
+  // Timeouts are among the failures, and a dead-lettered record failed too.
+  if (stats.failed > 0) {
+    const timedOut =
+      stats.timeouts > 0
+        ? ` (${stats.timeouts.toLocaleString()} timed out)`
+        : "";
+    progress.push(`${stats.failed.toLocaleString()} failed${timedOut}`);
   }
   return {
     progress,
     scriptShare:
       stats.script_share == null
         ? null
-        : `script ${shareText(stats.script_share)} of record time`,
+        : `${shareText(stats.script_share)} of time in scripts`,
+    deadLettered:
+      stats.dead_lettered > 0 ? stats.dead_lettered.toLocaleString() : null,
   };
 }
 

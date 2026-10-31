@@ -114,7 +114,8 @@ describe("hookDetail", () => {
   it("reads a running job's rate and time left, and the script's share", () => {
     expect(hookDetail(stats(), false)).toEqual({
       progress: ["410/s", "about 2 h 55 m left"],
-      scriptShare: "script 2.1% of record time",
+      scriptShare: "2.1% of time in scripts",
+      deadLettered: null,
     });
   });
 
@@ -123,11 +124,20 @@ describe("hookDetail", () => {
       stats({ failed: 3, timeouts: 1, dead_lettered: 2 }),
       false,
     );
-    expect(detail.progress.slice(2)).toEqual([
-      "3 failed",
-      "1 timed out",
-      "2 dead-lettered",
-    ]);
+    expect(detail.progress.slice(2)).toEqual(["3 failed (1 timed out)"]);
+    expect(detail.deadLettered).toBe("2");
+  });
+
+  it("leaves out timeouts and Dead Letters when there are none", () => {
+    const detail = hookDetail(stats({ failed: 3 }), false);
+    expect(detail.progress.slice(2)).toEqual(["3 failed"]);
+    expect(detail.deadLettered).toBeNull();
+  });
+
+  it("keeps a tiny script share readable", () => {
+    expect(hookDetail(stats({ script_share: 0.0004 }), false).scriptShare).toBe(
+      "<0.1% of time in scripts",
+    );
   });
 
   it("reads a finished job's average, with no time left", () => {
@@ -140,7 +150,7 @@ describe("hookDetail", () => {
         stats({ rate_per_s: 0, eta_s: null, script_share: null }),
         false,
       ),
-    ).toEqual({ progress: [], scriptShare: null });
+    ).toEqual({ progress: [], scriptShare: null, deadLettered: null });
   });
 
   it("keeps a decimal on a slow rate", () => {
