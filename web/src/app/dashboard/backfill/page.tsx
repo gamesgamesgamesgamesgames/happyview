@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
+import { AnimatedNumber } from "./animated-number";
 import { RecordsProgress } from "./records-progress-bar";
 import {
   hookDetail,
@@ -413,40 +414,6 @@ function PdsPlaceholderIcon() {
       <path d="M2 4v4M14 4v4" />
     </svg>
   );
-}
-
-function AnimatedNumber({ value }: { value: number }) {
-  const targetRef = useRef(value);
-  const displayedRef = useRef(value);
-  const [displayed, setDisplayed] = useState(value);
-  const rafRef = useRef<number>(0);
-
-  useEffect(() => {
-    targetRef.current = value;
-    cancelAnimationFrame(rafRef.current);
-
-    function tick() {
-      const current = displayedRef.current;
-      const target = targetRef.current;
-      const diff = target - current;
-
-      if (Math.abs(diff) < 0.5) {
-        displayedRef.current = target;
-        setDisplayed(target);
-        return;
-      }
-
-      const next = current + diff * 0.06;
-      displayedRef.current = next;
-      setDisplayed(next);
-      rafRef.current = requestAnimationFrame(tick);
-    }
-
-    tick();
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [value]);
-
-  return <>{Math.round(displayed).toLocaleString()}</>;
 }
 
 function CompactRepoRow({

@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 
+import { AnimatedNumber } from "./animated-number";
 import {
   type RecordsCount,
-  recordsCountText,
+  recordsCountParts,
   recordsFraction,
 } from "./records-progress";
 
@@ -23,12 +24,20 @@ export function RecordsProgress({
   detail?: ReactNode;
 }) {
   const fraction = recordsFraction(count);
+  const { done, total, estimated, noun } = recordsCountParts(count);
   return (
     <div className="flex flex-col gap-2 px-3 py-2.5 text-sm">
       <div className="flex items-center justify-between gap-2">
         <span>{label}</span>
         <span className="text-xs text-muted-foreground tabular-nums">
-          {recordsCountText(count)}
+          <AnimatedNumber value={done} />
+          {total != null && (
+            <>
+              {` of ${estimated ? "about " : ""}`}
+              <AnimatedNumber value={total} />
+            </>
+          )}
+          {` ${noun}`}
         </span>
       </div>
       <div
