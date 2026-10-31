@@ -15,19 +15,13 @@ use std::time::{Duration, Instant};
 
 use happyview::AppState;
 use happyview::plugin::{
-    ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits, ScriptKind,
+    ExecutionError, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits, ScriptKind,
 };
 use serde_json::Value;
 
 /// What a burn is sized to cost: three times the one-second budget a caller
 /// sets, so the margin absorbs the error in a measured rate.
 pub const TARGET: Duration = Duration::from_secs(3);
-
-/// What a caller's own measurement must clear for its run to have proved
-/// anything. The gap below [`TARGET`] is the slack a rate read on a machine
-/// that then ran slower is allowed; a burn the guest never spent falls far
-/// below it.
-pub const FLOOR: Duration = Duration::from_secs(2);
 
 /// The shortest reading a rate may be derived from. Under this a scheduling
 /// stall is a large fraction of it, so the sample grows until it clears this
@@ -38,7 +32,7 @@ const MIN_READING: Duration = Duration::from_millis(40);
 /// meaning anything. The start is short enough to cost little on a slow
 /// machine; growing it eightfold reaches a usable reading on a fast one in a
 /// step or two, and the discarded steps together cost a fraction of the one
-/// that is kept. No machine runs a trillion iterations inside the floor
+/// that is kept. No machine runs a trillion iterations inside the target
 /// above, so reaching the ceiling says the directive spends nothing — the
 /// fixture built for the host target rather than wasm does exactly that —
 /// and growing further would only overflow.
@@ -64,19 +58,38 @@ impl Burn {
         format!("burn:{}", self.iterations)
     }
 
-    /// Panics unless `measured` clears [`FLOOR`]. A caller's assertion that
+    /// Panics unless `measured` outlasts `budget`. A caller's assertion that
     /// the run completed means nothing on its own, because a burn the guest
     /// never spent completes under a lifted deadline and an armed one alike.
-    pub fn assert_outlasted(&self, measured: Duration) {
+    ///
+    /// The bound is the budget, not [`TARGET`]: the burn was sized from a
+    /// rate read a moment earlier, and a runner whose load eased since spends
+    /// it faster, which is no failure of the deadline. [`Self::assert_bounded`]
+    /// is what shows the burn outlasts the budget under this run's load.
+    pub fn assert_outlasted(&self, measured: Duration, budget: Duration) {
         assert!(
-            measured >= FLOOR,
+            measured > budget,
             "a burn of {} iterations, sized for {TARGET:?} from a measured \
-             {:.3e} iterations per second, took {measured:?}: the guest did \
-             not spend it, so the run completing says nothing about the \
-             deadline it ran under",
+             {:.3e} iterations per second, took {measured:?}, within the \
+             {budget:?} budget: the guest did not spend it, so the run \
+             completing says nothing about the deadline it ran under",
             self.iterations,
             self.rate,
         );
+    }
+
+    /// Panics unless the burn, run as an XRPC query under `state`'s wall
+    /// clock, times out: the burn outlasts that budget on this machine as it
+    /// runs now, whatever the rate it was sized from.
+    pub async fn assert_bounded(&self, state: &AppState, interpreter: &str) {
+        let mut query = burn_input(&self.source(), ScriptKind::XrpcQuery);
+        query.context.trigger = "xrpc.query:burn.bounded".into();
+        let err = state
+            .plugin_executor()
+            .execute_script(interpreter, &query)
+            .await
+            .expect_err("a burn that outlasts the wall clock must not return from a query");
+        assert!(matches!(err, ExecutionError::Timeout), "{err}");
     }
 }
 
@@ -114,9 +127,22 @@ pub async fn calibrate(state: &AppState, interpreter: &str) -> Burn {
 /// What one burn of `iterations` costs, measured as a job so no deadline can
 /// truncate the reading.
 async fn sample(state: &AppState, interpreter: &str, iterations: u64) -> Duration {
-    let input = ScriptExecuteInput {
-        source: format!("burn:{iterations}"),
-        kind: ScriptKind::Job,
+    let input = burn_input(&format!("burn:{iterations}"), ScriptKind::Job);
+
+    let started = Instant::now();
+    state
+        .plugin_executor()
+        .execute_script(interpreter, &input)
+        .await
+        .expect("a calibration burn must run");
+    started.elapsed()
+}
+
+/// A run of `source` as `kind`.
+fn burn_input(source: &str, kind: ScriptKind) -> ScriptExecuteInput {
+    ScriptExecuteInput {
+        source: source.to_string(),
+        kind,
         input: Value::Null,
         context: ScriptExecuteContext {
             trigger: "job.run:burn.calibrate".into(),
@@ -130,13 +156,5 @@ async fn sample(state: &AppState, interpreter: &str, iterations: u64) -> Duratio
         removed_globals: Vec::new(),
         chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
         artifact: None,
-    };
-
-    let started = Instant::now();
-    state
-        .plugin_executor()
-        .execute_script(interpreter, &input)
-        .await
-        .expect("a calibration burn must run");
-    started.elapsed()
+    }
 }

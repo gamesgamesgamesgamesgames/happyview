@@ -548,7 +548,9 @@ async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
     worker.abort();
 
     assert_eq!(status, "completed", "job error: {error:?}");
-    burn.assert_outlasted(burned);
+    let budget = std::time::Duration::from_secs(1);
+    burn.assert_outlasted(burned, budget);
+    burn.assert_bounded(&app.state, "interpreter_echo").await;
 }
 
 // Multi-threaded, because a burning guest holds its thread for the whole run.
