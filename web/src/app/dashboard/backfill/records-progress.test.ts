@@ -212,4 +212,21 @@ describe("executorProgress", () => {
     });
     expect(recordsFraction(row)).toBe(0.1);
   });
+
+  it("doesn't call a failed or paused pass running", () => {
+    for (const status of ["failed", "cancelled", "paused"] as const) {
+      const row = executorProgress({
+        status,
+        processed_repos: 10,
+        total_repos: 100,
+      });
+      expect(row.label).toBe("Record scripts");
+    }
+    const pausing = executorProgress({
+      status: "pausing",
+      processed_repos: 10,
+      total_repos: 100,
+    });
+    expect(pausing.label).toBe("Running record scripts");
+  });
 });

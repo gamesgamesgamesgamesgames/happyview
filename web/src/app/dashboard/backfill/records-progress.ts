@@ -168,7 +168,12 @@ export function executorProgress(
     };
   }
   return {
-    label: "Running record scripts",
+    // Only a pass that is still going is "running"; a failed, cancelled or
+    // paused one keeps its count under a plain label.
+    label:
+      job.status === "running" || job.status === "pausing"
+        ? "Running record scripts"
+        : "Record scripts",
     done,
     total: job.total_repos,
     estimated: true,
