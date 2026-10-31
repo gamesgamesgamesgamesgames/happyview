@@ -15,7 +15,7 @@ import {
 } from "./records-progress";
 
 describe("runningLabel", () => {
-  it("says a store pass is running, not starting, while its stage stays pending", () => {
+  it("says an executor's backfill is running, not starting, while its stage stays pending", () => {
     expect(runningLabel({ stage: "pending", source: "store-pass" })).toBe(
       "running",
     );
@@ -55,8 +55,8 @@ describe("recordsCountText", () => {
   });
 
   it("stands alone without a total", () => {
-    expect(recordsCountText({ done: 7, total: null, noun: "hooked" })).toBe(
-      "7 hooked",
+    expect(recordsCountText({ done: 7, total: null, noun: "repos" })).toBe(
+      "7 repos",
     );
     expect(recordsCountText({ done: 7 })).toBe("7 records");
   });
@@ -177,7 +177,7 @@ describe("executorProgress", () => {
       processed_repos: 1200,
       total_repos: 5500,
     });
-    expect(row.label).toBe("Running the create hook over stored records");
+    expect(row.label).toBe("Running record scripts");
     expect(recordsCountText(row)).toBe(
       `${(1200).toLocaleString()} of about ${(5500).toLocaleString()} records`,
     );
@@ -189,7 +189,7 @@ describe("executorProgress", () => {
       processed_repos: 5546055,
       total_repos: 5549379,
     });
-    expect(row.label).toBe("Ran the create hook over stored records");
+    expect(row.label).toBe("Ran record scripts");
     expect(recordsFraction(row)).toBe(1);
     expect(recordsCountText(row)).toBe(`${(5546055).toLocaleString()} records`);
   });

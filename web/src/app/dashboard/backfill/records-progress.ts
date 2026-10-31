@@ -154,14 +154,14 @@ export function executorProgress(
   const done = job.processed_repos ?? 0;
   if (job.status === "completed") {
     return {
-      label: "Ran the create hook over stored records",
+      label: "Ran record scripts",
       done,
       total: done,
       estimated: false,
     };
   }
   return {
-    label: "Running the create hook over stored records",
+    label: "Running record scripts",
     done,
     total: job.total_repos,
     estimated: true,

@@ -1411,9 +1411,8 @@ function JobDetail({
             )}
             {!byExecutor && hookStats && (
               <RecordsProgress
-                label="Running hooks"
+                label="Record scripts"
                 done={hookStats.done}
-                noun="records hooked"
                 active={isActive && !isPaused}
                 detail={
                   <HookDetailRow stats={hookStats} finished={!isActive} />
