@@ -520,7 +520,7 @@ pub(crate) async fn ensure_configured_superadmin(
     did: &str,
 ) -> Result<SuperadminSeed, sqlx::Error> {
     let now = now_rfc3339();
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db, backend).await?;
 
     let existing: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
         "SELECT id, is_super FROM happyview_users WHERE did = ?",
@@ -645,6 +645,54 @@ mod tests {
         assert_eq!(seed, SuperadminSeed::Promoted);
         assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
         assert_eq!(user(&db, "did:plc:other-super").await.unwrap().1, 1);
+    }
+
+    /// SQLite in WAL mode: another writer commits while the seed waits to
+    /// write. A deferred `BEGIN` read the user under the old snapshot, so its
+    /// write fails with `SQLITE_BUSY` at once; holding the write lock from
+    /// the start, the seed waits its turn and lands.
+    #[tokio::test]
+    async fn a_seed_waits_out_a_concurrent_writer() {
+        let path = std::env::temp_dir().join(format!("hv-seed-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = crate::db::connect_with(&url, DatabaseBackend::Sqlite, 2).await;
+        insert_user(&db, "did:plc:boss", 0).await;
+
+        let mut holder = db.acquire().await.expect("acquire the other writer");
+        crate::db::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .expect("take the write lock");
+        let seeding = tokio::spawn({
+            let db = db.clone();
+            async move {
+                ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss").await
+            }
+        });
+        // Long enough for the seed to have begun and be waiting on the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES ('t', 'v', 't')",
+        )
+        .execute(&mut *holder)
+        .await
+        .expect("the other writer writes");
+        crate::db::query("COMMIT")
+            .execute(&mut *holder)
+            .await
+            .expect("the other writer commits");
+        drop(holder);
+
+        let seed = seeding
+            .await
+            .expect("the seed task")
+            .expect("the seed lands");
+        assert_eq!(seed, SuperadminSeed::Promoted);
+        assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
+        db.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[tokio::test]

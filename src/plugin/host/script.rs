@@ -69,6 +69,10 @@ pub struct ScriptRun {
     /// caps in total: a wait is host time, so a job that waits in a loop
     /// would otherwise never reach its deadline.
     pub waited_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Where this run's host imports are timed, when the run is measured.
+    /// The run's own rather than the task's, because a library call runs on
+    /// the caller's task and its imports are already inside the caller's.
+    pub metrics: Option<Arc<crate::metrics::run::RunCollector>>,
 }
 
 #[derive(Debug, thiserror::Error)]

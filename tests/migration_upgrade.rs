@@ -722,3 +722,93 @@ async fn postgres_rollback_from_the_tombstones_then_upgrade_again() {
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
     }
 }
+
+/// The last migration before clients could hold several secrets.
+const PRE_CLIENT_SECRETS_CUTOFF: &str = "20261028000001";
+
+/// A client's secret from before the secrets table becomes its "Original"
+/// credential with the hash copied byte for byte; the plaintext was never
+/// stored, so a re-hash could not reproduce it. A client with no secret gets
+/// no credential.
+async fn assert_client_secrets_carry_over(pool: &AnyPool, migrations_dir: &str) {
+    let baseline_dir =
+        std::env::temp_dir().join(format!("hv-pre-secrets-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &baseline_dir, PRE_CLIENT_SECRETS_CUTOFF);
+    Migrator::new(baseline_dir.as_path())
+        .await
+        .expect("load pre-secrets migrations")
+        .run(pool)
+        .await
+        .expect("pre-secrets migrations apply");
+
+    sqlx::query(
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, client_type, created_by, created_at, updated_at) VALUES \
+         ('conf', 'hvc_conf', 'b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c', 'Confidential', 'https://conf.example/meta.json', 'https://conf.example', '[]', 'confidential', 'did:plc:admin', '2026-05-01T00:00:00+00:00', '2026-05-01T00:00:00+00:00'), \
+         ('pub', 'hvc_pub', '', 'Public', 'https://pub.example/meta.json', 'https://pub.example', '[]', 'public', 'did:plc:admin', '2026-05-01T00:00:00+00:00', '2026-05-01T00:00:00+00:00')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed clients");
+
+    Migrator::new(Path::new(migrations_dir))
+        .await
+        .expect("load current migrations")
+        .run(pool)
+        .await
+        .expect("current migrations apply");
+
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> =
+        sqlx::query_as(
+            "SELECT client_id, label, secret_hash, created_at, last_used_at, revoked_at FROM happyview_api_client_secrets ORDER BY client_id",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("read client secrets");
+    assert_eq!(
+        rows,
+        vec![(
+            "conf".to_string(),
+            "Original".to_string(),
+            "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c".to_string(),
+            "2026-05-01T00:00:00+00:00".to_string(),
+            None,
+            None,
+        )]
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+}
+
+#[tokio::test]
+async fn sqlite_client_secrets_carry_over() {
+    happyview::db::install_drivers();
+    let tmp_db = std::env::temp_dir().join(format!("hv-secrets-{}.db", uuid::Uuid::new_v4()));
+    let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+        .await
+        .expect("connect to fresh sqlite database");
+    assert_client_secrets_carry_over(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_client_secrets_carry_over() {
+    let ran = with_scratch_postgres("hv_secrets", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_client_secrets_carry_over(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}

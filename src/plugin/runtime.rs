@@ -170,6 +170,21 @@ pub struct WasmRuntime {
     epoch: Arc<AtomicU64>,
     ticker_stop: Arc<AtomicBool>,
     modules: Arc<ModuleCache>,
+    /// The linkers every instance on this engine is made with, built once.
+    /// They live here, beside the engine they are bound to, because an
+    /// executor is made per call and would rebuild them every time.
+    linkers: SharedLinkers,
+}
+
+/// One linker without WASI preview 1 and one with it, each built on first
+/// use. Building one registers every host function, which profiled at about
+/// a fifth of a record hook's CPU when it was done per instance. Host
+/// functions reach a run's state only through the store's data, so one
+/// linker serves every store.
+#[derive(Default)]
+pub(crate) struct SharedLinkers {
+    pub(crate) env: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
+    pub(crate) wasi: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
 }
 
 /// The WebAssembly proposal HappyView turns off that `bytes` needs, if one
@@ -265,7 +280,13 @@ impl WasmRuntime {
             epoch: Arc::new(AtomicU64::new(0)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
             modules: Arc::default(),
+            linkers: SharedLinkers::default(),
         })
+    }
+
+    /// The linkers instances on this engine share.
+    pub(crate) fn linkers(&self) -> &SharedLinkers {
+        &self.linkers
     }
 
     /// This runtime, compiling every module it does not hold itself rather
@@ -313,13 +334,27 @@ impl WasmRuntime {
     /// ones above it. Everything past this runtime's memory runs on a
     /// blocking thread: a compile takes up to seconds.
     pub async fn module_for(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
+        self.module_lookup(plugin).await.map(|(module, _)| module)
+    }
+
+    /// As [`WasmRuntime::module_for`], saying whether this lookup was served
+    /// from this runtime's memory. Anything else (disk, the process's
+    /// compiled modules, a compile) is a miss.
+    pub async fn module_lookup(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Result<(Module, bool), anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
-            return Ok(module);
+            self.modules.count_lookup(true);
+            return Ok((module, true));
         }
         let engine = self.engine.clone();
         let modules = self.modules.clone();
         let plugin = plugin.clone();
-        tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
+        let (module, hit) =
+            tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await??;
+        self.modules.count_lookup(hit);
+        Ok((module, hit))
     }
 
     /// Start compiling `plugin`'s module on a blocking thread, so its first
@@ -349,9 +384,12 @@ impl WasmRuntime {
     /// already off the async workers.
     pub fn module_for_blocking(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
+            self.modules.count_lookup(true);
             return Ok(module);
         }
-        resolve(&self.engine, &self.modules, plugin)
+        let (module, hit) = resolve(&self.engine, &self.modules, plugin)?;
+        self.modules.count_lookup(hit);
+        Ok(module)
     }
 
     /// Drop the in-memory module held for `plugin_id`.
@@ -362,6 +400,17 @@ impl WasmRuntime {
     /// Compiles performed by this runtime, cache hits excluded.
     pub fn compile_count(&self) -> u64 {
         self.modules.compiles.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups served from this runtime's memory.
+    pub fn cache_hits(&self) -> u64 {
+        self.modules.hits.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups that had to go to disk, the process's compiled
+    /// modules, or the compiler.
+    pub fn cache_misses(&self) -> u64 {
+        self.modules.misses.load(Ordering::Relaxed)
     }
 
     /// The file stem a module's serialized form is kept under: the wasm
@@ -423,33 +472,36 @@ fn cache_key(engine: &Engine, wasm_sha256: &str) -> String {
 
 /// `plugin`'s module past the identity check: by hash in memory, from
 /// disk, or through [`compile`].
+/// The module for `plugin` and whether this runtime's memory held it. A
+/// caller that waited out another's compile finds it in memory, which counts
+/// as a hit: the wait was not this caller's compile.
 fn resolve(
     engine: &Engine,
     modules: &ModuleCache,
     plugin: &Arc<LoadedPlugin>,
-) -> Result<Module, anyhow::Error> {
+) -> Result<(Module, bool), anyhow::Error> {
     let id = plugin.info.id.as_str();
     let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
     if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
-        return Ok(module);
+        return Ok((module, true));
     }
     let key = cache_key(engine, &sha);
     // One compile per key at a time: whoever waited here finds the module
     // the holder inserted.
     let slot = modules.compiling(&key);
     let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
-    let result = (|| -> Result<Module, anyhow::Error> {
+    let result = (|| -> Result<(Module, bool), anyhow::Error> {
         if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
-            return Ok(module);
+            return Ok((module, true));
         }
         if let Some(module) = modules.load_from_disk(engine, &key) {
             modules.insert(id, plugin, &sha, module.clone());
-            return Ok(module);
+            return Ok((module, false));
         }
         let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
         modules.write_to_disk(&key, &module, serialized.as_deref());
         modules.insert(id, plugin, &sha, module.clone());
-        Ok(module)
+        Ok((module, false))
     })();
     modules.done_compiling(&key, &slot);
     result
@@ -643,6 +695,8 @@ struct ModuleCache {
     entries: Mutex<HashMap<String, CachedModule>>,
     dir: Option<PathBuf>,
     compiles: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
     warned: AtomicBool,
     /// Set by [`WasmRuntime::without_shared_modules`].
     unshared: bool,
@@ -652,6 +706,11 @@ struct ModuleCache {
 }
 
 impl ModuleCache {
+    fn count_lookup(&self, hit: bool) {
+        let counter = if hit { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn compiling(&self, key: &str) -> Arc<Mutex<()>> {
         self.in_flight
             .lock()
@@ -1496,6 +1555,22 @@ mod tests {
         assert_eq!(runtime.compile_count(), 1);
         assert_eq!(answer(&runtime, &first), 7);
         assert_eq!(answer(&runtime, &second), 7);
+    }
+
+    /// Each lookup says whether memory served it, and the runtime keeps the
+    /// tally: a lookup that compiled or loaded is a miss.
+    #[tokio::test]
+    async fn a_lookup_reports_whether_memory_held_the_module() {
+        let runtime = WasmRuntime::without_ticker()
+            .unwrap()
+            .without_shared_modules();
+        let plugin = plugin("p", &answering(7));
+        let (_, first) = runtime.module_lookup(&plugin).await.unwrap();
+        let (_, second) = runtime.module_lookup(&plugin).await.unwrap();
+        assert!(!first);
+        assert!(second);
+        runtime.module_for_blocking(&plugin).unwrap();
+        assert_eq!((runtime.cache_hits(), runtime.cache_misses()), (2, 1));
     }
 
     /// The same bytes under a fresh registration hit by hash; different

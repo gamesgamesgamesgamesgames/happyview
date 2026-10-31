@@ -37,6 +37,7 @@ pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
 pub mod maintenance;
+pub mod metrics;
 pub mod oauth;
 pub mod plc;
 pub mod plugin;
@@ -140,6 +141,8 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
+    /// Per-script run metrics, in memory only.
+    pub metrics: Arc<metrics::ScriptMetrics>,
     /// Present only in a state the test command built for one test file.
     /// Every behaviour a test run changes — the in-process PDS, forged
     /// callers, mocks, single-attempt record scripts — is keyed on this, and

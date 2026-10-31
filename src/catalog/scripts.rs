@@ -1,8 +1,11 @@
 //! Scripts, layered: a project file, then a dashboard row.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Serialize;
 use sqlx::AnyPool;
@@ -15,6 +18,19 @@ use crate::project::{ProjectScript, ProjectSnapshot, ScriptBody, SharedSnapshot,
 /// The chunk name of a script with no file. The wire's own default, so a row
 /// resolved here and an input built without a chunk name agree.
 pub const DASHBOARD_CHUNK_NAME: &str = crate::plugin::DEFAULT_CHUNK_NAME;
+
+/// A record-event lookup's key within one batch: the snapshot it was
+/// resolved in, by address, then the collection and the action.
+type RecordEventKey = (usize, String, String);
+
+tokio::task_local! {
+    /// Record-event lookups already answered for the batch this task is
+    /// applying (see [`ScriptCatalog::for_one_batch`]). Each holds its
+    /// snapshot, so no other snapshot can take its address meanwhile.
+    static RECORD_EVENT_LOOKUPS: RefCell<
+        HashMap<RecordEventKey, (Arc<ProjectSnapshot>, Option<ResolvedScript>)>,
+    >;
+}
 
 /// What the dashboard asks to store. `outbound_xrpcs` is derived from `body`
 /// on every write, so no caller can store a stale list.
@@ -159,6 +175,8 @@ pub struct ScriptCatalog {
     db: AnyPool,
     backend: DatabaseBackend,
     project: SharedSnapshot,
+    /// How many times a lookup read the table.
+    table_reads: Arc<AtomicUsize>,
 }
 
 impl ScriptCatalog {
@@ -167,7 +185,23 @@ impl ScriptCatalog {
             db,
             backend,
             project,
+            table_reads: Arc::default(),
         }
+    }
+
+    /// How many times a lookup has read the table rather than answering from
+    /// the project or a batch's earlier lookup.
+    pub fn table_reads(&self) -> usize {
+        self.table_reads.load(Ordering::Relaxed)
+    }
+
+    /// Runs `fut` with record-event lookups remembered for its length: one
+    /// batch of events resolves each collection's hook once, not once per
+    /// record. A row saved meanwhile reaches the next batch.
+    pub async fn for_one_batch<F: Future>(fut: F) -> F::Output {
+        RECORD_EVENT_LOOKUPS
+            .scope(RefCell::new(HashMap::new()), fut)
+            .await
     }
 
     /// A catalog with an empty project layer, for a process that runs no
@@ -211,6 +245,7 @@ impl ScriptCatalog {
                 snapshot: Arc::clone(snap),
             });
         }
+        self.table_reads.fetch_add(1, Ordering::Relaxed);
         match script_rows::get(&self.db, self.backend, &trigger_id).await {
             Ok(Some(columns)) => {
                 let row = ManualScript::from_columns(columns);
@@ -237,6 +272,31 @@ impl ScriptCatalog {
     /// `record.<action>:<nsid>` first, then `record.index:<nsid>`, each looked
     /// up through every layer.
     pub async fn resolve_record_event_in(
+        &self,
+        snap: &Arc<ProjectSnapshot>,
+        nsid: &str,
+        action: &str,
+    ) -> Option<ResolvedScript> {
+        let key = (
+            Arc::as_ptr(snap) as usize,
+            nsid.to_string(),
+            action.to_string(),
+        );
+        if let Ok(Some(known)) =
+            RECORD_EVENT_LOOKUPS.try_with(|known| known.borrow().get(&key).map(|(_, s)| s.clone()))
+        {
+            return known;
+        }
+        let resolved = self.lookup_record_event(snap, nsid, action).await;
+        let _ = RECORD_EVENT_LOOKUPS.try_with(|known| {
+            known
+                .borrow_mut()
+                .insert(key, (Arc::clone(snap), resolved.clone()))
+        });
+        resolved
+    }
+
+    async fn lookup_record_event(
         &self,
         snap: &Arc<ProjectSnapshot>,
         nsid: &str,

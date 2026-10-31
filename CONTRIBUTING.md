@@ -67,6 +67,166 @@ git config core.hooksPath .githooks
   half is skipped.
 - **pre-push** runs `cargo clippy --all-targets`, which also covers test code.
 
+### Running the development stack
+
+This guide runs the full HappyView stack locally with hot reloading, using the `docker-compose.yml` at the repository root. The Rust server rebuilds on save via `cargo watch`, and the dashboard runs the Next.js dev server.
+
+This is not the production path — nothing here uses the published image. To deploy HappyView from prebuilt images, see [Docker](https://happyview.dev/docs/guides/self-hosting/docker). To run the server directly on your machine without containers, see [From Source](https://happyview.dev/docs/guides/self-hosting/from-source).
+
+#### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+
+#### 1. Clone and configure
+
+```sh
+git clone git@github.com:gamesgamesgamesgamesgames/happyview
+cd happyview
+cp .env.example .env
+```
+
+Set `SESSION_SECRET` in `.env` to a random value — `openssl rand -base64 48` works. The defaults cover everything else. See [Configuration](https://happyview.dev/docs/guides/configuration) for the full list.
+
+#### 2. Start the stack
+
+```sh
+docker compose up
+```
+
+The first run takes several minutes: it compiles the Rust workspace from scratch inside the container and installs `cargo-watch`. Subsequent runs reuse the cached `cargo-target` volume, so only changed crates rebuild.
+
+Four services come up:
+
+| Service       | Port   | Description                                                                 |
+| ------------- | ------ | --------------------------------------------------------------------------- |
+| **caddy**     | 3080   | Unified origin — routes to the backend or the dashboard                    |
+| **happyview** | 3000   | Rust API server, rebuilt on save by `cargo watch`                           |
+| **web**       | 3001   | Next.js dashboard dev server, hot-reloads on changes to `web/`              |
+| **tunnel**    | ---    | `cloudflared`, giving the stack a public HTTPS URL                          |
+
+> [!NOTE]
+> **Use :3080, not :3000 or :3001**
+>
+> `caddy` is what stitches the two halves into one origin, and it's what the tunnel points at. `scripts/dev-Caddyfile` sends `/api`, `/admin`, `/auth`, `/xrpc`, `/oauth`, `/external-auth`, `/.well-known`, `/health`, `/config`, and `/settings` to the Rust server, and everything else to Next.js. Hitting the two ports separately splits your session cookie across origins and skips that routing.
+
+Port 3000 does serve a dashboard, but not a useful one in this stack. The dev `happyview` service sets no `STATIC_DIR`, so the server falls back to its default of `./web/out` — which, under the source bind-mount, is whatever your last `npm run build` left on your host. That directory is gitignored and usually stale or missing. Use `:3080` (or the tunnel URL) for the dashboard.
+
+#### Exposing your instance with a Cloudflare Tunnel
+
+The `tunnel` service runs `cloudflared` against `http://caddy:80` and writes the resulting URL to a shared volume. `scripts/entrypoint.sh` in the `happyview` service reads that file and **exports it as `PUBLIC_URL`**, overriding whatever you set in `.env`.
+
+This exists because atproto OAuth needs a publicly reachable HTTPS URL. With a tunnel, your local instance gets one, so you can sign in with a real account and test flows that a loopback URL can't reach.
+
+> [!CAUTION]
+> **The tunnel overrides PUBLIC_URL**
+>
+> `docker-compose.yml` sets `TUNNEL_URL_FILE` on the `happyview` service unconditionally, so the entrypoint always waits for a tunnel URL — up to 30 seconds — before starting the server. The `PUBLIC_URL` in your `.env` is only used as the fallback if no URL appears in that window, which is why a fresh stack reports a `trycloudflare.com` address.
+
+The tunnel service picks its mode from your setup, in this order:
+
+1. `CLOUDFLARE_TUNNEL_TOKEN` is set: a [named tunnel](#named-tunnel-stable-hostname) routed from the Cloudflare dashboard.
+2. `.cloudflared/` holds a tunnel credentials file: a [locally-managed tunnel](#locally-managed-tunnel-stable-hostname-routed-from-the-repo) routed from your `.env`.
+3. Neither: a [quick tunnel](#quick-tunnel-default).
+
+##### Quick tunnel (default)
+
+Leave `CLOUDFLARE_TUNNEL_TOKEN` blank and `.cloudflared/` empty, and you get a free ephemeral tunnel — no Cloudflare account needed. Find the URL in the logs:
+
+```sh
+docker compose logs tunnel | grep trycloudflare
+```
+
+The hostname is random and **changes on every restart**, so anything that pins your instance's URL (an OAuth client registration, a lexicon's service entry) has to be updated each time.
+
+##### Named tunnel (stable hostname)
+
+For a hostname that survives restarts, create a tunnel in the Cloudflare dashboard and set both variables in `.env`:
+
+```sh
+CLOUDFLARE_TUNNEL_TOKEN=<token from the Cloudflare dashboard>
+TUNNEL_HOSTNAME=happyview-dev.example.com
+```
+
+The token starts the named tunnel, but `TUNNEL_HOSTNAME` is what actually gets written to the shared URL file. Set the token alone and nothing is written, so the server waits the full 30 seconds and then falls back to the `PUBLIC_URL` in your `.env`. That works, but only if you've already set it to match the tunnel's hostname.
+
+##### Locally-managed tunnel (stable hostname, routed from the repo)
+
+A locally-managed tunnel keeps the hostname-to-service routing out of the Cloudflare dashboard. The tunnel service generates the `cloudflared` config from `TUNNEL_HOSTNAME` and points it at `caddy`. You need a Cloudflare account with a domain on it and [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) installed on your machine for the one-time setup.
+
+```sh
+# Authorize cloudflared for your domain (opens a browser).
+cloudflared tunnel login
+
+# Create the tunnel. This writes ~/.cloudflared/<tunnel-id>.json.
+cloudflared tunnel create happyview-dev
+
+# Point a hostname at the tunnel.
+cloudflared tunnel route dns happyview-dev happyview-dev.example.com
+
+# Hand the credentials to the stack.
+cp ~/.cloudflared/<tunnel-id>.json .cloudflared/
+```
+
+Then set the hostname in `.env`, and leave `CLOUDFLARE_TUNNEL_TOKEN` blank, since a token takes precedence:
+
+```sh
+TUNNEL_HOSTNAME=happyview-dev.example.com
+```
+
+Everything in `.cloudflared/` except its `.gitignore` is ignored by git. The credentials file can run only that one tunnel, but treat it as a secret.
+
+> [!CAUTION]
+> **One tunnel per person**
+>
+> Two machines running the same tunnel become connectors for it, and Cloudflare splits requests between them, so your browser reaches whichever machine it gets routed to. Everyone who works on HappyView needs their own tunnel and hostname. Don't share credentials files or tokens.
+
+On a shared domain, give each person a single-level subdomain such as `happyview-alice.example.com`. Cloudflare's free certificate covers `*.example.com` but not `alice.dev.example.com`, so deeper hostnames fail TLS unless the zone has an advanced certificate.
+
+##### Running without a tunnel
+
+Start only the three local services:
+
+```sh
+docker compose up happyview web caddy
+```
+
+The server still waits 30 seconds for a URL that never arrives, then falls back to your `.env` `PUBLIC_URL`. To skip the wait, comment out the `TUNNEL_URL_FILE` line in the `happyview` service.
+
+> [!CAUTION]
+> **Use 127.0.0.1, not localhost**
+>
+> Without a tunnel you're an atproto OAuth loopback client, and those are registered with `127.0.0.1`. Setting `PUBLIC_URL` to `http://localhost:3000` makes OAuth sign-in fail, because the redirect URI won't match the loopback client ID.
+
+#### Using Postgres instead of SQLite
+
+SQLite is the default and needs no extra container. To use Postgres, uncomment the `postgres` service in `docker-compose.yml`, its `pgdata` volume, and the `depends_on` block on the `happyview` service, then point `DATABASE_URL` at it in `.env`:
+
+```sh
+DATABASE_URL=postgres://happyview:happyview@postgres/happyview
+POSTGRES_USER=happyview
+POSTGRES_PASSWORD=happyview
+POSTGRES_DB=happyview
+```
+
+See the [database setup guide](https://happyview.dev/docs/guides/database/database-setup) for the differences between backends.
+
+#### The other Compose files
+
+The repository root holds five Compose files, each declaring its own project name so they can run simultaneously without sharing containers, networks, or volumes:
+
+| File                                | Project name             | Purpose                                        |
+| ----------------------------------- | ------------------------ | ---------------------------------------------- |
+| `docker-compose.yml`                | `happyview`              | This dev stack                                 |
+| `docker-compose.test.yml`           | `happyview-test`         | Postgres for the Rust integration tests         |
+| `docker-compose.e2e.yml`            | `happyview-e2e`          | Full stack plus a local PLC directory and PDS for Playwright |
+| `docker-compose.prod.sqlite.yml`    | `happyview-prod-sqlite`  | [Production, SQLite](https://happyview.dev/docs/guides/self-hosting/docker)                |
+| `docker-compose.prod.postgres.yml`  | `happyview-prod-postgres`| [Production, Postgres](https://happyview.dev/docs/guides/self-hosting/docker)              |
+
+> [!NOTE]
+> **Containers named plain happyview-postgres-1 are orphans**
+>
+> The explicit project names are recent. Before them, every file defaulted to the directory name and shared containers, so a `down` in one stack tore down the others, including a running dev stack. Containers left over from before that change are orphans and can be removed.
+
 ## What CI checks
 
 These checks must pass before merging:
@@ -81,7 +241,7 @@ These checks must pass before merging:
 | `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
 | `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 
-The `coverage` job also runs on server changes. It reruns the Rust suites under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
+The Postgres e2e shards run their tests under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), and the `coverage` job merges what they measured: it writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
 
 Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
 
@@ -140,6 +300,11 @@ docker compose -f docker-compose.test.yml up -d
 TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test cargo test --tests
 docker compose -f docker-compose.test.yml down
 ```
+
+CI splits that run across two runners per database:
+`scripts/e2e-shard.sh` computes each shard's targets from `cargo metadata`, so
+`cargo test $(bash scripts/e2e-shard.sh 1 2)` runs exactly what shard 1 ran,
+and `bash scripts/e2e-shard.sh --list 2` shows the split.
 
 The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
 file. Run it this way once when you change SQL,

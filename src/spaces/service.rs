@@ -1409,7 +1409,7 @@ mod tests {
             super::create_invite(&state, &authority, &space_uri, None, None, None)
                 .await
                 .expect("authority creates invite");
-        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.id)
+        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.space_id, &invite.id)
             .await
             .expect("revoke should succeed");
         assert!(revoked);

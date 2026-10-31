@@ -30,6 +30,10 @@ pub mod segment_writer;
 pub mod syncer;
 #[allow(dead_code, unused_imports)]
 pub mod tls;
+#[allow(dead_code, unused_imports)]
+pub mod watchdog;
+#[allow(dead_code, unused_imports)]
+pub mod workers;
 
 #[allow(unused_macros)]
 macro_rules! require_db {

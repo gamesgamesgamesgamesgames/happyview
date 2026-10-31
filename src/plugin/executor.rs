@@ -623,6 +623,13 @@ pub struct PluginExecutor {
     app_state: Option<crate::AppState>,
 }
 
+/// Whether `module` imports WASI preview 1.
+fn imports_wasi(module: &wasmtime::Module) -> bool {
+    module
+        .imports()
+        .any(|import| import.module() == capabilities::WASI_MODULE)
+}
+
 /// Guest time a test file may spend outside the triggers it fires. Each
 /// trigger's own run is bounded by the operator's wall clock, and the time
 /// spent inside one is host time for the file, so this bounds only the
@@ -836,9 +843,11 @@ impl PluginExecutor {
         modules: ModuleScope,
         options: RunOptions,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
-        let mut inst = self
-            .instantiate_interpreter(plugin, Some(input), caller, modules)
+        let started = std::time::Instant::now();
+        let (mut inst, cache_hit) = self
+            .instantiate_interpreter_reporting(plugin, Some(input), caller, modules)
             .await?;
+        crate::metrics::run::record_instantiate(started.elapsed(), cache_hit);
         // The guard list is the host's, whatever the caller sent: see
         // `host_removed_globals`.
         let mut input = ScriptExecuteInput {
@@ -867,7 +876,11 @@ impl PluginExecutor {
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
-        let output = match inst.call_execute(input).await {
+        let started = std::time::Instant::now();
+        let called = inst.call_execute(input).await;
+        crate::metrics::run::record_guest_call(started.elapsed());
+        report_run_resources(&mut inst, options.call_fuel);
+        let output = match called {
             Ok(output) => output,
             // A guest that reported a panic answered the run; the trap is only
             // how an aborting guest stops. A timeout or a refused growth after
@@ -881,7 +894,9 @@ impl PluginExecutor {
             }
             Err(e) => return Err(e),
         };
+        let started = std::time::Instant::now();
         inst.settle_pending_calls(self.script_wall_clock()).await;
+        crate::metrics::run::record_settle(started.elapsed());
         Ok(output)
     }
 
@@ -1134,6 +1149,20 @@ impl PluginExecutor {
         caller: Option<Arc<CallerSession>>,
         modules: ModuleScope,
     ) -> Result<PluginInstance, ExecutionError> {
+        self.instantiate_interpreter_reporting(plugin, input, caller, modules)
+            .await
+            .map(|(inst, _)| inst)
+    }
+
+    /// As [`instantiate_interpreter`](Self::instantiate_interpreter), saying
+    /// whether the module came from the runtime's memory.
+    async fn instantiate_interpreter_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: Option<&ScriptExecuteInput>,
+        caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
+    ) -> Result<(PluginInstance, bool), ExecutionError> {
         let ctx = input
             .map(|input| LibraryCallContext {
                 caller_did: input.context.caller_did.clone(),
@@ -1152,8 +1181,8 @@ impl PluginExecutor {
             .map(str::to_string)
             .collect();
         let stamp = self.registry.artifact_stamp_for(plugin);
-        let mut inst = self
-            .instantiate_loaded(plugin, &scope, HashMap::new(), serde_json::Value::Null)
+        let (mut inst, cache_hit) = self
+            .instantiate_loaded_reporting(plugin, &scope, HashMap::new(), serde_json::Value::Null)
             .await?;
         let state = inst.store.data_mut();
         state.call_ctx = ctx;
@@ -1180,8 +1209,9 @@ impl PluginExecutor {
             stamp,
             modules,
             waited_ms: Default::default(),
+            metrics: crate::metrics::run::current(),
         });
-        Ok(inst)
+        Ok((inst, cache_hit))
     }
 
     /// The interpreter registered as `plugin_id`, fetched once so everything
@@ -1227,22 +1257,43 @@ impl PluginExecutor {
 
     /// The host functions, plus preview 1 only when the module's import
     /// section names it, so a `wasm32-unknown-unknown` plugin's linker
-    /// defines nothing but `env`.
+    /// defines nothing but `env`. A test that adds to its own linker builds
+    /// one; instances share [`Self::linker_for`]'s.
+    #[cfg(test)]
     fn build_linker(
         &self,
         module: &wasmtime::Module,
     ) -> Result<Linker<PluginState>, ExecutionError> {
+        self.new_linker(imports_wasi(module))
+    }
+
+    fn new_linker(&self, wasi: bool) -> Result<Linker<PluginState>, ExecutionError> {
         let mut linker = Linker::new(self.runtime.engine());
         register_host_functions(&mut linker)
             .map_err(|e| ExecutionError::Instantiation(e.into()))?;
-        if module
-            .imports()
-            .any(|import| import.module() == capabilities::WASI_MODULE)
-        {
+        if wasi {
             wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state| &mut state.wasi)
                 .map_err(|e| ExecutionError::Instantiation(e.into()))?;
         }
         Ok(linker)
+    }
+
+    /// [`Self::build_linker`]'s linker for `module`, built once per kind on
+    /// the runtime and shared by every instance after, whichever executor
+    /// makes it.
+    fn linker_for(
+        &self,
+        module: &wasmtime::Module,
+    ) -> Result<Arc<Linker<PluginState>>, ExecutionError> {
+        let wasi = imports_wasi(module);
+        let linkers = self.runtime.linkers();
+        let cell = if wasi { &linkers.wasi } else { &linkers.env };
+        if let Some(linker) = cell.get() {
+            return Ok(Arc::clone(linker));
+        }
+        let built = Arc::new(self.new_linker(wasi)?);
+        // A racing first use may have set it meanwhile; either is the same.
+        Ok(Arc::clone(cell.get_or_init(|| built)))
     }
 
     /// The store state for one instance of `plugin`.
@@ -1329,13 +1380,27 @@ impl PluginExecutor {
         secrets: HashMap<String, String>,
         config: serde_json::Value,
     ) -> Result<PluginInstance, ExecutionError> {
-        let module = self
+        self.instantiate_loaded_reporting(plugin, scope, secrets, config)
+            .await
+            .map(|(inst, _)| inst)
+    }
+
+    /// As [`instantiate_loaded`](Self::instantiate_loaded), saying whether
+    /// the module came from the runtime's memory.
+    async fn instantiate_loaded_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        scope: &str,
+        secrets: HashMap<String, String>,
+        config: serde_json::Value,
+    ) -> Result<(PluginInstance, bool), ExecutionError> {
+        let (module, cache_hit) = self
             .runtime
-            .module_for(plugin)
+            .module_lookup(plugin)
             .await
             .map_err(ExecutionError::Instantiation)?;
 
-        let linker = self.build_linker(&module)?;
+        let linker = self.linker_for(&module)?;
         let state = self.build_state(plugin, scope, secrets, config).await?;
 
         let mut store = Store::new(self.runtime.engine(), state);
@@ -1398,13 +1463,29 @@ impl PluginExecutor {
         store.data_mut().alloc = Some(alloc.clone());
         store.data_mut().dealloc = Some(dealloc.clone());
 
-        Ok(PluginInstance {
-            store,
-            instance,
-            memory,
-            alloc,
-            dealloc,
-        })
+        Ok((
+            PluginInstance {
+                store,
+                instance,
+                memory,
+                alloc,
+                dealloc,
+            },
+            cache_hit,
+        ))
+    }
+}
+
+/// Report what a script run's guest left behind: its linear memory, which
+/// never shrinks and so is the run's high-water mark, and, for a compiled
+/// module, the fuel it spent. An interpreter's fuel says nothing: it is
+/// unbounded, and a frame that catches a `throw` loses what it spent.
+fn report_run_resources(inst: &mut PluginInstance, call_fuel: Option<u64>) {
+    crate::metrics::run::record_memory_peak(inst.memory.data_size(&inst.store) as u64);
+    if let Some(call_fuel) = call_fuel
+        && let Ok(remaining) = inst.store.get_fuel()
+    {
+        crate::metrics::run::record_fuel(call_fuel.saturating_sub(remaining));
     }
 }
 
@@ -2453,6 +2534,65 @@ mod interpreter {
 
     fn run_input(source: &str) -> ScriptExecuteInput {
         serde_json::from_value(directive(source)).unwrap()
+    }
+
+    /// Instances share one linker, and each still sees only its own store:
+    /// two runs in flight at once, through the same linker, each get back
+    /// the input written into their own instance. The second run goes
+    /// through a separate executor over the same runtime, as
+    /// `AppState::plugin_executor` makes one per call.
+    #[tokio::test]
+    async fn runs_sharing_a_linker_each_see_only_their_own_store() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, _, current) = superseded().await;
+        let per_call = PluginExecutor::new(
+            Arc::clone(&executor.runtime),
+            Arc::clone(&executor.registry),
+            executor.db.clone(),
+            executor.db_backend,
+            executor.http_client.clone(),
+            Arc::clone(&executor.lexicons),
+        );
+        let module = executor.runtime.module_for(&current).await.unwrap();
+        assert!(
+            Arc::ptr_eq(
+                &executor.linker_for(&module).unwrap(),
+                &per_call.linker_for(&module).unwrap()
+            ),
+            "the linker is built once per runtime, not per executor"
+        );
+        let mut first = run_input("echo the first run");
+        first.input = serde_json::json!({"run": "first"});
+        let mut second = run_input("echo the second run");
+        second.input = serde_json::json!({"run": "second"});
+
+        let run = |executor: PluginExecutor, input| {
+            let current = Arc::clone(&current);
+            async move {
+                match executor
+                    .execute_loaded(
+                        &current,
+                        &input,
+                        None,
+                        ModuleScope::Dashboard,
+                        RunOptions::default(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    ScriptExecuteOutput::Returned { value, .. } => value,
+                    other => panic!("expected the input echoed, got {other:?}"),
+                }
+            }
+        };
+        let (a, b) = tokio::join!(run(executor.clone(), first), run(per_call, second));
+
+        assert_eq!(a["input"], serde_json::json!({"run": "first"}));
+        assert_eq!(a["source"], "echo the first run");
+        assert_eq!(b["input"], serde_json::json!({"run": "second"}));
+        assert_eq!(b["source"], "echo the second run");
     }
 
     /// The same bytes registered twice stamp alike, so only identity tells

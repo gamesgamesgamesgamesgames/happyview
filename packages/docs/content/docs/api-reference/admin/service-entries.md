@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:3000/admin/service-entries \
 
 The entry is created with `access_mode` set to `all`. The endpoint URL is derived from `PUBLIC_URL`.
 
-**Response**: `201 Created`
+**Response**: `201 Created`. Returns `409 Conflict` if a service entry with that `fragment_id` already exists.
 
 ## Update a service entry
 

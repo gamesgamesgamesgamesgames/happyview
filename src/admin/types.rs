@@ -584,10 +584,24 @@ pub(super) struct UpdateApiClientBody {
     pub(super) client_uri: Option<String>,
     pub(super) redirect_uris: Option<Vec<String>>,
     pub(super) scopes: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) allowed_origins: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) rate_limit_capacity: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) rate_limit_refill_rate: Option<Option<f64>>,
     pub(super) is_active: Option<bool>,
+}
+
+/// A field that may be cleared: absent is `None` (leave it), `null` is
+/// `Some(None)` (clear it), and a value is `Some(Some(_))`. A plain
+/// `Option<Option<T>>` reads `null` as `None`, so a clear was ignored.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]

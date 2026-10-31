@@ -156,20 +156,27 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
 
     match migrate(state, job, &input).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            // Any failure returns the repo to polyfill. Migration never modifies
-            // the local copy, so the user's repo keeps working as it did.
-            if let Err(revert) = set_mode(state, &input, HostMode::Polyfill).await {
-                tracing::error!(
-                    space_id = %input.space_id,
-                    author_did = %input.author_did,
-                    error = %revert,
-                    "failed to return repo to polyfill after a failed migration"
-                );
-            }
-            NativeOutcome::Failed(format!("{e}"))
-        }
+        Err(e) => failed(state, job, &input, e).await,
     }
+}
+
+/// The outcome of a run that failed. A failure returns the repo to
+/// polyfill: migration never modifies the local copy, so the user's repo
+/// keeps working as it did. Unless the run's job was taken over while it
+/// failed (a run stuck in a call to the PDS across the takeover): the run
+/// that took it may have moved the repo on already, and the mode is its.
+async fn failed(state: &AppState, job: &Job, input: &Input, e: AppError) -> NativeOutcome {
+    if jobs_db::should_stop(state, &job.id).await != Some("lost")
+        && let Err(revert) = set_mode(state, input, HostMode::Polyfill).await
+    {
+        tracing::error!(
+            space_id = %input.space_id,
+            author_did = %input.author_did,
+            error = %revert,
+            "failed to return repo to polyfill after a failed migration"
+        );
+    }
+    NativeOutcome::Failed(format!("{e}"))
 }
 
 async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOutcome, AppError> {
@@ -695,6 +702,50 @@ mod tests {
                 "{reason}"
             );
             assert_eq!(repo(&state, &input).await.host_mode, mode, "{reason}");
+        }
+    }
+
+    /// A failed run returns the repo to polyfill, unless its job was taken
+    /// over: the run that took it may have finished the move, and a stale
+    /// run failing late must not undo it.
+    #[tokio::test]
+    async fn a_failed_run_returns_the_repo_unless_its_job_was_taken_over() {
+        use super::super::super::held::{Held, Lease, run_under};
+
+        for (case, taken_over, mode) in [
+            ("its own", false, HostMode::Polyfill),
+            ("taken over", true, HostMode::Native),
+        ] {
+            let (state, job, input) = migrating().await;
+            let claimed = jobs_db::hold_job(&state, &job.id, "here")
+                .await
+                .unwrap()
+                .unwrap();
+            // The repo as the run that took the job over left it.
+            if taken_over {
+                set_mode(&state, &input, HostMode::Native).await.unwrap();
+            }
+            let attempt = claimed.attempt + i64::from(taken_over);
+            let run = Held::new(
+                &job.id,
+                Lease {
+                    owner: "here".into(),
+                    attempt,
+                },
+            );
+            let out = run_under(
+                run,
+                failed(
+                    &state,
+                    &job,
+                    &input,
+                    AppError::Internal("the PDS went away".into()),
+                ),
+            )
+            .await;
+
+            assert!(matches!(out, NativeOutcome::Failed(_)), "{case}");
+            assert_eq!(repo(&state, &input).await.host_mode, mode, "{case}");
         }
     }
 }
