@@ -141,7 +141,8 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
-    /// Per-script run metrics, in memory only.
+    /// Per-script run metrics: the last day in memory, longer in
+    /// `happyview_script_metrics`.
     pub metrics: Arc<metrics::ScriptMetrics>,
     /// The origins listed in `cookie_integration_origins`, read briefly cached.
     pub integration_origins: Arc<csrf::IntegrationOrigins>,

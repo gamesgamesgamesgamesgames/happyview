@@ -112,6 +112,8 @@ Structured logs go to stdout, so any platform that captures container stdout (Ra
 
 The admin [event log](../../guides/event-logs.md) is stored in the same database as records. `EVENT_LOG_RETENTION_DAYS` (default `30`) controls automatic cleanup. Set to `0` to keep events indefinitely — useful for compliance-sensitive deployments, but plan for database growth.
 
+[Stored script metrics](../../api-reference/admin/metrics.md#retention) (`happyview_script_metrics`) are kept for the same number of days.
+
 ## Health checks
 
 `GET /health` returns `200 ok` when HappyView can bind its HTTP listener. Use it as the readiness/liveness probe for your platform.

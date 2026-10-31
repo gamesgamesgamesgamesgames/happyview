@@ -53,7 +53,7 @@ impl Stages {
         self.add_us(name, us, n);
     }
 
-    fn add_us(&mut self, name: &'static str, us: u64, n: u64) {
+    pub(super) fn add_us(&mut self, name: &'static str, us: u64, n: u64) {
         match self.0.iter_mut().find(|s| s.name == name) {
             Some(sum) => {
                 sum.n = sum.n.saturating_add(n);
@@ -61,6 +61,10 @@ impl Stages {
             }
             None => self.0.push(StageSum { name, n, us }),
         }
+    }
+
+    pub fn sums(&self) -> &[StageSum] {
+        &self.0
     }
 
     pub fn merge(&mut self, other: &Stages) {

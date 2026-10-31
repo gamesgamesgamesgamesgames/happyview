@@ -2,11 +2,14 @@
 //! scripts.
 //!
 //! Every run through `script::dispatch` becomes one [`RunSample`], added to
-//! its script's rolling windows. Nothing is written per run: a restart starts
-//! the windows over.
+//! its script's rolling windows. Nothing is written per run: once a minute
+//! [`persist`] writes the minutes that have closed, and a restart reads the
+//! last day back.
 
 pub mod ingest;
 pub mod job;
+pub mod persist;
+pub mod retention;
 pub mod run;
 pub mod sketch;
 pub mod stages;
@@ -138,11 +141,14 @@ struct Key {
     layer: Layer,
 }
 
-/// The windows the registry keeps.
+/// The windows metrics are read over. The hour and the day are held in
+/// memory; a week and a month are read from the table [`persist`] writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
     Hour,
     Day,
+    Week,
+    Month,
 }
 
 impl Window {
@@ -150,6 +156,8 @@ impl Window {
         match s {
             "1h" => Some(Self::Hour),
             "24h" => Some(Self::Day),
+            "7d" => Some(Self::Week),
+            "30d" => Some(Self::Month),
             _ => None,
         }
     }
@@ -158,6 +166,8 @@ impl Window {
         match self {
             Self::Hour => "1h",
             Self::Day => "24h",
+            Self::Week => "7d",
+            Self::Month => "30d",
         }
     }
 
@@ -165,15 +175,35 @@ impl Window {
         match self {
             Self::Hour => 3_600,
             Self::Day => 86_400,
+            Self::Week => 7 * 86_400,
+            Self::Month => 30 * 86_400,
+        }
+    }
+
+    /// Whether the window is read from the table rather than memory.
+    pub fn is_stored(self) -> bool {
+        matches!(self, Self::Week | Self::Month)
+    }
+
+    /// The window in words, for a message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "7 days",
+            Self::Month => "30 days",
         }
     }
 }
 
-/// The widths a series can be read at.
+/// The widths a series can be read at: the minute and the half hour from
+/// memory, the hour and the day from the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Minute,
     HalfHour,
+    Hour,
+    Day,
 }
 
 impl Step {
@@ -181,14 +211,40 @@ impl Step {
         match s {
             "1m" => Some(Self::Minute),
             "30m" => Some(Self::HalfHour),
+            "1h" => Some(Self::Hour),
+            "1d" => Some(Self::Day),
             _ => None,
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minute => "1m",
+            Self::HalfHour => "30m",
+            Self::Hour => "1h",
+            Self::Day => "1d",
+        }
+    }
+
+    pub fn secs(self) -> u64 {
+        match self {
+            Self::Minute => 60,
+            Self::HalfHour => 1_800,
+            Self::Hour => 3_600,
+            Self::Day => 86_400,
+        }
+    }
+
+    pub fn is_stored(self) -> bool {
+        matches!(self, Self::Hour | Self::Day)
     }
 
     pub fn default_for(window: Window) -> Self {
         match window {
             Window::Hour => Self::Minute,
             Window::Day => Self::HalfHour,
+            Window::Week => Self::Hour,
+            Window::Month => Self::Day,
         }
     }
 }
@@ -223,6 +279,10 @@ pub struct ScriptMetrics {
     jobs: Mutex<HashMap<String, JobStats>>,
     overflow: AtomicU64,
     active: [AtomicU64; GAUGED.len()],
+    /// Every minute bucket starting before this (seconds since the epoch) is
+    /// in the table, and none after it. Zero until something is written or
+    /// read back.
+    persisted_to: AtomicU64,
 }
 
 impl Default for ScriptMetrics {
@@ -234,6 +294,7 @@ impl Default for ScriptMetrics {
             jobs: Mutex::default(),
             overflow: AtomicU64::new(0),
             active: Default::default(),
+            persisted_to: AtomicU64::new(0),
         }
     }
 }
@@ -304,7 +365,8 @@ impl Drop for ActiveRun<'_> {
     }
 }
 
-fn unix_now() -> u64 {
+/// Seconds since the epoch.
+pub fn unix_now() -> u64 {
     unix_now_ms() / 1_000
 }
 
@@ -389,7 +451,7 @@ impl ScriptMetrics {
             .cloned();
         let history = match held {
             Some(history) => history,
-            None => match self.insert(key, at) {
+            None => match self.insert(key, at, true) {
                 Some(history) => history,
                 None => return,
             },
@@ -400,28 +462,34 @@ impl ScriptMetrics {
             .add(at, sample);
     }
 
-    /// A new key's history, unless the registry is full. A full registry
-    /// first drops keys with nothing left inside the longest window.
-    fn insert(&self, key: Key, at: u64) -> Option<Arc<Mutex<History>>> {
-        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(history) = keys.get(&key) {
-            return Some(history.clone());
-        }
-        if keys.len() >= MAX_KEYS {
-            keys.retain(|_, history| {
-                history
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_live(at)
-            });
-        }
-        if keys.len() >= MAX_KEYS {
-            self.overflow.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let history = Arc::new(Mutex::new(History::default()));
-        keys.insert(key, history.clone());
-        Some(history)
+    /// A key's history, created unless the registry is full. A full registry
+    /// first drops keys with nothing left inside the longest window; a key
+    /// still refused counts in [`overflow`](Self::overflow) when `count` is
+    /// set.
+    fn insert(&self, key: Key, at: u64, count: bool) -> Option<Arc<Mutex<History>>> {
+        insert_capped(&self.keys, key, at, count.then_some(&self.overflow))
+    }
+
+    fn insert_ingest(
+        &self,
+        key: IngestKey,
+        at: u64,
+        count: bool,
+    ) -> Option<Arc<Mutex<History<IngestBucket>>>> {
+        insert_capped(&self.ingest, key, at, count.then_some(&self.overflow))
+    }
+
+    fn ingest_entries(&self) -> Vec<(IngestKey, Arc<Mutex<History<IngestBucket>>>)> {
+        self.ingest
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn persisted_to(&self) -> u64 {
+        self.persisted_to.load(Ordering::Relaxed)
     }
 
     fn entries(&self) -> Vec<(Key, Arc<Mutex<History>>)> {
@@ -456,13 +524,7 @@ impl ScriptMetrics {
                 })
             })
             .collect();
-        out.sort_by(|a, b| {
-            b.stats
-                .runs
-                .cmp(&a.stats.runs)
-                .then_with(|| a.trigger.cmp(&b.trigger))
-                .then_with(|| a.layer.cmp(b.layer))
-        });
+        sort_scripts(&mut out);
         out
     }
 
@@ -502,10 +564,15 @@ impl ScriptMetrics {
             return None;
         }
         let ring = |h: &History| match step {
-            Step::Minute => h.minutes.clone(),
-            Step::HalfHour => h.half_hours.clone(),
+            Step::Minute => Some(h.minutes.clone()),
+            Step::HalfHour => Some(h.half_hours.clone()),
+            Step::Hour | Step::Day => None,
         };
-        let rings: Vec<window::Ring> = histories.iter().map(|(_, h)| ring(h)).collect();
+        // Memory holds no hour or day buckets: those are the table's.
+        let rings: Vec<window::Ring> = histories
+            .iter()
+            .map(|(_, h)| ring(h))
+            .collect::<Option<_>>()?;
         let points = rings[0]
             .starts(now, window.secs())
             .map(|start| {
@@ -515,24 +582,7 @@ impl ScriptMetrics {
                         bucket.merge(b);
                     }
                 }
-                let q = |sketch: &sketch::Sketch| PointPercentiles {
-                    p50: sketch.quantile(0.5).map(|us| us as f64 / 1_000.0),
-                    p95: sketch.quantile(0.95).map(|us| us as f64 / 1_000.0),
-                    max: sketch.max().map(|us| us as f64 / 1_000.0),
-                };
-                let stats = bucket.stats();
-                SeriesPoint {
-                    start: rfc3339(start),
-                    runs: bucket.runs,
-                    outcomes: stats.outcomes,
-                    wall_ms: q(&bucket.wall),
-                    guest_ms: q(&bucket.guest),
-                    host_ms_mean: stats.host_ms_mean,
-                    instantiate_ms_mean: stats.instantiate_ms_mean,
-                    link_ms_mean: stats.link_ms_mean,
-                    allocate_ms_mean: stats.allocate_ms_mean,
-                    teardown_ms_mean: stats.teardown_ms_mean,
-                }
+                point(start, &bucket)
             })
             .collect();
         Some(ScriptSeries {
@@ -583,22 +633,10 @@ impl ScriptMetrics {
             .cloned();
         let history = match held {
             Some(history) => history,
-            None => {
-                let mut keys = self.ingest.write().unwrap_or_else(|e| e.into_inner());
-                if !keys.contains_key(&key) && keys.len() >= MAX_KEYS {
-                    keys.retain(|_, history| {
-                        history
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .is_live(at)
-                    });
-                    if keys.len() >= MAX_KEYS {
-                        self.overflow.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                }
-                keys.entry(key).or_default().clone()
-            }
+            None => match self.insert_ingest(key, at, true) {
+                Some(history) => history,
+                None => return,
+            },
         };
         history
             .lock()
@@ -613,21 +651,12 @@ impl ScriptMetrics {
     /// Every collection and action that saw records inside `window` ending
     /// at `now`, busiest first.
     pub fn ingest_at(&self, now: u64, window: Window) -> Vec<IngestSummary> {
-        let entries: Vec<(IngestKey, Arc<Mutex<History<IngestBucket>>>)> = self
-            .ingest
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let mut out: Vec<IngestSummary> = entries
+        let mut out: Vec<IngestSummary> = self
+            .ingest_entries()
             .into_iter()
             .filter_map(|(key, history)| {
                 let history = history.lock().unwrap_or_else(|e| e.into_inner());
-                let ring = match window {
-                    Window::Hour => &history.minutes,
-                    Window::Day => &history.half_hours,
-                };
+                let ring = ring_for(&history, window);
                 let bucket = ring.merged(now, window.secs());
                 let oldest = ring.oldest_in(now, window.secs())?;
                 (bucket.records > 0).then(|| {
@@ -635,12 +664,7 @@ impl ScriptMetrics {
                 })
             })
             .collect();
-        out.sort_by(|a, b| {
-            b.records
-                .cmp(&a.records)
-                .then_with(|| a.collection.cmp(&b.collection))
-                .then_with(|| a.action.cmp(b.action))
-        });
+        sort_ingest(&mut out);
         out
     }
 
@@ -765,10 +789,96 @@ impl ScriptMetrics {
     }
 }
 
-fn merged(history: &History, now: u64, window: Window) -> Bucket {
+/// The ring a window reads from memory. Memory holds a day at most, so a
+/// longer window reads the day here; the admin routes read those from the
+/// table instead.
+fn ring_for<B: window::Accumulate>(history: &History<B>, window: Window) -> &window::Ring<B> {
     match window {
-        Window::Hour => history.minutes.merged(now, window.secs()),
-        Window::Day => history.half_hours.merged(now, window.secs()),
+        Window::Hour => &history.minutes,
+        Window::Day | Window::Week | Window::Month => &history.half_hours,
+    }
+}
+
+fn merged(history: &History, now: u64, window: Window) -> Bucket {
+    ring_for(history, window).merged(now, window.secs())
+}
+
+/// A key's history in `keys`, created unless [`MAX_KEYS`] are held. A full
+/// map first drops keys with nothing left inside the longest window, and a
+/// key still refused is counted in `overflow` when one is given.
+fn insert_capped<K, B>(
+    keys: &RwLock<HashMap<K, Arc<Mutex<History<B>>>>>,
+    key: K,
+    at: u64,
+    overflow: Option<&AtomicU64>,
+) -> Option<Arc<Mutex<History<B>>>>
+where
+    K: std::hash::Hash + Eq,
+    B: window::Accumulate,
+{
+    let mut keys = keys.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(history) = keys.get(&key) {
+        return Some(history.clone());
+    }
+    if keys.len() >= MAX_KEYS {
+        keys.retain(|_, history| {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_live(at)
+        });
+    }
+    if keys.len() >= MAX_KEYS {
+        if let Some(overflow) = overflow {
+            overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        return None;
+    }
+    let history = Arc::new(Mutex::new(History::default()));
+    keys.insert(key, history.clone());
+    Some(history)
+}
+
+/// Busiest first.
+fn sort_scripts(rows: &mut [ScriptSummary]) {
+    rows.sort_by(|a, b| {
+        b.stats
+            .runs
+            .cmp(&a.stats.runs)
+            .then_with(|| a.trigger.cmp(&b.trigger))
+            .then_with(|| a.layer.cmp(b.layer))
+    });
+}
+
+/// Busiest first.
+fn sort_ingest(rows: &mut [IngestSummary]) {
+    rows.sort_by(|a, b| {
+        b.records
+            .cmp(&a.records)
+            .then_with(|| a.collection.cmp(&b.collection))
+            .then_with(|| a.action.cmp(b.action))
+    });
+}
+
+/// One step of a series, starting at `start`.
+fn point(start: u64, bucket: &Bucket) -> SeriesPoint {
+    let q = |sketch: &sketch::Sketch| PointPercentiles {
+        p50: sketch.quantile(0.5).map(|us| us as f64 / 1_000.0),
+        p95: sketch.quantile(0.95).map(|us| us as f64 / 1_000.0),
+        max: sketch.max().map(|us| us as f64 / 1_000.0),
+    };
+    let stats = bucket.stats();
+    SeriesPoint {
+        start: rfc3339(start),
+        runs: bucket.runs,
+        outcomes: stats.outcomes,
+        wall_ms: q(&bucket.wall),
+        guest_ms: q(&bucket.guest),
+        host_ms_mean: stats.host_ms_mean,
+        instantiate_ms_mean: stats.instantiate_ms_mean,
+        link_ms_mean: stats.link_ms_mean,
+        allocate_ms_mean: stats.allocate_ms_mean,
+        teardown_ms_mean: stats.teardown_ms_mean,
     }
 }
 

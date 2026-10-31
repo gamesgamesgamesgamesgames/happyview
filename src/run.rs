@@ -1201,6 +1201,24 @@ async fn boot(
         state.db.clone(),
         state.db_backend,
     ));
+    // The last day back into the rings before ingest starts, so a
+    // restart does not blank the live windows.
+    match crate::metrics::persist::reload(
+        &state.metrics,
+        &state.db,
+        state.db_backend,
+        crate::metrics::unix_now(),
+    )
+    .await
+    {
+        Ok(n) => tracing::debug!(rows = n, "read script metrics back"),
+        Err(e) => tracing::warn!(error = %e, "failed to read script metrics back"),
+    }
+    tokio::spawn(crate::metrics::persist::run(
+        state.metrics.clone(),
+        state.db.clone(),
+        state.db_backend,
+    ));
 
     // Staged OAuth client keys take over when they come due. In the boot,
     // rather than in `run`, so `boot_for_test` exercises it too.

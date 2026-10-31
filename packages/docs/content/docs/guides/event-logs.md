@@ -319,6 +319,8 @@ Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` 
 
 Set `EVENT_LOG_RETENTION_DAYS=0` to disable automatic cleanup and keep logs indefinitely.
 
+[Stored script metrics](../api-reference/admin/metrics.md#retention) follow the same retention, so one setting covers both.
+
 See [Configuration](../getting-started/configuration.md) for all environment variables.
 
 ## Dead Letters

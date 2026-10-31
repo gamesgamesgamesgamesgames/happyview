@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::db::adapt_sql;
 use crate::error::AppError;
-use crate::metrics::{Step, Window};
+use crate::metrics::{Step, Window, persist, unix_now};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -21,9 +21,7 @@ fn window_of(query: &WindowQuery) -> Result<Window, AppError> {
     match query.window.as_deref() {
         None => Ok(Window::Hour),
         Some(raw) => Window::parse(raw).ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "window '{raw}' is not kept: metrics are held in memory for the last hour (1h) and the last day (24h) only"
-            ))
+            AppError::BadRequest(format!("window '{raw}' is not one of 1h, 24h, 7d and 30d"))
         }),
     }
 }
@@ -32,7 +30,7 @@ fn step_of(query: &WindowQuery, window: Window) -> Result<Step, AppError> {
     let step = match query.step.as_deref() {
         None => Step::default_for(window),
         Some(raw) => Step::parse(raw).ok_or_else(|| {
-            AppError::BadRequest(format!("step '{raw}' is not one of 1m and 30m"))
+            AppError::BadRequest(format!("step '{raw}' is not one of 1m, 30m, 1h and 1d"))
         })?,
     };
     if window == Window::Day && step == Step::Minute {
@@ -40,7 +38,33 @@ fn step_of(query: &WindowQuery, window: Window) -> Result<Step, AppError> {
             "the last day is kept by the half hour: use step=30m with window=24h".into(),
         ));
     }
+    if window.is_stored() != step.is_stored() {
+        return Err(AppError::BadRequest(if window.is_stored() {
+            format!(
+                "window={} is read by the hour or the day: use step=1h or step=1d",
+                window.as_str()
+            )
+        } else {
+            format!(
+                "window={} is read from memory by the minute or the half hour: use step=1m or step=30m",
+                window.as_str()
+            )
+        }));
+    }
     Ok(step)
+}
+
+fn read_failed(e: sqlx::Error) -> AppError {
+    AppError::Internal(format!("failed to read stored metrics: {e}"))
+}
+
+/// The fields a stored window adds to its response: how long the table
+/// keeps rows, so a window longer than that is read as what exists.
+async fn stored_fields(state: &AppState, window: Window, body: &mut Value) {
+    if window.is_stored() {
+        body["retention_days"] =
+            json!(crate::metrics::retention::retention_days(&state.db, state.db_backend).await);
+    }
 }
 
 /// GET /admin/metrics/scripts — every script that ran inside the window.
@@ -51,12 +75,27 @@ pub(super) async fn scripts(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
-    Ok(Json(json!({
+    let scripts = if window.is_stored() {
+        persist::scripts(
+            &state.metrics,
+            &state.db,
+            state.db_backend,
+            unix_now(),
+            window,
+        )
+        .await
+        .map_err(read_failed)?
+    } else {
+        state.metrics.scripts(window)
+    };
+    let mut body = json!({
         "window": window.as_str(),
         "enabled": state.metrics.enabled(),
         "overflow": state.metrics.overflow(),
-        "scripts": state.metrics.scripts(window),
-    })))
+        "scripts": scripts,
+    });
+    stored_fields(&state, window, &mut body).await;
+    Ok(Json(body))
 }
 
 /// GET /admin/metrics/scripts/{trigger} — one script's series.
@@ -69,26 +108,33 @@ pub(super) async fn script(
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
     let step = step_of(&query, window)?;
-    let series = state
-        .metrics
-        .series(&trigger, window, step)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "'{trigger}' has not run in the last {}",
-                match window {
-                    Window::Hour => "hour",
-                    Window::Day => "day",
-                }
-            ))
-        })?;
+    let series = if window.is_stored() {
+        persist::series(
+            &state.metrics,
+            &state.db,
+            state.db_backend,
+            unix_now(),
+            &trigger,
+            window,
+            step,
+        )
+        .await
+        .map_err(read_failed)?
+    } else {
+        state.metrics.series(&trigger, window, step)
+    };
+    let series = series.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "'{trigger}' has not run in the last {}",
+            window.describe()
+        ))
+    })?;
     let mut body = serde_json::to_value(series)
         .map_err(|e| AppError::Internal(format!("failed to encode metrics: {e}")))?;
     body["window"] = json!(window.as_str());
-    body["step"] = json!(match step {
-        Step::Minute => "1m",
-        Step::HalfHour => "30m",
-    });
+    body["step"] = json!(step.as_str());
     body["enabled"] = json!(state.metrics.enabled());
+    stored_fields(&state, window, &mut body).await;
     Ok(Json(body))
 }
 
@@ -100,15 +146,30 @@ pub(super) async fn ingest(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
     let window = window_of(&query)?;
-    Ok(Json(json!({
+    let collections = if window.is_stored() {
+        persist::ingest(
+            &state.metrics,
+            &state.db,
+            state.db_backend,
+            unix_now(),
+            window,
+        )
+        .await
+        .map_err(read_failed)?
+    } else {
+        state.metrics.ingest(window)
+    };
+    let mut body = json!({
         "window": window.as_str(),
         "enabled": state.metrics.enabled(),
         "overflow": state.metrics.overflow(),
         // Since boot, not in the window: how often a record hook's lookup
         // missed the project and its batch and read the scripts table.
         "scripts_table_reads": state.scripts.table_reads(),
-        "collections": state.metrics.ingest(window),
-    })))
+        "collections": collections,
+    });
+    stored_fields(&state, window, &mut body).await;
+    Ok(Json(body))
 }
 
 /// GET /admin/metrics/live — what is running now.
