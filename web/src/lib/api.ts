@@ -61,6 +61,9 @@ import type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
@@ -79,6 +82,7 @@ import type {
   DeadLetterDetail,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
@@ -128,6 +132,9 @@ export type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKey,
   InstanceOauthKeysResponse,
@@ -160,6 +167,7 @@ export type {
   DeadLettersListResponse,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
@@ -1231,6 +1239,26 @@ export function revokeAllApiClientAuthKeys(id: string) {
   );
 }
 
+export function listApiClientSecrets(id: string) {
+  return apiFetch<{ secrets: ApiClientSecret[] }>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+  );
+}
+
+export function createApiClientSecret(id: string, label: string) {
+  return apiFetch<CreatedApiClientSecret>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+    { method: "POST", body: JSON.stringify({ label }) },
+  );
+}
+
+export function revokeApiClientSecret(id: string, secretId: string) {
+  return apiFetch<RevokeApiClientSecretResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets/${encodeURIComponent(secretId)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function rotateInstanceOauthKey(immediate = false) {
   return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
     method: "POST",
@@ -1561,7 +1589,7 @@ export function bulkRetryDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/retry", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/retry", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -1572,7 +1600,7 @@ export function bulkReindexDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/reindex", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/reindex", {
     method: "POST",
     body: JSON.stringify(body),
   });

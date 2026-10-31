@@ -293,6 +293,25 @@ struct Booted {
 /// starting the record source: everything a served instance has before its
 /// background tasks start and it listens. An `Err` is the exit code to stop
 /// with.
+/// Logs every configuration problem first, before anything slow can push it
+/// out of view. A bad `SESSION_SECRET` does not stop boot, because API-key,
+/// DPoP and service-auth callers need no cookie, but it leaves the dashboard
+/// with no way to sign in, so the error says that and names the fix.
+fn report_config_errors(config: &Config) {
+    let errors = config.config_errors();
+    for err in &errors {
+        tracing::error!("INSECURE CONFIGURATION: {err}");
+    }
+    if !config.session_secret_secure() {
+        tracing::error!(
+            "Dashboard sign-in is DISABLED: nobody can sign in with a cookie until \
+             SESSION_SECRET is set to a random value of at least 32 bytes \
+             (`openssl rand -base64 48`) and the server is restarted. API keys, \
+             DPoP and service auth keep working."
+        );
+    }
+}
+
 async fn boot(
     config: Config,
     dev_mode: bool,
@@ -300,9 +319,12 @@ async fn boot(
 ) -> Result<Booted, std::process::ExitCode> {
     let db_backend = config.database_backend;
 
+    report_config_errors(&config);
+
     // Connect to database and run migrations.
     let db_pool = db::connect(&config.database_url, db_backend).await;
-    let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
+    let backfill_db_pool =
+        db::connect_backfill_pool(&config.database_url, db_backend, &db_pool).await;
 
     // The source's own schema, after HappyView's own migrations and before
     // the source starts.
@@ -596,20 +618,32 @@ async fn boot(
             Option<String>,
         );
         let client_rows: Vec<ClientRow> = crate::db::query_as(
-            "SELECT client_key, client_secret_hash, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
+            "SELECT id, client_key, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
         )
         .fetch_all(&db_pool)
         .await
         .unwrap_or_default();
 
-        for (client_key, secret_hash, client_uri, capacity, refill_rate, _) in &client_rows {
-            rate_limiter.register_client_identity(
-                client_key.clone(),
-                crate::rate_limit::ClientIdentity {
-                    secret_hash: secret_hash.clone(),
-                    client_uri: client_uri.clone(),
-                },
-            );
+        for (client_id, client_key, client_uri, capacity, refill_rate, _) in &client_rows {
+            if let Err(e) = crate::oauth::client_secrets::register_identity(
+                &rate_limiter,
+                &db_pool,
+                db_backend,
+                client_id,
+                client_key,
+                client_uri,
+            )
+            .await
+            {
+                tracing::error!(client_key, error = %e, "could not load an API client's secrets; it is registered with none");
+                rate_limiter.register_client_identity(
+                    client_key.clone(),
+                    crate::rate_limit::ClientIdentity {
+                        secrets: Vec::new(),
+                        client_uri: client_uri.clone(),
+                    },
+                );
+            }
             if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
                 rate_limiter.register_client_config(
                     client_key.clone(),
@@ -805,13 +839,6 @@ async fn boot(
     let cookie_key = if config.session_secret_secure() {
         axum_extra::extract::cookie::Key::derive_from(config.session_secret.as_bytes())
     } else {
-        for err in config.config_errors() {
-            tracing::error!("INSECURE CONFIGURATION: {err}");
-        }
-        tracing::error!(
-            "Cookie-based login is DISABLED until SESSION_SECRET is set securely. \
-             Other auth (DPoP, service auth, API keys) continues to work."
-        );
         axum_extra::extract::cookie::Key::generate()
     };
 

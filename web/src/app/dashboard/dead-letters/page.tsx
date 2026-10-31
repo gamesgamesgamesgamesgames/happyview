@@ -22,7 +22,11 @@ import {
   bulkReindexDeadLetters,
   bulkDismissDeadLetters,
 } from "@/lib/api";
-import type { DeadLetterSummary, DeadLetterDetail } from "@/types/dead-letters";
+import type {
+  BulkItemsResponse,
+  DeadLetterSummary,
+  DeadLetterDetail,
+} from "@/types/dead-letters";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
@@ -307,8 +311,9 @@ export default function DeadLettersPage() {
         scope === "all"
           ? { all: true, collection: collectionFilter }
           : { ids: selectedIds };
-      if (action === "retry") await bulkRetryDeadLetters(body);
-      else if (action === "reindex") await bulkReindexDeadLetters(body);
+      let items: BulkItemsResponse | null = null;
+      if (action === "retry") items = await bulkRetryDeadLetters(body);
+      else if (action === "reindex") items = await bulkReindexDeadLetters(body);
       else await bulkDismissDeadLetters(body);
       const verb =
         action === "retry"
@@ -316,11 +321,18 @@ export default function DeadLettersPage() {
           : action === "reindex"
             ? "re-indexed"
             : "dismissed";
-      toast.success(
-        scope === "all"
-          ? `All matching dead letters ${verb}`
-          : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`,
-      );
+      if (items && items.failed > 0) {
+        const firstError = items.results.find((r) => !r.ok)?.error;
+        toast.error(
+          `${items.succeeded} ${verb}, ${items.failed} failed${firstError ? `: ${firstError}` : ""}`,
+        );
+      } else {
+        toast.success(
+          scope === "all"
+            ? `All matching dead letters ${verb}`
+            : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`,
+        );
+      }
       setRowSelection({});
       fetchItems();
     } catch (e: unknown) {
@@ -654,7 +666,7 @@ export default function DeadLettersPage() {
                       onClick={() => handleDetailAction("retry")}
                     >
                       <RotateCcw className="mr-1 size-3.5" />
-                      Retry Hook
+                      Retry
                     </Button>
                     <Button
                       size="sm"

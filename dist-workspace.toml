@@ -4,7 +4,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = ["shell", "powershell"]
+installers = ["shell"]
 install-path = "CARGO_HOME"
 install-updater = false
 features = ["embedded-dashboard"]
@@ -15,7 +15,6 @@ targets = [
   "aarch64-unknown-linux-gnu",
   "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-musl",
-  "x86_64-pc-windows-msvc",
 ]
 # semantic-release (ci.yml) tags the release, creates it on GitHub, and then
 # dispatches release.yml with the tag; dist uploads into that release.
@@ -37,7 +36,6 @@ aarch64-unknown-linux-musl = "depot-ubuntu-24.04-arm"
 aarch64-apple-darwin = "depot-macos-15"
 # Depot's macOS runners are Apple silicon; the Intel build cross-compiles.
 x86_64-apple-darwin = { runner = "depot-macos-15", host = "aarch64-apple-darwin" }
-x86_64-pc-windows-msvc = "depot-windows-2022"
 
 [dist.github-action-commits]
 "actions/checkout" = "v7"

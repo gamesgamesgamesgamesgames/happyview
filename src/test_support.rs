@@ -244,11 +244,8 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         plc_url: String::new(),
         static_dir: None,
         base_path: None,
-        event_log_retention_days: 30,
         app_name: None,
         logo_uri: None,
-        tos_uri: None,
-        policy_uri: None,
         // Spaces sign every commit with the `#atproto_space` key, which is
         // stored encrypted, so space writes need this set.
         token_encryption_key: Some(TEST_ENCRYPTION_KEY),
