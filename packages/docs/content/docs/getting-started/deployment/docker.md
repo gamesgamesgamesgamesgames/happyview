@@ -196,7 +196,7 @@ Postgres stack only:
 The full environment variable reference is in [Configuration](../configuration.md). A few that aren't wired into the Compose files — `ATTESTATION_PRIVATE_KEY`, `APP_NAME`, `LOGO_URI`, `TOS_URI`, `POLICY_URI`, and the `BACKFILL_CONCURRENT_*` tuning knobs — are present as commented-out lines you can uncomment.
 
 <Callout type="warn" title="Postgres connection limits">
-HappyView opens two pools: the main one (`DATABASE_MAX_CONNECTIONS`) and a separate backfill pool sized `(BACKFILL_CONCURRENT_PDS × BACKFILL_CONCURRENT_DIDS_PER_PDS) + BACKFILL_CONCURRENT_RESOLUTION + 4`, which is 134 on the defaults. Both are lazy, so an idle instance holds almost nothing, but a running backfill peaks near 166, and Postgres's stock limit of 100 would fail it with `sorry, too many clients already`. Raise `POSTGRES_MAX_CONNECTIONS` further if you raise the backfill concurrency or add replicas.
+HappyView opens two pools: the main one (`DATABASE_MAX_CONNECTIONS`) and a separate backfill pool sized `(BACKFILL_CONCURRENT_PDS × BACKFILL_CONCURRENT_DIDS_PER_PDS) + BACKFILL_CONCURRENT_RESOLUTION + 4`, which is 134 on the defaults. A value saved in the dashboard's backfill settings takes the place of its variable, and the pool is sized when HappyView starts, so a raised setting needs a restart to get its connections. Both are lazy, so an idle instance holds almost nothing, but a running backfill peaks near 166, and Postgres's stock limit of 100 would fail it with `sorry, too many clients already`. Raise `POSTGRES_MAX_CONNECTIONS` further if you raise the backfill concurrency or add replicas.
 </Callout>
 
 <Callout type="error" title="Don't override the SQLite DATABASE_URL through the environment">

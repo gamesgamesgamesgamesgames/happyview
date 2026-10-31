@@ -302,7 +302,8 @@ async fn boot(
 
     // Connect to database and run migrations.
     let db_pool = db::connect(&config.database_url, db_backend).await;
-    let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
+    let backfill_db_pool =
+        db::connect_backfill_pool(&config.database_url, db_backend, &db_pool).await;
 
     // The source's own schema, after HappyView's own migrations and before
     // the source starts.
