@@ -58,7 +58,7 @@ export interface ScriptStats {
   host_imports: HostImportStats[];
   memory_peak_bytes: { max: number | null; mean: number | null };
   /** Compiled script modules only. */
-  fuel_mean: number | null;
+  instructions_mean: number | null;
   module_cache: { hits: number; misses: number };
 }
 
