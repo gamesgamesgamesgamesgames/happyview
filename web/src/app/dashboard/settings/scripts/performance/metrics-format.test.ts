@@ -37,7 +37,7 @@ function stats(overrides: Partial<ScriptStats> = {}): ScriptStats {
     settle_ms_mean: null,
     host_imports: [],
     memory_peak_bytes: { max: null, mean: null },
-    fuel_mean: null,
+    instructions_mean: null,
     module_cache: { hits: 0, misses: 0 },
     ...overrides,
   };

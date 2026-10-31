@@ -172,8 +172,9 @@ async fn a_run_is_counted_timed_and_read_back() {
     );
     assert!(script["teardown_ms_mean"].as_f64().unwrap() > 0.0);
     assert!(script["memory_peak_bytes"]["max"].as_u64().unwrap() > 0);
-    // An installed interpreter's fuel says nothing, so none is reported.
-    assert!(script["fuel_mean"].is_null());
+    // An interpreter that does not count reports none, and its fuel says
+    // nothing.
+    assert!(script["instructions_mean"].is_null());
     let cache = &script["module_cache"];
     assert_eq!(
         cache["hits"].as_u64().unwrap() + cache["misses"].as_u64().unwrap(),
@@ -244,6 +245,17 @@ async fn a_run_is_counted_timed_and_read_back() {
     assert_eq!(live["jobs"], json!({"pending": 0, "running": 0}));
     assert!(live["module_cache"]["compiles"].is_u64());
 
+    // An interpreter that counts: the mean is over the runs that reported,
+    // not the two before them that did not.
+    for n in [1_200, 800] {
+        seed_script(&app, &format!("counted:{n}")).await;
+        assert_eq!(call_query(&app).await, StatusCode::OK);
+    }
+    let (_, listing) = get(&app, "/admin/metrics/scripts").await;
+    let script = row(&listing);
+    assert_eq!(script["runs"], 4);
+    assert_eq!(script["instructions_mean"], 1_000.0, "{script:#}");
+
     // Switched off, a run leaves the windows as they were.
     let (status, body) = request(
         &app,
@@ -257,7 +269,7 @@ async fn a_run_is_counted_timed_and_read_back() {
     call_query(&app).await;
     let (_, listing) = get(&app, "/admin/metrics/scripts").await;
     assert_eq!(listing["enabled"], false);
-    assert_eq!(row(&listing)["runs"], 2);
+    assert_eq!(row(&listing)["runs"], 4);
 
     let (status, _) = request(
         &app,

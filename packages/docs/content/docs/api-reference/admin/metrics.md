@@ -42,7 +42,7 @@ Recording is on by default. Turn it off with the `script_metrics_enabled` [insta
 | `settle_ms_mean` | Waiting for library calls the script started and never awaited |
 | `host_imports` | The host imports the script called, each with its call count and mean time per call. A library call is counted once, under the import that made it |
 | `memory_peak_bytes` | The interpreter's linear memory at the end of the run, which is its high-water mark |
-| `fuel_mean` | Fuel spent per run, for compiled script modules only. `null` for an interpreted script: interpreters run with unbounded fuel |
+| `instructions_mean` | Instructions per run, over the runs that reported a count. A compiled script module always does; an interpreted script does when its interpreter counts them (happyview-lua 1.0.0-alpha.8 and later). `null` when no run in the window reported one |
 | `module_cache` | How often the interpreter's compiled module came from memory (`hits`) rather than disk or a compile (`misses`) |
 
 Every mean is over the runs that reached that stage, so a run that found no interpreter does not pull the instantiation mean down. Durations are in milliseconds. Percentiles are accurate to about 1%; `max` is exact.
@@ -102,7 +102,7 @@ One row per script that ran inside the window, busiest first. A script is keyed 
         { "name": "host_script_log", "calls": 1, "ms_mean": 0.465 }
       ],
       "memory_peak_bytes": { "max": 1638400, "mean": 1638400.0 },
-      "fuel_mean": null,
+      "instructions_mean": null,
       "module_cache": { "hits": 1, "misses": 0 }
     }
   ]

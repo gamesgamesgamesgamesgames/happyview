@@ -21,8 +21,8 @@ use crate::plugin::runtime::{
 use crate::plugin::secrets::load_plugin_secrets;
 use crate::plugin::{
     ChunkRole, ExternalProfile, LoadedPlugin, ModuleScope, PluginInfo, PluginRegistry,
-    ScriptExecuteInput, ScriptExecuteOutput, ScriptKind, ScriptValidateInput, ScriptValidateOutput,
-    TokenSet,
+    ScriptExecuteInput, ScriptExecuteOutput, ScriptExecuteReport, ScriptKind, ScriptValidateInput,
+    ScriptValidateOutput, TokenSet,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -222,7 +222,11 @@ impl PluginInstance {
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
         let input = serde_json::to_value(input)
             .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
-        self.call_plugin_function("execute", &input).await
+        let report: ScriptExecuteReport = self.call_plugin_function("execute", &input).await?;
+        if let Some(used) = report.instructions_used {
+            crate::metrics::run::record_instructions(used);
+        }
+        Ok(report.output)
     }
 
     /// Call `validate` on an interpreter.
@@ -1502,14 +1506,17 @@ impl PluginExecutor {
 
 /// Report what a script run's guest left behind: its linear memory, which
 /// never shrinks and so is the run's high-water mark, and, for a compiled
-/// module, the fuel it spent. An interpreter's fuel says nothing: it is
-/// unbounded, and a frame that catches a `throw` loses what it spent.
+/// module, the fuel it spent in the instructions its budget is set in. An
+/// interpreter's fuel says nothing: it is unbounded, and a frame that catches
+/// a `throw` loses what it spent, so an interpreter counts its own.
 fn report_run_resources(inst: &mut PluginInstance, call_fuel: Option<u64>) {
     crate::metrics::run::record_memory_peak(inst.memory.data_size(&inst.store) as u64);
     if let Some(call_fuel) = call_fuel
         && let Ok(remaining) = inst.store.get_fuel()
     {
-        crate::metrics::run::record_fuel(call_fuel.saturating_sub(remaining));
+        crate::metrics::run::record_instructions(
+            call_fuel.saturating_sub(remaining) / crate::plugin::runtime::FUEL_PER_INSTRUCTION,
+        );
     }
 }
 

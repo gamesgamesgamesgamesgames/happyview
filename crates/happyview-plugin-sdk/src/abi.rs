@@ -11,7 +11,8 @@ use serde::Serialize;
 
 use crate::envelope::PluginError;
 use crate::types::{
-    CallContext, CallInput, ExecuteInput, ExecuteOutput, ValidateInput, ValidateOutput,
+    CallContext, CallInput, ExecuteInput, ExecuteOutput, ExecuteReport, ValidateInput,
+    ValidateOutput,
 };
 use serde_json::Value;
 
@@ -216,14 +217,31 @@ where
     write_bytes(&dispatch_bytes(bytes, handler))
 }
 
-/// The body of the `execute` export. Typed rather than generic so a handler
-/// with the wrong signature is refused in the plugin crate that wrote it.
-pub fn dispatch_execute(
+/// The body of the `execute` export. The handler returns an
+/// [`ExecuteOutput`] or an [`ExecuteReport`], and nothing else, so a handler
+/// with the wrong signature is refused in the plugin crate that wrote it. The
+/// two serialise alike when nothing was counted.
+pub fn dispatch_execute<O>(
     ptr: u32,
     len: u32,
-    handler: fn(&ExecuteInput) -> Result<ExecuteOutput, PluginError>,
-) -> i64 {
+    handler: fn(&ExecuteInput) -> Result<O, PluginError>,
+) -> i64
+where
+    O: ExecuteResult,
+{
     dispatch_input(ptr, len, handler)
+}
+
+/// What an `execute` handler may return.
+pub trait ExecuteResult: Serialize + private::Sealed {}
+
+impl ExecuteResult for ExecuteOutput {}
+impl ExecuteResult for ExecuteReport {}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for crate::types::ExecuteOutput {}
+    impl Sealed for crate::types::ExecuteReport {}
 }
 
 /// The body of the `validate` export.
