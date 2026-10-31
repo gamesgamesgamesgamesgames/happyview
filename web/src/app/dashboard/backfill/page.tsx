@@ -162,7 +162,7 @@ const ERROR_KIND_LABELS: Record<string, string> = {
   did_doc_not_found: "No did.json (404)",
   did_doc_forbidden: "Blocked (403)",
   did_doc_invalid: "Invalid DID document",
-  repo_not_found: "Repo deleted or moved",
+  repo_not_found: "Account deleted or moved",
   repo_deactivated: "Account deactivated",
   repo_takendown: "Account taken down",
   replay_block: "Archive block failed",
@@ -1465,7 +1465,7 @@ function JobDetail({
             {!replayView && !byExecutor && (
               <>
                 <ProgressRow
-                  label="Discovering repos"
+                  label="Discovering accounts"
                   active={
                     isActive &&
                     (job.stage === "discovering_repos" || discovering)
@@ -1477,7 +1477,9 @@ function JobDetail({
                       <AnimatedNumber value={job.total_repos} />
                     ) : undefined
                   }
-                  suffix={discovering ? "found so far" : "repos found"}
+                  suffix={
+                    discovering ? "accounts found so far" : "accounts found"
+                  }
                   loading={
                     discoveredOpen && discoveredReached && !discoveredLoaded
                   }
@@ -1508,8 +1510,8 @@ function JobDetail({
                   ) : discoveredLoaded ? (
                     <p className="py-3 text-center text-xs text-muted-foreground">
                       {bounded
-                        ? "No repos waiting."
-                        : "No repos discovered yet."}
+                        ? "No accounts waiting."
+                        : "No accounts discovered yet."}
                     </p>
                   ) : null}
                 </ProgressRow>
@@ -1552,8 +1554,9 @@ function JobDetail({
                           </span>
                           <span className="text-xs text-muted-foreground tabular-nums">
                             <AnimatedNumber value={pds.completed_repos} />/
-                            <AnimatedNumber value={pds.total_repos} /> repos ·{" "}
-                            <AnimatedNumber value={pds.total_records} /> records
+                            <AnimatedNumber value={pds.total_repos} /> accounts
+                            · <AnimatedNumber value={pds.total_records} />{" "}
+                            records
                           </span>
                         </div>
                       )}
@@ -1578,7 +1581,7 @@ function JobDetail({
                     job.stage === "resolving_and_fetching" ? (
                       <>
                         <AnimatedNumber value={job.processed_repos ?? 0} /> /{" "}
-                        <AnimatedNumber value={job.total_repos ?? 0} /> repos
+                        <AnimatedNumber value={job.total_repos ?? 0} /> accounts
                       </>
                     ) : undefined
                   }
@@ -1625,7 +1628,7 @@ function JobDetail({
                     />
                   ) : fetchedLoaded ? (
                     <p className="py-3 text-center text-xs text-muted-foreground">
-                      No repos fetched yet.
+                      No accounts fetched yet.
                     </p>
                   ) : null}
                 </ProgressRow>
@@ -2089,7 +2092,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
                 : chosenSource === "replay"
                   ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
                   : chosenSource === "crawl"
-                    ? "Lists repos from the relay and fetches each PDS."
+                    ? "Lists accounts from the relay and fetches each PDS."
                     : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
             </p>
           </div>
