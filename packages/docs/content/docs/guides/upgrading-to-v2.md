@@ -134,7 +134,7 @@ v2 introduces granular user permissions. After upgrading:
 
 1. The first user to authenticate becomes the **super user** (full access).
 2. Additional users are created with no permissions by default.
-3. Assign permissions or use a template (Viewer, Operator, Manager, Full Access).
+3. Assign permissions or use a template (Viewer, Maintainer, Manager, Full Access).
 
 See the [Permissions guide](permissions.md) for details.
 
