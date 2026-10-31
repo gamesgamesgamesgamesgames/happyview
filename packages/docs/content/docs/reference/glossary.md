@@ -52,7 +52,7 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 
 **Permissioned Data** — atproto data that is gated by membership in a space, as opposed to public repo data. Defined by atproto Proposal 0016.
 
-**Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Operator** (viewer + backfill and API key management), **Manager** (operator + lexicon, record, spaces, and plugin management), and **Full Access** (all 44 permissions).
+**Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Maintainer** (viewer + backfill, API key and dead letter management), **Manager** (maintainer + lexicon, record, spaces, and plugin management), and **Full Access** (all 52 permissions).
 
 **Read Policy / Write Policy** — A space's two independent policies. The read policy decides who can obtain a space credential; the write policy decides whose writes the space tracks. Each is member-list, public, or managing-app.
 

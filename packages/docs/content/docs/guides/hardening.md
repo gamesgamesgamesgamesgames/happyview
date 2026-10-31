@@ -132,20 +132,11 @@ The session cookie belongs to the instance's own dashboard. It is `SameSite=Lax`
 
 - the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
 - its `Origin` is one of the instance's domains;
-- its `Origin` is listed in the `cookie_integration_origins` setting (env `COOKIE_INTEGRATION_ORIGINS`);
 - or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
 
 Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
 
-Because the cookie is `SameSite=Lax`, a browser on another site does not send it with a `fetch`. A listed origin is therefore useful only for a sibling on the same site (`app.example.com` beside `happyview.example.com`), and only on `/admin`. Set it as the scheme, host and port only:
-
-```sh
-curl -X PUT "http://127.0.0.1:3000/admin/settings/cookie_integration_origins" \
-  -H "$AUTH" -H "content-type: application/json" \
-  -d '{"value": "https://app.example.com"}'
-```
-
-A value that is not a list of origins is refused with `400`. A listed origin is also allowed credentials by CORS. Listing an origin lets that site act as any admin who visits it while signed in, so list only sites you control.
+An integration on another origin, including a sibling on the same site, cannot use the session cookie at all: it authenticates with OAuth (DPoP) or an API key. CORS allows credentials only to the instance's own domains.
 
 ## A checklist
 
@@ -155,7 +146,6 @@ A value that is not a list of origins is refused with `400`. A listed origin is 
 - [ ] XRPC proxy set explicitly — allowlist if you can enumerate your NSIDs, disabled if you serve only your own
 - [ ] Linked-repo grants scoped before the invite goes out, not after
 - [ ] Third-party API clients reviewed: each one can ask the PDS to sign for an audience of its choosing
-- [ ] `cookie_integration_origins` lists only sites you control
 - [ ] Database backups cover `happyview_oauth_client_keys` — losing a row there permanently destroys every session pinned to it
 
 ## Related

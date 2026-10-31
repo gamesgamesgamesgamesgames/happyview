@@ -28,10 +28,6 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ),
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
-    (
-        crate::csrf::INTEGRATION_ORIGINS_SETTING,
-        "COOKIE_INTEGRATION_ORIGINS",
-    ),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
@@ -185,17 +181,11 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
-    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
-        crate::csrf::validate_origins(&body.value).map_err(AppError::BadRequest)?;
-    }
 
     put_setting(&state.db, &key, &body.value, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
     refresh_cached_setting(&state, &key).await;
-    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
-        state.integration_origins.forget().await;
-    }
 
     log_event(
         &state.db,
@@ -239,9 +229,6 @@ pub(super) async fn delete(
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
     refresh_cached_setting(&state, &key).await;
-    if key == crate::csrf::INTEGRATION_ORIGINS_SETTING {
-        state.integration_origins.forget().await;
-    }
 
     log_event(
         &state.db,
