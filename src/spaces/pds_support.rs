@@ -41,12 +41,19 @@ const CONTROL_METHOD: &str = "com.atproto.space.zzzProbeControlDoesNotExist";
 ///
 /// Each entry is a set of accepted spellings, and one match is enough.
 /// Implementations lag renames: `getRepoState` predates `getLatestCommit`, and
-/// pds.js still offers `addMember` rather than `putMember`.
+/// pds.js still offers `addMember` rather than `putMember`. The October 29
+/// spaces alpha moved space management to `space.*` and members to
+/// `memberspace.*`, and removed `simplespace` without an alias, so a host on
+/// either generation qualifies.
 const REQUIRED_METHODS: &[&[&str]] = &[
-    &["com.atproto.simplespace.createSpace"],
+    &[
+        "com.atproto.simplespace.createSpace",
+        "com.atproto.space.createSpace",
+    ],
     &[
         "com.atproto.simplespace.putMember",
         "com.atproto.simplespace.addMember",
+        "com.atproto.memberspace.putMember",
     ],
     &[
         "com.atproto.simplespace.getSpace",
@@ -408,6 +415,46 @@ mod tests {
                 .await
                 .supported
         );
+    }
+
+    /// The space methods zds 0.7.1 routes, from its `src/http/router.zig`: the
+    /// October 29 alpha, with no `simplespace` method left.
+    #[tokio::test]
+    async fn a_host_on_the_october_29_alpha_is_supported() {
+        let server = MockServer::start().await;
+        let methods = [
+            "com.atproto.managedspace.checkUserAccess",
+            "com.atproto.memberspace.listMembers",
+            "com.atproto.memberspace.putMember",
+            "com.atproto.memberspace.removeMember",
+            "com.atproto.space.applyWrites",
+            "com.atproto.space.createRecord",
+            "com.atproto.space.createSpace",
+            "com.atproto.space.deleteRecord",
+            "com.atproto.space.deleteSpace",
+            "com.atproto.space.getDelegationToken",
+            "com.atproto.space.getLatestCommit",
+            "com.atproto.space.getRecord",
+            "com.atproto.space.getRepo",
+            "com.atproto.space.getSpace",
+            "com.atproto.space.getSpaceCredential",
+            "com.atproto.space.listRecords",
+            "com.atproto.space.listRepoOps",
+            "com.atproto.space.listRepos",
+            "com.atproto.space.listSpaces",
+            "com.atproto.space.notifyWrite",
+            "com.atproto.space.putRecord",
+            "com.atproto.space.updateSpace",
+        ];
+
+        Mock::given(method("GET"))
+            .and(path(format!("/xrpc/{DESCRIBE_NSID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(descriptor(&methods)))
+            .mount(&server)
+            .await;
+
+        let got = probe(&reqwest::Client::new(), &server.uri()).await;
+        assert!(got.supported, "missing: {:?}", got.missing);
     }
 
     #[tokio::test]
