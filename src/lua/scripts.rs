@@ -476,8 +476,7 @@ pub async fn run_record_event_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+    let result: mlua::Value = sandbox::call_handle(&lua, &handle, ())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -684,8 +683,7 @@ async fn run_label_lua_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+    let result: mlua::Value = sandbox::call_handle(&lua, &handle, ())
         .await
         .map_err(|e| e.to_string())?;
 
