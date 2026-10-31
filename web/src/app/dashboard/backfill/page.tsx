@@ -956,6 +956,12 @@ function JobDetail({
   // Any other source names an executor: the record source backfills the
   // collection itself, and says what it holds for it now.
   const byExecutor = runByExecutor(job.source);
+  // The network store restarts a cancelled or failed store pass within about
+  // a minute; only a paused one stays stopped. So its backfills offer Pause
+  // and no Cancel.
+  const restartsUnlessPaused = job.source === "store-pass";
+  const pauseShown =
+    canCancel && (job.status === "running" || job.status === "pausing");
   const [collectionSummary, setCollectionSummary] =
     useState<BackfillCollection["summary"]>(null);
   useEffect(() => {
@@ -1649,7 +1655,12 @@ function JobDetail({
           </div>
         </div>
       </div>
-      <SheetFooter className="border-t flex-row justify-end gap-2">
+      <SheetFooter className="border-t flex-row items-center justify-end gap-2">
+        {restartsUnlessPaused && (pauseShown || (canCancel && resumable)) && (
+          <p className="mr-auto text-xs text-muted-foreground">
+            Paused backfills stay paused. Resume picks up where it left off.
+          </p>
+        )}
         {canFlush && flushable && (
           <AlertDialog>
             <AlertDialogTrigger asChild>
@@ -1692,17 +1703,16 @@ function JobDetail({
             </AlertDialogContent>
           </AlertDialog>
         )}
-        {canCancel &&
-          (job.status === "running" || job.status === "pausing") && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={pausing || job.status === "pausing"}
-              onClick={handlePause}
-            >
-              {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
-            </Button>
-          )}
+        {pauseShown && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={pausing || job.status === "pausing"}
+            onClick={handlePause}
+          >
+            {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
+          </Button>
+        )}
         {canCancel && resumable && (
           <Button
             variant="default"
@@ -1713,7 +1723,7 @@ function JobDetail({
             {resuming ? "Resuming…" : "Resume Job"}
           </Button>
         )}
-        {canCancel && isActive && (
+        {canCancel && isActive && !restartsUnlessPaused && (
           <Button
             variant="destructive"
             size="sm"
@@ -1723,7 +1733,7 @@ function JobDetail({
             {job.status === "cancelling" ? "Cancelling…" : "Cancel Job"}
           </Button>
         )}
-        {canCancel && job.status === "paused" && (
+        {canCancel && job.status === "paused" && !restartsUnlessPaused && (
           <Button
             variant="destructive"
             size="sm"
