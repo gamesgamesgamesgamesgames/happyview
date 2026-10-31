@@ -143,8 +143,6 @@ pub struct AppState {
     pub script_limits: Arc<lua::limits::ScriptLimits>,
     /// Per-script run metrics, in memory only.
     pub metrics: Arc<metrics::ScriptMetrics>,
-    /// The origins listed in `cookie_integration_origins`, read briefly cached.
-    pub integration_origins: Arc<csrf::IntegrationOrigins>,
     /// Present only in a state the test command built for one test file.
     /// Every behaviour a test run changes — the in-process PDS, forged
     /// callers, mocks, single-attempt record scripts — is keyed on this, and
