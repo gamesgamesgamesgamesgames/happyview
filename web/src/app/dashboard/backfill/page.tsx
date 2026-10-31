@@ -11,6 +11,7 @@ import { RecordsProgress } from "./records-progress-bar";
 import {
   hookDetail,
   hookStatsOf,
+  executorProgress,
   runByExecutor,
   runningLabel,
 } from "./records-progress";
@@ -1392,10 +1393,7 @@ function JobDetail({
             )}
             {byExecutor && (
               <RecordsProgress
-                label="Running the create hook over stored records"
-                done={job.processed_repos ?? 0}
-                total={job.total_repos}
-                estimated
+                {...executorProgress(job)}
                 active={isActive && !isPaused}
                 detail={
                   hookStats && (
