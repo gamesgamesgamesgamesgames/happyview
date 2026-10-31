@@ -739,7 +739,7 @@ export default function BackfillPage() {
   const load = useCallback(() => {
     getBackfillJobs()
       .then(setJobs)
-      .catch((e) => toastError("Failed to load backfill jobs", e));
+      .catch((e) => toastError("Couldn't load backfills", e));
   }, []);
 
   useEffect(() => {
@@ -765,7 +765,7 @@ export default function BackfillPage() {
       <SiteHeader title="Backfill" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Backfill Jobs</h2>
+          <h2 className="text-lg font-semibold">Backfills</h2>
           <div className="flex items-center gap-2">
             {canFlush && (
               <AlertDialog>
@@ -776,7 +776,7 @@ export default function BackfillPage() {
                 </AlertDialogTrigger>
                 <AlertDialogContent>
                   <AlertDialogHeader>
-                    <AlertDialogTitle>Clear all job details?</AlertDialogTitle>
+                    <AlertDialogTitle>Clear all details?</AlertDialogTitle>
                     <AlertDialogDescription>
                       This will permanently delete per-repo detail data for all
                       completed, cancelled and failed backfill jobs.
@@ -789,10 +789,10 @@ export default function BackfillPage() {
                         try {
                           await flushAllBackfillDetails();
                         } catch (e: unknown) {
-                          toastError("Failed to clear job details", e);
+                          toastError("Couldn't clear details", e);
                           return;
                         }
-                        toast.success("All job details cleared");
+                        toast.success("All details cleared");
                         setSelectedJobId(null);
                         load();
                       }}
@@ -827,8 +827,7 @@ export default function BackfillPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No backfill jobs yet. Create a job to import historical
-                    records from the AT Protocol network.
+                    No backfills yet.
                   </TableCell>
                 </TableRow>
               )}
@@ -1088,7 +1087,7 @@ function JobDetail({
     setCancelling(true);
     try {
       await onCancel();
-      toast.success("Backfill job cancelled");
+      toast.success("Backfill cancelled");
     } finally {
       setCancelling(false);
     }
@@ -1098,7 +1097,7 @@ function JobDetail({
     setPausing(true);
     try {
       await onPause();
-      toast.success("Backfill job paused");
+      toast.success("Backfill paused");
     } finally {
       setPausing(false);
     }
@@ -1108,7 +1107,7 @@ function JobDetail({
     setResuming(true);
     try {
       await onResume();
-      toast.success("Backfill job resumed");
+      toast.success("Backfill resumed");
     } finally {
       setResuming(false);
     }
@@ -1118,9 +1117,9 @@ function JobDetail({
     setRetrying(true);
     try {
       await onRetry(kinds);
-      toast.success("Retry job started");
+      toast.success("Retry started as a new backfill");
     } catch (e: unknown) {
-      toastError("Failed to start retry", e);
+      toastError("Couldn't start the retry", e);
     } finally {
       setRetrying(false);
     }
@@ -1302,13 +1301,13 @@ function JobDetail({
     <>
       <SheetHeader>
         <SheetTitle className="flex items-center gap-2">
-          <span className="font-mono text-sm">Backfill Details</span>
+          <span className="font-mono text-sm">Backfill details</span>
         </SheetTitle>
       </SheetHeader>
       <div className="flex-1 min-h-0 overflow-y-auto px-4 flex flex-col gap-4">
         <div className="grid grid-cols-2 gap-4 text-sm">
           <div className="col-span-2">
-            <span className="text-muted-foreground">Job ID</span>
+            <span className="text-muted-foreground">ID</span>
             <p className="font-mono text-xs break-all">{job.id}</p>
           </div>
           <div>
@@ -1687,7 +1686,7 @@ function JobDetail({
             </AlertDialogTrigger>
             <AlertDialogContent>
               <AlertDialogHeader>
-                <AlertDialogTitle>Clear job details?</AlertDialogTitle>
+                <AlertDialogTitle>Clear details?</AlertDialogTitle>
                 <AlertDialogDescription>
                   This will permanently delete per-repo detail data for this
                   backfill job.
@@ -1700,10 +1699,10 @@ function JobDetail({
                     try {
                       await flushBackfillDetails(job.id);
                     } catch (e: unknown) {
-                      toastError("Failed to clear job details", e);
+                      toastError("Couldn't clear details", e);
                       return;
                     }
-                    toast.success("Job details cleared");
+                    toast.success("Details cleared");
                     setDiscoveredRepos([]);
                     setDiscoveredCursor(null);
                     setDiscoveredLoaded(false);
@@ -1727,7 +1726,7 @@ function JobDetail({
             disabled={pausing || job.status === "pausing"}
             onClick={handlePause}
           >
-            {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
+            {pausing || job.status === "pausing" ? "Pausing…" : "Pause"}
           </Button>
         )}
         {canCancel && resumable && (
@@ -1737,7 +1736,7 @@ function JobDetail({
             disabled={resuming}
             onClick={handleResume}
           >
-            {resuming ? "Resuming…" : "Resume Job"}
+            {resuming ? "Resuming…" : "Resume"}
           </Button>
         )}
         {canCancel && isActive && !restartsUnlessPaused && (
@@ -1747,7 +1746,7 @@ function JobDetail({
             disabled={cancelling || job.status === "cancelling"}
             onClick={handleCancel}
           >
-            {job.status === "cancelling" ? "Cancelling…" : "Cancel Job"}
+            {job.status === "cancelling" ? "Cancelling…" : "Cancel"}
           </Button>
         )}
         {canCancel && job.status === "paused" && !restartsUnlessPaused && (
@@ -1757,7 +1756,7 @@ function JobDetail({
             disabled={cancelling}
             onClick={handleCancel}
           >
-            Cancel Job
+            Cancel
           </Button>
         )}
       </SheetFooter>
@@ -1972,21 +1971,21 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         dids: dids.length > 0 ? dids : undefined,
         source: chosenSource === "default" ? undefined : chosenSource,
       });
-      toast.success("Backfill job created");
+      toast.success("Backfill created");
       setCollection(null);
       setDids([]);
       setSource("default");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
-      toastError("Failed to create backfill job", e);
+      toastError("Couldn't create the backfill", e);
     }
   }
 
   return (
     <ResponsiveDialog open={open} onOpenChange={setOpen}>
       <ResponsiveDialogTrigger asChild>
-        <Button>Create Backfill Job</Button>
+        <Button>New backfill</Button>
       </ResponsiveDialogTrigger>
       <ResponsiveDialogContent
         className="data-[variant=dialog]:max-h-[calc(100dvh-2rem)] data-[variant=dialog]:grid-rows-[auto_minmax(0,1fr)_auto]"
@@ -2002,7 +2001,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         }}
       >
         <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>Create Backfill Job</ResponsiveDialogTitle>
+          <ResponsiveDialogTitle>New backfill</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
             Backfill a collection, specific accounts, or both. Without accounts,
             every repo on the network with matching records is backfilled;
