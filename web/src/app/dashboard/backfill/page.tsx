@@ -168,6 +168,16 @@ const ERROR_KIND_LABELS: Record<string, string> = {
   other: "Other",
 };
 
+// Rows cancelled before the server's wording changed keep the old text.
+const LEGACY_ERROR_NOTES: Record<string, string> = {
+  "cancelled by user": "Cancelled by an operator",
+};
+
+/** What a job that didn't fail says in its error column, read as a note. */
+function errorNote(error: string): string {
+  return LEGACY_ERROR_NOTES[error] ?? error;
+}
+
 function errorKindLabel(kind: string): string {
   return ERROR_KIND_LABELS[kind] ?? kind.replace(/_/g, " ");
 }
@@ -1350,12 +1360,19 @@ function JobDetail({
               {pauseReason}
             </div>
           </div>
+        ) : job.error && job.status === "failed" ? (
+          <div>
+            <span className="text-muted-foreground text-sm">Error</span>
+            <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
+              {job.error}
+            </div>
+          </div>
         ) : (
           job.error && (
             <div>
-              <span className="text-muted-foreground text-sm">Error</span>
-              <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
-                {job.error}
+              <span className="text-muted-foreground text-sm">Note</span>
+              <div className="bg-muted mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+                {errorNote(job.error)}
               </div>
             </div>
           )
