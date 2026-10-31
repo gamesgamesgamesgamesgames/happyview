@@ -300,9 +300,9 @@ async fn metrics_need_metrics_read_and_a_kept_window() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
     }
 
-    let (status, body) = get(&app, "/admin/metrics/scripts?window=7d").await;
+    let (status, body) = get(&app, "/admin/metrics/scripts?window=90d").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.to_string().contains("1h"), "{body}");
+    assert!(body.to_string().contains("30d"), "{body}");
     let (status, _) = get(&app, "/admin/metrics/scripts/x?window=24h&step=1m").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

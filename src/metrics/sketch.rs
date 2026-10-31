@@ -8,11 +8,16 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// The ratio between consecutive bucket bounds. The relative error is
 /// `(GAMMA - 1) / (GAMMA + 1)`, just under 1%.
 pub const GAMMA: f64 = 1.02;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Stored by field name, every field defaulting, so a row written before a
+/// field existed still reads.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sketch {
     /// Bucket `i` counts values in `(GAMMA^(i-1), GAMMA^i]`. Sparse: a
     /// latency distribution occupies a few dozen of the ~1,400 buckets

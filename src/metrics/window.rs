@@ -211,7 +211,7 @@ impl<B: Accumulate> Ring<B> {
         self.width
     }
 
-    fn start_of(&self, at: u64) -> u64 {
+    pub fn start_of(&self, at: u64) -> u64 {
         at - at % self.width
     }
 
@@ -229,6 +229,19 @@ impl<B: Accumulate> Ring<B> {
                 bucket.add_sample(sample);
                 *slot = Some((start, bucket));
             }
+        }
+    }
+
+    /// Merge `bucket`, whose span starts at `at`, into the bucket of that
+    /// span. This is how buckets read back from the table return to a ring;
+    /// a slot already holding a later span keeps it.
+    pub fn merge_bucket(&mut self, at: u64, bucket: &B) {
+        let start = self.start_of(at);
+        let i = self.slot_of(start);
+        match &mut self.slots[i] {
+            Some((held, held_bucket)) if *held == start => held_bucket.merge_from(bucket),
+            Some((held, _)) if *held > start => {}
+            slot => *slot = Some((start, bucket.clone())),
         }
     }
 
