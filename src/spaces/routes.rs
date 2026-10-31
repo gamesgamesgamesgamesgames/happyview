@@ -1461,12 +1461,24 @@ async fn list_repos(
     require_audience(&claims, &space.authority_did)?;
 
     let did = require_auth_or_credential(&state, &claims).await?;
-    service::require_membership(
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
         false,
         claims.space_credential.as_deref(),
+    )
+    .await?;
+    // Every writer's DID is a whole-space read, which read_self does not grant.
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
     )
     .await?;
 

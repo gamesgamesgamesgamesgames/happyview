@@ -508,18 +508,18 @@ pub fn compute_backfill_pool_size(
         .max(1)
 }
 
-pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
+/// The backfill pool, sized for the crawl concurrency a job will run with:
+/// [`crate::admin::settings::backfill_concurrency`] read from `settings`, the
+/// migrated main pool, so a setting saved from the dashboard counts.
+pub async fn connect_backfill_pool(
+    url: &str,
+    backend: DatabaseBackend,
+    settings: &AnyPool,
+) -> AnyPool {
     install_drivers();
 
-    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
-    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+    let (pds, dids, resolution) =
+        crate::admin::settings::backfill_concurrency(settings, backend).await;
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);
 
     tracing::info!(max_connections, "backfill pool sized");
@@ -1349,6 +1349,42 @@ mod tests {
         );
     }
 
+    /// The pool is sized for the concurrency a crawl will read, which is the
+    /// instance setting when there is one: an operator who raised it from
+    /// the dashboard gets a pool to match at the next start.
+    #[tokio::test]
+    #[serial]
+    async fn the_backfill_pool_is_sized_from_the_instance_settings() {
+        let path = std::env::temp_dir().join(format!("hv-bf-size-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let main = connect(&url, DatabaseBackend::Sqlite).await;
+        let size = |pool: &AnyPool| pool.options().get_max_connections();
+
+        let defaults = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &main).await;
+        assert_eq!(
+            size(&defaults),
+            16,
+            "10 × 3 + 100 + 4, held to SQLite's ceiling"
+        );
+
+        for (key, value) in [
+            ("backfill_concurrent_pds", "2"),
+            ("backfill_concurrent_dids_per_pds", "2"),
+            ("backfill_concurrent_resolution", "3"),
+        ] {
+            crate::admin::settings::put_setting(&main, key, value, DatabaseBackend::Sqlite)
+                .await
+                .unwrap();
+        }
+        let sized = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &main).await;
+        assert_eq!(size(&sized), 11, "2 × 2 + 3 + 4, from the stored settings");
+
+        defaults.close().await;
+        sized.close().await;
+        main.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     #[serial]
     async fn synchronous_normal_reaches_backfill_pool_connections() {
@@ -1360,7 +1396,8 @@ mod tests {
         unsafe {
             std::env::remove_var("SQLITE_SYNCHRONOUS");
         }
-        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite).await;
+        let settings = crate::test_support::migrated_memory_pool().await;
+        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &settings).await;
 
         let mut conns = Vec::new();
         for _ in 0..4 {

@@ -186,7 +186,7 @@ impl Default for ArchiveConfig {
 
 impl ArchiveConfig {
     pub fn from_env(user_agent: &str) -> Self {
-        let var = |name: &str| std::env::var(name).ok();
+        use happyview_provider::vars::var;
         let default_source = parse_default_source(var("BACKFILL_SOURCE").as_deref());
         Self {
             http: archive_client(user_agent),
@@ -287,9 +287,55 @@ mod tests {
 
     #[test]
     fn the_default_config_crawls() {
-        // `from_env` is not tested here: tests must not set process env. Its
-        // parse is covered by `sources_parse_in_any_case_and_refuse_the_rest`.
         assert_eq!(ArchiveConfig::default().default_source, SourceChoice::Crawl);
+    }
+
+    const REPLAY_VARS: [&str; 5] = [
+        "BACKFILL_SOURCE",
+        "JETSTREAM_API_KEY",
+        "BACKFILL_REPLAY_CONCURRENCY",
+        "BACKFILL_REPLAY_DIR",
+        "BACKFILL_REPLAY_MARKER_TAIL_HOURS",
+    ];
+
+    #[test]
+    #[serial_test::serial]
+    fn the_project_layer_reaches_the_replay_settings() {
+        use happyview_provider::vars::{LayerReset, set_project_layer};
+        let _reset = LayerReset;
+        unsafe {
+            for name in REPLAY_VARS {
+                std::env::remove_var(name);
+            }
+        }
+        set_project_layer(
+            [
+                ("BACKFILL_SOURCE", "replay"),
+                ("JETSTREAM_API_KEY", "file-key"),
+                ("BACKFILL_REPLAY_CONCURRENCY", "3"),
+                ("BACKFILL_REPLAY_DIR", "/srv/replay"),
+                ("BACKFILL_REPLAY_MARKER_TAIL_HOURS", "5"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into(),
+        );
+        let config = ArchiveConfig::from_env("test");
+        assert_eq!(config.default_source, SourceChoice::Replay);
+        assert_eq!(config.api_key.as_deref(), Some("file-key"));
+        assert_eq!(config.concurrency, 3);
+        assert_eq!(config.download_dir, PathBuf::from("/srv/replay"));
+        assert_eq!(
+            config.marker_tail,
+            std::time::Duration::from_secs(5 * 60 * 60)
+        );
+
+        unsafe { std::env::set_var("BACKFILL_REPLAY_CONCURRENCY", "6") };
+        assert_eq!(
+            ArchiveConfig::from_env("test").concurrency,
+            6,
+            "the environment wins over the file"
+        );
+        unsafe { std::env::remove_var("BACKFILL_REPLAY_CONCURRENCY") };
     }
 
     #[test]

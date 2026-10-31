@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use rand::Rng;
-use sha2::{Digest, Sha256};
+
 use uuid::Uuid;
 
 use super::CreateApiClientInput;
@@ -106,20 +106,10 @@ pub async fn create_api_client(
         ));
     }
 
-    // 6. Generate `hvc_` client key and optional `hvs_` client secret
+    // 6. Generate the `hvc_` client key
     let mut random_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut random_bytes);
     let child_client_key = format!("hvc_{}", hex::encode(random_bytes));
-
-    let (client_secret, client_secret_hash) = if input.client_type == "confidential" {
-        let mut secret_bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret_bytes);
-        let secret = format!("hvs_{}", hex::encode(secret_bytes));
-        let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        (Some(secret), hash)
-    } else {
-        (None, String::new())
-    };
 
     // 7. Insert into `api_clients` table
     let id = Uuid::new_v4().to_string();
@@ -132,13 +122,12 @@ pub async fn create_api_client(
         .map(|origins| serde_json::to_string(origins).unwrap_or_else(|_| "[]".to_string()));
 
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at, parent_client_id, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 1, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at, parent_client_id, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 1, ?, ?, ?, ?, ?)",
         state.db_backend,
     );
     crate::db::query(&insert_sql)
         .bind(&id)
         .bind(&child_client_key)
-        .bind(&client_secret_hash)
         .bind(&input.name)
         .bind(&input.client_id_url)
         .bind(&input.client_uri)
@@ -154,6 +143,20 @@ pub async fn create_api_client(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create api client: {e}")))?;
+
+    // A confidential client starts with one `hvs_` secret; a public one has none.
+    let client_secret = if input.client_type == "confidential" {
+        let (_, secret) = crate::oauth::client_secrets::create(
+            &state.db,
+            state.db_backend,
+            &id,
+            crate::oauth::client_secrets::ORIGINAL_LABEL,
+        )
+        .await?;
+        Some(secret)
+    } else {
+        None
+    };
 
     // 8. Register with OAuth registry and rate limiter
     let oauth_params = crate::auth::client_registry::ApiClientOAuthParams {
@@ -178,13 +181,15 @@ pub async fn create_api_client(
         );
     }
 
-    state.rate_limiter.register_client_identity(
-        child_client_key.clone(),
-        crate::rate_limit::ClientIdentity {
-            secret_hash: client_secret_hash.clone(),
-            client_uri: input.client_uri.clone(),
-        },
-    );
+    crate::oauth::client_secrets::register_identity(
+        &state.rate_limiter,
+        &state.db,
+        state.db_backend,
+        &id,
+        &child_client_key,
+        &input.client_uri,
+    )
+    .await?;
 
     let defaults = state.rate_limiter.defaults();
     state.rate_limiter.register_client_config(

@@ -49,7 +49,7 @@ A script requires only what it uses. The codemod writes its requires in this ord
 
 | Trigger | `input` |
 | --- | --- |
-| `xrpc.query:<nsid>` | The query-string parameters. A parameter the lexicon declares as `integer`, `number` or `boolean` arrives as that Lua type; any other value is a string, and a repeated key is an array of strings |
+| `xrpc.query:<nsid>` | The query-string parameters, already checked against the lexicon. A parameter the lexicon declares as `integer`, `number` or `boolean` arrives as that Lua type, one declared as an `array` arrives as an array even when it was sent once, and a missing parameter with a `default` arrives as its default. Any other value is a string, and a repeated key is an array of strings |
 | `xrpc.procedure:<nsid>` | The request body |
 | `record.index:<nsid>`, `record.create:<nsid>`, `record.update:<nsid>`, `record.delete:<nsid>` | `{ action, uri, did, collection, rkey, record }`. `action` is `"create"`, `"update"` or `"delete"`; `record` is `nil` on delete |
 | `labeler.apply:<nsid>`, `labeler.apply:_actor` | `{ src, uri, val, neg, cts, exp }`. `exp` is absent when the label does not expire |

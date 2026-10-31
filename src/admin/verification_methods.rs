@@ -80,12 +80,20 @@ pub(super) async fn create(
 }
 
 /// DELETE /admin/verification-methods/{fragment_id} — delete a verification method.
+///
+/// The fragment is stored with its `#`, which a URL path cannot carry
+/// unencoded, so the bare name (`atproto`) is accepted as well as `%23atproto`.
 pub(super) async fn delete(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(fragment_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    let fragment_id = if fragment_id.starts_with('#') {
+        fragment_id
+    } else {
+        format!("#{fragment_id}")
+    };
 
     let deleted = delete_method(&state.db, state.db_backend, &fragment_id).await?;
     if !deleted {

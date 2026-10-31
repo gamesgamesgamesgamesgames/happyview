@@ -610,6 +610,16 @@ All error responses return JSON with an `error` field:
 | `404 Not Found` | Method or record not found | XRPC method has no matching lexicon, or the requested record doesn't exist |
 | `500 Internal Server Error` | Server-side failure | Lua script error, database error, or upstream PDS failure |
 
+### Lexicon validation errors
+
+Before a query or procedure's script runs, HappyView checks the call against the method's lexicon: its parameters against `parameters`, and a JSON body against `input.schema`. A call that breaks it is refused with `400` and an `InvalidRequest` body naming the first problem, in the atproto reference implementation's wording:
+
+```json
+{ "error": "InvalidRequest", "message": "Params/limit can not be greater than 100" }
+```
+
+Required properties, `const`, `enum`, `minLength` and `maxLength` (in UTF-8 bytes), `minGraphemes` and `maxGraphemes`, string `format`s, integer `minimum` and `maximum`, types, array lengths and items, `ref`s and closed `union`s are all checked. `knownValues` is a hint and isn't enforced, and a parameter the lexicon doesn't declare passes through to the script. A `ref` to a lexicon this instance doesn't hold isn't checked. A script calling another method with `xrpc.query` or `xrpc.procedure` meets the same checks.
+
 ### Lua script errors
 
 When a Lua script fails, the response is a `script_error` body:

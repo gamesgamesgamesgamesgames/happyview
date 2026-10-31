@@ -439,6 +439,53 @@ async fn next_tick(tick: Option<&mut tokio::time::Interval>) {
     }
 }
 
+/// What the two checkpoint ticks do, apart from when they fire: the timed
+/// checkpoint and the size check share the busy tracker and the size check's
+/// backoff. [`run`] calls them on its intervals; a test calls them directly,
+/// so what it asserts does not depend on how fast the machine is.
+pub(crate) struct Checkpoints {
+    busy: BusyTracker,
+    backoff: Option<SizeBackoff>,
+    wal_limit: Option<WalLimit>,
+}
+
+impl Checkpoints {
+    pub(crate) fn new(checkpoint_every: Option<Duration>, wal_limit: Option<WalLimit>) -> Self {
+        let backoff = wal_limit.as_ref().map(|limit| {
+            let cap = limit.poll * SIZE_BACKOFF_MAX_POLLS;
+            SizeBackoff::new(
+                limit.poll,
+                checkpoint_every.map_or(cap, |every| cap.min(every)),
+            )
+        });
+        Self {
+            busy: BusyTracker::default(),
+            backoff,
+            wal_limit,
+        }
+    }
+
+    /// The timed checkpoint's tick.
+    pub(crate) async fn timed(&mut self, pool: &AnyPool) {
+        let was_busy = run_checkpoint(pool, &mut self.busy).await;
+        if let Some(backoff) = self.backoff.as_mut() {
+            backoff.observe(was_busy, tokio::time::Instant::now());
+        }
+    }
+
+    /// The size check's tick: checkpoints when the WAL is past its limit and
+    /// the backoff allows it.
+    pub(crate) async fn size_check(&mut self, pool: &AnyPool) {
+        if let (Some(limit), Some(backoff)) = (self.wal_limit.as_ref(), self.backoff.as_mut())
+            && backoff.ready(tokio::time::Instant::now())
+            && std::fs::metadata(&limit.path).is_ok_and(|m| m.len() > limit.max_bytes)
+        {
+            let was_busy = run_checkpoint(pool, &mut self.busy).await;
+            backoff.observe(was_busy, tokio::time::Instant::now());
+        }
+    }
+}
+
 /// The maintenance loop. A no-op on Postgres. `checkpoint_every` of `None`
 /// disables the timed checkpoint and `wal_limit` of `None` the size check;
 /// the daily optimize runs either way.
@@ -451,24 +498,17 @@ pub async fn run(
     if backend != DatabaseBackend::Sqlite {
         return;
     }
-    let mut busy = BusyTracker::default();
     let mut size_tick = wal_limit.as_ref().map(|limit| {
         let mut tick = tokio::time::interval(limit.poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick
-    });
-    let mut backoff = wal_limit.as_ref().map(|limit| {
-        let cap = limit.poll * SIZE_BACKOFF_MAX_POLLS;
-        SizeBackoff::new(
-            limit.poll,
-            checkpoint_every.map_or(cap, |every| cap.min(every)),
-        )
     });
     let mut checkpoint_tick = checkpoint_every.map(|every| {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick
     });
+    let mut checkpoints = Checkpoints::new(checkpoint_every, wal_limit);
     // Startup already ran `optimize` (see `db::connect`), so the first one
     // here is a day out.
     let mut optimize_tick = tokio::time::interval_at(
@@ -479,21 +519,8 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            _ = next_tick(checkpoint_tick.as_mut()) => {
-                let was_busy = run_checkpoint(&pool, &mut busy).await;
-                if let Some(backoff) = backoff.as_mut() {
-                    backoff.observe(was_busy, tokio::time::Instant::now());
-                }
-            }
-            _ = next_tick(size_tick.as_mut()) => {
-                if let (Some(limit), Some(backoff)) = (wal_limit.as_ref(), backoff.as_mut())
-                    && backoff.ready(tokio::time::Instant::now())
-                    && std::fs::metadata(&limit.path).is_ok_and(|m| m.len() > limit.max_bytes)
-                {
-                    let was_busy = run_checkpoint(&pool, &mut busy).await;
-                    backoff.observe(was_busy, tokio::time::Instant::now());
-                }
-            }
+            _ = next_tick(checkpoint_tick.as_mut()) => checkpoints.timed(&pool).await,
+            _ = next_tick(size_tick.as_mut()) => checkpoints.size_check(&pool).await,
             _ = optimize_tick.tick() => {
                 if let Err(e) = crate::db::sqlite_optimize(&pool).await {
                     tracing::warn!(error = %e, "daily PRAGMA optimize failed");
@@ -507,7 +534,7 @@ pub async fn run(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use serial_test::serial;
@@ -674,18 +701,41 @@ mod tests {
         remove_db_files(&path);
     }
 
-    /// Writes 6000 rows of 4 KiB into a file-backed database while three
-    /// staggered readers keep a read transaction open at every instant, and
-    /// returns the largest the `-wal` file got and how many times it was seen
-    /// to shrink sharply (a truncate).
+    /// Which checkpoint tick [`wal_under_overlapping_readers`] drives.
+    enum Drive {
+        /// No checkpoints but SQLite's own.
+        Nothing,
+        /// The timed checkpoint, every this many writes.
+        Timed(i64),
+        /// The size check, whenever the WAL is past this many bytes.
+        Size(u64),
+    }
+
+    /// A reader holding a read snapshot: a transaction that has read.
+    async fn open_reader(pool: &AnyPool) -> sqlx::Transaction<'static, sqlx::Any> {
+        let mut tx = pool.begin().await.expect("begin read");
+        let _: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM wal_load")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read");
+        tx
+    }
+
+    /// Writes 6000 rows of 4 KiB into a file-backed database while two
+    /// readers take turns holding a read snapshot, so one is open at every
+    /// write, and returns the largest the `-wal` file got and how many times
+    /// it was seen to shrink sharply (a truncate).
     ///
     /// Overlapping readers are what stopped the WAL on the managed tenant
     /// from ever rewinding: SQLite's own PASSIVE checkpoints can copy frames
     /// back but cannot restart the log while a reader holds a snapshot in it.
-    async fn wal_peak_under_load(
-        checkpoint_every: Option<Duration>,
-        wal_limit: Option<(u64, Duration)>,
-    ) -> (u64, u32) {
+    ///
+    /// The checkpoint ticks are called here rather than on [`run`]'s
+    /// intervals, and the readers rotate on write counts rather than on
+    /// sleeps, so the outcome does not depend on how fast the machine is. At
+    /// a tick the readers end while the checkpoint waits on its busy timeout,
+    /// as readers come and go in production, and a fresh one opens after it.
+    async fn wal_under_overlapping_readers(drive: Drive) -> (u64, u32) {
         let path = std::env::temp_dir().join(format!("hv-wal-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = crate::db::connect(&url, DatabaseBackend::Sqlite).await;
@@ -693,41 +743,20 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create table");
-
-        let wal_limit = wal_limit.map(|(max_bytes, poll)| WalLimit {
-            path: crate::maintenance::disk::wal_path_for(&path),
-            max_bytes,
-            poll,
-        });
-        let maintenance = (checkpoint_every.is_some() || wal_limit.is_some()).then(|| {
-            tokio::spawn(run(
-                pool.clone(),
-                DatabaseBackend::Sqlite,
-                checkpoint_every,
-                wal_limit,
-            ))
-        });
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut readers = Vec::new();
-        for i in 0..3u64 {
-            let pool = pool.clone();
-            let stop = Arc::clone(&stop);
-            readers.push(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(i * 10)).await;
-                while !stop.load(Ordering::Relaxed) {
-                    let mut tx = pool.begin().await.expect("begin read");
-                    let _: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM wal_load")
-                        .fetch_one(&mut *tx)
-                        .await
-                        .expect("read");
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    tx.commit().await.expect("end read");
-                }
-            }));
-        }
-
         let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let mut checkpoints = Checkpoints::new(
+            Some(Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS)),
+            match drive {
+                Drive::Size(max_bytes) => Some(WalLimit {
+                    path: wal.clone(),
+                    max_bytes,
+                    poll: Duration::from_millis(10),
+                }),
+                _ => None,
+            },
+        );
+
+        let mut readers = vec![open_reader(&pool).await];
         let body = vec![7u8; 4096];
         let mut peak = 0u64;
         let mut last = 0u64;
@@ -739,22 +768,48 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("insert");
-            if i % 10 == 0 {
-                let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-                peak = peak.max(size);
-                if last > MIB && size < last / 2 {
-                    truncations += 1;
+            // A new reader opens before the oldest ends, so a snapshot is
+            // held at every write.
+            if i % 50 == 0 {
+                readers.push(open_reader(&pool).await);
+                readers.remove(0).commit().await.expect("end read");
+            }
+            if i % 10 != 0 {
+                continue;
+            }
+            let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            peak = peak.max(size);
+            if last > MIB && size < last / 2 {
+                truncations += 1;
+            }
+            last = size;
+
+            let tick = match drive {
+                Drive::Nothing => false,
+                Drive::Timed(every) => i > 0 && i % every == 0,
+                Drive::Size(max_bytes) => size > max_bytes,
+            };
+            if tick {
+                let pool_for_tick = pool.clone();
+                let timed = matches!(drive, Drive::Timed(_));
+                let checkpoint = tokio::spawn(async move {
+                    if timed {
+                        checkpoints.timed(&pool_for_tick).await;
+                    } else {
+                        checkpoints.size_check(&pool_for_tick).await;
+                    }
+                    checkpoints
+                });
+                for reader in readers.drain(..) {
+                    reader.commit().await.expect("end read");
                 }
-                last = size;
+                checkpoints = checkpoint.await.expect("checkpoint task");
+                readers.push(open_reader(&pool).await);
             }
         }
 
-        stop.store(true, Ordering::Relaxed);
         for reader in readers {
-            reader.await.expect("reader task");
-        }
-        if let Some(handle) = maintenance {
-            handle.abort();
+            reader.commit().await.expect("end read");
         }
         drop(pool);
         remove_db_files(&path);
@@ -764,9 +819,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn the_checkpoint_task_bounds_the_wal_under_concurrent_readers() {
-        let (unchecked, unchecked_truncations) = wal_peak_under_load(None, None).await;
-        let (checked, checked_truncations) =
-            wal_peak_under_load(Some(Duration::from_millis(50)), None).await;
+        let (unchecked, unchecked_truncations) =
+            wal_under_overlapping_readers(Drive::Nothing).await;
+        let (checked, checked_truncations) = wal_under_overlapping_readers(Drive::Timed(500)).await;
         assert!(
             unchecked > 16 * MIB,
             "without the task the WAL should grow with the writes (peak {unchecked} bytes)"
@@ -775,38 +830,104 @@ mod tests {
             unchecked_truncations, 0,
             "overlapping readers should keep the WAL from ever rewinding on its own"
         );
+        // One checkpoint every 500 of the 6000 writes: eleven of them, and
+        // the WAL never holds much more than a twelfth of what it holds
+        // unchecked.
         assert!(
-            checked_truncations >= 1,
-            "with the task the WAL should be truncated at least once (peak {checked} bytes)"
+            checked_truncations >= 10,
+            "each timed checkpoint should truncate the WAL ({checked_truncations} times)"
         );
         assert!(
-            checked < unchecked / 2,
-            "with the task the WAL should stay well under the unchecked peak \
+            checked < unchecked / 6,
+            "with the task the WAL should hold about 500 writes at most \
              (checked {checked}, unchecked {unchecked} bytes)"
         );
     }
 
     /// The timed checkpoint bounds the WAL by time, so a fast writer fills it
     /// by gigabytes between two ticks. The size check bounds it by bytes:
-    /// here the timed checkpoint is the production minute away and never
-    /// fires. The load puts about 100 MiB through the WAL, all of which it
-    /// holds without the check. With it the WAL overshoots the 2 MiB limit by what
-    /// is written while a checkpoint waits (up to a second), so the bound is
-    /// a quarter of the load rather than the limit itself.
+    /// here only the size check runs, against a 2 MiB limit, and the load puts
+    /// about 100 MiB through the WAL. The check runs every ten writes, so the
+    /// WAL overshoots the limit by at most ten writes' frames.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn the_size_check_bounds_the_wal_between_timed_checkpoints() {
-        let minute = Some(Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS));
-        let (peak, truncations) =
-            wal_peak_under_load(minute, Some((2 * MIB, Duration::from_millis(10)))).await;
+        let (peak, truncations) = wal_under_overlapping_readers(Drive::Size(2 * MIB)).await;
         assert!(
             truncations >= 5,
             "the size check should truncate the WAL repeatedly ({truncations} times, peak {peak} bytes)"
         );
         assert!(
-            peak < 24 * MIB,
+            peak < 4 * MIB,
             "the WAL should stay near the 2 MiB limit, not grow with the writes (peak {peak} bytes)"
         );
+    }
+
+    /// [`run`] itself, on its own intervals: each tick it is given brings the
+    /// WAL back down. Untimed: it waits as long as a slow machine needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn the_maintenance_loop_truncates_the_wal() {
+        for (checkpoint_every, max_bytes) in [
+            (Some(Duration::from_millis(50)), None),
+            (None, Some(2 * MIB)),
+        ] {
+            let path = std::env::temp_dir().join(format!("hv-wal-{}.db", uuid::Uuid::new_v4()));
+            let url = format!("sqlite://{}?mode=rwc", path.display());
+            let pool = crate::db::connect(&url, DatabaseBackend::Sqlite).await;
+            crate::db::query("CREATE TABLE wal_load (id INTEGER PRIMARY KEY, body BLOB NOT NULL)")
+                .execute(&pool)
+                .await
+                .expect("create table");
+            let wal = PathBuf::from(format!("{}-wal", path.display()));
+            // A reader holding a snapshot while the WAL fills, so it cannot
+            // rewind on its own before the loop is started.
+            let reader = open_reader(&pool).await;
+            let body = vec![7u8; 4096];
+            for i in 0..1000i64 {
+                crate::db::query("INSERT INTO wal_load (id, body) VALUES (?, ?)")
+                    .bind(i)
+                    .bind(body.clone())
+                    .execute(&pool)
+                    .await
+                    .expect("insert");
+            }
+            reader.commit().await.expect("end read");
+            let filled = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                filled > 2 * MIB,
+                "the WAL should have filled ({filled} bytes)"
+            );
+
+            let maintenance = tokio::spawn(run(
+                pool.clone(),
+                DatabaseBackend::Sqlite,
+                checkpoint_every,
+                max_bytes.map(|max_bytes| WalLimit {
+                    path: wal.clone(),
+                    max_bytes,
+                    poll: Duration::from_millis(10),
+                }),
+            ));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let shrunk = loop {
+                let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                if size < filled / 2 {
+                    break true;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            maintenance.abort();
+            drop(pool);
+            remove_db_files(&path);
+            assert!(
+                shrunk,
+                "the loop ({checkpoint_every:?}, {max_bytes:?}) should truncate the WAL"
+            );
+        }
     }
 
     #[tokio::test]
