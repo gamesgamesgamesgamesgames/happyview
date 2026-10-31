@@ -836,9 +836,11 @@ impl PluginExecutor {
         modules: ModuleScope,
         options: RunOptions,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
-        let mut inst = self
-            .instantiate_interpreter(plugin, Some(input), caller, modules)
+        let started = std::time::Instant::now();
+        let (mut inst, cache_hit) = self
+            .instantiate_interpreter_reporting(plugin, Some(input), caller, modules)
             .await?;
+        crate::metrics::run::record_instantiate(started.elapsed(), cache_hit);
         // The guard list is the host's, whatever the caller sent: see
         // `host_removed_globals`.
         let mut input = ScriptExecuteInput {
@@ -867,7 +869,11 @@ impl PluginExecutor {
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
-        let output = match inst.call_execute(input).await {
+        let started = std::time::Instant::now();
+        let called = inst.call_execute(input).await;
+        crate::metrics::run::record_guest_call(started.elapsed());
+        report_run_resources(&mut inst, options.call_fuel);
+        let output = match called {
             Ok(output) => output,
             // A guest that reported a panic answered the run; the trap is only
             // how an aborting guest stops. A timeout or a refused growth after
@@ -881,7 +887,9 @@ impl PluginExecutor {
             }
             Err(e) => return Err(e),
         };
+        let started = std::time::Instant::now();
         inst.settle_pending_calls(self.script_wall_clock()).await;
+        crate::metrics::run::record_settle(started.elapsed());
         Ok(output)
     }
 
@@ -1134,6 +1142,20 @@ impl PluginExecutor {
         caller: Option<Arc<CallerSession>>,
         modules: ModuleScope,
     ) -> Result<PluginInstance, ExecutionError> {
+        self.instantiate_interpreter_reporting(plugin, input, caller, modules)
+            .await
+            .map(|(inst, _)| inst)
+    }
+
+    /// As [`instantiate_interpreter`](Self::instantiate_interpreter), saying
+    /// whether the module came from the runtime's memory.
+    async fn instantiate_interpreter_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: Option<&ScriptExecuteInput>,
+        caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
+    ) -> Result<(PluginInstance, bool), ExecutionError> {
         let ctx = input
             .map(|input| LibraryCallContext {
                 caller_did: input.context.caller_did.clone(),
@@ -1152,8 +1174,8 @@ impl PluginExecutor {
             .map(str::to_string)
             .collect();
         let stamp = self.registry.artifact_stamp_for(plugin);
-        let mut inst = self
-            .instantiate_loaded(plugin, &scope, HashMap::new(), serde_json::Value::Null)
+        let (mut inst, cache_hit) = self
+            .instantiate_loaded_reporting(plugin, &scope, HashMap::new(), serde_json::Value::Null)
             .await?;
         let state = inst.store.data_mut();
         state.call_ctx = ctx;
@@ -1180,8 +1202,9 @@ impl PluginExecutor {
             stamp,
             modules,
             waited_ms: Default::default(),
+            metrics: crate::metrics::run::current(),
         });
-        Ok(inst)
+        Ok((inst, cache_hit))
     }
 
     /// The interpreter registered as `plugin_id`, fetched once so everything
@@ -1329,9 +1352,23 @@ impl PluginExecutor {
         secrets: HashMap<String, String>,
         config: serde_json::Value,
     ) -> Result<PluginInstance, ExecutionError> {
-        let module = self
+        self.instantiate_loaded_reporting(plugin, scope, secrets, config)
+            .await
+            .map(|(inst, _)| inst)
+    }
+
+    /// As [`instantiate_loaded`](Self::instantiate_loaded), saying whether
+    /// the module came from the runtime's memory.
+    async fn instantiate_loaded_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        scope: &str,
+        secrets: HashMap<String, String>,
+        config: serde_json::Value,
+    ) -> Result<(PluginInstance, bool), ExecutionError> {
+        let (module, cache_hit) = self
             .runtime
-            .module_for(plugin)
+            .module_lookup(plugin)
             .await
             .map_err(ExecutionError::Instantiation)?;
 
@@ -1398,13 +1435,29 @@ impl PluginExecutor {
         store.data_mut().alloc = Some(alloc.clone());
         store.data_mut().dealloc = Some(dealloc.clone());
 
-        Ok(PluginInstance {
-            store,
-            instance,
-            memory,
-            alloc,
-            dealloc,
-        })
+        Ok((
+            PluginInstance {
+                store,
+                instance,
+                memory,
+                alloc,
+                dealloc,
+            },
+            cache_hit,
+        ))
+    }
+}
+
+/// Report what a script run's guest left behind: its linear memory, which
+/// never shrinks and so is the run's high-water mark, and, for a compiled
+/// module, the fuel it spent. An interpreter's fuel says nothing: it is
+/// unbounded, and a frame that catches a `throw` loses what it spent.
+fn report_run_resources(inst: &mut PluginInstance, call_fuel: Option<u64>) {
+    crate::metrics::run::record_memory_peak(inst.memory.data_size(&inst.store) as u64);
+    if let Some(call_fuel) = call_fuel
+        && let Ok(remaining) = inst.store.get_fuel()
+    {
+        crate::metrics::run::record_fuel(call_fuel.saturating_sub(remaining));
     }
 }
 

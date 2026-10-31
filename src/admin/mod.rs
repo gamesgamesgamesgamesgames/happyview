@@ -14,6 +14,7 @@ mod labelers;
 mod lexicon_publishing;
 mod lexicons;
 mod linked_repos;
+mod metrics;
 pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
@@ -136,6 +137,9 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             delete(linked_repos::revoke_linked_repo_invite),
         )
         .route("/events", get(events::list_events))
+        .route("/metrics/scripts", get(metrics::scripts))
+        .route("/metrics/scripts/{trigger}", get(metrics::script))
+        .route("/metrics/live", get(metrics::live))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))
         .route("/identity/resolve", get(identity::resolve_identity))

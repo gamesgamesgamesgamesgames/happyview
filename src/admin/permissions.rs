@@ -65,6 +65,9 @@ pub enum Permission {
     #[serde(rename = "events:purge")]
     EventsPurge,
 
+    #[serde(rename = "metrics:read")]
+    MetricsRead,
+
     #[serde(rename = "labelers:create")]
     LabelersCreate,
     #[serde(rename = "labelers:read")]
@@ -162,6 +165,7 @@ impl Permission {
             Self::StatsRead => "stats:read",
             Self::EventsRead => "events:read",
             Self::EventsPurge => "events:purge",
+            Self::MetricsRead => "metrics:read",
             Self::LabelersCreate => "labelers:create",
             Self::LabelersRead => "labelers:read",
             Self::LabelersDelete => "labelers:delete",
@@ -327,6 +331,12 @@ impl Permission {
                 key: "events:purge",
                 name: "Purge Events",
                 description: "Bulk-delete event log entries matching a filter",
+                category: "System",
+            },
+            Self::MetricsRead => PermissionInfo {
+                key: "metrics:read",
+                name: "View Metrics",
+                description: "View script run counts, latency, errors and resource use",
                 category: "System",
             },
             Self::LabelersCreate => PermissionInfo {
@@ -537,6 +547,7 @@ impl Permission {
             Self::StatsRead,
             Self::EventsRead,
             Self::EventsPurge,
+            Self::MetricsRead,
             Self::LabelersCreate,
             Self::LabelersRead,
             Self::LabelersDelete,
@@ -599,6 +610,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         StatsRead,
         EventsRead,
         EventsPurge,
+        MetricsRead,
         LabelersCreate,
         LabelersRead,
         LabelersDelete,
@@ -702,6 +714,7 @@ impl Template {
                 Permission::BackfillRead,
                 Permission::StatsRead,
                 Permission::EventsRead,
+                Permission::MetricsRead,
                 Permission::DeadLettersRead,
             ]),
             Self::Operator => {
@@ -847,6 +860,20 @@ mod tests {
                     entry.category, "Spaces",
                     "{} should be in Spaces category",
                     entry.key
+                );
+            }
+        }
+    }
+
+    /// Whoever can read the event log can read the metrics beside it.
+    #[test]
+    fn every_template_with_events_read_has_metrics_read() {
+        for template in Template::ALL {
+            let permissions = template.permissions();
+            if permissions.contains(&Permission::EventsRead) {
+                assert!(
+                    permissions.contains(&Permission::MetricsRead),
+                    "{template:?}"
                 );
             }
         }

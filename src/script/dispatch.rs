@@ -1,11 +1,17 @@
 //! Finding the interpreter a script's language names, and running it there.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use crate::AppState;
+use crate::metrics::run::RunCollector;
+use crate::metrics::{Layer, Outcome, RunSample};
 use crate::plugin::caller::CallerSession;
-use crate::plugin::{ExecutionError, ScriptExecuteOutput};
+use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptKind};
 use crate::project::snapshot::ScriptBody;
+use crate::telemetry::counters::Counters;
 
 use super::input::{Invocation, ScriptOrigin, build_input};
 
@@ -70,10 +76,70 @@ impl From<ExecutionError> for DispatchError {
 /// A compiled module is its own interpreter, so it runs as itself rather than
 /// through the interpreter its language would name. It is read from the
 /// snapshot the run pinned, so a rebuild mid-run cannot swap its bytes.
+///
+/// Every run but a test file's is counted here, once, whatever became of it:
+/// this is the one way to reach an interpreter, so no runner can count a run
+/// twice or forget one.
 pub async fn dispatch(
     state: &AppState,
     inv: &Invocation<'_>,
     caller: Option<Arc<CallerSession>>,
+) -> Result<ScriptExecuteOutput, DispatchError> {
+    let kind = inv.trigger.kind();
+    let _active = state.metrics.start_run(kind);
+    let _counted = (kind != ScriptKind::Test).then(|| TelemetryGuard {
+        counters: &state.telemetry_counters,
+        started: Instant::now(),
+    });
+    let collector = (kind != ScriptKind::Test && state.metrics.enabled()).then(RunCollector::new);
+    let started = Instant::now();
+    let mut prepare = Duration::ZERO;
+    let result = run(state, inv, caller, collector.clone(), &mut prepare).await;
+    if let Some(collector) = collector {
+        let layer = match inv.origin {
+            ScriptOrigin::Project { .. } => Layer::Project,
+            ScriptOrigin::Dashboard => Layer::Dashboard,
+        };
+        state.metrics.record(
+            inv.trigger_id,
+            kind,
+            layer,
+            &RunSample {
+                outcome: Outcome::of(&result),
+                wall: started.elapsed(),
+                prepare,
+                timings: collector.snapshot(),
+            },
+        );
+    }
+    result
+}
+
+/// Adds a run to the telemetry counters when dropped, so a run whose future
+/// is dropped mid-flight (a caller that hung up) is still counted.
+struct TelemetryGuard<'a> {
+    counters: &'a Counters,
+    started: Instant,
+}
+
+impl Drop for TelemetryGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_us, elapsed_us);
+        self.counters
+            .script_executions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The run itself, with the time spent building its input written to
+/// `prepare` and the executor's work measured into `collector`.
+async fn run(
+    state: &AppState,
+    inv: &Invocation<'_>,
+    caller: Option<Arc<CallerSession>>,
+    collector: Option<Arc<RunCollector>>,
+    prepare: &mut Duration,
 ) -> Result<ScriptExecuteOutput, DispatchError> {
     if let ScriptOrigin::Project { snapshot, script } = inv.origin
         && let ScriptBody::Module { module, hash } = &script.body
@@ -85,16 +151,20 @@ pub async fn dispatch(
                 crate::project::script_module::module_plugin_id(module),
             ))
         })?;
+        let started = Instant::now();
         let input = build_input(state, inv).await;
-        return Ok(state
-            .plugin_executor()
-            .execute_compiled_as(
+        *prepare = started.elapsed();
+        let executor = state.plugin_executor();
+        return Ok(measured(
+            collector,
+            executor.execute_compiled_as(
                 compiled.plugin.clone(),
                 &compiled.source_path,
                 &input,
                 caller,
-            )
-            .await?);
+            ),
+        )
+        .await?);
     }
     let interpreter = state
         .plugin_registry
@@ -103,11 +173,23 @@ pub async fn dispatch(
         .ok_or_else(|| DispatchError::NoInterpreter {
             language: inv.language.to_string(),
         })?;
+    let started = Instant::now();
     let mut input = build_input(state, inv).await;
     let modules =
         super::prepared::attach_prepared(state, &interpreter.info.id, inv, &mut input).await;
-    Ok(state
-        .plugin_executor()
-        .execute_script_in(&interpreter.info.id, &input, caller, modules)
-        .await?)
+    *prepare = started.elapsed();
+    let executor = state.plugin_executor();
+    Ok(measured(
+        collector,
+        executor.execute_script_in(&interpreter.info.id, &input, caller, modules),
+    )
+    .await?)
+}
+
+/// `fut` as the run `collector` measures, or unmeasured.
+async fn measured<F: Future>(collector: Option<Arc<RunCollector>>, fut: F) -> F::Output {
+    match collector {
+        Some(collector) => crate::metrics::run::run_under(collector, fut).await,
+        None => fut.await,
+    }
 }

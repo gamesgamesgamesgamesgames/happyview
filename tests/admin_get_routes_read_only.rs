@@ -445,6 +445,21 @@ fn bundle(files: &[(&str, &[u8])]) -> Vec<u8> {
 async fn seed(app: &TestApp) -> BTreeMap<&'static str, String> {
     let mut ids = BTreeMap::new();
 
+    // Metrics live in memory, so a run is recorded rather than seeded.
+    let trigger = "xrpc.query:com.example.sweep";
+    app.state.metrics.record(
+        trigger,
+        happyview::plugin::ScriptKind::XrpcQuery,
+        happyview::metrics::Layer::Dashboard,
+        &happyview::metrics::RunSample {
+            outcome: happyview::metrics::Outcome::Ok,
+            wall: std::time::Duration::from_millis(1),
+            prepare: std::time::Duration::ZERO,
+            timings: Default::default(),
+        },
+    );
+    ids.insert("trigger", trigger.to_string());
+
     let (status, body) = app
         .post_json_status(
             "/admin/lexicons",
@@ -706,7 +721,10 @@ fn concrete_path(path: &str, ids: &BTreeMap<&'static str, String>) -> String {
         .find(|(prefix, _)| path.starts_with(prefix))
         .and_then(|(_, key)| ids.get(*key))
         .unwrap_or(&fallback);
-    path.replace("{id}", value).replace("{nsid}", value)
+    let trigger = ids.get("trigger").unwrap_or(&fallback);
+    path.replace("{id}", value)
+        .replace("{nsid}", value)
+        .replace("{trigger}", trigger)
 }
 
 /// Every admin `GET` route, called as a full admin, changes no table.
