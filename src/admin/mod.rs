@@ -1,3 +1,4 @@
+mod api_client_secrets;
 pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
@@ -249,6 +250,14 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             get(api_clients::get_api_client)
                 .put(api_clients::update_api_client)
                 .delete(api_clients::delete_api_client),
+        )
+        .route(
+            "/api-clients/{id}/secrets",
+            get(api_client_secrets::list).post(api_client_secrets::create),
+        )
+        .route(
+            "/api-clients/{id}/secrets/{secret_id}",
+            delete(api_client_secrets::revoke),
         )
         .route(
             "/api-clients/{id}/auth-key",

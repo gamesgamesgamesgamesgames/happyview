@@ -6,7 +6,7 @@ API clients identify third-party applications that call HappyView's XRPC endpoin
 
 A single API client represents your application, not individual users. Create one client for your app and use the same client key across all instances. Users authenticate separately via OAuth — the client key identifies _your app_, not _who is using it_.
 
-Each client has an `hvc_`-prefixed client key and an `hvs_`-prefixed client secret. The secret is only returned at creation and is sha256-hashed in the database. Server-to-server callers pass the secret as `X-Client-Secret`. Browser callers use the `Origin` header, which is matched against the client's `client_uri`. Mismatches currently log warnings rather than rejecting the request, but rate limiting applies either way. See [Authentication — XRPC](../../getting-started/authentication.md#xrpc-api-client-identification) for the client-side view, and the [API Keys guide](../../guides/api-keys.md) for how admin API keys differ from API clients.
+Each client has an `hvc_`-prefixed client key. A confidential client also has one or more `hvs_`-prefixed client secrets, any of which authenticates it ([Client secrets](#client-secrets)). A secret is only returned when it is created, and only its sha256 hash is stored. Server-to-server callers pass the secret as `X-Client-Secret`. Browser callers use the `Origin` header, which is matched against the client's `client_uri`. Mismatches currently log warnings rather than rejecting the request, but rate limiting applies either way. See [Authentication — XRPC](../../getting-started/authentication.md#xrpc-api-client-identification) for the client-side view, and the [API Keys guide](../../guides/api-keys.md) for how admin API keys differ from API clients.
 
 <Callout type="idea" title="Third-Party API Clients">
 Third-party apps can also create, list, and delete their own API clients programmatically via the [XRPC API](../oauth/api-clients.md), without needing admin access.
@@ -117,7 +117,7 @@ curl http://127.0.0.1:3000/admin/api-clients -H "$AUTH"
 POST /admin/api-clients
 ```
 
-Requires `api-clients:create`. Generates a `client_key` and `client_secret`. Store the secret — it won't be shown again.
+Requires `api-clients:create`. Generates a `client_key` and, for a confidential client, a first `client_secret`, labelled `Original`. Store the secret — it won't be shown again. A public client gets no secret, and `client_secret` is `null`.
 
 ```ts tab="TypeScript" tab-group="language"
 interface ApiClient {
@@ -360,6 +360,92 @@ curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9... -H "$AUTH"
 ```
 
 **Response**: `204 No Content`
+
+## Client secrets
+
+A confidential client can hold several secrets at once, each with a label and each revocable on its own. Give each place the client runs (localhost, staging, production) its own secret. To rotate one, add a new secret, move to it, then revoke the old one. The client, its key and its sessions are untouched throughout.
+
+Revoking a secret takes effect on the next request that presents it. The client's other secrets keep working. A public client has no secrets: it is identified by its key and its `Origin`.
+
+### List secrets
+
+```
+GET /admin/api-clients/{id}/secrets
+```
+
+Requires `api-clients:view`. Lists every secret the client has held, oldest first, including revoked ones. The secrets themselves are never returned.
+
+```ts tab="TypeScript" tab-group="language"
+interface ApiClientSecret {
+  id: string;
+  label: string;
+  created_at: string;
+  last_used_at: string | null; // to the minute; null if never used
+  revoked_at: string | null;
+}
+
+const res = await fetch("http://127.0.0.1:3000/admin/api-clients/01J9.../secrets", { headers });
+const { secrets }: { secrets: ApiClientSecret[] } = await res.json();
+```
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/api-clients/01J9.../secrets -H "$AUTH"
+```
+
+```json
+{
+  "secrets": [
+    {
+      "id": "original-01J9...",
+      "label": "Original",
+      "created_at": "2026-05-01T00:00:00+00:00",
+      "last_used_at": "2026-10-30T09:12:00+00:00",
+      "revoked_at": null
+    }
+  ]
+}
+```
+
+### Add a secret
+
+```
+POST /admin/api-clients/{id}/secrets
+```
+
+Requires `api-clients:edit`. The body is `{ "label": string }`. A label is trimmed and must be 1–100 characters. The new secret works at once, alongside the others.
+
+```ts tab="TypeScript" tab-group="language"
+const res = await fetch("http://127.0.0.1:3000/admin/api-clients/01J9.../secrets", {
+  method: "POST",
+  headers: { ...headers, "Content-Type": "application/json" },
+  body: JSON.stringify({ label: "staging" }),
+});
+const secret = await res.json(); // { id, label, created_at, last_used_at, revoked_at, client_secret }
+```
+```sh tab="cURL" tab-group="language"
+curl -X POST http://127.0.0.1:3000/admin/api-clients/01J9.../secrets \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"label": "staging"}'
+```
+
+**Response**: `201 Created` with the secret's fields plus `client_secret`, the plaintext. This response is the only place it appears. `400` for a public client or an empty label.
+
+### Revoke a secret
+
+```
+DELETE /admin/api-clients/{id}/secrets/{secret_id}
+```
+
+Requires `api-clients:edit`. Revoking an already-revoked secret changes nothing and answers `revoked: false`.
+
+```sh tab="cURL" tab-group="language"
+curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../secrets/original-01J9... -H "$AUTH"
+```
+
+```json
+{ "revoked": true, "active_secrets": 1 }
+```
+
+`active_secrets` is how many still work. At `0` the client can't authenticate with a secret until you add one.
 
 ## AT Protocol client authentication keys
 
