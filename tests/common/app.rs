@@ -42,7 +42,7 @@ async fn as_dashboard(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
-use crate::common::db;
+use crate::common::{db, watchdog};
 
 pub struct TestApp {
     pub router: Router,
@@ -56,6 +56,8 @@ pub struct TestApp {
     /// The state's Jetstream source.
     pub jetstream: std::sync::Arc<happyview_source_jetstream::JetstreamSource>,
     _db_lock: Option<db::TestLock>,
+    /// Last, so it drops after everything else the app holds.
+    _alive: watchdog::Alive,
 }
 
 impl TestApp {
@@ -85,6 +87,8 @@ impl TestApp {
         registry_config: happyview::plugin::official_registry::RegistryConfig,
         persist_plugins: bool,
     ) -> Self {
+        // Before the lock, which can wait on another test binary.
+        let _alive = watchdog::Alive::new();
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
@@ -262,6 +266,7 @@ impl TestApp {
             admin_token,
             archive,
             jetstream,
+            _alive,
         }
     }
 

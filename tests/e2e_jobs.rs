@@ -10,6 +10,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::app::TestApp;
+use common::workers::Workers;
 use common::{burn, echo_interpreter};
 
 /// Skips the caller when the echo fixture's module is absent, naming the build
@@ -509,9 +510,9 @@ async fn worker_runs_pending_job_to_completion() {
     seed_script(&app, "job.run:test.worker", r#"returns:{"ok":true}"#).await;
     let id = seed_job(&app, "test.worker", "pending").await;
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let (status, result, error) = await_terminal_status(&app, &id).await;
-    worker.abort();
+    workers.stop().await;
 
     assert_eq!(status, "completed", "job error: {error:?}");
     let result: Value = serde_json::from_str(&result.expect("no result persisted")).unwrap();
@@ -541,11 +542,11 @@ async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
     seed_script(&app, "job.run:test.long", &burn.source()).await;
     let id = seed_job(&app, "test.long", "pending").await;
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let started = std::time::Instant::now();
     let (status, _result, error) = await_terminal_status(&app, &id).await;
     let burned = started.elapsed();
-    worker.abort();
+    workers.stop().await;
 
     assert_eq!(status, "completed", "job error: {error:?}");
     let budget = std::time::Duration::from_secs(1);
@@ -572,14 +573,13 @@ async fn two_workers_run_two_jobs_at_once() {
     let a = seed_job(&app, "test.slow", "pending").await;
     let b = seed_job(&app, "test.slow", "pending").await;
 
-    let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 2);
+    let workers = Workers::spawn(&app.state, 2);
+    let count = workers.len();
     let (status_a, _, error_a) = await_terminal_status(&app, &a).await;
     let (status_b, _, error_b) = await_terminal_status(&app, &b).await;
-    for w in &workers {
-        w.abort();
-    }
+    workers.stop().await;
 
-    assert_eq!(workers.len(), 2);
+    assert_eq!(count, 2);
     assert_eq!(status_a, "completed", "job a: {error_a:?}");
     assert_eq!(status_b, "completed", "job b: {error_b:?}");
 
@@ -608,9 +608,9 @@ async fn worker_records_the_line_of_a_failing_job() {
     seed_script(&app, "job.run:test.failing", "error:runtime").await;
     let id = seed_job(&app, "test.failing", "pending").await;
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let (status, _result, error) = await_terminal_status(&app, &id).await;
-    worker.abort();
+    workers.stop().await;
 
     assert_eq!(status, "failed");
     let error = error.expect("no error persisted");
@@ -1104,9 +1104,9 @@ async fn native_delete_collection_job_empties_the_collection() {
         .await
         .expect("enqueue failed");
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let (status, result, error) = await_terminal_status(&app, &id).await;
-    worker.abort();
+    workers.stop().await;
 
     assert_eq!(status, "completed", "job error: {error:?}");
     let result: Value = serde_json::from_str(&result.expect("no result")).unwrap();
@@ -1220,9 +1220,9 @@ async fn native_delete_collection_handles_more_than_one_batch() {
         .await
         .expect("enqueue failed");
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let (status, result, error) = await_terminal_status(&app, &id).await;
-    worker.abort();
+    workers.stop().await;
 
     assert_eq!(status, "completed", "job error: {error:?}");
     let result: Value = serde_json::from_str(&result.expect("no result")).unwrap();
