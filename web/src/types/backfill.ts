@@ -36,6 +36,31 @@ export interface BackfillJob {
   // What the job's executor said about it, for a collection backfilled by
   // the record source rather than a crawl or a replay.
   note?: string | null;
+  // What the job's records have cost in hooks so far, while this instance
+  // holds it; null before its first record and an hour after its last.
+  hooks?: HookStats | null;
+  // The same, kept with the job once it completed, failed or was cancelled.
+  hook_stats?: HookStats | null;
+}
+
+// A job's hook stats: `GET /admin/backfill/status` and the `hook_stats`
+// event. Times are milliseconds; shares are 0 to 1.
+export interface HookStats {
+  done: number;
+  failed: number;
+  timeouts: number;
+  dead_lettered: number;
+  skipped: number;
+  outcomes: Partial<
+    Record<"proceed" | "replace" | "skip" | "cid_mismatch", number>
+  >;
+  rate_per_s: number;
+  avg_rate_per_s: number;
+  eta_s: number | null;
+  record_ms_p50: number | null;
+  script_ms_p50: number | null;
+  script_share: number | null;
+  stages: Record<string, { n: number; ms_mean: number | null }>;
 }
 
 // What `GET /admin/backfill/collections/{nsid}` reports: the executor that
@@ -73,7 +98,8 @@ export interface PdsSummaryResponse {
   pds_endpoints: PdsSummaryEntry[];
 }
 
-export interface BackfillEvent {
+// `hook_stats` events carry a whole `HookStats` beside the job id.
+export interface BackfillEvent extends Partial<HookStats> {
   type: string;
   job_id: string;
   did?: string;
