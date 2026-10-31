@@ -684,8 +684,12 @@ async fn an_executor_for_a_claimed_collection_lands_its_stored_events_as_deltas(
         collection: B.to_string(),
         rkey: rkey.to_string(),
     };
+    // A backfill's records are applied several at once, so their deltas
+    // land in any order; each key's own delta is what matters.
+    let mut deltas = storage.deltas();
+    deltas.sort_by(|a, b| a.0.rkey.cmp(&b.0.rkey));
     assert_eq!(
-        storage.deltas(),
+        deltas,
         vec![
             (key("r1"), Delta::Proceed, Some(rev(1))),
             (key("r2"), Delta::Proceed, Some(rev(2))),
