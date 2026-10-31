@@ -562,7 +562,7 @@ pub async fn execute_procedure_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let result: mlua::Value = match sandbox::call_handle(&lua, &handle, ()).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -576,7 +576,7 @@ pub async fn execute_procedure_script(
                     .unwrap_or(&clean_msg)
                     .to_string();
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),
@@ -1036,7 +1036,7 @@ pub async fn execute_query_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let result: mlua::Value = match sandbox::call_handle(&lua, &handle, ()).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -1050,7 +1050,7 @@ pub async fn execute_query_script(
                     .unwrap_or(&clean_msg)
                     .to_string();
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),
