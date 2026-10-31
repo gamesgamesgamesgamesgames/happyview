@@ -7,6 +7,7 @@
 //! last day back.
 
 pub mod ingest;
+pub mod instance;
 pub mod job;
 pub mod persist;
 pub mod retention;
@@ -142,7 +143,9 @@ struct Key {
 }
 
 /// The windows metrics are read over. The hour and the day are held in
-/// memory; a week and a month are read from the table [`persist`] writes.
+/// memory, so they cover this instance's runs alone; a week and a month are
+/// read from the table [`persist`] writes, summed over every instance
+/// sharing the database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
     Hour,
@@ -283,6 +286,8 @@ pub struct ScriptMetrics {
     /// in the table, and none after it. Zero until something is written or
     /// read back.
     persisted_to: AtomicU64,
+    /// This process's id in the table's `instance` column; see [`instance`].
+    instance: String,
 }
 
 impl Default for ScriptMetrics {
@@ -295,6 +300,7 @@ impl Default for ScriptMetrics {
             overflow: AtomicU64::new(0),
             active: Default::default(),
             persisted_to: AtomicU64::new(0),
+            instance: instance::this_process().to_string(),
         }
     }
 }
@@ -386,6 +392,21 @@ fn rfc3339(secs: u64) -> String {
 impl ScriptMetrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry writing and reading its stored rows as `id`, normalised as
+    /// [`instance::resolve`] does. For tests standing in for two instances
+    /// in one process; a serving instance takes [`instance::this_process`].
+    pub fn with_instance(id: &str) -> Self {
+        Self {
+            instance: instance::resolve(Some(id), None),
+            ..Self::default()
+        }
+    }
+
+    /// This process's id in the stored rows.
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
 
     pub fn enabled(&self) -> bool {

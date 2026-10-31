@@ -232,6 +232,7 @@ async fn stored_metrics_are_written_folded_trimmed_and_read_back() {
     assert_eq!(week["window"], "7d");
     assert_eq!(week["retention_days"], 30);
     assert_eq!(week["enabled"], true);
+    assert_eq!(week["instances"], 1);
     assert_eq!(runs(&week), 3);
     let row = &week["scripts"][0];
     assert_eq!(row["trigger"], trigger());
@@ -247,6 +248,7 @@ async fn stored_metrics_are_written_folded_trimmed_and_read_back() {
         k
     };
     assert_eq!(keys(row), keys(&hour["scripts"][0]));
+    assert!(hour.get("instances").is_none(), "{hour:#}");
 
     let (_, month) = get(&app, "/admin/metrics/scripts?window=30d").await;
     assert_eq!(runs(&month), 4);
@@ -326,4 +328,62 @@ async fn stored_metrics_are_written_folded_trimmed_and_read_back() {
     assert_eq!(restored, metrics.scripts_at(now, Window::Hour));
     assert_eq!(restored[0].stats.runs, 2);
     assert_eq!(restarted.scripts_at(now, Window::Day)[0].stats.runs, 2);
+}
+
+/// Instances sharing a database: each writes and folds its own rows, and the
+/// stored windows sum them.
+#[tokio::test]
+async fn stored_windows_sum_every_instance_sharing_the_database() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (db, backend) = (&app.state.db, app.state.db_backend);
+    let base = unix_now();
+    let a = ScriptMetrics::with_instance("replica-a");
+    let b = ScriptMetrics::with_instance("replica-b");
+    // The same key in the same minute, three days ago.
+    let at = base - 3 * DAY;
+    let at = at - at % 60;
+    run_at(&a, at + 1, 4);
+    run_at(&b, at + 2, 6);
+    run_at(&b, at + 3, 8);
+    record_at(&a, at + 1);
+    record_at(&b, at + 2);
+    for m in [&a, &b] {
+        let written = persist::write_closed(m, db, backend, at + 60)
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+    }
+    assert_eq!(rows(&app, "minute").await, 4);
+
+    let check = |label: &'static str| {
+        let app = &app;
+        async move {
+            let (status, week) = get(app, "/admin/metrics/scripts?window=7d").await;
+            assert_eq!(status, StatusCode::OK, "{week}");
+            assert_eq!(runs(&week), 3, "{label}: {week:#}");
+            assert_eq!(week["instances"], 2, "{label}");
+            assert_eq!(week["scripts"][0]["outcomes"], json!({"ok": 3}));
+            let encoded = trigger().replace(':', "%3A");
+            let (_, series) =
+                get(app, &format!("/admin/metrics/scripts/{encoded}?window=30d")).await;
+            assert_eq!(point_runs(&series), (30, 3), "{label}");
+            assert_eq!(series["instances"], 2, "{label}");
+            let (_, ingest) = get(app, "/admin/metrics/ingest?window=7d").await;
+            assert_eq!(ingest["collections"][0]["records"], 2, "{label}");
+            assert_eq!(ingest["instances"], 2, "{label}");
+        }
+    };
+    check("before the folds").await;
+
+    // Each instance's hourly pass folds its own minutes only.
+    let ta = Persister::default().tick(&a, db, backend, base).await;
+    assert_eq!(ta.folded, 2, "{ta:?}");
+    assert_eq!(rows(&app, "minute").await, 2);
+    check("after a's fold").await;
+    let tb = Persister::default().tick(&b, db, backend, base).await;
+    assert_eq!(tb.folded, 2);
+    assert_eq!(rows(&app, "minute").await, 0);
+    assert_eq!(rows(&app, "hour").await, 4);
+    check("after both folds").await;
 }

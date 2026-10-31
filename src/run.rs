@@ -1062,6 +1062,10 @@ async fn boot(
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
     let metrics = std::sync::Arc::new(crate::metrics::ScriptMetrics::new());
+    tracing::info!(
+        instance = metrics.instance(),
+        "script metrics are stored under this instance id"
+    );
     metrics.refresh(&db_pool, db_backend).await;
 
     let mut records = crate::record_store::RecordStore::shared(db_pool.clone(), db_backend)
