@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use crate::AppState;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::scripts;
@@ -36,16 +38,33 @@ pub async fn run_worker(state: AppState) {
 /// [`run_worker`], claiming jobs as `owner`. Public so a test can run two
 /// instances' workers in one process.
 pub async fn run_worker_as(state: AppState, owner: String) {
-    run_worker_renewing(state, owner, db::RENEW_EVERY).await
+    run_worker_renewing(state, owner, db::RENEW_EVERY, never()).await
 }
 
-/// [`run_worker_as`], renewing each job's lease every `renew_every`, which a
-/// test shortens to see a run outlast it.
+/// [`run_worker`] until `stop` holds `true`. A job already running then runs
+/// to its end, and its thread is joined, before this returns. Aborting the
+/// worker's task instead leaves that thread running, so a runtime dropped
+/// right after waits on it, and the thread waits on the runtime.
+pub async fn run_worker_until(state: AppState, stop: watch::Receiver<bool>) {
+    run_worker_renewing(state, instance_id().to_string(), db::RENEW_EVERY, stop).await
+}
+
+/// [`run_worker_until`], claiming jobs as `owner` and renewing each job's
+/// lease every `renew_every`, which a test shortens to see a run outlast it.
+/// A dropped `stop` sender never stops the worker.
 #[doc(hidden)]
-pub async fn run_worker_renewing(state: AppState, owner: String, renew_every: Duration) {
+pub async fn run_worker_renewing(
+    state: AppState,
+    owner: String,
+    renew_every: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
     tracing::info!(owner, "job worker started");
 
     loop {
+        if *stop.borrow() {
+            return;
+        }
         match db::claim_next_job(&state, &owner).await {
             Ok(Some(job)) => {
                 tracing::info!(job_id = %job.id, job_type = %job.job_type, attempt = job.attempt, "executing job");
@@ -54,16 +73,23 @@ pub async fn run_worker_renewing(state: AppState, owner: String, renew_every: Du
                     attempt: job.attempt,
                 };
                 run_on_its_own_thread(&state, job, lease, renew_every).await;
+                continue;
             }
-            Ok(None) => {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
+            Ok(None) => {}
             Err(e) => {
                 tracing::error!(error = %e, "job worker: failed to claim job");
-                tokio::time::sleep(POLL_INTERVAL).await;
             }
         }
+        tokio::select! {
+            () = tokio::time::sleep(POLL_INTERVAL) => {}
+            Ok(_) = stop.wait_for(|stop| *stop) => return,
+        }
     }
+}
+
+/// A stop no one will ever send.
+fn never() -> watch::Receiver<bool> {
+    watch::channel(false).1
 }
 
 /// Run one job on the blocking pool, renewing its lease while it runs. A job
@@ -123,10 +149,19 @@ pub(crate) async fn renew_while_running(state: AppState, held: super::held::Held
 /// Start `count` job workers (at least one). Each claims jobs independently;
 /// `db::claim_next_job` guarantees a job is claimed by exactly one worker.
 pub fn spawn_workers(state: AppState, count: usize) -> Vec<tokio::task::JoinHandle<()>> {
+    spawn_workers_until(state, count, never())
+}
+
+/// [`spawn_workers`], each run by [`run_worker_until`] with `stop`.
+pub fn spawn_workers_until(
+    state: AppState,
+    count: usize,
+    stop: watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let count = count.max(1);
     tracing::info!(count, "starting job workers");
     (0..count)
-        .map(|_| tokio::spawn(run_worker(state.clone())))
+        .map(|_| tokio::spawn(run_worker_until(state.clone(), stop.clone())))
         .collect()
 }
 

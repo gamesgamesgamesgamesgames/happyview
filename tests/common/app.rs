@@ -42,7 +42,7 @@ async fn as_dashboard(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
-use crate::common::db;
+use crate::common::{db, watchdog};
 
 pub struct TestApp {
     pub router: Router,
@@ -56,6 +56,8 @@ pub struct TestApp {
     /// The state's Jetstream source.
     pub jetstream: std::sync::Arc<happyview_source_jetstream::JetstreamSource>,
     _db_lock: Option<db::TestLock>,
+    /// Last, so it drops after everything else the app holds.
+    _alive: watchdog::Alive,
 }
 
 impl TestApp {
@@ -85,6 +87,8 @@ impl TestApp {
         registry_config: happyview::plugin::official_registry::RegistryConfig,
         persist_plugins: bool,
     ) -> Self {
+        // Before the lock, which can wait on another test binary.
+        let _alive = watchdog::Alive::new();
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
@@ -125,11 +129,8 @@ impl TestApp {
             plc_url: mock_url.clone(),
             static_dir: Some("./web/out".into()),
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             // Space writes need this to decrypt the `#atproto_space` signing key.
             token_encryption_key: Some(db::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
@@ -265,6 +266,7 @@ impl TestApp {
             admin_token,
             archive,
             jetstream,
+            _alive,
         }
     }
 
@@ -412,6 +414,19 @@ impl TestApp {
             .execute(&self.state.db)
             .await
             .expect("failed to create test API client");
+
+        let secret_sql = adapt_sql(
+            "INSERT INTO happyview_api_client_secrets (id, client_id, label, secret_hash, created_at) VALUES (?, ?, 'Original', ?, ?)",
+            self.state.db_backend,
+        );
+        happyview::db::query(&secret_sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(&secret_hash)
+            .bind(&now)
+            .execute(&self.state.db)
+            .await
+            .expect("failed to create test API client secret");
 
         (client_key, client_secret, id)
     }

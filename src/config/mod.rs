@@ -15,9 +15,10 @@ use std::env;
 use vars::var;
 
 /// Placeholder session secrets that have shipped in this repo's docs/examples.
-/// Booting with any of them is refused — the cookie signing key is derived from
-/// `SESSION_SECRET`, so a known value lets anyone forge a validly-signed admin
-/// session cookie.
+/// The cookie signing key is derived from `SESSION_SECRET`, so a known value
+/// would let anyone forge a validly-signed admin session cookie. The instance
+/// still boots with one, but cookie sign-in is disabled and boot logs an error
+/// naming the fix, since API-key, DPoP and service-auth callers need no cookie.
 const INSECURE_SESSION_SECRETS: &[&str] = &[
     "change-me-in-production-not-secure",
     "change-me-in-production",
@@ -220,11 +221,8 @@ pub struct Config {
     pub plc_url: String,
     pub static_dir: Option<String>,
     pub base_path: Option<String>,
-    pub event_log_retention_days: u32,
     pub app_name: Option<String>,
     pub logo_uri: Option<String>,
-    pub tos_uri: Option<String>,
-    pub policy_uri: Option<String>,
     pub token_encryption_key: Option<[u8; 32]>,
     pub default_rate_limit_capacity: u32,
     pub default_rate_limit_refill_rate: f64,
@@ -400,7 +398,7 @@ impl Config {
             public_url,
             // Not required and never defaulted to a placeholder: an unset,
             // insecure, or too-short value is surfaced via `config_errors()` and
-            // disables cookie auth rather than aborting boot. See C3.
+            // disables cookie auth rather than aborting boot.
             session_secret: var("SESSION_SECRET").unwrap_or_default(),
             jetstream_url: var("JETSTREAM_URL")
                 .unwrap_or_else(|| "wss://jetstream1.us-east.bsky.network".into()),
@@ -428,13 +426,8 @@ impl Config {
                     Some(s)
                 }
             }),
-            event_log_retention_days: var("EVENT_LOG_RETENTION_DAYS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
             app_name: var("APP_NAME"),
             logo_uri: var("LOGO_URI"),
-            tos_uri: var("TOS_URI"),
-            policy_uri: var("POLICY_URI"),
             token_encryption_key: match parse_token_encryption_key(
                 var("TOKEN_ENCRYPTION_KEY").as_deref(),
             ) {
@@ -742,11 +735,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
@@ -1077,41 +1067,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn default_event_log_retention_days() {
-        unsafe {
-            clear_env();
-            set_required_env();
-        }
-        let config = Config::from_env();
-        assert_eq!(config.event_log_retention_days, 30);
-    }
-
-    #[test]
-    #[serial]
-    fn custom_event_log_retention_days() {
-        unsafe {
-            clear_env();
-            set_required_env();
-            env::set_var("EVENT_LOG_RETENTION_DAYS", "7");
-        }
-        let config = Config::from_env();
-        assert_eq!(config.event_log_retention_days, 7);
-    }
-
-    #[test]
-    #[serial]
-    fn zero_event_log_retention_days_disables_cleanup() {
-        unsafe {
-            clear_env();
-            set_required_env();
-            env::set_var("EVENT_LOG_RETENTION_DAYS", "0");
-        }
-        let config = Config::from_env();
-        assert_eq!(config.event_log_retention_days, 0);
-    }
-
-    #[test]
-    #[serial]
     fn database_backend_detected_from_url() {
         unsafe {
             clear_env();
@@ -1234,11 +1189,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
@@ -1274,11 +1226,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: Some("/hv".into()),
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
@@ -1314,11 +1263,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: Some("/hv".into()),
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
@@ -1354,11 +1300,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: Some("/hv".into()),
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
@@ -1424,11 +1367,8 @@ mod tests {
             plc_url: String::new(),
             static_dir: None,
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
