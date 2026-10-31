@@ -74,6 +74,7 @@ import type {
   DeadLetterDetail,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
@@ -158,6 +159,7 @@ export type {
   DeadLettersListResponse,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
@@ -1550,7 +1552,7 @@ export function bulkRetryDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/retry", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/retry", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -1561,7 +1563,7 @@ export function bulkReindexDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/reindex", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/reindex", {
     method: "POST",
     body: JSON.stringify(body),
   });
