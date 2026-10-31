@@ -125,11 +125,8 @@ impl TestApp {
             plc_url: mock_url.clone(),
             static_dir: Some("./web/out".into()),
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             // Space writes need this to decrypt the `#atproto_space` signing key.
             token_encryption_key: Some(db::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
