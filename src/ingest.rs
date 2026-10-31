@@ -177,6 +177,14 @@ pub(crate) async fn apply_batch_in(
     state: &AppState,
     events: Vec<SourceEvent>,
 ) -> (BatchOutcome, Option<String>) {
+    crate::catalog::ScriptCatalog::for_one_batch(apply_events(state, events)).await
+}
+
+/// [`apply_batch_in`], within its batch's lookups.
+async fn apply_events(
+    state: &AppState,
+    events: Vec<SourceEvent>,
+) -> (BatchOutcome, Option<String>) {
     let total = events.len();
     let mut out = BatchOutcome {
         outcomes: Vec::with_capacity(total),
