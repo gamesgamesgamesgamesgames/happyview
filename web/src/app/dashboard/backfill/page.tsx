@@ -147,9 +147,9 @@ const SUMMARY_STATE_LABELS: Record<
   NonNullable<NonNullable<BackfillCollection["summary"]>["state"]>,
   string
 > = {
-  running: "still being filled",
+  running: "crawling",
   complete: "complete",
-  failed: "filling failed",
+  failed: "crawl failed",
 };
 
 // Operators read these, not enum names.
@@ -793,8 +793,8 @@ export default function BackfillPage() {
                   <AlertDialogHeader>
                     <AlertDialogTitle>Clear all details?</AlertDialogTitle>
                     <AlertDialogDescription>
-                      This will permanently delete per-repo detail data for all
-                      completed, cancelled and failed backfill jobs.
+                      Deletes the per-account detail of every finished backfill.
+                      The backfills stay in the list.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
@@ -1410,7 +1410,7 @@ function JobDetail({
         {collectionSummary && (
           <div>
             <span className="text-muted-foreground text-sm">
-              The collection now
+              In the network store
             </span>
             <div className="mt-1 space-y-1 rounded-md border p-3 text-xs">
               <p>{collectionSummary.message}</p>
@@ -1488,8 +1488,7 @@ function JobDetail({
                 >
                   {bounded && discoveredLoaded && (
                     <p className="px-3 pt-2 text-xs text-muted-foreground">
-                      Repos waiting to be fetched. Finished repos move to
-                      Fetching records.
+                      Waiting to be fetched.
                     </p>
                   )}
                   {discoveredRepos.length > 0 ? (
@@ -1600,8 +1599,8 @@ function JobDetail({
                 >
                   {job.recent_completions_limit != null && fetchedLoaded && (
                     <p className="px-3 pt-2 text-xs text-muted-foreground">
-                      The {job.recent_completions_limit.toLocaleString()} most
-                      recently fetched repos.
+                      The last {job.recent_completions_limit.toLocaleString()}{" "}
+                      fetched.
                     </p>
                   )}
                   {fetchedWithRecords.length > 0 ? (
@@ -1654,7 +1653,7 @@ function JobDetail({
                     <div className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
                       <span className="text-muted-foreground">
                         {errorsCapped
-                          ? `Detail log capped — showing first ${errorsCap.toLocaleString()} of ${errorsTotal.toLocaleString()}`
+                          ? `Showing the first ${errorsCap.toLocaleString()} of ${errorsTotal.toLocaleString()}.`
                           : null}
                       </span>
                       {canRetry && anyRetryable && (
@@ -1713,8 +1712,7 @@ function JobDetail({
               <AlertDialogHeader>
                 <AlertDialogTitle>Clear details?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  This will permanently delete per-repo detail data for this
-                  backfill job.
+                  Deletes this backfill&apos;s per-account detail.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -2028,9 +2026,8 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>New backfill</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Backfill a collection, specific accounts, or both. Without accounts,
-            every repo on the network with matching records is backfilled;
-            without a collection, every record collection is.
+            Leave Collection empty to backfill every collection, or Accounts
+            empty to backfill every account.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <ResponsiveDialogBody className="flex flex-col gap-4">
@@ -2065,8 +2062,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               onBlockedChange={setAccountsBlocked}
             />
             <p className="text-muted-foreground text-xs">
-              Search by handle, or paste handles and DIDs separated by commas or
-              spaces.
+              Search by handle, or paste handles and DIDs.
             </p>
           </div>
           <div className="flex flex-col gap-2">
@@ -2090,10 +2086,10 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               {accountJob
                 ? "Account backfills always crawl each account's PDS."
                 : chosenSource === "replay"
-                  ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
+                  ? "Reads the Jetstream archive. Needs Jetstream v2, and can miss an account's oldest records."
                   : chosenSource === "crawl"
                     ? "Lists accounts from the relay and fetches each PDS."
-                    : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
+                    : "Crawl, unless BACKFILL_SOURCE says otherwise."}
             </p>
           </div>
         </ResponsiveDialogBody>
