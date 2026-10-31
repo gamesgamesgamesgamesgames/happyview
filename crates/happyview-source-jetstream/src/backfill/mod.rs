@@ -553,7 +553,7 @@ pub(crate) async fn finalise_cancel(state: &JobState, job_id: &str) {
     keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'Cancelled by an operator' WHERE id = ?",
         state.db_backend,
     );
     job_write(state, job_id, "cancel", || {
