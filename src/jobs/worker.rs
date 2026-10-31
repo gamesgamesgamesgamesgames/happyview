@@ -174,7 +174,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
     };
 
-    lua.remove_hook();
+    sandbox::lift_execution_limit(&lua);
 
     let state_arc = Arc::new(state.clone());
 
