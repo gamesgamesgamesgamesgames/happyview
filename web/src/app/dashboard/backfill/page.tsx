@@ -1683,7 +1683,8 @@ function JobDetail({
             Paused backfills stay paused. Resume picks up where it left off.
           </p>
         )}
-        {canFlush && flushable && (
+        {/* An executor's job keeps no per-repo detail to clear. */}
+        {canFlush && flushable && !byExecutor && (
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="outline" size="sm">
