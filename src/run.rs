@@ -406,6 +406,13 @@ async fn boot(
         ),
     }
 
+    crate::script::variables::encrypt_at_boot(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    )
+    .await;
+
     match crate::maintenance::vacuum::run_if_requested(&db_pool, db_backend, &config.database_url)
         .await
     {
