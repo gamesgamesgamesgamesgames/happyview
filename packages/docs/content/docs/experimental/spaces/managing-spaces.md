@@ -377,7 +377,7 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20' 
 
 | Field    | Type    | Required | Default        | Description                  |
 | -------- | ------- | -------- | -------------- | ---------------------------- |
-| `did`    | string  | No       | authenticated user | Filter by DID              |
+| `did`    | string  | No       | authenticated user | Whose memberships to list. Naming another account takes a super admin; anyone else gets `403 Forbidden`. |
 | `spaceType` | string (NSID) | No | | Lists only spaces of this type. `type`, the earlier name, is accepted until v3. |
 | `limit`  | integer | No       | 50             | Max spaces to return (1-100) |
 | `cursor` | string  | No       |                | Pagination cursor            |
