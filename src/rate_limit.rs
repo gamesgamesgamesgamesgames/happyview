@@ -183,6 +183,33 @@ impl RateLimiter {
         self.client_configs.insert(client_key, config);
     }
 
+    /// Give `client_key` its bucket: the client's own capacity and refill rate
+    /// when it sets both, and the instance's (`instance_capacity`,
+    /// `instance_refill_rate`) otherwise.
+    pub fn register_client_limit(
+        &self,
+        client_key: String,
+        capacity: Option<i32>,
+        refill_rate: Option<f64>,
+        instance_capacity: u32,
+        instance_refill_rate: f64,
+    ) {
+        let (capacity, refill_rate) = match (capacity, refill_rate) {
+            (Some(capacity), Some(refill_rate)) => (capacity as u32, refill_rate),
+            _ => (instance_capacity, instance_refill_rate),
+        };
+        self.register_client_config(
+            client_key,
+            RateLimitConfig {
+                capacity,
+                refill_rate,
+                default_query_cost: self.defaults.query_cost,
+                default_procedure_cost: self.defaults.procedure_cost,
+                default_proxy_cost: self.defaults.proxy_cost,
+            },
+        );
+    }
+
     pub fn get_client_config(&self, client_key: &str) -> Option<RateLimitConfig> {
         self.client_configs
             .get(client_key)
@@ -343,6 +370,21 @@ mod tests {
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Allowed { .. }));
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Allowed { .. }));
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Limited { .. }));
+    }
+
+    #[test]
+    fn a_client_limit_uses_its_overrides_only_when_both_are_set() {
+        let rl = RateLimiter::new(defaults());
+        for (key, capacity, refill, expected) in [
+            ("hvc_both", Some(7), Some(0.5), (7, 0.5)),
+            ("hvc_neither", None, None, (100, 2.0)),
+            ("hvc_capacity", Some(7), None, (100, 2.0)),
+            ("hvc_refill", None, Some(0.5), (100, 2.0)),
+        ] {
+            rl.register_client_limit(key.into(), capacity, refill, 100, 2.0);
+            let cfg = rl.get_client_config(key).expect(key);
+            assert_eq!((cfg.capacity, cfg.refill_rate), expected, "{key}");
+        }
     }
 
     #[test]

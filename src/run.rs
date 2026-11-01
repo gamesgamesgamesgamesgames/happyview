@@ -644,29 +644,13 @@ async fn boot(
                     },
                 );
             }
-            if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: *cap as u32,
-                        refill_rate: *refill,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            } else {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: config.default_rate_limit_capacity,
-                        refill_rate: config.default_rate_limit_refill_rate,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            }
+            rate_limiter.register_client_limit(
+                client_key.clone(),
+                *capacity,
+                *refill_rate,
+                config.default_rate_limit_capacity,
+                config.default_rate_limit_refill_rate,
+            );
         }
     }
 
