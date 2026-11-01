@@ -7,6 +7,7 @@ import {
   hookDetail,
   hookStatsOf,
   executorProgress,
+  recordsCountParts,
   recordsCountText,
   recordsFraction,
   runByExecutor,
@@ -59,6 +60,24 @@ describe("recordsCountText", () => {
       "7 repos",
     );
     expect(recordsCountText({ done: 7 })).toBe("7 records");
+  });
+});
+
+describe("recordsCountParts", () => {
+  it("keeps the total, and says whether it is an estimate", () => {
+    expect(recordsCountParts({ done: 3, total: 10, estimated: true })).toEqual({
+      done: 3,
+      total: 10,
+      estimated: true,
+      noun: "records",
+    });
+  });
+
+  it("drops a known total the count has reached, but not an estimate", () => {
+    expect(recordsCountParts({ done: 10, total: 10 }).total).toBeNull();
+    expect(
+      recordsCountParts({ done: 10, total: 10, estimated: true }).total,
+    ).toBe(10);
   });
 });
 
