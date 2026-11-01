@@ -30,6 +30,8 @@ pub fn state_with_pool_on(
     } else {
         config.public_url.trim_end_matches('/').to_string()
     };
+    let encryption_key = config.token_encryption_key;
+    let encryption_key = encryption_key.as_ref();
     let metadata_url = format!("{public_url}/oauth-client-metadata.json");
     let callback = format!("{public_url}/auth/callback");
     let (tx, _) = watch::channel(vec![]);
@@ -56,8 +58,16 @@ pub fn state_with_pool_on(
             scopes: Some(scopes.clone()),
         },
         keys: None,
-        state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
-        session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend, None),
+        state_store: crate::auth::oauth_store::DbStateStore::new(
+            pool.clone(),
+            backend,
+            encryption_key,
+        ),
+        session_store: crate::auth::oauth_store::DbSessionStore::new(
+            pool.clone(),
+            backend,
+            encryption_key,
+        ),
         resolver: atrium_oauth::OAuthResolverConfig {
             did_resolver,
             handle_resolver,
@@ -88,8 +98,15 @@ pub fn state_with_pool_on(
             procedure_cost: 1,
             proxy_cost: 1,
         }),
-        oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth), None)),
-        oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
+        oauth: Arc::new(crate::auth::OAuthClientRegistry::new(
+            Arc::new(oauth),
+            encryption_key,
+        )),
+        oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
+            pool.clone(),
+            backend,
+            encryption_key,
+        ),
         linked_repos_client: Arc::new(
             crate::linked_repos::client::build(
                 plc_url.as_str(),
@@ -98,11 +115,11 @@ pub fn state_with_pool_on(
                 callback.clone(),
                 true,
                 scopes,
-                crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
+                crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, encryption_key),
                 pool.clone(),
                 backend,
                 None,
-                None,
+                encryption_key,
             )
             .expect("test linked-repo OAuth client"),
         ),
