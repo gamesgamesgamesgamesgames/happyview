@@ -36,9 +36,16 @@ pub(crate) async fn require_space_admin(
     space: &Space,
     did: &str,
 ) -> Result<(), AppError> {
-    if space.creator_did == did {
+    if space.creator_did == did || is_super_admin(state, did).await? {
         return Ok(());
     }
+    Err(AppError::Forbidden(
+        "Only the space's creator can perform this action".into(),
+    ))
+}
+
+/// Whether `did` is a HappyView super admin.
+pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "SELECT is_super FROM happyview_users WHERE did = ?",
         state.db_backend,
@@ -48,12 +55,7 @@ pub(crate) async fn require_space_admin(
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space's creator can perform this action".into(),
-    ))
+    Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
