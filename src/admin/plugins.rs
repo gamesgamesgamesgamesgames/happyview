@@ -1413,25 +1413,7 @@ pub(super) async fn get_secrets(
 
             // Extract and decrypt secrets, then mask for display
             if let Some(secrets_obj) = config.get("secrets").and_then(|s| s.as_object()) {
-                secrets_obj
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str().and_then(|encrypted_b64| {
-                            // Decode base64 and decrypt
-                            let encrypted = BASE64.decode(encrypted_b64).ok()?;
-                            let decrypted = decrypt(encryption_key, &encrypted).ok()?;
-                            let val = String::from_utf8(decrypted).ok()?;
-
-                            // Mask the value for display
-                            let masked = if val.len() > 8 {
-                                format!("********{}", &val[val.len() - 4..])
-                            } else {
-                                "********".to_string()
-                            };
-                            Some((k.clone(), masked))
-                        })
-                    })
-                    .collect()
+                masked_secrets(secrets_obj, encryption_key)
             } else {
                 HashMap::new()
             }
@@ -1440,6 +1422,26 @@ pub(super) async fn get_secrets(
     };
 
     Ok(Json(PluginSecretsResponse { plugin_id, secrets }))
+}
+
+/// What every secret shows in place of its value. Fixed, so it gives away
+/// nothing of the value, and `update_plugin_secrets` reads it as "unchanged".
+const SECRET_MASK: &str = "********";
+
+/// Each secret that still opens, masked.
+fn masked_secrets(
+    secrets: &serde_json::Map<String, serde_json::Value>,
+    encryption_key: &[u8; 32],
+) -> HashMap<String, String> {
+    secrets
+        .iter()
+        .filter_map(|(name, value)| {
+            let encrypted = BASE64.decode(value.as_str()?).ok()?;
+            let decrypted = decrypt(encryption_key, &encrypted).ok()?;
+            String::from_utf8(decrypted).ok()?;
+            Some((name.clone(), SECRET_MASK.to_string()))
+        })
+        .collect()
 }
 
 /// PUT /admin/plugins/{id}/secrets - update plugin secrets
@@ -1747,6 +1749,26 @@ async fn refuse_a_bad_surface(state: &AppState, plugin: &LoadedPlugin) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value mustn't show through its mask, and one whose end falls inside a
+    /// multi-byte character mustn't take the request down.
+    #[test]
+    fn a_secret_masks_the_same_whatever_its_value() {
+        let key = [6u8; 32];
+        let seal = |value: &str| {
+            serde_json::Value::String(BASE64.encode(encrypt(&key, value.as_bytes()).unwrap()))
+        };
+        let secrets = serde_json::Map::from_iter([
+            ("LONG".to_string(), seal("abcdefghijkl")),
+            ("MULTIBYTE".to_string(), seal("pässwörd-✨✨✨")),
+            ("SHORT".to_string(), seal("ab")),
+        ]);
+
+        let masked = masked_secrets(&secrets, &key);
+
+        assert_eq!(masked.len(), 3);
+        assert!(masked.values().all(|value| value == SECRET_MASK));
+    }
     use crate::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
 
     fn release(version: &str) -> ReleaseEntry {

@@ -108,7 +108,7 @@ tokio-tungstenite = "0.29"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors", "fs", "trace"] }
 http-body-util = "0.1"
 hickory-resolver = "0.26"
 ipnet = "2"

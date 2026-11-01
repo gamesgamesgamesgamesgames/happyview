@@ -411,6 +411,22 @@ impl IntoResponse for AppError {
     }
 }
 
+impl AppError {
+    /// This error as text a client may see, for a response that carries several
+    /// outcomes. An internal error's detail goes to the log under a correlation
+    /// id, as it does when one is the whole response.
+    pub fn client_message(&self) -> String {
+        match self {
+            AppError::Internal(msg) => {
+                let correlation_id = format!("{:016x}", rand::random::<u64>());
+                tracing::error!(correlation_id, "internal error: {msg}");
+                format!("Internal server error ({correlation_id})")
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +481,17 @@ mod tests {
         let (status, body) = response_parts(AppError::BadRequest("missing field".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "missing field");
+    }
+
+    #[test]
+    fn a_client_message_keeps_internal_detail_out() {
+        let message = AppError::Internal("secret SQL driver details".into()).client_message();
+        assert!(message.starts_with("Internal server error"));
+        assert!(!message.contains("secret"));
+        assert_eq!(
+            AppError::NotFound("no such letter".into()).client_message(),
+            AppError::NotFound("no such letter".into()).to_string()
+        );
     }
 
     #[tokio::test]
