@@ -39,6 +39,20 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
 
+/// Keys the settings routes neither show nor change. Each is owned by code that
+/// stores it properly; a row left under one of these names is a leftover from
+/// before that.
+const RESERVED_KEYS: &[&str] = &[crate::plugin::attestation::LEGACY_KEY_SETTING];
+
+fn refuse_if_reserved(key: &str) -> Result<(), AppError> {
+    if RESERVED_KEYS.contains(&key) {
+        return Err(AppError::BadRequest(format!(
+            "'{key}' can't be changed through settings"
+        )));
+    }
+    Ok(())
+}
+
 /// The environment variable a setting falls back to, if it has one.
 pub fn env_var_for(key: &str) -> Option<&'static str> {
     ENV_FALLBACKS
@@ -150,7 +164,10 @@ pub(super) async fn list(
     let rows: Vec<(String, String)> = crate::db::query_as(&sql)
         .fetch_all(&state.db)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?
+        .into_iter()
+        .filter(|(key, _): &(String, String)| !RESERVED_KEYS.contains(&key.as_str()))
+        .collect();
 
     let db_keys: std::collections::HashSet<String> = rows.iter().map(|(k, _)| k.clone()).collect();
 
@@ -176,6 +193,7 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertSettingBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    refuse_if_reserved(&key)?;
     if key.starts_with("telemetry.") {
         super::telemetry::refuse_if_managed(&state)?;
     }
@@ -210,6 +228,7 @@ pub(super) async fn delete(
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    refuse_if_reserved(&key)?;
     if key.starts_with("telemetry.") {
         super::telemetry::refuse_if_managed(&state)?;
     }

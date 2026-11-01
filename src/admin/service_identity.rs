@@ -24,6 +24,18 @@ pub(super) async fn get(
     }))
 }
 
+async fn stored_rotation_key(state: &AppState) -> Result<Option<String>, AppError> {
+    let sql = crate::db::adapt_sql(
+        "SELECT rotation_key_enc FROM happyview_service_identity WHERE id = 1",
+        state.db_backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read service identity: {e}")))?;
+    Ok(row.and_then(|(key,)| key))
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct UpdateIdentityBody {
     pub mode: String,
@@ -44,13 +56,28 @@ pub(super) async fn update(
     let mode = IdentityMode::parse(&body.mode)
         .ok_or_else(|| AppError::BadRequest(format!("invalid identity mode: {}", body.mode)))?;
 
+    // Keys aren't returned by GET, so a caller changing something else can't
+    // send them back. An update within a mode keeps the ones it omits; a
+    // change of mode leaves the old mode's keys behind.
+    let (signing_key_enc, rotation_key_enc) =
+        match get_identity(&state.db, state.db_backend).await? {
+            Some(current) if current.mode.as_str() == mode.as_str() => (
+                body.signing_key_enc.or(current.signing_key_enc),
+                match body.rotation_key_enc {
+                    Some(key) => Some(key),
+                    None => stored_rotation_key(&state).await?,
+                },
+            ),
+            _ => (body.signing_key_enc, body.rotation_key_enc),
+        };
+
     upsert_identity(
         &state.db,
         state.db_backend,
         &mode,
         body.did.as_deref(),
-        body.signing_key_enc.as_deref(),
-        body.rotation_key_enc.as_deref(),
+        signing_key_enc.as_deref(),
+        rotation_key_enc.as_deref(),
         body.attached_account_did.as_deref(),
     )
     .await?;
