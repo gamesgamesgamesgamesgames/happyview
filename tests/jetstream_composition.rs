@@ -170,6 +170,7 @@ struct JobRow {
     status: String,
     source: String,
     error: Option<String>,
+    note: Option<String>,
     processed_repos: Option<i32>,
     total_repos: Option<i32>,
     total_records: Option<i32>,
@@ -177,13 +178,14 @@ struct JobRow {
 
 async fn job(app: &TestApp, id: &str) -> JobRow {
     let sql = adapt_sql(
-        "SELECT status, source, error, processed_repos, total_repos, total_records FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT status, source, error, note, processed_repos, total_repos, total_records FROM happyview_backfill_jobs WHERE id = ?",
         app.state.db_backend,
     );
     #[allow(clippy::type_complexity)]
     let row: (
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<i32>,
         Option<i32>,
@@ -197,9 +199,10 @@ async fn job(app: &TestApp, id: &str) -> JobRow {
         status: row.0,
         source: row.1,
         error: row.2,
-        processed_repos: row.3,
-        total_repos: row.4,
-        total_records: row.5,
+        note: row.3,
+        processed_repos: row.4,
+        total_repos: row.5,
+        total_records: row.6,
     }
 }
 
@@ -1030,6 +1033,102 @@ async fn an_account_backfill_leaves_executor_collections_out() {
         .await
         .unwrap();
     assert_eq!(jobs, 1, "no executor job beside an account backfill");
+}
+
+/// A source whose every collection has an [`Unused`] executor.
+fn every_collection_executed() -> (Arc<Unused>, Arc<JetstreamSource>) {
+    let executor = Arc::new(Unused {
+        calls: AtomicUsize::new(0),
+    });
+    let routed = executor.clone();
+    let source = JetstreamSource::builder()
+        .executor_for(move |_| Some(routed.clone() as Arc<dyn BackfillExecutor>))
+        .build_detached();
+    (executor, source)
+}
+
+async fn start(source: &JetstreamSource, collection: Option<&str>, dids: Vec<String>) -> String {
+    source
+        .start_backfill(BackfillRequest {
+            collection: collection.map(str::to_string),
+            dids,
+            source: None,
+            actor: "did:plc:testadmin".to_string(),
+            kind: BackfillKind::Manual,
+        })
+        .await
+        .expect("start a backfill")
+        .expect("a job id")
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_backfill_of_an_executor_collection_completes_with_a_note() {
+    let Some((app, _tracked)) = app(&[A, B]).await else {
+        return;
+    };
+    let (executor, source) = every_collection_executed();
+    attach(&app.state, &source);
+
+    let id = start(&source, Some(B), vec![DID.to_string()]).await;
+    wait_until!(
+        "the job to finish",
+        job(&app, &id).await.status != "running"
+    );
+    let row = job(&app, &id).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.error, None);
+    assert_eq!(
+        row.note.as_deref(),
+        Some("app.test.b is backfilled as a whole, not per account.")
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_backfill_of_every_collection_all_with_executors_completes_with_a_note() {
+    let Some((app, _tracked)) = app(&[A, B]).await else {
+        return;
+    };
+    let (_executor, source) = every_collection_executed();
+    attach(&app.state, &source);
+
+    let id = start(&source, None, Vec::new()).await;
+    wait_until!(
+        "the job to finish",
+        job(&app, &id).await.status != "running"
+    );
+    let row = job(&app, &id).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.error, None);
+    assert_eq!(
+        row.note.as_deref(),
+        Some("Each collection is backfilled by its own job.")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_backfill_with_no_collections_at_all_says_so_as_its_error() {
+    let Some((app, _tracked)) = app(&[]).await else {
+        return;
+    };
+    let (_executor, source) = every_collection_executed();
+    attach(&app.state, &source);
+
+    let id = start(&source, None, Vec::new()).await;
+    wait_until!(
+        "the job to finish",
+        job(&app, &id).await.status != "running"
+    );
+    let row = job(&app, &id).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(
+        row.error.as_deref(),
+        Some("no backfill-eligible collections")
+    );
+    assert_eq!(row.note, None);
 }
 
 struct Panicking;
