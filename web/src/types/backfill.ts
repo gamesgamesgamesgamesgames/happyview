@@ -13,7 +13,9 @@ export interface BackfillJob {
   collection: string | null;
   did: string | null;
   scope: "network" | "dids";
-  source: BackfillSource;
+  // One of HappyView's own sources, or the name of the executor that ran the
+  // job, such as a network store's `store-pass`.
+  source: BackfillSource | (string & {});
   // Set for jobs that read the Jetstream archive; null for crawl jobs.
   replay: ReplayProgress | null;
   status: string;

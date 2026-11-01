@@ -41,7 +41,7 @@ test.describe("Backfill for specific accounts", () => {
   test("creates one job for a suggested handle and a typed DID", async ({
     page,
   }) => {
-    await page.getByRole("button", { name: "Create Backfill Job" }).click();
+    await page.getByRole("button", { name: "New backfill" }).click();
 
     const input = page.getByLabel("Accounts (optional)");
     await input.fill("ali");
@@ -67,7 +67,7 @@ test.describe("Backfill for specific accounts", () => {
       "did:plc:e2ebob",
     ]);
 
-    await expect(page.getByText("Backfill job created")).toBeVisible();
+    await expect(page.getByText("Backfill created")).toBeVisible();
     await expect(page.locator("table tbody tr").first()).toContainText(
       "2 accounts",
     );
@@ -76,7 +76,7 @@ test.describe("Backfill for specific accounts", () => {
   test("an account that cannot be resolved blocks creation", async ({
     page,
   }) => {
-    await page.getByRole("button", { name: "Create Backfill Job" }).click();
+    await page.getByRole("button", { name: "New backfill" }).click();
 
     const input = page.getByLabel("Accounts (optional)");
     await input.fill("nobody.invalid");
@@ -91,7 +91,7 @@ test.describe("Backfill for specific accounts", () => {
   test("choosing the same suggested account twice leaves one tag", async ({
     page,
   }) => {
-    await page.getByRole("button", { name: "Create Backfill Job" }).click();
+    await page.getByRole("button", { name: "New backfill" }).click();
 
     const input = page.getByLabel("Accounts (optional)");
     await input.fill("ali");
@@ -108,7 +108,7 @@ test.describe("Backfill for specific accounts", () => {
   test("Escape while reopening suggestions does not drop an already-added account", async ({
     page,
   }) => {
-    await page.getByRole("button", { name: "Create Backfill Job" }).click();
+    await page.getByRole("button", { name: "New backfill" }).click();
 
     const input = page.getByLabel("Accounts (optional)");
     await input.fill("ali");

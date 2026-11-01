@@ -204,7 +204,9 @@ macro_rules! auth_plugin {
 /// handler returns. Input it cannot parse becomes a `BAD_INPUT` error
 /// envelope — it never panics and never traps. A script that failed is an
 /// `Ok(ExecuteOutput::Error { .. })`, not a `PluginError`: the envelope's error
-/// half is for the interpreter itself failing.
+/// half is for the interpreter itself failing. `execute` may return an
+/// [`ExecuteReport`](crate::ExecuteReport) instead, to say how many
+/// instructions the run used.
 ///
 /// The allocator is the crate's own, through
 /// [`export_abi!(alloc = system)`](export_abi), so an interpreter plugin links
@@ -258,10 +260,8 @@ macro_rules! interpreter_plugin {
 
         #[cfg_attr(target_arch = "wasm32", no_mangle)]
         pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
-            let handler: fn(
-                &$crate::ExecuteInput,
-            )
-                -> core::result::Result<$crate::ExecuteOutput, $crate::PluginError> = $execute;
+            let handler: fn(&$crate::ExecuteInput) -> core::result::Result<_, $crate::PluginError> =
+                $execute;
             $crate::abi::dispatch_execute(ptr, len, handler)
         }
 
@@ -319,8 +319,8 @@ mod interpreter_macro {
 mod interpreter_macro_with_declarations {
     use crate::declarations::{DeclarationFile, Declarations, DeclarationsInput};
     use crate::{
-        ExecuteInput, ExecuteOutput, PluginError, PluginInfo, ScriptValueKind, ValidateInput,
-        ValidateOutput,
+        ExecuteInput, ExecuteOutput, ExecuteReport, PluginError, PluginInfo, ScriptValueKind,
+        ValidateInput, ValidateOutput,
     };
 
     crate::interpreter_plugin! {
@@ -330,11 +330,14 @@ mod interpreter_macro_with_declarations {
         declarations: declarations,
     }
 
-    fn execute_script(_input: &ExecuteInput) -> Result<ExecuteOutput, PluginError> {
+    // This arm's handler counts what it ran, the report half of the
+    // signature.
+    fn execute_script(_input: &ExecuteInput) -> Result<ExecuteReport, PluginError> {
         Ok(ExecuteOutput::Returned {
             value: serde_json::Value::Null,
             value_kind: ScriptValueKind::Other,
-        })
+        }
+        .with_instructions(Some(1)))
     }
 
     fn validate_script(_input: &ValidateInput) -> Result<ValidateOutput, PluginError> {

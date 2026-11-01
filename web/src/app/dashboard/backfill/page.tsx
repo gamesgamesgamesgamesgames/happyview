@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import Link from "next/link";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -127,19 +128,28 @@ function isReplayStage(stage: string): boolean {
   return REPLAY_STAGES.includes(stage);
 }
 
-const SOURCE_LABELS: Record<BackfillSource, string> = {
+const SOURCE_LABELS: Record<string, string> = {
   auto: "Auto",
   replay: "Replay",
   crawl: "Crawl",
+  "store-pass": "Network store",
 };
+
+/** A job's source as the Source badge says it; an unknown executor's name reads as words. */
+function sourceLabel(source: string): string {
+  const known = SOURCE_LABELS[source];
+  if (known) return known;
+  const words = source.replace(/[-_]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
 
 const SUMMARY_STATE_LABELS: Record<
   NonNullable<NonNullable<BackfillCollection["summary"]>["state"]>,
   string
 > = {
-  running: "still being filled",
+  running: "crawling",
   complete: "complete",
-  failed: "filling failed",
+  failed: "crawl failed",
 };
 
 // Operators read these, not enum names.
@@ -152,12 +162,22 @@ const ERROR_KIND_LABELS: Record<string, string> = {
   did_doc_not_found: "No did.json (404)",
   did_doc_forbidden: "Blocked (403)",
   did_doc_invalid: "Invalid DID document",
-  repo_not_found: "Repo deleted or moved",
+  repo_not_found: "Account deleted or moved",
   repo_deactivated: "Account deactivated",
   repo_takendown: "Account taken down",
   replay_block: "Archive block failed",
   other: "Other",
 };
+
+// Rows cancelled before the server's wording changed keep the old text.
+const LEGACY_ERROR_NOTES: Record<string, string> = {
+  "cancelled by user": "Cancelled by an operator",
+};
+
+/** What a job that didn't fail says in its error column, read as a note. */
+function errorNote(error: string): string {
+  return LEGACY_ERROR_NOTES[error] ?? error;
+}
 
 function errorKindLabel(kind: string): string {
   return ERROR_KIND_LABELS[kind] ?? kind.replace(/_/g, " ");
@@ -522,10 +542,24 @@ function HookDetailRow({
   stats: HookStats;
   finished: boolean;
 }) {
-  const { progress, scriptShare } = hookDetail(stats, finished);
+  const { progress, scriptShare, deadLettered } = hookDetail(stats, finished);
   return (
     <>
-      <span>{progress.join(" · ")}</span>
+      <span>
+        {progress.join(" · ")}
+        {deadLettered && (
+          <>
+            {progress.length > 0 && " · "}
+            {deadLettered} in{" "}
+            <Link
+              href="/dashboard/dead-letters"
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              Dead Letters
+            </Link>
+          </>
+        )}
+      </span>
       {scriptShare && <span>{scriptShare}</span>}
     </>
   );
@@ -720,7 +754,7 @@ export default function BackfillPage() {
   const load = useCallback(() => {
     getBackfillJobs()
       .then(setJobs)
-      .catch((e) => toastError("Failed to load backfill jobs", e));
+      .catch((e) => toastError("Couldn't load backfills", e));
   }, []);
 
   useEffect(() => {
@@ -743,7 +777,7 @@ export default function BackfillPage() {
 
   return (
     <>
-      <SiteHeader title="Backfill" />
+      <SiteHeader title="Backfills" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <div className="flex items-center justify-end">
           <div className="flex items-center gap-2">
@@ -756,10 +790,10 @@ export default function BackfillPage() {
                 </AlertDialogTrigger>
                 <AlertDialogContent>
                   <AlertDialogHeader>
-                    <AlertDialogTitle>Clear all job details?</AlertDialogTitle>
+                    <AlertDialogTitle>Clear all details?</AlertDialogTitle>
                     <AlertDialogDescription>
-                      This will permanently delete per-repo detail data for all
-                      completed, cancelled and failed backfill jobs.
+                      Deletes the per-account detail of every finished backfill.
+                      The backfills stay in the list.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
@@ -769,10 +803,10 @@ export default function BackfillPage() {
                         try {
                           await flushAllBackfillDetails();
                         } catch (e: unknown) {
-                          toastError("Failed to clear job details", e);
+                          toastError("Couldn't clear details", e);
                           return;
                         }
-                        toast.success("All job details cleared");
+                        toast.success("All details cleared");
                         setSelectedJobId(null);
                         load();
                       }}
@@ -807,8 +841,7 @@ export default function BackfillPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No backfill jobs yet. Create a job to import historical
-                    records from the AT Protocol network.
+                    No backfills yet.
                   </TableCell>
                 </TableRow>
               )}
@@ -946,6 +979,12 @@ function JobDetail({
   // Any other source names an executor: the record source backfills the
   // collection itself, and says what it holds for it now.
   const byExecutor = runByExecutor(job.source);
+  // The network store restarts a cancelled or failed store pass within about
+  // a minute; only a paused one stays stopped. So its backfills offer Pause
+  // and no Cancel.
+  const restartsUnlessPaused = job.source === "store-pass";
+  const pauseShown =
+    canCancel && (job.status === "running" || job.status === "pausing");
   const [collectionSummary, setCollectionSummary] =
     useState<BackfillCollection["summary"]>(null);
   useEffect(() => {
@@ -1062,7 +1101,9 @@ function JobDetail({
     setCancelling(true);
     try {
       await onCancel();
-      toast.success("Backfill job cancelled");
+      toast.success("Backfill cancelled");
+    } catch (e: unknown) {
+      toastError("Couldn't cancel", e);
     } finally {
       setCancelling(false);
     }
@@ -1072,7 +1113,9 @@ function JobDetail({
     setPausing(true);
     try {
       await onPause();
-      toast.success("Backfill job paused");
+      toast.success("Backfill paused");
+    } catch (e: unknown) {
+      toastError("Couldn't pause", e);
     } finally {
       setPausing(false);
     }
@@ -1082,7 +1125,9 @@ function JobDetail({
     setResuming(true);
     try {
       await onResume();
-      toast.success("Backfill job resumed");
+      toast.success("Backfill resumed");
+    } catch (e: unknown) {
+      toastError("Couldn't resume", e);
     } finally {
       setResuming(false);
     }
@@ -1092,9 +1137,9 @@ function JobDetail({
     setRetrying(true);
     try {
       await onRetry(kinds);
-      toast.success("Retry job started");
+      toast.success("Retry started as a new backfill");
     } catch (e: unknown) {
-      toastError("Failed to start retry", e);
+      toastError("Couldn't start the retry", e);
     } finally {
       setRetrying(false);
     }
@@ -1286,13 +1331,13 @@ function JobDetail({
     <>
       <SheetHeader>
         <SheetTitle className="flex items-center gap-2">
-          <span className="font-mono text-sm">Backfill Details</span>
+          <span className="font-mono text-sm">Backfill details</span>
         </SheetTitle>
       </SheetHeader>
       <div className="flex-1 min-h-0 overflow-y-auto px-4 flex flex-col gap-4">
         <div className="grid grid-cols-2 gap-4 text-sm">
           <div className="col-span-2">
-            <span className="text-muted-foreground">Job ID</span>
+            <span className="text-muted-foreground">ID</span>
             <p className="font-mono text-xs break-all">{job.id}</p>
           </div>
           <div>
@@ -1308,9 +1353,7 @@ function JobDetail({
           <div>
             <span className="text-muted-foreground">Source</span>
             <p className="text-xs">
-              <Badge variant="secondary">
-                {SOURCE_LABELS[job.source] ?? job.source}
-              </Badge>
+              <Badge variant="secondary">{sourceLabel(job.source)}</Badge>
             </p>
           </div>
           <div>
@@ -1346,12 +1389,19 @@ function JobDetail({
               {pauseReason}
             </div>
           </div>
+        ) : job.error && job.status === "failed" ? (
+          <div>
+            <span className="text-muted-foreground text-sm">Error</span>
+            <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
+              {job.error}
+            </div>
+          </div>
         ) : (
           job.error && (
             <div>
-              <span className="text-muted-foreground text-sm">Error</span>
-              <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
-                {job.error}
+              <span className="text-muted-foreground text-sm">Note</span>
+              <div className="bg-muted mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+                {errorNote(job.error)}
               </div>
             </div>
           )
@@ -1369,7 +1419,7 @@ function JobDetail({
         {collectionSummary && (
           <div>
             <span className="text-muted-foreground text-sm">
-              The collection now
+              In the network store
             </span>
             <div className="mt-1 space-y-1 rounded-md border p-3 text-xs">
               <p>{collectionSummary.message}</p>
@@ -1413,9 +1463,8 @@ function JobDetail({
             )}
             {!byExecutor && hookStats && (
               <RecordsProgress
-                label="Running hooks"
+                label="Record scripts"
                 done={hookStats.done}
-                noun="records hooked"
                 active={isActive && !isPaused}
                 detail={
                   <HookDetailRow stats={hookStats} finished={!isActive} />
@@ -1425,7 +1474,7 @@ function JobDetail({
             {!replayView && !byExecutor && (
               <>
                 <ProgressRow
-                  label="Discovering repos"
+                  label="Discovering accounts"
                   active={
                     isActive &&
                     (job.stage === "discovering_repos" || discovering)
@@ -1437,7 +1486,9 @@ function JobDetail({
                       <AnimatedNumber value={job.total_repos} />
                     ) : undefined
                   }
-                  suffix={discovering ? "found so far" : "repos found"}
+                  suffix={
+                    discovering ? "accounts found so far" : "accounts found"
+                  }
                   loading={
                     discoveredOpen && discoveredReached && !discoveredLoaded
                   }
@@ -1446,8 +1497,7 @@ function JobDetail({
                 >
                   {bounded && discoveredLoaded && (
                     <p className="px-3 pt-2 text-xs text-muted-foreground">
-                      Repos waiting to be fetched. Finished repos move to
-                      Fetching records.
+                      Waiting to be fetched.
                     </p>
                   )}
                   {discoveredRepos.length > 0 ? (
@@ -1468,8 +1518,8 @@ function JobDetail({
                   ) : discoveredLoaded ? (
                     <p className="py-3 text-center text-xs text-muted-foreground">
                       {bounded
-                        ? "No repos waiting."
-                        : "No repos discovered yet."}
+                        ? "No accounts waiting."
+                        : "No accounts discovered yet."}
                     </p>
                   ) : null}
                 </ProgressRow>
@@ -1512,8 +1562,9 @@ function JobDetail({
                           </span>
                           <span className="text-xs text-muted-foreground tabular-nums">
                             <AnimatedNumber value={pds.completed_repos} />/
-                            <AnimatedNumber value={pds.total_repos} /> repos ·{" "}
-                            <AnimatedNumber value={pds.total_records} /> records
+                            <AnimatedNumber value={pds.total_repos} /> accounts
+                            · <AnimatedNumber value={pds.total_records} />{" "}
+                            records
                           </span>
                         </div>
                       )}
@@ -1538,7 +1589,7 @@ function JobDetail({
                     job.stage === "resolving_and_fetching" ? (
                       <>
                         <AnimatedNumber value={job.processed_repos ?? 0} /> /{" "}
-                        <AnimatedNumber value={job.total_repos ?? 0} /> repos
+                        <AnimatedNumber value={job.total_repos ?? 0} /> accounts
                       </>
                     ) : undefined
                   }
@@ -1557,8 +1608,8 @@ function JobDetail({
                 >
                   {job.recent_completions_limit != null && fetchedLoaded && (
                     <p className="px-3 pt-2 text-xs text-muted-foreground">
-                      The {job.recent_completions_limit.toLocaleString()} most
-                      recently fetched repos.
+                      The last {job.recent_completions_limit.toLocaleString()}{" "}
+                      fetched.
                     </p>
                   )}
                   {fetchedWithRecords.length > 0 ? (
@@ -1585,7 +1636,7 @@ function JobDetail({
                     />
                   ) : fetchedLoaded ? (
                     <p className="py-3 text-center text-xs text-muted-foreground">
-                      No repos fetched yet.
+                      No accounts fetched yet.
                     </p>
                   ) : null}
                 </ProgressRow>
@@ -1611,7 +1662,7 @@ function JobDetail({
                     <div className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
                       <span className="text-muted-foreground">
                         {errorsCapped
-                          ? `Detail log capped — showing first ${errorsCap.toLocaleString()} of ${errorsTotal.toLocaleString()}`
+                          ? `Showing the first ${errorsCap.toLocaleString()} of ${errorsTotal.toLocaleString()}.`
                           : null}
                       </span>
                       {canRetry && anyRetryable && (
@@ -1652,8 +1703,14 @@ function JobDetail({
           </div>
         </div>
       </div>
-      <SheetFooter className="border-t flex-row justify-end gap-2">
-        {canFlush && flushable && (
+      <SheetFooter className="border-t flex-row items-center justify-end gap-2">
+        {restartsUnlessPaused && (pauseShown || (canCancel && resumable)) && (
+          <p className="mr-auto text-xs text-muted-foreground">
+            Paused backfills stay paused. Resume picks up where it left off.
+          </p>
+        )}
+        {/* An executor's job keeps no per-repo detail to clear. */}
+        {canFlush && flushable && !byExecutor && (
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="outline" size="sm">
@@ -1662,10 +1719,9 @@ function JobDetail({
             </AlertDialogTrigger>
             <AlertDialogContent>
               <AlertDialogHeader>
-                <AlertDialogTitle>Clear job details?</AlertDialogTitle>
+                <AlertDialogTitle>Clear details?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  This will permanently delete per-repo detail data for this
-                  backfill job.
+                  Deletes this backfill&apos;s per-account detail.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -1675,10 +1731,10 @@ function JobDetail({
                     try {
                       await flushBackfillDetails(job.id);
                     } catch (e: unknown) {
-                      toastError("Failed to clear job details", e);
+                      toastError("Couldn't clear details", e);
                       return;
                     }
-                    toast.success("Job details cleared");
+                    toast.success("Details cleared");
                     setDiscoveredRepos([]);
                     setDiscoveredCursor(null);
                     setDiscoveredLoaded(false);
@@ -1695,17 +1751,16 @@ function JobDetail({
             </AlertDialogContent>
           </AlertDialog>
         )}
-        {canCancel &&
-          (job.status === "running" || job.status === "pausing") && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={pausing || job.status === "pausing"}
-              onClick={handlePause}
-            >
-              {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
-            </Button>
-          )}
+        {pauseShown && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={pausing || job.status === "pausing"}
+            onClick={handlePause}
+          >
+            {pausing || job.status === "pausing" ? "Pausing…" : "Pause"}
+          </Button>
+        )}
         {canCancel && resumable && (
           <Button
             variant="default"
@@ -1713,27 +1768,27 @@ function JobDetail({
             disabled={resuming}
             onClick={handleResume}
           >
-            {resuming ? "Resuming…" : "Resume Job"}
+            {resuming ? "Resuming…" : "Resume"}
           </Button>
         )}
-        {canCancel && isActive && (
+        {canCancel && isActive && !restartsUnlessPaused && (
           <Button
             variant="destructive"
             size="sm"
             disabled={cancelling || job.status === "cancelling"}
             onClick={handleCancel}
           >
-            {job.status === "cancelling" ? "Cancelling…" : "Cancel Job"}
+            {job.status === "cancelling" ? "Cancelling…" : "Cancel"}
           </Button>
         )}
-        {canCancel && job.status === "paused" && (
+        {canCancel && job.status === "paused" && !restartsUnlessPaused && (
           <Button
             variant="destructive"
             size="sm"
             disabled={cancelling}
             onClick={handleCancel}
           >
-            Cancel Job
+            Cancel
           </Button>
         )}
       </SheetFooter>
@@ -1925,6 +1980,30 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   // Account backfills always crawl; the server refuses replay for them.
   const accountJob = dids.length > 0;
   const chosenSource = accountJob && source === "replay" ? "default" : source;
+  // The executor that backfills the chosen collection, if one does: its
+  // records come from that executor whatever source is asked for.
+  // Kept with the collection it answers for, so a stale answer is ignored.
+  const [lookup, setLookup] = useState<{
+    collection: string;
+    executor: string | null;
+  } | null>(null);
+  const executor =
+    collection && lookup?.collection === collection ? lookup.executor : null;
+
+  useEffect(() => {
+    if (!collection) return;
+    let current = true;
+    getBackfillCollection(collection)
+      .then((resp) => {
+        if (current) setLookup({ collection, executor: resp.executor });
+      })
+      .catch(() => {
+        /* keep the source select */
+      });
+    return () => {
+      current = false;
+    };
+  }, [collection]);
 
   useEffect(() => {
     if (open) {
@@ -1946,23 +2025,24 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       await createBackfillJob({
         collection: collection || undefined,
         dids: dids.length > 0 ? dids : undefined,
-        source: chosenSource === "default" ? undefined : chosenSource,
+        source:
+          executor || chosenSource === "default" ? undefined : chosenSource,
       });
-      toast.success("Backfill job created");
+      toast.success("Backfill created");
       setCollection(null);
       setDids([]);
       setSource("default");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
-      toastError("Failed to create backfill job", e);
+      toastError("Couldn't create the backfill", e);
     }
   }
 
   return (
     <ResponsiveDialog open={open} onOpenChange={setOpen}>
       <ResponsiveDialogTrigger asChild>
-        <Button>Create Backfill Job</Button>
+        <Button>New backfill</Button>
       </ResponsiveDialogTrigger>
       <ResponsiveDialogContent
         className="data-[variant=dialog]:max-h-[calc(100dvh-2rem)] data-[variant=dialog]:grid-rows-[auto_minmax(0,1fr)_auto]"
@@ -1978,11 +2058,10 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         }}
       >
         <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>Create Backfill Job</ResponsiveDialogTitle>
+          <ResponsiveDialogTitle>New backfill</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Backfill a collection, specific accounts, or both. Without accounts,
-            every repo on the network with matching records is backfilled;
-            without a collection, every record collection is.
+            Leave Collection empty to backfill every collection, or Accounts
+            empty to backfill every account.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <ResponsiveDialogBody className="flex flex-col gap-4">
@@ -2017,36 +2096,48 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               onBlockedChange={setAccountsBlocked}
             />
             <p className="text-muted-foreground text-xs">
-              Search by handle, or paste handles and DIDs separated by commas or
-              spaces.
+              Search by handle, or paste handles and DIDs.
             </p>
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="bf-source">Source</Label>
-            <Select
-              value={chosenSource}
-              onValueChange={(v) => setSource(v as BackfillSource | "default")}
-            >
-              <SelectTrigger id="bf-source" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">Default</SelectItem>
-                <SelectItem value="replay" disabled={accountJob}>
-                  Replay from Jetstream
-                </SelectItem>
-                <SelectItem value="crawl">Crawl PDSes</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-muted-foreground text-xs">
-              {accountJob
-                ? "Account backfills always crawl each account's PDS."
-                : chosenSource === "replay"
-                  ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
-                  : chosenSource === "crawl"
-                    ? "Lists repos from the relay and fetches each PDS."
-                    : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
-            </p>
+            {executor ? (
+              <>
+                <Label>Source</Label>
+                <p className="text-muted-foreground text-xs">
+                  Records come from the network store.
+                </p>
+              </>
+            ) : (
+              <>
+                <Label htmlFor="bf-source">Source</Label>
+                <Select
+                  value={chosenSource}
+                  onValueChange={(v) =>
+                    setSource(v as BackfillSource | "default")
+                  }
+                >
+                  <SelectTrigger id="bf-source" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Default</SelectItem>
+                    <SelectItem value="replay" disabled={accountJob}>
+                      Replay from Jetstream
+                    </SelectItem>
+                    <SelectItem value="crawl">Crawl PDSes</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  {accountJob
+                    ? "Account backfills always crawl each account's PDS."
+                    : chosenSource === "replay"
+                      ? "Reads the Jetstream archive. Needs Jetstream v2, and can miss an account's oldest records."
+                      : chosenSource === "crawl"
+                        ? "Lists accounts from the relay and fetches each PDS."
+                        : "Crawl, unless BACKFILL_SOURCE says otherwise."}
+                </p>
+              </>
+            )}
           </div>
         </ResponsiveDialogBody>
         <ResponsiveDialogFooter>
