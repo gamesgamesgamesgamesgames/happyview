@@ -644,6 +644,62 @@ async fn create_api_client_with_rate_limit_overrides() {
     assert_eq!(json["rate_limit_refill_rate"], 1.5);
 }
 
+/// `null` clears a rate-limit override or the allowed origins; leaving a
+/// field out keeps it.
+#[tokio::test]
+#[serial]
+async fn null_clears_an_api_clients_overrides_and_absence_keeps_them() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut body = sample_api_client_body();
+    body["rate_limit_capacity"] = json!(7);
+    body["rate_limit_refill_rate"] = json!(0.5);
+    body["allowed_origins"] = json!(["https://testapp.example.com"]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/api-clients", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = json_body(resp).await["id"].as_str().unwrap().to_string();
+    let uri = format!("/admin/api-clients/{id}");
+
+    let get = |app: &TestApp| {
+        let req = admin_get(&uri, app.admin_cookie());
+        let router = app.router.clone();
+        async move { json_body(router.oneshot(req).await.unwrap()).await }
+    };
+    let put = |app: &TestApp, body: Value| {
+        let req = admin_put(&uri, app.admin_cookie(), &body);
+        let router = app.router.clone();
+        async move { router.oneshot(req).await.unwrap().status() }
+    };
+
+    assert_eq!(
+        put(&app, json!({ "name": "Renamed" })).await,
+        StatusCode::NO_CONTENT
+    );
+    let kept = get(&app).await;
+    assert_eq!(kept["rate_limit_capacity"], 7, "absence keeps it: {kept}");
+    assert_eq!(kept["rate_limit_refill_rate"], 0.5, "{kept}");
+    assert!(kept["allowed_origins"].is_array(), "{kept}");
+
+    let cleared = json!({
+        "rate_limit_capacity": null,
+        "rate_limit_refill_rate": null,
+        "allowed_origins": null,
+    });
+    assert_eq!(put(&app, cleared).await, StatusCode::NO_CONTENT);
+    let got = get(&app).await;
+    assert!(
+        got["rate_limit_capacity"].is_null(),
+        "null clears it: {got}"
+    );
+    assert!(got["rate_limit_refill_rate"].is_null(), "{got}");
+    assert!(got["allowed_origins"].is_null(), "{got}");
+}
+
 // Self-service client creation tests removed — the /oauth/api-clients route
 // no longer exists. The XRPC equivalent (dev.happyview.createApiClient) is
 // tested in tests/dev_happyview.rs.
