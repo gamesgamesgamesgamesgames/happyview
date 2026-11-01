@@ -233,6 +233,22 @@ mod tests {
         }
     }
 
+    /// What rotation relies on: with no key id on the value, trying each
+    /// configured key in turn has to fail cleanly on the wrong one, then
+    /// succeed on the right one, whichever order they're tried in.
+    #[test]
+    fn trying_keys_in_turn_finds_the_one_that_opens_a_value() {
+        for value in ["secret", "", "héllo ✨"] {
+            let sealed = seal(Some(&OTHER_KEY), value).unwrap();
+            for keys in [[KEY, OTHER_KEY], [OTHER_KEY, KEY]] {
+                let opened = keys
+                    .iter()
+                    .find_map(|key| open(Some(key), &sealed.value, true));
+                assert_eq!(opened.as_deref(), Some(value));
+            }
+        }
+    }
+
     /// Text that looks like ciphertext is still plaintext: the flag decides.
     #[test]
     fn the_flag_decides_what_a_row_holds_not_its_text() {
