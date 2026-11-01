@@ -5,6 +5,7 @@ pub mod client_attestation;
 pub mod commit;
 pub mod credential;
 pub mod db;
+pub mod delegation_key;
 pub mod describe;
 pub mod host_mode;
 pub mod http_signature;
