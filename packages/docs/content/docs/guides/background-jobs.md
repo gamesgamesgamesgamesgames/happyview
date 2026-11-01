@@ -90,7 +90,7 @@ end
 
 ### Logging
 
-`internal.logging`'s `info`, `warn` and `error` write to the job's own log as well as the event log, so the dashboard's job detail shows them alongside progress:
+`internal.logging`'s `info`, `warn` and `error` write to the job's own log as well as the event log, so the dashboard's job detail shows them alongside progress. A job's log lines are kept for `EVENT_LOG_RETENTION_DAYS` (default 30), like the event log:
 
 ```lua
 local log = require("internal.logging")
