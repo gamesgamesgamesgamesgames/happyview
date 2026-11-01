@@ -542,7 +542,15 @@ async fn list_spaces(
     Query(query): Query<ListSpacesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let did = query.did.unwrap_or_else(|| claims.did().to_string());
+    let caller = claims.did();
+    let did = query.did.unwrap_or_else(|| caller.to_string());
+    // Another account's memberships are its own business; only a super admin
+    // may ask for them, as with `getSpace`.
+    if did != caller && !service::is_super_admin(&state, caller).await? {
+        return Err(AppError::Forbidden(
+            "listSpaces lists only the caller's own spaces".into(),
+        ));
+    }
     let limit = query.limit.unwrap_or(50).min(100);
 
     let (views, cursor) = db::list_spaces_for_user(
