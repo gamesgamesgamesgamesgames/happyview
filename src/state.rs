@@ -57,7 +57,7 @@ pub fn state_with_pool_on(
         },
         keys: None,
         state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-        session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend),
+        session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend, None),
         resolver: atrium_oauth::OAuthResolverConfig {
             did_resolver,
             handle_resolver,
@@ -88,7 +88,7 @@ pub fn state_with_pool_on(
             procedure_cost: 1,
             proxy_cost: 1,
         }),
-        oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
+        oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth), None)),
         oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
         linked_repos_client: Arc::new(
             crate::linked_repos::client::build(
@@ -101,6 +101,7 @@ pub fn state_with_pool_on(
                 crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
                 pool.clone(),
                 backend,
+                None,
                 None,
             )
             .expect("test linked-repo OAuth client"),

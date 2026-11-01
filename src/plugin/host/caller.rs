@@ -868,6 +868,7 @@ mod tests {
             state.db.clone(),
             state.db_backend,
             crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+            state.config.token_encryption_key.as_ref(),
         );
         let did_value = atrium_api::types::string::Did::new(did.to_string()).unwrap();
         Store::set(&store, did_value.clone(), session)

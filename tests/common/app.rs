@@ -214,7 +214,11 @@ impl TestApp {
                 oauth_pool.clone(),
                 backend,
             ),
-            session_store: happyview::auth::oauth_store::DbSessionStore::new(oauth_pool, backend),
+            session_store: happyview::auth::oauth_store::DbSessionStore::new(
+                oauth_pool,
+                backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
+            ),
             resolver: OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -247,6 +251,7 @@ impl TestApp {
         state.collections_tx = collections_tx;
         state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            Some(&db::TEST_ENCRYPTION_KEY),
         ));
         state.linked_repos_client = std::sync::Arc::new(
             happyview::linked_repos::client::build(
@@ -260,6 +265,7 @@ impl TestApp {
                 pool.clone(),
                 backend,
                 None,
+                Some(&db::TEST_ENCRYPTION_KEY),
             )
             .expect("Failed to create test linked-repo OAuth client"),
         );
@@ -346,6 +352,7 @@ impl TestApp {
             session_store: happyview::auth::oauth_store::DbSessionStore::new(
                 self.state.db.clone(),
                 backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
             ),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -366,6 +373,7 @@ impl TestApp {
         self.state.config.plc_url = plc_url.to_string();
         self.state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            Some(&db::TEST_ENCRYPTION_KEY),
         ));
         self.state.oauth_state_store = state_store;
         self.rebuild_router();

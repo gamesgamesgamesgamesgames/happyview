@@ -95,16 +95,16 @@ async fn attached_session_scope(
     state: &AppState,
     did: &str,
 ) -> Result<Option<Option<String>>, AppError> {
-    let sql = crate::db::adapt_sql(
-        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+    let data = crate::auth::oauth_store::stored_session_json(
+        &state.db,
         state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read the attached session: {e}")))?;
-    Ok(row.map(|(data,)| crate::linked_repos::db::session_scope(&data)))
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        did,
+        state.config.token_encryption_key.as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read the attached session: {e}")))?;
+    Ok(data.map(|data| crate::linked_repos::db::session_scope(&data)))
 }
 
 /// The attached account signs in through the dashboard's own OAuth client, so
