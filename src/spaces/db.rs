@@ -1258,23 +1258,74 @@ pub async fn get_invite_by_token_hash(
     row.map(parse_invite_row).transpose()
 }
 
-pub async fn increment_invite_uses(
+/// What [`claim_invite`] came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteClaim {
+    Joined,
+    /// Revoked, or every use already taken.
+    Unavailable,
+    AlreadyMember,
+}
+
+/// Takes one use of an invite and adds its member, or does neither.
+///
+/// The use is taken by an `UPDATE` whose `WHERE` re-checks the limit, so two
+/// accepts racing for an invite's last use cannot both get it: on Postgres the
+/// second waits on the row lock and re-reads `uses`, and on SQLite
+/// `BEGIN IMMEDIATE` serializes them. A member who is already in the space
+/// gives the use back by rolling the transaction back.
+pub async fn claim_invite(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     invite_id: &str,
-) -> Result<(), AppError> {
-    let sql = adapt_sql(
-        "UPDATE happyview_space_invites SET uses = uses + 1 WHERE id = ?",
+    member: &SpaceMember,
+) -> Result<InviteClaim, AppError> {
+    let err = |e: sqlx::Error| AppError::Internal(format!("failed to accept invite: {e}"));
+    let mut tx = match backend {
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => pool.begin().await,
+    }
+    .map_err(err)?;
+
+    let take_use = adapt_sql(
+        "UPDATE happyview_space_invites SET uses = uses + 1 \
+         WHERE id = ? AND revoked = 0 AND (max_uses IS NULL OR uses < max_uses)",
         backend,
     );
-
-    crate::db::query(&sql)
+    let taken = crate::db::query(&take_use)
         .bind(invite_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to increment invite uses: {e}")))?;
+        .map_err(err)?;
+    if taken.rows_affected() == 0 {
+        return Ok(InviteClaim::Unavailable);
+    }
 
-    Ok(())
+    let insert_member = adapt_sql(
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, member_did) DO NOTHING",
+        backend,
+    );
+    let inserted = crate::db::query(&insert_member)
+        .bind(&member.id)
+        .bind(&member.space_id)
+        .bind(&member.did)
+        .bind(member.access.read as i32)
+        .bind(member.access.write as i32)
+        .bind(member.access.read_self as i32)
+        .bind(member.is_delegation as i32)
+        .bind(&member.granted_by)
+        .bind(&member.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+    if inserted.rows_affected() == 0 {
+        return Ok(InviteClaim::AlreadyMember);
+    }
+
+    tx.commit().await.map_err(err)?;
+    Ok(InviteClaim::Joined)
 }
 
 pub async fn revoke_invite(
