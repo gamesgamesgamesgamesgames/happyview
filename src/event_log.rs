@@ -128,7 +128,7 @@ pub struct SweepOutcome {
 /// runtime setting rather than a boot-time constant, so an operator can point
 /// this at an arbitrarily large backlog (e.g. set retention to `1` on a
 /// multi-million-row instance) — batching is what keeps that safe.
-const SWEEP_BATCH_SIZE: i64 = 5000;
+pub(crate) const SWEEP_BATCH_SIZE: i64 = 5000;
 
 /// Delete every event log row strictly older than `cutoff`, then reclaim.
 ///
@@ -273,14 +273,8 @@ pub async fn sweep_resolved_dead_letters(
     deleted
 }
 
-/// Hourly retention sweep for event logs, resolved dead letters and expired
-/// record and account tombstones.
-///
-/// The event log retention value is re-read every iteration rather than
-/// captured at spawn, so an operator can change it without a restart. A value
-/// of `0` therefore skips the sweep and leaves this task running — it must not
-/// return, or disabling retention once would be permanent until the process
-/// restarts.
+/// Hourly retention sweep for event logs, job logs, resolved dead letters and
+/// expired record and account tombstones.
 pub async fn spawn_retention_cleanup(
     db: AnyPool,
     backend: DatabaseBackend,
@@ -291,25 +285,42 @@ pub async fn spawn_retention_cleanup(
 
     loop {
         tokio::time::sleep(interval).await;
-
-        let dead_letters =
-            sweep_resolved_dead_letters(&db, dead_letter_retention_days, backend).await;
-        if dead_letters > 0 {
-            tracing::info!(count = dead_letters, "cleaned up resolved dead letters");
-        }
-
-        let tombstones = crate::tombstones::sweep(&db, backend, tombstone_retention_hours).await;
-        if tombstones > 0 {
-            tracing::info!(count = tombstones, "cleaned up expired tombstones");
-        }
-
-        let retention_days = match crate::admin::settings::get_setting(
+        retention_pass(
             &db,
-            "event_log_retention_days",
             backend,
+            dead_letter_retention_days,
+            tombstone_retention_hours,
         )
-        .await
-        {
+        .await;
+    }
+}
+
+/// One pass of the retention sweep.
+///
+/// The event log retention value is re-read every pass rather than captured at
+/// spawn, so an operator can change it without a restart. A value of `0`
+/// therefore skips the sweep and leaves the task running — it must not
+/// return, or disabling retention once would be permanent until the process
+/// restarts. Job logs follow the same setting: they are the same kind of
+/// operational record, and the dashboard reads both as history.
+pub(crate) async fn retention_pass(
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    dead_letter_retention_days: u32,
+    tombstone_retention_hours: u32,
+) {
+    let dead_letters = sweep_resolved_dead_letters(db, dead_letter_retention_days, backend).await;
+    if dead_letters > 0 {
+        tracing::info!(count = dead_letters, "cleaned up resolved dead letters");
+    }
+
+    let tombstones = crate::tombstones::sweep(db, backend, tombstone_retention_hours).await;
+    if tombstones > 0 {
+        tracing::info!(count = tombstones, "cleaned up expired tombstones");
+    }
+
+    let retention_days =
+        match crate::admin::settings::get_setting(db, "event_log_retention_days", backend).await {
             Some(v) => v.parse::<u32>().unwrap_or_else(|e| {
                 tracing::warn!(
                     value = %v,
@@ -321,27 +332,30 @@ pub async fn spawn_retention_cleanup(
             None => 30,
         };
 
-        let outcome = run_retention_sweep(&db, retention_days, backend).await;
-        if outcome.deleted > 0 {
-            tracing::info!(
-                count = outcome.deleted,
-                vacuumed = outcome.vacuumed,
-                "cleaned up old event logs"
-            );
-        }
+    let job_logs = crate::jobs::logs::sweep_older_than(db, retention_days, backend).await;
+    if job_logs > 0 {
+        tracing::info!(count = job_logs, "cleaned up old job logs");
+    }
 
-        // The event log sweep reclaims pages only when it deleted something;
-        // dead letters and tombstones need the same when they were the only
-        // deletions.
-        if dead_letters + tombstones > 0
-            && !outcome.vacuumed
-            && backend == DatabaseBackend::Sqlite
-            && let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
-                .execute(&db)
-                .await
-        {
-            tracing::warn!(error = %e, "incremental_vacuum after dead letter and tombstone cleanup failed");
-        }
+    let outcome = run_retention_sweep(db, retention_days, backend).await;
+    if outcome.deleted > 0 {
+        tracing::info!(
+            count = outcome.deleted,
+            vacuumed = outcome.vacuumed,
+            "cleaned up old event logs"
+        );
+    }
+
+    // The event log sweep reclaims pages only when it deleted something; the
+    // other sweeps need the same when they were the only deletions.
+    if dead_letters + tombstones + job_logs > 0
+        && !outcome.vacuumed
+        && backend == DatabaseBackend::Sqlite
+        && let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
+            .execute(db)
+            .await
+    {
+        tracing::warn!(error = %e, "incremental_vacuum after retention cleanup failed");
     }
 }
 
@@ -627,6 +641,48 @@ mod tests {
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
+    }
+
+    /// A pass prunes job logs by `event_log_retention_days`, read from the
+    /// settings. The setting here is shorter than the default, so a pass that
+    /// skipped job logs or ignored the setting would keep the 15-day line.
+    #[tokio::test]
+    async fn a_pass_prunes_job_logs_by_the_event_log_retention_setting() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let insert = "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) \
+                      VALUES (?, 'job-1', 'info', ?, ?)";
+        for (message, age_days) in [("fifteen-days", 15), ("five-days", 5)] {
+            crate::db::query(insert)
+                .bind(Uuid::new_v4().to_string())
+                .bind(message)
+                .bind((chrono::Utc::now() - chrono::Duration::days(age_days)).to_rfc3339())
+                .execute(&pool)
+                .await
+                .expect("seed job log");
+        }
+        let messages = || async {
+            let (logs, _) = crate::jobs::logs::list_logs(&pool, backend, "job-1", 10, None)
+                .await
+                .unwrap();
+            logs.into_iter().map(|l| l.message).collect::<Vec<_>>()
+        };
+
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "0", backend)
+            .await
+            .unwrap();
+        retention_pass(&pool, backend, 30, 24).await;
+        assert_eq!(
+            messages().await,
+            vec!["fifteen-days", "five-days"],
+            "0 keeps them"
+        );
+
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "10", backend)
+            .await
+            .unwrap();
+        retention_pass(&pool, backend, 30, 24).await;
+        assert_eq!(messages().await, vec!["five-days"]);
     }
 
     #[test]

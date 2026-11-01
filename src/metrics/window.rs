@@ -48,8 +48,8 @@ pub struct Bucket {
     pub memory_peak_max: u64,
     pub memory_peak_sum: u64,
     pub memory_measured: u64,
-    pub fuel_sum: u64,
-    pub fuel_measured: u64,
+    pub instructions_sum: u64,
+    pub instructions_measured: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub wall: Sketch,
@@ -105,9 +105,9 @@ impl Bucket {
             self.memory_peak_sum = self.memory_peak_sum.saturating_add(bytes);
             self.memory_measured += 1;
         }
-        if let Some(fuel) = t.fuel_consumed {
-            self.fuel_sum = self.fuel_sum.saturating_add(fuel);
-            self.fuel_measured += 1;
+        if let Some(fuel) = t.instructions {
+            self.instructions_sum = self.instructions_sum.saturating_add(fuel);
+            self.instructions_measured += 1;
         }
         match t.module_cache_hit {
             Some(true) => self.cache_hits += 1,
@@ -150,8 +150,8 @@ impl Bucket {
         self.memory_peak_max = self.memory_peak_max.max(other.memory_peak_max);
         self.memory_peak_sum = self.memory_peak_sum.saturating_add(other.memory_peak_sum);
         self.memory_measured += other.memory_measured;
-        self.fuel_sum = self.fuel_sum.saturating_add(other.fuel_sum);
-        self.fuel_measured += other.fuel_measured;
+        self.instructions_sum = self.instructions_sum.saturating_add(other.instructions_sum);
+        self.instructions_measured += other.instructions_measured;
         self.cache_hits += other.cache_hits;
         self.cache_misses += other.cache_misses;
         self.wall.merge(&other.wall);
@@ -211,7 +211,7 @@ impl<B: Accumulate> Ring<B> {
         self.width
     }
 
-    fn start_of(&self, at: u64) -> u64 {
+    pub fn start_of(&self, at: u64) -> u64 {
         at - at % self.width
     }
 
@@ -229,6 +229,19 @@ impl<B: Accumulate> Ring<B> {
                 bucket.add_sample(sample);
                 *slot = Some((start, bucket));
             }
+        }
+    }
+
+    /// Merge `bucket`, whose span starts at `at`, into the bucket of that
+    /// span. This is how buckets read back from the table return to a ring;
+    /// a slot already holding a later span keeps it.
+    pub fn merge_bucket(&mut self, at: u64, bucket: &B) {
+        let start = self.start_of(at);
+        let i = self.slot_of(start);
+        match &mut self.slots[i] {
+            Some((held, held_bucket)) if *held == start => held_bucket.merge_from(bucket),
+            Some((held, _)) if *held > start => {}
+            slot => *slot = Some((start, bucket.clone())),
         }
     }
 
@@ -373,8 +386,9 @@ pub struct Stats {
     /// Mean per call, sorted by total time spent.
     pub host_imports: Vec<HostImportStats>,
     pub memory_peak_bytes: MemoryStats,
-    /// `None` unless the script is a compiled module.
-    pub fuel_mean: Option<f64>,
+    /// Over the runs that reported a count: every compiled module run, and
+    /// an interpreter's when it counts. `None` when no run did.
+    pub instructions_mean: Option<f64>,
     pub module_cache: CacheStats,
 }
 
@@ -407,8 +421,8 @@ impl Bucket {
                 mean: (self.memory_measured > 0)
                     .then(|| self.memory_peak_sum as f64 / self.memory_measured as f64),
             },
-            fuel_mean: (self.fuel_measured > 0)
-                .then(|| self.fuel_sum as f64 / self.fuel_measured as f64),
+            instructions_mean: (self.instructions_measured > 0)
+                .then(|| self.instructions_sum as f64 / self.instructions_measured as f64),
             module_cache: CacheStats {
                 hits: self.cache_hits,
                 misses: self.cache_misses,
@@ -438,7 +452,7 @@ mod tests {
                 host_by_import: vec![("host_db_query", Duration::from_millis(1), 2)],
                 settle: Some(Duration::ZERO),
                 memory_peak_bytes: Some(1 << 20),
-                fuel_consumed: None,
+                instructions: None,
             },
         }
     }
@@ -535,6 +549,6 @@ mod tests {
         assert_eq!(stats.guest_ms.mean, Some(7.0));
         assert_eq!(stats.module_cache, CacheStats { hits: 1, misses: 0 });
         assert_eq!(stats.memory_peak_bytes.max, Some(1 << 20));
-        assert_eq!(stats.fuel_mean, None);
+        assert_eq!(stats.instructions_mean, None);
     }
 }

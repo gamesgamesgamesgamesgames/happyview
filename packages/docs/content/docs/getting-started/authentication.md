@@ -32,7 +32,7 @@ On top of the client key, HappyView does best-effort validation that the caller 
 - If an `Origin` header is present (typical for browser apps), it must match the client's registered `client_uri`.
 - Otherwise, an `X-Client-Secret` header may be supplied and must match the stored secret (typical for server-to-server callers).
 
-Both checks currently log warnings on mismatch rather than rejecting the request, but the intent is clear: don't share client keys, and treat the secret like a password.
+A request that fails both checks, or names a key HappyView does not know, is not rejected: it is logged and handled as an anonymous request, so it is never charged to the named client's rate limit bucket. A DPoP request is identified by its session and needs neither check. Don't share client keys, and treat the secret like a password.
 
 ### Calling a query
 

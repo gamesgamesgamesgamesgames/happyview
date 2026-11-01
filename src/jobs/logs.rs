@@ -95,6 +95,48 @@ pub async fn list_logs(
     Ok((logs, next_cursor))
 }
 
+/// Delete job log lines written more than `retention_days` ago, in batches for
+/// the same reasons as the event log sweep. A retention of `0` is a no-op.
+/// Returns the rows deleted.
+pub async fn sweep_older_than(
+    db: &sqlx::AnyPool,
+    retention_days: u32,
+    backend: DatabaseBackend,
+) -> u64 {
+    if retention_days == 0 {
+        return 0;
+    }
+    // `created_at` is text on both backends and written by `now_rfc3339`, so
+    // this compares like-formatted RFC 3339 strings.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    let sql = adapt_sql(
+        "DELETE FROM happyview_job_logs WHERE id IN \
+         (SELECT id FROM happyview_job_logs WHERE created_at < ? LIMIT ?)",
+        backend,
+    );
+
+    let mut deleted: u64 = 0;
+    loop {
+        let affected = match crate::db::query(&sql)
+            .bind(&cutoff)
+            .bind(crate::event_log::SWEEP_BATCH_SIZE)
+            .execute(db)
+            .await
+        {
+            Ok(result) => result.rows_affected(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to clean up job logs");
+                break;
+            }
+        };
+        deleted += affected;
+        if (affected as i64) < crate::event_log::SWEEP_BATCH_SIZE {
+            break;
+        }
+    }
+    deleted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +279,48 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "a-msg");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_deletes_only_lines_past_retention() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let job_id = format!("job-sweep-{}", Uuid::new_v4());
+            let old = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+            let recent = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+            let insert = adapt_sql(
+                "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) VALUES (?, ?, 'info', ?, ?)",
+                backend,
+            );
+            for (message, created_at) in [("old", &old), ("recent", &recent)] {
+                crate::db::query(&insert)
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(&job_id)
+                    .bind(message)
+                    .bind(created_at)
+                    .execute(&pool)
+                    .await
+                    .expect("seed job log");
+            }
+
+            assert_eq!(
+                sweep_older_than(&pool, 0, backend).await,
+                0,
+                "0 disables the sweep"
+            );
+            assert!(sweep_older_than(&pool, 30, backend).await >= 1);
+
+            let (logs, _) = list_logs(&pool, backend, &job_id, 10, None).await.unwrap();
+            let left: Vec<&str> = logs.iter().map(|l| l.message.as_str()).collect();
+            assert_eq!(left, vec!["recent"], "{backend:?}");
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_job_logs WHERE job_id = ?",
+                backend,
+            ))
+            .bind(&job_id)
+            .execute(&pool)
+            .await
+            .expect("clean up");
+        }
     }
 }

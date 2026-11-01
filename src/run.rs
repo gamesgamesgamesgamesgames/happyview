@@ -1089,6 +1089,10 @@ async fn boot(
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
     let metrics = std::sync::Arc::new(crate::metrics::ScriptMetrics::new());
+    tracing::info!(
+        instance = metrics.instance(),
+        "script metrics are stored under this instance id"
+    );
     metrics.refresh(&db_pool, db_backend).await;
 
     let mut records = crate::record_store::RecordStore::shared(db_pool.clone(), db_backend)
@@ -1223,6 +1227,24 @@ async fn boot(
         state.db_backend,
     ));
     tokio::spawn(crate::metrics::run_refresh_loop(
+        state.metrics.clone(),
+        state.db.clone(),
+        state.db_backend,
+    ));
+    // The last day back into the rings before ingest starts, so a
+    // restart does not blank the live windows.
+    match crate::metrics::persist::reload(
+        &state.metrics,
+        &state.db,
+        state.db_backend,
+        crate::metrics::unix_now(),
+    )
+    .await
+    {
+        Ok(n) => tracing::debug!(rows = n, "read script metrics back"),
+        Err(e) => tracing::warn!(error = %e, "failed to read script metrics back"),
+    }
+    tokio::spawn(crate::metrics::persist::run(
         state.metrics.clone(),
         state.db.clone(),
         state.db_backend,

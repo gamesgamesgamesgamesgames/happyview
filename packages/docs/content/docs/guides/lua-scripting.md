@@ -144,6 +144,10 @@ To see debug output in stdout, make sure your `RUST_LOG` environment variable in
 
 When a script fails, the client receives the Lua error message, its type and the line it came from, as described under [Errors](../api-reference/lua/script-contract.md#errors) in the Script Contract. The same message is logged server-side at error level with its stack trace.
 
+### Performance
+
+The dashboard's **Script Performance** page shows how often each script runs, how long it takes and where that time goes, split into the script's own code and the platform's work around it. See [Dashboard](../getting-started/dashboard.md#script-performance).
+
 ### Common mistakes
 
 - **Missing `handle` function**: Every script must define `handle(input, ctx)` at file scope. If it's missing or misspelled, every call fails with `errorType: missing_handle`.

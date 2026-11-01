@@ -315,9 +315,11 @@ See the [Admin API reference](../api-reference/admin/events.md#list-event-logs) 
 
 ## Retention
 
-Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period.
+Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period. Background jobs' own log lines are deleted on the same schedule.
 
 Set `EVENT_LOG_RETENTION_DAYS=0` to disable automatic cleanup and keep logs indefinitely.
+
+[Stored script metrics](../api-reference/admin/metrics.md#retention) follow the same retention, so one setting covers both.
 
 See [Configuration](../getting-started/configuration.md) for all environment variables.
 

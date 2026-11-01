@@ -4,9 +4,28 @@ title: "Metrics"
 
 Admin API endpoints for script execution metrics: how often each script runs, how long it takes, how it ends, and where its time goes.
 
-Metrics are kept in memory by the process that runs the scripts, for the last hour by the minute and the last day by the half hour. Nothing is written to the database per run, and a restart starts the windows over. Test files run by `happyview test` are not recorded.
+Metrics are kept in memory by the process that runs the scripts, for the last hour by the minute and the last day by the half hour. Nothing is written to the database per run. Instead, once a minute, each minute that has closed is written to the `happyview_script_metrics` table, one row for each script, and for each collection and action, that saw runs in it. Idle scripts write nothing. Test files run by `happyview test` are not recorded.
 
-Recording is on by default. Turn it off with the `script_metrics_enabled` [instance setting](./settings.md) (`"false"`), or the `SCRIPT_METRICS_ENABLED` environment variable when no setting is stored. While it is off nothing is recorded, what is already held stays readable until it leaves its window, and the active-runs gauge in [`/admin/metrics/live`](#live) keeps counting.
+The `1h` and `24h` windows are read from memory, and the `7d` and `30d` windows from the table. At startup the last day's rows are read back into memory, so a restart loses at most the minute that was open.
+
+## Several instances on one database
+
+Each row records the instance that wrote it. An instance names itself with `HAPPYVIEW_INSTANCE_ID`, or uses its hostname when that is unset, or a random id for that boot when it has no hostname either. Instances sharing a database each write their own rows, fold only their own minutes into hours, and at startup read only their own rows back.
+
+That makes the two kinds of window answer different questions:
+
+- `1h` and `24h` are the memory of the instance that answered the request, so they cover its runs only. Behind a load balancer, two requests can return different numbers.
+- `7d` and `30d` add up every instance's rows, plus the minutes the answering instance hasn't written yet. Their responses carry `instances`, the number of instances whose runs the window counts.
+
+Give each replica a stable, distinct `HAPPYVIEW_INSTANCE_ID`. A hostname that changes on every deploy, like a container's, or a random id, works for counting, but the replica can't read its own history back after a restart: its last hour and day start empty. Rows written under an id that never comes back are never folded into hours. Retention deletes them like any other row.
+
+## Retention
+
+Stored metrics follow the event log's retention by design: they are kept for `event_log_retention_days` (the `EVENT_LOG_RETENTION_DAYS` environment variable when no setting is stored, default `30`), and `0` keeps them indefinitely. Once an hour, rows older than that are deleted, and minute rows more than two days old are folded into hour rows. A folded hour answers the same counts and percentiles its minutes would have, so a stored window is read by the minute where it is newer than two days and by the hour before that.
+
+A window longer than retention is answered with what is still stored. Its response carries `retention_days`, the retention in force, so a `30d` window on an instance that keeps 7 days reads as 7 days of data, not as a quiet month.
+
+Recording is on by default. Turn it off with the `script_metrics_enabled` [instance setting](./settings.md) (`"false"`), or the `SCRIPT_METRICS_ENABLED` environment variable when no setting is stored. While it is off nothing is recorded or written to the table, what is already held stays readable until it leaves its window, and the active-runs gauge in [`/admin/metrics/live`](#live) keeps counting. Retention and folding still run over what is stored.
 
 ## What a run measures
 
@@ -23,7 +42,7 @@ Recording is on by default. Turn it off with the `script_metrics_enabled` [insta
 | `settle_ms_mean` | Waiting for library calls the script started and never awaited |
 | `host_imports` | The host imports the script called, each with its call count and mean time per call. A library call is counted once, under the import that made it |
 | `memory_peak_bytes` | The interpreter's linear memory at the end of the run, which is its high-water mark |
-| `fuel_mean` | Fuel spent per run, for compiled script modules only. `null` for an interpreted script: interpreters run with unbounded fuel |
+| `instructions_mean` | Instructions per run, over the runs that reported a count. A compiled script module always does; an interpreted script does when its interpreter counts them (happyview-lua releases after 1.0.0-alpha.7). `null` when no run in the window reported one |
 | `module_cache` | How often the interpreter's compiled module came from memory (`hits`) rather than disk or a compile (`misses`) |
 
 Every mean is over the runs that reached that stage, so a run that found no interpreter does not pull the instantiation mean down. Durations are in milliseconds. Percentiles are accurate to about 1%; `max` is exact.
@@ -52,7 +71,7 @@ One row per script that ran inside the window, busiest first. A script is keyed 
 
 | Parameter | Type   | Description |
 | --------- | ------ | ----------- |
-| `window`  | string | `1h` (default) or `24h`. Anything else is `400`: only these two are kept |
+| `window`  | string | `1h` (default), `24h`, `7d` or `30d`. Anything else is `400` |
 
 **Permission:** `metrics:read`
 
@@ -83,7 +102,7 @@ One row per script that ran inside the window, busiest first. A script is keyed 
         { "name": "host_script_log", "calls": 1, "ms_mean": 0.465 }
       ],
       "memory_peak_bytes": { "max": 1638400, "mean": 1638400.0 },
-      "fuel_mean": null,
+      "instructions_mean": null,
       "module_cache": { "hits": 1, "misses": 0 }
     }
   ]
@@ -91,6 +110,8 @@ One row per script that ran inside the window, busiest first. A script is keyed 
 ```
 
 `overflow` counts scripts that were not recorded because 1,024 were already held. Scripts with nothing left inside the last day make room for new ones.
+
+A `7d` or `30d` response has the same shape plus `retention_days` ([Retention](#retention)) and `instances` ([Several instances](#several-instances-on-one-database)). Its rows add every instance's stored minutes and hours to the minutes this instance's memory has not yet written.
 
 ## Get one script
 
@@ -104,12 +125,12 @@ One script's totals for the window and a series of points across it, merged over
 
 | Parameter | Type   | Description |
 | --------- | ------ | ----------- |
-| `window`  | string | `1h` (default) or `24h` |
-| `step`    | string | `1m` (default for `1h`) or `30m` (default for `24h`). The last day is kept by the half hour, so `window=24h&step=1m` is `400` |
+| `window`  | string | `1h` (default), `24h`, `7d` or `30d` |
+| `step`    | string | `1m` (default for `1h`) or `30m` (default for `24h`) with a window read from memory; `1h` (default for `7d`) or `1d` (default for `30d`) with a stored window. The last day is kept by the half hour, so `window=24h&step=1m` is `400`, and a step from the other pair is `400` too |
 
 **Permission:** `metrics:read`
 
-**Response:** the fields of a row in the list, plus `layers`, `window`, `step`, `enabled` and `points`. There is one point per step across the window, oldest first (60 for `1h` by the minute, 48 for `24h` by the half hour); a step with no runs has `runs: 0` and `null` latencies. The example omits the fields a list row also has, and shows the first and last of its 60 points.
+**Response:** the fields of a row in the list, plus `layers`, `window`, `step`, `enabled` and `points`, and `retention_days` and `instances` for a stored window. There is one point per step across the window, oldest first (60 for `1h` by the minute, 48 for `24h` by the half hour, 168 for `7d` by the hour, 30 for `30d` by the day, and so on); the newest is the step still open, and days are UTC days. A step with no runs has `runs: 0` and `null` latencies. The example omits the fields a list row also has, and shows the first and last of its 60 points.
 
 ```json
 {
@@ -154,7 +175,7 @@ One script's totals for the window and a series of points across it, merged over
 
 | Status | Condition |
 | ------ | --------- |
-| 400    | An unknown `window` or `step`, or `step=1m` with `window=24h` |
+| 400    | An unknown `window` or `step`, `step=1m` with `window=24h`, or a step that does not go with the window |
 | 404    | The script has not run inside the window |
 
 ## Ingest
@@ -169,7 +190,7 @@ The record pipeline: what each record of a collection costs on its way through i
 
 | Parameter | Type   | Description |
 | --------- | ------ | ----------- |
-| `window`  | string | `1h` (default) or `24h` |
+| `window`  | string | `1h` (default), `24h`, `7d` or `30d`. A stored window adds `retention_days` and `instances` |
 
 **Permission:** `metrics:read`
 
@@ -257,3 +278,20 @@ What is running now: script runs in progress by kind, background jobs waiting an
 `backfill_jobs` lists every backfill job this process holds [hook stats](./backfill.md#hook-stats) for that has not finished, most recently active first, with `idle_s` the seconds since its last record or report. A paused job stays listed until an hour after its last record. The example's `hooks` is cut short.
 
 `module_cache` counts every module lookup the runtime made, libraries included. `compiles` is how many modules it has compiled; a miss that loaded a module from disk does not add to it.
+
+## The table
+
+`happyview_script_metrics` holds one row for each key and bucket:
+
+| Column | Meaning |
+| ------ | ------- |
+| `kind` | `script` or `ingest` |
+| `key` | A script's trigger, or a collection |
+| `variant` | A script's kind and layer, as `record_event/dashboard`, or a collection's action |
+| `resolution` | `minute`, or `hour` once folded |
+| `bucket_start` | When the bucket starts, RFC 3339 in UTC |
+| `counters` | The bucket's counts and sums, as JSON |
+| `sketches` | The bucket's latency sketches, as JSON |
+
+At worst, 50 scripts busy every minute write about 72,000 minute rows a day, kept for two days, and 1,200 hour rows a day after that. Most scripts are idle most minutes, so real use is far lower.
+

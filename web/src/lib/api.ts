@@ -21,6 +21,14 @@ import type {
 } from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
 import type {
+  IngestMetricsResponse,
+  LiveMetricsResponse,
+  MetricsStep,
+  MetricsWindow,
+  ScriptMetricsListResponse,
+  ScriptSeriesResponse,
+} from "@/types/metrics";
+import type {
   CreateLinkedRepoBody,
   LinkedRepo,
   LinkedReposListResponse,
@@ -282,10 +290,23 @@ export function uploadLexicon(body: {
   });
 }
 
-export function deleteLexicon(id: string) {
-  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
+export function deleteLexicon(id: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
+}
+
+// How many records are indexed under a record lexicon's collection. Asked
+// for only when the delete confirm opens, because it is a COUNT(*).
+export function getLexiconRecordCount(id: string) {
+  return apiFetch<{
+    collection: string;
+    count: number;
+    /** False when a shared record store serves this collection. */
+    deletable: boolean;
+    not_deletable_reason: string | null;
+  }>(`/admin/lexicons/${encodeURIComponent(id)}/record-count`);
 }
 
 // Lexicon publishing
@@ -365,10 +386,12 @@ export function addNetworkLexicon(body: {
   }>("/admin/network-lexicons", { method: "POST", body: JSON.stringify(body) });
 }
 
-export function deleteNetworkLexicon(nsid: string) {
-  return apiFetch(`/admin/network-lexicons/${encodeURIComponent(nsid)}`, {
-    method: "DELETE",
-  });
+export function deleteNetworkLexicon(nsid: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(
+    `/admin/network-lexicons/${encodeURIComponent(nsid)}${query}`,
+    { method: "DELETE" },
+  );
 }
 
 // Backfill
@@ -459,6 +482,35 @@ export function retryFailedBackfill(jobId: string, kinds?: string[]) {
     method: "POST",
     body: JSON.stringify(kinds ? { kinds } : {}),
   });
+}
+
+// Metrics
+export function getScriptMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<ScriptMetricsListResponse>(
+    `/admin/metrics/scripts?window=${window}`,
+  );
+}
+
+export function getScriptSeries(
+  trigger: string,
+  window: MetricsWindow = "1h",
+  step?: MetricsStep,
+) {
+  const qs = new URLSearchParams({ window });
+  if (step) qs.set("step", step);
+  return apiFetch<ScriptSeriesResponse>(
+    `/admin/metrics/scripts/${encodeURIComponent(trigger)}?${qs}`,
+  );
+}
+
+export function getIngestMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<IngestMetricsResponse>(
+    `/admin/metrics/ingest?window=${window}`,
+  );
+}
+
+export function getLiveMetrics() {
+  return apiFetch<LiveMetricsResponse>("/admin/metrics/live");
 }
 
 // Jobs

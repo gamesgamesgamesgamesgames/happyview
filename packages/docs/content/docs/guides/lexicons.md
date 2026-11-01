@@ -45,7 +45,9 @@ Turning indexing on collects new records from then on. It doesn't fetch older on
 
 When record-type lexicons change (uploaded or deleted), HappyView reconnects to Jetstream with an updated collection filter. HappyView always includes `com.atproto.lexicon.schema` in the filter to track network lexicon updates.
 
-Deleting a lexicon stops live indexing for that collection but does **not** remove previously indexed records from the database. If you want to start fresh, you'll need to delete the records separately (e.g. via the admin API or directly in the database) before re-adding the lexicon and running a [backfill](backfill.md).
+Deleting a lexicon stops live indexing for that collection. By default it does **not** remove previously indexed records: they stay in the database and remain queryable.
+
+The dashboard's delete confirmation offers to delete them as well, and shows how many there are. Over the admin API that is `DELETE /admin/lexicons/{id}?delete_records=true`, which answers `202` with the id of the job doing the deleting; see [the admin API reference](../api-reference/admin/lexicons.md#also-deleting-the-collections-records). Either way, to start fresh delete the records before re-adding the lexicon and running a [backfill](backfill.md).
 
 ## Network lexicons
 

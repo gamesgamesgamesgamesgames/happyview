@@ -2,7 +2,7 @@
 //!
 //! `dispatch` opens a collector around the executor call with [`run_under`];
 //! the executor reports instantiation, the guest call, settling, memory and
-//! fuel into it through the free functions here, which do nothing outside a
+//! instructions into it through the free functions here, which do nothing outside a
 //! scope, so a run nobody is measuring (a validation, a test file, a run with
 //! metrics switched off) pays one failed task-local read per report.
 //!
@@ -41,9 +41,9 @@ pub struct RunTimings {
     pub host_by_import: Vec<(&'static str, Duration, u64)>,
     pub settle: Option<Duration>,
     pub memory_peak_bytes: Option<u64>,
-    /// Compiled modules only: an interpreter's fuel is unbounded, and loses
-    /// what a frame that catches a `throw` spent.
-    pub fuel_consumed: Option<u64>,
+    /// A compiled module's fuel in instructions, or what an interpreter said
+    /// it executed. `None` from an interpreter that does not count.
+    pub instructions: Option<u64>,
 }
 
 impl RunTimings {
@@ -129,8 +129,8 @@ pub fn record_memory_peak(bytes: u64) {
     with(|t| t.memory_peak_bytes = Some(bytes));
 }
 
-pub fn record_fuel(consumed: u64) {
-    with(|t| t.fuel_consumed = Some(consumed));
+pub fn record_instructions(used: u64) {
+    with(|t| t.instructions = Some(used));
 }
 
 #[cfg(test)]
@@ -157,7 +157,7 @@ mod tests {
             record_settle(Duration::from_micros(20));
             record_teardown(Duration::from_micros(15));
             record_memory_peak(65_536);
-            record_fuel(4_000);
+            record_instructions(4_000);
         })
         .await;
         let t = collector.snapshot();
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(t.guest(), Some(Duration::from_micros(650)));
         assert_eq!(t.settle, Some(Duration::from_micros(20)));
         assert_eq!(t.memory_peak_bytes, Some(65_536));
-        assert_eq!(t.fuel_consumed, Some(4_000));
+        assert_eq!(t.instructions, Some(4_000));
     }
 
     #[test]

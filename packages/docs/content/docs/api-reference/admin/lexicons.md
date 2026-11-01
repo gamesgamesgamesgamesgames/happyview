@@ -431,6 +431,80 @@ curl -X DELETE http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status -H "$
 
 **Response**: `204 No Content`
 
+### Also deleting the collection's records
+
+Deleting a lexicon stops live indexing; on its own it leaves every record
+already indexed under that collection in place. Add `delete_records=true` to
+delete those too:
+
+```
+DELETE /admin/lexicons/{id}?delete_records=true
+```
+
+```sh tab="cURL" tab-group="language"
+curl -X DELETE "http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status?delete_records=true" -H "$AUTH"
+```
+
+**Response**: `202 Accepted`
+
+    { "job_id": "0f9f...", "collection": "xyz.statusphere.status" }
+
+The records are deleted by a `happyview.delete-collection` job, so a large
+collection can be followed, paused and cancelled through
+[the jobs API](jobs.md). The lexicon itself is removed before the job is
+enqueued, so live indexing cannot put records back while it runs.
+
+Requires `records:delete-collection` and `records:delete` in addition to
+`lexicons:delete` — the same permissions as
+[deleting a collection directly](records.md).
+
+Only a **record** lexicon has records of its own. A query or procedure lexicon
+operates on another lexicon's collection through `target_collection`, so
+`delete_records=true` for one is refused with `400 Bad Request` naming that
+collection rather than deleting records the request did not describe.
+
+Records a record script kept after the source deleted them are included: an
+operator deleting the collection overrides what a script chose to do with an
+upstream delete.
+
+**A collection served from a shared record store is refused** with
+`400 Bad Request`. On a managed instance the records are read from a store
+several instances share, and a delete here would reach only this instance's own
+overlay rows — the shared records would stay exactly where they are, and the
+job would report success having removed a fraction of what you were looking at.
+The shared rows are never at risk (this instance reads them and nothing more);
+the refusal is there because succeeding at almost nothing is worse than saying
+no. `GET /admin/lexicons/{id}/record-count` reports this as
+`deletable: false` with a `not_deletable_reason`, which is how the dashboard
+knows not to offer the option.
+
+The same parameter, on the same terms, works on
+[`DELETE /admin/network-lexicons/{nsid}`](#stop-tracking-a-network-lexicon).
+
+## How many records a collection holds
+
+```
+GET /admin/lexicons/{id}/record-count
+```
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status/record-count -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+    {
+      "collection": "xyz.statusphere.status",
+      "count": 1204,
+      "deletable": true,
+      "not_deletable_reason": null
+    }
+
+A separate route rather than a field on the lexicon because it counts the
+collection, which is far more expensive than reading the lexicon. The dashboard
+asks for it when the delete confirmation opens. Record lexicons only; anything
+else is a `400`. Requires `lexicons:read` and `records:read`.
+
 ## Lexicons a project file defines
 
 When the instance runs a project, a lexicon defined by a file under `src/` answers ahead of any stored row with the same id. Uploading, deleting, adding as a network lexicon or removing as one is refused with `409 Conflict`:
