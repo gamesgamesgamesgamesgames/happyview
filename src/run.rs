@@ -757,7 +757,11 @@ async fn boot(
         protected_resource_metadata: Default::default(),
     };
 
-    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
+    let oauth_state_store = DbStateStore::new(
+        db_pool.clone(),
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    );
 
     let oauth_scopes = crate::oauth::rotation::instance_scopes();
 

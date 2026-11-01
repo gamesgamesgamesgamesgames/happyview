@@ -289,13 +289,15 @@ pub struct DbStateStore {
     /// Serializes authorize() + take_last_state_key() pairs so concurrent
     /// logins cannot interleave and swap each other's state keys.
     pub authorize_lock: Arc<tokio::sync::Mutex<()>>,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl DbStateStore {
-    pub fn new(pool: AnyPool, backend: DatabaseBackend) -> Self {
+    pub fn new(pool: AnyPool, backend: DatabaseBackend, key: Option<&[u8; 32]>) -> Self {
         Self {
             pool,
             backend,
+            encryption_key: key.copied(),
             last_state_key: Arc::new(Mutex::new(None)),
             authorize_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -311,29 +313,33 @@ impl Store<String, InternalStateData> for DbStateStore {
     type Error = StoreError;
 
     async fn get(&self, key: &String) -> Result<Option<InternalStateData>, Self::Error> {
-        let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
-            "SELECT state_data FROM happyview_oauth_state WHERE state_key = ?",
+        let row: Option<(String, i64)> = crate::db::query_as(&adapt_sql(
+            "SELECT state_data, CAST(encrypted AS BIGINT) FROM happyview_oauth_state WHERE state_key = ?",
             self.backend,
         ))
         .bind(key)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
-            None => Ok(None),
-        }
+        // State that won't open reads as no state, and the sign-in restarts.
+        let data = row.and_then(|(data, encrypted)| {
+            open(self.encryption_key.as_ref(), &data, encrypted != 0)
+        });
+        Ok(data.map(|data| serde_json::from_str(&data)).transpose()?)
     }
 
     async fn set(&self, key: String, value: InternalStateData) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
+        let sealed = seal(self.encryption_key.as_ref(), &json).map_err(StoreError::Seal)?;
         crate::db::query(&adapt_sql(
-            "INSERT INTO happyview_oauth_state (state_key, state_data) VALUES (?, ?)
-             ON CONFLICT (state_key) DO UPDATE SET state_data = EXCLUDED.state_data",
+            "INSERT INTO happyview_oauth_state (state_key, state_data, encrypted) VALUES (?, ?, ?)
+             ON CONFLICT (state_key) DO UPDATE SET state_data = EXCLUDED.state_data, \
+             encrypted = EXCLUDED.encrypted",
             self.backend,
         ))
         .bind(&key)
-        .bind(&json)
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
         .execute(&self.pool)
         .await?;
         *self.last_state_key.lock().unwrap() = Some(key);
@@ -503,6 +509,77 @@ mod tests {
             .unwrap();
             assert_eq!(json.as_deref(), Some("{\"t\":1}"));
         }
+    }
+
+    fn sample_state() -> InternalStateData {
+        let key = crate::oauth::client_keys::generate_client_key("test-owner").unwrap();
+        InternalStateData {
+            iss: "https://issuer.example".to_string(),
+            dpop_key: crate::oauth::client_keys::to_atrium_jwk(&key).unwrap().key,
+            verifier: "pkce-verifier".to_string(),
+            app_state: None,
+        }
+    }
+
+    async fn raw_state(pool: &AnyPool) -> (String, i64) {
+        crate::db::query_as(
+            "SELECT state_data, CAST(encrypted AS BIGINT) FROM happyview_oauth_state WHERE state_key = 'k'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_in_state_is_sealed_and_opens_for_the_callback() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let store = DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+
+        store.set("k".to_string(), sample_state()).await.unwrap();
+
+        let (stored, encrypted) = raw_state(&pool).await;
+        assert_eq!(encrypted, 1);
+        assert!(!stored.contains("pkce-verifier"));
+        let state = store
+            .get(&"k".to_string())
+            .await
+            .unwrap()
+            .expect("state opens");
+        assert_eq!(state.verifier, "pkce-verifier");
+    }
+
+    /// A sign-in in flight across an upgrade wrote plaintext, and its callback
+    /// still has to work on the new version.
+    #[tokio::test]
+    async fn sign_in_state_from_before_sealing_is_still_read() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
+            .set("k".to_string(), sample_state())
+            .await
+            .unwrap();
+
+        let store = state_store_with_key(&pool);
+        assert_eq!(
+            store.get(&"k".to_string()).await.unwrap().unwrap().verifier,
+            "pkce-verifier"
+        );
+    }
+
+    /// State that won't open restarts the sign-in, as expired state does.
+    #[tokio::test]
+    async fn sign_in_state_another_key_sealed_reads_as_none() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&[3u8; 32]))
+            .set("k".to_string(), sample_state())
+            .await
+            .unwrap();
+
+        let store = state_store_with_key(&pool);
+        assert!(store.get(&"k".to_string()).await.unwrap().is_none());
+    }
+
+    fn state_store_with_key(pool: &AnyPool) -> DbStateStore {
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY))
     }
 
     fn sample_session(access_token: &str) -> Session {

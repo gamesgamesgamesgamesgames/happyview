@@ -832,7 +832,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -864,7 +864,7 @@ mod tests {
                 "atproto",
                 &ApiClientOAuthParams {
                     plc_url: "https://plc.directory".into(),
-                    state_store: DbStateStore::new(pool.clone(), backend),
+                    state_store: DbStateStore::new(pool.clone(), backend, None),
                     session_store_pool: pool.clone(),
                     db_backend: backend,
                     client_keys: Some(vec![jwk]),
@@ -895,7 +895,7 @@ mod tests {
                 "atproto",
                 &ApiClientOAuthParams {
                     plc_url: "https://plc.directory".into(),
-                    state_store: DbStateStore::new(pool.clone(), backend),
+                    state_store: DbStateStore::new(pool.clone(), backend, None),
                     session_store_pool: pool.clone(),
                     db_backend: backend,
                     client_keys: None,
@@ -924,7 +924,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -969,7 +969,7 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
                 session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1018,7 +1018,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1058,7 +1058,7 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
                 session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1108,7 +1108,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1144,7 +1144,7 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
                 session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1207,7 +1207,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1244,7 +1244,7 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
                 session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1319,7 +1319,7 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
             session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -1355,7 +1355,7 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
                 session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {

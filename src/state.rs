@@ -56,7 +56,7 @@ pub fn state_with_pool_on(
             scopes: Some(scopes.clone()),
         },
         keys: None,
-        state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+        state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
         session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend, None),
         resolver: atrium_oauth::OAuthResolverConfig {
             did_resolver,
@@ -89,7 +89,7 @@ pub fn state_with_pool_on(
             proxy_cost: 1,
         }),
         oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth), None)),
-        oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+        oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
         linked_repos_client: Arc::new(
             crate::linked_repos::client::build(
                 plc_url.as_str(),
@@ -98,7 +98,7 @@ pub fn state_with_pool_on(
                 callback.clone(),
                 true,
                 scopes,
-                crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
                 pool.clone(),
                 backend,
                 None,

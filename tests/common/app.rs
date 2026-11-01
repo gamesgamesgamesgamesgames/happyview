@@ -213,6 +213,7 @@ impl TestApp {
             state_store: happyview::auth::oauth_store::DbStateStore::new(
                 oauth_pool.clone(),
                 backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
             ),
             session_store: happyview::auth::oauth_store::DbSessionStore::new(
                 oauth_pool,
@@ -261,7 +262,11 @@ impl TestApp {
                 "http://127.0.0.1:0/auth/callback".into(),
                 true,
                 oauth_scopes,
-                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                happyview::auth::oauth_store::DbStateStore::new(
+                    pool.clone(),
+                    backend,
+                    Some(&db::TEST_ENCRYPTION_KEY),
+                ),
                 pool.clone(),
                 backend,
                 None,
@@ -332,8 +337,11 @@ impl TestApp {
         let http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         // One store, shared: `/auth/login` reads back the state key the client
         // just stored through `oauth_state_store`.
-        let state_store =
-            happyview::auth::oauth_store::DbStateStore::new(self.state.db.clone(), backend);
+        let state_store = happyview::auth::oauth_store::DbStateStore::new(
+            self.state.db.clone(),
+            backend,
+            Some(&db::TEST_ENCRYPTION_KEY),
+        );
         let scopes: Vec<Scope> = scopes
             .iter()
             .map(|s| match *s {
