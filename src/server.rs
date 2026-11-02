@@ -738,3 +738,38 @@ mod tests {
         assert!(kids.contains(&retiring.kid.as_str()));
     }
 }
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_without_its_detail() {
+        async fn panics() -> &'static str {
+            panic!("internal detail");
+        }
+        let app = Router::new()
+            .route("/", get(panics))
+            .layer(CatchPanicLayer::custom(panic_response));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("internal detail"));
+    }
+}
