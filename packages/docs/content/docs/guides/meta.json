@@ -16,6 +16,7 @@
     "api-clients",
     "linked-repos",
     "attestation-signing",
+    "rotating-the-encryption-key",
     "labelers",
     "plugins",
     "developing-plugins",

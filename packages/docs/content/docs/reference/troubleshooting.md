@@ -105,7 +105,7 @@ See [Backfill](../guides/backfill.md) for how the process works.
 **Causes**:
 
 - `TOKEN_ENCRYPTION_KEY` is not set. Plugin secrets are encrypted at rest and cannot be read without this key. See [Plugins - Configuration](../guides/plugins.md#plugin-configuration).
-- If `TOKEN_ENCRYPTION_KEY` changed since the secrets were saved, the existing encrypted values are unreadable. Re-enter the secrets via the dashboard or `PUT /admin/plugins/{id}/secrets`.
+- If `TOKEN_ENCRYPTION_KEY` changed since the secrets were saved without the old key set as `TOKEN_ENCRYPTION_KEY_PREVIOUS`, the existing encrypted values are unreadable. Set the old key as `TOKEN_ENCRYPTION_KEY_PREVIOUS` and restart, as in [Rotating the encryption key](../guides/rotating-the-encryption-key.md). Without the old key, re-enter the secrets via the dashboard or `PUT /admin/plugins/{id}/secrets`.
 - Environment variable secrets (`PLUGIN_<ID>_<KEY>`) are overridden by dashboard-configured secrets. If you've set both, the dashboard values take precedence.
 
 ## OAuth or login issues
