@@ -41,7 +41,8 @@ HappyView is configured via environment variables. Serving with a plain `happyvi
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `SCRIPT_METRICS_ENABLED` | no | `true` | Keep per-script run counts, latency, errors and resource use in memory, read through [`/admin/metrics`](../api-reference/admin/metrics.md). `false` turns recording off. The `script_metrics_enabled` instance setting takes precedence when set |
 | `HAPPYVIEW_INSTANCE_ID` | no | the hostname, else a random id for each boot | This instance's name in the stored script metrics, at most 128 characters (longer values are cut, and surrounding whitespace is trimmed). Instances sharing a database each keep their own rows under it, and the `7d` and `30d` windows add them all up. Give each replica a stable, distinct value, so a restart reads its own history back. See [several instances on one database](../api-reference/admin/metrics.md#several-instances-on-one-database) |
-| `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs, job logs and stored script metrics before automatic cleanup. Set to `0` to disable cleanup |
+| `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs, job logs and stored script metrics before automatic cleanup. Set to `0` to disable cleanup. [Protected events](../guides/event-logs.md#protected-events) follow `SPACE_ACCESS_LOG_RETENTION_DAYS` instead |
+| `SPACE_ACCESS_LOG_RETENTION_DAYS` | no | `365` | Days to keep [protected events](../guides/event-logs.md#protected-events) — space access grants and revocations, the reads made under them, event log purges, and retention changes — before cleanup. Access grants that ended (expired or were revoked) longer ago than this are deleted on the same schedule. Set to `0` to keep them forever. When unset, it follows an `EVENT_LOG_RETENTION_DAYS` of `0` and is `365` otherwise. The events tied to an access grant that still exists (its grant and revocation events and the reads made under it) are kept regardless. Overridden by database setting if set via admin API |
 | `DEAD_LETTER_RETENTION_DAYS` | no | `30` | Days to keep script dead letters after they are resolved; the hourly cleanup deletes older ones. Unresolved dead letters are never deleted. `0` keeps resolved ones indefinitely |
 | `RECORD_TOMBSTONE_RETENTION_HOURS` | no | `72` | Hours to remember a deleted record or account, so that a late or replayed copy of it cannot bring it back. The hourly cleanup deletes older tombstones. `0` keeps them indefinitely |
 | `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
@@ -112,6 +113,7 @@ SESSION_SECRET=change-me-in-production
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
+# SPACE_ACCESS_LOG_RETENTION_DAYS=365
 # DEAD_LETTER_RETENTION_DAYS=30
 # RECORD_TOMBSTONE_RETENTION_HOURS=72
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key

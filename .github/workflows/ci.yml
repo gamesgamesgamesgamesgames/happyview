@@ -349,10 +349,22 @@ jobs:
       # (Also part of whichever shard's run holds it; runs here first, on one
       # shard, for a clear signal, sharing the compiled test binary so the extra
       # cost is ~a second.)
+      # The stable branches' own migrations, so the upgrade test boots this
+      # branch on a database each of them migrated.
+      - name: Fetch the stable branches' migrations
+        if: matrix.shard == 1
+        run: |
+          git fetch --no-tags --depth=1 origin beta main
+          for branch in beta main; do
+            mkdir -p "$RUNNER_TEMP/stable/$branch"
+            git archive "origin/$branch" migrations | tar -x -C "$RUNNER_TEMP/stable/$branch"
+          done
+
       - name: Migration upgrade test (old DB → latest)
         if: matrix.shard == 1
         env:
           TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
+          STABLE_MIGRATIONS: ${{ runner.temp }}/stable
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo llvm-cov --no-report --test migration_upgrade
 
@@ -749,6 +761,11 @@ jobs:
 
       - name: Check that nothing links OpenSSL
         run: bash scripts/check-no-openssl.sh
+
+      - name: Check that every stable migration is here
+        run: |
+          git fetch --no-tags --depth=1 origin beta main
+          bash scripts/check-migration-drift.sh beta main
 
       - name: Version stamp
         run: bash scripts/stamp-version.test.sh

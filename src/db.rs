@@ -228,6 +228,91 @@ fn with_sqlite_pragmas(
 pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
 pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
 
+/// Migrations a stable branch applied under a version alpha had already given
+/// to another migration, as `(stable version, alpha version, description)`.
+/// See `migrations/renumbered.tsv`.
+pub(crate) fn renumbered_migrations() -> Vec<(i64, i64, &'static str)> {
+    include_str!("../migrations/renumbered.tsv")
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let mut version = || {
+                fields
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("migrations/renumbered.tsv: a version")
+            };
+            let (from, to) = (version(), version());
+            let description = fields
+                .next()
+                .expect("migrations/renumbered.tsv: a description");
+            (from, to, description)
+        })
+        .collect()
+}
+
+/// Move a database's record of each renumbered migration to the version alpha
+/// carries it under, so the migrator finds the file it ran and runs the one
+/// alpha keeps at the old version.
+///
+/// A row is moved only when its description and checksum are those of the file
+/// alpha carries at the new version, which is byte for byte the one the stable
+/// branch ran, and nothing holds the new version yet. Anything else is left for
+/// the migrator to report. The move is one statement, so a boot that stops
+/// after it, or any later boot, finds nothing left to move. On Postgres it runs
+/// under the migration lock, so two instances booting together can't both act.
+async fn renumber_stable_migrations(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    migrator: &Migrator,
+) -> Result<(), sqlx::Error> {
+    let exists = match backend {
+        DatabaseBackend::Sqlite => {
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations'"
+        }
+    };
+    let found: Option<(i32,)> = crate::db::query_as(exists)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if found.is_none() {
+        return Ok(());
+    }
+    for (from, to, description) in renumbered_migrations() {
+        let Some(carried) = migrator.iter().find(|m| m.version == to) else {
+            continue;
+        };
+        let sql = adapt_sql(
+            "UPDATE _sqlx_migrations SET version = ? \
+             WHERE version = ? AND description = ? AND checksum = ? \
+             AND NOT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = ?)",
+            backend,
+        );
+        let moved = crate::db::query(&sql)
+            .bind(to)
+            .bind(from)
+            .bind(description)
+            .bind(carried.checksum.to_vec())
+            .bind(to)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        if moved > 0 {
+            tracing::info!(
+                from,
+                to,
+                description,
+                "moved a stable migration to its alpha version"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Install sqlx's `Any` drivers and register the record store's SQLite
 /// functions (`record_store::sqlite_functions`), which must happen before
 /// the first SQLite connection opens. Call this, not
@@ -347,6 +432,7 @@ pub async fn migrate(pool: &AnyPool, backend: DatabaseBackend) {
     let migrated: Result<(), MigrateFailure> = match backend {
         DatabaseBackend::Sqlite => {
             async {
+                renumber_stable_migrations(&mut *pool.acquire().await?, backend, migrator).await?;
                 migrator.run(pool).await?;
                 crate::record_store::upgrade::run(pool, backend).await?;
                 Ok(())
@@ -447,6 +533,7 @@ async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), Mig
         // `run` would do, but its `Acquire` bound is not general enough for
         // the compiler to prove `connect`'s future `Send`. `run_direct` is
         // what `run` calls once it has the connection.
+        renumber_stable_migrations(&mut conn, DatabaseBackend::Postgres, migrator).await?;
         migrator.run_direct(None, &mut *conn, false).await?;
         // On the lock's own connection: it stays busy (no idle session the
         // server could drop mid-copy), and a one-connection pool suffices.
