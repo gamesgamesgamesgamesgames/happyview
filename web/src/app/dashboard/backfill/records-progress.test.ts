@@ -285,7 +285,11 @@ describe("executorRanNothing", () => {
       total_records: number | null;
     },
     done?: number,
-  ) => executorRanNothing(job, done == null ? null : { done });
+  ) =>
+    executorRanNothing(
+      job,
+      done == null ? null : { done, failed: 0, timeouts: 0, dead_lettered: 0 },
+    );
 
   it("is a completed pass that hooked nothing, whatever its note says", () => {
     expect(
@@ -317,6 +321,26 @@ describe("executorRanNothing", () => {
     }
     expect(
       ran({ status: "failed", processed_repos: 4, total_records: 4 }),
+    ).toBe(false);
+  });
+
+  it("is not a pass whose hooks failed, though none reached a decision", () => {
+    const job = { status: "failed", processed_repos: 0, total_records: 0 };
+    expect(
+      executorRanNothing(job, {
+        done: 0,
+        failed: 2,
+        timeouts: 0,
+        dead_lettered: 2,
+      }),
+    ).toBe(false);
+    expect(
+      executorRanNothing(job, {
+        done: 0,
+        failed: 0,
+        timeouts: 1,
+        dead_lettered: 0,
+      }),
     ).toBe(false);
   });
 

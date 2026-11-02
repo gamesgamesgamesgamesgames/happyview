@@ -219,20 +219,31 @@ export function executorProgress(
  * Whether an executor-run job ended with nothing counted against it: a store
  * pass that found no record script or nothing in the store, one that failed
  * before it read anything, or the row the store keeps for a collection it has
- * seen. Its counts are 0, or unset on that row, and no hook ran under it, so
+ * seen. Its counts are 0, or unset on that row, and no hook ran or failed
+ * under it, so
  * it has no progress to show; its note or error says why. Records the feed
  * delivered and hooked are not this job's to count. Judged by the counts, not
  * the note's wording.
  */
 export function executorRanNothing(
   job: Pick<BackfillJob, "status" | "processed_repos" | "total_records">,
-  hooks: Pick<HookStats, "done"> | null,
+  hooks: Pick<
+    HookStats,
+    "done" | "failed" | "timeouts" | "dead_lettered"
+  > | null,
 ): boolean {
+  // Hooks that failed reached no decision, so `done` leaves them out; the
+  // row is where their counts show.
+  const hooked =
+    (hooks?.done ?? 0) +
+    (hooks?.failed ?? 0) +
+    (hooks?.timeouts ?? 0) +
+    (hooks?.dead_lettered ?? 0);
   return (
     ["completed", "failed", "cancelled"].includes(job.status) &&
     (job.processed_repos ?? 0) === 0 &&
     (job.total_records ?? 0) === 0 &&
-    (hooks?.done ?? 0) === 0
+    hooked === 0
   );
 }
 
