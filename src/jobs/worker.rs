@@ -93,10 +93,11 @@ fn never() -> watch::Receiver<bool> {
 }
 
 /// Run one job on the blocking pool, renewing its lease while it runs. A job
-/// has no deadline, so its guest never yields and holds whichever thread runs
-/// it until it finishes. On a runtime worker that starves every task queued
-/// behind it there, another job worker and the renewal included, so two
-/// workers would run their jobs one after the other.
+/// has no deadline, so its guest is never interrupted and keeps a thread
+/// busy until it finishes. Its deadline still yields every slice, but a
+/// runtime worker would spend most of its time on the job's guest all the
+/// same, so a job gets a thread of its own rather than sharing a worker with
+/// another job worker and the renewal.
 async fn run_on_its_own_thread(
     state: &AppState,
     job: super::Job,

@@ -143,6 +143,16 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// the delta to the current epoch, and that sum must not overflow.
 pub const UNBOUNDED_TICKS: u64 = u64::MAX / 2;
 
+/// The ticks a guest runs before its store's epoch callback hands the worker
+/// back to the async executor: 50 ms at the 10 ms tick. A deadline is armed a
+/// slice at a time, so however long a budget is, a guest that spins in its
+/// own code yields its tokio worker at least this often, and the tasks queued
+/// behind it wait at most about one slice. Smaller would yield more often for
+/// no gain an operator could see; larger would let a spinning guest stall its
+/// neighbours for longer. The callback is a few atomic loads and a boxed
+/// future, so at twenty a second per running guest its cost is noise.
+pub const EPOCH_SLICE: u64 = 5;
+
 /// The native stack a guest's frames may take, which wasmtime's default holds
 /// to 512 KiB. A guest cannot see this stack at all: a C interpreter measures
 /// the shadow stack in its own linear memory, and each level of its recursion
@@ -984,6 +994,15 @@ impl ResourceLimiter for MemoryLimiter {
 /// is not charged for the host's latency. The methods keep the books; the
 /// caller applies the returned delta with `set_epoch_deadline`, since the
 /// store owns this value and cannot be borrowed through it.
+///
+/// The delta is never more than [`EPOCH_SLICE`]: the store's deadline is
+/// armed a slice at a time, and the callback [`slice_guest_deadline`]
+/// installs charges each slice here and either yields with the next one or,
+/// once the budget is spent, interrupts the guest. The time a yielded guest
+/// waits to be polled again is charged: the clock is running through it, as
+/// it was before there were yields, when the same wait fell on the tasks the
+/// guest held the worker from. A run therefore still ends within its wall
+/// clock however busy the runtime is, short of its host imports.
 pub struct GuestDeadline {
     epoch: Arc<AtomicU64>,
     remaining: u64,
@@ -1022,12 +1041,17 @@ impl GuestDeadline {
         self.armed_at = now;
     }
 
+    /// The delta for `set_epoch_deadline`: what is left, a slice at most.
+    fn slice(&self) -> u64 {
+        self.remaining.min(EPOCH_SLICE)
+    }
+
     /// Start a fresh budget. Returns the delta for `set_epoch_deadline`.
     pub fn arm(&mut self, ticks: u64) -> u64 {
         self.remaining = ticks;
         self.armed_at = self.now();
         self.running = true;
-        ticks
+        self.slice()
     }
 
     /// The guest has entered a host import: spend what it ran and stop
@@ -1044,12 +1068,67 @@ impl GuestDeadline {
     pub fn resume(&mut self) -> u64 {
         self.settle();
         self.running = true;
-        self.remaining
+        self.slice()
+    }
+
+    /// Spend the whole budget, so the guest is interrupted at its next
+    /// epoch check. Used when the host decides a run must stop, as when a
+    /// job's worker loses its lease, and a lifted deadline is spent all the same.
+    pub fn exhaust(&mut self) {
+        self.settle();
+        self.remaining = 0;
+    }
+
+    /// The store's epoch deadline has been reached. Charges the slice the
+    /// guest ran and answers the next slice, or `None` once the budget is
+    /// spent.
+    fn on_deadline(&mut self) -> Option<u64> {
+        self.settle();
+        (self.remaining > 0).then(|| self.slice())
     }
 
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
+}
+
+/// What a guest's yield awaits: its tokio worker, given back.
+///
+/// Two of tokio's yields rather than one. A yield is deferred until the
+/// worker next polls its timers and I/O, and the tasks that poll wakes are
+/// queued behind the yielding one, which a tokio worker runs first as its
+/// most recently woken: with one yield, a timer task beside a spinning guest
+/// on a one-worker runtime ran every other slice (gaps of about 100 ms at a
+/// 50 ms slice). The second yield, taken at once, puts the guest behind
+/// everything the first one woke.
+async fn give_back_the_worker() {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+}
+
+/// Install the epoch callback every store that runs guest code needs. When a
+/// store reaches the deadline its [`GuestDeadline`] last armed, the slice is
+/// charged; a spent budget interrupts the guest with
+/// [`Trap::Interrupt`], the trap a deadline raised before there was a
+/// callback, so it still classifies as a timeout. Otherwise the guest yields
+/// its tokio worker and resumes with the next slice. A lifted or unbounded
+/// deadline therefore yields every slice and never traps.
+///
+/// A yield needs the guest to have been entered through an `*_async` call:
+/// from a synchronous one wasmtime raises a trap instead. Every store with
+/// this callback is only ever called through `call_async` and
+/// `instantiate_async`.
+pub fn slice_guest_deadline<T: 'static>(
+    store: &mut Store<T>,
+    deadline: fn(&mut T) -> &mut GuestDeadline,
+) {
+    store.epoch_deadline_callback(move |mut state| {
+        let deadline = deadline(state.data_mut());
+        Ok(match deadline.on_deadline() {
+            None => UpdateDeadline::Interrupt,
+            Some(delta) => UpdateDeadline::YieldCustom(delta, Box::pin(give_back_the_worker())),
+        })
+    });
 }
 
 #[cfg(test)]
@@ -1293,19 +1372,21 @@ mod tests {
     }
 
     /// Ticks that pass while suspended are not charged; ticks that pass
-    /// while running are, and the budget re-arms with what is left.
+    /// while running are, and the budget re-arms with what is left, a slice
+    /// at a time.
     #[test]
     fn a_suspended_deadline_does_not_spend_host_time() {
         let epoch = Arc::new(AtomicU64::new(0));
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
-        assert_eq!(deadline.arm(10), 10);
+        assert_eq!(deadline.arm(10), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), 10);
 
         epoch.fetch_add(3, Ordering::Relaxed);
         deadline.suspend();
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(100, Ordering::Relaxed);
-        assert_eq!(deadline.resume(), 7);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(2, Ordering::Relaxed);
@@ -1315,9 +1396,32 @@ mod tests {
 
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 5);
+        epoch.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(deadline.resume(), 2);
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 0);
         assert_eq!(deadline.resume(), 0);
+    }
+
+    /// Each slice the callback sees is charged and answered with the next,
+    /// the last one short; a spent budget answers nothing.
+    #[test]
+    fn the_deadline_is_charged_a_slice_at_a_time() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut deadline = GuestDeadline::unbounded(epoch.clone());
+        assert_eq!(deadline.arm(12), EPOCH_SLICE);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(EPOCH_SLICE));
+        assert_eq!(deadline.remaining(), 7);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(2));
+        epoch.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), None);
+
+        // An exhausted budget answers nothing even when lifted before.
+        deadline.arm(UNBOUNDED_TICKS);
+        deadline.exhaust();
+        assert_eq!(deadline.on_deadline(), None);
     }
 
     #[test]
@@ -1786,9 +1890,11 @@ mod tests {
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert_eq!(deadline.resume(), UNBOUNDED_TICKS);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), UNBOUNDED_TICKS);
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert!(deadline.resume() > UNBOUNDED_TICKS - 2_000_000);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert!(deadline.remaining() > UNBOUNDED_TICKS - 2_000_000);
     }
 }
