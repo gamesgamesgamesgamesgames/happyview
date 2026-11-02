@@ -14,6 +14,8 @@ function handle(input, ctx)
 end
 ```
 
+`happyview.db` is a library plugin, not part of HappyView, so this script loads only where it is installed: from **Integrations > Plugins** in the dashboard, or with `hpy happyview add happyview.db` in a project. See [Libraries](libraries.md).
+
 `input` is the trigger's payload and `ctx` is what the runtime knows about the invocation. Both are plain tables. Nothing else is injected: a script sees the [standard libraries](standard-libraries.md) the sandbox allows, `require`, and `handle`'s two arguments. Reading a v2 global name (`db`, `params`, `now`, …) raises an error that names it and points at [Migrating Scripts](../../guides/migrating-scripts.md).
 
 ## `require`
