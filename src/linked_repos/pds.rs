@@ -231,23 +231,6 @@ pub(crate) fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, Stri
     Ok((uri.to_string(), cid.to_string()))
 }
 
-/// Whether the PDS's `uri` names the record a write was sent for: in `did`'s
-/// repo, in `collection`, and at `rkey` when the caller chose one. The index
-/// row is keyed by that `uri`, so an answer naming another record is not
-/// indexed.
-fn names_written(uri: &str, did: &str, collection: &str, rkey: Option<&str>) -> bool {
-    let Some(path) = uri.strip_prefix("at://") else {
-        return false;
-    };
-    let mut parts = path.split('/');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(d), Some(c), Some(k), None) => {
-            d == did && c == collection && !k.is_empty() && rkey.is_none_or(|r| r == k)
-        }
-        _ => false,
-    }
-}
-
 /// Index a write the PDS accepted, unless its answer names another record.
 async fn index_accepted(
     state: &AppState,
@@ -258,7 +241,7 @@ async fn index_accepted(
     cid: &str,
     record: &Value,
 ) {
-    if !names_written(uri, did, collection, rkey) {
+    if !crate::plugin::host::records::reply_names_written(uri, did, collection, rkey) {
         tracing::warn!(
             uri,
             did,
@@ -486,19 +469,6 @@ mod tests {
         )
         .await;
         assert!(indexed(written).await);
-    }
-
-    #[test]
-    fn an_answer_names_only_the_record_written() {
-        let names = |uri, rkey| names_written(uri, "did:plc:a", "app.test.rec", rkey);
-        assert!(names("at://did:plc:a/app.test.rec/1", Some("1")));
-        assert!(names("at://did:plc:a/app.test.rec/3kgen", None));
-        assert!(!names("at://did:plc:b/app.test.rec/1", Some("1")));
-        assert!(!names("at://did:plc:a/app.test.other/1", Some("1")));
-        assert!(!names("at://did:plc:a/app.test.rec/2", Some("1")));
-        assert!(!names("at://did:plc:a/app.test.rec/1/extra", None));
-        assert!(!names("at://did:plc:a/app.test.rec/", None));
-        assert!(!names("https://did:plc:a/app.test.rec/1", None));
     }
 
     async fn bound_grant(state: &AppState) -> LinkedRepo {

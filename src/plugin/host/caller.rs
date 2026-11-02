@@ -273,13 +273,6 @@ struct Written<'a> {
     rkey: Option<&'a str>,
 }
 
-impl Written<'_> {
-    /// Whether the PDS's `uri` names a record this write could have made.
-    fn names(&self, did: &str, collection: &str, rkey: &str) -> bool {
-        did == self.repo && collection == self.collection && self.rkey.is_none_or(|k| k == rkey)
-    }
-}
-
 /// The PDS has accepted the write, so the index is told what it holds.
 /// A mirror that fails leaves the index stale until Jetstream echoes the
 /// record; it never turns an accepted write into an error the script would
@@ -291,6 +284,22 @@ async fn mirror_write(
     record: &Value,
 ) {
     let state = &caller.app_state;
+    // The row is keyed by what the PDS answered, which only the write itself
+    // vouches for. An answer naming any other record is not indexed.
+    if !super::records::reply_names_written(
+        &reference.uri,
+        written.repo,
+        written.collection,
+        written.rkey,
+    ) {
+        tracing::warn!(
+            uri = %reference.uri,
+            repo = written.repo,
+            collection = written.collection,
+            "the PDS answered a write with another record's uri; its index row is not written"
+        );
+        return;
+    }
     let (did, collection, rkey) = match parse_at_uri(&reference.uri) {
         Ok(parts) => parts,
         Err(e) => {
@@ -301,17 +310,6 @@ async fn mirror_write(
             return;
         }
     };
-    // The row is keyed by what the PDS answered, which only the write itself
-    // vouches for. An answer naming any other record is not indexed.
-    if !written.names(&did, &collection, &rkey) {
-        tracing::warn!(
-            uri = %reference.uri,
-            repo = written.repo,
-            collection = written.collection,
-            "the PDS answered a write with another record's uri; its index row is not written"
-        );
-        return;
-    }
     let mirrored = super::mirror_network_write(
         &state.records,
         super::NetworkWrite {
@@ -989,6 +987,26 @@ mod tests {
             create_record(&caller, create("1")).await.unwrap();
             assert!(!indexed(&caller, uri).await, "{uri} was indexed");
         }
+
+        // With no rkey chosen, the PDS picks one, but it must still be one.
+        let no_rkey: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.test.rec", "record": {"text": "hi"}, "validate": false,
+        }))
+        .unwrap();
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/a/b",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, no_rkey.clone()).await.unwrap();
+        let rows: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records WHERE uri LIKE 'at://did:plc:alice/app.test.rec/a%'",
+        )
+        .fetch_one(&caller.app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(rows.0, 0, "a malformed record key was indexed");
 
         write_reply(
             "com.atproto.repo.putRecord",
