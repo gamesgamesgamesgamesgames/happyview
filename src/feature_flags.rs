@@ -34,8 +34,8 @@ pub struct FeatureFlagStatus {
 pub async fn list_flags(pool: &AnyPool, backend: DatabaseBackend) -> Vec<FeatureFlagStatus> {
     let all_flags = [(
         FeatureFlag::SPACES_ENABLED,
-        "Permissioned Spaces",
-        "Collaborative data spaces with granular permissions, membership, and invites.",
+        "atproto spaces",
+        "Permissioned data in spaces, with membership and invites.",
     )];
 
     let mut result = Vec::new();
