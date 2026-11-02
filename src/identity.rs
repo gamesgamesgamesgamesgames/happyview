@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn transient_did_document_failures_are_bad_gateway() {
-        use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+        use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
         let failure = |kind| BackfillFailure {
             kind,
