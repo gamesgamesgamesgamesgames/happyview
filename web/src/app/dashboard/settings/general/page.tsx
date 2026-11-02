@@ -90,9 +90,9 @@ const SCRIPT_LIMIT_FIELDS: {
   },
   {
     key: "script_wall_clock_seconds",
-    label: "Request wall clock (seconds)",
+    label: "Script wall clock (seconds)",
     description:
-      "How long a query or procedure's handle may run by the clock, including time spent awaiting the host; jobs are exempt.",
+      "How long a query, procedure, record or label script may run by the clock. Time spent waiting on the host isn't counted, and jobs are exempt.",
   },
 ];
 

@@ -143,7 +143,7 @@ v2 set a one-million-instruction limit and then never enforced it: the hook was 
 
 Jobs are exempt from the first two — running long is what a job is for, and `ctx.job.should_stop()` is its stop.
 
-Both settings resolve database → environment → default, so the **Instruction limit** and **Request wall clock** fields in **System → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
+Both settings resolve database → environment → default, so the **Instruction limit** and **Script wall clock** fields in **System → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
 
 The wall clock counts only time the script itself runs. Waiting on the host — an HTTP request, a database read — is not charged to it.
 
