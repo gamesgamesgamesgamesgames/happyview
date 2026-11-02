@@ -40,7 +40,7 @@ pub trait BackfillExecutor: Send + Sync + 'static {
 
 /// An executor's account of a collection it backfills
 /// ([`BackfillExecutor::describe`]).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CollectionSummary {
     /// A sentence for the operator, in the executor's words.
     pub message: String,
@@ -48,11 +48,16 @@ pub struct CollectionSummary {
     pub records: Option<i64>,
     /// Whether what it backfills from is still being filled.
     pub state: Option<SummaryState>,
+    /// When it next tries to fill it, after a try that found nothing: RFC
+    /// 3339 with a `+00:00` offset. `None` while no retry is due.
+    pub retry_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SummaryState {
+    /// Due to be filled, and not started yet.
+    Queued,
     Running,
     Complete,
     Failed,

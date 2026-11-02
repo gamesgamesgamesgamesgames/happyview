@@ -1,4 +1,5 @@
 import type {
+  BackfillCollection,
   BackfillEvent,
   BackfillJob,
   BackfillSource,
@@ -174,14 +175,30 @@ export function hookDetail(stats: HookStats, finished: boolean): HookDetail {
  * bar rather than reading as a pass that stopped short.
  */
 export function executorProgress(
-  job: Pick<BackfillJob, "status" | "processed_repos" | "total_repos">,
+  job: Pick<
+    BackfillJob,
+    "status" | "stage" | "processed_repos" | "total_repos" | "total_records"
+  >,
 ): { label: string } & RecordsCount {
   const done = job.processed_repos ?? 0;
+  if (waitingForCrawl(job)) {
+    // Records the crawl stores reach this instance as they are stored, and
+    // their record scripts run then, so the count grows with no total.
+    return {
+      label: "Waiting for the Network store's crawl",
+      done,
+      total: null,
+      noun: "records arrived so far",
+    };
+  }
   if (job.status === "completed") {
+    // A resumed pass can report fewer than it wrote over all its runs, so a
+    // finished one counts whichever is more.
+    const ran = Math.max(done, job.total_records ?? 0);
     return {
       label: "Ran record scripts",
-      done,
-      total: done,
+      done: ran,
+      total: ran,
       estimated: false,
     };
   }
@@ -196,4 +213,87 @@ export function executorProgress(
     total: job.total_repos,
     estimated: true,
   };
+}
+
+/**
+ * Whether an executor-run job ended with nothing counted against it: a store
+ * pass that found no record script or nothing in the store, one that failed
+ * before it read anything, or the row the store keeps for a collection it has
+ * seen. Its counts are 0, or unset on that row, and no hook ran or failed
+ * under it, so
+ * it has no progress to show; its note or error says why. Records the feed
+ * delivered and hooked are not this job's to count. Judged by the counts, not
+ * the note's wording.
+ */
+export function executorRanNothing(
+  job: Pick<BackfillJob, "status" | "processed_repos" | "total_records">,
+  hooks: Pick<
+    HookStats,
+    "done" | "failed" | "timeouts" | "dead_lettered"
+  > | null,
+): boolean {
+  // Hooks that failed reached no decision, so `done` leaves them out; the
+  // row is where their counts show.
+  const hooked =
+    (hooks?.done ?? 0) +
+    (hooks?.failed ?? 0) +
+    (hooks?.timeouts ?? 0) +
+    (hooks?.dead_lettered ?? 0);
+  return (
+    ["completed", "failed", "cancelled"].includes(job.status) &&
+    (job.processed_repos ?? 0) === 0 &&
+    (job.total_records ?? 0) === 0 &&
+    hooked === 0
+  );
+}
+
+/** The stage an executor's job holds while its source is still being filled. */
+export const WAITING_FOR_CRAWL = "waiting_for_crawl";
+
+/** Whether a job is running and waiting for the Network store to crawl. */
+export function waitingForCrawl(
+  job: Pick<BackfillJob, "status" | "stage">,
+): boolean {
+  return (
+    job.stage === WAITING_FOR_CRAWL &&
+    (job.status === "running" || job.status === "pausing")
+  );
+}
+
+type CollectionSummary = NonNullable<BackfillCollection["summary"]>;
+
+const SUMMARY_STATE_LABELS: Record<
+  NonNullable<CollectionSummary["state"]>,
+  string
+> = {
+  queued: "crawl queued",
+  running: "crawling",
+  complete: "crawl complete",
+  failed: "crawl failed",
+};
+
+/**
+ * What a collection summary says beside its message, in reading order: the
+ * records held, how the crawl stands, and when it is next tried.
+ */
+export function summaryParts(
+  summary: Pick<CollectionSummary, "records" | "state" | "retry_at">,
+  formatTime: (iso: string) => string = (iso) => new Date(iso).toLocaleString(),
+  now: number = Date.now(),
+): string[] {
+  const parts: string[] = [];
+  if (summary.records != null) {
+    parts.push(`${summary.records.toLocaleString()} records`);
+  }
+  if (summary.state) parts.push(SUMMARY_STATE_LABELS[summary.state]);
+  if (summary.retry_at) {
+    // A time already gone by is due, not upcoming: the store tries it on its
+    // next pass.
+    parts.push(
+      Date.parse(summary.retry_at) <= now
+        ? "next crawl attempt due"
+        : `next crawl attempt at ${formatTime(summary.retry_at)}`,
+    );
+  }
+  return parts;
 }

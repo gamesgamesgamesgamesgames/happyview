@@ -121,7 +121,7 @@ The `dev.happyview.space.*` aliases are deprecated and kept until v3. Most endpo
 
 A space's creator administers it: they update and delete the space and manage its members and invites.
 
-Instance operators can browse any space for moderation through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Each read of a space's contents is recorded in the event log.
+With the [space inspector](#moderating-spaces) turned on, instance operators can browse any space's metadata and members through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Reading a space's contents also takes a time-limited grant, logged to the event log.
 
 Two independent **policies** decide who can use the space. See [Policies](./managing-spaces.md#policies).
 
@@ -166,6 +166,18 @@ HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/p
 - **`displayName`, `description` on spaces**: human-readable metadata
 - **`config` object**: `membership_public`, plus arbitrary extra fields. `records_public` is deprecated and not enforced.
 - **`read_self` access**: limits a member's reads to their own records
+
+## Moderating spaces
+
+The space inspector lets moderators read space contents while handling a report. It is off by default. An operator with `settings:manage` turns it on with **Enable Space Inspector** under **Settings > General**, or with `SPACE_INSPECTOR_ENABLED` (see [Configuration](../../getting-started/configuration.md)). The same page sets the longest access a moderator can request, and how long the access log is kept.
+
+With it on, a user with the `spaces:inspect` permission requests access from the dashboard:
+
+1. Open **Spaces**, then a space, and choose **Request access** on its Records card. To look at one account across every space it writes to, enter its DID and choose **Open account** instead.
+2. Choose what to read: the whole space, or one of its members in every space.
+3. State why, and choose how long. Access lasts an hour by default, and never longer than the instance allows.
+
+The records appear under a banner that shows the reason and the time remaining. **End access** ends the grant early; otherwise it expires on its own. The grant, the reason, and every record and blob opened under it go to the event log as [protected events](../../guides/event-logs.md#protected-events), which can't be purged by hand. The event for a grant lists the reads made under it. See the [admin spaces API](../../api-reference/admin/spaces.md#access-grants) to do the same without the dashboard.
 
 ## Next steps
 
