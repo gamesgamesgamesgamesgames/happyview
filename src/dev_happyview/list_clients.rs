@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 
-use super::row_to_view;
+use super::{Manager, row_to_view};
 use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::adapt_sql;
@@ -41,36 +41,23 @@ pub async fn list_api_clients(
 
     let did = claims.did();
 
-    // Reject requests from child clients
-    if let Some(client_key) = claims.client_key() {
-        let sql = adapt_sql(
-            "SELECT parent_client_id FROM happyview_api_clients WHERE client_key = $1",
-            state.db_backend,
-        );
-        let parent_check: Option<Option<String>> = crate::db::query_scalar(&sql)
-            .bind(client_key)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("client lookup failed: {e}")))?;
+    let (filter, app_id) = Manager::of(&state, &claims).await?.filter();
 
-        if let Some(Some(_)) = parent_check {
-            return Err(AppError::Auth(
-                "child clients cannot manage API clients".into(),
-            ));
-        }
-    }
-
-    // Fetch all clients owned by the authenticated user
     let sql = adapt_sql(
-        "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
-         FROM happyview_api_clients \
-         WHERE owner_did = $1 \
-         ORDER BY created_at DESC",
+        &format!(
+            "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
+             FROM happyview_api_clients \
+             WHERE owner_did = ?{filter} \
+             ORDER BY created_at DESC"
+        ),
         state.db_backend,
     );
 
-    let rows = crate::db::query(&sql)
-        .bind(did)
+    let mut query = crate::db::query(&sql).bind(did);
+    if let Some(app_id) = app_id {
+        query = query.bind(app_id);
+    }
+    let rows = query
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list clients: {e}")))?;
