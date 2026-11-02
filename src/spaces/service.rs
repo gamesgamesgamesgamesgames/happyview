@@ -453,7 +453,7 @@ pub(crate) async fn notify_ops(
 ///
 /// This bridge is deprecated. It keeps existing clients working once their
 /// repos migrate. Remove it once clients write to PDSes directly.
-async fn forward_write_if_native(
+pub(crate) async fn forward_write_if_native(
     state: &AppState,
     space: &Space,
     author_did: &str,

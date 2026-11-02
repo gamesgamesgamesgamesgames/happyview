@@ -1019,7 +1019,7 @@ async fn raw_sql_writes_to_a_claimed_collection_are_refused() {
     assert!(err.contains(CLAIMED), "{err}");
     assert!(
         err.contains(
-            "writes to records of a collection stored outside this instance must go through records.indexPut"
+            "writes to records of a collection stored outside this instance must go through save_local in happyview.record"
         ),
         "{err}"
     );

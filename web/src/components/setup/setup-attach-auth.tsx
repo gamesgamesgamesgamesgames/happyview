@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -141,7 +140,7 @@ export function SetupAttachAuth({
           restored and you&apos;ll continue from where you left off.
           <br />
           <a
-            href={docsUrl("/getting-started/service-identity#linked-account")}
+            href={docsUrl("/docs/guides/service-identity#attached-account")}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline underline-offset-4 hover:text-primary/80"

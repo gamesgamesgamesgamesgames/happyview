@@ -74,7 +74,7 @@ function VerifyDidWeb({
           A signing key has been generated and your identity document is ready.{" "}
           <a
             href={docsUrl(
-              "/getting-started/service-identity#domain-identity-didweb",
+              "/docs/guides/service-identity#domain-identity-didweb",
             )}
             target="_blank"
             rel="noopener noreferrer"
@@ -236,7 +236,7 @@ function VerifyAttachAccount({
             ? "A code has been sent to the email address on this account."
             : "We'll send a confirmation code to the email address on this account."}{" "}
           <a
-            href={docsUrl("/getting-started/service-identity#linked-account")}
+            href={docsUrl("/docs/guides/service-identity#attached-account")}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline underline-offset-4 hover:text-primary/80"
@@ -430,7 +430,7 @@ function VerifyDidPlc({
           won&apos;t be able to access it again after this step.{" "}
           <a
             href={docsUrl(
-              "/getting-started/service-identity#network-identity-didplc",
+              "/docs/guides/service-identity#network-identity-didplc",
             )}
             target="_blank"
             rel="noopener noreferrer"

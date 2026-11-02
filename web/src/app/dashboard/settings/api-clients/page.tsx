@@ -488,7 +488,7 @@ function CreateApiClientDialog({
                 </p>
                 <a
                   href={docsUrl(
-                    "/getting-started/authentication#api-clients-confidential-vs-public",
+                    "/docs/reference/authentication#api-clients-confidential-vs-public",
                   )}
                   target="_blank"
                   rel="noopener noreferrer"
@@ -640,7 +640,7 @@ function CreateApiClientDialog({
                     <code>transition:generic</code> grants broad write access to
                     any collection. Prefer specific scopes or{" "}
                     <a
-                      href={docsUrl("/guides/api-clients#permission-sets")}
+                      href={docsUrl("/docs/guides/api-clients#permission-sets")}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline"
@@ -915,7 +915,7 @@ function EditApiClientDialog({
                   broad write access to any collection. Prefer specific scopes
                   or{" "}
                   <a
-                    href={docsUrl("/guides/api-clients#permission-sets")}
+                    href={docsUrl("/docs/guides/api-clients#permission-sets")}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline"

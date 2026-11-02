@@ -479,6 +479,74 @@ async fn a_new_repo_starts_in_polyfill_mode() {
     assert!(state.sync_cursor.is_none());
 }
 
+/// A batch for a repo hosted on its author's PDS goes there, as a single write
+/// does. With no session to send it with, it is refused, and HappyView's copy
+/// is left as it was rather than forked from the PDS's.
+#[tokio::test]
+#[serial]
+async fn a_native_repo_refuses_a_local_batch() {
+    common::require_db!();
+    let (app, space_id, space_uri, did) = setup("hostmode3").await;
+    create_record(&app, &space_uri, &did, json!({ "text": "one" })).await;
+
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut state = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_id,
+        &did,
+    )
+    .await
+    .unwrap();
+    state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    happyview::spaces::db::update_repo_state(&mut *conn, app.state.db_backend, &state)
+        .await
+        .unwrap();
+    drop(conn);
+    let count = |app: &TestApp| {
+        let sql = happyview::db::adapt_sql(
+            "SELECT COUNT(*) FROM happyview_space_records WHERE space_id = ?",
+            app.state.db_backend,
+        );
+        let (db, id) = (app.state.db.clone(), space_id.clone());
+        async move {
+            let (n,): (i64,) = happyview::db::query_as(&sql)
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            n
+        }
+    };
+    let before = count(&app).await;
+
+    let (name, value) = cookie_for(&app, &did);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.applyWrites")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space_uri,
+                "writes": [{
+                    "action": "create",
+                    "collection": "com.example.item",
+                    "value": { "text": "two" },
+                }],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a native repo with no PDS session must refuse the batch"
+    );
+    assert_eq!(count(&app).await, before, "nothing is written locally");
+}
+
 #[tokio::test]
 #[serial]
 async fn a_native_repo_refuses_local_writes_and_keeps_its_mode() {
