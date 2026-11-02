@@ -118,22 +118,13 @@ pub(super) async fn create_api_client(
         },
     );
 
-    // Register per-client rate limit config if overrides are set.
-    if let (Some(capacity), Some(refill_rate)) =
-        (body.rate_limit_capacity, body.rate_limit_refill_rate)
-    {
-        let defaults = state.rate_limiter.defaults();
-        state.rate_limiter.register_client_config(
-            client_key.clone(),
-            crate::rate_limit::RateLimitConfig {
-                capacity: capacity as u32,
-                refill_rate,
-                default_query_cost: defaults.query_cost,
-                default_procedure_cost: defaults.procedure_cost,
-                default_proxy_cost: defaults.proxy_cost,
-            },
-        );
-    }
+    state.rate_limiter.register_client_limit(
+        client_key.clone(),
+        body.rate_limit_capacity,
+        body.rate_limit_refill_rate,
+        state.config.default_rate_limit_capacity,
+        state.config.default_rate_limit_refill_rate,
+    );
 
     log_event(
         &state.db,
@@ -419,22 +410,13 @@ pub(super) async fn update_api_client(
                 client_uri: client_uri.clone(),
             },
         );
-        if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-            let defaults = state.rate_limiter.defaults();
-            state.rate_limiter.register_client_config(
-                client_key,
-                crate::rate_limit::RateLimitConfig {
-                    capacity: cap as u32,
-                    refill_rate: refill,
-                    default_query_cost: defaults.query_cost,
-                    default_procedure_cost: defaults.procedure_cost,
-                    default_proxy_cost: defaults.proxy_cost,
-                },
-            );
-        } else {
-            // Rate limit overrides were cleared — remove per-client config.
-            state.rate_limiter.remove_client_config(&client_key);
-        }
+        state.rate_limiter.register_client_limit(
+            client_key,
+            capacity,
+            refill_rate,
+            state.config.default_rate_limit_capacity,
+            state.config.default_rate_limit_refill_rate,
+        );
     } else {
         state.rate_limiter.remove_client_identity(&client_key);
         state.rate_limiter.remove_client_config(&client_key);
