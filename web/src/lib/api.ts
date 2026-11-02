@@ -1,3 +1,5 @@
+import type { LimitReached } from "@/types/limits";
+import { parseLimitReached } from "@/lib/limits";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
@@ -197,16 +199,23 @@ export class ApiError extends Error {
    * `issues`. Absent on every other error.
    */
   lexiconIssues?: LexiconIssue[];
+  /**
+   * The limit a `LimitReached` refusal hit, with the host's wording. Absent
+   * on every other error.
+   */
+  limitReached?: LimitReached;
   constructor(
     status: number,
     message: string,
     removedGlobals?: string[],
     lexiconIssues?: LexiconIssue[],
+    limitReached?: LimitReached,
   ) {
     super(message);
     this.status = status;
     this.removedGlobals = removedGlobals;
     this.lexiconIssues = lexiconIssues;
+    this.limitReached = limitReached;
   }
 }
 
@@ -234,6 +243,7 @@ async function apiFetch<T = unknown>(
     let message = text;
     let removedGlobals: string[] | undefined;
     let lexiconIssues: LexiconIssue[] | undefined;
+    let limitReached: LimitReached | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
@@ -243,10 +253,18 @@ async function apiFetch<T = unknown>(
       if (Array.isArray(parsed.issues)) {
         lexiconIssues = parsed.issues;
       }
+      limitReached = parseLimitReached(parsed);
+      if (limitReached) message = limitReached.message;
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message, removedGlobals, lexiconIssues);
+    throw new ApiError(
+      res.status,
+      message,
+      removedGlobals,
+      lexiconIssues,
+      limitReached,
+    );
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
