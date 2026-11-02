@@ -56,6 +56,25 @@ pub fn build_no_redirect_client(user_agent: &str) -> reqwest::Client {
         .expect("failed to build HTTP client")
 }
 
+/// The shared client's settings, screened by the policy installed for
+/// plugins' own requests (`crate::outbound::Source::Plugins`), which may
+/// exempt hosts nothing else is allowed to reach. Only the requests a plugin
+/// or script names itself go through this; `follow_redirects` picks between
+/// the shared client's redirect handling and none.
+pub fn build_plugin_client(user_agent: &str, follow_redirects: bool) -> reqwest::Client {
+    let builder = crate::outbound::screened(
+        base_builder(CONNECT_TIMEOUT, READ_TIMEOUT, user_agent),
+        crate::outbound::Source::Plugins,
+        follow_redirects.then_some(10),
+    );
+    let builder = if follow_redirects {
+        builder
+    } else {
+        builder.redirect(reqwest::redirect::Policy::none())
+    };
+    builder.build().expect("failed to build HTTP client")
+}
+
 fn client_with_timeouts(connect: Duration, read: Duration, user_agent: &str) -> reqwest::Client {
     client_builder_with_timeouts(connect, read, user_agent)
         .build()
@@ -72,13 +91,17 @@ fn client_builder_with_timeouts(
     // Every outbound client screens the addresses it connects to; see
     // `crate::outbound`. Ten redirects is reqwest's own default.
     crate::outbound::screened(
-        reqwest::Client::builder()
-            .connect_timeout(connect)
-            .read_timeout(read)
-            .user_agent(user_agent),
+        base_builder(connect, read, user_agent),
         crate::outbound::Source::Installed,
         Some(10),
     )
+}
+
+fn base_builder(connect: Duration, read: Duration, user_agent: &str) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .user_agent(user_agent)
 }
 
 /// Wraps our shared, UA-and-timeout-configured `reqwest::Client` so it can
