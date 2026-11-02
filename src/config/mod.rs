@@ -386,6 +386,11 @@ impl Config {
         if let Err(message) = parse_telemetry_managed_by(var("TELEMETRY_MANAGED_BY").as_deref()) {
             return Err(project::ProjectConfigError::InvalidSetting { message });
         }
+        // Read as unlocked, a broken lock would let the operator change what
+        // the platform fixed.
+        if let Err(message) = crate::admin::settings::check_platform_locks() {
+            return Err(project::ProjectConfigError::InvalidSetting { message });
+        }
         if let Some(message) = project
             .as_ref()
             .and_then(|p| p.version_mismatch(crate::version::version()))
@@ -619,6 +624,7 @@ mod tests {
             "TELEMETRY_MANAGED_BY",
             "TOKEN_ENCRYPTION_KEY",
             "TOKEN_ENCRYPTION_KEY_PREVIOUS",
+            "PLATFORM_LOCKED_SETTINGS",
             "HAPPYVIEW_PROJECT",
             "PLUGIN_DIR",
             "HAPPYVIEW_SCRIPT_ENV_FILE",

@@ -69,6 +69,36 @@ async fn a_trusted_address_is_reached() {
 }
 
 #[tokio::test]
+async fn an_exempt_address_is_exempt_only_on_its_configured_port() {
+    let configured = MockServer::start().await;
+    let other = MockServer::start().await;
+    for server in [&configured, &other] {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+    let client = client(Policy::trusting([configured.uri().as_str()]));
+
+    let response = client.get(configured.uri()).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    // The same address on another port, as a service beside the configured
+    // one would be.
+    let err = client
+        .get(other.uri())
+        .send()
+        .await
+        .expect_err("another port on an exempt address must be refused");
+    let chain = error_chain(&err);
+    assert!(
+        chain.contains("127.0.0.1 is not a public address"),
+        "{chain}"
+    );
+    assert!(other.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_name_resolving_only_to_private_addresses_is_refused_before_connecting() {
     let err = client(Policy::default())
         .get("http://localhost:9/")
@@ -188,11 +218,13 @@ async fn the_peer_is_read_through_tls() {
 
     // A connection whose peer could not be read is refused, so reaching the
     // server at all shows the peer was read through the TLS stream.
-    let response = https_client(Policy::trusting(["http://127.0.0.1"]))
-        .get(format!("https://localhost:{port}/"))
-        .send()
-        .await
-        .expect("an exempt address is reached over TLS");
+    let response = https_client(Policy::trusting([
+        format!("https://127.0.0.1:{port}").as_str()
+    ]))
+    .get(format!("https://localhost:{port}/"))
+    .send()
+    .await
+    .expect("an exempt address is reached over TLS");
     assert_eq!(response.text().await.unwrap(), "ok");
 
     let err = https_client(Policy::default())
@@ -220,7 +252,10 @@ async fn a_raw_socket_is_screened_the_same_way() {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{host}");
     }
 
-    let trusted = Source::Fixed(Arc::new(Policy::trusting(["http://127.0.0.1"])));
+    let trusted = Source::Fixed(Arc::new(Policy::trusting([format!(
+        "http://127.0.0.1:{port}"
+    )
+    .as_str()])));
     connect_tcp(&trusted, "127.0.0.1", port)
         .await
         .expect("an exempt address is reached");

@@ -769,3 +769,81 @@ async fn a_module_runs_from_its_artifact_rather_than_its_source() {
         );
     }
 }
+
+/// A Lua run counts its instructions, and the count reaches the metrics an
+/// operator reads. The loop is about two instructions an iteration, so its
+/// mean sits far from both zero and the budget; the interpreter counts in
+/// steps of a thousand, so the bounds are loose rather than exact.
+#[tokio::test]
+async fn a_run_reports_the_instructions_it_used_to_the_metrics() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    if registered(&app).await.is_none() {
+        return;
+    }
+    let query = "games.gamesgamesgamesgames.listGames";
+    let trigger = format!("xrpc.query:{query}");
+
+    let cookie = app.admin_cookie();
+    let upload = Request::post("/admin/lexicons")
+        .header(cookie.0, cookie.1)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "lexicon_json": common::fixtures::list_games_query_lexicon(),
+                "target_collection": "games.gamesgamesgamesgames.game",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(upload).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let now = happyview::db::now_rfc3339();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&trigger)
+    .bind(
+        "function handle() local s = 0 for i = 1, 50000 do s = s + i end \
+         return { games = {}, sum = s } end",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&app.state.db)
+    .await
+    .expect("seed a script row");
+
+    let call = Request::get(format!("/xrpc/{query}"))
+        .header("x-client-key", "hvc_test")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(call).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cookie = app.admin_cookie();
+    let listing = Request::get("/admin/metrics/scripts")
+        .header(cookie.0, cookie.1)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(listing).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let listing: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let script = listing["scripts"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["trigger"] == trigger.as_str()))
+        .unwrap_or_else(|| panic!("no metrics row for {trigger}: {listing:#}"));
+    let used = script["instructions_mean"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the plugin reported no instructions: {script:#}"));
+    println!("instructions_mean: {used}");
+    assert!((50_000.0..1_000_000.0).contains(&used), "{script:#}");
+}
