@@ -483,6 +483,85 @@ async fn boot_opens_what_the_previous_key_sealed() {
     }
 }
 
+/// A whole rotation through boot: under the old key, then with the new key
+/// current and the old one previous, which starts a re-seal; once it has
+/// run, the old key is removed and the instance boots on the new key alone,
+/// around the same OAuth client key, and still reads what it stored.
+#[tokio::test]
+async fn a_rotation_ends_with_the_old_key_removed() {
+    let old = [0x41u8; 32];
+    let new = [0x42u8; 32];
+    for target in BootTarget::all().await {
+        let boot = |current, previous| {
+            let mut config = target.config();
+            config.token_encryption_key = Some(current);
+            config.token_encryption_key_previous = previous;
+            happyview::run::boot_for_test(
+                config,
+                Providers {
+                    source: Arc::new(Double::default()),
+                    storage: None,
+                },
+            )
+        };
+
+        let state = boot(old, None).await;
+        let kid = booted_kid(&state);
+        let sealed = happyview::script::variables::seal(Some(&old.into()), "secret").unwrap();
+        happyview::db::query(&happyview::db::adapt_sql(
+            "INSERT INTO happyview_script_variables (key, value, encrypted, created_at) VALUES ('API_KEY', ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .bind(happyview::db::now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        state.db.close().await;
+
+        let state = boot(new, Some(old)).await;
+        // What `run` starts once a serving instance has booted.
+        let workers = happyview::jobs::worker::spawn_workers(state.clone(), 1);
+        happyview::reseal::spawn_boot_check(state.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let keys = state.config.keyring().unwrap();
+            let left: u64 = happyview::reseal::status(&state.db, state.db_backend, &keys)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| s.previous)
+                .sum();
+            if left == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}: {left} values still need the previous key",
+                target.name()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        for worker in workers {
+            worker.abort();
+        }
+        state.db.close().await;
+
+        let state = boot(new, None).await;
+        assert_eq!(booted_kid(&state), kid, "{}", target.name());
+        let env = happyview::script::variables::load(
+            &state.db,
+            state.db_backend,
+            state.config.keyring().as_ref(),
+        )
+        .await;
+        assert_eq!(env["API_KEY"], "secret", "{}", target.name());
+        state.db.close().await;
+        target.finish().await;
+    }
+}
+
 /// Where a boot test runs: its own SQLite file, and a scratch Postgres
 /// database when `TEST_DATABASE_URL` names a Postgres server.
 enum BootTarget {
