@@ -115,7 +115,9 @@ export default function EnvVariablesPage() {
                     {v.key}
                   </TableCell>
                   <TableCell className="font-mono text-sm text-muted-foreground">
-                    {v.preview}
+                    {v.unreadable
+                      ? "Can't be read with this instance's key. Set it again."
+                      : v.preview}
                   </TableCell>
                   <TableCell>
                     {new Date(v.updated_at).toLocaleString()}
