@@ -7,11 +7,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{DatabaseBackend, adapt_sql};
+use crate::plugin::encryption::{EncryptionError, open, seal};
 
 #[derive(Debug)]
 pub enum StoreError {
     Sqlx(sqlx::Error),
     Json(serde_json::Error),
+    Seal(EncryptionError),
 }
 
 impl fmt::Display for StoreError {
@@ -19,6 +21,7 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::Sqlx(e) => write!(f, "database error: {e}"),
             StoreError::Json(e) => write!(f, "json error: {e}"),
+            StoreError::Seal(e) => write!(f, "encryption error: {e}"),
         }
     }
 }
@@ -28,6 +31,7 @@ impl std::error::Error for StoreError {
         match self {
             StoreError::Sqlx(e) => Some(e),
             StoreError::Json(e) => Some(e),
+            StoreError::Seal(e) => Some(e),
         }
     }
 }
@@ -46,25 +50,99 @@ impl From<serde_json::Error> for StoreError {
 
 // --- DbSessionStore ---
 
+pub const SESSIONS_TABLE: &str = "happyview_oauth_sessions";
+
+/// A stored session's JSON, for callers that read a field without restoring the
+/// session. `None` when there's no row, or it won't open under this key, which
+/// a caller treats the same way: nothing known, and the user signs in again.
+pub async fn stored_session_json(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    table: &str,
+    did: &str,
+    key: Option<&[u8; 32]>,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String, i64)> = crate::db::query_as(&adapt_sql(
+        &format!("SELECT session_data, CAST(encrypted AS BIGINT) FROM {table} WHERE did = ?"),
+        backend,
+    ))
+    .bind(did)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(data, encrypted)| open(key, &data, encrypted != 0)))
+}
+
+/// Encrypt every plaintext session. Safe on every boot and from several
+/// instances: a row is only updated if it's still plaintext with the value that
+/// was read, so a refresh in between wins. A row that fails stays readable and
+/// is retried at the next boot. Returns how many rows were sealed.
+pub async fn seal_stored_sessions(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    key: &[u8; 32],
+) -> Result<usize, sqlx::Error> {
+    let mut sealed_rows = 0;
+    for table in [
+        SESSIONS_TABLE,
+        crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+    ] {
+        let rows: Vec<(String, String)> = crate::db::query_as(&adapt_sql(
+            &format!("SELECT did, session_data FROM {table} WHERE encrypted = 0"),
+            backend,
+        ))
+        .fetch_all(pool)
+        .await?;
+        let update = adapt_sql(
+            &format!(
+                "UPDATE {table} SET session_data = ?, encrypted = 1 \
+                 WHERE did = ? AND encrypted = 0 AND session_data = ?"
+            ),
+            backend,
+        );
+        for (did, data) in rows {
+            let Ok(sealed) = seal(Some(key), &data) else {
+                continue;
+            };
+            let result = crate::db::query(&update)
+                .bind(&sealed.value)
+                .bind(&did)
+                .bind(&data)
+                .execute(pool)
+                .await?;
+            sealed_rows += result.rows_affected() as usize;
+        }
+    }
+    Ok(sealed_rows)
+}
+
 #[derive(Clone)]
 pub struct DbSessionStore {
     pool: AnyPool,
     backend: DatabaseBackend,
     table: &'static str,
     signing_kid: Option<String>,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl DbSessionStore {
-    pub fn new(pool: AnyPool, backend: DatabaseBackend) -> Self {
-        Self::new_with_table(pool, backend, "happyview_oauth_sessions")
+    pub fn new(pool: AnyPool, backend: DatabaseBackend, key: Option<&[u8; 32]>) -> Self {
+        Self::new_with_table(pool, backend, SESSIONS_TABLE, key)
     }
 
-    pub fn new_with_table(pool: AnyPool, backend: DatabaseBackend, table: &'static str) -> Self {
+    /// `key` is required rather than set by a builder method, so a store can't
+    /// be built that silently writes plaintext.
+    pub fn new_with_table(
+        pool: AnyPool,
+        backend: DatabaseBackend,
+        table: &'static str,
+        key: Option<&[u8; 32]>,
+    ) -> Self {
         Self {
             pool,
             backend,
             table,
             signing_kid: None,
+            encryption_key: key.copied(),
         }
     }
 
@@ -78,22 +156,20 @@ impl Store<Did, Session> for DbSessionStore {
     type Error = StoreError;
 
     async fn get(&self, key: &Did) -> Result<Option<Session>, Self::Error> {
-        let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
-            &format!("SELECT session_data FROM {} WHERE did = ?", self.table),
+        let data = stored_session_json(
+            &self.pool,
             self.backend,
-        ))
-        .bind(key.as_ref())
-        .fetch_optional(&self.pool)
+            self.table,
+            key.as_ref(),
+            self.encryption_key.as_ref(),
+        )
         .await?;
-
-        match row {
-            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
-            None => Ok(None),
-        }
+        Ok(data.map(|data| serde_json::from_str(&data)).transpose()?)
     }
 
     async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
+        let sealed = seal(self.encryption_key.as_ref(), &json).map_err(StoreError::Seal)?;
         // `updated_at` is TEXT, and `adapt_sql` turns `datetime('now')` into
         // Postgres's `NOW()`, whose assignment cast stores a space-separated
         // `+00` form — so the column holds one shape on SQLite and another on
@@ -104,15 +180,17 @@ impl Store<Did, Session> for DbSessionStore {
         // SQL clock cannot be compared against TEXT on Postgres at all.
         crate::db::query(&adapt_sql(
             &format!(
-                "INSERT INTO {} (did, session_data, signing_kid, updated_at) VALUES (?, ?, ?, datetime('now')) \
+                "INSERT INTO {} (did, session_data, encrypted, signing_kid, updated_at) \
+                 VALUES (?, ?, ?, ?, datetime('now')) \
                  ON CONFLICT (did) DO UPDATE SET session_data = EXCLUDED.session_data, \
-                 updated_at = datetime('now')",
+                 encrypted = EXCLUDED.encrypted, updated_at = datetime('now')",
                 self.table
             ),
             self.backend,
         ))
         .bind(key.as_ref())
-        .bind(&json)
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
         .bind(self.signing_kid.as_deref())
         .execute(&self.pool)
         .await?;
@@ -211,13 +289,15 @@ pub struct DbStateStore {
     /// Serializes authorize() + take_last_state_key() pairs so concurrent
     /// logins cannot interleave and swap each other's state keys.
     pub authorize_lock: Arc<tokio::sync::Mutex<()>>,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl DbStateStore {
-    pub fn new(pool: AnyPool, backend: DatabaseBackend) -> Self {
+    pub fn new(pool: AnyPool, backend: DatabaseBackend, key: Option<&[u8; 32]>) -> Self {
         Self {
             pool,
             backend,
+            encryption_key: key.copied(),
             last_state_key: Arc::new(Mutex::new(None)),
             authorize_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -233,29 +313,33 @@ impl Store<String, InternalStateData> for DbStateStore {
     type Error = StoreError;
 
     async fn get(&self, key: &String) -> Result<Option<InternalStateData>, Self::Error> {
-        let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
-            "SELECT state_data FROM happyview_oauth_state WHERE state_key = ?",
+        let row: Option<(String, i64)> = crate::db::query_as(&adapt_sql(
+            "SELECT state_data, CAST(encrypted AS BIGINT) FROM happyview_oauth_state WHERE state_key = ?",
             self.backend,
         ))
         .bind(key)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
-            None => Ok(None),
-        }
+        // State that won't open reads as no state, and the sign-in restarts.
+        let data = row.and_then(|(data, encrypted)| {
+            open(self.encryption_key.as_ref(), &data, encrypted != 0)
+        });
+        Ok(data.map(|data| serde_json::from_str(&data)).transpose()?)
     }
 
     async fn set(&self, key: String, value: InternalStateData) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
+        let sealed = seal(self.encryption_key.as_ref(), &json).map_err(StoreError::Seal)?;
         crate::db::query(&adapt_sql(
-            "INSERT INTO happyview_oauth_state (state_key, state_data) VALUES (?, ?)
-             ON CONFLICT (state_key) DO UPDATE SET state_data = EXCLUDED.state_data",
+            "INSERT INTO happyview_oauth_state (state_key, state_data, encrypted) VALUES (?, ?, ?)
+             ON CONFLICT (state_key) DO UPDATE SET state_data = EXCLUDED.state_data, \
+             encrypted = EXCLUDED.encrypted",
             self.backend,
         ))
         .bind(&key)
-        .bind(&json)
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
         .execute(&self.pool)
         .await?;
         *self.last_state_key.lock().unwrap() = Some(key);
@@ -294,6 +378,7 @@ mod tests {
             "CREATE TABLE happyview_oauth_sessions (
                 did TEXT PRIMARY KEY,
                 session_data TEXT NOT NULL,
+                encrypted INTEGER NOT NULL DEFAULT 0,
                 signing_kid TEXT,
                 updated_at TEXT
             )",
@@ -302,6 +387,199 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    const KEY: [u8; 32] = [2; 32];
+
+    async fn raw_row(pool: &AnyPool, did: &str) -> (String, i64) {
+        crate::db::query_as(
+            "SELECT session_data, CAST(encrypted AS BIGINT) FROM happyview_oauth_sessions WHERE did = ?",
+        )
+        .bind(did)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_is_sealed_on_write_and_opened_on_read() {
+        let pool = sessions_pool().await;
+        let did = Did::new("did:plc:sealed".to_string()).unwrap();
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+
+        store
+            .set(did.clone(), sample_session("tok-secret"))
+            .await
+            .unwrap();
+
+        let (stored, encrypted) = raw_row(&pool, did.as_ref()).await;
+        assert_eq!(encrypted, 1);
+        assert!(!stored.contains("tok-secret"));
+        let session = store.get(&did).await.unwrap().expect("the session opens");
+        assert_eq!(session.token_set.access_token, "tok-secret");
+    }
+
+    /// A refresh after sealing rewrites the row under the same flag, and a row
+    /// from before sealing is still read.
+    #[tokio::test]
+    async fn a_plaintext_row_stays_readable_and_a_rewrite_seals_it() {
+        let pool = sessions_pool().await;
+        let did = Did::new("did:plc:plain".to_string()).unwrap();
+        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
+            .set(did.clone(), sample_session("tok-old"))
+            .await
+            .unwrap();
+
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+        assert_eq!(
+            store
+                .get(&did)
+                .await
+                .unwrap()
+                .unwrap()
+                .token_set
+                .access_token,
+            "tok-old"
+        );
+
+        store
+            .set(did.clone(), sample_session("tok-new"))
+            .await
+            .unwrap();
+        assert_eq!(raw_row(&pool, did.as_ref()).await.1, 1);
+    }
+
+    /// Nothing can recover a session this key won't open, but signing in again
+    /// replaces it, so it reads as no session rather than as an error.
+    #[tokio::test]
+    async fn a_session_another_key_sealed_reads_as_none_and_stays_stored() {
+        let pool = sessions_pool().await;
+        let did = Did::new("did:plc:other".to_string()).unwrap();
+        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY))
+            .set(did.clone(), sample_session("tok"))
+            .await
+            .unwrap();
+        let before = raw_row(&pool, did.as_ref()).await;
+
+        for key in [Some(&[3u8; 32]), None] {
+            let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, key);
+            assert!(store.get(&did).await.unwrap().is_none());
+        }
+        assert_eq!(raw_row(&pool, did.as_ref()).await, before);
+    }
+
+    #[tokio::test]
+    async fn boot_seals_both_session_tables_once() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        for table in [
+            SESSIONS_TABLE,
+            crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+        ] {
+            crate::db::query(&format!(
+                "INSERT INTO {table} (did, session_data, updated_at) VALUES ('did:plc:a', '{{\"t\":1}}', 'now')"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let sealed = seal_stored_sessions(&pool, DatabaseBackend::Sqlite, &KEY)
+            .await
+            .unwrap();
+        assert_eq!(sealed, 2);
+        assert_eq!(
+            seal_stored_sessions(&pool, DatabaseBackend::Sqlite, &KEY)
+                .await
+                .unwrap(),
+            0
+        );
+
+        for table in [
+            SESSIONS_TABLE,
+            crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+        ] {
+            let json = stored_session_json(
+                &pool,
+                DatabaseBackend::Sqlite,
+                table,
+                "did:plc:a",
+                Some(&KEY),
+            )
+            .await
+            .unwrap();
+            assert_eq!(json.as_deref(), Some("{\"t\":1}"));
+        }
+    }
+
+    fn sample_state() -> InternalStateData {
+        let key = crate::oauth::client_keys::generate_client_key("test-owner").unwrap();
+        InternalStateData {
+            iss: "https://issuer.example".to_string(),
+            dpop_key: crate::oauth::client_keys::to_atrium_jwk(&key).unwrap().key,
+            verifier: "pkce-verifier".to_string(),
+            app_state: None,
+        }
+    }
+
+    async fn raw_state(pool: &AnyPool) -> (String, i64) {
+        crate::db::query_as(
+            "SELECT state_data, CAST(encrypted AS BIGINT) FROM happyview_oauth_state WHERE state_key = 'k'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_in_state_is_sealed_and_opens_for_the_callback() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let store = DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+
+        store.set("k".to_string(), sample_state()).await.unwrap();
+
+        let (stored, encrypted) = raw_state(&pool).await;
+        assert_eq!(encrypted, 1);
+        assert!(!stored.contains("pkce-verifier"));
+        let state = store
+            .get(&"k".to_string())
+            .await
+            .unwrap()
+            .expect("state opens");
+        assert_eq!(state.verifier, "pkce-verifier");
+    }
+
+    /// A sign-in in flight across an upgrade wrote plaintext, and its callback
+    /// still has to work on the new version.
+    #[tokio::test]
+    async fn sign_in_state_from_before_sealing_is_still_read() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
+            .set("k".to_string(), sample_state())
+            .await
+            .unwrap();
+
+        let store = state_store_with_key(&pool);
+        assert_eq!(
+            store.get(&"k".to_string()).await.unwrap().unwrap().verifier,
+            "pkce-verifier"
+        );
+    }
+
+    /// State that won't open restarts the sign-in, as expired state does.
+    #[tokio::test]
+    async fn sign_in_state_another_key_sealed_reads_as_none() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&[3u8; 32]))
+            .set("k".to_string(), sample_state())
+            .await
+            .unwrap();
+
+        let store = state_store_with_key(&pool);
+        assert!(store.get(&"k".to_string()).await.unwrap().is_none());
+    }
+
+    fn state_store_with_key(pool: &AnyPool) -> DbStateStore {
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY))
     }
 
     fn sample_session(access_token: &str) -> Session {
@@ -339,7 +617,7 @@ mod tests {
         let pool = sessions_pool().await;
         let did = Did::new("did:plc:abc123test".to_string()).unwrap();
 
-        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-1".to_string()));
         store
             .set(did.clone(), sample_session("tok-1"))
@@ -350,7 +628,7 @@ mod tests {
             Some("kid-1".to_string())
         );
 
-        let store_after_rotation = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        let store_after_rotation = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-2".to_string()));
         store_after_rotation
             .set(did.clone(), sample_session("tok-2"))
@@ -377,7 +655,7 @@ mod tests {
         let did = Did::new("did:plc:abc123test".to_string()).unwrap();
 
         // Establish under kid-1, as an initial login would.
-        let store_k1 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        let store_k1 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-1".to_string()));
         store_k1
             .set(did.clone(), sample_session("tok-1"))
@@ -388,7 +666,7 @@ mod tests {
             Some("kid-1".to_string())
         );
 
-        let store_k2 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        let store_k2 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-2".to_string()));
         store_k2
             .set(did.clone(), sample_session("tok-2"))
@@ -416,7 +694,7 @@ mod tests {
             "an unconditional re-pin after a fresh exchange must move the kid"
         );
 
-        let store_k3 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        let store_k3 = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-3".to_string()));
         store_k3
             .set(did.clone(), sample_session("tok-3"))
@@ -434,7 +712,7 @@ mod tests {
         let pool = sessions_pool().await;
         let did = Did::new("did:plc:abc123test".to_string()).unwrap();
 
-        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite);
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None);
         store
             .set(did.clone(), sample_session("tok-1"))
             .await
@@ -462,7 +740,7 @@ mod tests {
 
         // A row that exists but was never pinned.
         let unpinned_did = Did::new("did:plc:unpinnedtest".to_string()).unwrap();
-        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .set(unpinned_did.clone(), sample_session("tok-1"))
             .await
             .unwrap();
@@ -480,7 +758,7 @@ mod tests {
 
         // A row pinned to a kid on its first insert.
         let pinned_did = Did::new("did:plc:pinnedtest".to_string()).unwrap();
-        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite)
+        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, None)
             .with_signing_kid(Some("kid-1".to_string()))
             .set(pinned_did.clone(), sample_session("tok-2"))
             .await

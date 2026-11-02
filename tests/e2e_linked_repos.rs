@@ -1403,6 +1403,7 @@ async fn client_for_grant_stamps_the_key_it_actually_signs_with_across_a_rotatio
             state.db.clone(),
             state.db_backend,
             Some(vec![jwk_a]),
+            state.config.token_encryption_key.as_ref(),
         )
         .expect("failed to build non-loopback linked-repo OAuth client"),
     );
