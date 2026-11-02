@@ -105,8 +105,8 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet. Variables defined here are
-                    readable by scripts as ctx.env.
+                    No script variables yet. Variables defined here are readable
+                    by scripts as ctx.env.
                   </TableCell>
                 </TableRow>
               )}
