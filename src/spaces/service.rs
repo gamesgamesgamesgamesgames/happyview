@@ -645,9 +645,7 @@ pub(crate) async fn put_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 
@@ -739,9 +737,7 @@ pub(crate) async fn delete_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 

@@ -776,9 +776,7 @@ async fn apply_writes(
     // transaction is open deadlocks on SQLite.
     let signing_key = service::service_signing_key(&state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 
@@ -1831,9 +1829,7 @@ async fn notify_write(
         input.data.as_ref().or(input.hash.as_ref()),
     ) {
         let hash = hash.decode()?;
-        let mut conn = state
-            .db
-            .begin()
+        let mut conn = crate::db::begin_write(&state.db, state.db_backend)
             .await
             .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
         let recorded = crate::spaces::writers::record(
