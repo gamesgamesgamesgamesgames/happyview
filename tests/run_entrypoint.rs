@@ -288,6 +288,12 @@ async fn boot_encrypts_stored_script_variables() {
     .execute(&state.db)
     .await
     .unwrap();
+    happyview::db::query(
+        "INSERT INTO happyview_oauth_sessions (did, session_data) VALUES ('did:plc:a', 'session-secret')",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
 
     let key = [5u8; 32];
     let state = boot(Some(key)).await;
@@ -301,6 +307,14 @@ async fn boot_encrypts_stored_script_variables() {
     assert!(!value.contains("secret"));
     let env = happyview::script::variables::load(&state.db, state.db_backend, Some(&key)).await;
     assert_eq!(env["API_KEY"], "secret");
+
+    let (session,): (String,) = happyview::db::query_as(
+        "SELECT session_data FROM happyview_oauth_sessions WHERE did = 'did:plc:a'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert!(!session.contains("session-secret"));
 }
 
 async fn boot_in(dir: &std::path::Path) -> AppState {

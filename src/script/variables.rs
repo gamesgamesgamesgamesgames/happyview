@@ -10,43 +10,12 @@
 
 use std::collections::BTreeMap;
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
 use crate::db::{DatabaseBackend, adapt_sql};
-use crate::plugin::encryption::{EncryptionError, decrypt, encrypt};
+pub use crate::plugin::encryption::{Sealed, open, seal};
 
 /// What every variable shows in place of its value. Fixed, so it gives away
 /// neither the value nor its length.
 pub const MASK: &str = "****";
-
-/// A value as it goes in the table.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Sealed {
-    pub value: String,
-    pub encrypted: i32,
-}
-
-pub fn seal(key: Option<&[u8; 32]>, value: &str) -> Result<Sealed, EncryptionError> {
-    Ok(match key {
-        Some(key) => Sealed {
-            value: BASE64.encode(encrypt(key, value.as_bytes())?),
-            encrypted: 1,
-        },
-        None => Sealed {
-            value: value.to_string(),
-            encrypted: 0,
-        },
-    })
-}
-
-/// The value of a row, or `None` if it's ciphertext this instance can't open.
-pub fn open(key: Option<&[u8; 32]>, stored: &str, encrypted: bool) -> Option<String> {
-    if !encrypted {
-        return Some(stored.to_string());
-    }
-    let bytes = BASE64.decode(stored).ok()?;
-    String::from_utf8(decrypt(key?, &bytes).ok()?).ok()
-}
 
 /// Every variable a script can read. One that won't open is left out, as an
 /// unset variable would be; [`encrypt_stored`] reports it at boot and the

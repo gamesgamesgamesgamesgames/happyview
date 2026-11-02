@@ -342,6 +342,7 @@ mod tests {
             state.db.clone(),
             state.db_backend,
             crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+            state.config.token_encryption_key.as_ref(),
         );
         Store::set(&session_store, did.clone(), session)
             .await
