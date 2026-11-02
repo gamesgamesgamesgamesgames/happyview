@@ -803,10 +803,12 @@ mod tests {
             state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             session_store: crate::auth::oauth_store::DbSessionStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
@@ -834,12 +836,14 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
+            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(
+                std::sync::Arc::new(oauth),
+                None,
+            )),
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             linked_repos_client: std::sync::Arc::new(
                 crate::linked_repos::client::build(
@@ -854,9 +858,11 @@ mod tests {
                     crate::auth::oauth_store::DbStateStore::new(
                         test_db.clone(),
                         crate::db::DatabaseBackend::Sqlite,
+                        None,
                     ),
                     test_db.clone(),
                     crate::db::DatabaseBackend::Sqlite,
+                    None,
                     None,
                 )
                 .expect("Failed to create test linked-repo OAuth client"),

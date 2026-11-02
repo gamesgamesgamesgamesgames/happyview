@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use crate::AppState;
 use crate::auth::Claims;
-use crate::db::{DatabaseBackend, adapt_sql};
 use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, parse_lua_line};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
@@ -36,17 +35,6 @@ impl Drop for ScriptTimingGuard {
             .script_executions
             .fetch_add(1, Ordering::Relaxed);
     }
-}
-
-/// Load all script variables from the database as a key-value map.
-async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
 }
 
 /// Execute a Lua script for a procedure endpoint.
@@ -474,7 +462,15 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
+    if let Err(e) = context::set_env_context(
+        &lua,
+        &crate::lua::variables::load(
+            &state.db,
+            backend,
+            state.config.token_encryption_key.as_ref(),
+        )
+        .await,
+    ) {
         let error_message = format!("failed to set env context: {e}");
         log_event(
             &state.db,
@@ -562,7 +558,7 @@ pub async fn execute_procedure_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let result: mlua::Value = match sandbox::call_handle(&lua, &handle, ()).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -576,7 +572,7 @@ pub async fn execute_procedure_script(
                     .unwrap_or(&clean_msg)
                     .to_string();
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),
@@ -956,7 +952,15 @@ pub async fn execute_query_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
+    if let Err(e) = context::set_env_context(
+        &lua,
+        &crate::lua::variables::load(
+            &state.db,
+            backend,
+            state.config.token_encryption_key.as_ref(),
+        )
+        .await,
+    ) {
         let error_message = format!("failed to set env context: {e}");
         log_event(
             &state.db,
@@ -1038,7 +1042,7 @@ pub async fn execute_query_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let result: mlua::Value = match sandbox::call_handle(&lua, &handle, ()).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -1052,7 +1056,7 @@ pub async fn execute_query_script(
                     .unwrap_or(&clean_msg)
                     .to_string();
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),

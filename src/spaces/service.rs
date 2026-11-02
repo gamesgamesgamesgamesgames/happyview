@@ -1124,8 +1124,19 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-    db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
+    match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
+        db::InviteClaim::Joined => {}
+        db::InviteClaim::Unavailable => {
+            return Err(AppError::BadRequest(
+                "This invite has been revoked or has reached its maximum uses".into(),
+            ));
+        }
+        db::InviteClaim::AlreadyMember => {
+            return Err(AppError::Conflict(
+                "You are already a member of this space".into(),
+            ));
+        }
+    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))
@@ -1207,8 +1218,12 @@ mod tests {
                 )]),
             },
             keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend),
+            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
+            session_store: crate::auth::oauth_store::DbSessionStore::new(
+                pool.clone(),
+                backend,
+                None,
+            ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -1236,10 +1251,15 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(
+                std::sync::Arc::new(oauth),
+                None,
+            )),
+            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
+                pool.clone(),
+                backend,
+                None,
+            ),
             linked_repos_client: std::sync::Arc::new(
                 crate::linked_repos::client::build(
                     "https://plc.directory",
@@ -1250,9 +1270,10 @@ mod tests {
                     vec![atrium_oauth::Scope::Known(
                         atrium_oauth::KnownScope::Atproto,
                     )],
-                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
                     pool.clone(),
                     backend,
+                    None,
                     None,
                 )
                 .expect("Failed to create test linked-repo OAuth client"),
