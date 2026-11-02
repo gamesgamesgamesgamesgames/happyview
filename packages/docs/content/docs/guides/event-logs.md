@@ -73,9 +73,9 @@ Logged when a user attempts to access an endpoint they don't have permission for
 
 | Event Type             | Severity | Subject       | Detail                                                        |
 | ---------------------- | -------- | ------------- | ------------------------------------------------------------- |
-| `space.moderator_read` | info     | Space AT URI  | `action`, `space_id`, `user_id`, and what was read (see below) |
+| `space.moderator_read` | info     | Space AT URI, or the account's DID | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below) |
 
-Logged when an admin reads a space's records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `action` is `list_records` or `get_blob`. A `list_records` event includes the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the blob `cid` and the `repo` that references it. Listing spaces and viewing their metadata or members is not logged.
+Logged when an admin reads space records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `grant_id` is the [access grant](../api-reference/admin/spaces.md#access-grants) the read was made under, and `scope` is that grant's scope (`space` or `account`). `action` is `list_records`, `get_blob` or `list_account_records`. A `list_records` event includes the `space_id`, the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the `space_id`, the blob `cid` and the `repo` that references it. A `list_account_records` event's subject is the account's DID, and it includes that `repo`, the `space_id` and `collection` filters and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
 
 ### API Key events
 

@@ -5,6 +5,8 @@ import { usePathname } from "next/navigation";
 import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
+import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
 import { toastError } from "@/lib/format";
 import {
   adminSpaceBlobUrl,
@@ -92,13 +94,13 @@ function Field({
   );
 }
 
-export default function SpaceDetail() {
+function SpaceDetailContent() {
   const pathname = usePathname();
   const id = decodeURIComponent(
     pathname.split("/").filter(Boolean).pop() ?? "",
   );
   const { hasPermission } = useCurrentUser();
-  const canReadRecords = hasPermission("spaces:manage-records");
+  const canReadRecords = hasPermission("spaces:inspect");
 
   const [detail, setDetail] = useState<AdminSpaceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -514,4 +516,10 @@ export default function SpaceDetail() {
       </div>
     </>
   );
+}
+
+export default function SpaceDetail() {
+  const { features } = useConfig();
+  if (!features.space_inspector) return <InspectorDisabled title="Space" />;
+  return <SpaceDetailContent />;
 }

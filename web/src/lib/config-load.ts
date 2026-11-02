@@ -1,3 +1,22 @@
+/** The `/config` features the dashboard shows or hides pages by. */
+export interface Features {
+  spaces: boolean;
+  space_inspector: boolean;
+}
+
+/**
+ * The features `/config` reports. Anything but an explicit `true` is off, so
+ * a server that predates a feature reads as not having it.
+ */
+export function parseFeatures(raw: unknown): Features {
+  const features =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    spaces: features.spaces === true,
+    space_inspector: features.space_inspector === true,
+  };
+}
+
 /** Why the dashboard could not load `/config`. */
 export type ConfigFailure =
   | {

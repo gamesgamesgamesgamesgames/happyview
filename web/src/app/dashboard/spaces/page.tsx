@@ -17,10 +17,12 @@ import { DataTable } from "@/components/data-table/data-table";
 import { DataTableViewOptions } from "@/components/data-table/data-table-view-options";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
+import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { useConfig } from "@/lib/config-context";
 
 const PAGE_SIZE = 50;
 
-export default function SpacesPage() {
+function SpacesList() {
   const router = useRouter();
   const [spaces, setSpaces] = useState<AdminSpace[]>([]);
   const [cursorStack, setCursorStack] = useState<string[]>([]);
@@ -184,4 +186,10 @@ export default function SpacesPage() {
       </div>
     </>
   );
+}
+
+export default function SpacesPage() {
+  const { features } = useConfig();
+  if (!features.space_inspector) return <InspectorDisabled title="Spaces" />;
+  return <SpacesList />;
 }

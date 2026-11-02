@@ -28,6 +28,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub(crate) mod space_access;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
@@ -58,6 +59,8 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             auth::require_admin_caller,
         ))
         .with_state(());
+    let audited_read =
+        axum::middleware::from_fn_with_state(state.clone(), crate::csrf::audited_read);
     Router::new()
         .merge(source_routes)
         .route(
@@ -113,9 +116,40 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             get(spaces_migration::migration_status),
         )
         .route("/spaces", get(spaces::list_spaces))
+        .route("/spaces/inspector", get(space_access::inspector_status))
+        .route(
+            "/spaces/access-grants",
+            get(space_access::list_grants).post(space_access::create_grant),
+        )
+        .route(
+            "/spaces/access-grants/{id}",
+            delete(space_access::revoke_grant),
+        )
+        .route(
+            "/spaces/access-grants/{id}/reads",
+            get(space_access::grant_reads),
+        )
         .route("/spaces/{id}", get(spaces::get_space))
-        .route("/spaces/{id}/records", get(spaces::list_space_records))
-        .route("/spaces/{id}/blob", get(spaces::get_space_blob))
+        .route("/spaces/{id}/access", get(spaces::covering_grant))
+        // Each of these records the read it serves, so a cookie only counts
+        // on a request from the dashboard itself; see `csrf::audited_read`.
+        .route(
+            "/spaces/{id}/records",
+            get(spaces::list_space_records).layer(audited_read.clone()),
+        )
+        .route(
+            "/spaces/{id}/blob",
+            get(spaces::get_space_blob).layer(audited_read.clone()),
+        )
+        .route("/accounts/{did}/spaces", get(spaces::list_account_spaces))
+        .route(
+            "/accounts/{did}/access",
+            get(spaces::account_covering_grant),
+        )
+        .route(
+            "/accounts/{did}/space-records",
+            get(spaces::list_account_space_records).layer(audited_read),
+        )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))

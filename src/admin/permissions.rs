@@ -115,6 +115,8 @@ pub enum Permission {
     SpacesManageRecords,
     #[serde(rename = "spaces:manage-credentials")]
     SpacesManageCredentials,
+    #[serde(rename = "spaces:inspect")]
+    SpacesInspect,
 
     #[serde(rename = "scripts:read")]
     ScriptsRead,
@@ -187,6 +189,7 @@ impl Permission {
             Self::SpacesManageInvites => "spaces:manage-invites",
             Self::SpacesManageRecords => "spaces:manage-records",
             Self::SpacesManageCredentials => "spaces:manage-credentials",
+            Self::SpacesInspect => "spaces:inspect",
             Self::ScriptsRead => "scripts:read",
             Self::ScriptsManage => "scripts:manage",
             Self::JobsRead => "jobs:read",
@@ -456,13 +459,19 @@ impl Permission {
             Self::SpacesManageRecords => PermissionInfo {
                 key: "spaces:manage-records",
                 name: "Manage Records",
-                description: "Read and write records within spaces",
+                description: "Reserved; grants no access. Use `spaces:inspect` to read space contents.",
                 category: "Spaces",
             },
             Self::SpacesManageCredentials => PermissionInfo {
                 key: "spaces:manage-credentials",
                 name: "Manage Credentials",
                 description: "Issue and revoke space access credentials",
+                category: "Spaces",
+            },
+            Self::SpacesInspect => PermissionInfo {
+                key: "spaces:inspect",
+                name: "Inspect Space Contents",
+                description: "Request time-limited access to read records and blobs in private spaces",
                 category: "Spaces",
             },
             Self::ScriptsRead => PermissionInfo {
@@ -569,6 +578,7 @@ impl Permission {
             Self::SpacesManageInvites,
             Self::SpacesManageRecords,
             Self::SpacesManageCredentials,
+            Self::SpacesInspect,
             Self::ScriptsRead,
             Self::ScriptsManage,
             Self::JobsRead,
@@ -632,6 +642,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         SpacesManageInvites,
         SpacesManageRecords,
         SpacesManageCredentials,
+        SpacesInspect,
         JobsRead,
         JobsCreate,
         JobsManage,
@@ -902,6 +913,19 @@ mod tests {
             assert!(
                 !template.permissions().contains(&Permission::EventsPurge),
                 "purging the audit log must not come with a built-in role template"
+            );
+        }
+    }
+
+    #[test]
+    fn spaces_inspect_is_opt_in() {
+        assert_eq!(Permission::SpacesInspect.as_str(), "spaces:inspect");
+        assert!(is_valid("spaces:inspect"));
+        assert!(Permission::all().contains(&Permission::SpacesInspect));
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
+            assert!(
+                !template.permissions().contains(&Permission::SpacesInspect),
+                "reading private space contents is granted deliberately, not by template"
             );
         }
     }

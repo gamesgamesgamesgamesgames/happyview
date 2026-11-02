@@ -12,10 +12,12 @@ use crate::event_log::{
     DEFAULT_RETENTION_DAYS, EventLog, SPACE_ACCESS_RETENTION_SETTING, Severity,
     effective_protected_retention, log_event, write_event,
 };
+use crate::feature_flags::FeatureFlag;
 use crate::lua::limits as script_limits;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
+use super::space_access;
 use super::types::{SettingEntry, UpsertSettingBody};
 
 const ENV_FALLBACKS: &[(&str, &str)] = &[
@@ -32,6 +34,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
+    ("feature.space_inspector_enabled", "SPACE_INSPECTOR_ENABLED"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
     ("tos_uri", "TOS_URI"),
@@ -42,6 +45,10 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     (
         "space_access_log_retention_days",
         "SPACE_ACCESS_LOG_RETENTION_DAYS",
+    ),
+    (
+        "space_inspector_max_grant_minutes",
+        "SPACE_INSPECTOR_MAX_GRANT_MINUTES",
     ),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
@@ -100,6 +107,19 @@ pub async fn try_get_setting(
     key: &str,
     backend: DatabaseBackend,
 ) -> Result<Option<String>, sqlx::Error> {
+    if let Some(value) = stored_setting(pool, key, backend).await? {
+        return Ok(Some(value));
+    }
+
+    Ok(env_var_for(key).and_then(vars::var))
+}
+
+/// A setting's stored row alone, without the fallback.
+pub async fn stored_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -108,16 +128,11 @@ pub async fn try_get_setting(
         .bind(key)
         .fetch_optional(pool)
         .await?;
-
-    if let Some((value,)) = row {
-        return Ok(Some(value));
-    }
-
-    Ok(env_var_for(key).and_then(vars::var))
+    Ok(row.map(|(value,)| value))
 }
 
-/// The protected events for an audited setting change: how long event logs
-/// are kept.
+/// The protected events for an audited setting change: turning the space
+/// inspector on or off, and changing how long event logs are kept.
 ///
 /// Compares effective values, fallbacks included, so a save that rewrites an
 /// unchanged value logs nothing.
@@ -136,6 +151,18 @@ fn audited_setting_events(
         detail,
     };
     match key {
+        FeatureFlag::SPACE_INSPECTOR => {
+            let on = |v: &Option<String>| v.as_deref().is_some_and(|v| v == "true");
+            match (on(before), on(after)) {
+                (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
+                (true, false) => vec![event(
+                    key,
+                    "space_inspector.disabled",
+                    serde_json::json!({}),
+                )],
+                _ => Vec::new(),
+            }
+        }
         GENERAL_RETENTION_SETTING | SPACE_ACCESS_RETENTION_SETTING => {
             // Effective values, as the retention sweep reads them: the protected
             // retention depends on the general one, so a change to either can
@@ -179,8 +206,8 @@ fn fallback_value(key: &str) -> Option<String> {
     env_var_for(key).and_then(vars::var)
 }
 
-/// A setting's value inside a transaction, fallback included.
-async fn read_setting_in(
+/// A setting's stored row inside a transaction, without the fallback.
+async fn read_stored_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     backend: DatabaseBackend,
     key: &str,
@@ -193,10 +220,22 @@ async fn read_setting_in(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
-    Ok(stored.map(|(v,)| v).or_else(|| fallback_value(key)))
+    Ok(stored.map(|(v,)| v))
+}
+
+/// A setting's value inside a transaction, fallback included.
+async fn read_setting_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    backend: DatabaseBackend,
+    key: &str,
+) -> Result<Option<String>, AppError> {
+    Ok(read_stored_in(tx, backend, key)
+        .await?
+        .or_else(|| fallback_value(key)))
 }
 
 /// What [`write_audited`] does to a setting's row.
+#[derive(Clone, Copy)]
 enum SettingWrite<'a> {
     Put(&'a str),
     Delete,
@@ -233,7 +272,26 @@ async fn write_audited(
         .await
         .map_err(|e| AppError::Internal(format!("failed to lock setting: {e}")))?;
 
-    let before = read_setting_in(&mut tx, backend, key).await?;
+    let (before, after) = if key == FeatureFlag::SPACE_INSPECTOR {
+        // The switch as the inspector reads it, which is not always the
+        // stored-then-fallback value every other setting has.
+        let on = |stored: Option<&str>| {
+            Some(space_access::switch_is_on(stored, fallback_value(key).as_deref()).to_string())
+        };
+        let before = read_stored_in(&mut tx, backend, key).await?;
+        let after = match write {
+            SettingWrite::Put(value) => Some(value),
+            SettingWrite::Delete => None,
+        };
+        (on(before.as_deref()), on(after))
+    } else {
+        let before = read_setting_in(&mut tx, backend, key).await?;
+        let after = match write {
+            SettingWrite::Put(value) => Some(value.to_string()),
+            SettingWrite::Delete => fallback_value(key),
+        };
+        (before, after)
+    };
     let other_retention = match key {
         GENERAL_RETENTION_SETTING => {
             read_setting_in(&mut tx, backend, SPACE_ACCESS_RETENTION_SETTING).await?
@@ -242,10 +300,6 @@ async fn write_audited(
             read_setting_in(&mut tx, backend, GENERAL_RETENTION_SETTING).await?
         }
         _ => None,
-    };
-    let after = match write {
-        SettingWrite::Put(value) => Some(value.to_string()),
-        SettingWrite::Delete => fallback_value(key),
     };
     let events = audited_setting_events(actor_did, key, &before, &after, &other_retention);
 
@@ -351,6 +405,7 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    space_access::refuse_switch_on(&key, &body.value)?;
 
     write_audited(
         &state.db,
@@ -813,6 +868,78 @@ mod tests {
         let changes = retention_changes(&pool).await;
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[2].1, serde_json::json!({ "from": 0, "to": 365 }));
+    }
+
+    async fn inspector_events(pool: &AnyPool) -> Vec<String> {
+        let rows: Vec<(String,)> = crate::db::query_as(
+            "SELECT event_type FROM happyview_event_logs \
+             WHERE event_type LIKE 'space_inspector.%' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter().map(|(t,)| t).collect()
+    }
+
+    /// Turning the inspector on or off is a protected event, judged by the
+    /// switch as the inspector reads it. `upsert` refuses `true` until the
+    /// dashboard ships, so this drives the write beneath it.
+    #[tokio::test]
+    #[serial]
+    async fn the_inspector_switch_logs_each_effective_change() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        let pool = migrated_memory_pool().await;
+        let key = FeatureFlag::SPACE_INSPECTOR;
+
+        put_audited(&pool, key, "false").await;
+        assert!(inspector_events(&pool).await.is_empty());
+        put_audited(&pool, key, " true ").await;
+        put_audited(&pool, key, "true").await;
+        put_audited(&pool, key, "false").await;
+        put_audited(&pool, key, "true").await;
+        write_audited(
+            &pool,
+            DatabaseBackend::Sqlite,
+            "did:plc:admin",
+            key,
+            SettingWrite::Delete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inspector_events(&pool).await,
+            [
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+            ]
+        );
+    }
+
+    /// Configuration that says `true` leaves the inspector off in this build,
+    /// so storing `false` over it is no change and logs nothing.
+    #[tokio::test]
+    #[serial]
+    async fn a_configured_inspector_switch_is_ignored() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        set_project_layer([("SPACE_INSPECTOR_ENABLED".to_string(), "true".to_string())].into());
+        let _reset = LayerReset;
+        let pool = migrated_memory_pool().await;
+
+        assert_eq!(
+            get_setting(&pool, FeatureFlag::SPACE_INSPECTOR, DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("true"),
+            "the value is configured"
+        );
+        assert!(
+            !space_access::inspector_enabled(&pool, DatabaseBackend::Sqlite).await,
+            "and ignored"
+        );
+        put_audited(&pool, FeatureFlag::SPACE_INSPECTOR, "false").await;
+        assert!(inspector_events(&pool).await.is_empty());
     }
 
     #[test]

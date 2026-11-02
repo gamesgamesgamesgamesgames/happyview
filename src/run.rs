@@ -173,6 +173,10 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
         });
     }
 
+    // Reads the switch once so a value configuration sets, which this build
+    // ignores, is reported at startup rather than at the first space request.
+    crate::admin::space_access::inspector_enabled(&state.db, state.db_backend).await;
+
     tokio::spawn(crate::event_log::spawn_retention_cleanup(
         state.db.clone(),
         state.db_backend,

@@ -49,6 +49,34 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     .into_response()
 }
 
+/// Refuse a cookie-authenticated read that records itself, unless it came from
+/// this instance's own pages.
+///
+/// [`guard`] lets every `GET` through, and a read of space contents writes an
+/// audit row naming the operator. A link on another site would make an
+/// operator who holds a grant log a read they never made, so these reads hold
+/// the cookie to [`cookie_request_is_same_origin`], as routes outside `/admin`
+/// do. They stay `GET`s, because a blob is loaded by an `<img>`, and a browser
+/// marks those `same-origin` too.
+pub async fn audited_read(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !carries_session_cookie(&req) || cookie_request_is_same_origin(&state, req.headers()).await {
+        return next.run(req).await;
+    }
+
+    tracing::warn!(
+        path = req.uri().path(),
+        origin = origin_of(req.headers()).unwrap_or(""),
+        "refused an audited read with the session cookie from outside the dashboard"
+    );
+    AppError::Forbidden(
+        "this read is recorded against the operator making it, so with the session cookie \
+         it is served only to the dashboard's own pages; an integration authenticates with \
+         an API key instead"
+            .into(),
+    )
+    .into_response()
+}
+
 /// Whether a request carrying the session cookie may use it: the browser says
 /// it came from this instance, or its `Origin` is one of the instance's
 /// domains, or it sent neither header and so did not
