@@ -812,3 +812,292 @@ async fn postgres_client_secrets_carry_over() {
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A database a stable branch migrated boots on this one
+// ---------------------------------------------------------------------------
+
+/// `(stable version, alpha version, description)` for each migration a stable
+/// branch ran under a version this branch gives to another file.
+fn renumbered() -> Vec<(String, String, String)> {
+    std::fs::read_to_string("migrations/renumbered.tsv")
+        .expect("read migrations/renumbered.tsv")
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0].to_string(), f[1].to_string(), f[2].to_string())
+        })
+        .collect()
+}
+
+/// The migration directories of each stable branch, as `(label, dir)` where
+/// `dir/<backend>` holds that backend's files.
+///
+/// `STABLE_MIGRATIONS` names a directory holding `<branch>/migrations`, as
+/// `git archive origin/<branch> migrations` writes it, which is what CI
+/// supplies. Without it, a beta directory is built from this tree: every
+/// migration before the first one beta added, then the files beta ran at the
+/// versions beta ran them, which `migrations/renumbered.tsv` records.
+fn stable_migration_dirs() -> Vec<(String, std::path::PathBuf)> {
+    if let Ok(root) = std::env::var("STABLE_MIGRATIONS") {
+        let mut dirs: Vec<_> = std::fs::read_dir(&root)
+            .expect("read STABLE_MIGRATIONS")
+            .map(|e| e.expect("dir entry"))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.path().join("migrations"),
+                )
+            })
+            .collect();
+        dirs.sort();
+        assert!(!dirs.is_empty(), "STABLE_MIGRATIONS holds no branches");
+        return dirs;
+    }
+    eprintln!("STABLE_MIGRATIONS unset: building a beta directory from this tree");
+    let out = std::env::temp_dir().join(format!("hv-beta-{}", uuid::Uuid::new_v4()));
+    for backend in ["sqlite", "postgres"] {
+        let dest = out.join(backend);
+        stage_baseline_migrations(&format!("migrations/{backend}"), &dest, "20261005999999");
+        for entry in std::fs::read_dir(format!("migrations/{backend}")).expect("read") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if name.contains("space_access") {
+                let mut stable_name = name.clone();
+                for (from, to, _) in renumbered() {
+                    if name.starts_with(&to) {
+                        stable_name = format!("{from}{}", &name[to.len()..]);
+                    }
+                }
+                std::fs::copy(
+                    format!("migrations/{backend}/{name}"),
+                    dest.join(stable_name),
+                )
+                .expect("copy");
+            }
+        }
+    }
+    vec![("beta (from this tree)".into(), out)]
+}
+
+async fn applied(pool: &AnyPool) -> Vec<(i64, String)> {
+    happyview::db::query_as("SELECT version, description FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .expect("read _sqlx_migrations")
+}
+
+/// Migrate `url` as the stable branch in `dir` would have, then boot this
+/// branch on it, twice, and check every migration of this branch is recorded
+/// once under its own version.
+async fn assert_stable_database_boots(
+    url: &str,
+    dir: &std::path::Path,
+    backend: happyview::db::DatabaseBackend,
+) {
+    let sub = match backend {
+        happyview::db::DatabaseBackend::Sqlite => "sqlite",
+        happyview::db::DatabaseBackend::Postgres => "postgres",
+    };
+    let pool = AnyPool::connect(url).await.expect("connect");
+    Migrator::new(dir.join(sub))
+        .await
+        .expect("load the stable migrations")
+        .run(&pool)
+        .await
+        .expect("the stable branch migrates");
+    pool.close().await;
+
+    for _ in 0..2 {
+        happyview::db::connect(url, backend).await.close().await;
+    }
+
+    let pool = AnyPool::connect(url).await.expect("connect");
+    let ours = Migrator::new(Path::new(&format!("migrations/{sub}")))
+        .await
+        .expect("load");
+    let rows = applied(&pool).await;
+    for m in ours.iter() {
+        let recorded: Vec<_> = rows.iter().filter(|(v, _)| *v == m.version).collect();
+        assert_eq!(
+            recorded,
+            vec![&(m.version, m.description.to_string())],
+            "{sub}: version {}",
+            m.version
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_databases_from_stable_branches_boot() {
+    happyview::db::install_drivers();
+    for (label, dir) in stable_migration_dirs() {
+        let path = std::env::temp_dir().join(format!("hv-stable-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        eprintln!("{label} -> this branch (sqlite)");
+        assert_stable_database_boots(&url, &dir, happyview::db::DatabaseBackend::Sqlite).await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_databases_from_stable_branches_boot() {
+    for (label, dir) in stable_migration_dirs() {
+        eprintln!("{label} -> this branch (postgres)");
+        let ran = with_scratch_postgres("hv_stable", |url| async move {
+            assert_stable_database_boots(&url, &dir, happyview::db::DatabaseBackend::Postgres)
+                .await;
+        })
+        .await;
+        if ran.is_none() {
+            eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+            return;
+        }
+    }
+}
+
+/// A database this branch created holds another migration at a renumbered
+/// stable version. Booting leaves every row of it as it was.
+#[tokio::test]
+async fn sqlite_boot_leaves_this_branchs_own_migrations_alone() {
+    happyview::db::install_drivers();
+    let path = std::env::temp_dir().join(format!("hv-own-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    happyview::db::connect(&url, happyview::db::DatabaseBackend::Sqlite)
+        .await
+        .close()
+        .await;
+    let pool = AnyPool::connect(&url).await.expect("connect");
+    let checksums = |pool: AnyPool| async move {
+        let rows: Vec<(i64, String, Vec<u8>)> = happyview::db::query_as(
+            "SELECT version, description, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read");
+        rows
+    };
+    let before = checksums(pool.clone()).await;
+    for (from, _, description) in renumbered() {
+        let at: i64 = from.parse().unwrap();
+        let row = before
+            .iter()
+            .find(|(v, _, _)| *v == at)
+            .expect("a row at the stable version");
+        assert_ne!(row.1, description, "this branch's own migration is at {at}");
+    }
+    happyview::db::connect(&url, happyview::db::DatabaseBackend::Sqlite)
+        .await
+        .close()
+        .await;
+    assert_eq!(checksums(pool.clone()).await, before);
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A row at a renumbered stable version whose checksum isn't the stable
+/// file's is not moved: the boot fails as it would have, and the row stays.
+#[tokio::test]
+async fn sqlite_boot_does_not_move_a_row_it_does_not_recognise() {
+    happyview::db::install_drivers();
+    let (label, dir) = stable_migration_dirs().remove(0);
+    let path = std::env::temp_dir().join(format!("hv-odd-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let pool = AnyPool::connect(&url).await.expect("connect");
+    Migrator::new(dir.join("sqlite"))
+        .await
+        .expect("load")
+        .run(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{label} migrates: {e}"));
+    let (from, to, _) = renumbered().remove(0);
+    happyview::db::query(&format!(
+        "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = {from}"
+    ))
+    .execute(&pool)
+    .await
+    .expect("alter the checksum");
+    let row = |pool: AnyPool, version: String| async move {
+        let rows: Vec<(String, Vec<u8>)> = happyview::db::query_as(&format!(
+            "SELECT description, checksum FROM _sqlx_migrations WHERE version = {version}"
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("read");
+        rows
+    };
+    let before = row(pool.clone(), from.clone()).await;
+
+    let boot = tokio::spawn(async move {
+        happyview::db::connect(&url, happyview::db::DatabaseBackend::Sqlite)
+            .await
+            .close()
+            .await;
+    })
+    .await;
+    assert!(boot.is_err(), "a boot on an unrecognised row must fail");
+    assert_eq!(
+        row(pool.clone(), from).await,
+        before,
+        "the row stays where it was"
+    );
+    assert!(
+        row(pool.clone(), to).await.is_empty(),
+        "nothing is moved to the new version"
+    );
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Instances booting together on a stable branch's database all come up, and
+/// the stable migration is recorded once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn postgres_instances_booting_together_on_a_stable_database_all_boot() {
+    let (_, dir) = stable_migration_dirs().remove(0);
+    let ran = with_scratch_postgres("hv_stable_concurrent", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        Migrator::new(dir.join("postgres"))
+            .await
+            .expect("load")
+            .run(&pool)
+            .await
+            .expect("the stable branch migrates");
+        let boots = (0..4).map(|_| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                happyview::db::connect(&url, happyview::db::DatabaseBackend::Postgres)
+                    .await
+                    .close()
+                    .await;
+            })
+        });
+        for boot in futures::future::join_all(boots).await {
+            boot.expect("every instance migrates and boots");
+        }
+        let rows = applied(&pool).await;
+        for (from, to, description) in renumbered() {
+            let to: i64 = to.parse().unwrap();
+            let from: i64 = from.parse().unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|(_, d)| *d == description)
+                    .map(|(v, _)| *v)
+                    .collect::<Vec<_>>(),
+                vec![to]
+            );
+            assert!(rows.iter().any(|(v, d)| *v == from && *d != description));
+        }
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
