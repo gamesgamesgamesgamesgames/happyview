@@ -19,7 +19,10 @@ export function RecordsProgress({
   ...count
 }: RecordsCount & {
   label: string;
-  /** Running now: an unknown total pulses rather than sitting still. */
+  /**
+   * Running now: an unknown total pulses rather than sitting still. A row
+   * that isn't running and has no total to measure against has no bar.
+   */
   active: boolean;
   detail?: ReactNode;
 }) {
@@ -40,25 +43,29 @@ export function RecordsProgress({
           {` ${noun}`}
         </span>
       </div>
-      <div
-        role="progressbar"
-        aria-label={label}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={
-          fraction == null ? undefined : Math.round(fraction * 100)
-        }
-        className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
-      >
+      {(fraction != null || active) && (
         <div
-          className={`h-full rounded-full bg-blue-500 ${
-            fraction == null
-              ? `w-1/3 ${active ? "animate-pulse" : ""}`
-              : "transition-[width]"
-          }`}
-          style={fraction == null ? undefined : { width: `${fraction * 100}%` }}
-        />
-      </div>
+          role="progressbar"
+          aria-label={label}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={
+            fraction == null ? undefined : Math.round(fraction * 100)
+          }
+          className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+        >
+          <div
+            className={`h-full rounded-full bg-blue-500 ${
+              fraction == null
+                ? `w-1/3 ${active ? "animate-pulse" : ""}`
+                : "transition-[width]"
+            }`}
+            style={
+              fraction == null ? undefined : { width: `${fraction * 100}%` }
+            }
+          />
+        </div>
+      )}
       {detail && (
         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground tabular-nums">
           {detail}

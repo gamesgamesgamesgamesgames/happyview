@@ -14,6 +14,7 @@ import {
   hookDetail,
   hookStatsOf,
   executorProgress,
+  executorRanNothing,
   runByExecutor,
   runningLabel,
 } from "./records-progress";
@@ -1117,15 +1118,16 @@ function JobDetail({
   // Live while this instance holds the job; what it kept once it ended.
   const hookStats = job.hooks ?? job.hook_stats ?? null;
   // A finished job that only left a note, such as one whose collections all
-  // run as their own backfills, has no progress to show.
-  const nothingRan =
-    !isActive &&
-    !byExecutor &&
-    !replayView &&
-    !hookStats &&
-    Boolean(job.note) &&
-    (job.total_repos ?? 0) === 0 &&
-    (job.processed_repos ?? 0) === 0;
+  // run as their own backfills, has no progress to show; nor has a store
+  // pass that ran nothing.
+  const nothingRan = byExecutor
+    ? executorRanNothing(job, hookStats)
+    : !isActive &&
+      !replayView &&
+      !hookStats &&
+      Boolean(job.note) &&
+      (job.total_repos ?? 0) === 0 &&
+      (job.processed_repos ?? 0) === 0;
 
   const discoveredReached = hasReached("discovering_repos");
   const pdsReached = hasReached("resolving_pds");
