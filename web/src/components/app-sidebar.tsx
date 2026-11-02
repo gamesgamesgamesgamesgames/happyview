@@ -126,7 +126,7 @@ const integrationItems: NavItem[] = [
     requiredPermissions: ["scripts:read"],
   },
   {
-    title: "Script Performance",
+    title: "Script performance",
     url: "/dashboard/settings/scripts/performance",
     icon: IconGauge,
     requiredPermissions: ["metrics:read"],
@@ -275,7 +275,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   ].map((item) => item.url);
 
   // The longest matching entry wins, so a page nested under another entry's
-  // path (Script Performance under Scripts) lights only its own.
+  // path (Script performance under Scripts) lights only its own.
   function isActive(url: string) {
     if (url === "/dashboard") return pathname === "/dashboard";
     if (!pathname.startsWith(url)) return false;

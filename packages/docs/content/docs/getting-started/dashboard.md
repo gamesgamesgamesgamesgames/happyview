@@ -73,7 +73,7 @@ Register and manage third-party API clients. Each client gets an `hvc_…` clien
 
 ### Script performance
 
-Navigate to **Script Performance** to see how your scripts are running. It needs the `metrics:read` [permission](../guides/permissions.md), and the entry is hidden without it. Pick a window of 1 hour, 24 hours, 7 days or 30 days.
+Navigate to **Script performance** to see how your scripts are running. It needs the `metrics:read` [permission](../guides/permissions.md), and the entry is hidden without it. Pick a window of 1 hour, 24 hours, 7 days or 30 days.
 
 - **Scripts** lists every script that ran in the window: its runs, p50, p95 and max run time, errors and timeouts, peak memory, and the mean time spent in the script's own code and in the host calls it made. It is sorted by runs, and any column can be sorted.
 - Select a script to graph it over the window: runs, run time (p50 and p95, with max as a faint line) and errors and timeouts. **Where a run's time goes** splits a mean run into the script's part (its code and host calls, with the busiest host calls by name) and the platform's part (preparing the input, linking and allocating the instance, settling and teardown). This is how to tell a slow script from a slow platform.

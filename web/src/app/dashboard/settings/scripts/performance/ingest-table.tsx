@@ -86,7 +86,7 @@ export function IngestTable({
               </TableCell>
               <TableCell>
                 {row.script_share == null ? (
-                  <span className="text-xs text-muted-foreground">No hook</span>
+                  <span className="text-xs text-muted-foreground">No record script</span>
                 ) : (
                   <div className="flex flex-col gap-1">
                     <ShareBar scriptShare={row.script_share} />
