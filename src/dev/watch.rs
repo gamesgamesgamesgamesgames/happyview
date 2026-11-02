@@ -35,7 +35,7 @@ pub enum Change {
     /// Something in `PLUGIN_DIR`, or the directory itself, which hpy
     /// places plugins in. Only `happyview dev` watches it.
     Plugins,
-    /// `happyview.lock`, whose plugins load only at boot.
+    /// `happyview.lock`, which pins the plugins hpy places in `PLUGIN_DIR`.
     Lock,
 }
 
@@ -340,8 +340,6 @@ pub fn spawn_with(
 
     let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
-    // What hpy placed the plugins from, to tell a real change from a rewrite.
-    let lock_at_boot = std::fs::read(root.join("happyview.lock")).ok();
     tokio::spawn(async move {
         // The boot build is already installed; its types come first, in the
         // same task as every later pass so two never write at once.
@@ -349,16 +347,8 @@ pub fn spawn_with(
             out(line);
         }
         while let Some(batch) = next_batch(&mut rx).await {
-            let lines = handle_batch(
-                &state,
-                &session,
-                &rewatch,
-                &plugins,
-                &mut declared,
-                lock_at_boot.as_deref(),
-                batch,
-            )
-            .await;
+            let lines =
+                handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
             for line in lines {
                 out(line);
             }
@@ -446,9 +436,9 @@ fn watch_dir_again<W: Watch>(rewatch: &Weak<Mutex<W>>, path: &Path, recursive: R
 
 /// One batch's work: watch again any directory that was recreated, load
 /// and unload plugins if `PLUGIN_DIR` changed, reload the config if it
-/// changed, say so if the lock changed, then build. Answers the plugins'
-/// line, if they changed, the lock's, if it needs a restart, and the
-/// build's.
+/// changed, say which declared plugins still wait for a restart, then build.
+/// Answers the plugins' line, if they changed, the restart line, if any
+/// declared key is unserved, and the build's.
 ///
 /// `plugins` is the canonical `PLUGIN_DIR` the watcher uses; the registry is
 /// synced against `state.config.plugin_dir` as given, since that is the
@@ -459,32 +449,35 @@ async fn handle_batch<W: Watch>(
     rewatch: &Weak<Mutex<W>>,
     plugins: &Path,
     declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
-    lock_at_boot: Option<&[u8]>,
     batch: Batch,
 ) -> Vec<String> {
     watch_again(rewatch, &session.root, batch.src_dir, batch.build_dir);
-    let mut lines = Vec::new();
-    if batch.plugins {
+    let synced = if batch.plugins {
         // The directory may have been created or replaced since it was
         // last watched.
         watch_dir_again(rewatch, plugins, RecursiveMode::NonRecursive);
-        lines.extend(
-            crate::dev::plugins::sync(&state.plugin_registry, &state.config.plugin_dir).await,
-        );
-    }
-    if batch.lock {
-        let now = std::fs::read(session.root.join("happyview.lock")).ok();
-        lines.extend(crate::dev::reload::lock_notice(
-            lock_at_boot,
-            now.as_deref(),
-        ));
-    }
+        crate::dev::plugins::sync(&state.plugin_registry, &state.config.plugin_dir).await
+    } else {
+        None
+    };
     if batch.config
         && let Err(e) = crate::dev::reload::reload(state, session, declared).await
     {
         // The snapshot build below reads the same file and reports the same
         // error with the standing line.
         tracing::debug!("happyview.toml did not load: {e}");
+    }
+    let mut lines = Vec::new();
+    if batch.plugins || batch.lock || batch.config {
+        // After the reload, so the keys judged are the ones now declared.
+        lines = crate::dev::plugins::settle(
+            &state.plugin_registry,
+            &state.config.plugin_dir,
+            &session.root,
+            declared.as_deref(),
+            synced,
+        )
+        .await;
     }
     lines.push(rebuild(state, &session.root).await);
     lines
@@ -945,7 +938,6 @@ mod tests {
             &rewatch,
             &plugins,
             &mut declared,
-            None,
             src_and_build,
         )
         .await;
@@ -962,7 +954,6 @@ mod tests {
             &rewatch,
             &plugins,
             &mut declared,
-            None,
             Batch::default(),
         )
         .await;
@@ -1015,16 +1006,7 @@ mod tests {
             plugins: true,
             ..Batch::default()
         };
-        let lines = handle_batch(
-            &state,
-            &session,
-            &rewatch,
-            &plugins,
-            &mut declared,
-            None,
-            batch,
-        )
-        .await;
+        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0], "plugins: loaded happyview-db 1.0.0-alpha.7");
         assert_eq!(
@@ -1038,17 +1020,130 @@ mod tests {
             plugins: true,
             ..Batch::default()
         };
-        let lines = handle_batch(
-            &state,
-            &session,
-            &rewatch,
-            &plugins,
-            &mut declared,
-            None,
-            batch,
-        )
-        .await;
+        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
         assert_eq!(lines[0], "plugins: removed happyview-db");
         assert!(state.plugin_registry.get("happyview-db").await.is_none());
+    }
+
+    fn place_db(entry: &Path) {
+        std::fs::create_dir_all(entry).unwrap();
+        std::fs::write(
+            entry.join("plugin.wasm"),
+            wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+        )
+        .unwrap();
+        // The manifest last, so the entry loads only once it is whole.
+        std::fs::write(
+            entry.join("manifest.json"),
+            serde_json::json!({
+                "id": "happyview-db", "name": "db", "version": "1.0.0-alpha.7",
+                "api_version": "2", "plugin_type": "library", "capabilities": [],
+                "wasm_file": "plugin.wasm",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A project that declares `happyview.db`, with a lock that pins it, and
+    /// an empty `PLUGIN_DIR`.
+    async fn declaring_db() -> (
+        tempfile::TempDir,
+        PathBuf,
+        AppState,
+        DevSession,
+        Option<Arc<crate::config::project::ProjectConfig>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let plugins = root.join(".happyview/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(
+            root.join("happyview.lock"),
+            r#"version = 2
+
+[[plugin]]
+id = "happyview-db"
+kind = "library"
+keys = ["happyview.db"]
+version = "1.0.0-alpha.7"
+"#,
+        )
+        .unwrap();
+        let project: crate::config::project::ProjectConfig = toml::from_str(
+            r#"[libraries]
+"happyview.db" = { did = "did:plc:x", name = "happyview-db", channel = "alpha" }
+"#,
+        )
+        .unwrap();
+
+        let mut config = crate::test_support::test_config(crate::db::DatabaseBackend::Sqlite);
+        config.plugin_dir = plugins.clone();
+        let state = crate::state::state_with_pool_on(
+            config,
+            crate::test_support::migrated_memory_pool().await,
+            crate::db::DatabaseBackend::Sqlite,
+        );
+        let session = DevSession {
+            root: root.clone(),
+            public_url: String::new(),
+            secrets: crate::dev::secrets::load_or_create(&root.join(".happyview")).unwrap(),
+            watch_mode: WatchMode::Native,
+        };
+        (dir, plugins, state, session, Some(Arc::new(project)))
+    }
+
+    /// `hpy happyview add` writes the lock, then places the plugin. A batch
+    /// that sees only the lock waits for the plugin, loads it, and never
+    /// says a restart is needed.
+    #[tokio::test]
+    async fn a_plugin_placed_just_after_its_lock_is_loaded_not_flagged() {
+        let (_dir, plugins, state, session, mut declared) = declaring_db().await;
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let rewatch = Arc::downgrade(&recorded);
+
+        let entry = plugins.join("happyview-db");
+        let placing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            place_db(&entry);
+        });
+        let batch = Batch {
+            lock: true,
+            ..Batch::default()
+        };
+        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+        placing.await.unwrap();
+        assert_eq!(lines[0], "plugins: loaded happyview-db 1.0.0-alpha.7");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("restart required")),
+            "{lines:?}"
+        );
+
+        // The plugin's own directory event, arriving after, has nothing
+        // left to say.
+        let batch = Batch {
+            plugins: true,
+            ..Batch::default()
+        };
+        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+        assert_eq!(lines.len(), 1, "only the build's line: {lines:?}");
+    }
+
+    /// A key the lock pins but nothing places, as under an hpy that doesn't
+    /// place on `add`, still says a restart is needed.
+    #[tokio::test]
+    async fn a_locked_plugin_that_never_arrives_needs_a_restart() {
+        let (_dir, plugins, state, session, mut declared) = declaring_db().await;
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let rewatch = Arc::downgrade(&recorded);
+        let batch = Batch {
+            lock: true,
+            config: false,
+            ..Batch::default()
+        };
+        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "restart required to load: happyview.db");
     }
 }

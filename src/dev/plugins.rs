@@ -213,6 +213,117 @@ pub async fn sync(registry: &PluginRegistry, dir: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| format!("plugins: {}", parts.join("; ")))
 }
 
+/// A `happyview.lock` plugin, as much of it as says what it serves.
+#[derive(Debug, serde::Deserialize)]
+struct Locked {
+    id: String,
+    version: String,
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Lock {
+    #[serde(default, rename = "plugin")]
+    plugins: Vec<Locked>,
+}
+
+/// A plugin the registry holds: its version, and whether it came from
+/// `PLUGIN_DIR`. One from elsewhere is never replaced live, so it serves
+/// its keys whatever the lock pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held<'a> {
+    pub version: &'a str,
+    pub from_dir: bool,
+}
+
+/// The keys `happyview.toml` declares under `[interpreters]` and
+/// `[libraries]` that no loaded plugin serves as `lock` pins it: a key the
+/// lock doesn't name yet, or one whose plugin isn't loaded at the locked
+/// version. A restart of `hpy happyview dev` resolves and places them.
+///
+/// `None` for a lock that is missing or unreadable, as under a plain
+/// `happyview dev`: without one there is nothing to judge by.
+pub fn unserved(
+    declared: &[&str],
+    lock: Option<&str>,
+    held: &BTreeMap<&str, Held<'_>>,
+) -> Option<Vec<String>> {
+    let lock: Lock = toml::from_str(lock?).ok()?;
+    let served = |key: &str| {
+        lock.plugins
+            .iter()
+            .filter(|p| p.keys.iter().any(|k| k == key))
+            .any(|p| {
+                held.get(p.id.as_str())
+                    .is_some_and(|h| !h.from_dir || h.version == p.version)
+            })
+    };
+    Some(
+        declared
+            .iter()
+            .filter(|key| !served(key))
+            .map(|key| key.to_string())
+            .collect(),
+    )
+}
+
+/// How long to wait for `hpy happyview add`, which writes the lock and
+/// then places what it pins, before saying a plugin isn't loaded.
+const PLACING: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// After a change to the plugins, the lock or `happyview.toml`: the
+/// plugins' line, if they changed, and a restart line for any declared key
+/// no loaded plugin serves. When something is unserved, waits for hpy to
+/// finish placing and syncs once more before saying so, so a plugin that
+/// is on its way only ever gets its "loaded" line.
+pub async fn settle(
+    registry: &PluginRegistry,
+    dir: &Path,
+    root: &Path,
+    project: Option<&crate::config::project::ProjectConfig>,
+    synced: Option<String>,
+) -> Vec<String> {
+    let declared: Vec<&str> = project.map_or_else(Vec::new, |p| {
+        p.interpreters
+            .keys()
+            .chain(p.libraries.keys())
+            .map(String::as_str)
+            .collect()
+    });
+    let check = || async {
+        let lock = std::fs::read_to_string(root.join("happyview.lock")).ok();
+        let plugins = registry.list().await;
+        let held: BTreeMap<&str, Held<'_>> = plugins
+            .iter()
+            .map(|p| {
+                let from_dir =
+                    matches!(&p.source, PluginSource::File { path } if path.starts_with(dir));
+                (
+                    p.info.id.as_str(),
+                    Held {
+                        version: p.info.version.as_str(),
+                        from_dir,
+                    },
+                )
+            })
+            .collect();
+        unserved(&declared, lock.as_deref(), &held).unwrap_or_default()
+    };
+
+    let mut lines: Vec<String> = synced.into_iter().collect();
+    let mut missing = check().await;
+    if !missing.is_empty() {
+        tokio::time::sleep(PLACING).await;
+        lines.extend(sync(registry, dir).await);
+        missing = check().await;
+    }
+    if !missing.is_empty() {
+        lines.push(format!("restart required to load: {}", missing.join(", ")));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +334,78 @@ mod tests {
 
     fn ids(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    const LOCK: &str = r#"
+version = 2
+
+[[plugin]]
+id = "happyview-db"
+kind = "library"
+keys = ["happyview.db"]
+version = "1.0.0-alpha.7"
+
+[[plugin]]
+id = "happyview-lua"
+kind = "interpreter"
+keys = ["lua"]
+version = "1.0.0-alpha.8"
+"#;
+
+    fn held<'a>(list: &[(&'a str, &'a str, bool)]) -> BTreeMap<&'a str, Held<'a>> {
+        list.iter()
+            .map(|&(id, version, from_dir)| (id, Held { version, from_dir }))
+            .collect()
+    }
+
+    #[test]
+    fn a_key_is_served_by_its_locked_plugin_at_the_locked_version() {
+        let loaded = held(&[
+            ("happyview-db", "1.0.0-alpha.7", true),
+            ("happyview-lua", "1.0.0-alpha.8", true),
+        ]);
+        assert_eq!(
+            unserved(&["lua", "happyview.db"], Some(LOCK), &loaded),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn a_missing_or_stale_plugin_leaves_its_key_unserved() {
+        let loaded = held(&[
+            ("happyview-db", "1.0.0-alpha.6", true),
+            ("happyview-lua", "1.0.0-alpha.8", true),
+        ]);
+        assert_eq!(
+            unserved(&["lua", "happyview.db"], Some(LOCK), &loaded),
+            Some(vec!["happyview.db".to_string()])
+        );
+        let loaded = held(&[("happyview-lua", "1.0.0-alpha.8", true)]);
+        assert_eq!(
+            unserved(&["happyview.db"], Some(LOCK), &loaded),
+            Some(vec!["happyview.db".to_string()])
+        );
+        // Declared, but not resolved into the lock yet.
+        assert_eq!(
+            unserved(&["happyview.record"], Some(LOCK), &loaded),
+            Some(vec!["happyview.record".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_plugin_from_elsewhere_serves_its_key_at_any_version() {
+        let loaded = held(&[("happyview-db", "0.9.0", false)]);
+        assert_eq!(
+            unserved(&["happyview.db"], Some(LOCK), &loaded),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn without_a_readable_lock_nothing_is_judged() {
+        let loaded = held(&[]);
+        assert_eq!(unserved(&["lua"], None, &loaded), None);
+        assert_eq!(unserved(&["lua"], Some("not [ toml"), &loaded), None);
     }
 
     #[test]
