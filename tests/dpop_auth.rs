@@ -586,6 +586,91 @@ async fn provision_and_register(
     (provision_id, dpop_key, session_id)
 }
 
+/// The body's `pds_url` is the app's word. The session is stored with the PDS
+/// resolved from the DID document, which verification reached, so an app
+/// cannot point a user's writes, or the index rows they mirror, elsewhere.
+#[tokio::test]
+#[serial]
+async fn test_register_session_stores_the_resolved_pds_not_the_bodys() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:resolvedpds";
+
+    provision_and_register(&app, &client_key, &client_secret, did, "token-resolved").await;
+
+    let (pds_url,): (Option<String>,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT pds_url FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        pds_url.as_deref(),
+        Some(format!("{}/pds/{did}", app.mock_server.uri()).as_str()),
+        "the body named https://pds.example.com"
+    );
+}
+
+/// An issuer the user's PDS does not name is refused before the session is
+/// stored: a refresh or a revocation would send its tokens there.
+#[tokio::test]
+#[serial]
+async fn test_register_session_refuses_an_issuer_the_pds_does_not_name() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:unnamedissuer";
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let provision_id = response_json(key_resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    app.mock_session_verification(did, did).await;
+    app.mock_pds_names_issuer(did, "https://the-real-issuer.example")
+        .await;
+
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": did,
+            "access_token": "token-unnamed-issuer",
+            "scopes": "atproto",
+            "issuer": "https://attacker.example",
+        }),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let (count,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
 #[tokio::test]
 #[serial]
 async fn test_multi_device_sessions_coexist() {

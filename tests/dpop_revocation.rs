@@ -80,6 +80,7 @@ async fn logged_in(
     let dpop_key = key_body["dpop_key"].clone();
 
     app.mock_session_verification(did, did).await;
+    app.mock_pds_names_issuer(did, &auth_server.uri()).await;
 
     let access_token = "revocation-access-token".to_string();
     let session_req = post_json_with_headers(

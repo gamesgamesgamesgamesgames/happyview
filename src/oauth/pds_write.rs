@@ -925,12 +925,24 @@ async fn verify_issuer(
     did: &str,
     issuer: Option<&str>,
 ) -> Result<(), AppError> {
-    let refused =
-        || AppError::Forbidden("the session's authorization server is not the account's".into());
-    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
-    let issuer = issuer.ok_or_else(refused)?;
-
+    let issuer = issuer.ok_or_else(issuer_refused)?;
     let pds = resolve_pds_from_did(http, plc_url, did).await?;
+    verify_issuer_of(http, &pds, issuer).await
+}
+
+fn issuer_refused() -> AppError {
+    AppError::Forbidden("the session's authorization server is not the account's".into())
+}
+
+/// [`verify_issuer`] for a PDS already resolved from the account's DID
+/// document: `issuer` must be listed by `pds` and name itself.
+pub(crate) async fn verify_issuer_of(
+    http: &reqwest::Client,
+    pds: &str,
+    issuer: &str,
+) -> Result<(), AppError> {
+    let refused = issuer_refused;
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
     let resource_url = format!(
         "{}/.well-known/oauth-protected-resource",
         pds.trim_end_matches('/')
@@ -1302,15 +1314,15 @@ fn generate_dpop_proof_inner(
 /// provisioned key the token is bound to. The PDS reports which DID the token
 /// actually belongs to; the caller compares it against the claimed `did`.
 ///
-/// Returns the DID the PDS reports for the token, or an auth error if the token
-/// is rejected.
+/// Returns the DID the PDS reports for the token and the PDS URL resolved for
+/// `did`, or an auth error if the token is rejected.
 pub async fn verify_access_token_did(
     http: &reqwest::Client,
     plc_url: &str,
     private_jwk: &serde_json::Value,
     did: &str,
     access_token: &str,
-) -> Result<String, AppError> {
+) -> Result<(String, String), AppError> {
     let pds_url = resolve_pds_from_did(http, plc_url, did).await?;
     let target_url = format!(
         "{}/xrpc/com.atproto.server.getSession",
@@ -1335,7 +1347,7 @@ pub async fn verify_access_token_did(
             .map_err(|e| AppError::Internal(format!("invalid getSession response: {e}")))?;
         return body["did"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(|s| (s.to_string(), pds_url.clone()))
             .ok_or_else(|| AppError::Auth("getSession response missing did".into()));
     }
 
