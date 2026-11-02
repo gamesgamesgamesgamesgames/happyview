@@ -40,13 +40,11 @@ const QUERY_LEXICON = {
 async function seedLexicon(
   request: import("@playwright/test").APIRequestContext,
   lexiconJson: object,
-  targetCollection?: string,
 ) {
   const resp = await request.post("/admin/lexicons", {
     data: {
       lexicon_json: lexiconJson,
       backfill: false,
-      ...(targetCollection ? { target_collection: targetCollection } : {}),
     },
   });
   if (!resp.ok()) {
@@ -68,7 +66,7 @@ test.describe("Lexicon Services", () => {
     await loginAsTestAdmin(page);
 
     await seedLexicon(page.request, RECORD_LEXICON);
-    await seedLexicon(page.request, QUERY_LEXICON, RECORD_LEXICON.id);
+    await seedLexicon(page.request, QUERY_LEXICON);
   });
 
   test.afterEach(async ({ page }) => {

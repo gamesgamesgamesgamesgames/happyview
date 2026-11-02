@@ -482,6 +482,11 @@ pub(super) async fn codemod_apply(
         source: draft,
     } = body.map(|Json(b)| b).unwrap_or_default();
     let kind = ScriptKind::from_trigger_id(&id);
+    let collection = codemod::v2_collection(&state.db, state.db_backend, &id)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("could not read the script's v2 collection: {e}"))
+        })?;
 
     if let Some(draft) = draft {
         if apply {
@@ -489,7 +494,7 @@ pub(super) async fn codemod_apply(
                 "apply rewrites the stored script; a supplied source is preview-only".to_string(),
             ));
         }
-        let rewrite = rewrite_lua(&draft, kind)?;
+        let rewrite = rewrite_lua(&draft, kind, collection.as_deref())?;
         return Ok(Json(CodemodResponse {
             changed: rewrite.source != draft,
             source: rewrite.source,
@@ -511,7 +516,7 @@ pub(super) async fn codemod_apply(
         ));
     }
 
-    let rewrite = rewrite_lua(&existing.body, kind)?;
+    let rewrite = rewrite_lua(&existing.body, kind, collection.as_deref())?;
     let changed = rewrite.source != existing.body;
     let marker_count = rewrite.notes.len();
 
@@ -581,8 +586,12 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
     ))
 }
 
-fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppError> {
-    codemod::rewrite(source, kind)
+fn rewrite_lua(
+    source: &str,
+    kind: ScriptKind,
+    collection: Option<&str>,
+) -> Result<codemod::Rewrite, AppError> {
+    codemod::rewrite_for(source, kind, collection)
         .map_err(|e| AppError::BadRequest(format!("script did not parse as Lua: {e}")))
 }
 

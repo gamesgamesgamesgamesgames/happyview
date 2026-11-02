@@ -27,7 +27,6 @@ async function seedLexicon(
     data: {
       lexicon_json: TEST_LEXICON,
       backfill: false,
-      target_collection: TEST_NSID,
     },
   });
   if (!resp.ok()) {

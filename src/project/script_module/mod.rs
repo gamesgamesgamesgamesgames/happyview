@@ -381,7 +381,7 @@ fn error(path: &Path, message: String) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{ParsedLexicon, ProcedureAction};
+    use crate::lexicon::ParsedLexicon;
     use crate::plugin::capabilities::PluginCapability;
 
     /// A module that answers nothing useful but carries the given handler
@@ -416,8 +416,6 @@ mod tests {
         let parsed = ParsedLexicon::parse(
             serde_json::json!({"lexicon": 1, "id": id, "defs": {"main": main}}),
             1,
-            None,
-            ProcedureAction::Upsert,
             None,
         )
         .unwrap();

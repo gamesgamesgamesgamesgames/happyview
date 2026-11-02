@@ -11,7 +11,7 @@ use crate::AppState;
 use crate::catalog::{CatalogError, LexiconCatalog, LexiconWrite};
 use crate::db::DatabaseBackend;
 use crate::error::AppError;
-use crate::lexicon::{LexiconType, ProcedureAction};
+use crate::lexicon::LexiconType;
 use crate::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
 
 use super::auth::UserAuth;
@@ -74,7 +74,6 @@ pub(crate) async fn track_network_lexicon(
     backend: DatabaseBackend,
     lexicons: &LexiconCatalog,
     nsid: &str,
-    target_collection: Option<String>,
     backfill: bool,
     indexed: Option<bool>,
 ) -> Result<TrackedNetworkLexicon, AppError> {
@@ -99,8 +98,6 @@ pub(crate) async fn track_network_lexicon(
             LexiconWrite {
                 lexicon_json,
                 backfill,
-                target_collection,
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some(authority_did.clone()),
                 indexed,
@@ -136,7 +133,6 @@ pub(super) async fn add(
         state.db_backend,
         &state.lexicons,
         nsid,
-        body.target_collection.clone(),
         body.backfill,
         body.indexed,
     )
@@ -197,7 +193,6 @@ pub(super) async fn list(
             declared: declared.contains(&l.id),
             nsid: l.id,
             authority_did: l.authority_did.unwrap_or_default(),
-            target_collection: l.target_collection,
             last_fetched_at: l.last_fetched_at,
             created_at: l.created_at.unwrap_or_default(),
             indexed: l.indexed,
@@ -435,8 +430,6 @@ mod tests {
                 LexiconWrite {
                     lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,
@@ -473,8 +466,6 @@ mod tests {
                 LexiconWrite {
                     lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,

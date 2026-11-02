@@ -277,8 +277,6 @@ async fn put_manual(s: &happyview::AppState, nsid: &str) {
             happyview::catalog::LexiconWrite {
                 lexicon_json: record_lexicon(nsid),
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,
@@ -552,8 +550,6 @@ async fn publish_refuses_a_network_lexicon_even_when_a_rule_matches() {
             happyview::catalog::LexiconWrite {
                 lexicon_json: record_lexicon(nsid),
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some("did:plc:other".into()),
                 indexed: true,
@@ -943,8 +939,6 @@ async fn overview_lists_a_manual_lexicon_with_no_rule_and_omits_network_ones() {
             happyview::catalog::LexiconWrite {
                 lexicon_json: record_lexicon("com.other.theirs"),
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: Some("did:plc:other".into()),
                 indexed: true,

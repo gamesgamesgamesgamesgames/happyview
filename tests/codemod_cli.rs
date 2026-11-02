@@ -68,6 +68,40 @@ fn stdin_mode_on_a_script_with_a_marker_exits_2_and_reports_it_on_stderr() {
     assert!(stderr.contains("line 2"), "stderr: {stderr}");
 }
 
+/// A query's v2 `collection` is written as the NSID it is given, and left
+/// marked when it is given none.
+#[test]
+fn stdin_mode_writes_the_collection_it_is_given() {
+    let source = "function handle()\n  return { listing = collection }\nend\n";
+
+    let output = run_stdin(
+        &[
+            "--stdin",
+            "--kind",
+            "query",
+            "--collection",
+            "app.example.thing",
+        ],
+        source,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("listing = \"app.example.thing\""),
+        "stdout: {stdout}"
+    );
+
+    let output = run_stdin(&["--stdin", "--kind", "query"], source);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no collection"), "stderr: {stderr}");
+}
+
 #[test]
 fn file_mode_reads_the_named_file_and_exits_2_on_a_marker() {
     let dir = std::env::temp_dir().join(format!(

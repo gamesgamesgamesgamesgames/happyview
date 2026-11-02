@@ -49,7 +49,7 @@ use crate::test_support::{memory_pool, test_state_with_pool};
 use wiremock::matchers::{method, path, path_regex, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 
 /// With automatic backfill off, nothing is queued: no job row, no task.
 #[tokio::test]
@@ -328,14 +328,7 @@ fn record_lexicon(nsid: &str) -> (serde_json::Value, ParsedLexicon) {
         "id": nsid,
         "defs": {"main": {"type": "record", "key": "tid"}},
     });
-    let parsed = ParsedLexicon::parse(
-        lexicon.clone(),
-        1,
-        Some(nsid.to_string()),
-        ProcedureAction::Upsert,
-        None,
-    )
-    .expect("parse lexicon");
+    let parsed = ParsedLexicon::parse(lexicon.clone(), 1, None).expect("parse lexicon");
     (lexicon, parsed)
 }
 
@@ -354,8 +347,6 @@ async fn pipeline_state(mock: &MockServer, collections: &[&str]) -> AppState {
                 crate::catalog::LexiconWrite {
                     lexicon_json: record_lexicon(nsid).0,
                     backfill: true,
-                    target_collection: Some(nsid.to_string()),
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,

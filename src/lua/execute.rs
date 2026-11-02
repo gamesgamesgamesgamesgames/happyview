@@ -176,7 +176,6 @@ pub async fn execute_procedure_script(
         caller_did = %claims.did(),
     );
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source and input for error logging before anything is consumed.
     let script_source = script.body.clone();
@@ -256,7 +255,7 @@ pub async fn execute_procedure_script(
             caller_did: Some(claims.did()),
             has_pds_auth,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: Some(params),
             delegate_did,
             space: space.as_ref(),
@@ -352,7 +351,6 @@ pub async fn execute_query_script(
     let backend = state.db_backend;
     let span = tracing::info_span!("script.execute", method = method, script_type = "query",);
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source for error logging.
     let script_source = script.body.clone();
@@ -374,7 +372,7 @@ pub async fn execute_query_script(
             caller_did: claims.map(|c| c.did()),
             has_pds_auth: false,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: None,
             delegate_did: None,
             space: space.as_ref(),
@@ -455,7 +453,7 @@ pub async fn execute_query_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::lexicon::LexiconType;
     use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
     use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
     use axum::response::IntoResponse;
@@ -471,8 +469,6 @@ mod tests {
             record_schema: None,
             raw: serde_json::json!({ "id": "com.example.probe" }),
             revision: 1,
-            target_collection: Some("com.example.probe".to_string()),
-            action: ProcedureAction::Upsert,
             token_cost: None,
             space_type: None,
             space_name: None,

@@ -53,7 +53,6 @@ async fn seed_query_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
@@ -81,7 +80,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
@@ -1077,7 +1075,6 @@ async fn static_analysis_persistence() {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await

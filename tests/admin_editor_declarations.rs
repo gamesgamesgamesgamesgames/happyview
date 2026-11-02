@@ -62,8 +62,6 @@ async fn put_lexicon(app: &TestApp, id: &str) {
                         "schema": { "type": "object", "properties": { "n": { "type": "integer" } } } } } }
                 }),
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

@@ -958,7 +958,6 @@ async fn seed_procedure_lexicon(app: &common::app::TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": common::fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await

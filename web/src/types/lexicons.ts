@@ -5,8 +5,6 @@ export interface LexiconSummary {
   backfill: boolean;
   /** `false` when records are not collected from the network. */
   indexed: boolean;
-  action: string | null;
-  target_collection: string | null;
   source: string;
   authority_did: string | null;
   last_fetched_at: string | null;

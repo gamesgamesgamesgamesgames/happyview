@@ -46,16 +46,15 @@ async fn deleting_a_lexicon_can_also_delete_its_records() {
     assert_eq!(counted["collection"], GAME, "{counted}");
     assert_eq!(counted["count"], 0, "an empty collection counts zero");
 
-    // A query lexicon stores nothing of its own: it reads the record
-    // lexicon's collection through target_collection. Offering to delete
-    // "its" records would delete another lexicon's, so it is refused...
+    // A query lexicon stores nothing of its own: the records its script reads
+    // are a record lexicon's. Offering to delete "its" records would delete
+    // another lexicon's, so it is refused...
     let (status, body) = app
         .post_json_status(
             "/admin/lexicons",
             json!({
                 "lexicon_json": fixtures::list_games_query_lexicon(),
                 "backfill": false,
-                "target_collection": GAME,
             }),
         )
         .await;
@@ -67,10 +66,6 @@ async fn deleting_a_lexicon_can_also_delete_its_records() {
     assert_eq!(status, 400, "{body}");
     let message = body["error"].as_str().unwrap_or_default();
     assert!(message.contains("query"), "{body}");
-    assert!(
-        message.contains(GAME),
-        "the refusal should name whose records those are: {body}"
-    );
 
     // ...and the refusal must leave the lexicon alone. Removing it and then
     // refusing would orphan exactly what this route exists to tidy up.

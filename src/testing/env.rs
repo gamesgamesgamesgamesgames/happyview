@@ -392,8 +392,6 @@ mod tests {
                 "defs": { "main": { "type": "query" } },
             }),
             backfill: false,
-            target_collection: None,
-            action: crate::lexicon::ProcedureAction::Upsert,
             token_cost: None,
             authority_did: None,
             indexed: true,

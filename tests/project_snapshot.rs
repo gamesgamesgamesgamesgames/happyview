@@ -83,8 +83,8 @@ async fn a_project_query_is_served_by_its_file_with_its_overrides() {
         sent["context"]["trigger"],
         "xrpc.query:com.example.project.getThing"
     );
-    // From happyview.toml, not the lexicon file.
-    assert_eq!(sent["context"]["collection"], "com.example.project.thing");
+    // A query's script names its collection; nothing supplies one.
+    assert!(sent["context"]["collection"].is_null(), "{sent}");
 
     assert!(
         app.state

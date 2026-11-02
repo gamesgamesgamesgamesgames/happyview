@@ -31,7 +31,6 @@ import {
   ComboboxItem,
   ComboboxList,
 } from "@/components/ui/combobox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -52,7 +51,6 @@ export default function AddLexiconPage() {
 
   // Local state
   const [json, setJson] = useState(LEXICON_TEMPLATE);
-  const [localTargetCollection, setLocalTargetCollection] = useState("");
   const [backfill, setBackfill] = useState(true);
   const [indexed, setIndexed] = useState(true);
 
@@ -63,7 +61,6 @@ export default function AddLexiconPage() {
 
   // Network state
   const [nsid, setNsid] = useState("");
-  const [networkTargetCollection, setNetworkTargetCollection] = useState("");
   const [resolved, setResolved] = useState<{
     nsid: string;
     type: string | undefined;
@@ -120,8 +117,6 @@ export default function AddLexiconPage() {
     return null;
   }, [json]);
 
-  const showLocalTargetCollection =
-    localMainType === "query" || localMainType === "procedure";
   const prevType = useRef(localMainType);
   useEffect(() => {
     if (prevType.current !== localMainType) {
@@ -185,9 +180,6 @@ export default function AddLexiconPage() {
     };
   }, [nsid, canSuggest]);
 
-  const showNetworkTargetCollection =
-    mainType === "query" || mainType === "procedure";
-
   async function handleUploadLocal() {
     setError(null);
     setIssues(null);
@@ -223,9 +215,6 @@ export default function AddLexiconPage() {
         nsid,
         backfill: mainType === "record" && indexed && backfill,
         indexed: mainType === "record" ? indexed : undefined,
-        target_collection: showNetworkTargetCollection
-          ? networkTargetCollection || undefined
-          : undefined,
       });
       router.push(`/dashboard/lexicons/${encodeURIComponent(added.nsid)}`);
     } catch (e: unknown) {
@@ -276,23 +265,6 @@ export default function AddLexiconPage() {
                   ))}
                 </ul>
               )}
-
-              {/* Metadata fields */}
-              {/* <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {showLocalTargetCollection && (
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="target-collection">
-                      Record Collection (optional)
-                    </Label>
-                    <Input
-                      id="target-collection"
-                      value={localTargetCollection}
-                      onChange={(e) => setLocalTargetCollection(e.target.value)}
-                      placeholder="com.example.record"
-                    />
-                  </div>
-                )}
-              </div> */}
 
               {/* Code panels */}
               <CodePanels
@@ -388,22 +360,6 @@ export default function AddLexiconPage() {
                     </ComboboxContent>
                   </Combobox>
                 </div>
-
-                {showNetworkTargetCollection && (
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="nl-target-collection">
-                      Target Collection (optional)
-                    </Label>
-                    <Input
-                      id="nl-target-collection"
-                      value={networkTargetCollection}
-                      onChange={(e) =>
-                        setNetworkTargetCollection(e.target.value)
-                      }
-                      placeholder="com.example.record"
-                    />
-                  </div>
-                )}
               </div>
 
               {resolving && (

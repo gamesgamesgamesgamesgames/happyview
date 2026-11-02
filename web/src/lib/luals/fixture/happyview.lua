@@ -7,7 +7,6 @@
 ---@field env table<string, string> The script variables
 ---@field caller_did? string The caller's DID
 ---@field method string The XRPC method's NSID
----@field collection string The record collection this method operates on
 ---@field space? { uri: string, id: string, did: string, authority_did: string, spaceType: string, skey: string } The space the request is scoped to
 
 --- ctx for an XRPC procedure
@@ -17,7 +16,6 @@
 ---@field env table<string, string> The script variables
 ---@field caller_did string The caller's DID
 ---@field method string The XRPC method's NSID
----@field collection string The record collection this method operates on
 ---@field params table<string, any> The query parameters the request carried
 ---@field delegate_did? string|nil The account the caller is acting for, when it delegated
 ---@field space? { uri: string, id: string, did: string, authority_did: string, spaceType: string, skey: string } The space the request is scoped to
@@ -28,7 +26,7 @@
 ---@field has_pds_auth boolean Whether library calls can act as the caller on their PDS
 ---@field env table<string, string> The script variables
 ---@field caller_did string The record's author
----@field collection string The record collection this method operates on
+---@field collection string The record's collection NSID
 
 --- ctx for a label script
 ---@class happyview.LabelCtx

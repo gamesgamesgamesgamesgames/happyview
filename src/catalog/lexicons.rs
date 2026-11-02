@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use super::{CatalogError, Entry, Layer, lexicon_rows};
 use crate::db::DatabaseBackend;
-use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
+use crate::lexicon::{LexiconType, ParsedLexicon};
 use crate::project::{ProjectLexicon, SharedSnapshot, shared_empty};
 
 /// A stored row's parsed copy. A row is manual or network, never both: the
@@ -64,8 +64,6 @@ impl From<&StoredLexicon> for NetworkLexicon {
 pub struct LexiconWrite {
     pub lexicon_json: Value,
     pub backfill: bool,
-    pub target_collection: Option<String>,
-    pub action: ProcedureAction,
     pub token_cost: Option<i32>,
     /// The DID the NSID resolved to. Required by `put_network`, ignored by
     /// `put_manual`.
@@ -90,8 +88,6 @@ impl LexiconWrite {
         ParsedLexicon::parse(
             self.lexicon_json.clone(),
             revision,
-            self.target_collection.clone(),
-            self.action.clone(),
             self.token_cost.map(|c| c as u32),
         )
         .map_err(|e| CatalogError::Invalid(format!("failed to parse lexicon: {e}")))
@@ -111,8 +107,6 @@ pub struct LexiconListing {
     pub lexicon_json: Value,
     pub revision: i32,
     pub backfill: bool,
-    pub action: Option<String>,
-    pub target_collection: Option<String>,
     pub authority_did: Option<String>,
     pub last_fetched_at: Option<String>,
     pub created_at: Option<String>,
@@ -133,8 +127,6 @@ impl LexiconListing {
             id: row.id,
             revision: row.revision,
             backfill: row.backfill,
-            action: row.action,
-            target_collection: row.target_collection,
             authority_did: row.authority_did,
             last_fetched_at: row.last_fetched_at,
             created_at: Some(row.created_at),
@@ -153,8 +145,6 @@ impl LexiconListing {
             lexicon_json: lex.parsed.raw.clone(),
             revision: lex.parsed.revision,
             backfill: lex.backfill,
-            action: lex.parsed.action.to_optional_str().map(str::to_string),
-            target_collection: lex.parsed.target_collection.clone(),
             authority_did: None,
             last_fetched_at: None,
             created_at: None,
@@ -246,20 +236,7 @@ impl LexiconCatalog {
                     continue;
                 }
             };
-            let action = match ProcedureAction::from_optional_str(row.action.as_deref()) {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!(%id, "invalid action value: {e}");
-                    ProcedureAction::Upsert
-                }
-            };
-            match ParsedLexicon::parse(
-                json,
-                row.revision,
-                row.target_collection,
-                action,
-                row.token_cost.map(|c| c as u32),
-            ) {
+            match ParsedLexicon::parse(json, row.revision, row.token_cost.map(|c| c as u32)) {
                 Ok(parsed) => {
                     loaded.insert(
                         id,
@@ -488,14 +465,9 @@ impl LexiconCatalog {
                 None => return Ok(None),
             },
         };
-        let mut parsed = ParsedLexicon::parse(
-            lexicon_json.clone(),
-            1,
-            current.parsed.target_collection.clone(),
-            current.parsed.action.clone(),
-            current.parsed.token_cost,
-        )
-        .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
+        let mut parsed =
+            ParsedLexicon::parse(lexicon_json.clone(), 1, current.parsed.token_cost)
+                .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
         let Some(revision) = crate::db::retry_on_busy(|| {
             lexicon_rows::refresh_network(db, backend, id, &lexicon_json)
         })
@@ -532,13 +504,9 @@ impl LexiconCatalog {
         }
         // A placeholder document: the caller replaces it, and only the row's
         // settings are read from it.
-        let action = ProcedureAction::from_optional_str(row.action.as_deref())
-            .unwrap_or(ProcedureAction::Upsert);
         let placeholder = ParsedLexicon::parse(
             serde_json::json!({"lexicon": 1, "id": id, "defs": {}}),
             row.revision,
-            row.target_collection,
-            action,
             row.token_cost.map(|c| c as u32),
         )
         .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
@@ -760,7 +728,7 @@ mod tests {
     }
 
     fn parse(json: Value, revision: i32) -> ParsedLexicon {
-        ParsedLexicon::parse(json, revision, None, ProcedureAction::Upsert, None).unwrap()
+        ParsedLexicon::parse(json, revision, None).unwrap()
     }
 
     fn snapshot_with(lexicons: &[(Value, &str)]) -> ProjectSnapshot {
@@ -1045,8 +1013,6 @@ mod tests {
         LexiconWrite {
             lexicon_json: json,
             backfill: false,
-            target_collection: None,
-            action: ProcedureAction::Upsert,
             token_cost: None,
             authority_did: None,
             indexed: true,
@@ -1187,8 +1153,7 @@ mod tests {
             let catalog = LexiconCatalog::detached();
             let net_id = unique("net");
             let man_id = unique("man");
-            let mut write = network(record_json(&net_id), "did:plc:authority");
-            write.target_collection = Some("com.example.target".into());
+            let write = network(record_json(&net_id), "did:plc:authority");
             catalog.put_network(&db, backend, write).await.unwrap();
             catalog
                 .put_manual(&db, backend, manual(record_json(&man_id)))
@@ -1206,10 +1171,6 @@ mod tests {
             );
             let net = catalog.get_network(&net_id).await.unwrap();
             assert_eq!(net.parsed.raw["description"], "v2");
-            assert_eq!(
-                net.parsed.target_collection.as_deref(),
-                Some("com.example.target")
-            );
             assert_eq!(net.authority_did.as_deref(), Some("did:plc:authority"));
 
             assert_eq!(

@@ -813,6 +813,104 @@ async fn postgres_client_secrets_carry_over() {
     }
 }
 
+/// The last migration before lexicons stopped naming a collection.
+const PRE_DROP_TARGET_COLLECTION_CUTOFF: &str = "20261101000004";
+
+/// A lexicon's `target_collection` survives the column for the codemod, and
+/// only where it named one; the column and `action` are gone.
+async fn assert_target_collections_kept_for_the_codemod(pool: &AnyPool, migrations_dir: &str) {
+    let baseline_dir = std::env::temp_dir().join(format!("hv-pre-target-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(
+        migrations_dir,
+        &baseline_dir,
+        PRE_DROP_TARGET_COLLECTION_CUTOFF,
+    );
+    Migrator::new(baseline_dir.as_path())
+        .await
+        .expect("load pre-drop migrations")
+        .run(pool)
+        .await
+        .expect("pre-drop migrations apply");
+
+    sqlx::query(
+        "INSERT INTO happyview_lexicons (id, lexicon_json, target_collection, action, created_at) VALUES \
+         ('app.example.listThings', '{}', 'app.example.thing', NULL, '2026-05-01T00:00:00+00:00'), \
+         ('app.example.deleteThing', '{}', 'app.example.thing', 'delete', '2026-05-01T00:00:00+00:00'), \
+         ('app.example.blank', '{}', '', NULL, '2026-05-01T00:00:00+00:00'), \
+         ('app.example.thing', '{}', NULL, NULL, '2026-05-01T00:00:00+00:00')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed lexicons");
+
+    Migrator::new(Path::new(migrations_dir))
+        .await
+        .expect("load current migrations")
+        .run(pool)
+        .await
+        .expect("current migrations apply");
+
+    let kept: Vec<(String, String)> = sqlx::query_as(
+        "SELECT lexicon_id, collection FROM happyview_codemod_collections ORDER BY lexicon_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read kept collections");
+    assert_eq!(
+        kept,
+        vec![
+            (
+                "app.example.deleteThing".to_string(),
+                "app.example.thing".to_string()
+            ),
+            (
+                "app.example.listThings".to_string(),
+                "app.example.thing".to_string()
+            ),
+        ]
+    );
+    for (column, select) in [
+        (
+            "target_collection",
+            "SELECT target_collection FROM happyview_lexicons",
+        ),
+        ("action", "SELECT action FROM happyview_lexicons"),
+    ] {
+        assert!(
+            sqlx::query(select).fetch_all(pool).await.is_err(),
+            "{column} is still a column"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+}
+
+#[tokio::test]
+async fn sqlite_target_collections_are_kept_for_the_codemod() {
+    happyview::db::install_drivers();
+    let tmp_db = std::env::temp_dir().join(format!("hv-target-{}.db", uuid::Uuid::new_v4()));
+    let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+        .await
+        .expect("connect to fresh sqlite database");
+    assert_target_collections_kept_for_the_codemod(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_target_collections_are_kept_for_the_codemod() {
+    let ran = with_scratch_postgres("hv_target", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_target_collections_kept_for_the_codemod(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A database a stable branch migrated boots on this one
 // ---------------------------------------------------------------------------

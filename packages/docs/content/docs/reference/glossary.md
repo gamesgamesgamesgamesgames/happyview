@@ -61,5 +61,3 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 **Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 10-minute TTL) for cross-service read access to space data. Bound to the requester's P-256 key through `cnf.kid`, and used with HTTP Message Signatures by that key. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
 
 **Super user** — The bootstrapped user created on first login to a fresh HappyView instance. The super user has unrestricted access to all endpoints regardless of permissions, can transfer super status to another user, and cannot be deleted.
-
-**Target collection** — The record collection that a query or procedure lexicon operates on. Set via the `target_collection` field when uploading a lexicon.

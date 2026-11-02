@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use happyview::config::project::ModuleDecl;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ParsedLexicon;
 use happyview::plugin::capabilities::{PluginCapability, analyze_imports, minimal_set};
 use happyview::plugin::{
     ExecutionError, ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
@@ -58,8 +58,6 @@ fn lexicon(id: &str, kind: &str) -> (String, ProjectLexicon) {
     let parsed = ParsedLexicon::parse(
         json!({"lexicon": 1, "id": id, "defs": {"main": main}}),
         1,
-        None,
-        ProcedureAction::Upsert,
         None,
     )
     .unwrap();

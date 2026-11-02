@@ -46,8 +46,8 @@ export function DeleteLexiconDialog({
   const [deletable, setDeletable] = useState<boolean | null>(null);
   const [notDeletable, setNotDeletable] = useState<string | null>(null);
 
-  // Only a record lexicon has records of its own. A query or procedure
-  // lexicon reads another lexicon's collection through target_collection, so
+  // Only a record lexicon has records of its own. The records a query's or
+  // procedure's script reads or writes belong to a record lexicon, so
   // offering to delete "its" records would delete someone else's.
   const hasRecords = lexicon.lexicon_type === "record";
   // Whether the records are this instance's to delete is the server's call,

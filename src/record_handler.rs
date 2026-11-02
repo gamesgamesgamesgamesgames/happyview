@@ -104,7 +104,6 @@ mod tests {
     use crate::catalog::LexiconWrite;
     use crate::db::adapt_sql;
     use crate::lexicon::ParsedLexicon;
-    use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::project::{ProjectLexicon, ProjectSnapshot};
     use crate::test_support::test_state_with_pool;
@@ -222,8 +221,6 @@ mod tests {
                 "defs": {"main": {"type": "record", "key": "tid"}},
             }),
             1,
-            Some(NSID.to_string()),
-            ProcedureAction::Upsert,
             None,
         )
         .expect("parse test lexicon");
@@ -1257,8 +1254,6 @@ mod tests {
                 LexiconWrite {
                     lexicon_json: net_json("v1"),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some(AUTHORITY.to_string()),
                     indexed: true,
@@ -1339,14 +1334,7 @@ mod tests {
         snap.lexicons.insert(
             NET.to_string(),
             ProjectLexicon {
-                parsed: crate::lexicon::ParsedLexicon::parse(
-                    net_json("file"),
-                    0,
-                    None,
-                    ProcedureAction::Upsert,
-                    None,
-                )
-                .unwrap(),
+                parsed: crate::lexicon::ParsedLexicon::parse(net_json("file"), 0, None).unwrap(),
                 path: "src/lexicons/com/example/net.json".into(),
                 backfill: false,
                 indexed: true,
@@ -1388,8 +1376,6 @@ mod tests {
                 crate::catalog::LexiconWrite {
                     lexicon_json: schema_event("create").record.unwrap(),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some("did:plc:abc".to_string()),
                     indexed: true,

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ParsedLexicon;
 use happyview::project::{ProjectLexicon, ProjectScript, ProjectSnapshot, ScriptBody};
 use serde_json::Value;
 
@@ -15,8 +15,7 @@ pub fn snapshot() -> ProjectSnapshot {
 }
 
 pub fn add_lexicon(snap: &mut ProjectSnapshot, json: Value, path: &str) {
-    let parsed = ParsedLexicon::parse(json, 0, None, ProcedureAction::Upsert, None)
-        .expect("a test lexicon parses");
+    let parsed = ParsedLexicon::parse(json, 0, None).expect("a test lexicon parses");
     snap.lexicons.insert(
         parsed.id.clone(),
         ProjectLexicon {

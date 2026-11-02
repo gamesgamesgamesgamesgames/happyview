@@ -198,6 +198,65 @@ async fn codemod_preview_does_not_store() {
     assert_eq!(row["body"], original);
 }
 
+/// A v2 query's `collection` is its lexicon's, which v3 does not supply: the
+/// rewrite writes the NSID the migration kept for it, and marks the read in a
+/// script whose lexicon named none.
+#[tokio::test]
+#[serial]
+async fn codemod_writes_the_collection_the_v2_lexicon_named() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_codemod_collections (lexicon_id, collection) VALUES (?, ?)",
+        app.state.db_backend,
+    ))
+    .bind("com.example.list")
+    .bind("com.example.thing")
+    .execute(&app.state.db)
+    .await
+    .expect("seed a kept collection");
+    let body = "function handle()\n  return { listing = collection }\nend\n";
+    seed_stored_script(&app, "xrpc.query:com.example.list", body).await;
+    seed_stored_script(&app, "xrpc.query:com.example.other", body).await;
+
+    let preview = |id: &'static str| {
+        let app = &app;
+        async move {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_post(
+                    &format!("/admin/scripts/{}/codemod", urlencoding::encode(id)),
+                    app.admin_cookie(),
+                    &json!({}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            json_body(resp).await
+        }
+    };
+
+    let known = preview("xrpc.query:com.example.list").await;
+    let source = known["source"].as_str().unwrap();
+    assert!(
+        source.contains("listing = \"com.example.thing\""),
+        "{source}"
+    );
+    assert_eq!(known["notes"], json!([]), "{known}");
+
+    let unknown = preview("xrpc.query:com.example.other").await;
+    let notes = unknown["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{unknown}");
+    assert!(
+        notes[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no collection"),
+        "{unknown}"
+    );
+}
+
 /// A genuinely empty POST (no body, no `Content-Type`) must resolve to a
 /// preview, not a 415/422 — the endpoint is usable from a plain `curl -X
 /// POST` with nothing else.

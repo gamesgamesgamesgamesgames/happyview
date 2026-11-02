@@ -8,7 +8,7 @@ use happyview_source_jetstream::consumer::event::{Commit, CursorPoint, Event, Ev
 use crate::AppState;
 use crate::db::adapt_sql;
 use crate::host::AppHost;
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 
 const NSID: &str = "app.test.replayed";
 const BASE_US: i64 = 1_779_719_000_000_000;
@@ -24,8 +24,6 @@ async fn states() -> Vec<AppState> {
         let parsed = ParsedLexicon::parse(
             serde_json::json!({ "lexicon": 1, "id": NSID, "defs": { "main": { "type": "record", "key": "tid" } } }),
             1,
-            Some(NSID.to_string()),
-            ProcedureAction::Upsert,
             None,
         )
         .expect("lexicon");

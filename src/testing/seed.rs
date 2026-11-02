@@ -5,7 +5,6 @@ use serde_json::Value;
 
 use crate::AppState;
 use crate::catalog::{LexiconWrite, ScriptWrite};
-use crate::lexicon::ProcedureAction;
 
 pub async fn lexicon(state: &AppState, doc: Value) {
     state
@@ -16,8 +15,6 @@ pub async fn lexicon(state: &AppState, doc: Value) {
             LexiconWrite {
                 lexicon_json: doc,
                 backfill: false,
-                target_collection: None,
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

@@ -43,7 +43,7 @@ end
 
 ## How it works
 
-1. Query statuses from the target collection with pagination, same as a normal list query.
+1. Query statuses from `xyz.statusphere.status` with pagination, same as a normal list query.
 2. Each envelope carries the author's `did`, so the unique DIDs fall out of the page without parsing URIs.
 3. Look up each DID's `app.bsky.actor.profile/self` record (this is where Bluesky profiles live) with `db.get`. A profile that isn't indexed locally returns `nil` and is skipped.
 4. Return statuses and profiles as separate keys, with the cursor from the status query. `json.to_array` keeps `profiles` a JSON array when it is empty.

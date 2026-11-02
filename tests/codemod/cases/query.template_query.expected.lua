@@ -45,5 +45,5 @@ function handle(input, ctx)
     return { record = record }
   end
 
-  return __codemod_flat_page(db.records(ctx.collection):limit(input.limit):cursor(input.cursor):did(input.did):run())
+  return __codemod_flat_page(db.records("games.gamesgamesgamesgames.game"):limit(input.limit):cursor(input.cursor):did(input.did):run())
 end

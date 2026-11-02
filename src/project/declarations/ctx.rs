@@ -5,16 +5,10 @@ use happyview_plugin_sdk::declarations::{CtxShapes, EventShapes, ObjectType, Pro
 
 pub fn ctx_shapes() -> CtxShapes {
     CtxShapes {
-        query: with(&[
-            caller_did().optional(),
-            method(),
-            collection(),
-            space().optional(),
-        ]),
+        query: with(&[caller_did().optional(), method(), space().optional()]),
         procedure: with(&[
             caller_did(),
             method(),
-            collection(),
             Property::new("params", map(TypeExpr::Unknown))
                 .describe("The query parameters the request carried"),
             Property::new("delegate_did", TypeExpr::string().nullable())
@@ -111,8 +105,7 @@ fn method() -> Property {
 }
 
 fn collection() -> Property {
-    Property::new("collection", TypeExpr::string())
-        .describe("The record collection this method operates on")
+    Property::new("collection", TypeExpr::string()).describe("The record's collection NSID")
 }
 
 fn space() -> Property {

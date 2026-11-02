@@ -796,7 +796,6 @@ async fn a_run_reports_the_instructions_it_used_to_the_metrics() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }))
             .unwrap(),
         ))

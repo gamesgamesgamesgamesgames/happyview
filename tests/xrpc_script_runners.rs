@@ -70,7 +70,6 @@ async fn upload_lexicon(app: &TestApp, lexicon: Value) {
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "lexicon_json": lexicon,
-                        "target_collection": "games.gamesgamesgamesgames.game",
                     }))
                     .unwrap(),
                 ))

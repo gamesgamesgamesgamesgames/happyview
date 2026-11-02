@@ -8,7 +8,7 @@ use happyview_provider::Host;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::ingest::REPO_STATUS_MAX_BYTES;
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 use happyview_source_jetstream::consumer::apply::*;
 use happyview_source_jetstream::consumer::event::{Commit, CursorPoint, Event, EventKind};
 use happyview_source_jetstream::consumer::workers::ApplyOutcome;
@@ -44,8 +44,6 @@ async fn register(state: &AppState) {
             "defs": {"main": {"type": "record", "key": "tid"}},
         }),
         1,
-        Some(NSID.to_string()),
-        ProcedureAction::Upsert,
         None,
     )
     .expect("parse lexicon");
@@ -221,8 +219,6 @@ async fn register_unindexed(state: &AppState) {
             "defs": {"main": {"type": "record", "key": "tid"}},
         }),
         1,
-        Some(NSID.to_string()),
-        ProcedureAction::Upsert,
         None,
     )
     .expect("parse lexicon");

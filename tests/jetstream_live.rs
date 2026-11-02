@@ -11,7 +11,6 @@ use std::time::Duration;
 use happyview::db::DatabaseBackend;
 use happyview::db::adapt_sql;
 use happyview::host::AppHost;
-use happyview::lexicon::ProcedureAction;
 use happyview_source_jetstream::consumer::config::{
     DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
 };
@@ -68,8 +67,6 @@ async fn app() -> Option<TestApp> {
             happyview::catalog::LexiconWrite {
                 lexicon_json: common::fixtures::game_record_lexicon(),
                 backfill: false,
-                target_collection: Some(GAME.to_string()),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

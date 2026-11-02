@@ -4,12 +4,16 @@
 
 use std::path::PathBuf;
 
-use happyview::codemod::{ScriptKind, needs_migration, rewrite};
+use happyview::codemod::{Rewrite, ScriptKind, needs_migration, rewrite_for};
 
 /// Inputs `needs_migration` says nothing about: a `handle` with no parameters
-/// is a contract change that names no global, and a name the trigger does not
-/// set is not a global this kind of script ever had.
-const NO_GLOBALS: [&str; 2] = [
+/// is a contract change that names no global, a name the trigger does not
+/// set is not a global this kind of script ever had, and `ctx.collection` is
+/// a context field a query or procedure is no longer given rather than a
+/// global.
+const NO_GLOBALS: [&str; 4] = [
+    "procedure.ctx_collection_unknown",
+    "query.already_migrated",
     "query.handle_no_params",
     "query.marker_global_from_another_kind",
 ];
@@ -19,7 +23,7 @@ const NO_GLOBALS: [&str; 2] = [
 #[test]
 fn every_note_has_a_marker_standing_in_the_source() {
     for case in cases() {
-        let result = rewrite(&case.source, case.kind).expect("rewrite");
+        let result = case.rewrite(&case.source);
         for note in &result.notes {
             let marker = format!("-- codemod: {}", note.message);
             assert!(
@@ -35,8 +39,17 @@ fn every_note_has_a_marker_standing_in_the_source() {
 struct Case {
     name: String,
     kind: ScriptKind,
+    /// The collection the v2 lexicon named, from `NAME.collection`, as the
+    /// endpoint and the CLI's database mode read it from the instance.
+    collection: Option<String>,
     source: String,
     expected: String,
+}
+
+impl Case {
+    fn rewrite(&self, source: &str) -> Rewrite {
+        rewrite_for(source, self.kind, self.collection.as_deref()).expect("rewrite")
+    }
 }
 
 /// The kind is the file name's first segment, because a case is only
@@ -69,6 +82,9 @@ fn cases() -> Vec<Case> {
             Some(Case {
                 name: name.to_string(),
                 kind: kind_of(name),
+                collection: std::fs::read_to_string(dir.join(format!("{name}.collection")))
+                    .ok()
+                    .map(|text| text.trim().to_string()),
                 source: std::fs::read_to_string(path).expect("case source"),
                 expected: std::fs::read_to_string(dir.join(format!("{name}.expected.lua")))
                     .unwrap_or_else(|_| panic!("{name} has no expected file")),
@@ -86,7 +102,7 @@ fn the_corpus_covers_the_rewrite_table() {
 fn every_case_rewrites_to_its_expected_file() {
     let mut failures = Vec::new();
     for case in cases() {
-        let got = rewrite(&case.source, case.kind).expect("rewrite").source;
+        let got = case.rewrite(&case.source).source;
         if got != case.expected {
             failures.push(format!(
                 "--- {} ---\n-- got --\n{got}\n-- want --\n{}",
@@ -100,8 +116,8 @@ fn every_case_rewrites_to_its_expected_file() {
 #[test]
 fn every_case_is_idempotent() {
     for case in cases() {
-        let once = rewrite(&case.source, case.kind).expect("rewrite").source;
-        let twice = rewrite(&once, case.kind).expect("rewrite again").source;
+        let once = case.rewrite(&case.source).source;
+        let twice = case.rewrite(&once).source;
         assert_eq!(once, twice, "{}", case.name);
     }
 }
@@ -157,7 +173,7 @@ fn needs_migration_empties_out_over_a_clean_rewrite() {
     for case in cases() {
         let before = needs_migration(&case.source, case.kind);
         let after = needs_migration(&case.expected, case.kind);
-        let notes = rewrite(&case.source, case.kind).expect("rewrite").notes;
+        let notes = case.rewrite(&case.source).notes;
 
         if case.source != case.expected && !NO_GLOBALS.contains(&case.name.as_str()) {
             assert!(!before.is_empty(), "{}: nothing to migrate", case.name);
@@ -178,7 +194,7 @@ fn needs_migration_empties_out_over_a_clean_rewrite() {
 #[test]
 fn a_marked_case_names_every_construct_it_left_behind() {
     for case in cases() {
-        let result = rewrite(&case.source, case.kind).expect("rewrite");
+        let result = case.rewrite(&case.source);
         let markers = result
             .source
             .lines()

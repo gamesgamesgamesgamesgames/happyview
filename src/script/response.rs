@@ -564,8 +564,6 @@ mod tests {
                 json!({ "lexicon": 1, "id": "at.example.getThing", "defs": { "main": main } }),
                 1,
                 None,
-                crate::lexicon::ProcedureAction::Create,
-                None,
             )
             .expect("the fixture lexicon should parse")
         };

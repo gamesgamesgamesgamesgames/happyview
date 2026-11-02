@@ -31,8 +31,6 @@ const projectLexicon = {
   revision: 0,
   lexicon_type: "query",
   backfill: false,
-  action: null,
-  target_collection: null,
   source: "project",
   layer: "project",
   path: LEXICON_PATH,

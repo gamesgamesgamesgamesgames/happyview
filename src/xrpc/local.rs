@@ -92,7 +92,7 @@ pub(crate) async fn execute_local_procedure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{ParsedLexicon, ProcedureAction};
+    use crate::lexicon::ParsedLexicon;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::test_support::test_state_with_pool;
     use http_body_util::BodyExt;
@@ -159,8 +159,6 @@ mod tests {
             record_schema: None,
             raw: json!({}),
             revision: 1,
-            target_collection: None,
-            action: ProcedureAction::Create,
             token_cost: None,
             space_type: None,
             space_name: None,

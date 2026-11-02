@@ -1007,8 +1007,6 @@ mod tests {
             }),
             1,
             None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
         )
         .unwrap();
         state.lexicons.upsert_unindexed(parsed).await;
