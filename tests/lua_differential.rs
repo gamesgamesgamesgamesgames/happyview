@@ -768,7 +768,7 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     // deliberately.
     assert_eq!(
         (calls_compared, logs_compared, progress_compared),
-        (83, 18, 2),
+        (84, 18, 2),
         "the transcript, the log rows or the job progress are not being recorded; \
          a deliberate change to the case list has to be recorded here. Two of the \
          three job cases call `ctx.job.progress`, which is why that one is 2"
