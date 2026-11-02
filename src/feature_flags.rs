@@ -32,11 +32,18 @@ pub struct FeatureFlagStatus {
 }
 
 pub async fn list_flags(pool: &AnyPool, backend: DatabaseBackend) -> Vec<FeatureFlagStatus> {
-    let all_flags = [(
-        FeatureFlag::SPACES_ENABLED,
-        "atproto spaces",
-        "Permissioned data in spaces, with membership and invites.",
-    )];
+    let all_flags = [
+        (
+            FeatureFlag::SPACES_ENABLED,
+            "atproto spaces",
+            "Permissioned data in spaces, with membership and invites.",
+        ),
+        (
+            FeatureFlag::SPACES_PDS_MIGRATION,
+            "Move spaces to PDSes",
+            "When a user signs in, move their space data to their PDS if it can host spaces.",
+        ),
+    ];
 
     let mut result = Vec::new();
     for (key, name, description) in all_flags {
