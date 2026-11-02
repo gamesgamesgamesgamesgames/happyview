@@ -147,6 +147,10 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             }
         },
     };
+    // Before the first outbound request: every shared client reads it. Here
+    // rather than in `boot`, which tests also run against local mocks.
+    crate::outbound::install_for(&config, dev.is_some());
+
     let Booted {
         state,
         labeler_subscriptions_rx,
