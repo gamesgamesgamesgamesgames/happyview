@@ -247,7 +247,7 @@ Jobs only run when the files they cover change, so a docs-only PR skips the Rust
 
 ### Open a draft while you iterate
 
-A full run costs real money, so CI holds a **draft** pull request. Push to a draft as often as you like: `lint`, `unit-tests`, `e2e-tests` and `frontend` fail at once with "this pull request is a draft", and the other costly jobs don't run. That failure is deliberate. A skipped required check would count as passed, so a draft's gate reads red until the checks have really run.
+A full run costs real money, so CI holds a **draft** pull request. Push to a draft as often as you like: the costly jobs are skipped, and `e2e-tests` fails at once with "this pull request is a draft". That one failure is deliberate. A skipped check counts as passed, and `e2e-tests` is created late in a run, so failing it keeps a draft from ever looking mergeable before its checks have run.
 
 When the branch is ready, mark the pull request **Ready for review**. That starts the full run on the same commit, and its checks replace the draft's. A pull request can't merge while it's a draft, and a review should wait for that run.
 
