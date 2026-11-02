@@ -559,6 +559,65 @@ async fn concurrent_writes_to_one_space_all_land() {
     );
 }
 
+/// An author's first writes to a space, arriving together. On Postgres, one
+/// that created the author's repo state before taking the space lock
+/// deadlocked against one that already held the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_first_writes_to_fresh_spaces_all_land() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    const WRITERS: usize = 12;
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    for space in 0..20 {
+        let skey = rand_skey(&format!("first-{space}"));
+        let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
+        add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let writes: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let record = json!({ "$type": "com.example.doc", "n": i });
+                let cookie = Some(cookie_for(&app, &writer));
+                let req = match i % 3 {
+                    0 => create_record_req(&space_uri, "com.example.doc", &record, cookie),
+                    1 => put_record_req(
+                        &space_uri,
+                        "com.example.doc",
+                        &format!("rk{i}"),
+                        &record,
+                        None,
+                        cookie,
+                    ),
+                    _ => apply_writes_req(
+                        &space_uri,
+                        json!([{ "action": "create", "collection": "com.example.doc", "value": record }]),
+                        None,
+                        cookie,
+                    ),
+                };
+                let router = app.router.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    router.oneshot(req).await
+                })
+            })
+            .collect();
+        let mut statuses = Vec::new();
+        for write in writes {
+            statuses.push(write.await.unwrap().unwrap().status());
+        }
+        assert!(
+            statuses.iter().all(|s| s.is_success()),
+            "space {space}: {statuses:?}"
+        );
+    }
+}
+
 /// A non-member cannot putRecord into a space.
 #[tokio::test]
 #[serial]

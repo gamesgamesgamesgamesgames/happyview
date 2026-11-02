@@ -1074,7 +1074,10 @@ pub async fn get_or_create_repo_state(
         .ok_or_else(|| AppError::Internal("repo state missing after insert".into()))
 }
 
-async fn read_repo_state(
+/// An author's repo state, or `None` when they have never written here.
+/// Unlike [`get_or_create_repo_state`] it writes nothing, so it is safe
+/// outside a space write transaction.
+pub async fn read_repo_state(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &str,
