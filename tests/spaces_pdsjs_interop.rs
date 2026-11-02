@@ -20,10 +20,9 @@ mod interop_support;
 
 use interop_support::Sample;
 
-use happyview::spaces::commit::{SpaceVerifyingKey, verify_commit};
 use happyview::spaces::lthash::{LtHashState, record_element};
 use happyview::spaces::native_client::{
-    OpAction, RepoOp, collect_repo_ops, latest_op_per_record, parse_signed_commit,
+    OpAction, RepoOp, VerifiedCommit, collect_repo_ops, latest_op_per_record,
 };
 use happyview::spaces::pds_support::{self, DetectionTier};
 use happyview::spaces::types::Policy;
@@ -130,15 +129,9 @@ impl Account {
         .await;
     }
 
-    async fn latest_commit(&self, space: &str) -> Value {
-        let (status, body) = self
-            .get(
-                "com.atproto.space.getLatestCommit",
-                &[("space", space.to_string()), ("repo", self.did.clone())],
-            )
-            .await;
-        assert_eq!(status, 200, "getLatestCommit failed: {body}");
-        body["commit"].clone()
+    /// The latest commit, fetched and authenticated as native sync does.
+    async fn verified_commit(&self, space: &str) -> VerifiedCommit {
+        interop_support::verified_latest_commit(PDSJS, PLC, &self.token, space, &self.did).await
     }
 
     async fn oplog(&self, space: &str, since: Option<&str>, page_size: u32) -> Vec<RepoOp> {
@@ -161,26 +154,6 @@ async fn post(token: Option<&str>, method: &str, body: Value) -> (u16, Value) {
     let resp = req.send().await.expect("request to pds.js failed");
     let status = resp.status().as_u16();
     (status, resp.json().await.unwrap_or(Value::Null))
-}
-
-/// The account's `#atproto` signing key, from its DID document in the directory.
-async fn author_key(did: &str) -> SpaceVerifyingKey {
-    let doc: Value = client()
-        .get(format!("{PLC}/{did}"))
-        .send()
-        .await
-        .expect("PLC request failed")
-        .json()
-        .await
-        .expect("PLC json");
-    let multibase = doc["verificationMethod"]
-        .as_array()
-        .expect("verificationMethod")
-        .iter()
-        .find(|v| v["id"].as_str().unwrap_or_default().ends_with("#atproto"))
-        .and_then(|v| v["publicKeyMultibase"].as_str())
-        .expect("an #atproto key");
-    happyview::spaces::credential::multikey_to_space_key(multibase).expect("the key decodes")
 }
 
 fn fold_latest(ops: &[RepoOp]) -> LtHashState {
@@ -258,11 +231,8 @@ async fn a_commit_written_by_pdsjs_verifies_and_agrees_with_our_set_hash() {
     let mut expected = LtHashState::new();
     expected.add(&record_element(NOTE, "b", b2["cid"].as_str().unwrap()));
 
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).expect("parses");
-    let key = author_key(&account.did).await;
-    verify_commit(&commit, &space, &account.did, &key)
-        .expect("a commit written by pds.js must verify with our own code");
-    assert_eq!(commit.hash, expected.hash());
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(*commit.hash(), expected.hash());
 }
 
 #[tokio::test]
@@ -290,8 +260,8 @@ async fn replaying_the_pdsjs_oplog_across_pages_reproduces_its_commit() {
         ]
     );
 
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).unwrap();
-    assert_eq!(fold_latest(&ops).hash(), commit.hash);
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(fold_latest(&ops).hash(), *commit.hash());
 
     // Resuming from a cursor sees only what came after it.
     let cursor = ops.last().unwrap().rev.clone();
@@ -304,32 +274,24 @@ async fn replaying_the_pdsjs_oplog_across_pages_reproduces_its_commit() {
 #[tokio::test]
 #[ignore]
 async fn the_migration_replay_lands_on_pdsjs_with_the_hash_it_expects() {
-    // Plain JSON only. pds.js encodes `$link`, `$bytes` and large integers
-    // differently from HappyView and the reference PDS (pinned below), so a repo
-    // holding those cannot migrate to it.
+    // Plain JSON only. pds.js encodes large integers differently from HappyView
+    // and the reference PDS (pinned below), so a repo holding one cannot
+    // migrate to it.
     let account = Account::sign_in().await;
     let space = account.new_space(json!({})).await;
 
     let records =
         interop_support::records_awaiting_migration(&space, &account.did, Sample::PlainJson);
-    let commit =
-        interop_support::replay_as_migration(PDSJS, &account.token, &space, &account.did, &records)
-            .await;
+    interop_support::replay_as_migration(PDSJS, &account.token, &space, &account.did, &records)
+        .await;
 
     let disagreements =
         interop_support::cid_disagreements(PDSJS, &account.token, &space, &account.did, &records)
             .await;
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 
-    let commit = parse_signed_commit(&commit).expect("parses");
-    verify_commit(
-        &commit,
-        &space,
-        &account.did,
-        &author_key(&account.did).await,
-    )
-    .expect("authentic");
-    assert_eq!(commit.hash, interop_support::migration_expects(&records));
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(*commit.hash(), interop_support::migration_expects(&records));
 }
 
 #[tokio::test]
@@ -341,12 +303,11 @@ async fn a_repo_with_typed_values_is_refused_rather_than_migrated_wrongly_to_pds
     let space = account.new_space(json!({})).await;
 
     let records = interop_support::records_awaiting_migration(&space, &account.did, Sample::Full);
-    let commit =
-        interop_support::replay_as_migration(PDSJS, &account.token, &space, &account.did, &records)
-            .await;
-    let commit = parse_signed_commit(&commit).expect("parses");
+    interop_support::replay_as_migration(PDSJS, &account.token, &space, &account.did, &records)
+        .await;
+    let commit = account.verified_commit(&space).await;
     assert_ne!(
-        commit.hash,
+        *commit.hash(),
         interop_support::migration_expects(&records),
         "pds.js now agrees on typed values; fold this into the migration test above"
     );
@@ -432,25 +393,15 @@ async fn pdsjs_answers_the_single_policy_field_from_the_read_policy_alone() {
 
 #[tokio::test]
 #[ignore]
-async fn pdsjs_encodes_links_bytes_and_large_integers_differently_from_the_reference() {
-    // Each of these gets one CID from HappyView and the reference PDS (the
-    // migration test in spaces_reference_interop covers them) and another from
-    // pds.js. A blob ref is a `$link`, so this covers any record with a blob.
-    //
-    // Causes, in pds.js's space write path: `{$link}` and `{$bytes}` are encoded
-    // as plain maps rather than a CID and a byte string, and the DAG-CBOR encoder
-    // has no length form past 32 bits.
+async fn pdsjs_encodes_large_integers_differently_from_the_reference() {
+    // A large integer gets one CID from HappyView and the reference PDS (the
+    // migration test in spaces_reference_interop covers it) and another from
+    // pds.js, whose DAG-CBOR encoder has no length form past 32 bits. `$link`
+    // and `$bytes` diverged here too until pds.js's October 2026 builds.
     let account = Account::sign_in().await;
     let space = account.new_space(json!({})).await;
 
-    let cases = [
-        ("big", json!(9_007_199_254_740_991_i64)),
-        (
-            "link",
-            json!({ "$link": "bafyreihn37cccblw3mmwmmm6jewugcohecjf5kpzuciirdvisasq7k3siu" }),
-        ),
-        ("bytes", json!({ "$bytes": "AAECAwQFBgc" })),
-    ];
+    let cases = [("big", json!(9_007_199_254_740_991_i64))];
     for (rkey, value) in cases {
         let record = json!({ "$type": NOTE, "v": value });
         let ours = happyview::cid_verify::compute_record_cid(&record)
@@ -515,10 +466,10 @@ async fn pdsjs_drops_ops_when_a_page_ends_inside_a_batch() {
         "pds.js now pages within a batch; this divergence is fixed and the test can go"
     );
 
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).unwrap();
+    let commit = account.verified_commit(&space).await;
     assert_ne!(
         fold_latest(&ops).hash(),
-        commit.hash,
+        *commit.hash(),
         "the loss must be detectable"
     );
 }

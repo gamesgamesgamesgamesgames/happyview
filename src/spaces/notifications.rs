@@ -171,15 +171,19 @@ pub struct RepoUpdate {
 impl RepoUpdate {
     fn body(&self) -> serde_json::Value {
         use base64::Engine;
+        let digest = serde_json::json!({
+            "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),
+        });
         let mut body = serde_json::json!({
             "space": self.space_uri,
             "repo": self.repo,
             "repoRev": self.rev,
             // The alpha lexicon's name for `repoRev`. Sent until v3.
             "rev": self.rev,
-            "hash": {
-                "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),
-            },
+            "data": digest,
+            // The name for `data` before proposal 0016. Sent until every
+            // syncer reads `data`.
+            "hash": digest,
         });
         body[SPACE_REV_FIELD] = self.space_rev.clone().into();
         if let Some(prev) = &self.prev_space_rev {
