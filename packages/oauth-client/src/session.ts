@@ -79,10 +79,36 @@ export class HappyViewSession {
     }
   }
 
+  private isInstanceUrl(candidate: string): boolean {
+    let target: URL;
+    let instance: URL;
+    try {
+      target = new URL(candidate);
+      instance = new URL(this.instanceUrl);
+    } catch {
+      return false;
+    }
+    if (target.origin !== instance.origin) return false;
+    const base = instance.pathname.replace(/\/+$/, "");
+    return (
+      base === "" ||
+      target.pathname === base ||
+      target.pathname.startsWith(`${base}/`)
+    );
+  }
+
   async fetchHandler(url: string, init: RequestInit): Promise<Response> {
     const fullUrl = /^https?:\/\//i.test(url)
       ? url
       : `${this.instanceUrl}${url}`;
+    // The session's token and client key belong to the instance, so they go
+    // only to it. Checked on the joined URL too: a path that doesn't start
+    // with `/` would otherwise extend the instance's host name.
+    if (!this.isInstanceUrl(fullUrl)) {
+      throw new Error(
+        `fetchHandler only sends requests to ${this.instanceUrl}`,
+      );
+    }
     const method = (init.method ?? "GET").toUpperCase();
     const htu = fullUrl.split("?")[0];
 
@@ -121,8 +147,9 @@ export class HappyViewSession {
     try {
       response = await sendWithProof();
     } catch (e) {
-      const info = `_fetch type: ${typeof this._fetch}, toString: ${String(this._fetch).slice(0, 120)}, url: ${fullUrl}`;
-      throw new Error(`fetchHandler failed: ${(e as Error).message}\n\nDEBUG: ${info}`);
+      throw new Error(`fetchHandler failed: ${(e as Error).message}`, {
+        cause: e,
+      });
     }
 
     // Retry once if the server requires a DPoP nonce we didn't have
