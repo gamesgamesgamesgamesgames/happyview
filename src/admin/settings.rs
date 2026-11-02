@@ -89,16 +89,19 @@ pub fn platform_locked(key: &str) -> bool {
     locked_keys().iter().any(|locked| locked == key)
 }
 
-/// Refuse to start on a lock that can't hold: a key with no environment
-/// variable to read, a variable left unset, or a retention fixed at `0`. Read
-/// as unlocked, any of these would hand the operator a setting the platform
-/// meant to fix.
+/// Refuse to start on a lock that can't hold: a variable left unset, or a
+/// retention fixed at `0`. Read as unlocked, either would hand the operator a
+/// setting the platform meant to fix. A key this build doesn't have is only
+/// warned about, because a platform names the settings of every build it
+/// runs, and a build without the setting has nothing to fix.
 pub fn check_platform_locks() -> Result<(), String> {
     for key in locked_keys() {
         let Some(env_var) = env_var_for(&key) else {
-            return Err(format!(
-                "{PLATFORM_LOCKED_SETTINGS} names '{key}', which isn't a setting that can be fixed"
-            ));
+            tracing::warn!(
+                key,
+                "{PLATFORM_LOCKED_SETTINGS} names a setting this build doesn't have"
+            );
+            continue;
         };
         let Some(value) = vars::var(env_var) else {
             return Err(format!(
@@ -892,7 +895,7 @@ mod tests {
         let zero = check_platform_locks();
         unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
         let unset = check_platform_locks();
-        unsafe { std::env::set_var(PLATFORM_LOCKED_SETTINGS, "no_such_setting") };
+        unsafe { std::env::set_var(PLATFORM_LOCKED_SETTINGS, "a_later_build_s_setting") };
         let unknown = check_platform_locks();
         unsafe { std::env::remove_var(PLATFORM_LOCKED_SETTINGS) };
 
@@ -902,7 +905,10 @@ mod tests {
             "a fixed retention of 0 would keep records forever"
         );
         assert!(unset.is_err());
-        assert!(unknown.is_err());
+        assert!(
+            unknown.is_ok(),
+            "a setting this build lacks has nothing to fix"
+        );
         assert_eq!(
             get_setting(
                 &pool,
