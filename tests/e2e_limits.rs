@@ -221,3 +221,51 @@ async fn xrpc_without_an_api_client_is_answered_by_default() {
         .unwrap();
     assert_ne!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// HAP-227: an owner can keep logs for less than the ceiling, not for
+/// longer, and not forever. The space access log isn't held to it.
+#[tokio::test]
+#[serial]
+async fn a_retention_setting_over_the_ceiling_is_refused() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.limits = limited(Limits {
+        log_retention_days: Some(Cap {
+            max: 7,
+            wording: Wording {
+                message: Some("Your plan keeps logs for at most 7 days.".into()),
+                ..Wording::default()
+            },
+        }),
+        ..Limits::default()
+    });
+    app.rebuild_router();
+
+    let put = |key: &str, value: &str| {
+        admin_json(
+            "PUT",
+            &format!("/admin/settings/{key}"),
+            app.admin_cookie(),
+            &json!({ "value": value }),
+        )
+    };
+    for key in ["event_log_retention_days", "backfill_retention_days"] {
+        let resp = app.router.clone().oneshot(put(key, "3")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{key}");
+        for over in ["30", "0"] {
+            let resp = app.router.clone().oneshot(put(key, over)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{key} = {over}");
+            let body = json_body(resp).await;
+            assert_eq!(body["limit"], "log_retention_days");
+            assert_eq!(body["max"], 7);
+            assert_eq!(body["message"], "Your plan keeps logs for at most 7 days.");
+        }
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put("space_access_log_retention_days", "365"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}

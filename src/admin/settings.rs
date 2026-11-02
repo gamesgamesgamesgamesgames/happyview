@@ -479,6 +479,9 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    // The log_retention_days ceiling (HAP-227): an owner can keep logs for
+    // less, never for longer.
+    crate::limits::check_retention_setting(&state.limits.limits(), &key, &body.value)?;
 
     write_audited(
         &state.db,

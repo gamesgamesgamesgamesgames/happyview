@@ -665,9 +665,34 @@ pub struct TickOutcome {
 }
 
 /// The writer's state between ticks.
-#[derive(Debug, Default)]
 pub struct Persister {
     maintained_at: Option<u64>,
+    /// The host's limits: metrics follow the event log's retention, and its
+    /// ceiling.
+    limits: Arc<dyn happyview_provider::LimitsProvider>,
+}
+
+impl std::fmt::Debug for Persister {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Persister")
+            .field("maintained_at", &self.maintained_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Persister {
+    fn default() -> Self {
+        Persister::with_limits(Arc::new(happyview_provider::FixedLimits::default()))
+    }
+}
+
+impl Persister {
+    pub fn with_limits(limits: Arc<dyn happyview_provider::LimitsProvider>) -> Self {
+        Persister {
+            maintained_at: None,
+            limits,
+        }
+    }
 }
 
 impl Persister {
@@ -694,7 +719,10 @@ impl Persister {
             return outcome;
         }
         self.maintained_at = Some(now);
-        let days = super::retention::retention_days(pool, backend).await;
+        let days = self.limits.limits().cap(
+            happyview_provider::Limit::LogRetentionDays,
+            super::retention::retention_days(pool, backend).await,
+        );
         match sweep(pool, backend, now, days).await {
             Ok(n) => outcome.swept = n,
             Err(e) => tracing::warn!(error = %e, "failed to sweep script metrics"),
@@ -708,8 +736,13 @@ impl Persister {
 }
 
 /// Write and maintain the table for the life of the process.
-pub async fn run(metrics: Arc<ScriptMetrics>, pool: AnyPool, backend: DatabaseBackend) {
-    let mut persister = Persister::default();
+pub async fn run(
+    metrics: Arc<ScriptMetrics>,
+    pool: AnyPool,
+    backend: DatabaseBackend,
+    limits: Arc<dyn happyview_provider::LimitsProvider>,
+) {
+    let mut persister = Persister::with_limits(limits);
     loop {
         tokio::time::sleep(WRITE_INTERVAL).await;
         persister
