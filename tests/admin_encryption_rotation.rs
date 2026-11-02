@@ -79,3 +79,32 @@ async fn a_reseal_needs_a_key() {
     let (status, _) = send(&app, "POST").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+const PLATFORM_KEY: &str = "hv_0123456789abcdef0123456789abcdef";
+
+async fn send_as_platform(app: &TestApp, method: &str) -> StatusCode {
+    let req = Request::builder()
+        .method(method)
+        .uri("/admin/encryption/rotation")
+        .header("authorization", format!("Bearer {PLATFORM_KEY}"))
+        .body(Body::empty())
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// The hosting platform reads the status, to know when the previous key can
+/// go, but can't start a re-seal.
+#[tokio::test]
+#[serial]
+async fn the_platform_reads_the_status_but_cannot_start_a_reseal() {
+    use sha2::{Digest, Sha256};
+
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    app.state.config.platform_api_key_hash =
+        Some(hex::encode(Sha256::digest(PLATFORM_KEY.as_bytes())));
+    app.rebuild_router();
+
+    assert_eq!(send_as_platform(&app, "GET").await, StatusCode::OK);
+    assert_eq!(send_as_platform(&app, "POST").await, StatusCode::FORBIDDEN);
+}
