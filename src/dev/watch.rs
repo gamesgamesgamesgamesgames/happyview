@@ -32,6 +32,8 @@ pub enum Change {
     BuildDir,
     /// `.env.test`, which only a test run reads. The dev server ignores it.
     TestEnv,
+    /// `happyview.lock`, whose plugins load only at boot.
+    Lock,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -39,6 +41,7 @@ struct Batch {
     config: bool,
     src_dir: bool,
     build_dir: bool,
+    lock: bool,
 }
 
 fn build_dir(root: &Path) -> PathBuf {
@@ -69,6 +72,9 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
     }
     if rel == Path::new(".env.test") {
         return Some(Change::TestEnv);
+    }
+    if rel == Path::new("happyview.lock") {
+        return Some(Change::Lock);
     }
     if rel == Path::new("src") {
         return Some(Change::SrcDir);
@@ -110,6 +116,7 @@ async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
             Change::Config => batch.config = true,
             Change::SrcDir => batch.src_dir = true,
             Change::BuildDir => batch.build_dir = true,
+            Change::Lock => batch.lock = true,
             Change::Source | Change::TestEnv => {}
         }
     }
@@ -307,6 +314,8 @@ pub fn spawn_with(
 
     let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
+    // What hpy placed the plugins from, to tell a real change from a rewrite.
+    let lock_at_boot = std::fs::read(root.join("happyview.lock")).ok();
     tokio::spawn(async move {
         // The boot build is already installed; its types come first, in the
         // same task as every later pass so two never write at once.
@@ -314,7 +323,15 @@ pub fn spawn_with(
             out(line);
         }
         while let Some(batch) = next_batch(&mut rx).await {
-            let line = handle_batch(&state, &session, &rewatch, &mut declared, batch).await;
+            let line = handle_batch(
+                &state,
+                &session,
+                &rewatch,
+                &mut declared,
+                lock_at_boot.as_deref(),
+                batch,
+            )
+            .await;
             out(line);
             for line in refresh_types(&state, &root, false).await {
                 out(line);
@@ -377,15 +394,23 @@ pub(crate) fn watch_again<W: Watch>(
 }
 
 /// One batch's work: watch again any directory that was recreated, reload
-/// the config if it changed, then build. Answers the build's line.
+/// the config if it changed, say so if the lock changed, then build.
+/// Answers the build's line.
 async fn handle_batch<W: Watch>(
     state: &AppState,
     session: &DevSession,
     rewatch: &Weak<Mutex<W>>,
     declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
+    lock_at_boot: Option<&[u8]>,
     batch: Batch,
 ) -> String {
     watch_again(rewatch, &session.root, batch.src_dir, batch.build_dir);
+    if batch.lock {
+        let now = std::fs::read(session.root.join("happyview.lock")).ok();
+        if let Some(line) = crate::dev::reload::lock_notice(lock_at_boot, now.as_deref()) {
+            println!("{line}");
+        }
+    }
     if batch.config
         && let Err(e) = crate::dev::reload::reload(state, session, declared).await
     {
@@ -441,6 +466,10 @@ mod tests {
         assert_eq!(
             classify(root, Path::new("/p/.env.test")),
             Some(Change::TestEnv)
+        );
+        assert_eq!(
+            classify(root, Path::new("/p/happyview.lock")),
+            Some(Change::Lock)
         );
         assert_eq!(classify(root, Path::new("/p/srcery/x.lua")), None);
         assert_eq!(classify(root, Path::new("/elsewhere/src/a.json")), None);
@@ -535,12 +564,14 @@ mod tests {
         tx.send(Change::Config).unwrap();
         tx.send(Change::SrcDir).unwrap();
         tx.send(Change::BuildDir).unwrap();
+        tx.send(Change::Lock).unwrap();
         assert_eq!(
             next_batch(&mut rx).await,
             Some(Batch {
                 config: true,
                 src_dir: true,
-                build_dir: true
+                build_dir: true,
+                lock: true,
             })
         );
         assert!(
@@ -711,7 +742,15 @@ mod tests {
             build_dir: true,
             ..Batch::default()
         };
-        handle_batch(&state, &session, &rewatch, &mut declared, src_and_build).await;
+        handle_batch(
+            &state,
+            &session,
+            &rewatch,
+            &mut declared,
+            None,
+            src_and_build,
+        )
+        .await;
         assert_eq!(
             recorded.lock().unwrap().0,
             vec![(root.join("src"), RecursiveMode::Recursive)],
@@ -719,7 +758,15 @@ mod tests {
         );
 
         recorded.lock().unwrap().0.clear();
-        handle_batch(&state, &session, &rewatch, &mut declared, Batch::default()).await;
+        handle_batch(
+            &state,
+            &session,
+            &rewatch,
+            &mut declared,
+            None,
+            Batch::default(),
+        )
+        .await;
         assert!(recorded.lock().unwrap().0.is_empty());
     }
 }
