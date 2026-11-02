@@ -53,7 +53,7 @@ describe("HappyViewSession", () => {
     );
   });
 
-  test("fetchHandler passes through absolute URLs without prepending", async () => {
+  test("fetchHandler sends an absolute URL on the instance as given", async () => {
     let capturedUrl: string | undefined;
     const fetchMock = mock(async (input: RequestInfo | URL) => {
       capturedUrl = input instanceof URL ? input.toString() : String(input);
@@ -62,13 +62,62 @@ describe("HappyViewSession", () => {
 
     const session = await createSession({ fetchMock })();
     await session.fetchHandler(
-      "https://other-service.example.com/xrpc/test.method",
+      "https://happyview.example.com/xrpc/test.method",
       {},
     );
 
-    expect(capturedUrl).toBe(
-      "https://other-service.example.com/xrpc/test.method",
+    expect(capturedUrl).toBe("https://happyview.example.com/xrpc/test.method");
+  });
+
+  test("fetchHandler sends no credentials anywhere but the instance", async () => {
+    const fetchMock = mock(
+      async () => new Response("{}", { status: 200 }),
     );
+    const session = await createSession({ fetchMock })();
+
+    for (const url of [
+      "https://other-service.example.com/xrpc/test.method",
+      "http://happyview.example.com/xrpc/test.method",
+      "https://happyview.example.com:8443/xrpc/test.method",
+      ".attacker.example/xrpc/test.method",
+    ]) {
+      await expect(session.fetchHandler(url, {})).rejects.toThrow(
+        "only sends requests to https://happyview.example.com",
+      );
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test("fetchHandler keeps requests under an instance's base path", async () => {
+    const fetchMock = mock(
+      async () => new Response("{}", { status: 200 }),
+    );
+    const session = await createSession({
+      instanceUrl: "https://example.com/happyview",
+      fetchMock,
+    })();
+
+    await session.fetchHandler("/xrpc/test.method", {});
+    await expect(
+      session.fetchHandler("https://example.com/other/xrpc/test.method", {}),
+    ).rejects.toThrow();
+    await expect(
+      session.fetchHandler("https://example.com/happyviewer/xrpc/test.method", {}),
+    ).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed request's error carries neither the URL nor the fetch source", async () => {
+    const fetchMock = mock(async () => {
+      throw new Error("network down");
+    });
+    const session = await createSession({ fetchMock })();
+
+    const error = await session
+      .fetchHandler("/xrpc/test.method?secret=1", {})
+      .catch((e: Error) => e);
+    expect((error as Error).message).toBe("fetchHandler failed: network down");
+    expect((error as Error).message).not.toContain("secret");
   });
 
   test("fetchHandler adds Authorization DPoP header", async () => {
