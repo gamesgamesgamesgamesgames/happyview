@@ -942,8 +942,16 @@ mod tests {
                 scopes: Some(scopes.clone()),
             },
             keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(test_db.clone(), backend),
+            state_store: crate::auth::oauth_store::DbStateStore::new(
+                test_db.clone(),
+                backend,
+                None,
+            ),
+            session_store: crate::auth::oauth_store::DbSessionStore::new(
+                test_db.clone(),
+                backend,
+                None,
+            ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -970,10 +978,11 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
+            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth), None)),
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 backend,
+                None,
             ),
             linked_repos_client: Arc::new(
                 crate::linked_repos::client::build(
@@ -983,9 +992,10 @@ mod tests {
                     "http://127.0.0.1:0/auth/callback".into(),
                     true,
                     scopes,
-                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
+                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend, None),
                     test_db.clone(),
                     backend,
+                    None,
                     None,
                 )
                 .expect("test linked-repo OAuth client"),

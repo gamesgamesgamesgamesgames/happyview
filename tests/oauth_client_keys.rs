@@ -627,6 +627,7 @@ async fn rotation_survives_for_a_session_pinned_to_the_old_key() {
         pool.clone(),
         backend,
         &key_a,
+        app.state.config.token_encryption_key.as_ref(),
     )
     .unwrap();
     app.state.oauth.register_for_kid(
@@ -706,8 +707,12 @@ async fn a_second_login_after_rotation_moves_the_pin_to_the_new_key() {
         .unwrap();
     assert_ne!(key_a.kid, key_b.kid, "rotation must mint a distinct key");
 
-    let store_for_b = happyview::auth::oauth_store::DbSessionStore::new(pool.clone(), backend)
-        .with_signing_kid(Some(key_b.kid.clone()));
+    let store_for_b = happyview::auth::oauth_store::DbSessionStore::new(
+        pool.clone(),
+        backend,
+        Some(&common::db::TEST_ENCRYPTION_KEY),
+    )
+    .with_signing_kid(Some(key_b.kid.clone()));
     let session_did = atrium_api::types::string::Did::new(did.to_string()).unwrap();
     store_for_b
         .set(session_did.clone(), sample_session())
