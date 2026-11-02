@@ -54,6 +54,7 @@ pub mod record_handler;
 pub mod record_refs;
 pub mod record_store;
 pub mod repo;
+pub mod reseal;
 pub mod resolve;
 pub mod run;
 pub mod script;

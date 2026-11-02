@@ -19,6 +19,10 @@ use crate::dev::DevSession;
 /// `JETSTREAM_PROTOCOL` and `JETSTREAM_COMPRESSION` are not `Config` fields:
 /// the consumer reads them through `vars::var` once, when it is spawned, so
 /// they are judged by [`jetstream_changed`] against the boot file instead.
+///
+/// `[interpreters]` and `[libraries]` are not listed: the plugins they name
+/// load live from `PLUGIN_DIR`, and [`crate::dev::plugins::unserved`] says
+/// which of them still wait for a restart.
 pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> {
     let checks = [
         ("HOST", running.host != edited.host),

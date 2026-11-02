@@ -2,6 +2,7 @@
 
 pub mod env;
 pub mod instance;
+pub mod plugins;
 pub mod reload;
 pub mod report;
 pub mod secrets;

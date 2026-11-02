@@ -11,6 +11,7 @@ pub mod delete_collection;
 pub mod migrate_space_repo;
 pub mod purge_event_logs;
 pub mod reconcile_collection;
+pub mod reseal;
 
 use crate::AppState;
 
@@ -26,6 +27,7 @@ const NATIVE_TYPES: &[&str] = &[
     "happyview.purge-event-logs",
     migrate_space_repo::JOB_TYPE,
     reconcile_collection::JOB_TYPE,
+    reseal::JOB_TYPE,
 ];
 
 /// Whether a job type is reserved. Reserved-but-unimplemented types are still
@@ -53,6 +55,7 @@ pub async fn execute(state: &AppState, job: &Job) -> NativeOutcome {
         "happyview.purge-event-logs" => purge_event_logs::run(state, job).await,
         migrate_space_repo::JOB_TYPE => migrate_space_repo::run(state, job).await,
         reconcile_collection::JOB_TYPE => reconcile_collection::run(state, job).await,
+        reseal::JOB_TYPE => reseal::run(state, job).await,
         other => NativeOutcome::Failed(format!("no native handler for job type '{other}'")),
     }
 }

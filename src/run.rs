@@ -223,6 +223,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
     // Resume interrupted jobs and start the job worker
     crate::jobs::worker::spawn_recovery(state.clone());
     crate::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
+    crate::reseal::spawn_boot_check(state.clone());
 
     {
         let keepalive_state = state.clone();
