@@ -109,3 +109,15 @@ serial_test = "3"
 urlencoding = "2.1.3"
 futures = "0.3"
 rcgen = "0.14"
+
+# sqlx-core 0.9.0's pool maintenance task can spin a worker thread at 100% CPU
+# when `num_idle` underflows (launchbadge/sqlx#4289). Remove this section and
+# bump `sqlx` once a release includes that fix.
+[patch.crates-io]
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }

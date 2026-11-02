@@ -1070,4 +1070,48 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
+
+    // -----------------------------------------------------------------------
+    // pool idle count
+    // -----------------------------------------------------------------------
+
+    // sqlx-core 0.9.0 made a released connection acquirable before counting it
+    // idle, so a concurrent acquire could take it first and wrap `num_idle` to
+    // `usize::MAX`. The pool's maintenance task loops over `0..num_idle()`
+    // without yielding, which pinned a worker thread at 100% CPU. On 0.9.0
+    // this sees the wrapped count within a millisecond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_pool_idle_count_never_wraps() {
+        const MAX: usize = 3;
+        sqlx::any::install_default_drivers();
+        let pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(MAX as u32)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let tasks: Vec<_> = (0..24)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let mut most = 0;
+                    while most <= MAX && std::time::Instant::now() < deadline {
+                        match pool.try_acquire() {
+                            Some(conn) => drop(conn),
+                            None => tokio::task::yield_now().await,
+                        }
+                        most = most.max(pool.num_idle());
+                    }
+                    most
+                })
+            })
+            .collect();
+        for task in tasks {
+            let most = task.await.expect("task");
+            assert!(
+                most <= MAX,
+                "num_idle reached {most} with {MAX} connections"
+            );
+        }
+    }
 }
