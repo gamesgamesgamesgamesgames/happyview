@@ -2566,6 +2566,58 @@ mod deadline {
         }
     }
 
+    /// Every store `new_store` builds yields at its epoch deadline, and
+    /// wasmtime traps a yield from a guest entered synchronously. That trap
+    /// would come at the first slice boundary, 50 ms in, so a short test
+    /// could pass while a production path was broken. Production plugin
+    /// code must therefore enter guests only through the `*_async` calls:
+    /// no `.call(`, no `Instance::new(`, and no linker
+    /// `.instantiate(&mut …)` outside a test module.
+    #[test]
+    fn production_plugin_code_enters_guests_only_asynchronously() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugin");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(files.len() > 5, "{files:?}");
+        let sync_entry =
+            regex::Regex::new(r"\.call\(|Instance::new\(|\.instantiate\(\s*&mut").unwrap();
+        for sync in [
+            "func.call(&mut store, ())",
+            "Instance::new(&mut store, &module, &[])",
+            "linker.instantiate(&mut store, &module)",
+        ] {
+            assert!(sync_entry.is_match(sync), "{sync}");
+        }
+        assert!(!sync_entry.is_match("func.call_async(&mut store, ()).await"));
+        let mut found = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            // Only the code before a file's test module runs in production.
+            let production = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (i, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if sync_entry.is_match(code) {
+                    found.push(format!("{}:{}: {}", file.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "synchronous guest entry:\n{}",
+            found.join("\n")
+        );
+    }
+
     fn bindings_test_state(runtime: &WasmRuntime) -> PluginState {
         crate::db::install_drivers();
         PluginState {

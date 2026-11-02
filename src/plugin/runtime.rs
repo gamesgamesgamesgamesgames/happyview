@@ -1003,6 +1003,17 @@ impl ResourceLimiter for MemoryLimiter {
 /// it was before there were yields, when the same wait fell on the tasks the
 /// guest held the worker from. A run therefore still ends within its wall
 /// clock however busy the runtime is, short of its host imports.
+///
+/// The cost is in the oversubscribed case. With N CPU-bound guests sharing
+/// M workers (N > M), each takes about N/M times its CPU in wall time and is
+/// charged all of it, so once that passes the budget they all time out
+/// together, where without yields the first ones would have finished and
+/// only the later ones would have waited. At the default instruction limit a
+/// run is tens of milliseconds of CPU, so this needs hundreds of guests per
+/// worker against a 10 s clock; it gets nearer as an operator raises
+/// `script_instruction_limit`. Charging only the slices a guest ran would
+/// avoid it, at the price of runs outlasting their wall clock on a saturated
+/// runtime.
 pub struct GuestDeadline {
     epoch: Arc<AtomicU64>,
     remaining: u64,
