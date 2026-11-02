@@ -72,6 +72,9 @@ pub fn register_atproto_api(
                         urlencoding::encode(&cid),
                     );
 
+                    // The endpoint came from a DID document, so this goes through
+                    // the shared client, which screens the addresses it connects
+                    // to and every redirect hop (`crate::outbound`).
                     let response = state.http.get(&url).send().await.map_err(|e| {
                         mlua::Error::runtime(format!("blob_download: request failed: {e}"))
                     })?;

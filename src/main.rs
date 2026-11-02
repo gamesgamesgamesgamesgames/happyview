@@ -37,6 +37,8 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
+    // Before the first outbound request: every shared client reads it.
+    happyview::outbound::install_for(&config);
     let db_backend = config.database_backend;
 
     // Connect to database and run migrations.

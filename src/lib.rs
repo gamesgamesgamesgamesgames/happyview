@@ -25,6 +25,7 @@ pub mod lua;
 pub mod lua_analysis;
 pub mod maintenance;
 pub mod oauth;
+pub mod outbound;
 pub mod plc;
 pub mod plugin;
 pub mod profile;

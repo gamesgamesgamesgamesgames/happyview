@@ -99,6 +99,9 @@ services:
       # A closed port, so e2e runs never send snapshots to the production
       # collector and the telemetry test sees a send fail.
       TELEMETRY_COLLECTOR_URL: http://127.0.0.1:9/v1/snapshot
+      # The PDS is on this network's private addresses, which a serving
+      # instance otherwise refuses to connect to.
+      ALLOW_PRIVATE_DESTINATIONS: "true"
     ports:
       - "3200:3000"
     volumes:
