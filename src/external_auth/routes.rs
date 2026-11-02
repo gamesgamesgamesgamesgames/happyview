@@ -14,7 +14,7 @@ use crate::error::AppError;
 use crate::external_auth::refresh::{RefreshError, RefreshOutcome, ensure_fresh_tokens};
 use crate::external_auth::{state, tokens};
 use crate::plugin::secrets::load_plugin_secrets;
-use crate::plugin::{PluginExecutor, TokenSetExt};
+use crate::plugin::{LoadedPlugin, PluginExecutor, PluginType, TokenSetExt};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -37,6 +37,18 @@ struct ProviderInfo {
     config_schema: Option<serde_json::Value>,
 }
 
+/// The installed auth plugin `plugin_id`. Any other kind of plugin answers as
+/// if nothing by that id were installed, because these routes run sign-in
+/// exports that only an auth plugin has.
+async fn auth_plugin(state: &AppState, plugin_id: &str) -> Result<Arc<LoadedPlugin>, AppError> {
+    state
+        .plugin_registry
+        .get(plugin_id)
+        .await
+        .filter(|p| p.plugin_type() == PluginType::Auth)
+        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {plugin_id}")))
+}
+
 async fn list_providers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProviderInfo>>, AppError> {
@@ -44,6 +56,7 @@ async fn list_providers(
 
     let providers: Vec<ProviderInfo> = plugins
         .into_iter()
+        .filter(|p| p.plugin_type() == PluginType::Auth)
         .map(|p| ProviderInfo {
             id: p.info.id.clone(),
             name: p.info.name.clone(),
@@ -79,11 +92,7 @@ async fn authorize(
     domain: Option<axum::extract::Extension<std::sync::Arc<crate::domain::Domain>>>,
     PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _plugin = app_state
-        .plugin_registry
-        .get(&plugin_id)
-        .await
-        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {}", plugin_id)))?;
+    auth_plugin(&app_state, &plugin_id).await?;
 
     // Generate state parameter for CSRF protection
     let state_param = uuid::Uuid::new_v4().to_string();
@@ -216,6 +225,9 @@ async fn callback_inner(
     stored_state: &state::StoredState,
     params: &HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    auth_plugin(app_state, &stored_state.plugin_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let config = serde_json::Value::Null;
     let secrets = load_plugin_secrets(
         &app_state.db,
@@ -285,11 +297,7 @@ async fn connect_with_config(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_did = claims.did();
 
-    let plugin = app_state
-        .plugin_registry
-        .get(&plugin_id)
-        .await
-        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {}", plugin_id)))?;
+    let plugin = auth_plugin(&app_state, &plugin_id).await?;
 
     // Verify this is an API key plugin
     if plugin.info.auth_type != "api_key" {
@@ -393,6 +401,7 @@ async fn refresh(
     Path(plugin_id): Path<String>,
     PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    auth_plugin(&app_state, &plugin_id).await?;
     let outcome = ensure_fresh_tokens(&app_state, claims.did(), &plugin_id)
         .await
         .map_err(|e| match e {
