@@ -206,7 +206,7 @@ impl TestEnv {
         );
         state.lexicons = lexicons;
         state.oauth_state_store =
-            crate::auth::oauth_store::DbStateStore::new(pool, DatabaseBackend::Sqlite);
+            crate::auth::oauth_store::DbStateStore::new(pool, DatabaseBackend::Sqlite, None);
         state.rate_limiter =
             crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
                 query_cost: 1,

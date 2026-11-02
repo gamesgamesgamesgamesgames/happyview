@@ -395,12 +395,153 @@ pub fn load_from_env() -> Result<Option<AttestationSigner>, AttestationError> {
     )?))
 }
 
+/// The setting an earlier version kept the key in. Reserved, so the generic
+/// settings routes can neither show nor replace it.
+pub const LEGACY_KEY_SETTING: &str = "attestation_private_key";
+
+/// A key as it goes in `happyview_attestation_key`.
+fn seal_key(
+    encryption_key: Option<&[u8; 32]>,
+    hex_key: &str,
+) -> Result<(String, i32), AttestationError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    Ok(match encryption_key {
+        Some(key) => (
+            BASE64.encode(
+                crate::plugin::encryption::encrypt(key, hex_key.as_bytes())
+                    .map_err(|e| AttestationError::Encoding(e.to_string()))?,
+            ),
+            1,
+        ),
+        None => (hex_key.to_string(), 0),
+    })
+}
+
+fn open_key(
+    encryption_key: Option<&[u8; 32]>,
+    stored: &str,
+    encrypted: bool,
+) -> Result<String, AttestationError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    if !encrypted {
+        return Ok(stored.to_string());
+    }
+    let unreadable = || {
+        AttestationError::InvalidKey(
+            "the stored attestation key can't be read with this TOKEN_ENCRYPTION_KEY".to_string(),
+        )
+    };
+    let key = encryption_key.ok_or_else(unreadable)?;
+    let bytes = BASE64.decode(stored).map_err(|_| unreadable())?;
+    let plain = crate::plugin::encryption::decrypt(key, &bytes).map_err(|_| unreadable())?;
+    String::from_utf8(plain).map_err(|_| unreadable())
+}
+
+async fn read_key(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> Result<Option<(String, i64)>, AttestationError> {
+    let sql = crate::db::adapt_sql(
+        "SELECT private_key, CAST(encrypted AS BIGINT) FROM happyview_attestation_key WHERE id = 1",
+        backend,
+    );
+    crate::db::query_as(&sql)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AttestationError::Encoding(format!("db query failed: {e}")))
+}
+
+/// Store a key unless one is already there, so instances booting together
+/// settle on one key.
+async fn insert_key<'e, E>(
+    db: E,
+    backend: crate::db::DatabaseBackend,
+    encryption_key: Option<&[u8; 32]>,
+    hex_key: &str,
+) -> Result<(), AttestationError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    let (stored, encrypted) = seal_key(encryption_key, hex_key)?;
+    let sql = crate::db::adapt_sql(
+        "INSERT INTO happyview_attestation_key (id, private_key, encrypted, created_at) \
+         VALUES (1, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(stored)
+        .bind(encrypted)
+        .bind(crate::db::now_rfc3339())
+        .execute(db)
+        .await
+        .map_err(|e| AttestationError::Encoding(format!("failed to persist key: {e}")))?;
+    Ok(())
+}
+
+/// Bring a stored key up to date: out of the settings, then encrypted once the
+/// instance has a key to encrypt it with. The key itself never changes, because
+/// signatures already published have to keep verifying. A failure leaves it
+/// where it was for the next boot.
+async fn migrate_key(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<(), AttestationError> {
+    use crate::db::adapt_sql;
+    let fail = |e: sqlx::Error| AttestationError::Encoding(format!("failed to move key: {e}"));
+
+    let select = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
+    let legacy: Option<(String,)> = crate::db::query_as(&select)
+        .bind(LEGACY_KEY_SETTING)
+        .fetch_optional(db)
+        .await
+        .map_err(fail)?;
+    if let Some((hex_key,)) = legacy {
+        let mut tx = db.begin().await.map_err(fail)?;
+        insert_key(&mut *tx, backend, encryption_key, &hex_key).await?;
+        let delete = adapt_sql(
+            "DELETE FROM happyview_instance_settings WHERE key = ?",
+            backend,
+        );
+        crate::db::query(&delete)
+            .bind(LEGACY_KEY_SETTING)
+            .execute(&mut *tx)
+            .await
+            .map_err(fail)?;
+        tx.commit().await.map_err(fail)?;
+    }
+
+    if let (Some(_), Some((stored, 0))) = (encryption_key, read_key(db, backend).await?) {
+        let (sealed, _) = seal_key(encryption_key, &stored)?;
+        let update = adapt_sql(
+            "UPDATE happyview_attestation_key SET private_key = ?, encrypted = 1 \
+             WHERE id = 1 AND encrypted = 0 AND private_key = ?",
+            backend,
+        );
+        crate::db::query(&update)
+            .bind(sealed)
+            .bind(stored)
+            .execute(db)
+            .await
+            .map_err(fail)?;
+    }
+    Ok(())
+}
+
 pub async fn load_or_generate(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
     public_url: &str,
+    encryption_key: Option<&[u8; 32]>,
 ) -> Result<AttestationSigner, AttestationError> {
     use crate::db::adapt_sql;
+
+    // Before the environment is consulted, so a key from an earlier boot is
+    // moved even on an instance that now signs with one from its environment.
+    migrate_key(db, backend, encryption_key).await?;
 
     if let Some(signer) = load_from_env()? {
         tracing::info!("Attestation signer loaded from environment variables");
@@ -425,13 +566,10 @@ pub async fn load_or_generate(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
     );
-    let existing: Option<(String,)> = crate::db::query_as(&sql)
-        .bind("attestation_private_key")
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AttestationError::Encoding(format!("db query failed: {e}")))?;
-
-    if let Some((hex_key,)) = existing {
+    if let Some((stored, encrypted)) = read_key(db, backend).await? {
+        // An unreadable key is an error, never a reason to generate another:
+        // that would strand every signature the old one made.
+        let hex_key = open_key(encryption_key, &stored, encrypted != 0)?;
         let key_id: Option<(String,)> = crate::db::query_as(&sql)
             .bind("attestation_key_id")
             .fetch_optional(db)
@@ -463,6 +601,8 @@ pub async fn load_or_generate(
         hex::encode(key_bytes)
     };
 
+    insert_key(db, backend, encryption_key, &hex_key).await?;
+
     let upsert_sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -471,7 +611,6 @@ pub async fn load_or_generate(
     let now = crate::db::now_rfc3339();
 
     for (k, v) in [
-        ("attestation_private_key", hex_key.as_str()),
         ("attestation_key_id", default_key_id.as_str()),
         ("attestation_sig_type", default_sig_type.as_str()),
     ] {
@@ -486,7 +625,16 @@ pub async fn load_or_generate(
 
     tracing::info!(key_id = %default_key_id, "Attestation signing key generated and persisted");
 
-    AttestationSigner::from_hex(&hex_key, default_key_id, default_sig_type)
+    // Reread rather than use what was generated: another instance may have
+    // stored first.
+    let (stored, encrypted) = read_key(db, backend)
+        .await?
+        .ok_or_else(|| AttestationError::Encoding("attestation key was not stored".to_string()))?;
+    AttestationSigner::from_hex(
+        &open_key(encryption_key, &stored, encrypted != 0)?,
+        default_key_id,
+        default_sig_type,
+    )
 }
 
 #[cfg(test)]
@@ -643,23 +791,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_creates_key() {
-        crate::db::install_drivers();
-        let pool = sqlx::pool::PoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::query(
-            "CREATE TABLE happyview_instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = crate::test_support::migrated_memory_pool().await;
 
         let signer = load_or_generate(
             &pool,
             crate::db::DatabaseBackend::Sqlite,
             "https://happyview.example.com",
+            None,
         )
         .await
         .expect("should generate a key");
@@ -670,6 +808,7 @@ mod tests {
             &pool,
             crate::db::DatabaseBackend::Sqlite,
             "https://happyview.example.com",
+            None,
         )
         .await
         .expect("should load from DB");
@@ -679,23 +818,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_sign_verify_roundtrip() {
-        crate::db::install_drivers();
-        let pool = sqlx::pool::PoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::query(
-            "CREATE TABLE happyview_instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = crate::test_support::migrated_memory_pool().await;
 
         let signer = load_or_generate(
             &pool,
             crate::db::DatabaseBackend::Sqlite,
             "https://example.com",
+            None,
         )
         .await
         .unwrap();
@@ -915,5 +1044,122 @@ mod tests {
                 .unwrap(),
             SignatureVerification::Invalid,
         );
+    }
+
+    const BACKEND: crate::db::DatabaseBackend = crate::db::DatabaseBackend::Sqlite;
+    const URL: &str = "https://happyview.example.com";
+    const LEGACY_HEX: &str = "4c0883a69102937d6231471b5dbb6204fe5129617082796fe9f4a4c7e6f9a1b2";
+    const KEY: [u8; 32] = [4; 32];
+
+    async fn pool_with_legacy_key() -> sqlx::AnyPool {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind(LEGACY_KEY_SETTING)
+        .bind(LEGACY_HEX)
+        .bind(crate::db::now_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn legacy_rows(pool: &sqlx::AnyPool) -> i64 {
+        let (count,): (i64,) =
+            crate::db::query_as("SELECT COUNT(*) FROM happyview_instance_settings WHERE key = ?")
+                .bind(LEGACY_KEY_SETTING)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        count
+    }
+
+    fn legacy_public_key() -> Vec<u8> {
+        AttestationSigner::from_hex(LEGACY_HEX, "k".into(), "t".into())
+            .unwrap()
+            .public_key_bytes()
+    }
+
+    /// The same key comes out, so what it signed before the move still verifies.
+    #[tokio::test]
+    async fn an_existing_key_moves_out_of_settings_unchanged_and_encrypted() {
+        let pool = pool_with_legacy_key().await;
+
+        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+
+        assert_eq!(signer.public_key_bytes(), legacy_public_key());
+        assert_eq!(legacy_rows(&pool).await, 0);
+        let (stored, encrypted) = read_key(&pool, BACKEND).await.unwrap().unwrap();
+        assert_eq!(encrypted, 1);
+        assert!(!stored.contains(LEGACY_HEX));
+    }
+
+    #[tokio::test]
+    async fn a_new_key_is_stored_encrypted_and_never_in_settings() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+
+        let first = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+        let again = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+
+        assert_eq!(first.public_key_bytes(), again.public_key_bytes());
+        assert_eq!(legacy_rows(&pool).await, 0);
+        assert_eq!(read_key(&pool, BACKEND).await.unwrap().unwrap().1, 1);
+    }
+
+    /// With no encryption key the signing key still leaves the settings, and
+    /// the first boot that has one encrypts it.
+    #[tokio::test]
+    async fn without_an_encryption_key_it_moves_and_a_later_key_seals_it() {
+        let pool = pool_with_legacy_key().await;
+
+        let signer = load_or_generate(&pool, BACKEND, URL, None).await.unwrap();
+        assert_eq!(signer.public_key_bytes(), legacy_public_key());
+        assert_eq!(legacy_rows(&pool).await, 0);
+        assert_eq!(read_key(&pool, BACKEND).await.unwrap().unwrap().1, 0);
+
+        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+        assert_eq!(signer.public_key_bytes(), legacy_public_key());
+        assert_eq!(read_key(&pool, BACKEND).await.unwrap().unwrap().1, 1);
+    }
+
+    /// Generating a replacement would strand every signature the key made.
+    #[tokio::test]
+    async fn a_key_that_will_not_open_is_an_error_and_is_not_replaced() {
+        let pool = pool_with_legacy_key().await;
+        load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+        let before = read_key(&pool, BACKEND).await.unwrap();
+
+        for key in [Some(&[8u8; 32]), None] {
+            assert!(load_or_generate(&pool, BACKEND, URL, key).await.is_err());
+            assert_eq!(read_key(&pool, BACKEND).await.unwrap(), before);
+        }
+        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
+            .await
+            .unwrap();
+        assert_eq!(signer.public_key_bytes(), legacy_public_key());
+    }
+
+    /// A second boot, or a second instance, finding the key already moved keeps
+    /// what's stored.
+    #[tokio::test]
+    async fn the_move_is_safe_to_repeat() {
+        let pool = pool_with_legacy_key().await;
+        migrate_key(&pool, BACKEND, Some(&KEY)).await.unwrap();
+        let before = read_key(&pool, BACKEND).await.unwrap();
+
+        migrate_key(&pool, BACKEND, Some(&KEY)).await.unwrap();
+
+        assert_eq!(read_key(&pool, BACKEND).await.unwrap(), before);
     }
 }

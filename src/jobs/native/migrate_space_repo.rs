@@ -50,17 +50,17 @@ fn parse_input(input: &serde_json::Value) -> Option<Input> {
 /// login: the two differ whenever a user declines part of a consent screen, and
 /// acting on the request would enqueue migrations that cannot run.
 pub async fn granted_scope(state: &AppState, did: &str) -> Result<Option<String>, AppError> {
-    let sql = crate::db::adapt_sql(
-        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+    let data = crate::auth::oauth_store::stored_session_json(
+        &state.db,
         state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        did,
+        state.config.token_encryption_key.as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
 
-    let Some((data,)) = row else {
+    let Some(data) = data else {
         return Ok(None);
     };
     let parsed: serde_json::Value = serde_json::from_str(&data)
@@ -284,18 +284,13 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     }
 
     // Verify with two independent checks. Both must pass.
+    // Authenticity: the commit is signed by, or MACed under, the author's key.
     let commit =
-        native_client::get_latest_commit(state, &session, &space_uri, &input.author_did).await?;
+        native_client::get_verified_commit(state, &session, &space_uri, &input.author_did).await?;
 
-    // Authenticity: the commit carries a valid signature from the author's key.
-    let key =
-        native_client::author_signing_key(&state.http, &state.config.plc_url, &input.author_did)
-            .await?;
-    crate::spaces::commit::verify_commit(&commit, &space_uri, &input.author_did, &key)?;
-
-    // Agreement: the signed hash describes the records we sent. An authentic
-    // commit can still summarise a different record set.
-    if commit.hash != expected_commit_hash(&records) {
+    // Agreement: the authenticated hash describes the records we sent. An
+    // authentic commit can still summarise a different record set.
+    if *commit.hash() != expected_commit_hash(&records) {
         return Err(AppError::Internal(format!(
             "the PDS's commit does not describe the {total} records we replayed; \
              leaving this repo on HappyView"
@@ -303,14 +298,14 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     }
 
     // Handoff confirmed.
-    if let Some(reason) = hand_off(state, job, input, &commit.rev).await? {
+    if let Some(reason) = hand_off(state, job, input, commit.rev()).await? {
         return Ok(stopped(state, input, reason, total, total).await);
     }
 
     Ok(NativeOutcome::Completed(serde_json::json!({
         "status": "migrated",
         "records": total,
-        "rev": commit.rev,
+        "rev": commit.rev(),
     })))
 }
 

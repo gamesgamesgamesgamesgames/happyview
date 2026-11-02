@@ -3,7 +3,7 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use super::row_to_view;
+use super::{Manager, row_to_view};
 use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::adapt_sql;
@@ -47,17 +47,22 @@ pub async fn get_api_client(
     }
 
     let did = claims.did();
+    let (filter, app_id) = Manager::of(&state, &claims).await?.filter();
 
     let sql = adapt_sql(
-        "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
-         FROM happyview_api_clients \
-         WHERE id = $1 AND owner_did = $2",
+        &format!(
+            "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
+             FROM happyview_api_clients \
+             WHERE id = ? AND owner_did = ?{filter}"
+        ),
         state.db_backend,
     );
 
-    let row = crate::db::query(&sql)
-        .bind(&params.id)
-        .bind(did)
+    let mut query = crate::db::query(&sql).bind(&params.id).bind(did);
+    if let Some(app_id) = app_id {
+        query = query.bind(app_id);
+    }
+    let row = query
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get client: {e}")))?

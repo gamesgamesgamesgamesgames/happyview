@@ -136,6 +136,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
         state.db.clone(),
         state.db_backend,
         new_key,
+        state.config.token_encryption_key.as_ref(),
     ) {
         Ok(client) => {
             let client = Arc::new(client);
@@ -203,6 +204,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
             state.db.clone(),
             state.db_backend,
             new_key,
+            state.config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);
@@ -242,6 +244,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
             state.db.clone(),
             state.db_backend,
             Some(vec![jwk]),
+            state.config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);

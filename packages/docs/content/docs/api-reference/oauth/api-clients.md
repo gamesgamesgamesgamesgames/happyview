@@ -7,7 +7,7 @@ Third-party applications can manage their own API clients via the `dev.happyview
 All endpoints use [DPoP authentication](../../getting-started/authentication.md#authenticating-users-for-procedures). See the [admin API client docs](../admin/api-clients.md) for managing clients through the admin API, and the [API Clients guide](../../guides/api-clients.md) for how API clients work.
 
 <Callout type="info">
-Only top-level API clients can call these endpoints. Third-party (child) clients receive `401 Unauthorized` or `403 Forbidden`.
+Only top-level API clients can call these endpoints, and each one reaches only the clients it created. Third-party (child) clients receive `403 Forbidden`.
 </Callout>
 
 ## Authentication
@@ -28,7 +28,7 @@ The access token must belong to a valid DPoP session for the parent client.
 GET /xrpc/dev.happyview.listApiClients
 ```
 
-Returns all API clients owned by the authenticated user.
+Returns the API clients the calling app created for the authenticated user. Clients the same user created through another app are not listed.
 
 **Response**: `200 OK`
 
@@ -82,7 +82,7 @@ GET /xrpc/dev.happyview.getApiClient?id=<client_id>
 }
 ```
 
-Returns `404` if the client doesn't exist or isn't owned by the authenticated user.
+Returns `404` if the client doesn't exist or isn't one the calling app created for the authenticated user.
 
 ## Create a client
 
@@ -333,7 +333,7 @@ curl -X POST https://happyview.example.com/xrpc/dev.happyview.deleteApiClient \
 
 **Response**: `200 OK` with `{}`
 
-Returns `404` if the client doesn't exist or isn't owned by the authenticated user. Deleting a client cascades to all its children.
+Returns `404` if the client doesn't exist or isn't one the calling app created for the authenticated user. Deleting a client cascades to all its children.
 
 ## Confidential client authentication
 
@@ -530,9 +530,9 @@ Returns `400` (`no usable authentication key '<kid>' ...`) if the requested `kid
 | 401    | `requires an API client key`              | `X-Client-Key` header is absent                                  |
 | 401    | `token_expired`                           | The access token has expired                                     |
 | 401    | `Invalid client`                          | `X-Client-Key` doesn't match a known client                     |
-| 401    | `child clients cannot manage API clients` | The calling client is itself a third-party (child) client        |
+| 403    | `Child clients cannot manage API clients` | The calling client is itself a third-party (child) client        |
 | 403    | `Child clients cannot create API clients` | The calling client is itself a third-party (child) client        |
-| 404    | `API client not found`                    | No client with that ID owned by the authenticated user           |
+| 404    | `API client not found`                    | No client with that ID that the calling app created for the authenticated user |
 | 409    | `client_id_url already registered`        | Another client already uses that `clientIdUrl`                   |
 
 ## Operational notes

@@ -527,7 +527,7 @@ Requires `plugins:create`. Reads one plugin's project from the registry now, the
 GET /admin/plugins/{id}/secrets
 ```
 
-Requires `plugins:read`. Returns the plugin's configured secrets with values masked (last 4 characters shown for values longer than 8 characters, otherwise fully masked). Requires `TOKEN_ENCRYPTION_KEY` to be configured.
+Requires `plugins:read`. Returns the plugin's configured secrets with every value masked as `********`. Requires `TOKEN_ENCRYPTION_KEY` to be configured.
 
 **Response**: `200 OK`
 
@@ -535,7 +535,7 @@ Requires `plugins:read`. Returns the plugin's configured secrets with values mas
 {
   "plugin_id": "steam",
   "secrets": {
-    "PLUGIN_STEAM_API_KEY": "********ABCD"
+    "PLUGIN_STEAM_API_KEY": "********"
   }
 }
 ```
