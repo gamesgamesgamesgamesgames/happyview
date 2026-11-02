@@ -59,9 +59,10 @@ pub async fn resolve_service(
 /// nothing stops one from advertising `http://169.254.169.254/...` or a
 /// private-network address, and unlike `host_http_request` there is no
 /// `allowed_hosts` list checking it, since the plugin never chose this URL
-/// itself. This checks the URL's literal host, not a DNS lookup: an IP
-/// literal is checked against the loopback/link-local/private ranges
-/// directly, and a hostname is refused only if it is literally `localhost`.
+/// itself. This judges the URL as written, refusing plain http, `localhost`
+/// and private IP literals before anything is sent; what a hostname resolves
+/// to, and the address actually connected to, is judged by the client itself
+/// (`crate::outbound`).
 fn refuse_unsafe_endpoint(endpoint: &str) -> Result<(), AtprotoError> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| AtprotoError::Resolve(format!("invalid service endpoint {endpoint}: {e}")))?;

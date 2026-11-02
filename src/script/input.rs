@@ -7,7 +7,6 @@ use serde_json::Value;
 
 use crate::AppState;
 use crate::catalog::Layer;
-use crate::db::adapt_sql;
 use crate::lua::TriggerKind;
 use crate::lua::scripts::ResolvedScript;
 use crate::plugin::{
@@ -201,16 +200,12 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
 /// Script variables, which every kind of run reads as `ctx.env`: the
 /// database's, then the env file's over them.
 async fn load_env(state: &AppState) -> BTreeMap<String, String> {
-    let sql = adapt_sql(
-        "SELECT key, value FROM happyview_script_variables",
+    let mut env = crate::script::variables::load(
+        &state.db,
         state.db_backend,
-    );
-    let mut env: BTreeMap<String, String> = crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+        state.config.token_encryption_key.as_ref(),
+    )
+    .await;
     if let Some(path) = &state.config.script_env_file {
         match tokio::fs::read_to_string(path).await {
             Ok(text) => {
@@ -289,6 +284,25 @@ mod tests {
         .await
         .expect("seed a script variable");
         state
+    }
+
+    /// A run reads an encrypted variable as its value, never as ciphertext.
+    #[tokio::test]
+    async fn a_run_reads_an_encrypted_variable_as_its_value() {
+        let mut state = test_state_with_pool(migrated_memory_pool().await);
+        let key = [3u8; 32];
+        state.config.token_encryption_key = Some(key);
+        let sealed = crate::script::variables::seal(Some(&key), "secret").unwrap();
+        crate::db::query(
+            "INSERT INTO happyview_script_variables (key, value, encrypted) VALUES ('API_KEY', ?, ?)",
+        )
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        assert_eq!(load_env(&state).await["API_KEY"], "secret");
     }
 
     /// The env file overlays the database's variables: its keys win, the

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -238,7 +237,10 @@ async fn run_subscription_once(
         .to_string();
     let port = request.uri().port_u16().unwrap_or(443);
 
-    let tcp = TcpStream::connect((&*host, port)).await?;
+    // The endpoint comes from the labeler's DID document, so it is screened
+    // like any reqwest request; see `crate::outbound`.
+    let tcp =
+        crate::outbound::connect_tcp(&crate::outbound::Source::Installed, &host, port).await?;
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let root_store =

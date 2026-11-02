@@ -895,6 +895,107 @@ async fn sync_plc_updates_did_document() {
 
 #[tokio::test]
 #[serial]
+async fn sync_plc_publishes_verification_methods_as_did_keys() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_plc().await;
+
+    // Generate and store a rotation key (setup_did_plc only stores a signing key)
+    let encryption_key = [0x42u8; 32];
+
+    let mut rotation_key_bytes = [0u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut rotation_key_bytes);
+    let encrypted = happyview::plugin::encryption::encrypt(&encryption_key, &rotation_key_bytes)
+        .expect("encryption failed");
+    let rotation_key_enc =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted);
+
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_service_identity SET rotation_key_enc = ? WHERE id = 1",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&rotation_key_enc)
+        .execute(&app.state.db)
+        .await
+        .expect("failed to store rotation key");
+
+    // Build a genesis-like PLC document for the mock
+    let rotation_did_key = happyview_plc::private_key_to_did_key(&rotation_key_bytes).unwrap();
+
+    // Compute the signing key's did:key from the stored identity
+    let identity = happyview::service_identity::get_identity(&app.state.db, app.state.db_backend)
+        .await
+        .unwrap()
+        .unwrap();
+    let signing_key_bytes =
+        happyview::plc::decrypt_key(identity.signing_key_enc.as_ref().unwrap(), &encryption_key)
+            .unwrap();
+    let signing_did_key = happyview_plc::private_key_to_did_key(&signing_key_bytes).unwrap();
+
+    let genesis_doc = json!({
+        "type": "plc_operation",
+        "rotationKeys": [&rotation_did_key],
+        "verificationMethods": {
+            "atproto": &signing_did_key,
+        },
+        "alsoKnownAs": [],
+        "services": {},
+        "prev": null,
+        "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+
+    plc_store.write().await.insert(did.clone(), genesis_doc);
+
+    // TestApp provisions `#atproto_space` the way instance startup does. The
+    // table stores it as a bare multibase key; PLC requires the did:key form.
+    let vm = happyview::verification_methods::ensure_atproto_space_method(
+        &app.state.db,
+        app.state.db_backend,
+        &encryption_key,
+    )
+    .await
+    .unwrap();
+    assert!(!vm.public_key_multibase.starts_with("did:key:"));
+
+    let cookie = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/service-entries/sync-plc")
+                .header(cookie.0, cookie.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "sync-plc should return 204: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let store = plc_store.read().await;
+    let methods = store[&did]["verificationMethods"]
+        .as_object()
+        .expect("verificationMethods should exist");
+    assert_eq!(methods["atproto"], signing_did_key.as_str());
+    assert_eq!(
+        methods["atproto_space"],
+        format!("did:key:{}", vm.public_key_multibase).as_str()
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn sync_plc_rejects_non_plc_mode() {
     common::require_db!();
     let mut app = TestApp::new().await;

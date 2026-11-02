@@ -207,6 +207,9 @@ pub(super) struct CreateApiKeyResponse {
 pub(super) struct ScriptVariableSummary {
     pub(super) key: String,
     pub(super) preview: String,
+    /// The value can't be read with this instance's key. Setting the variable
+    /// again replaces it.
+    pub(super) unreadable: bool,
     pub(super) created_at: String,
     pub(super) updated_at: String,
 }

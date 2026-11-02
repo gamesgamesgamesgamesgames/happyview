@@ -13,6 +13,7 @@ use crate::service_entries::{
     update_entry,
 };
 use crate::service_identity::IdentityMode;
+use crate::verification_methods::VerificationMethod;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -154,6 +155,19 @@ pub(super) async fn lexicon_services(
 // PLC sync endpoints
 // ---------------------------------------------------------------------------
 
+fn merge_verification_methods(
+    methods: &mut serde_json::Map<String, serde_json::Value>,
+    vm_entries: &[VerificationMethod],
+) {
+    for vm in vm_entries {
+        let key = vm.fragment_id.trim_start_matches('#').to_string();
+        methods.insert(
+            key,
+            serde_json::json!(format!("did:key:{}", vm.public_key_multibase)),
+        );
+    }
+}
+
 /// POST /admin/service-entries/sync-plc — one-click PLC sync for did_plc mode.
 ///
 /// Signs and submits a PLC update operation directly using the rotation key.
@@ -210,10 +224,7 @@ pub(super) async fn sync_plc(
 
     // Merge verification methods from the table
     let vm_entries = crate::verification_methods::list_methods(&state.db, state.db_backend).await?;
-    for vm in &vm_entries {
-        let key = vm.fragment_id.trim_start_matches('#').to_string();
-        verification_methods.insert(key, serde_json::json!(vm.public_key_multibase));
-    }
+    merge_verification_methods(&mut verification_methods, &vm_entries);
 
     // Build services: start from existing, then merge our service entries
     let mut services_map = last_op["services"].as_object().cloned().unwrap_or_default();
@@ -452,10 +463,7 @@ pub(super) async fn sync_plc_submit(
         .cloned()
         .unwrap_or_default();
     let vm_entries = crate::verification_methods::list_methods(&state.db, state.db_backend).await?;
-    for vm in &vm_entries {
-        let key = vm.fragment_id.trim_start_matches('#').to_string();
-        vm_map.insert(key, serde_json::json!(vm.public_key_multibase));
-    }
+    merge_verification_methods(&mut vm_map, &vm_entries);
     let verification_methods: Unknown = serde_json::from_value(serde_json::Value::Object(vm_map))
         .map_err(|e| {
         AppError::Internal(format!("failed to build verification methods Unknown: {e}"))
@@ -523,4 +531,27 @@ pub(super) async fn sync_plc_submit(
     tracing::info!(did = %account_did, "PLC DID document synced (attach_account mode)");
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_verification_methods_writes_did_keys() {
+        let mut methods = serde_json::Map::new();
+        methods.insert("atproto".into(), serde_json::json!("did:key:zExisting"));
+
+        let vm = VerificationMethod {
+            id: "id".into(),
+            fragment_id: "#atproto_space".into(),
+            key_type: "Multikey".into(),
+            public_key_multibase: "zDnaeSpaceKey".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        merge_verification_methods(&mut methods, &[vm]);
+
+        assert_eq!(methods["atproto"], "did:key:zExisting");
+        assert_eq!(methods["atproto_space"], "did:key:zDnaeSpaceKey");
+    }
 }

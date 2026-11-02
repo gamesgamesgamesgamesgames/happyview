@@ -63,18 +63,36 @@ export interface RecordsCount {
 }
 
 /**
+ * A count's pieces in reading order: `done`, then `total` (null when the
+ * count stands alone), said with "about" when `estimated`, then the noun.
+ */
+export interface RecordsCountParts {
+  done: number;
+  total: number | null;
+  estimated: boolean;
+  noun: string;
+}
+
+/**
  * "1,200 of about 5,500 records", or "1,200 records" with no total or once
  * the count has reached a known one.
  */
-export function recordsCountText({
+export function recordsCountParts({
   done,
   total,
   noun = "records",
   estimated = false,
-}: RecordsCount): string {
+}: RecordsCount): RecordsCountParts {
   if (total == null || (total === done && !estimated)) {
-    return `${done.toLocaleString()} ${noun}`;
+    return { done, total: null, estimated: false, noun };
   }
+  return { done, total, estimated, noun };
+}
+
+/** {@link recordsCountParts} as one string. */
+export function recordsCountText(count: RecordsCount): string {
+  const { done, total, estimated, noun } = recordsCountParts(count);
+  if (total == null) return `${done.toLocaleString()} ${noun}`;
   return `${done.toLocaleString()} of ${estimated ? "about " : ""}${total.toLocaleString()} ${noun}`;
 }
 

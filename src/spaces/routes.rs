@@ -3,7 +3,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
-use k256;
 use serde::Deserialize;
 
 use crate::AppState;
@@ -78,11 +77,14 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced, with its new `repoRev` and `hash`.
+    /// The repo that advanced, with its new `repoRev` and `data`.
     repo: Option<String>,
     repo_rev: Option<String>,
     /// The alpha lexicon's name for `repoRev`. Accepted until v3.
     rev: Option<String>,
+    data: Option<LexBytes>,
+    /// The name for `data` before proposal 0016. Accepted until every repo
+    /// host sends `data`.
     hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
     /// Accepted until v3.
@@ -104,7 +106,7 @@ impl LexBytes {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(self.bytes.trim_end_matches('='))
-            .map_err(|_| AppError::BadRequest("hash is not valid base64".into()))
+            .map_err(|_| AppError::BadRequest("data is not valid base64".into()))
     }
 }
 
@@ -1196,8 +1198,9 @@ async fn get_delegation_token(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+    let signing_key =
+        crate::spaces::delegation_key::load_or_create(&state.db, state.db_backend, encryption_key)
+            .await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1237,31 +1240,48 @@ async fn get_delegation_token(
 // Protocol endpoint implementations
 // ---------------------------------------------------------------------------
 
-fn repo_state_commit_json(repo_state: &RepoState) -> Result<Option<serde_json::Value>, AppError> {
+/// The commit to serve for a repo, in whichever model its state holds.
+///
+/// A repo synced from a 0016 host holds only its hash: the MAC that
+/// authenticated it was for that one request. Until HappyView can MAC a commit
+/// itself (HAP-192), it serves such a commit in the 0016 shape with no MAC,
+/// which 0016 permits under OAuth. `space` is echoed as the caller named it,
+/// as the reference does.
+fn repo_state_commit_json(
+    repo_state: &RepoState,
+    space: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
     let Some(h) = repo_state.hash.as_deref() else {
         return Ok(None);
     };
-    let ikm = repo_state.ikm.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but ikm missing".into())
-    })?;
-    let mac = repo_state.mac.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but mac missing".into())
-    })?;
-    let sig = repo_state.sig.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but sig missing".into())
-    })?;
     // The lexicon types these as `bytes`, which atproto renders as
     // `{"$bytes": "<standard base64>"}`. Other implementations cannot parse a
     // commit that carries bare base64url strings instead.
     use crate::spaces::commit::encode_lex_bytes;
-    Ok(Some(serde_json::json!({
-        "ver": 1,
-        "hash": encode_lex_bytes(h),
-        "ikm": encode_lex_bytes(ikm),
-        "sig": encode_lex_bytes(sig),
-        "mac": encode_lex_bytes(mac),
-        "rev": repo_state.rev,
-    })))
+    match (
+        repo_state.ikm.as_deref(),
+        repo_state.sig.as_deref(),
+        repo_state.mac.as_deref(),
+    ) {
+        (Some(ikm), Some(sig), Some(mac)) => Ok(Some(serde_json::json!({
+            "ver": 1,
+            "hash": encode_lex_bytes(h),
+            "ikm": encode_lex_bytes(ikm),
+            "sig": encode_lex_bytes(sig),
+            "mac": encode_lex_bytes(mac),
+            "rev": repo_state.rev,
+        }))),
+        (None, None, None) => Ok(Some(serde_json::json!({
+            "ver": 1,
+            "repo": repo_state.author_did,
+            "space": space,
+            "rev": repo_state.rev,
+            "data": encode_lex_bytes(h),
+        }))),
+        _ => Err(AppError::Internal(
+            "corrupt repo state: a signed commit is missing its ikm, sig or mac".into(),
+        )),
+    }
 }
 
 async fn get_latest_commit(
@@ -1300,7 +1320,7 @@ async fn get_latest_commit(
     let repo_state =
         db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
 
-    let commit = repo_state_commit_json(&repo_state)?;
+    let commit = repo_state_commit_json(&repo_state, &params.space)?;
 
     Ok(Json(serde_json::json!({
         "rev": repo_state.rev,
@@ -1354,34 +1374,41 @@ async fn get_repo(
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
-    let ikm: [u8; 32] = repo_state
-        .ikm
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing ikm".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("corrupt repo state: ikm is not 32 bytes".into()))?;
-    let mac: [u8; 32] = repo_state
-        .mac
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing mac".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("corrupt repo state: mac is not 32 bytes".into()))?;
     let rev = repo_state
         .rev
         .ok_or_else(|| AppError::Internal("corrupt repo state: missing rev".into()))?;
-    let sig = repo_state
-        .sig
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?;
-    let commit = crate::spaces::commit::SignedCommit {
-        ver: 1,
-        hash,
-        ikm,
-        sig,
-        mac,
-        rev,
-    };
 
-    let car_bytes = crate::spaces::car::serialize_repo(&commit, &records)?;
+    use crate::spaces::car::{CarCommit, serialize_repo};
+    let to_32 = |field: &str, value: Option<&[u8]>| -> Result<[u8; 32], AppError> {
+        value
+            .ok_or_else(|| AppError::Internal(format!("corrupt repo state: missing {field}")))?
+            .try_into()
+            .map_err(|_| AppError::Internal(format!("corrupt repo state: {field} is not 32 bytes")))
+    };
+    // See `repo_state_commit_json` for why a repo may hold only its hash.
+    let car_bytes =
+        if repo_state.ikm.is_none() && repo_state.sig.is_none() && repo_state.mac.is_none() {
+            let commit = crate::spaces::space_mac::Commit {
+                ver: 1,
+                repo: params.did.clone(),
+                space: params.space.clone(),
+                rev,
+                data: hash,
+            };
+            serialize_repo(CarCommit::Mac(&commit), &records)?
+        } else {
+            let commit = crate::spaces::commit::SignedCommit {
+                ver: 1,
+                hash,
+                ikm: to_32("ikm", repo_state.ikm.as_deref())?,
+                mac: to_32("mac", repo_state.mac.as_deref())?,
+                sig: repo_state
+                    .sig
+                    .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?,
+                rev,
+            };
+            serialize_repo(CarCommit::Signed(&commit), &records)?
+        };
 
     Ok((
         StatusCode::OK,
@@ -1451,7 +1478,7 @@ async fn list_repo_ops(
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
     let repo_state =
         db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-    let commit = repo_state_commit_json(&repo_state)?;
+    let commit = repo_state_commit_json(&repo_state, &params.space)?;
 
     Ok(Json(serde_json::json!({
         "ops": ops,
@@ -1512,6 +1539,9 @@ async fn list_repos(
                 "repoRev": w.rev,
                 // The alpha lexicon's name for `repoRev`. Sent until v3.
                 "rev": w.rev,
+                "data": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+                // The name for `data` before proposal 0016. Sent until every
+                // syncer reads `data`.
                 "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
                 "spaceRev": w.space_rev,
             })
@@ -1792,7 +1822,10 @@ async fn notify_write(
         ),
     }
 
-    if let (Some(rev), Some(hash)) = (input.repo_rev.as_ref().or(input.rev.as_ref()), &input.hash) {
+    if let (Some(rev), Some(hash)) = (
+        input.repo_rev.as_ref().or(input.rev.as_ref()),
+        input.data.as_ref().or(input.hash.as_ref()),
+    ) {
         let hash = hash.decode()?;
         let mut conn = service::begin_space_write(&state, &space.id).await?;
         let recorded = crate::spaces::writers::record(
@@ -1899,22 +1932,37 @@ async fn get_space_credential(
     // A PDS that serves spaces mints delegation tokens with the account's own
     // key. For accounts on one that does not, HappyView mints them with its own
     // delegation key.
-    let delegation_claims =
-        match verify_local_delegation_token(encryption_key, &token, &accepted_aud) {
-            Ok(claims) => claims,
-            Err(_) => crate::spaces::credential::verify_account_delegation_token(
-                &token,
-                &state.http,
-                &state.config.plc_url,
-                &accepted_aud,
-            )
+    // A key that cannot be read leaves only the account's own key to try, as
+    // a token this instance signed cannot be verified without it anyway.
+    let local_key =
+        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
             .await
-            .map_err(|e| AppError::XrpcError {
-                status: StatusCode::BAD_REQUEST,
-                code: "InvalidDelegationToken",
-                message: e.to_string(),
-            })?,
-        };
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "delegation key unreadable");
+                None
+            });
+    let local_claims = local_key.as_ref().map(|key| {
+        crate::spaces::credential::verify_delegation_token(
+            &token,
+            key.verifying_key(),
+            &accepted_aud,
+        )
+    });
+    let delegation_claims = match local_claims {
+        Some(Ok(claims)) => claims,
+        _ => crate::spaces::credential::verify_account_delegation_token(
+            &token,
+            &state.http,
+            &state.config.plc_url,
+            &accepted_aud,
+        )
+        .await
+        .map_err(|e| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: e.to_string(),
+        })?,
+    };
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
@@ -1979,21 +2027,6 @@ async fn get_space_credential(
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
-}
-
-/// Verify a delegation token HappyView minted with its own delegation key.
-fn verify_local_delegation_token(
-    encryption_key: &[u8; 32],
-    token: &str,
-    accepted_aud: &[&str],
-) -> Result<crate::spaces::credential::DelegationTokenClaims, AppError> {
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
-    crate::spaces::credential::verify_delegation_token(
-        token,
-        &k256::ecdsa::VerifyingKey::from(&signing_key),
-        accepted_aud,
-    )
 }
 
 #[cfg(test)]

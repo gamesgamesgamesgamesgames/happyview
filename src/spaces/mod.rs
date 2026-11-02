@@ -5,6 +5,7 @@ pub mod client_attestation;
 pub mod commit;
 pub mod credential;
 pub mod db;
+pub mod delegation_key;
 pub mod describe;
 pub mod host_mode;
 pub mod http_signature;
@@ -20,6 +21,7 @@ pub mod routes;
 pub mod scope;
 pub mod service;
 pub mod simplespace;
+pub mod space_mac;
 pub mod types;
 pub mod writers;
 

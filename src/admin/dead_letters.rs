@@ -361,7 +361,7 @@ fn bulk_results(results: Vec<(String, Result<(), AppError>)>) -> Value {
         .into_iter()
         .map(|(id, result)| match result {
             Ok(()) => serde_json::json!({ "id": id, "ok": true }),
-            Err(e) => serde_json::json!({ "id": id, "ok": false, "error": e.to_string() }),
+            Err(e) => serde_json::json!({ "id": id, "ok": false, "error": e.client_message() }),
         })
         .collect();
     serde_json::json!({
@@ -1031,4 +1031,22 @@ async fn reindex_single(state: &AppState, id: &str) -> Result<(), AppError> {
     mark_resolved(state, &dl.id, dl.source).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bulk_result_keeps_internal_detail_out() {
+        let body = bulk_results(vec![
+            ("a".to_string(), Ok(())),
+            (
+                "b".to_string(),
+                Err(AppError::Internal("database driver detail".into())),
+            ),
+        ]);
+        assert_eq!(body["failed"], 1);
+        assert!(!body.to_string().contains("driver detail"));
+    }
 }
