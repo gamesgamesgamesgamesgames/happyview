@@ -79,7 +79,7 @@ export default function PluginsPage() {
   const [sort, setSort] = useState<SortKey>("attention");
   const [grouped, setGrouped] = useState(true);
 
-  const canManage = hasPermission("plugins:manage");
+  const canInstall = hasPermission("plugins:create");
 
   const load = useCallback(async () => {
     try {
@@ -179,7 +179,7 @@ export default function PluginsPage() {
                     : `${plugins.length} installed · all configured`}
             </p>
           </div>
-          {canManage ? (
+          {canInstall ? (
             <Button asChild>
               <Link href="/dashboard/settings/plugins/add">
                 <Plus />
@@ -253,7 +253,7 @@ export default function PluginsPage() {
                 sign-in providers.
               </p>
             </div>
-            {canManage ? (
+            {canInstall ? (
               <Button asChild size="sm">
                 <Link href="/dashboard/settings/plugins/add">
                   <Plus />
