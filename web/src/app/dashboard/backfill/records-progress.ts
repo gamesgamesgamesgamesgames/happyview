@@ -177,7 +177,7 @@ export function hookDetail(stats: HookStats, finished: boolean): HookDetail {
 export function executorProgress(
   job: Pick<
     BackfillJob,
-    "status" | "stage" | "processed_repos" | "total_repos"
+    "status" | "stage" | "processed_repos" | "total_repos" | "total_records"
   >,
 ): { label: string } & RecordsCount {
   const done = job.processed_repos ?? 0;
@@ -192,10 +192,13 @@ export function executorProgress(
     };
   }
   if (job.status === "completed") {
+    // A resumed pass can report fewer than it wrote over all its runs, so a
+    // finished one counts whichever is more.
+    const ran = Math.max(done, job.total_records ?? 0);
     return {
       label: "Ran record scripts",
-      done,
-      total: done,
+      done: ran,
+      total: ran,
       estimated: false,
     };
   }
@@ -213,18 +216,20 @@ export function executorProgress(
 }
 
 /**
- * Whether an executor-run job finished having run nothing: a store pass that
- * found no record script, or nothing in the store, or the row the store keeps
- * to say a collection with no history has been seen. Its counts are 0, or
- * unset on that row, and it ran no hook, so it has no progress to show; its
- * note says why. Judged by the counts, not the note's wording.
+ * Whether an executor-run job ended with nothing counted against it: a store
+ * pass that found no record script or nothing in the store, one that failed
+ * before it read anything, or the row the store keeps for a collection it has
+ * seen. Its counts are 0, or unset on that row, and no hook ran under it, so
+ * it has no progress to show; its note or error says why. Records the feed
+ * delivered and hooked are not this job's to count. Judged by the counts, not
+ * the note's wording.
  */
 export function executorRanNothing(
   job: Pick<BackfillJob, "status" | "processed_repos" | "total_records">,
   hooks: Pick<HookStats, "done"> | null,
 ): boolean {
   return (
-    job.status === "completed" &&
+    ["completed", "failed", "cancelled"].includes(job.status) &&
     (job.processed_repos ?? 0) === 0 &&
     (job.total_records ?? 0) === 0 &&
     (hooks?.done ?? 0) === 0
@@ -263,6 +268,7 @@ const SUMMARY_STATE_LABELS: Record<
 export function summaryParts(
   summary: Pick<CollectionSummary, "records" | "state" | "retry_at">,
   formatTime: (iso: string) => string = (iso) => new Date(iso).toLocaleString(),
+  now: number = Date.now(),
 ): string[] {
   const parts: string[] = [];
   if (summary.records != null) {
@@ -270,7 +276,13 @@ export function summaryParts(
   }
   if (summary.state) parts.push(SUMMARY_STATE_LABELS[summary.state]);
   if (summary.retry_at) {
-    parts.push(`next crawl attempt ${formatTime(summary.retry_at)}`);
+    // A time already gone by is due, not upcoming: the store tries it on its
+    // next pass.
+    parts.push(
+      Date.parse(summary.retry_at) <= now
+        ? "next crawl attempt due"
+        : `next crawl attempt at ${formatTime(summary.retry_at)}`,
+    );
   }
   return parts;
 }
