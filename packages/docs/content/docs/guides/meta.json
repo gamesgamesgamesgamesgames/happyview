@@ -8,6 +8,7 @@
     "backfill",
     "background-jobs",
     "record-providers",
+    "instance-limits",
     "record-scripts",
     "lua-scripting",
     "testing",
