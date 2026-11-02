@@ -28,7 +28,7 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: open PRs against `dev`, sign off your commits with `git commit -s`, and run `git config core.hooksPath .githooks` once per clone.
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: open PRs against `beta` (or `alpha` for a change that belongs to the next major line), sign off your commits with `git commit -s`, and run `git config core.hooksPath .githooks` once per clone.
 
 ## Documentation
 

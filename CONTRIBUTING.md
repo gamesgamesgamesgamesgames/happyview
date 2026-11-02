@@ -268,7 +268,7 @@ CI runs a fork's PR without the repository's secrets, and every required check i
 
 1. **Approve the workflow run** for a first-time contributor, from the banner on the PR's Checks tab. Read the diff first, especially anything under `.github/`: the run executes the PR's code on our runners.
 2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
-3. **Check the squash message before merging.** This repository fills it with the PR's commit messages, trailers included. Delete any trailer we don't carry, such as an AI co-author line, in the merge dialog, and keep the contributor's `Signed-off-by`.
+3. **Check the commit trailers before merging.** Pull requests into `alpha` and `beta` merge with a merge commit, so every commit lands as written, trailers included, and the merge dialog can't remove one. If a commit carries a trailer we don't carry, such as an AI co-author line, ask the contributor to amend it before merging, and keep their `Signed-off-by`.
 
 ### Missing prerequisites fail
 
@@ -381,19 +381,18 @@ Postgres, a PLC directory and a PDS. It gates a release the same way the other
 checks do, and runs only after `frontend` and `build-server` have succeeded.
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml \
-  --target wasm32-unknown-unknown --release
+bash scripts/fetch-lua-plugin.sh
 docker compose -f docker-compose.e2e.yml down -v
 docker compose -f docker-compose.e2e.yml up -d --build
 cd web && npx playwright test
 ```
 
 Two things that look like test failures and are not. The stack's `lua`
-interpreter is that fixture, bind-mounted from a path git ignores, and saving a
-script asks the interpreter its language names whether the body is one it can
-run — so without the build above every save is refused and the suite stops in
-`globalSetup`. And `down -v` matters because `scripts/init-e2e-dbs.sql` runs
+interpreter is the published plugin that `scripts/fetch-lua-plugin.sh` downloads
+into `tests/fixtures/lua-plugin`, a path git ignores, and the stack bind-mounts
+it. Saving a script asks the interpreter its language names whether the body is
+one it can run, so without the fetch above every save is refused and the suite
+stops in `globalSetup`. And `down -v` matters because `scripts/init-e2e-dbs.sql` runs
 only when the volume is new: on a reused one the PDS and PLC containers
 crash-loop over missing databases, and the specs that cover first-run setup
 need a database where setup has not happened.
