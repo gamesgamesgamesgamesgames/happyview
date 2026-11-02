@@ -62,6 +62,69 @@ fn refuse_if_reserved(key: &str) -> Result<(), AppError> {
 
 const GENERAL_RETENTION_SETTING: &str = "event_log_retention_days";
 
+/// The variable a hosting platform names the settings it fixes in, as a
+/// comma-separated list of keys. A fixed setting reads its environment value
+/// whatever is stored, and the settings routes refuse to change it.
+pub const PLATFORM_LOCKED_SETTINGS: &str = "PLATFORM_LOCKED_SETTINGS";
+
+/// Fixed settings whose value has to be a positive number of days or minutes,
+/// so a platform can't fix them to `0`, which would keep records forever.
+const POSITIVE_WHEN_LOCKED: &[&str] = &[SPACE_ACCESS_RETENTION_SETTING];
+
+/// The keys `PLATFORM_LOCKED_SETTINGS` names.
+fn locked_keys() -> Vec<String> {
+    vars::var(PLATFORM_LOCKED_SETTINGS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the hosting platform fixes `key`.
+pub fn platform_locked(key: &str) -> bool {
+    locked_keys().iter().any(|locked| locked == key)
+}
+
+/// Refuse to start on a lock that can't hold: a key with no environment
+/// variable to read, a variable left unset, or a retention fixed at `0`. Read
+/// as unlocked, any of these would hand the operator a setting the platform
+/// meant to fix.
+pub fn check_platform_locks() -> Result<(), String> {
+    for key in locked_keys() {
+        let Some(env_var) = env_var_for(&key) else {
+            return Err(format!(
+                "{PLATFORM_LOCKED_SETTINGS} names '{key}', which isn't a setting that can be fixed"
+            ));
+        };
+        let Some(value) = vars::var(env_var) else {
+            return Err(format!(
+                "{PLATFORM_LOCKED_SETTINGS} fixes '{key}', but {env_var} isn't set"
+            ));
+        };
+        if POSITIVE_WHEN_LOCKED.contains(&key.as_str())
+            && !value.trim().parse::<u32>().is_ok_and(|n| n > 0)
+        {
+            return Err(format!(
+                "{PLATFORM_LOCKED_SETTINGS} fixes '{key}', so {env_var} must be a positive number ('{value}')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_if_locked(key: &str) -> Result<(), AppError> {
+    if platform_locked(key) {
+        return Err(AppError::Conflict(format!(
+            "'{key}' is set by the hosting platform and can't be changed here"
+        )));
+    }
+    Ok(())
+}
+
 /// The environment variable a setting falls back to, if it has one.
 pub fn env_var_for(key: &str) -> Option<&'static str> {
     ENV_FALLBACKS
@@ -123,7 +186,9 @@ pub async fn try_get_setting(
         .fetch_optional(pool)
         .await?;
 
-    if let Some((value,)) = row {
+    if let Some((value,)) = row
+        && !platform_locked(key)
+    {
         return Ok(Some(value));
     }
 
@@ -207,7 +272,10 @@ async fn read_setting_in(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
-    Ok(stored.map(|(v,)| v).or_else(|| fallback_value(key)))
+    Ok(stored
+        .map(|(v,)| v)
+        .filter(|_| !platform_locked(key))
+        .or_else(|| fallback_value(key)))
 }
 
 /// What [`write_audited`] does to a setting's row.
@@ -313,7 +381,11 @@ fn fallback_entries(db_keys: &std::collections::HashSet<String>) -> Vec<SettingE
             vars::var_with_source(env_var).map(|(value, source)| SettingEntry {
                 key: setting_key.to_string(),
                 value,
-                source: source.as_str().to_string(),
+                source: if platform_locked(setting_key) {
+                    "platform".to_string()
+                } else {
+                    source.as_str().to_string()
+                },
             })
         })
         .collect()
@@ -336,7 +408,9 @@ pub(super) async fn list(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?
         .into_iter()
-        .filter(|(key, _): &(String, String)| !RESERVED_KEYS.contains(&key.as_str()))
+        .filter(|(key, _): &(String, String)| {
+            !RESERVED_KEYS.contains(&key.as_str()) && !platform_locked(key)
+        })
         .collect();
 
     let db_keys: std::collections::HashSet<String> = rows.iter().map(|(k, _)| k.clone()).collect();
@@ -364,6 +438,7 @@ pub(super) async fn upsert(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
     refuse_if_reserved(&key)?;
+    refuse_if_locked(&key)?;
     if key.starts_with("telemetry.") {
         super::telemetry::refuse_if_managed(&state)?;
     }
@@ -404,6 +479,7 @@ pub(super) async fn delete(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
     refuse_if_reserved(&key)?;
+    refuse_if_locked(&key)?;
     if key.starts_with("telemetry.") {
         super::telemetry::refuse_if_managed(&state)?;
     }
@@ -781,6 +857,63 @@ mod tests {
         let changes = retention_changes(&pool).await;
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[1].1, serde_json::json!({ "from": 7, "to": 14 }));
+    }
+
+    /// A setting the platform fixes reads its environment value whatever row
+    /// is stored, and the lock refuses to start unless that value holds.
+    #[tokio::test]
+    #[serial]
+    async fn a_platform_fixed_setting_ignores_a_stored_row() {
+        unsafe {
+            std::env::set_var(PLATFORM_LOCKED_SETTINGS, SPACE_ACCESS_RETENTION_SETTING);
+            std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "364");
+        }
+        let pool = migrated_memory_pool().await;
+        put_setting(
+            &pool,
+            SPACE_ACCESS_RETENTION_SETTING,
+            "0",
+            DatabaseBackend::Sqlite,
+        )
+        .await
+        .unwrap();
+
+        let read = get_setting(
+            &pool,
+            SPACE_ACCESS_RETENTION_SETTING,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
+        assert!(check_platform_locks().is_ok());
+        assert!(refuse_if_locked(SPACE_ACCESS_RETENTION_SETTING).is_err());
+        assert!(refuse_if_locked(GENERAL_RETENTION_SETTING).is_ok());
+
+        unsafe { std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "0") };
+        let zero = check_platform_locks();
+        unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
+        let unset = check_platform_locks();
+        unsafe { std::env::set_var(PLATFORM_LOCKED_SETTINGS, "no_such_setting") };
+        let unknown = check_platform_locks();
+        unsafe { std::env::remove_var(PLATFORM_LOCKED_SETTINGS) };
+
+        assert_eq!(read.as_deref(), Some("364"));
+        assert!(
+            zero.is_err(),
+            "a fixed retention of 0 would keep records forever"
+        );
+        assert!(unset.is_err());
+        assert!(unknown.is_err());
+        assert_eq!(
+            get_setting(
+                &pool,
+                SPACE_ACCESS_RETENTION_SETTING,
+                DatabaseBackend::Sqlite
+            )
+            .await
+            .as_deref(),
+            Some("0"),
+            "without the lock the stored row decides again"
+        );
     }
 
     #[tokio::test]
