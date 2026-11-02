@@ -456,3 +456,68 @@ async fn a_project_deploys_redeploys_and_survives_a_boot() {
         assert_eq!(body["error"], "ProjectFromFile", "{label}");
     }
 }
+
+/// A deploy that adds a lexicon an auto-publish rule covers starts a
+/// publishing run, as an admin upload does. The rule's linked repo has no
+/// session, so the run records a failed attempt, which is all the test needs
+/// to see.
+#[tokio::test]
+async fn a_deploy_starts_auto_publish() {
+    use happyview::lexicon_publishing::{Pattern, store};
+    use happyview::linked_repos::db as linked;
+
+    const AUTO: &str = "com.example.autopublished";
+    const AUTO_PATH: &str = "src/lexicons/com/example/autopublished.json";
+
+    let _lock = common::db::acquire_test_lock().await;
+    for (pool, backend) in happyview::test_support::test_pools().await {
+        let label = format!("{backend:?}");
+        happyview::db::migrate(&pool, backend).await;
+        let app = app(pool.clone(), backend, None).await;
+        seed(&app).await;
+        app.exec("DELETE FROM happyview_lexicon_publications", &[])
+            .await;
+        app.exec("DELETE FROM happyview_lexicon_publish_rules", &[])
+            .await;
+        // Active with no stored session, so the publish fails when the session
+        // is restored, before anything reaches the network.
+        let scopes =
+            "atproto repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
+        let repo = linked::create(&app.state, None, None, None, scopes, ADMIN.1)
+            .await
+            .unwrap();
+        let did = format!("did:plc:autopub{}", uuid::Uuid::new_v4().simple());
+        linked::bind_did(&app.state, &repo.id, &did, None)
+            .await
+            .unwrap();
+        store::insert_rule(
+            &app.state,
+            &Pattern::parse("com.example.*").unwrap(),
+            "linked_repo",
+            Some(&repo.id),
+            true,
+            ADMIN.1,
+        )
+        .await
+        .unwrap();
+
+        let auto = lexicon(AUTO);
+        let (status, body) = app
+            .deploy("", None, bundle(&[(AUTO_PATH, auto.as_bytes())]))
+            .await;
+        assert_eq!(status, 200, "{label}: {body}");
+
+        let mut attempted = None;
+        for _ in 0..100 {
+            attempted = store::get_publication(&app.state, AUTO).await.unwrap();
+            if attempted.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let attempted =
+            attempted.unwrap_or_else(|| panic!("{label}: the deploy started no publishing run"));
+        assert!(attempted.last_error.is_some(), "{label}");
+        assert_eq!(attempted.did, None, "{label}");
+    }
+}
