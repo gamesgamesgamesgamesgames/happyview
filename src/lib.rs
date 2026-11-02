@@ -35,6 +35,7 @@ pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
 pub mod lexicon_publishing;
+pub mod limits;
 pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
@@ -145,6 +146,8 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
+    /// What this instance may hold or do (`limits`); unlimited unless set.
+    pub limits: Arc<dyn happyview_provider::LimitsProvider>,
     /// Per-script run metrics: the last day in memory, longer in
     /// `happyview_script_metrics`.
     pub metrics: Arc<metrics::ScriptMetrics>,

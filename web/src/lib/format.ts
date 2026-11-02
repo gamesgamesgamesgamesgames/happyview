@@ -1,6 +1,21 @@
 import { toast } from "sonner";
 
+import { ApiError } from "@/lib/api";
+import { limitToast } from "@/lib/limits";
+
 export function toastError(context: string, e: unknown) {
+  // Before the 403 test below: a limit is not a missing permission.
+  if (e instanceof ApiError && e.limitReached) {
+    const { title, description, action } = limitToast(context, e.limitReached);
+    toast.error(title, {
+      description,
+      action: action && {
+        label: action.label,
+        onClick: () => window.open(action.url, "_blank", "noopener,noreferrer"),
+      },
+    });
+    return;
+  }
   const msg = e instanceof Error ? e.message : String(e);
   const lower = msg.toLowerCase();
   if (

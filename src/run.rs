@@ -1096,6 +1096,17 @@ async fn boot(
 
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
+    let limits = match crate::limits::load() {
+        Ok(limits) => limits,
+        Err(e) => {
+            tracing::error!("{e}");
+            return Err(std::process::ExitCode::FAILURE);
+        }
+    };
+    if let Some(file) = limits.file.clone() {
+        tracing::info!(file = %file.path().display(), "limits are read from this file");
+        tokio::spawn(file.watch());
+    }
     let metrics = std::sync::Arc::new(crate::metrics::ScriptMetrics::new());
     tracing::info!(
         instance = metrics.instance(),
@@ -1142,6 +1153,7 @@ async fn boot(
         client_jwks,
         telemetry_counters,
         script_limits,
+        limits: limits.provider,
         metrics,
         test: None,
     };
