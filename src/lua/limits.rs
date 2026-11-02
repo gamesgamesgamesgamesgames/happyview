@@ -16,11 +16,11 @@ pub const WALL_CLOCK_SECONDS_KEY: &str = "script_wall_clock_seconds";
 
 pub const DEFAULT_INSTRUCTION_LIMIT: u32 = 1_000_000;
 
-/// The instruction budget counts Lua alone, so a script whose time goes to
-/// awaiting the host (a loop of HTTP calls, say) would otherwise hold its
-/// caller's connection for as long as the host keeps answering. The event
-/// runners have no connection to hold and sit inside a retry loop that a
-/// spent budget can only delay, so they get no clock.
+/// How long a script's own code may run, by the clock, before the host stops
+/// it. The instruction budget is the interpreter's to enforce; this is the
+/// host's bound, armed for query, procedure, record-event and label runs and
+/// lifted for jobs (`plugin::executor::guest_deadline`). Time spent inside a
+/// host import, such as an HTTP request or a database query, is not counted.
 pub const DEFAULT_WALL_CLOCK_SECONDS: u32 = 10;
 
 /// The values a budget may take. The dashboard mirrors both ranges in
