@@ -264,7 +264,7 @@ pub(super) async fn upsert(
     let _trigger = ParsedTrigger::parse(&body.id).map_err(AppError::BadRequest)?;
 
     if let Some(ref desc) = body.description
-        && desc.len() > MAX_DESCRIPTION_LEN
+        && checks::description_too_long(desc)
     {
         return Err(AppError::BadRequest(format!(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
@@ -355,7 +355,7 @@ pub(super) async fn patch(
     // Ahead of the body check, which keeps what it prepares: a patch refused
     // for its description should leave nothing behind for its body.
     if let Some(Some(ref desc)) = body.description
-        && desc.len() > MAX_DESCRIPTION_LEN
+        && checks::description_too_long(desc)
     {
         return Err(AppError::BadRequest(format!(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
