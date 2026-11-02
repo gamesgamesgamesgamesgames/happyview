@@ -226,6 +226,13 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
     raw[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("a valid P-256 scalar");
     let did_key = happyview_plc::private_key_to_did_key(&raw).unwrap();
+    // A second key for `#atproto_kem`, which a host proves its space commits
+    // against with a MAC. pds.js takes it at `/init`; without it, the account
+    // has a key its DID document never names, and no commit verifies.
+    let mut kem_raw = [0u8; 32];
+    kem_raw[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    kem_raw[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let kem_did_key = happyview_plc::private_key_to_did_key(&kem_raw).unwrap();
 
     let handle = "alice.localhost";
     let mut genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
@@ -238,6 +245,7 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
         )],
     });
     genesis["alsoKnownAs"] = json!([format!("at://{handle}")]);
+    genesis["verificationMethods"]["atproto_kem"] = json!(kem_did_key);
     let signed = happyview_plc::sign_operation(&genesis, &key).unwrap();
     let did = happyview_plc::derive_did(&signed).unwrap();
 
@@ -258,6 +266,7 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
         .json(&json!({
             "did": did,
             "privateKey": raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "kemKey": kem_raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "handle": handle,
             "curve": "p256",
             "password": password,
@@ -271,4 +280,78 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
         resp.text().await.unwrap_or_default()
     );
     did
+}
+
+/// An author's DID document from the stack's PLC directory.
+pub async fn did_doc(plc_url: &str, did: &str) -> happyview::profile::DidDocument {
+    happyview::profile::resolve_did_document(&reqwest::Client::new(), plc_url, did)
+        .await
+        .unwrap_or_else(|e| panic!("PLC resolution failed for {did}: {e}"))
+}
+
+/// A `getLatestCommit` answer, with what a syncer needs to authenticate it.
+pub struct FetchedCommit {
+    pub json: Value,
+    pub mac_header: Option<reqwest::header::HeaderValue>,
+    pub exchange: Option<happyview::spaces::space_mac::Encapsulation>,
+}
+
+/// Fetch `repo`'s latest commit as native sync does, asking for a MAC keyed to
+/// `kem_doc`'s `#atproto_kem` key when it publishes one.
+///
+/// `kem_doc` is normally the repo author's own document. Passing another
+/// account's is how a test shows that a MAC is bound to the author's key.
+pub async fn fetch_latest_commit(
+    base: &str,
+    token: &str,
+    space_uri: &str,
+    repo: &str,
+    kem_doc: &happyview::profile::DidDocument,
+) -> FetchedCommit {
+    use happyview::spaces::space_mac;
+
+    let exchange = space_mac::author_kem_key(kem_doc)
+        .expect("the KEM key decodes")
+        .map(|key| space_mac::encapsulate(&key));
+    let mut req = reqwest::Client::new()
+        .get(format!("{base}/xrpc/com.atproto.space.getLatestCommit"))
+        .query(&[("space", space_uri), ("repo", repo)])
+        .bearer_auth(token);
+    if let Some(exchange) = &exchange {
+        req = req.header(
+            space_mac::WANT_MAC_HEADER,
+            space_mac::want_mac_header(&exchange.key_share).unwrap(),
+        );
+    }
+    let resp = req.send().await.expect("getLatestCommit request");
+    assert_eq!(resp.status().as_u16(), 200, "getLatestCommit failed");
+    let mac_header = resp.headers().get(space_mac::MAC_HEADER).cloned();
+    let json = resp.json::<Value>().await.expect("commit json")["commit"].clone();
+    FetchedCommit {
+        json,
+        mac_header,
+        exchange,
+    }
+}
+
+/// `repo`'s latest commit, fetched and authenticated exactly as native sync
+/// does, whichever commit model the host speaks.
+pub async fn verified_latest_commit(
+    base: &str,
+    plc_url: &str,
+    token: &str,
+    space_uri: &str,
+    repo: &str,
+) -> happyview::spaces::native_client::VerifiedCommit {
+    let doc = did_doc(plc_url, repo).await;
+    let fetched = fetch_latest_commit(base, token, space_uri, repo, &doc).await;
+    happyview::spaces::native_client::verify_remote_commit(
+        &fetched.json,
+        space_uri,
+        repo,
+        &doc,
+        fetched.exchange.as_ref(),
+        fetched.mac_header.as_ref(),
+    )
+    .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
 }

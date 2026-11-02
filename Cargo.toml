@@ -83,7 +83,7 @@ ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 libsqlite3-sys = { version = "0.30", default-features = false }
 multibase = "0.9"
-p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
+p256 = { version = "0.14", features = ["pkcs8", "ecdsa", "ecdh"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
 # rustls rather than the default native-tls: OpenSSL cannot link into a static
