@@ -427,7 +427,8 @@ impl BackfillExecutor for Describing {
         Some(CollectionSummary {
             message: format!("{collection} is still being filled."),
             records: Some(42),
-            state: Some(SummaryState::Running),
+            state: Some(SummaryState::Queued),
+            retry_at: Some("2026-11-02T15:00:00+00:00".to_string()),
         })
     }
 }
@@ -500,7 +501,8 @@ async fn an_executor_notes_its_job_and_describes_its_collections() {
             "summary": {
                 "message": format!("{B} is still being filled."),
                 "records": 42,
-                "state": "running",
+                "state": "queued",
+                "retry_at": "2026-11-02T15:00:00+00:00",
             },
         })
     );

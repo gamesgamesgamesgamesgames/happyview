@@ -17,6 +17,7 @@ import {
   executorRanNothing,
   runByExecutor,
   runningLabel,
+  summaryParts,
 } from "./records-progress";
 import { AccountInput } from "@/components/account-input/account-input";
 import {
@@ -144,15 +145,6 @@ function sourceLabel(source: string): string {
   const words = source.replace(/[-_]+/g, " ").trim();
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
-
-const SUMMARY_STATE_LABELS: Record<
-  NonNullable<NonNullable<BackfillCollection["summary"]>["state"]>,
-  string
-> = {
-  running: "crawling",
-  complete: "complete",
-  failed: "crawl failed",
-};
 
 // Operators read these, not enum names.
 const ERROR_KIND_LABELS: Record<string, string> = {
@@ -955,20 +947,31 @@ function JobDetail({
     canCancel && (job.status === "running" || job.status === "pausing");
   const [collectionSummary, setCollectionSummary] =
     useState<BackfillCollection["summary"]>(null);
+  // Read again every ten seconds while the job runs, since the Network
+  // store's count and crawl keep moving under a job that waits on them.
+  const summaryLive =
+    job.status === "running" ||
+    job.status === "pausing" ||
+    job.status === "cancelling";
   useEffect(() => {
     if (!byExecutor || !job.collection) return;
+    const collection = job.collection;
     let current = true;
-    getBackfillCollection(job.collection)
-      .then((resp) => {
-        if (current) setCollectionSummary(resp.summary);
-      })
-      .catch(() => {
-        /* ignore */
-      });
+    const load = () =>
+      getBackfillCollection(collection)
+        .then((resp) => {
+          if (current) setCollectionSummary(resp.summary);
+        })
+        .catch(() => {
+          /* ignore */
+        });
+    load();
+    const timer = summaryLive ? setInterval(load, 10_000) : undefined;
     return () => {
       current = false;
+      if (timer) clearInterval(timer);
     };
-  }, [byExecutor, job.collection, job.status]);
+  }, [byExecutor, job.collection, job.status, summaryLive]);
 
   // Detail data state
   const [discoveredRepos, setDiscoveredRepos] = useState<BackfillRepoEntry[]>(
@@ -1392,17 +1395,9 @@ function JobDetail({
             </span>
             <div className="mt-1 space-y-1 rounded-md border p-3 text-xs">
               <p>{collectionSummary.message}</p>
-              {(collectionSummary.records != null ||
-                collectionSummary.state) && (
+              {summaryParts(collectionSummary).length > 0 && (
                 <p className="text-muted-foreground">
-                  {[
-                    collectionSummary.records != null &&
-                      `${collectionSummary.records.toLocaleString()} records`,
-                    collectionSummary.state &&
-                      SUMMARY_STATE_LABELS[collectionSummary.state],
-                  ]
-                    .filter(Boolean)
-                    .join(", ")}
+                  {summaryParts(collectionSummary).join(", ")}
                 </p>
               )}
             </div>
@@ -1955,16 +1950,24 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [lookup, setLookup] = useState<{
     collection: string;
     executor: string | null;
+    summary: BackfillCollection["summary"];
   } | null>(null);
-  const executor =
-    collection && lookup?.collection === collection ? lookup.executor : null;
+  const lookedUp =
+    collection && lookup?.collection === collection ? lookup : null;
+  const executor = lookedUp?.executor ?? null;
+  const storeSummary = lookedUp?.summary ?? null;
 
   useEffect(() => {
     if (!collection) return;
     let current = true;
     getBackfillCollection(collection)
       .then((resp) => {
-        if (current) setLookup({ collection, executor: resp.executor });
+        if (current)
+          setLookup({
+            collection,
+            executor: resp.executor,
+            summary: resp.summary,
+          });
       })
       .catch(() => {
         /* keep the source select */
@@ -2073,7 +2076,10 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               <>
                 <Label>Source</Label>
                 <p className="text-muted-foreground text-xs">
-                  Records come from the network store.
+                  Records come from the Network store
+                  {storeSummary && summaryParts(storeSummary).length > 0
+                    ? `: ${summaryParts(storeSummary).join(", ")}.`
+                    : "."}
                 </p>
               </>
             ) : (

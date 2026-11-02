@@ -8,6 +8,8 @@ import {
   hookStatsOf,
   executorProgress,
   executorRanNothing,
+  summaryParts,
+  waitingForCrawl,
   recordsCountParts,
   recordsCountText,
   recordsFraction,
@@ -203,6 +205,7 @@ describe("hookStatsOf", () => {
 describe("executorProgress", () => {
   it("counts against the store's estimate while the pass runs", () => {
     const row = executorProgress({
+      stage: "pending",
       status: "running",
       processed_repos: 1200,
       total_repos: 5500,
@@ -215,6 +218,7 @@ describe("executorProgress", () => {
 
   it("reads a finished pass as finished, however far it fell short of the estimate", () => {
     const row = executorProgress({
+      stage: "pending",
       status: "completed",
       processed_repos: 5546055,
       total_repos: 5549379,
@@ -226,6 +230,7 @@ describe("executorProgress", () => {
 
   it("keeps the estimate for a pass that stopped", () => {
     const row = executorProgress({
+      stage: "pending",
       status: "cancelled",
       processed_repos: 10,
       total_repos: 100,
@@ -236,6 +241,7 @@ describe("executorProgress", () => {
   it("doesn't call a failed or paused pass running", () => {
     for (const status of ["failed", "cancelled", "paused"] as const) {
       const row = executorProgress({
+        stage: "pending",
         status,
         processed_repos: 10,
         total_repos: 100,
@@ -243,6 +249,7 @@ describe("executorProgress", () => {
       expect(row.label).toBe("Record scripts");
     }
     const pausing = executorProgress({
+      stage: "pending",
       status: "pausing",
       processed_repos: 10,
       total_repos: 100,
@@ -295,5 +302,80 @@ describe("executorRanNothing", () => {
     ]) {
       expect(ran({ status, processed_repos: 0, total_records: 0 })).toBe(false);
     }
+  });
+});
+
+describe("waiting for the Network store's crawl", () => {
+  it("is a running job at the waiting stage", () => {
+    expect(
+      waitingForCrawl({ status: "running", stage: "waiting_for_crawl" }),
+    ).toBe(true);
+    expect(
+      waitingForCrawl({ status: "pausing", stage: "waiting_for_crawl" }),
+    ).toBe(true);
+    expect(waitingForCrawl({ status: "running", stage: "pending" })).toBe(
+      false,
+    );
+    expect(
+      waitingForCrawl({ status: "paused", stage: "waiting_for_crawl" }),
+    ).toBe(false);
+  });
+
+  it("says so in the badge", () => {
+    expect(
+      runningLabel({ stage: "waiting_for_crawl", source: "store-pass" }),
+    ).toBe("waiting for crawl");
+  });
+
+  it("counts what has arrived, with no total, while it waits", () => {
+    const row = executorProgress({
+      stage: "waiting_for_crawl",
+      status: "running",
+      processed_repos: 40,
+      total_repos: 0,
+    });
+    expect(row.label).toBe("Waiting for the Network store's crawl");
+    expect(recordsFraction(row)).toBeNull();
+    expect(recordsCountText(row)).toBe("40 records arrived so far");
+  });
+});
+
+describe("summaryParts", () => {
+  const at = (iso: string) => `at ${iso}`;
+
+  it("reads the records, the crawl and the next attempt in order", () => {
+    expect(
+      summaryParts(
+        {
+          records: 18571,
+          state: "failed",
+          retry_at: "2026-11-02T15:00:00+00:00",
+        },
+        at,
+      ),
+    ).toEqual([
+      `${(18571).toLocaleString()} records`,
+      "crawl failed",
+      "next crawl attempt at 2026-11-02T15:00:00+00:00",
+    ]);
+  });
+
+  it("names every crawl state", () => {
+    expect(summaryParts({ records: null, state: "queued" })).toEqual([
+      "crawl queued",
+    ]);
+    expect(summaryParts({ records: null, state: "running" })).toEqual([
+      "crawling",
+    ]);
+    expect(summaryParts({ records: null, state: "complete" })).toEqual([
+      "crawl complete",
+    ]);
+  });
+
+  it("leaves out what it doesn't know", () => {
+    expect(
+      summaryParts({ records: null, state: null, retry_at: null }),
+    ).toEqual([]);
+    expect(summaryParts({ records: 0, state: null })).toEqual(["0 records"]);
   });
 });
