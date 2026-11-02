@@ -75,7 +75,7 @@ export interface BackfillCollection {
     records: number | null;
     state: "queued" | "running" | "complete" | "failed" | null;
     /** When the executor next tries to fill the collection, if a try is due. */
-    retry_at?: string | null;
+    retry_at: string | null;
   } | null;
 }
 

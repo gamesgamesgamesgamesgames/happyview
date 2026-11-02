@@ -957,19 +957,29 @@ function JobDetail({
     if (!byExecutor || !job.collection) return;
     const collection = job.collection;
     let current = true;
-    const load = () =>
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Each read is scheduled after the last one answers, so a slow answer
+    // can't land after a newer one, and a hidden tab skips its turn.
+    const load = () => {
+      if (summaryLive && document.hidden) {
+        timer = setTimeout(load, 10_000);
+        return;
+      }
       getBackfillCollection(collection)
         .then((resp) => {
           if (current) setCollectionSummary(resp.summary);
         })
         .catch(() => {
           /* ignore */
+        })
+        .finally(() => {
+          if (current && summaryLive) timer = setTimeout(load, 10_000);
         });
+    };
     load();
-    const timer = summaryLive ? setInterval(load, 10_000) : undefined;
     return () => {
       current = false;
-      if (timer) clearInterval(timer);
+      if (timer) clearTimeout(timer);
     };
   }, [byExecutor, job.collection, job.status, summaryLive]);
 
@@ -1381,7 +1391,10 @@ function JobDetail({
 
         {job.note && (
           <div>
-            <span className="text-muted-foreground text-sm">Result</span>
+            {/* A running job's note says what it is doing, not what it did. */}
+            <span className="text-muted-foreground text-sm">
+              {isActive ? "Status" : "Result"}
+            </span>
             <div className="bg-muted mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
               {job.note}
             </div>
@@ -1391,7 +1404,7 @@ function JobDetail({
         {collectionSummary && (
           <div>
             <span className="text-muted-foreground text-sm">
-              In the network store
+              In the Network store
             </span>
             <div className="mt-1 space-y-1 rounded-md border p-3 text-xs">
               <p>{collectionSummary.message}</p>
