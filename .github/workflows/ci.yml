@@ -102,8 +102,8 @@ jobs:
       # The event's own `draft` is the state when it fired. A push and "mark
       # ready" a second apart give a `synchronize` run that still says draft,
       # and it cancels the `ready_for_review` run, which leaves the pull
-      # request with a failed draft hold and no full run. Asking now sees it
-      # ready.
+      # request with a failed draft hold and no full run. Asked here, a few
+      # seconds into the run, the API already reports it ready.
       - name: Read whether the pull request is still a draft
         id: draft
         if: github.event_name == 'pull_request'
