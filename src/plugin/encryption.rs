@@ -101,7 +101,28 @@ impl Keyring {
     }
 }
 
+/// Which of a keyring's keys opened a value, and what it held.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Opened {
+    Current(Vec<u8>),
+    Previous(Vec<u8>),
+    /// Neither key opens it, or it isn't ciphertext at all.
+    Neither,
+}
+
 impl Keyring {
+    /// Like [`Keyring::decrypt`], but says which key opened the value, so a
+    /// rotation can tell what still needs re-sealing.
+    pub fn which_opens(&self, ciphertext: &[u8]) -> Opened {
+        if let Ok(plain) = decrypt(&self.current, ciphertext) {
+            return Opened::Current(plain);
+        }
+        match self.previous.as_ref().map(|key| decrypt(key, ciphertext)) {
+            Some(Ok(plain)) => Opened::Previous(plain),
+            _ => Opened::Neither,
+        }
+    }
+
     /// One key and no rotation under way.
     pub const fn single(current: [u8; 32]) -> Self {
         Self {
@@ -199,6 +220,28 @@ mod tests {
             keys.decrypt(&[0u8; 10]),
             Err(EncryptionError::InvalidFormat)
         ));
+    }
+
+    #[test]
+    fn a_keyring_says_which_key_opened_a_value() {
+        let keys = Keyring::new(NEW, Some(OLD));
+        assert_eq!(
+            keys.which_opens(&encrypt(&NEW, b"n").unwrap()),
+            Opened::Current(b"n".to_vec())
+        );
+        assert_eq!(
+            keys.which_opens(&encrypt(&OLD, b"o").unwrap()),
+            Opened::Previous(b"o".to_vec())
+        );
+        assert_eq!(
+            keys.which_opens(&encrypt(&[0x33; 32], b"x").unwrap()),
+            Opened::Neither
+        );
+        assert_eq!(keys.which_opens(b"short"), Opened::Neither);
+        assert_eq!(
+            Keyring::single(NEW).which_opens(&encrypt(&OLD, b"o").unwrap()),
+            Opened::Neither
+        );
     }
 
     #[test]

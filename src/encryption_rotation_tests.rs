@@ -2,10 +2,14 @@
 //! test run has: a value sealed under the old key still opens once the new key
 //! is current and the old one is `TOKEN_ENCRYPTION_KEY_PREVIOUS`, a value
 //! written mid-rotation is sealed under the new key, and nothing opens under
-//! the new key alone until it has been re-sealed.
+//! the new key alone until it has been re-sealed. Re-sealing then leaves
+//! nothing needing the previous key, and everything opens under the new key
+//! alone.
 //!
-//! The singleton key tables are cleared per run, so those tests share a
-//! `serial` key with the delegation key's own tests on the shared Postgres.
+//! The full rotation re-seals every store of the shared Postgres, so every test
+//! here holds the `encryption_rotation` key; the singleton key tables are also
+//! cleared per run, which the delegation key's own tests hold `delegation_key`
+//! for.
 
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
@@ -60,6 +64,7 @@ async fn plugin_row(pool: &sqlx::AnyPool, backend: DatabaseBackend, id: &str) {
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn dpop_keys_and_sessions_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         let client = format!("rot-{}", uuid::Uuid::new_v4());
@@ -130,6 +135,7 @@ async fn dpop_keys_and_sessions_open_with_the_previous_key() {
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn oauth_client_keys_open_with_the_previous_key_and_new_ones_seal_with_the_new_key() {
     for (pool, backend) in test_pools().await {
         let owner = format!("rot-{}", uuid::Uuid::new_v4());
@@ -163,6 +169,7 @@ async fn oauth_client_keys_open_with_the_previous_key_and_new_ones_seal_with_the
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn external_tokens_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         let did = format!("did:plc:rot-{}", uuid::Uuid::new_v4());
@@ -209,6 +216,7 @@ async fn external_tokens_open_with_the_previous_key() {
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn plugin_secrets_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         let plugin = format!("rot{}", uuid::Uuid::new_v4().simple());
@@ -242,6 +250,7 @@ async fn plugin_secrets_open_with_the_previous_key() {
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn verification_method_keys_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         let fragment = format!("#rot{}", uuid::Uuid::new_v4().simple());
@@ -276,7 +285,7 @@ async fn verification_method_keys_open_with_the_previous_key() {
 }
 
 #[tokio::test]
-#[serial_test::serial(delegation_key)]
+#[serial_test::serial(delegation_key, encryption_rotation)]
 async fn the_delegation_and_attestation_keys_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         crate::db::query("DELETE FROM happyview_delegation_key")
@@ -321,6 +330,7 @@ async fn the_delegation_and_attestation_keys_open_with_the_previous_key() {
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn script_variables_open_with_the_previous_key_and_saves_seal_with_the_new_key() {
     for (pool, backend) in test_pools().await {
         crate::db::query("DELETE FROM happyview_script_variables")
@@ -356,6 +366,7 @@ async fn script_variables_open_with_the_previous_key_and_saves_seal_with_the_new
 }
 
 #[tokio::test]
+#[serial_test::serial(encryption_rotation)]
 async fn oauth_sessions_and_state_open_with_the_previous_key() {
     for (pool, backend) in test_pools().await {
         let did = Did::new(format!("did:plc:rot{}", uuid::Uuid::new_v4().simple())).unwrap();
@@ -443,4 +454,424 @@ fn only_the_encryption_module_calls_the_raw_decrypt() {
         offenders.is_empty(),
         "open stored values with Keyring::decrypt: {offenders:?}"
     );
+}
+
+/// Something sealed under the old key in every store, keyed by what each
+/// reader looks it up by.
+struct Seeded {
+    client: String,
+    provision: String,
+    key_id: String,
+    did: String,
+    owner_sealed: String,
+    owner_plain: String,
+    plugin: String,
+    fragment: String,
+    space_did_id: String,
+    session_did: Did,
+    state_key: String,
+}
+
+async fn seed_everything_under_the_old_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Seeded {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let seeded = Seeded {
+        client: format!("rot-{id}"),
+        provision: format!("rot-{id}-p"),
+        key_id: format!("rot-{id}-k"),
+        did: format!("did:plc:rot{id}"),
+        owner_sealed: format!("rot-{id}-sealed"),
+        owner_plain: format!("rot-{id}-plain"),
+        plugin: format!("rot{id}"),
+        fragment: format!("#rot{id}"),
+        space_did_id: format!("rot-{id}-space"),
+        session_did: Did::new(format!("did:plc:rot{id}")).unwrap(),
+        state_key: format!("rot-{id}-state"),
+    };
+
+    api_client(pool, backend, &seeded.client).await;
+    let keypair = crate::oauth::keys::generate_dpop_keypair().unwrap();
+    crate::oauth::keys::store_dpop_key(
+        pool,
+        backend,
+        &OLD,
+        &seeded.key_id,
+        &seeded.provision,
+        &seeded.client,
+        &keypair,
+        None,
+    )
+    .await
+    .unwrap();
+    crate::oauth::sessions::store_dpop_session(
+        pool,
+        backend,
+        &OLD,
+        &format!("{}-s", seeded.client),
+        &seeded.client,
+        &seeded.key_id,
+        &seeded.did,
+        "access",
+        Some("refresh"),
+        None,
+        "atproto",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let sealed = crate::oauth::client_keys::generate_client_key(&seeded.owner_sealed).unwrap();
+    crate::oauth::client_keys::insert_key(pool, backend, Some(&old()), &sealed)
+        .await
+        .unwrap();
+    // Stored before the instance had a key, as an `encrypted = 0` row.
+    let plain = crate::oauth::client_keys::generate_client_key(&seeded.owner_plain).unwrap();
+    crate::oauth::client_keys::insert_key(pool, backend, None, &plain)
+        .await
+        .unwrap();
+
+    plugin_row(pool, backend, &seeded.plugin).await;
+    crate::external_auth::tokens::store_tokens(
+        pool,
+        backend,
+        Some(&OLD),
+        &seeded.did,
+        &seeded.plugin,
+        "acct",
+        "access",
+        Some("refresh"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let name = format!(
+        "{}API_KEY",
+        crate::plugin::secrets::secret_env_prefix(&seeded.plugin)
+    );
+    let config =
+        serde_json::json!({ "secrets": { name: STANDARD.encode(encrypt(&OLD, b"shh").unwrap()) } });
+    crate::db::query(&crate::db::adapt_sql(
+        "INSERT INTO happyview_plugin_configs (plugin_id, config, updated_at) VALUES (?, ?, ?)",
+        backend,
+    ))
+    .bind(&seeded.plugin)
+    .bind(config.to_string())
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    crate::db::query("DELETE FROM happyview_service_identity")
+        .execute(pool)
+        .await
+        .unwrap();
+    crate::db::query(&crate::db::adapt_sql(
+        "INSERT INTO happyview_service_identity (id, mode, signing_key_enc, rotation_key_enc, created_at, updated_at) VALUES (1, 'not_exposed', ?, ?, ?, ?)",
+        backend,
+    ))
+    .bind(STANDARD.encode(encrypt(&OLD, b"signing").unwrap()))
+    .bind(STANDARD.encode(encrypt(&OLD, b"rotation").unwrap()))
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    crate::verification_methods::create_method(pool, backend, &seeded.fragment, &OLD)
+        .await
+        .unwrap();
+    crate::db::query(&crate::db::adapt_sql(
+        "INSERT INTO happyview_space_dids (id, did, signing_key_enc, rotation_key_enc, created_by, created_at) VALUES (?, ?, ?, ?, 'did:plc:owner', ?)",
+        backend,
+    ))
+    .bind(&seeded.space_did_id)
+    .bind(format!("did:plc:{}", seeded.space_did_id))
+    .bind(encrypt(&OLD, b"space-signing").unwrap())
+    .bind(encrypt(&OLD, b"space-rotation").unwrap())
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for table in ["happyview_delegation_key", "happyview_attestation_key"] {
+        crate::db::query(&format!("DELETE FROM {table}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    crate::spaces::delegation_key::load_or_create(pool, backend, &old())
+        .await
+        .unwrap();
+    crate::plugin::attestation::load_or_generate(
+        pool,
+        backend,
+        "https://rotation.example",
+        Some(&old()),
+    )
+    .await
+    .unwrap();
+
+    crate::db::query("DELETE FROM happyview_script_variables")
+        .execute(pool)
+        .await
+        .unwrap();
+    let variable = crate::script::variables::seal(Some(&old()), "secret").unwrap();
+    crate::db::query(&crate::db::adapt_sql(
+        "INSERT INTO happyview_script_variables (key, value, encrypted, created_at) VALUES ('API_KEY', ?, ?, ?)",
+        backend,
+    ))
+    .bind(&variable.value)
+    .bind(variable.encrypted)
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for table in [
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+    ] {
+        DbSessionStore::new_with_table(pool.clone(), backend, table, Some(old()))
+            .set(
+                seeded.session_did.clone(),
+                crate::auth::oauth_store::tests::sample_session("access"),
+            )
+            .await
+            .unwrap();
+    }
+    DbStateStore::new(pool.clone(), backend, Some(old()))
+        .set(
+            seeded.state_key.clone(),
+            crate::auth::oauth_store::tests::sample_state(),
+        )
+        .await
+        .unwrap();
+    seeded
+}
+
+/// The whole rotation: values sealed under the old key in every store, then
+/// a re-seal with the new key current and the old one previous. Afterwards
+/// nothing needs the previous key, the plaintext client key is sealed, and
+/// every value opens under the new key alone.
+#[tokio::test]
+#[serial_test::serial(delegation_key, encryption_rotation)]
+async fn a_reseal_leaves_nothing_needing_the_previous_key() {
+    for (pool, backend) in test_pools().await {
+        let seeded = seed_everything_under_the_old_key(&pool, backend).await;
+
+        let before = crate::reseal::status(&pool, backend, &rotating())
+            .await
+            .unwrap();
+        let count = |name: &str| before.iter().find(|s| s.store == name).unwrap().clone();
+        for store in [
+            "dpop_keys",
+            "dpop_sessions",
+            "oauth_client_keys",
+            "external_account_tokens",
+            "service_identity",
+            "verification_methods",
+            "space_dids",
+            "attestation_key",
+            "delegation_key",
+            "script_variables",
+            "oauth_sessions",
+            "linked_repo_sessions",
+            "oauth_state",
+            "plugin_secrets",
+        ] {
+            assert!(count(store).previous >= 1, "{store}: {:?}", count(store));
+        }
+        assert!(count("oauth_client_keys").unsealed >= 1);
+
+        let (_, stopped) = crate::reseal::reseal(&pool, backend, &rotating(), || async { None })
+            .await
+            .unwrap();
+        assert_eq!(stopped, None);
+
+        let after = crate::reseal::status(&pool, backend, &rotating())
+            .await
+            .unwrap();
+        for store in &after {
+            assert_eq!((store.previous, store.unsealed), (0, 0), "{store:?}");
+        }
+
+        let new = new_only();
+        crate::oauth::keys::get_dpop_key(&pool, backend, &new, &seeded.provision)
+            .await
+            .unwrap();
+        let session = crate::oauth::sessions::get_dpop_session(
+            &pool,
+            backend,
+            &new,
+            &seeded.client,
+            &seeded.did,
+            &seeded.key_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.refresh_token.as_deref(), Some("refresh"));
+        for owner in [&seeded.owner_sealed, &seeded.owner_plain] {
+            assert_eq!(
+                crate::oauth::client_keys::load_keys(&pool, backend, Some(&new), owner)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let (plain_flag,): (i64,) = crate::db::query_as(&crate::db::adapt_sql(
+            "SELECT CAST(encrypted AS BIGINT) FROM happyview_oauth_client_keys WHERE owner = ?",
+            backend,
+        ))
+        .bind(&seeded.owner_plain)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(plain_flag, 1);
+        assert_eq!(
+            crate::external_auth::tokens::get_tokens(
+                &pool,
+                backend,
+                Some(&new),
+                &seeded.did,
+                &seeded.plugin
+            )
+            .await
+            .unwrap()
+            .refresh_token
+            .as_deref(),
+            Some("refresh")
+        );
+        assert_eq!(
+            crate::plugin::secrets::load_plugin_secrets(&pool, backend, Some(&new), &seeded.plugin)
+                .await
+                .get("API_KEY")
+                .map(String::as_str),
+            Some("shh")
+        );
+        let (signing, rotation): (String, String) = crate::db::query_as(
+            "SELECT signing_key_enc, rotation_key_enc FROM happyview_service_identity",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(crate::plc::decrypt_key(&signing, &new).unwrap(), b"signing");
+        assert_eq!(
+            crate::plc::decrypt_key(&rotation, &new).unwrap(),
+            b"rotation"
+        );
+        assert!(
+            crate::verification_methods::get_private_key_bytes(
+                &pool,
+                backend,
+                &seeded.fragment,
+                &new
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        let (space_signing,): (Vec<u8>,) = crate::db::query_as(&crate::db::adapt_sql(
+            "SELECT signing_key_enc FROM happyview_space_dids WHERE id = ?",
+            backend,
+        ))
+        .bind(&seeded.space_did_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(new.decrypt(&space_signing).unwrap(), b"space-signing");
+        assert!(
+            crate::spaces::delegation_key::load(&pool, backend, &new)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        crate::plugin::attestation::load_or_generate(
+            &pool,
+            backend,
+            "https://rotation.example",
+            Some(&new),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::script::variables::load(&pool, backend, Some(&new)).await["API_KEY"],
+            "secret"
+        );
+        for table in [
+            crate::auth::oauth_store::SESSIONS_TABLE,
+            crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+        ] {
+            assert!(
+                DbSessionStore::new_with_table(pool.clone(), backend, table, Some(new))
+                    .get(&seeded.session_did)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{table}"
+            );
+        }
+        assert!(
+            DbStateStore::new(pool.clone(), backend, Some(new))
+                .get(&seeded.state_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+/// A value rewritten between the re-seal's read and its write wins: the
+/// writer sealed it under the current key already, and re-sealing what was
+/// read would put the old value back.
+#[tokio::test]
+#[serial_test::serial(encryption_rotation)]
+async fn a_reseal_leaves_a_value_that_changed_since_it_was_read() {
+    for (pool, backend) in test_pools().await {
+        crate::db::query("DELETE FROM happyview_script_variables")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = crate::script::variables::seal(Some(&old()), "stale").unwrap();
+        crate::db::query(&crate::db::adapt_sql(
+            "INSERT INTO happyview_script_variables (key, value, encrypted, created_at) VALUES ('API_KEY', ?, 1, ?)",
+            backend,
+        ))
+        .bind(&stale.value)
+        .bind(now_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The writer's save lands after the pass read the row.
+        let fresh = crate::script::variables::seal(Some(&rotating()), "fresh").unwrap();
+        let wrote = crate::reseal::tests::reseal_with_a_write_between(
+            &pool,
+            backend,
+            &rotating(),
+            "script_variables",
+            || async {
+                crate::db::query(&crate::db::adapt_sql(
+                    "UPDATE happyview_script_variables SET value = ? WHERE key = 'API_KEY'",
+                    backend,
+                ))
+                .bind(&fresh.value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            },
+        )
+        .await;
+        assert!(!wrote);
+        assert_eq!(
+            crate::script::variables::load(&pool, backend, Some(&new_only())).await["API_KEY"],
+            "fresh"
+        );
+    }
 }

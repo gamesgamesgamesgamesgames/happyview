@@ -7,6 +7,7 @@ mod dead_letters;
 pub mod default_plugins;
 mod domains;
 mod editor;
+mod encryption;
 mod events;
 mod feature_flags;
 mod identity;
@@ -181,6 +182,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             delete(records::delete_collection_records),
         )
         .route("/database/status", get(database::status))
+        .route(
+            "/encryption/rotation",
+            get(encryption::rotation_status).post(encryption::start_reseal),
+        )
         .route(
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
