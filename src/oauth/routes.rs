@@ -607,6 +607,18 @@ async fn register_session(
     )
     .await?;
 
+    // Checked above: the PDS was resolved from the DID document, and the
+    // issuer, when given, was verified against it.
+    sessions::mark_verified(
+        &state.db,
+        state.db_backend,
+        &client.id,
+        &body.did,
+        &dpop_key_id,
+        &pds_url,
+    )
+    .await?;
+
     if let Err(e) = sessions::repin_dpop_session_signing_kid(
         &state.db,
         state.db_backend,
@@ -763,6 +775,7 @@ async fn revoke_sessions_best_effort(
             state.db_backend,
             encryption_key,
             &state.oauth,
+            &state.config.plc_url,
             api_client_id,
             did,
             dpop_key_id,

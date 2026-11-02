@@ -1376,8 +1376,8 @@ async fn a_delegated_write_uses_the_delegated_accounts_newest_session() {
             [fresh_key, target_did],
         ),
         (
-            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at) \
-             SELECT 'fresh-session', api_client_id, ?, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at \
+            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at, verified_at) \
+             SELECT 'fresh-session', api_client_id, ?, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at, verified_at \
              FROM happyview_dpop_sessions WHERE user_did = ?",
             [fresh_key, target_did],
         ),
