@@ -29,6 +29,8 @@ mod service_entries;
 mod service_identity;
 pub mod settings;
 pub(crate) mod space_access;
+#[doc(hidden)]
+pub use space_access::enable_space_inspector_for_tests;
 mod spaces;
 pub mod spaces_migration;
 mod stats;

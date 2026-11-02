@@ -116,9 +116,11 @@ async fn moderator_reads(app: &TestApp) -> Vec<(Option<String>, Option<String>, 
         .unwrap()
 }
 
-/// Stored directly: the settings API refuses to turn the inspector on until
-/// the dashboard can request a grant.
+/// Stored directly, with this process's inspector let follow it: the settings
+/// API refuses to turn it on, and this build holds it off whatever is stored,
+/// until the dashboard can request a grant.
 async fn enable_inspector(app: &TestApp) {
+    common::let_space_inspector_follow_its_setting();
     let sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, 'true', ?)",
         app.state.db_backend,

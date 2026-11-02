@@ -52,10 +52,11 @@ async fn put_setting(app: &TestApp, key: &str, value: &str) {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
-/// Store the inspector switch directly. The settings API refuses to turn it on
-/// until the dashboard can request a grant, and a stored row is the only
-/// thing that turns it on in the meantime.
+/// Store the inspector switch directly, and let this process's inspector
+/// follow it. The settings API refuses to turn it on, and this build holds it
+/// off whatever is stored, until the dashboard can request a grant.
 async fn store_switch(app: &TestApp, value: &str) {
+    common::let_space_inspector_follow_its_setting();
     let sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -142,38 +143,6 @@ async fn the_settings_api_will_not_turn_the_inspector_on() {
     assert_eq!(body["enabled"], false);
     assert!(events_of(&app, "space_inspector.enabled").await.is_empty());
     assert!(events_of(&app, "setting.updated").await.is_empty());
-}
-
-/// Restores `SPACE_INSPECTOR_ENABLED` to unset even when the test panics.
-struct InspectorEnv;
-
-impl Drop for InspectorEnv {
-    fn drop(&mut self) {
-        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
-    }
-}
-
-/// The environment cannot turn the inspector on before the dashboard can
-/// request a grant: it would only answer `SpaceAccessGrantRequired`.
-#[tokio::test]
-#[serial]
-async fn the_environment_does_not_turn_the_inspector_on() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    let _env = InspectorEnv;
-    unsafe { std::env::set_var("SPACE_INSPECTOR_ENABLED", "true") };
-
-    let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
-    assert_eq!(body["enabled"], false);
-    let body = json_body(send(&app, "GET", "/config", None).await).await;
-    assert_eq!(body["features"]["space_inspector"], false);
-    let resp = send(&app, "GET", "/admin/spaces", None).await;
-    assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
-
-    // A stored row still decides, as it does for every setting.
-    store_switch(&app, "true").await;
-    let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
-    assert_eq!(body["enabled"], true);
 }
 
 #[tokio::test]

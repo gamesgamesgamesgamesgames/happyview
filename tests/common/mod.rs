@@ -35,6 +35,15 @@ pub mod watchdog;
 #[allow(dead_code, unused_imports)]
 pub mod workers;
 
+/// Let the space inspector in this test process follow its setting, which a
+/// serving build holds off until its dashboard ships. Process-wide and
+/// one-way, so a test that needs it held off lives in a target that never
+/// calls this.
+#[allow(dead_code)]
+pub fn let_space_inspector_follow_its_setting() {
+    happyview::admin::enable_space_inspector_for_tests();
+}
+
 /// Mint an API key for the test admin limited to `permissions`.
 #[allow(dead_code)]
 pub async fn api_key(app: &app::TestApp, permissions: &[&str]) -> String {

@@ -152,7 +152,9 @@ fn audited_setting_events(
     };
     match key {
         FeatureFlag::SPACE_INSPECTOR => {
-            let on = |v: &Option<String>| v.as_deref().is_some_and(|v| v == "true");
+            // What the setting says, which the inspector follows once this
+            // build can turn it on, so the trail records the operator's choice.
+            let on = |v: &Option<String>| space_access::setting_says_on(v.as_deref(), None);
             match (on(before), on(after)) {
                 (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
                 (true, false) => vec![event(
@@ -206,8 +208,8 @@ fn fallback_value(key: &str) -> Option<String> {
     env_var_for(key).and_then(vars::var)
 }
 
-/// A setting's stored row inside a transaction, without the fallback.
-async fn read_stored_in(
+/// A setting's value inside a transaction, fallback included.
+async fn read_setting_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     backend: DatabaseBackend,
     key: &str,
@@ -220,22 +222,10 @@ async fn read_stored_in(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
-    Ok(stored.map(|(v,)| v))
-}
-
-/// A setting's value inside a transaction, fallback included.
-async fn read_setting_in(
-    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
-    backend: DatabaseBackend,
-    key: &str,
-) -> Result<Option<String>, AppError> {
-    Ok(read_stored_in(tx, backend, key)
-        .await?
-        .or_else(|| fallback_value(key)))
+    Ok(stored.map(|(v,)| v).or_else(|| fallback_value(key)))
 }
 
 /// What [`write_audited`] does to a setting's row.
-#[derive(Clone, Copy)]
 enum SettingWrite<'a> {
     Put(&'a str),
     Delete,
@@ -272,26 +262,7 @@ async fn write_audited(
         .await
         .map_err(|e| AppError::Internal(format!("failed to lock setting: {e}")))?;
 
-    let (before, after) = if key == FeatureFlag::SPACE_INSPECTOR {
-        // The switch as the inspector reads it, which is not always the
-        // stored-then-fallback value every other setting has.
-        let on = |stored: Option<&str>| {
-            Some(space_access::switch_is_on(stored, fallback_value(key).as_deref()).to_string())
-        };
-        let before = read_stored_in(&mut tx, backend, key).await?;
-        let after = match write {
-            SettingWrite::Put(value) => Some(value),
-            SettingWrite::Delete => None,
-        };
-        (on(before.as_deref()), on(after))
-    } else {
-        let before = read_setting_in(&mut tx, backend, key).await?;
-        let after = match write {
-            SettingWrite::Put(value) => Some(value.to_string()),
-            SettingWrite::Delete => fallback_value(key),
-        };
-        (before, after)
-    };
+    let before = read_setting_in(&mut tx, backend, key).await?;
     let other_retention = match key {
         GENERAL_RETENTION_SETTING => {
             read_setting_in(&mut tx, backend, SPACE_ACCESS_RETENTION_SETTING).await?
@@ -300,6 +271,10 @@ async fn write_audited(
             read_setting_in(&mut tx, backend, GENERAL_RETENTION_SETTING).await?
         }
         _ => None,
+    };
+    let after = match write {
+        SettingWrite::Put(value) => Some(value.to_string()),
+        SettingWrite::Delete => fallback_value(key),
     };
     let events = audited_setting_events(actor_did, key, &before, &after, &other_retention);
 
@@ -881,9 +856,10 @@ mod tests {
         rows.into_iter().map(|(t,)| t).collect()
     }
 
-    /// Turning the inspector on or off is a protected event, judged by the
-    /// switch as the inspector reads it. `upsert` refuses `true` until the
-    /// dashboard ships, so this drives the write beneath it.
+    /// Turning the inspector on or off is a protected event, judged by what
+    /// the setting says rather than by this build holding the inspector off,
+    /// since the setting is what takes effect once it can be on. `upsert`
+    /// refuses `true` until then, so this drives the write beneath it.
     #[tokio::test]
     #[serial]
     async fn the_inspector_switch_logs_each_effective_change() {
@@ -918,10 +894,10 @@ mod tests {
     }
 
     /// Configuration that says `true` leaves the inspector off in this build,
-    /// so storing `false` over it is no change and logs nothing.
+    /// and storing `false` over it is recorded as the operator turning it off.
     #[tokio::test]
     #[serial]
-    async fn a_configured_inspector_switch_is_ignored() {
+    async fn a_configured_inspector_switch_is_held_off() {
         unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
         set_project_layer([("SPACE_INSPECTOR_ENABLED".to_string(), "true".to_string())].into());
         let _reset = LayerReset;
@@ -939,7 +915,7 @@ mod tests {
             "and ignored"
         );
         put_audited(&pool, FeatureFlag::SPACE_INSPECTOR, "false").await;
-        assert!(inspector_events(&pool).await.is_empty());
+        assert_eq!(inspector_events(&pool).await, ["space_inspector.disabled"]);
     }
 
     #[test]

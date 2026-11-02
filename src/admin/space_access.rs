@@ -11,6 +11,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::AppState;
 use crate::admin::settings::{env_var_for, get_setting, stored_setting};
 use crate::config::vars;
@@ -47,29 +50,67 @@ fn is_true(value: &str) -> bool {
     value.trim().eq_ignore_ascii_case("true")
 }
 
-/// Whether the inspector is on, from its stored row and the value the
-/// environment or `happyview.toml` configures for it.
+/// What the inspector setting says: its stored row, else the value the
+/// environment or `happyview.toml` configures. This is the value the audit
+/// trail records, and the one the inspector will follow once it can be on.
+pub fn setting_says_on(stored: Option<&str>, configured: Option<&str>) -> bool {
+    stored.or(configured).is_some_and(is_true)
+}
+
+static ENABLED_FOR_TESTS: AtomicBool = AtomicBool::new(false);
+
+/// Let the inspector follow its setting in this process. Only the
+/// integration-test harness calls it; `tests::only_the_harness_enables_the_inspector`
+/// holds everything under `src/` to that.
+#[doc(hidden)]
+pub fn enable_space_inspector_for_tests() {
+    ENABLED_FOR_TESTS.store(true, Ordering::SeqCst);
+}
+
+/// Whether the inspector is on.
 ///
-/// This build has no dashboard for requesting a grant, so an inspector that
-/// configuration turned on would answer every read with
-/// `SpaceAccessGrantRequired` and offer no way to get one. Until that
-/// dashboard ships, only a stored row turns it on, and a configured `true` is
-/// ignored with a warning the first time it is seen, which `boot` arranges to
-/// be at startup.
+/// This build has no dashboard for requesting a grant, so an inspector turned
+/// on would answer every read with `SpaceAccessGrantRequired` and offer no way
+/// to get one. Until that dashboard ships it stays off whatever the setting
+/// says. A stored setting is kept as it is, so it takes effect once the
+/// dashboard is available. Each way of saying `true` is warned about the first
+/// time it is seen, which `boot` arranges to be at startup.
 pub fn switch_is_on(stored: Option<&str>, configured: Option<&str>) -> bool {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    if let Some(stored) = stored {
-        return is_true(stored);
+    held_off(
+        setting_says_on(stored, configured),
+        ENABLED_FOR_TESTS.load(Ordering::SeqCst),
+        || {
+            static STORED: Once = Once::new();
+            static CONFIGURED: Once = Once::new();
+            if stored.is_some() {
+                STORED.call_once(|| {
+                    tracing::warn!(
+                        "the stored setting turns the space inspector on, but this build has \
+                         no dashboard for requesting access to space contents, so the \
+                         inspector stays off. The setting is kept and takes effect once the \
+                         dashboard is available"
+                    );
+                });
+            } else {
+                CONFIGURED.call_once(|| {
+                    tracing::warn!(
+                        "SPACE_INSPECTOR_ENABLED is true, but this build has no dashboard for \
+                         requesting access to space contents, so the space inspector stays off"
+                    );
+                });
+            }
+        },
+    )
+}
+
+/// [`switch_is_on`]'s rule, apart from the process-wide override and the
+/// warnings: the setting counts only where the override is set.
+fn held_off(says_on: bool, enabled_for_tests: bool, warn: impl FnOnce()) -> bool {
+    if says_on && !enabled_for_tests {
+        warn();
+        return false;
     }
-    if configured.is_some_and(is_true) {
-        WARNED.call_once(|| {
-            tracing::warn!(
-                "SPACE_INSPECTOR_ENABLED is true, but this build has no dashboard for \
-                 requesting access to space contents, so the space inspector stays off"
-            );
-        });
-    }
-    false
+    says_on
 }
 
 /// The inspector switch as [`switch_is_on`] reads it. A database that cannot
@@ -725,15 +766,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_stored_row_turns_the_switch_on() {
-        assert!(switch_is_on(Some("true"), None));
-        assert!(switch_is_on(Some(" TRUE "), Some("false")));
-        assert!(!switch_is_on(Some("false"), Some("true")));
+    fn the_setting_reads_stored_then_configured() {
+        assert!(setting_says_on(Some("true"), None));
+        assert!(setting_says_on(Some(" TRUE "), Some("false")));
+        assert!(!setting_says_on(Some("false"), Some("true")));
+        assert!(setting_says_on(None, Some("true")));
+        assert!(!setting_says_on(None, None));
+    }
+
+    #[test]
+    fn the_switch_stays_off_unless_the_harness_lets_it_follow_the_setting() {
+        let warned = std::cell::Cell::new(0);
+        let warn = || warned.set(warned.get() + 1);
+        assert!(!held_off(true, false, warn), "held off in this build");
+        assert_eq!(warned.get(), 1);
+        assert!(held_off(true, true, warn));
+        assert!(!held_off(false, true, warn), "the setting still decides");
+        assert!(!held_off(false, false, warn));
+        assert_eq!(warned.get(), 1, "only a held-off true is warned about");
+    }
+
+    /// The override exists for the integration tests and nothing else: a
+    /// call from the server would turn the inspector on with no dashboard to
+    /// request a grant from. Any mention under `src/` other than the
+    /// definition and the `admin` re-export the tests reach it through fails.
+    #[test]
+    fn only_the_harness_enables_the_inspector() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let name = concat!("enable_space_inspector_", "for_tests");
+        let allowed = [
+            (
+                root.join("src/admin/space_access.rs"),
+                concat!("pub fn enable_space_inspector_", "for_tests() {"),
+            ),
+            (
+                root.join("src/admin/mod.rs"),
+                concat!(
+                    "pub use space_access::enable_space_inspector_",
+                    "for_tests;"
+                ),
+            ),
+        ];
+        let mut offenders = Vec::new();
+        let mut dirs = vec![root.join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    let permitted = allowed
+                        .iter()
+                        .any(|(file, exact)| *file == path && line.trim() == *exact);
+                    if line.contains(name) && !permitted {
+                        offenders.push(format!(
+                            "{}:{}",
+                            path.strip_prefix(root).unwrap().display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
         assert!(
-            !switch_is_on(None, Some("true")),
-            "configuration cannot turn the inspector on before its dashboard exists"
+            offenders.is_empty(),
+            "only the integration-test harness may enable the space inspector: {offenders:?}"
         );
-        assert!(!switch_is_on(None, None));
     }
 
     #[test]

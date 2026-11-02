@@ -637,7 +637,9 @@ async fn seed(app: &TestApp) -> BTreeMap<&'static str, String> {
     .expect("could not seed a space record");
 
     // Space contents are read under a grant, with the inspector on. The
-    // switch is stored directly: the settings API will not turn it on yet.
+    // switch is stored directly and this process's inspector let follow it:
+    // the settings API will not turn it on yet, and the build holds it off.
+    common::let_space_inspector_follow_its_setting();
     let sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, 'true', ?)",
         app.state.db_backend,
