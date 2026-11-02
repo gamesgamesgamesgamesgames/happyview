@@ -10,7 +10,7 @@ Endpoints for following a `TOKEN_ENCRYPTION_KEY` rotation. [Rotating the encrypt
 GET /admin/encryption/rotation
 ```
 
-Requires `settings:manage`. Each call reads every stored value, so the counts are never stale, and `previous_key_can_go` is never `true` while any value still needs the previous key.
+Requires `settings:manage`, or the [platform principal](./platform.md). Each call reads every stored value, so the counts are never stale, and `previous_key_can_go` is never `true` while any value still needs the previous key.
 
 ```sh
 curl -s http://127.0.0.1:3000/admin/encryption/rotation \
@@ -66,4 +66,4 @@ curl -s -X POST http://127.0.0.1:3000/admin/encryption/rotation \
 { "job_id": "ffd3922d-db8d-4fd9-a287-be128500c3be" }
 ```
 
-Returns `400` when `TOKEN_ENCRYPTION_KEY` isn't set.
+Returns `400` when `TOKEN_ENCRYPTION_KEY` isn't set, and `403` for the platform principal.
