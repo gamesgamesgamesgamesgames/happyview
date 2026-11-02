@@ -151,7 +151,7 @@ mod tests {
             pds_auth: Arc::new(PdsAuth::Dpop {
                 api_client_id: "test_client".into(),
                 dpop_key_id: "test_key".into(),
-                encryption_key: [0u8; 32],
+                encryption_key: [0u8; 32].into(),
             }),
             app_state: state.clone(),
         }
@@ -342,7 +342,7 @@ mod tests {
             state.db.clone(),
             state.db_backend,
             crate::linked_repos::client::LINKED_SESSIONS_TABLE,
-            state.config.token_encryption_key.as_ref(),
+            state.config.keyring(),
         );
         Store::set(&session_store, did.clone(), session)
             .await

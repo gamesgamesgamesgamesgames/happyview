@@ -344,7 +344,7 @@ A replay job looks like this:
 
 `source` is the source the job was created with; a job with accounts is always `crawl`. `auto` stays until the job's first request to the archive, then becomes `replay` or, for a Jetstream with no archive, `crawl`. `replay` is `null` for a crawl job. For a replay job, `after_seq` is where it started (`0`, or the last applied seq of a gap replay), `through_seq` and `tip_seq` are the running sweep's position and the tip it is working towards, `bytes` is what it has downloaded from the archive, and `blocks_failed` counts blocks that failed after retries. `through_seq` and `tip_seq` are `null` until the first plan answers.
 
-The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `replaying`, `replaying_accounts`, `retrying_blocks`, `completed`, `failed`, `cancelled`). A replay job has no repo counters: `total_records` counts the records it has written. The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
+The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `replaying`, `replaying_accounts`, `retrying_blocks`, `completed`, `failed`, `cancelled`). A record source's job can also report `waiting_for_crawl` while what it backfills from is still being filled; the dashboard shows that job as waiting rather than running. A replay job has no repo counters: `total_records` counts the records it has written. The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
 
 The three repo counters count work units. A unit is one repo under one collection: a network backfill discovers repos per collection, so a repo found under two collections is two units and counts twice. A unit for an account-targeted job covers every collection the job targets, so there one unit is one account. `total_repos` is the number discovered so far while a network backfill is still listing repos from the relay.
 
@@ -422,12 +422,13 @@ curl http://127.0.0.1:3000/admin/backfill/collections/xyz.statusphere.status -H 
   "summary": {
     "message": "This collection is served from the record source's own copy, which is still being filled.",
     "records": 594312,
-    "state": "running"
+    "state": "running",
+    "retry_at": null
   }
 }
 ```
 
-`executor` is `null` for a collection HappyView crawls or replays, and `summary` is then `null` too. A record source that backfills a collection but says nothing about it answers `"summary": null`. In a summary, `records` and `state` (`running`, `complete` or `failed`) are `null` when the record source doesn't know them.
+`executor` is `null` for a collection HappyView crawls or replays, and `summary` is then `null` too. A record source that backfills a collection but says nothing about it answers `"summary": null`. In a summary, `records` and `state` are `null` when the record source doesn't know them. `state` is `queued` (due to be filled, not started), `running`, `complete` or `failed`. `retry_at` is when the record source next tries to fill a collection whose last try found nothing, as RFC 3339, and `null` when no try is due.
 
 ## List errors for a job
 

@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 
 /// A generated ES256 DPoP keypair with its JWK representation.
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +140,7 @@ pub async fn store_dpop_key(
 pub async fn get_dpop_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     provision_id: &str,
 ) -> Result<(String, String, serde_json::Value, String, Option<String>), AppError> {
     // Returns: (id, api_client_id, private_jwk, thumbprint, pkce_challenge)
@@ -159,7 +159,8 @@ pub async fn get_dpop_key(
     let (id, api_client_id, encrypted, thumbprint, pkce_challenge) =
         row.ok_or_else(|| AppError::NotFound("DPoP key not found".into()))?;
 
-    let decrypted = decrypt(encryption_key, &encrypted)
+    let decrypted = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
 
     let private_jwk: serde_json::Value = serde_json::from_slice(&decrypted)

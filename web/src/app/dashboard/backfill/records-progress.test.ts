@@ -209,6 +209,7 @@ describe("executorProgress", () => {
       status: "running",
       processed_repos: 1200,
       total_repos: 5500,
+      total_records: null,
     });
     expect(row.label).toBe("Running record scripts");
     expect(recordsCountText(row)).toBe(
@@ -222,6 +223,7 @@ describe("executorProgress", () => {
       status: "completed",
       processed_repos: 5546055,
       total_repos: 5549379,
+      total_records: null,
     });
     expect(row.label).toBe("Ran record scripts");
     expect(recordsFraction(row)).toBe(1);
@@ -234,6 +236,7 @@ describe("executorProgress", () => {
       status: "cancelled",
       processed_repos: 10,
       total_repos: 100,
+      total_records: null,
     });
     expect(recordsFraction(row)).toBe(0.1);
   });
@@ -245,6 +248,7 @@ describe("executorProgress", () => {
         status,
         processed_repos: 10,
         total_repos: 100,
+        total_records: null,
       });
       expect(row.label).toBe("Record scripts");
     }
@@ -253,8 +257,23 @@ describe("executorProgress", () => {
       status: "pausing",
       processed_repos: 10,
       total_repos: 100,
+      total_records: null,
     });
     expect(pausing.label).toBe("Running record scripts");
+  });
+});
+
+describe("a resumed pass's count", () => {
+  it("counts what all its runs wrote once it completes", () => {
+    const row = executorProgress({
+      stage: "pending",
+      status: "completed",
+      processed_repos: 0,
+      total_repos: 0,
+      total_records: 120,
+    });
+    expect(recordsCountText(row)).toBe("120 records");
+    expect(recordsFraction(row)).toBe(1);
   });
 });
 
@@ -266,7 +285,11 @@ describe("executorRanNothing", () => {
       total_records: number | null;
     },
     done?: number,
-  ) => executorRanNothing(job, done == null ? null : { done });
+  ) =>
+    executorRanNothing(
+      job,
+      done == null ? null : { done, failed: 0, timeouts: 0, dead_lettered: 0 },
+    );
 
   it("is a completed pass that hooked nothing, whatever its note says", () => {
     expect(
@@ -292,14 +315,37 @@ describe("executorRanNothing", () => {
     ).toBe(false);
   });
 
-  it("is not a pass that is still going or stopped", () => {
-    for (const status of [
-      "running",
-      "pausing",
-      "paused",
-      "failed",
-      "cancelled",
-    ]) {
+  it("is a pass that failed or was cancelled before it counted anything", () => {
+    for (const status of ["failed", "cancelled"]) {
+      expect(ran({ status, processed_repos: 0, total_records: 0 })).toBe(true);
+    }
+    expect(
+      ran({ status: "failed", processed_repos: 4, total_records: 4 }),
+    ).toBe(false);
+  });
+
+  it("is not a pass whose hooks failed, though none reached a decision", () => {
+    const job = { status: "failed", processed_repos: 0, total_records: 0 };
+    expect(
+      executorRanNothing(job, {
+        done: 0,
+        failed: 2,
+        timeouts: 0,
+        dead_lettered: 2,
+      }),
+    ).toBe(false);
+    expect(
+      executorRanNothing(job, {
+        done: 0,
+        failed: 0,
+        timeouts: 1,
+        dead_lettered: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("is not a pass that is still going or paused", () => {
+    for (const status of ["running", "pausing", "paused"]) {
       expect(ran({ status, processed_repos: 0, total_records: 0 })).toBe(false);
     }
   });
@@ -333,6 +379,7 @@ describe("waiting for the Network store's crawl", () => {
       status: "running",
       processed_repos: 40,
       total_repos: 0,
+      total_records: null,
     });
     expect(row.label).toBe("Waiting for the Network store's crawl");
     expect(recordsFraction(row)).toBeNull();
@@ -341,7 +388,8 @@ describe("waiting for the Network store's crawl", () => {
 });
 
 describe("summaryParts", () => {
-  const at = (iso: string) => `at ${iso}`;
+  const bare = (iso: string) => iso;
+  const before = Date.parse("2026-11-02T14:00:00+00:00");
 
   it("reads the records, the crawl and the next attempt in order", () => {
     expect(
@@ -351,7 +399,8 @@ describe("summaryParts", () => {
           state: "failed",
           retry_at: "2026-11-02T15:00:00+00:00",
         },
-        at,
+        bare,
+        before,
       ),
     ).toEqual([
       `${(18571).toLocaleString()} records`,
@@ -360,22 +409,49 @@ describe("summaryParts", () => {
     ]);
   });
 
+  it("says a next attempt that has gone by is due", () => {
+    expect(
+      summaryParts(
+        {
+          records: null,
+          state: "failed",
+          retry_at: "2026-11-02T15:00:00+00:00",
+        },
+        bare,
+        Date.parse("2026-11-02T16:00:00+00:00"),
+      ),
+    ).toEqual(["crawl failed", "next crawl attempt due"]);
+  });
+
+  it("reads the time in the reader's own format by default", () => {
+    const iso = "2026-11-02T15:00:00+00:00";
+    expect(
+      summaryParts(
+        { records: null, state: null, retry_at: iso },
+        undefined,
+        before,
+      ),
+    ).toEqual([`next crawl attempt at ${new Date(iso).toLocaleString()}`]);
+  });
+
   it("names every crawl state", () => {
-    expect(summaryParts({ records: null, state: "queued" })).toEqual([
-      "crawl queued",
-    ]);
-    expect(summaryParts({ records: null, state: "running" })).toEqual([
-      "crawling",
-    ]);
-    expect(summaryParts({ records: null, state: "complete" })).toEqual([
-      "crawl complete",
-    ]);
+    expect(
+      summaryParts({ records: null, state: "queued", retry_at: null }),
+    ).toEqual(["crawl queued"]);
+    expect(
+      summaryParts({ records: null, state: "running", retry_at: null }),
+    ).toEqual(["crawling"]);
+    expect(
+      summaryParts({ records: null, state: "complete", retry_at: null }),
+    ).toEqual(["crawl complete"]);
   });
 
   it("leaves out what it doesn't know", () => {
     expect(
       summaryParts({ records: null, state: null, retry_at: null }),
     ).toEqual([]);
-    expect(summaryParts({ records: 0, state: null })).toEqual(["0 records"]);
+    expect(summaryParts({ records: 0, state: null, retry_at: null })).toEqual([
+      "0 records",
+    ]);
   });
 });

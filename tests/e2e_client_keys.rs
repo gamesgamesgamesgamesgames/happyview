@@ -1048,7 +1048,7 @@ async fn a_rotation_stages_the_new_key_until_caches_have_seen_it() {
     let keys = happyview::oauth::client_keys::load_keys(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &client_id,
     )
     .await

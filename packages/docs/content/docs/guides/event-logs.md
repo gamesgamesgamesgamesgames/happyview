@@ -71,11 +71,17 @@ Logged when a user attempts to access an endpoint they don't have permission for
 
 ### Space events
 
-| Event Type             | Severity | Subject       | Detail                                                        |
-| ---------------------- | -------- | ------------- | ------------------------------------------------------------- |
-| `space.moderator_read` | info     | Space AT URI, or the account's DID | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below) |
+| Event Type                 | Severity | Subject                                                                     | Detail                                                                   |
+| -------------------------- | -------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `space.access_granted`     | info     | Space AT URI for a space grant, account DID for an account grant            | `grant_id`, `scope`, `target`, `reason`, `expires_at`, `user_id`         |
+| `space.access_revoked`     | info     | Same as `space.access_granted`; the raw space id if the space was deleted   | `grant_id`, `revoked_by`, `user_id`                                      |
+| `space.moderator_read`     | info     | Space AT URI, or the account's DID                                          | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below) |
+| `space_inspector.enabled`  | warn     | Setting key                                                                 | —                                                                        |
+| `space_inspector.disabled` | warn     | Setting key                                                                 | —                                                                        |
 
-Logged when an admin reads space records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `grant_id` is the [access grant](../api-reference/admin/spaces.md#access-grants) the read was made under, and `scope` is that grant's scope (`space` or `account`). `action` is `list_records`, `get_blob` or `list_account_records`. A `list_records` event includes the `space_id`, the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the `space_id`, the blob `cid` and the `repo` that references it. A `list_account_records` event's subject is the account's DID, and it includes that `repo`, the `space_id` and `collection` filters and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
+Logged when a moderator requests, uses, or ends access to a space's contents through the [space inspector](../api-reference/admin/spaces.md#access-grants). `space.access_granted` and `space.access_revoked` record the request and the end of a grant; `space_inspector.enabled` and `space_inspector.disabled` record the inspector being turned on or off for the instance (see [Configuration](../getting-started/configuration.md)). In the dashboard, a `space.access_granted` event lists the reads made under that grant.
+
+`space.moderator_read` is logged when an admin reads space records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `grant_id` is the [access grant](../api-reference/admin/spaces.md#access-grants) the read was made under, and `scope` is that grant's scope (`space` or `account`). `action` is `list_records`, `get_blob` or `list_account_records`. A `list_records` event includes the `space_id`, the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the `space_id`, the blob `cid` and the `repo` that references it. A `list_account_records` event's subject is the account's DID, and it includes that `repo`, the `space_id` and `collection` filters and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
 
 ### API Key events
 

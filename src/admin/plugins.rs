@@ -11,7 +11,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::plugin::capabilities;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
 use crate::plugin::official_registry::{
@@ -1381,10 +1381,9 @@ pub(super) async fn get_secrets(
 ) -> Result<Json<PluginSecretsResponse>, AppError> {
     auth.require(Permission::PluginsRead).await?;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("Encryption key not configured".into()))?;
 
     // Verify plugin exists
@@ -1431,13 +1430,13 @@ const SECRET_MASK: &str = "********";
 /// Each secret that still opens, masked.
 fn masked_secrets(
     secrets: &serde_json::Map<String, serde_json::Value>,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> HashMap<String, String> {
     secrets
         .iter()
         .filter_map(|(name, value)| {
             let encrypted = BASE64.decode(value.as_str()?).ok()?;
-            let decrypted = decrypt(encryption_key, &encrypted).ok()?;
+            let decrypted = encryption_key.decrypt(&encrypted).ok()?;
             String::from_utf8(decrypted).ok()?;
             Some((name.clone(), SECRET_MASK.to_string()))
         })
@@ -1764,7 +1763,7 @@ mod tests {
             ("SHORT".to_string(), seal("ab")),
         ]);
 
-        let masked = masked_secrets(&secrets, &key);
+        let masked = masked_secrets(&secrets, &crate::plugin::encryption::Keyring::from(key));
 
         assert_eq!(masked.len(), 3);
         assert!(masked.values().all(|value| value == SECRET_MASK));

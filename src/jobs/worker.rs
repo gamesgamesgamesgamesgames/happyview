@@ -256,8 +256,8 @@ async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease
         } else if let (Some(api_client_id), Some(dpop_key_id)) =
             (&job.api_client_id, &job.dpop_key_id)
         {
-            let encryption_key = match state.config.token_encryption_key.as_ref() {
-                Some(k) => *k,
+            let encryption_key = match state.config.keyring() {
+                Some(k) => k,
                 None => {
                     let error = "inherit_auth with DPoP requires TOKEN_ENCRYPTION_KEY";
                     finalize(state, job, lease, JobOutcome::Failed(error.to_string())).await;

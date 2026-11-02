@@ -100,7 +100,7 @@ async fn attached_session_scope(
         state.db_backend,
         crate::auth::oauth_store::SESSIONS_TABLE,
         did,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
     )
     .await
     .map_err(|e| AppError::Internal(format!("failed to read the attached session: {e}")))?;

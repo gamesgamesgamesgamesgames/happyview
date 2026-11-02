@@ -488,7 +488,7 @@ pub(super) async fn provision_auth_key(
     let existing = crate::oauth::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -503,7 +503,7 @@ pub(super) async fn provision_auth_key(
             crate::oauth::client_keys::insert_key(
                 &state.db,
                 state.db_backend,
-                state.config.token_encryption_key.as_ref(),
+                state.config.keyring().as_ref(),
                 &key,
             )
             .await?;
@@ -528,7 +528,7 @@ pub(super) async fn get_auth_key(
     let keys = crate::oauth::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -722,7 +722,8 @@ pub(super) async fn rotate_auth_key(
     crate::auth::cli_client::refuse_change(&id)?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let enc = state.config.token_encryption_key.as_ref();
+    let keys = state.config.keyring();
+    let enc = keys.as_ref();
     let (key, activates_at) = if body.immediate {
         let key =
             crate::oauth::client_keys::rotate_key(&state.db, state.db_backend, enc, &id).await?;

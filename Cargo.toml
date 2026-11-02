@@ -114,7 +114,7 @@ hickory-resolver = "0.26"
 # For the connected peer address `outbound` checks.
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 ipnet = "2"
-lru = "0.16"
+lru = "0.18"
 mlua = { version = "0.12", optional = true, features = ["lua54", "async", "serialize", "vendored", "send"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

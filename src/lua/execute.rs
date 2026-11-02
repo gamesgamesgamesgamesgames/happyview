@@ -184,10 +184,9 @@ pub async fn execute_procedure_script(
     let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
         Some(auth)
     } else if let Some(client_key) = claims.client_key() {
-        let encryption_key = state
+        let encryption_key = &state
             .config
-            .token_encryption_key
-            .as_ref()
+            .keyring()
             .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
         let api_client_id = match repo::get_dpop_client_id(state, client_key).await {
             Ok(id) => id,
