@@ -136,8 +136,6 @@ function openSealed(stored: string): string {
 export async function getOauthSessionTokenState(did: string): Promise<{
   accessToken: string;
   expiresAt: string | null;
-  /** What the authorization server granted. */
-  scope: string | null;
 }> {
   const client = new pg.Client(DB_URL);
   await client.connect();
