@@ -7,6 +7,7 @@ import {
   hookDetail,
   hookStatsOf,
   executorProgress,
+  executorRanNothing,
   recordsCountParts,
   recordsCountText,
   recordsFraction,
@@ -247,5 +248,52 @@ describe("executorProgress", () => {
       total_repos: 100,
     });
     expect(pausing.label).toBe("Running record scripts");
+  });
+});
+
+describe("executorRanNothing", () => {
+  const ran = (
+    job: {
+      status: string;
+      processed_repos: number | null;
+      total_records: number | null;
+    },
+    done?: number,
+  ) => executorRanNothing(job, done == null ? null : { done });
+
+  it("is a completed pass that hooked nothing, whatever its note says", () => {
+    expect(
+      ran({ status: "completed", processed_repos: 0, total_records: 0 }),
+    ).toBe(true);
+    expect(
+      ran({ status: "completed", processed_repos: 0, total_records: 0 }, 0),
+    ).toBe(true);
+  });
+
+  it("is the row the store keeps for a collection with no history, whose counts are unset", () => {
+    expect(
+      ran({ status: "completed", processed_repos: null, total_records: null }),
+    ).toBe(true);
+  });
+
+  it("is not a pass that ran records", () => {
+    expect(
+      ran({ status: "completed", processed_repos: 12, total_records: 12 }),
+    ).toBe(false);
+    expect(
+      ran({ status: "completed", processed_repos: 0, total_records: 0 }, 3),
+    ).toBe(false);
+  });
+
+  it("is not a pass that is still going or stopped", () => {
+    for (const status of [
+      "running",
+      "pausing",
+      "paused",
+      "failed",
+      "cancelled",
+    ]) {
+      expect(ran({ status, processed_repos: 0, total_records: 0 })).toBe(false);
+    }
   });
 });

@@ -197,3 +197,22 @@ export function executorProgress(
     estimated: true,
   };
 }
+
+/**
+ * Whether an executor-run job finished having run nothing: a store pass that
+ * found no record script, or nothing in the store, or the row the store keeps
+ * to say a collection with no history has been seen. Its counts are 0, or
+ * unset on that row, and it ran no hook, so it has no progress to show; its
+ * note says why. Judged by the counts, not the note's wording.
+ */
+export function executorRanNothing(
+  job: Pick<BackfillJob, "status" | "processed_repos" | "total_records">,
+  hooks: Pick<HookStats, "done"> | null,
+): boolean {
+  return (
+    job.status === "completed" &&
+    (job.processed_repos ?? 0) === 0 &&
+    (job.total_records ?? 0) === 0 &&
+    (hooks?.done ?? 0) === 0
+  );
+}
