@@ -116,21 +116,19 @@ async fn moderator_reads(app: &TestApp) -> Vec<(Option<String>, Option<String>, 
         .unwrap()
 }
 
-/// Stored directly, with this process's inspector let follow it: the settings
-/// API refuses to turn it on, and this build holds it off whatever is stored,
-/// until the dashboard can request a grant.
 async fn enable_inspector(app: &TestApp) {
-    common::let_space_inspector_follow_its_setting();
-    let sql = adapt_sql(
-        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, 'true', ?)",
-        app.state.db_backend,
-    );
-    happyview::db::query(&sql)
-        .bind("feature.space_inspector_enabled")
-        .bind(now_rfc3339())
-        .execute(&app.state.db)
-        .await
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/admin/settings/feature.space_inspector_enabled")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "value": "true" }).to_string()))
         .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
 }
 
 async fn grant(app: &TestApp, scope: &str, target: &str) -> String {
