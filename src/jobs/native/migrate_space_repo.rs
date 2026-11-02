@@ -50,17 +50,17 @@ fn parse_input(input: &serde_json::Value) -> Option<Input> {
 /// login: the two differ whenever a user declines part of a consent screen, and
 /// acting on the request would enqueue migrations that cannot run.
 pub async fn granted_scope(state: &AppState, did: &str) -> Result<Option<String>, AppError> {
-    let sql = crate::db::adapt_sql(
-        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+    let data = crate::auth::oauth_store::stored_session_json(
+        &state.db,
         state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        did,
+        state.config.token_encryption_key.as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
 
-    let Some((data,)) = row else {
+    let Some(data) = data else {
         return Ok(None);
     };
     let parsed: serde_json::Value = serde_json::from_str(&data)

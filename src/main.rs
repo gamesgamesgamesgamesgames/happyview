@@ -108,6 +108,16 @@ async fn main() {
         ),
     }
 
+    if let Some(key) = config.token_encryption_key.as_ref() {
+        match happyview::auth::oauth_store::seal_stored_sessions(&db_pool, db_backend, key).await {
+            Ok(0) => {}
+            Ok(count) => info!(count, "encrypted stored OAuth sessions"),
+            Err(e) => {
+                tracing::error!(error = %e, "OAuth session encryption failed; will retry on next startup")
+            }
+        }
+    }
+
     happyview::lua::variables::encrypt_at_boot(
         &db_pool,
         db_backend,
@@ -541,7 +551,11 @@ async fn main() {
         protected_resource_metadata: Default::default(),
     };
 
-    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
+    let oauth_state_store = DbStateStore::new(
+        db_pool.clone(),
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    );
 
     let oauth_scopes = vec![
         Scope::Known(KnownScope::Atproto),
@@ -576,7 +590,11 @@ async fn main() {
             },
             keys: None,
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            ),
             resolver: resolver_config,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -595,8 +613,12 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
-                .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            )
+            .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -630,6 +652,7 @@ async fn main() {
             db_pool.clone(),
             db_backend,
             Some(client_jwks.clone()),
+            config.token_encryption_key.as_ref(),
         )
         .expect("Failed to create linked-repo OAuth client"),
     );
@@ -656,6 +679,7 @@ async fn main() {
     let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new_with_kid(
         Arc::clone(&oauth_client_arc),
         instance_signing_kid.clone(),
+        config.token_encryption_key.as_ref(),
     ));
     oauth_registry
         .load_from_db(
@@ -726,8 +750,12 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
-                .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            )
+            .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
@@ -776,6 +804,7 @@ async fn main() {
             db_pool.clone(),
             db_backend,
             key,
+            config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 oauth_registry.register_for_kid(
@@ -811,6 +840,7 @@ async fn main() {
                 db_pool.clone(),
                 db_backend,
                 key,
+                config.token_encryption_key.as_ref(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
@@ -844,6 +874,7 @@ async fn main() {
                 db_pool.clone(),
                 db_backend,
                 Some(vec![jwk]),
+                config.token_encryption_key.as_ref(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));

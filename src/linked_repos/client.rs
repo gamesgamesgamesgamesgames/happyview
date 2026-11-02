@@ -26,6 +26,7 @@ pub fn build(
     pool: sqlx::AnyPool,
     backend: DatabaseBackend,
     client_keys: Option<Vec<jose_jwk::Jwk>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> Result<HappyViewOAuthClient, String> {
     let http = Arc::new(crate::http_retry::HappyViewHttpClient::new(
         crate::http_retry::shared_client().clone(),
@@ -51,8 +52,9 @@ pub fn build(
             .and_then(|keys| keys.first())
             .and_then(|jwk| jwk.prm.kid.clone())
     };
-    let session_store = DbSessionStore::new_with_table(pool, backend, LINKED_SESSIONS_TABLE)
-        .with_signing_kid(signing_kid);
+    let session_store =
+        DbSessionStore::new_with_table(pool, backend, LINKED_SESSIONS_TABLE, encryption_key)
+            .with_signing_kid(signing_kid);
 
     let client = if is_loopback {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
