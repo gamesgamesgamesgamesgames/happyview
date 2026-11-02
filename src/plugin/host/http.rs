@@ -1,6 +1,4 @@
-use super::{
-    HostContext, MAX_HTTP_REQUESTS, MAX_HTTP_RESPONSE_SIZE, MAX_HTTP_TOTAL_TRANSFER, ResourceUsage,
-};
+use super::{MAX_HTTP_REQUESTS, MAX_HTTP_RESPONSE_SIZE, MAX_HTTP_TOTAL_TRANSFER, ResourceUsage};
 use serde::{Deserialize, Serialize};
 
 /// Accepts both a JSON string and a byte array for the body field,
@@ -98,7 +96,6 @@ pub enum HttpError {
 }
 
 pub async fn http_request(
-    ctx: &HostContext,
     usage: &mut ResourceUsage,
     req: HttpRequest,
 ) -> Result<HttpResponse, HttpError> {
@@ -110,7 +107,9 @@ pub async fn http_request(
 
     // Build request
     let method = req.method.parse().unwrap_or(reqwest::Method::GET);
-    let mut builder = ctx.http_client.request(method, &req.url);
+    // The plugin names this URL itself, so it goes through the client
+    // `ALLOW_PRIVATE_HOSTS` reaches; see `crate::outbound`.
+    let mut builder = crate::http_retry::plugin_client().request(method, &req.url);
 
     for (name, value) in &req.headers {
         builder = builder.header(name, value);
