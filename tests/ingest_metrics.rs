@@ -18,7 +18,6 @@ use axum::http::Request;
 use happyview::AppState;
 use happyview::db::adapt_sql;
 use happyview::host::AppHost;
-use happyview::lexicon::ProcedureAction;
 use happyview_provider::{
     Action, BackfillKind, BackfillRequest, Origin, RecordEvent, RecordKey, RecordSource,
     SourceEvent,
@@ -88,8 +87,6 @@ async fn app() -> Option<TestApp> {
                 happyview::catalog::LexiconWrite {
                     lexicon_json: record_lexicon(collection),
                     backfill: false,
-                    target_collection: Some(collection.to_string()),
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,

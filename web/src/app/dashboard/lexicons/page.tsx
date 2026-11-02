@@ -189,15 +189,6 @@ export default function LexiconsPage() {
           ]
         : []),
       {
-        id: "action",
-        accessorKey: "action",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} label="Action" />
-        ),
-        cell: ({ row }) => row.original.action ?? "--",
-        enableSorting: true,
-      },
-      {
         id: "backfill",
         accessorKey: "backfill",
         header: ({ column }) => (

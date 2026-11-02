@@ -154,6 +154,7 @@ mod tests {
                 encryption_key: [0u8; 32].into(),
             }),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         }
     }
 
@@ -367,6 +368,7 @@ mod tests {
             claims: Arc::new(Claims::internal(did.to_string())),
             pds_auth: Arc::new(PdsAuth::OAuth(Arc::new(session))),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
 
         let err = create(

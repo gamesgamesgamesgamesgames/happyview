@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::AppState;
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lexicon::{LexiconType, ProcedureAction};
+use crate::lexicon::LexiconType;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -57,10 +57,6 @@ pub(super) async fn upload_lexicon(
     // to.
     let warnings = issues;
 
-    // Validate action
-    let action =
-        ProcedureAction::from_optional_str(body.action.as_deref()).map_err(AppError::BadRequest)?;
-
     let indexed = match body.indexed {
         Some(v) => v,
         None => state
@@ -78,8 +74,6 @@ pub(super) async fn upload_lexicon(
             crate::catalog::LexiconWrite {
                 lexicon_json: body.lexicon_json,
                 backfill: body.backfill,
-                target_collection: body.target_collection,
-                action,
                 token_cost: body.token_cost,
                 authority_did: None,
                 indexed,
@@ -273,9 +267,8 @@ pub(crate) fn records_not_locally_deletable(state: &AppState, collection: &str) 
 }
 
 /// Why a lexicon has no records of its own to delete. A query or procedure
-/// lexicon reads and writes *another* lexicon's collection through
-/// `target_collection`, so honouring `delete_records` for one would destroy
-/// records that belong to a record lexicon nobody asked about.
+/// is an endpoint, and the records its script reads or writes belong to a
+/// record lexicon nobody asked about.
 pub(super) fn not_a_record_lexicon(id: &str, lexicon: &crate::lexicon::ParsedLexicon) -> String {
     let kind = match lexicon.lexicon_type {
         LexiconType::Record => "record",
@@ -284,13 +277,7 @@ pub(super) fn not_a_record_lexicon(id: &str, lexicon: &crate::lexicon::ParsedLex
         LexiconType::Space => "space",
         LexiconType::Definitions => "definitions",
     };
-    match lexicon.target_collection.as_deref() {
-        Some(target) => format!(
-            "'{id}' is a {kind} lexicon, so it stores no records of its own; it operates on \
-             '{target}', whose records belong to that lexicon"
-        ),
-        None => format!("'{id}' is a {kind} lexicon, so it stores no records of its own"),
-    }
+    format!("'{id}' is a {kind} lexicon, so it stores no records of its own")
 }
 
 /// DELETE /admin/lexicons/:id — remove a lexicon, and with

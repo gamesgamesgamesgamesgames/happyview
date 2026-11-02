@@ -28,7 +28,7 @@ Every script is identified by a **trigger string** -- the script's `id` in the `
 | `xrpc.query:<nsid>`        | An XRPC query endpoint is called              |
 | `xrpc.procedure:<nsid>`    | An XRPC procedure endpoint is called          |
 
-XRPC scripts handle the request and return the response. Without a script, HappyView uses [default query/procedure behavior](../api-reference/xrpc-api.md). See [Lua Scripting](./lua-scripting.md) for the full query/procedure scripting reference.
+XRPC scripts handle the request and return the response. Without a script, a query answers only a lookup by `uri` and everything else answers `501`; see [XRPC API](../api-reference/xrpc-api.md#method-has-no-script). See [Lua Scripting](./lua-scripting.md) for the full query/procedure scripting reference.
 
 ### Label event triggers
 

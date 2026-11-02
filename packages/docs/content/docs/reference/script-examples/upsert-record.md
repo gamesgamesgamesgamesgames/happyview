@@ -12,9 +12,11 @@ local tids = require("internal.tids")
 local db = require("happyview.db")
 local record = require("happyview.record")
 
+local COLLECTION = "xyz.statusphere.status"
+
 function handle(input, ctx)
   local rkey = input.rkey or tids.create()
-  local uri = "at://" .. ctx.caller_did .. "/" .. ctx.collection .. "/" .. rkey
+  local uri = "at://" .. ctx.caller_did .. "/" .. COLLECTION .. "/" .. rkey
   local ts = time.to_iso8601(time.now())
 
   local existing = db.get(uri)
@@ -27,7 +29,7 @@ function handle(input, ctx)
   end
 
   -- Create new record
-  return record.create(ctx.collection, {
+  return record.create(COLLECTION, {
     status = input.status,
     createdAt = ts,
     updatedAt = ts,
@@ -38,7 +40,7 @@ end
 ## How it works
 
 1. Use the client-provided `input.rkey` if present, otherwise mint a fresh TID with [`tids.create()`](../../api-reference/lua/built-in-modules.md#internaltids). This means omitting `rkey` always creates, while providing one enables updates.
-2. Build the AT URI from the caller's DID, the target collection, and the rkey, then look it up with `db.get`.
+2. Build the AT URI from the caller's DID, the collection, and the rkey, then look it up with `db.get`.
 3. If the record exists, change its fields and write it back with `record.put`, which calls `putRecord`.
 4. If it doesn't exist, create it with `record.create`, passing the rkey in `opts` so `createRecord` uses that key. Both writes answer `{ uri, cid }`.
 

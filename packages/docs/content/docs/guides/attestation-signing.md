@@ -50,7 +50,7 @@ local atproto = require("happyview.atproto")
 
 function handle(input, ctx)
   local body = { text = input.text, createdAt = time.to_iso8601(time.now()) }
-  local ref = record.create(ctx.collection, body)
+  local ref = record.create("com.example.post", body)
 
   local sig = atproto.sign(body)
   return { uri = ref.uri, cid = ref.cid, signature = sig }

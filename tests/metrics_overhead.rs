@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use happyview::db::adapt_sql;
 use happyview::host::AppHost;
-use happyview::lexicon::ProcedureAction;
 use happyview_provider::{Action, Host, Origin, RecordEvent, RecordKey, SourceEvent};
 use serde_json::json;
 
@@ -79,8 +78,6 @@ async fn what_metrics_cost_a_trivially_hooked_record() {
                         "record": {"type": "object", "properties": {"text": {"type": "string"}}}}}
                 }),
                 backfill: false,
-                target_collection: Some(COLLECTION.to_string()),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

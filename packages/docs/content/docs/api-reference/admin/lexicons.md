@@ -62,7 +62,6 @@ const response = await fetch("http://127.0.0.1:3000/admin/lexicons", {
       },
     },
     backfill: true,
-    target_collection: null,
   }),
 });
 const data: LexiconResult = await response.json();
@@ -94,7 +93,6 @@ const response = await fetch("http://127.0.0.1:3000/admin/lexicons", {
       },
     },
     backfill: true,
-    target_collection: null,
   }),
 });
 const data = await response.json();
@@ -122,8 +120,7 @@ let response = client
                 }
             }
         },
-        "backfill": true,
-        "target_collection": null
+        "backfill": true
     }))
     .send()
     .await?;
@@ -149,8 +146,7 @@ body := bytes.NewBufferString(`{
       }
     }
   },
-  "backfill": true,
-  "target_collection": null
+  "backfill": true
 }`)
 req, _ := http.NewRequest("POST", "http://127.0.0.1:3000/admin/lexicons", body)
 req.Header.Set("Authorization", "Bearer "+token)
@@ -163,8 +159,7 @@ curl -X POST http://127.0.0.1:3000/admin/lexicons \
   -H "Content-Type: application/json" \
   -d '{
     "lexicon_json": { "lexicon": 1, "id": "xyz.statusphere.status", "defs": { "main": { "type": "record", "key": "tid", "record": { "type": "object", "required": ["status", "createdAt"], "properties": { "status": { "type": "string", "maxGraphemes": 1 }, "createdAt": { "type": "string", "format": "datetime" } } } } } },
-    "backfill": true,
-    "target_collection": null
+    "backfill": true
   }'
 ```
 
@@ -172,7 +167,6 @@ curl -X POST http://127.0.0.1:3000/admin/lexicons \
 | ------------------- | ------- | -------- | --------------------------------------------------------------------- |
 | `lexicon_json`      | object  | yes      | Raw lexicon JSON (must have `lexicon: 1` and a valid NSID `id`)       |
 | `backfill`          | boolean | no       | Whether the first upload triggers a historical backfill (default `true`) |
-| `target_collection` | string  | no       | For query/procedure lexicons, the record collection they operate on   |
 | `token_cost`        | integer | no       | Token cost for query/procedure endpoints (overrides instance default) |
 | `indexed`           | boolean | no       | For record lexicons, whether HappyView ingests the collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept. An unindexed lexicon starts no backfill |
 
@@ -459,9 +453,9 @@ Requires `records:delete-collection` and `records:delete` in addition to
 [deleting a collection directly](records.md).
 
 Only a **record** lexicon has records of its own. A query or procedure lexicon
-operates on another lexicon's collection through `target_collection`, so
-`delete_records=true` for one is refused with `400 Bad Request` naming that
-collection rather than deleting records the request did not describe.
+is an endpoint, and the records its script reads or writes belong to a record
+lexicon, so `delete_records=true` for one is refused with `400 Bad Request`
+rather than deleting records the request did not describe.
 
 Records a record script kept after the source deleted them are included: an
 operator deleting the collection overrides what a script chose to do with an
@@ -538,7 +532,6 @@ const response = await fetch("http://127.0.0.1:3000/admin/network-lexicons", {
   },
   body: JSON.stringify({
     nsid: "xyz.statusphere.status",
-    target_collection: null,
   }),
 });
 const data: NetworkLexiconResult = await response.json();
@@ -552,7 +545,6 @@ const response = await fetch("http://127.0.0.1:3000/admin/network-lexicons", {
   },
   body: JSON.stringify({
     nsid: "xyz.statusphere.status",
-    target_collection: null,
   }),
 });
 const data = await response.json();
@@ -562,8 +554,7 @@ let response = client
     .post("http://127.0.0.1:3000/admin/network-lexicons")
     .bearer_auth(token)
     .json(&serde_json::json!({
-        "nsid": "xyz.statusphere.status",
-        "target_collection": null
+        "nsid": "xyz.statusphere.status"
     }))
     .send()
     .await?;
@@ -571,8 +562,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "nsid": "xyz.statusphere.status",
-  "target_collection": null
+  "nsid": "xyz.statusphere.status"
 }`)
 req, _ := http.NewRequest("POST", "http://127.0.0.1:3000/admin/network-lexicons", body)
 req.Header.Set("Authorization", "Bearer "+token)
@@ -584,15 +574,13 @@ curl -X POST http://127.0.0.1:3000/admin/network-lexicons \
   -H "$AUTH" \
   -H "Content-Type: application/json" \
   -d '{
-    "nsid": "xyz.statusphere.status",
-    "target_collection": null
+    "nsid": "xyz.statusphere.status"
   }'
 ```
 
 | Field               | Type   | Required | Description                                                         |
 | ------------------- | ------ | -------- | ------------------------------------------------------------------- |
 | `nsid`              | string | yes      | The NSID of the lexicon to watch                                    |
-| `target_collection` | string | no       | For query/procedure lexicons, the record collection they operate on |
 | `indexed`           | boolean | no     | Whether HappyView ingests the record collection. Defaults to `true` for a new lexicon; left out on an update, the stored setting is kept |
 
 HappyView resolves the NSID authority via DNS TXT, fetches the lexicon from the authority's PDS, parses it, and stores it.
@@ -617,7 +605,6 @@ GET /admin/network-lexicons
 interface NetworkLexicon {
   nsid: string;
   authority_did: string;
-  target_collection: string | null;
   last_fetched_at: string;
   created_at: string;
   declared: boolean;
@@ -658,7 +645,6 @@ curl http://127.0.0.1:3000/admin/network-lexicons -H "$AUTH"
   {
     "nsid": "xyz.statusphere.status",
     "authority_did": "did:plc:authority",
-    "target_collection": null,
     "last_fetched_at": "2025-01-01T00:00:00Z",
     "created_at": "2025-01-01T00:00:00Z"
   }

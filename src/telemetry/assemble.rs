@@ -639,7 +639,7 @@ mod tests {
 
     /// A catalog holding one project lexicon, `com.example.project.thing`.
     fn project_catalog() -> LexiconCatalog {
-        use crate::lexicon::{ParsedLexicon, ProcedureAction};
+        use crate::lexicon::ParsedLexicon;
         use crate::project::snapshot::{ProjectLexicon, ProjectSnapshot};
 
         let parsed = ParsedLexicon::parse(
@@ -650,8 +650,6 @@ mod tests {
                     "record": { "type": "object", "properties": {} } } }
             }),
             0,
-            None,
-            ProcedureAction::Upsert,
             None,
         )
         .unwrap();

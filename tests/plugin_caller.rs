@@ -146,7 +146,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -752,7 +751,6 @@ async fn xrpc_query_reaches_a_local_handler() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -799,7 +797,6 @@ async fn xrpc_query_reaches_a_local_handler_with_no_session() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -834,7 +831,6 @@ async fn index_put_and_lexicon_get_round_trip() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": lexicon,
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -1263,11 +1259,12 @@ async fn a_test_runs_procedure_script_writes_through_the_in_process_pds() {
     assert_eq!(row["cid"], body["cid"]);
 }
 
-/// A procedure with a lexicon and no script writes through the in-process
-/// PDS and mirrors what it answered, as the OAuth path does.
+/// A procedure with a lexicon and no script has nothing to run: an
+/// authenticated caller gets the 501 naming the trigger, and nothing reaches
+/// the PDS.
 #[tokio::test]
 #[serial]
-async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
+async fn a_procedure_without_a_script_names_the_missing_script() {
     common::require_db!();
     let mut app = TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
@@ -1288,17 +1285,14 @@ async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
     .await;
     let status = resp.status();
     let body = response_json(resp).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    let writes = harness.pds().writes();
-    assert_eq!(writes.len(), 1, "{writes:?}");
-    assert_eq!(writes[0].action, "create");
-    assert_eq!(writes[0].repo, DID);
-    assert_eq!(writes[0].collection, "games.gamesgamesgamesgames.game");
-    let uri = body["uri"].as_str().expect("the PDS's uri is answered");
-    let row = indexed(&app, uri).await.expect("the write is in the index");
-    assert_eq!(row["cid"], body["cid"]);
-    assert_eq!(row["record"]["name"], "Tetris");
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"], "MethodNotImplemented", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("xrpc.procedure:{CREATE_GAME}")),
+        "{message}"
+    );
+    assert!(harness.pds().writes().is_empty());
 }
 
 // ---------------------------------------------------------------------------

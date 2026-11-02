@@ -557,23 +557,23 @@ async fn redelivery_is_idempotent(app: &ProviderApp, feeder: &Feeder) {
     assert_eq!(app.list(COLLECTION).await, vec![a1]);
 }
 
-/// The 503 rule: while the storage that claims a collection is down, a
-/// default XRPC get and list of it answer `503 ServiceUnavailable`, so a
-/// client knows to retry. A provider whose storage claims nothing keeps
-/// records in the instance database, where the rule does not apply; for it
-/// the case checks only that the query serves.
+/// The 503 rule: while the storage that claims a collection is down, an XRPC
+/// get of one of its records answers `503 ServiceUnavailable`, so a client
+/// knows to retry, and a listing of it fails rather than answering empty. A
+/// provider whose storage claims nothing keeps records in the instance
+/// database, where the rule does not apply; for it the case checks only that
+/// the query serves.
 async fn an_unavailable_store_answers_503(app: &ProviderApp, feeder: &Feeder) {
     app.track(COLLECTION, false).await;
-    app.track_query(QUERY, COLLECTION).await;
+    app.track_query(QUERY).await;
     feeder.put(created(ALICE, "a1", "kept", 1)).await;
     let get = format!("/xrpc/{QUERY}?uri={}", uri(ALICE, "a1"));
-    let list = format!("/xrpc/{QUERY}");
 
     let (status, answer) = app.xrpc_get(&get).await;
     assert_eq!(status, 200, "{get} before the outage: {answer}");
     assert_eq!(answer["record"]["text"], "kept", "{get}: {answer}");
-    let (status, answer) = app.xrpc_get(&list).await;
-    assert_eq!(status, 200, "{list} before the outage: {answer}");
+    let listed = app.state.records.list_recent(COLLECTION, None, 20, 0).await;
+    assert!(listed.is_ok(), "listing before the outage: {listed:?}");
 
     if !app.claims(COLLECTION) {
         eprintln!(
@@ -590,14 +590,20 @@ async fn an_unavailable_store_answers_503(app: &ProviderApp, feeder: &Feeder) {
     });
     outage().await;
 
-    for path in [&get, &list] {
-        let (status, answer) = app.xrpc_get(path).await;
-        assert_eq!(status, 503, "{path} while the storage is down: {answer}");
-        assert_eq!(
-            answer["error"], "ServiceUnavailable",
-            "{path} while the storage is down: {answer}"
-        );
-    }
+    let (status, answer) = app.xrpc_get(&get).await;
+    assert_eq!(status, 503, "{get} while the storage is down: {answer}");
+    assert_eq!(
+        answer["error"], "ServiceUnavailable",
+        "{get} while the storage is down: {answer}"
+    );
+    assert!(
+        app.state
+            .records
+            .list_recent(COLLECTION, None, 20, 0)
+            .await
+            .is_err(),
+        "a listing while the storage is down"
+    );
 }
 
 /// When the storage offers a raw route, the compat views on it show the

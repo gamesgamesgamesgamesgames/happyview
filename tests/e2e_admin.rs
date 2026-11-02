@@ -614,7 +614,6 @@ async fn query_lexicon_with_backfill_starts_no_job() {
     let body = json!({
         "lexicon_json": fixtures::list_games_query_lexicon(),
         "backfill": true,
-        "target_collection": "games.gamesgamesgamesgames.game"
     });
 
     let resp = app
@@ -865,8 +864,6 @@ async fn stats_with_seeded_records() {
             happyview::catalog::LexiconWrite {
                 lexicon_json: lexicon_json_val,
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

@@ -13,7 +13,7 @@ function handle(input, ctx)
   local limit = tonumber(input.limit) or 20
   if limit > 100 then limit = 100 end
 
-  return db.records(ctx.collection)
+  return db.records("xyz.statusphere.status")
     :did(input.did)
     :limit(limit)
     :cursor(input.cursor)
@@ -24,7 +24,7 @@ end
 ## How it works
 
 1. Parse `limit` from the query string, defaulting to 20 and capping at 100.
-2. Build a `db.records` chain on the target collection, narrowed by the optional DID filter and continued from the cursor. A step given `nil` is skipped, so a request without `did` or `cursor` needs no branching.
+2. Build a `db.records` chain on the `xyz.statusphere.status` collection, narrowed by the optional DID filter and continued from the cursor. A step given `nil` is skipped, so a request without `did` or `cursor` needs no branching.
 3. `run()` answers `{ records = [...], cursor = "..." }`, where each record is an envelope and `cursor` is an opaque string present when more records exist.
 
 ## Usage

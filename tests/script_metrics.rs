@@ -122,7 +122,6 @@ async fn app_with_query() -> TestApp {
         None,
         Some(json!({
             "lexicon_json": common::fixtures::list_games_query_lexicon(),
-            "target_collection": "games.gamesgamesgamesgames.game",
         })),
     )
     .await;

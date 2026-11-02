@@ -21,6 +21,7 @@ use happyview_plugin_sdk::wire::{
 };
 
 use crate::plugin::caller::{CallerSession, check_writable_repo};
+use crate::repo::PdsAuth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CallerError {
@@ -304,10 +305,13 @@ pub async fn upload_blob(
     caller: &CallerSession,
     spec: CallerBlobUpload,
 ) -> Result<Value, CallerError> {
+    // A blob goes to the repo a record write would default to, so a record
+    // a delegated script writes can reference it.
+    let repo = caller.default_repo();
     crate::repo::upload_blob_to_pds(
         &caller.app_state,
-        &caller.did,
-        &caller.pds_auth,
+        repo,
+        auth_for(caller, repo)?,
         &spec.mime_type,
         Bytes::from(spec.bytes),
     )
@@ -480,14 +484,22 @@ async fn check_against_lexicon(
     validate_required_fields(record, &schema).map_err(CallerError::Validation)
 }
 
+fn auth_for<'a>(caller: &'a CallerSession, repo: &str) -> Result<&'a PdsAuth, CallerError> {
+    caller.auth_for(repo).map_err(|did| {
+        CallerError::NoSession(format!(
+            "{did} has no session with this app, so nothing can sign a write to its \
+             repo; the account has to sign in to the app again"
+        ))
+    })
+}
+
 async fn post(
     caller: &CallerSession,
     repo: &str,
     method: &str,
     body: &Value,
 ) -> Result<Value, CallerError> {
-    let response = caller
-        .pds_auth
+    let response = auth_for(caller, repo)?
         .post_json(&caller.app_state, repo, method, body)
         .await
         .map_err(pds_failure)?;
@@ -821,6 +833,7 @@ mod tests {
                 )),
                 pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
                 app_state: state.clone(),
+                delegate_pds_auth: None,
             };
             let err = get_session(&caller, json!({})).await.unwrap_err();
             assert_eq!(err.code(), "NO_SESSION", "{err}");
@@ -883,6 +896,7 @@ mod tests {
                 session,
             ))),
             app_state: state,
+            delegate_pds_auth: None,
         };
         (caller, pds)
     }
@@ -966,6 +980,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,
@@ -1007,8 +1022,6 @@ mod tests {
             }),
             1,
             None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
         )
         .unwrap();
         state.lexicons.upsert_unindexed(parsed).await;
@@ -1020,6 +1033,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,

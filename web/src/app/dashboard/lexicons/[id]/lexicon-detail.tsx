@@ -109,7 +109,6 @@ export default function LexiconDetailPage() {
           nsid: lexicon.id,
           backfill: lexicon.backfill,
           indexed,
-          target_collection: lexicon.target_collection ?? undefined,
         });
         load();
       } else {
@@ -117,8 +116,6 @@ export default function LexiconDetailPage() {
           lexicon_json: lexicon.lexicon_json,
           backfill: lexicon.backfill,
           indexed,
-          target_collection: lexicon.target_collection ?? undefined,
-          action: lexicon.action ?? undefined,
           token_cost: lexicon.token_cost,
         });
         setLexicon(await getLexicon(id));

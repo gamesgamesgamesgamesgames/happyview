@@ -22,7 +22,7 @@ Every script defines a `handle(input, ctx)` function. HappyView calls it when th
 local db = require("happyview.db")
 
 function handle(input, ctx)
-  return db.records(ctx.collection):limit(20):run()
+  return db.records("xyz.statusphere.status"):limit(20):run()
 end
 ```
 
@@ -50,7 +50,7 @@ See the [Standard Libraries](../api-reference/lua/standard-libraries.md) referen
 local db = require("happyview.db")
 
 function handle(input, ctx)
-  local page = db.records(ctx.collection)
+  local page = db.records("xyz.statusphere.status")
     :where("status", "=", input.status)
     :did(input.did)
     :limit(tonumber(input.limit))
@@ -76,7 +76,7 @@ local time = require("internal.time")
 local record = require("happyview.record")
 
 function handle(input, ctx)
-  return record.create(ctx.collection, {
+  return record.create("com.example.post", {
     text = input.text,
     createdAt = time.to_iso8601(time.now()),
   })
@@ -113,7 +113,7 @@ Anything too slow for a request goes to a job. `happyview.jobs` enqueues one fro
 local jobs = require("happyview.jobs")
 
 function handle(input, ctx)
-  local job_id = jobs.create("export", { collection = ctx.collection })
+  local job_id = jobs.create("export", { collection = "xyz.statusphere.status" })
   return { job_id = job_id }
 end
 ```
@@ -132,7 +132,7 @@ local db = require("happyview.db")
 
 function handle(input, ctx)
   log.debug("handle called", { limit = input.limit })
-  local page = db.records(ctx.collection):limit(tonumber(input.limit)):run()
+  local page = db.records("xyz.statusphere.status"):limit(tonumber(input.limit)):run()
   log.info("query returned records", { count = #page.records })
   return page
 end

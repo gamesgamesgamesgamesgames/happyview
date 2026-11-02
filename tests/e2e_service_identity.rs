@@ -53,11 +53,34 @@ async fn seed_query_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
         .unwrap();
+
+    // A query answers a list only through its script. The echo fixture
+    // answers any run, and the access check in front of it is the subject.
+    install_lua_interpreter(app).await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/scripts",
+            app.admin_cookie(),
+            &json!({
+                "id": "xrpc.query:games.gamesgamesgamesgames.listGames",
+                "script_type": "lua",
+                "body": "function handle() return {} end",
+                "description": "test query"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "seeding the query script failed with status {}",
+        resp.status(),
+    );
 }
 
 async fn seed_procedure_lexicon(app: &TestApp) {
@@ -81,7 +104,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
@@ -1077,7 +1099,6 @@ async fn static_analysis_persistence() {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await

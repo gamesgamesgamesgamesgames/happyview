@@ -420,14 +420,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -476,14 +469,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         // Its own authority: granted.
@@ -531,14 +517,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         for scope in [
@@ -577,14 +556,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         assert!(
@@ -657,14 +629,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -707,14 +672,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -745,14 +703,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(

@@ -176,12 +176,12 @@ pub async fn execute_procedure_script(
         caller_did = %claims.did(),
     );
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source and input for error logging before anything is consumed.
     let script_source = script.body.clone();
     let input_json = input.clone();
 
+    let mut delegate_pds_auth: Option<Arc<repo::PdsAuth>> = None;
     let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
         Some(auth)
     } else if let Some(client_key) = claims.client_key() {
@@ -219,6 +219,31 @@ pub async fn execute_procedure_script(
             .dpop_key_id()
             .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
             .to_string();
+        // The procedure handler has already checked that the caller may write
+        // for `delegate_did` under this same api client. A delegated account
+        // with no session here can still run a script that never writes to
+        // its repo; a write that does is refused by `auth_for`.
+        if let Some(did) = delegate_did {
+            match crate::oauth::sessions::get_dpop_session_for_user(
+                &state.db,
+                backend,
+                encryption_key,
+                &api_client_id,
+                did,
+            )
+            .await
+            {
+                Ok(target) => {
+                    delegate_pds_auth = Some(Arc::new(repo::PdsAuth::Dpop {
+                        api_client_id: api_client_id.clone(),
+                        dpop_key_id: target.dpop_key_id,
+                        encryption_key: *encryption_key,
+                    }));
+                }
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Some(repo::PdsAuth::Dpop {
             api_client_id,
             dpop_key_id,
@@ -238,6 +263,7 @@ pub async fn execute_procedure_script(
             delegate_did: delegate_did.map(|s| s.to_string()),
             claims: claims_arc.clone(),
             pds_auth: Arc::new(pds_auth),
+            delegate_pds_auth: delegate_pds_auth.clone(),
             app_state: state.clone(),
         })
     });
@@ -255,7 +281,7 @@ pub async fn execute_procedure_script(
             caller_did: Some(claims.did()),
             has_pds_auth,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: Some(params),
             delegate_did,
             space: space.as_ref(),
@@ -351,7 +377,6 @@ pub async fn execute_query_script(
     let backend = state.db_backend;
     let span = tracing::info_span!("script.execute", method = method, script_type = "query",);
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source for error logging.
     let script_source = script.body.clone();
@@ -373,7 +398,7 @@ pub async fn execute_query_script(
             caller_did: claims.map(|c| c.did()),
             has_pds_auth: false,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: None,
             delegate_did: None,
             space: space.as_ref(),
@@ -454,7 +479,7 @@ pub async fn execute_query_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::lexicon::LexiconType;
     use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
     use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
     use axum::response::IntoResponse;
@@ -470,8 +495,6 @@ mod tests {
             record_schema: None,
             raw: serde_json::json!({ "id": "com.example.probe" }),
             revision: 1,
-            target_collection: Some("com.example.probe".to_string()),
-            action: ProcedureAction::Upsert,
             token_cost: None,
             space_type: None,
             space_name: None,

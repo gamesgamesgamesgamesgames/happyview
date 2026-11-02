@@ -14,13 +14,19 @@ Common issues and how to resolve them.
 - The lexicon's `defs.main.type` doesn't match the HTTP method. Queries are `GET`, procedures are `POST`.
 - The NSID in the URL doesn't match the `id` field in the uploaded lexicon JSON.
 
+## XRPC endpoint returns 501
+
+**Symptom**: `GET` or `POST /xrpc/your.method.name` returns `501` with `{"error": "MethodNotImplemented", "message": "your.method.name has no script. Add one for the trigger xrpc.query:your.method.name"}`.
+
+**Cause**: the query or procedure lexicon has no script. A query with no script answers only `?uri=<at-uri>`, and a procedure with no script answers nothing. Add a script for the trigger the message names; it names the collection it reads or writes. See [Lexicons - Queries and procedures need a script](../guides/lexicons.md#queries-and-procedures-need-a-script).
+
 ## Queries return empty results
 
 **Symptom**: The XRPC query endpoint returns `{"records": []}` even though records should exist.
 
 **Causes**:
 
-- The query lexicon is missing a `target_collection`. Without it, the query doesn't know which records to read. See [Lexicons - target_collection](../guides/lexicons.md#target-collection).
+- The query's script reads a different collection from the one the records are in. The script names the collection as a string, such as `db.records("xyz.statusphere.status")`; check the spelling against the record lexicon's NSID.
 - The record-type lexicon hasn't finished backfilling. Check backfill status with `GET /admin/backfill/status` or the dashboard.
 - Records exist on the network but HappyView hasn't indexed them yet. Jetstream only delivers events from after the collection was added to the filter. Use [backfill](../guides/backfill.md) to import historical records.
 
@@ -94,7 +100,7 @@ See [Backfill](../guides/backfill.md) for how the process works.
 
 **Causes**:
 
-- `ctx.collection` is only set when the lexicon has a `target_collection`. If you're using a hardcoded collection name, double-check the spelling matches exactly.
+- `ctx.collection` is `nil` in a query or procedure; only record-event scripts get it. Name the collection as a string, and check the spelling matches the record lexicon's NSID exactly.
 - `db.get` expects a full AT URI (`at://did:plc:abc/collection/rkey`), not just an rkey.
 - If querying by DID, make sure you're passing the full DID string including the `did:plc:` or `did:web:` prefix.
 

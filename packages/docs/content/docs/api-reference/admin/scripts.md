@@ -634,6 +634,8 @@ curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere
 
 `source` previews the rewrite of text the server doesn't hold, such as an editor's unsaved changes. No stored script is needed, so it works before a script is first saved: the `{id}` in the path then only tells the codemod which kind of script it is rewriting. Nothing is stored, `changed` compares against `source` rather than the stored body, and sending it with `apply: true` returns `400 Bad Request`.
 
+For a query or procedure, a read of the v2 `collection` global or of `ctx.collection` is rewritten to the NSID the instance's v2 lexicon for the script's method named, looked up by the trigger's NSID. When the instance has none recorded, the read is left under a `-- codemod:` marker; see [The collection a query or procedure names](../../guides/migrating-scripts.md#the-collection-a-query-or-procedure-names).
+
 A non-Lua `script_type` returns `400 Bad Request`. A body that doesn't parse as Lua also returns `400 Bad Request` rather than a result — this is different from `needs_migration`'s `"unparseable"`, which is a value on the *script list/get* response, not this endpoint.
 
 ### A script whose language has no interpreter
