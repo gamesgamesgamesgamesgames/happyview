@@ -2572,7 +2572,12 @@ mod deadline {
     /// could pass while a production path was broken. Production plugin
     /// code must therefore enter guests only through the `*_async` calls:
     /// no `.call(`, no `Instance::new(`, and no linker
-    /// `.instantiate(&mut …)` outside a test module.
+    /// `.instantiate(&mut …)` outside a test module. The scan covers
+    /// `src/plugin` and the two places that drive plugin stores,
+    /// `src/project/script_module` and `src/script`. It cuts each file at
+    /// its test *module*, not its first `#[cfg(test)]`: several files mark a
+    /// single helper test-only well before production code that must be
+    /// scanned, such as `PluginExecutor::instantiate`.
     #[test]
     fn production_plugin_code_enters_guests_only_asynchronously() {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2585,10 +2590,13 @@ mod deadline {
                 }
             }
         }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugin");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
-        sources(&root, &mut files);
+        for dir in ["plugin", "project/script_module", "script"] {
+            sources(&src.join(dir), &mut files);
+        }
         assert!(files.len() > 5, "{files:?}");
+        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s").unwrap();
         let sync_entry =
             regex::Regex::new(r"\.call\(|Instance::new\(|\.instantiate\(\s*&mut").unwrap();
         for sync in [
@@ -2603,7 +2611,7 @@ mod deadline {
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
             // Only the code before a file's test module runs in production.
-            let production = text.split("#[cfg(test)]").next().unwrap_or("");
+            let production = test_module.split(&text).next().unwrap_or("");
             for (i, line) in production.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if sync_entry.is_match(code) {
