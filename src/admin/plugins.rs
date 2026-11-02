@@ -1443,6 +1443,30 @@ fn masked_secrets(
         .collect()
 }
 
+/// The secrets to store after an update. A value that is exactly
+/// [`SECRET_MASK`] keeps the stored one, an empty value clears it, and
+/// anything else is the new value. Only the exact mask counts, so a real
+/// secret that happens to start with asterisks is still saved.
+fn merge_secrets(
+    existing: &HashMap<String, String>,
+    incoming: HashMap<String, String>,
+    encryption_key: &[u8; 32],
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    let mut merged = serde_json::Map::new();
+    for (key, value) in incoming {
+        if value == SECRET_MASK {
+            if let Some(stored) = existing.get(&key) {
+                merged.insert(key, serde_json::Value::String(stored.clone()));
+            }
+        } else if !value.is_empty() {
+            let encrypted = encrypt(encryption_key, value.as_bytes())
+                .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
+            merged.insert(key, serde_json::Value::String(BASE64.encode(&encrypted)));
+        }
+    }
+    Ok(merged)
+}
+
 /// PUT /admin/plugins/{id}/secrets - update plugin secrets
 pub(super) async fn update_secrets(
     State(state): State<AppState>,
@@ -1494,24 +1518,7 @@ pub(super) async fn update_secrets(
         })
         .unwrap_or_default();
 
-    // Merge secrets: if new value starts with "********", keep existing encrypted value
-    // Otherwise, encrypt the new value
-    let mut merged_secrets = serde_json::Map::new();
-    for (key, value) in body.secrets {
-        if value.starts_with("********") {
-            // Keep existing encrypted value if present
-            if let Some(existing) = existing_secrets.get(&key) {
-                merged_secrets.insert(key, serde_json::Value::String(existing.clone()));
-            }
-        } else if !value.is_empty() {
-            // Encrypt new value and store as base64
-            let encrypted = encrypt(encryption_key, value.as_bytes())
-                .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
-            let encoded = BASE64.encode(&encrypted);
-            merged_secrets.insert(key, serde_json::Value::String(encoded));
-        }
-        // Empty values are not stored (allows clearing a secret)
-    }
+    let merged_secrets = merge_secrets(&existing_secrets, body.secrets, encryption_key)?;
 
     // Update config with merged secrets
     config["secrets"] = serde_json::Value::Object(merged_secrets);
@@ -1768,6 +1775,33 @@ mod tests {
         assert_eq!(masked.len(), 3);
         assert!(masked.values().all(|value| value == SECRET_MASK));
     }
+    /// Only the exact mask keeps a stored secret. A new value that merely
+    /// starts with asterisks is a new value.
+    #[test]
+    fn only_the_exact_mask_keeps_a_stored_secret() {
+        let key = [6u8; 32];
+        let existing = HashMap::from([
+            ("KEPT".to_string(), "stored-kept".to_string()),
+            ("REPLACED".to_string(), "stored-replaced".to_string()),
+            ("CLEARED".to_string(), "stored-cleared".to_string()),
+        ]);
+        let incoming = HashMap::from([
+            ("KEPT".to_string(), SECRET_MASK.to_string()),
+            ("REPLACED".to_string(), format!("{SECRET_MASK}-and-more")),
+            ("CLEARED".to_string(), String::new()),
+        ]);
+
+        let merged = merge_secrets(&existing, incoming, &key).unwrap();
+
+        assert_eq!(merged["KEPT"], "stored-kept");
+        let replaced = BASE64.decode(merged["REPLACED"].as_str().unwrap()).unwrap();
+        let replaced = crate::plugin::encryption::Keyring::from(key)
+            .decrypt(&replaced)
+            .unwrap();
+        assert_eq!(replaced, b"********-and-more");
+        assert!(!merged.contains_key("CLEARED"));
+    }
+
     use crate::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
 
     fn release(version: &str) -> ReleaseEntry {
