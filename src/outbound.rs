@@ -16,20 +16,24 @@
 //!   URLs and redirect hops, which never reach a resolver.
 //!
 //! Hosts the operator configured (the PLC directory, relay, Jetstream,
-//! telemetry, this instance's own URL, plugin registry and sources, and any
-//! proxy) are exempt by name, and the addresses they resolve to are exempt at
-//! connect time. The hosts in `ALLOW_PRIVATE_HOSTS` are exempt too, but only
-//! for the clients plugins and scripts send their own requests through
+//! telemetry, plugin registry and sources, and any proxy) are exempt by name,
+//! and the addresses they resolve to are exempt at connect time, each only on
+//! the port its URL names: a configured `http://127.0.0.1:2582` exempts that
+//! one service, not everything else listening on the machine. This
+//! instance's own `PUBLIC_URL` is not exempt; nothing it sends is addressed
+//! to itself. The hosts in `ALLOW_PRIVATE_HOSTS` are exempt too, but only for
+//! the clients plugins and scripts send their own requests through
 //! ([`Source::Plugins`]): every other request keeps refusing them, by name and
-//! by address, because its destination came from somewhere else. Behind a proxy the peer is the proxy, so what the proxy
-//! connects to onwards is the proxy's to decide.
+//! by address, because its destination came from somewhere else. Behind a
+//! proxy the peer is the proxy, so what the proxy connects to onwards is the
+//! proxy's to decide.
 //!
 //! Nothing is filtered until [`install`] has run, which `run` does at boot, so
 //! tests and one-shot tools that point at a local mock keep working. A redirect
 //! to an IP literal is judged before it is followed, so it is never connected
 //! to at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -51,69 +55,117 @@ pub const ALLOW_PRIVATE_VAR: &str = "ALLOW_PRIVATE_DESTINATIONS";
 /// Read from the process environment only.
 pub const ALLOW_PRIVATE_HOSTS_VAR: &str = "ALLOW_PRIVATE_HOSTS";
 
+/// The ports an exempt host may be reached on. A configured URL names one,
+/// explicitly or by its scheme's default; only a bare host name allows any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ports {
+    Any,
+    Only(HashSet<u16>),
+}
+
+impl Ports {
+    fn allows(&self, port: u16) -> bool {
+        match self {
+            Ports::Any => true,
+            Ports::Only(ports) => ports.contains(&port),
+        }
+    }
+
+    fn merge(&mut self, other: &Ports) {
+        match (&mut *self, other) {
+            (Ports::Any, _) => {}
+            (_, Ports::Any) => *self = Ports::Any,
+            (Ports::Only(mine), Ports::Only(theirs)) => mine.extend(theirs),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Policy {
-    trusted_names: HashSet<String>,
-    trusted_addrs: RwLock<HashSet<IpAddr>>,
+    trusted_names: HashMap<String, Ports>,
+    trusted_addrs: RwLock<HashMap<IpAddr, Ports>>,
 }
 
 impl Policy {
-    /// A policy exempting the hosts of `urls`. An IP-literal host is exempt as
-    /// that address; a name is exempt along with whatever it resolves to.
+    /// A policy exempting the hosts of `urls`, each on its URL's port (the
+    /// scheme's default when none is written), or on any port for a bare host
+    /// name. An IP-literal host is exempt as that address; a name is exempt
+    /// along with whatever it resolves to, on the same ports.
     pub fn trusting<'a>(urls: impl IntoIterator<Item = &'a str>) -> Self {
-        let policy = Self::default();
-        let mut names = HashSet::new();
-        {
-            let mut addrs = policy.trusted_addrs.write().expect("fresh lock");
-            for raw in urls {
-                let Some(host) = url_host(raw) else { continue };
-                match host {
-                    url::Host::Ipv4(v4) => {
-                        addrs.insert(IpAddr::V4(v4));
-                    }
-                    url::Host::Ipv6(v6) => {
-                        addrs.insert(IpAddr::V6(v6));
-                    }
-                    url::Host::Domain(name) => {
-                        names.insert(name.trim_end_matches('.').to_ascii_lowercase());
-                    }
-                }
+        let mut names: HashMap<String, Ports> = HashMap::new();
+        let mut addrs: HashMap<IpAddr, Ports> = HashMap::new();
+        for raw in urls {
+            let Some((host, ports)) = url_host(raw) else {
+                continue;
+            };
+            match host {
+                url::Host::Ipv4(v4) => merge_into(&mut addrs, canonical(IpAddr::V4(v4)), &ports),
+                url::Host::Ipv6(v6) => merge_into(&mut addrs, canonical(IpAddr::V6(v6)), &ports),
+                url::Host::Domain(name) => merge_into(
+                    &mut names,
+                    name.trim_end_matches('.').to_ascii_lowercase(),
+                    &ports,
+                ),
             }
         }
         Self {
             trusted_names: names,
-            ..policy
+            trusted_addrs: RwLock::new(addrs),
         }
     }
 
-    fn trusts_name(&self, host: &str) -> bool {
+    fn name_ports(&self, host: &str) -> Option<&Ports> {
         self.trusted_names
-            .contains(&host.trim_end_matches('.').to_ascii_lowercase())
+            .get(&host.trim_end_matches('.').to_ascii_lowercase())
     }
 
-    fn admits(&self, ip: IpAddr) -> bool {
+    /// Whether `ip` may be connected to on `port`.
+    fn admits(&self, ip: IpAddr, port: u16) -> bool {
         is_public(ip)
             || self
                 .trusted_addrs
                 .read()
-                .map(|addrs| addrs.contains(&canonical(ip)))
+                .map(|addrs| addrs.get(&canonical(ip)).is_some_and(|p| p.allows(port)))
+                .unwrap_or(false)
+    }
+
+    /// Whether `ip` is exempt on any port: what a resolver, which does not know
+    /// the port yet, can judge. The port is judged once connected.
+    fn admits_on_some_port(&self, ip: IpAddr) -> bool {
+        is_public(ip)
+            || self
+                .trusted_addrs
+                .read()
+                .map(|addrs| addrs.contains_key(&canonical(ip)))
                 .unwrap_or(false)
     }
 }
 
-fn url_host(raw: &str) -> Option<url::Host<String>> {
+fn merge_into<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Ports>, key: K, ports: &Ports) {
+    map.entry(key)
+        .and_modify(|p| p.merge(ports))
+        .or_insert_with(|| ports.clone());
+}
+
+/// The host of a configured URL and the ports it names. A full URL names its
+/// port, or its scheme's default; a bare `host:port`, as a proxy variable may
+/// be, names that port; a bare host names none, and so allows any.
+fn url_host(raw: &str) -> Option<(url::Host<String>, Ports)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    let host_of = |s: &str| {
-        url::Url::parse(s)
-            .ok()
-            .and_then(|u| u.host().map(|h| h.to_owned()))
-    };
-    // A proxy variable may be a bare `host:port`, which parses as a scheme
-    // and a path with no host at all.
-    host_of(raw).or_else(|| host_of(&format!("http://{raw}")))
+    let only = |port: u16| Ports::Only(HashSet::from([port]));
+    if let Ok(url) = url::Url::parse(raw)
+        && let Some(host) = url.host()
+    {
+        let ports = url.port_or_known_default().map_or(Ports::Any, only);
+        return Some((host.to_owned(), ports));
+    }
+    // A bare `host:port` parses as a scheme and a path with no host at all.
+    let url = url::Url::parse(&format!("http://{raw}")).ok()?;
+    let host = url.host()?.to_owned();
+    Some((host, url.port().map_or(Ports::Any, only)))
 }
 
 static POLICY: OnceLock<Arc<Policy>> = OnceLock::new();
@@ -219,7 +271,6 @@ pub fn install_for(config: &crate::config::Config, dev: bool) {
         config.relay_url.clone(),
         config.jetstream_url.clone(),
         config.telemetry_collector_url.clone(),
-        config.public_url.clone(),
     ];
     urls.extend(config.default_plugins.iter().cloned());
     for var in ["PLUGIN_REGISTRY_URL", "PLUGIN_URLS"] {
@@ -340,15 +391,17 @@ fn screen(source: &Source, host: &str, addrs: Vec<SocketAddr>) -> io::Result<Vec
     let Some(policy) = source.policy() else {
         return Ok(addrs);
     };
-    if policy.trusts_name(host) {
+    if let Some(ports) = policy.name_ports(host) {
         if let Ok(mut trusted) = policy.trusted_addrs.write() {
-            trusted.extend(addrs.iter().map(|a| canonical(a.ip())));
+            for addr in &addrs {
+                merge_into(&mut trusted, canonical(addr.ip()), ports);
+            }
         }
         return Ok(addrs);
     }
     let public: Vec<SocketAddr> = addrs
         .into_iter()
-        .filter(|a| policy.admits(a.ip()))
+        .filter(|a| policy.admits_on_some_port(a.ip()))
         .collect();
     if public.is_empty() {
         return Err(refusal(format!("{host} resolves to no public address")));
@@ -370,7 +423,7 @@ fn check_peer(source: &Source, peer: Option<SocketAddr>) -> io::Result<()> {
         return Ok(());
     };
     match peer {
-        Some(addr) if policy.admits(addr.ip()) => Ok(()),
+        Some(addr) if policy.admits(addr.ip(), addr.port()) => Ok(()),
         Some(addr) => Err(refusal(format!("{} is not a public address", addr.ip()))),
         None => Err(refusal("the peer address could not be read".to_string())),
     }
@@ -383,9 +436,10 @@ fn redirect_allowed(source: &Source, url: &url::Url) -> bool {
     let Some(policy) = source.policy() else {
         return true;
     };
+    let port = url.port_or_known_default().unwrap_or(0);
     match url.host() {
-        Some(url::Host::Ipv4(v4)) => policy.admits(IpAddr::V4(v4)),
-        Some(url::Host::Ipv6(v6)) => policy.admits(IpAddr::V6(v6)),
+        Some(url::Host::Ipv4(v4)) => policy.admits(IpAddr::V4(v4), port),
+        Some(url::Host::Ipv6(v6)) => policy.admits(IpAddr::V6(v6), port),
         _ => true,
     }
 }
@@ -557,25 +611,47 @@ mod tests {
     }
 
     #[test]
-    fn a_trusted_host_is_matched_by_name_or_by_its_literal_address() {
+    fn a_trusted_host_is_matched_by_name_or_by_its_literal_address_on_its_port() {
         let policy = Policy::trusting([
             "http://plc:2582",
             "https://Relay.Example.",
             "http://10.9.8.7:6000/x",
-            "http://[fd00::5]:80",
+            "http://[fd00::5]",
             "proxy.internal:3128",
+            "sidecar",
             "",
             "not a url at all ::",
         ]);
-        assert!(policy.trusts_name("plc"));
-        assert!(policy.trusts_name("relay.example"));
-        assert!(policy.trusts_name("RELAY.EXAMPLE."));
-        assert!(policy.trusts_name("proxy.internal"));
-        assert!(!policy.trusts_name("evil.example"));
-        assert!(policy.admits(ip("10.9.8.7")));
-        assert!(policy.admits(ip("::ffff:10.9.8.7")));
-        assert!(policy.admits(ip("fd00::5")));
-        assert!(!policy.admits(ip("10.9.8.8")));
-        assert!(policy.admits(ip("8.8.8.8")));
+        let only = |p: u16| Some(Ports::Only(HashSet::from([p])));
+        assert_eq!(policy.name_ports("plc").cloned(), only(2582));
+        assert_eq!(policy.name_ports("relay.example").cloned(), only(443));
+        assert_eq!(policy.name_ports("RELAY.EXAMPLE.").cloned(), only(443));
+        assert_eq!(policy.name_ports("proxy.internal").cloned(), only(3128));
+        assert_eq!(policy.name_ports("sidecar").cloned(), Some(Ports::Any));
+        assert!(policy.name_ports("evil.example").is_none());
+
+        assert!(policy.admits(ip("10.9.8.7"), 6000));
+        assert!(policy.admits(ip("::ffff:10.9.8.7"), 6000));
+        assert!(!policy.admits(ip("10.9.8.7"), 5432));
+        assert!(policy.admits(ip("fd00::5"), 80));
+        assert!(!policy.admits(ip("fd00::5"), 22));
+        assert!(!policy.admits(ip("10.9.8.8"), 6000));
+        assert!(policy.admits(ip("8.8.8.8"), 5432));
+        assert!(policy.admits_on_some_port(ip("10.9.8.7")));
+        assert!(!policy.admits_on_some_port(ip("10.9.8.8")));
+    }
+
+    #[test]
+    fn a_name_lends_its_ports_to_the_addresses_it_resolves_to() {
+        let source = Source::Fixed(Arc::new(Policy::trusting(["http://plc:2582", "sidecar"])));
+        let addrs = vec!["10.0.0.5:0".parse().unwrap()];
+        screen(&source, "plc", addrs.clone()).unwrap();
+        assert!(check_peer(&source, Some("10.0.0.5:2582".parse().unwrap())).is_ok());
+        assert!(check_peer(&source, Some("10.0.0.5:5432".parse().unwrap())).is_err());
+        screen(&source, "sidecar", vec!["10.0.0.6:0".parse().unwrap()]).unwrap();
+        assert!(check_peer(&source, Some("10.0.0.6:9999".parse().unwrap())).is_ok());
+        // An untrusted name resolving to a trusted address keeps it, so that
+        // address may be connected to on its trusted port and no other.
+        assert_eq!(screen(&source, "elsewhere", addrs).unwrap().len(), 1);
     }
 }
