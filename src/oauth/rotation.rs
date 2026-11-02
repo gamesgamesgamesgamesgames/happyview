@@ -48,6 +48,7 @@ pub async fn rotate_instance_key(state: &AppState) -> Result<(ClientKey, u64), A
         state.db.clone(),
         state.db_backend,
         &new_key,
+        state.config.token_encryption_key.as_ref(),
     ) {
         Ok(client) => {
             let client = Arc::new(client);
@@ -115,6 +116,7 @@ pub async fn rotate_instance_key(state: &AppState) -> Result<(ClientKey, u64), A
             state.db.clone(),
             state.db_backend,
             &new_key,
+            state.config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);
@@ -154,6 +156,7 @@ pub async fn rotate_instance_key(state: &AppState) -> Result<(ClientKey, u64), A
             state.db.clone(),
             state.db_backend,
             Some(vec![jwk]),
+            state.config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);

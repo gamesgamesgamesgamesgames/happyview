@@ -2,6 +2,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::Rng;
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +59,38 @@ pub fn decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionE
     cipher
         .decrypt(&nonce, encrypted)
         .map_err(|_| EncryptionError::DecryptionFailed)
+}
+
+/// Text as it goes in a column beside an `encrypted` flag.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Sealed {
+    pub value: String,
+    pub encrypted: i32,
+}
+
+/// Encrypt `value` when the instance has a key, or keep it as plaintext: the
+/// key is optional, and a store shouldn't refuse a write that worked without it.
+pub fn seal(key: Option<&[u8; 32]>, value: &str) -> Result<Sealed, EncryptionError> {
+    Ok(match key {
+        Some(key) => Sealed {
+            value: BASE64.encode(encrypt(key, value.as_bytes())?),
+            encrypted: 1,
+        },
+        None => Sealed {
+            value: value.to_string(),
+            encrypted: 0,
+        },
+    })
+}
+
+/// The text of a stored value, or `None` if it's ciphertext this instance can't
+/// open.
+pub fn open(key: Option<&[u8; 32]>, stored: &str, encrypted: bool) -> Option<String> {
+    if !encrypted {
+        return Some(stored.to_string());
+    }
+    let bytes = BASE64.decode(stored).ok()?;
+    String::from_utf8(decrypt(key?, &bytes).ok()?).ok()
 }
 
 #[cfg(test)]

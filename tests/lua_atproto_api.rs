@@ -59,8 +59,12 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
         },
         keys: None,
-        state_store: happyview::auth::oauth_store::DbStateStore::new(oauth_pool.clone(), backend),
-        session_store: happyview::auth::oauth_store::DbSessionStore::new(oauth_pool, backend),
+        state_store: happyview::auth::oauth_store::DbStateStore::new(
+            oauth_pool.clone(),
+            backend,
+            None,
+        ),
+        session_store: happyview::auth::oauth_store::DbSessionStore::new(oauth_pool, backend, None),
         resolver: OAuthResolverConfig {
             did_resolver,
             handle_resolver,
@@ -87,8 +91,13 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         ),
         oauth: std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            None,
         )),
-        oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+        oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(
+            pool.clone(),
+            backend,
+            None,
+        ),
         linked_repos_client: std::sync::Arc::new(
             happyview::linked_repos::client::build(
                 "https://plc.directory",
@@ -97,9 +106,10 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
                 "http://127.0.0.1:0/auth/callback".into(),
                 true,
                 vec![Scope::Known(KnownScope::Atproto)],
-                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
                 pool.clone(),
                 backend,
+                None,
                 None,
             )
             .expect("Failed to create test linked-repo OAuth client"),
