@@ -110,13 +110,16 @@ function scriptLimitError(
   return `Enter a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`;
 }
 
+const SOURCE_LABELS: Partial<Record<SettingSource, string>> = {
+  env: "from env var",
+  project: "from happyview.toml",
+  platform: "set by your hosting provider",
+};
+
 function SourceLabel({ source }: { source: SettingSource }) {
-  if (source !== "env" && source !== "project") return null;
-  return (
-    <span className="text-xs text-muted-foreground">
-      {source === "env" ? "from env var" : "from happyview.toml"}
-    </span>
-  );
+  const label = SOURCE_LABELS[source];
+  if (!label) return null;
+  return <span className="text-xs text-muted-foreground">{label}</span>;
 }
 
 export default function GeneralSettingsPage() {
@@ -685,7 +688,10 @@ export default function GeneralSettingsPage() {
               }))
             }
             placeholder="60"
-            disabled={!canManage}
+            disabled={
+              !canManage ||
+              sources["space_inspector_max_grant_minutes"] === "platform"
+            }
           />
           <p className="text-muted-foreground text-xs">
             The longest a moderator can request access for. Requests default to
@@ -750,7 +756,10 @@ export default function GeneralSettingsPage() {
             placeholder={
               values.event_log_retention_days.trim() === "0" ? "0" : "365"
             }
-            disabled={!canManage}
+            disabled={
+              !canManage ||
+              sources["space_access_log_retention_days"] === "platform"
+            }
           />
           <p className="text-muted-foreground text-xs">
             How long to keep records of space access: grants, the reads made

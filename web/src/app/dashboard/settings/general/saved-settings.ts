@@ -30,13 +30,16 @@ export type SettingWrite =
 
 /**
  * What saving the form sends. An empty value clears a stored setting so the
- * env var or the default applies, and sends nothing when none is stored.
+ * env var or the default applies, and sends nothing when none is stored. A
+ * setting the hosting platform fixes is never sent: the server refuses to
+ * change it, and that refusal would stop the rest of the save.
  */
 export function settingWrites(
   values: Record<FieldKey, string>,
   sources: Record<FieldKey, SettingSource>,
 ): SettingWrite[] {
   return SAVED_KEYS.flatMap((key): SettingWrite[] => {
+    if (sources[key] === "platform") return [];
     const value = values[key];
     if (value !== "") return [{ key, action: "put", value }];
     return sources[key] === "database" ? [{ key, action: "delete" }] : [];

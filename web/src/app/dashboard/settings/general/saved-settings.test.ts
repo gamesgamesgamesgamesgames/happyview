@@ -63,4 +63,21 @@ describe("settingWrites", () => {
       { key: "space_access_log_retention_days", action: "delete" },
     ]);
   });
+
+  // The server refuses a change to one, which would stop the whole save.
+  it("never sends a setting the hosting platform fixes", () => {
+    expect(
+      form(
+        {
+          space_access_log_retention_days: "364",
+          space_inspector_max_grant_minutes: "1440",
+          app_name: "Acme",
+        },
+        {
+          space_access_log_retention_days: "platform",
+          space_inspector_max_grant_minutes: "platform",
+        },
+      ),
+    ).toEqual([{ key: "app_name", action: "put", value: "Acme" }]);
+  });
 });
