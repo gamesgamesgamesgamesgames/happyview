@@ -7,6 +7,7 @@ use base64::Engine;
 use bytes::Bytes;
 use http_body_util::Full;
 use std::convert::Infallible;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -188,6 +189,7 @@ pub fn router(state: AppState) -> Router {
     };
 
     outer
+        .layer(CatchPanicLayer::custom(panic_response))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
         .layer(axum::middleware::from_fn_with_state(
@@ -195,6 +197,18 @@ pub fn router(state: AppState) -> Router {
             crate::telemetry_middleware::count_http_bytes,
         ))
         .with_state(state)
+}
+
+/// A handler that panics answers as an internal error does: a logged detail and
+/// a generic body. Left uncaught, the panic drops the connection with no
+/// response at all.
+fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    AppError::Internal(format!("handler panicked: {detail}")).into_response()
 }
 
 /// Allowed request methods, shared by both CORS policies.
