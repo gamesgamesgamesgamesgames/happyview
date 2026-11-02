@@ -18,7 +18,10 @@
 //! Hosts the operator configured (the PLC directory, relay, Jetstream,
 //! telemetry, this instance's own URL, plugin registry and sources, and any
 //! proxy) are exempt by name, and the addresses they resolve to are exempt at
-//! connect time. Behind a proxy the peer is the proxy, so what the proxy
+//! connect time. The hosts in `ALLOW_PRIVATE_HOSTS` are exempt too, but only
+//! for the clients plugins and scripts send their own requests through
+//! ([`Source::Plugins`]): every other request keeps refusing them, by name and
+//! by address, because its destination came from somewhere else. Behind a proxy the peer is the proxy, so what the proxy
 //! connects to onwards is the proxy's to decide.
 //!
 //! Nothing is filtered until [`install`] has run, which `run` does at boot, so
@@ -42,6 +45,11 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// Turns the filter off, for an instance whose PDSes or labelers really are on
 /// a private network. Read from the process environment only.
 pub const ALLOW_PRIVATE_VAR: &str = "ALLOW_PRIVATE_DESTINATIONS";
+
+/// Host names, or URLs whose host is taken, that plugins and scripts may reach
+/// at a private address: services beside this instance that its scripts call.
+/// Read from the process environment only.
+pub const ALLOW_PRIVATE_HOSTS_VAR: &str = "ALLOW_PRIVATE_HOSTS";
 
 #[derive(Debug, Default)]
 pub struct Policy {
@@ -109,20 +117,36 @@ fn url_host(raw: &str) -> Option<url::Host<String>> {
 }
 
 static POLICY: OnceLock<Arc<Policy>> = OnceLock::new();
+static PLUGIN_POLICY: OnceLock<Arc<Policy>> = OnceLock::new();
 
-/// Start filtering with `policy`. Only the first call has any effect.
+/// Start filtering with `policy`, for plugins' own requests as well. Only the
+/// first call has any effect.
 pub fn install(policy: Policy) {
-    let _ = POLICY.set(Arc::new(policy));
+    install_with_plugins(policy, None);
+}
+
+/// Start filtering with `policy`, and with `plugins` for the requests plugins
+/// and scripts send themselves (`policy` when `None`). Each keeps its own
+/// record of trusted addresses, so an address only the plugin policy trusts
+/// never becomes trusted for anything else. Only the first call has any
+/// effect.
+pub fn install_with_plugins(policy: Policy, plugins: Option<Policy>) {
+    let policy = Arc::new(policy);
+    if POLICY.set(policy.clone()).is_ok() {
+        let _ = PLUGIN_POLICY.set(plugins.map(Arc::new).unwrap_or(policy));
+    }
 }
 
 /// Where a client finds its policy: the one [`install`] set, read at each
 /// lookup and connect so a client built before boot installed it is still
-/// covered, or a fixed one, which is how tests exercise the filter without
-/// installing it for their whole binary.
+/// covered; the one installed for plugins' own requests; or a fixed one, which
+/// is how tests exercise the filter without installing it for their whole
+/// binary.
 #[derive(Clone, Debug, Default)]
 pub enum Source {
     #[default]
     Installed,
+    Plugins,
     Fixed(Arc<Policy>),
 }
 
@@ -130,6 +154,7 @@ impl Source {
     fn policy(&self) -> Option<&Policy> {
         match self {
             Source::Installed => POLICY.get().map(Arc::as_ref),
+            Source::Plugins => PLUGIN_POLICY.get().map(Arc::as_ref),
             Source::Fixed(policy) => Some(policy),
         }
     }
@@ -214,7 +239,29 @@ pub fn install_for(config: &crate::config::Config, dev: bool) {
             urls.push(value);
         }
     }
-    install(Policy::trusting(urls.iter().map(String::as_str)));
+    let private_hosts = private_hosts(std::env::var(ALLOW_PRIVATE_HOSTS_VAR).ok().as_deref());
+    let plugins = if private_hosts.is_empty() {
+        None
+    } else {
+        tracing::info!(
+            hosts = %private_hosts.join(","),
+            "{ALLOW_PRIVATE_HOSTS_VAR}: plugins and scripts may reach these hosts at private addresses"
+        );
+        Some(Policy::trusting(
+            urls.iter().chain(&private_hosts).map(String::as_str),
+        ))
+    };
+    install_with_plugins(Policy::trusting(urls.iter().map(String::as_str)), plugins);
+}
+
+/// The entries of `ALLOW_PRIVATE_HOSTS`: comma-separated, blanks dropped.
+pub fn private_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Whether `ip` is publicly routable. Everything else (loopback, private,
