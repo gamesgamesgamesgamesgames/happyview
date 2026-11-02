@@ -819,6 +819,15 @@ async fn apply_writes(
         }
     }
 
+    // The single writes check the collection before they forward; a batch
+    // checks every op before it does, so it cannot carry a collection the
+    // space does not allow.
+    for write in &input.writes {
+        if let WriteOp::Create { collection, .. } | WriteOp::Update { collection, .. } = write {
+            service::check_collection_allowed(&space, collection)?;
+        }
+    }
+
     // A repo hosted on its author's PDS takes the batch there, as the single
     // writes do; writing only HappyView's copy would fork the two, and the
     // next sync would drop what was written here.
