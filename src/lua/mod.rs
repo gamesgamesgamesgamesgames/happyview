@@ -10,6 +10,7 @@ pub(crate) mod sandbox;
 pub mod scripts;
 pub(crate) mod spaces_api;
 pub(crate) mod tid;
+pub mod variables;
 pub(crate) mod xrpc_api;
 
 #[allow(unused_imports)]

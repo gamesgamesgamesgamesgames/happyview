@@ -434,6 +434,46 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
     assert_eq!(body["title"], "TEST GAME");
 }
 
+/// A script reads a script variable as its value, however it's stored.
+#[tokio::test]
+#[serial]
+async fn a_record_script_reads_an_encrypted_variable_as_its_value() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    seed_lexicon(&app, fixtures::game_record_lexicon()).await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/script-variables",
+            app.admin_cookie(),
+            &json!({ "key": "API_TOKEN", "value": "from-a-variable" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    create_script(
+        &app,
+        "record.create:games.gamesgamesgamesgames.game",
+        "function handle() event.record.title = env.API_TOKEN; return event.record end",
+    )
+    .await;
+
+    let _ = handle_record_event(
+        &app.state,
+        &game_event("rk-env", "create", json!({"title": "x"})),
+    )
+    .await;
+
+    let body = fetch_record_body(
+        &app,
+        "at://did:plc:test/games.gamesgamesgamesgames.game/rk-env",
+    )
+    .await
+    .unwrap();
+    assert_eq!(body["title"], "from-a-variable");
+}
+
 #[tokio::test]
 #[serial]
 async fn cascade_action_specific_wins_over_wildcard() {
