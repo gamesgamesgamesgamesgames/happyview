@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{DatabaseBackend, adapt_sql};
-use crate::plugin::encryption::{EncryptionError, open, seal};
+use crate::plugin::encryption::{EncryptionError, Keyring, open, seal};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -60,7 +60,7 @@ pub async fn stored_session_json(
     backend: DatabaseBackend,
     table: &str,
     did: &str,
-    key: Option<&[u8; 32]>,
+    keys: Option<&Keyring>,
 ) -> Result<Option<String>, sqlx::Error> {
     let row: Option<(String, i64)> = crate::db::query_as(&adapt_sql(
         &format!("SELECT session_data, CAST(encrypted AS BIGINT) FROM {table} WHERE did = ?"),
@@ -69,7 +69,7 @@ pub async fn stored_session_json(
     .bind(did)
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|(data, encrypted)| open(key, &data, encrypted != 0)))
+    Ok(row.and_then(|(data, encrypted)| open(keys, &data, encrypted != 0)))
 }
 
 /// Encrypt every plaintext session. Safe on every boot and from several
@@ -100,7 +100,7 @@ pub async fn seal_stored_sessions(
             backend,
         );
         for (did, data) in rows {
-            let Ok(sealed) = seal(Some(key), &data) else {
+            let Ok(sealed) = seal(Some(&Keyring::from(*key)), &data) else {
                 continue;
             };
             let result = crate::db::query(&update)
@@ -121,28 +121,28 @@ pub struct DbSessionStore {
     backend: DatabaseBackend,
     table: &'static str,
     signing_kid: Option<String>,
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<Keyring>,
 }
 
 impl DbSessionStore {
-    pub fn new(pool: AnyPool, backend: DatabaseBackend, key: Option<&[u8; 32]>) -> Self {
-        Self::new_with_table(pool, backend, SESSIONS_TABLE, key)
+    pub fn new(pool: AnyPool, backend: DatabaseBackend, keys: Option<Keyring>) -> Self {
+        Self::new_with_table(pool, backend, SESSIONS_TABLE, keys)
     }
 
-    /// `key` is required rather than set by a builder method, so a store can't
+    /// `keys` is required rather than set by a builder method, so a store can't
     /// be built that silently writes plaintext.
     pub fn new_with_table(
         pool: AnyPool,
         backend: DatabaseBackend,
         table: &'static str,
-        key: Option<&[u8; 32]>,
+        keys: Option<Keyring>,
     ) -> Self {
         Self {
             pool,
             backend,
             table,
             signing_kid: None,
-            encryption_key: key.copied(),
+            encryption_key: keys,
         }
     }
 
@@ -289,15 +289,15 @@ pub struct DbStateStore {
     /// Serializes authorize() + take_last_state_key() pairs so concurrent
     /// logins cannot interleave and swap each other's state keys.
     pub authorize_lock: Arc<tokio::sync::Mutex<()>>,
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<Keyring>,
 }
 
 impl DbStateStore {
-    pub fn new(pool: AnyPool, backend: DatabaseBackend, key: Option<&[u8; 32]>) -> Self {
+    pub fn new(pool: AnyPool, backend: DatabaseBackend, keys: Option<Keyring>) -> Self {
         Self {
             pool,
             backend,
-            encryption_key: key.copied(),
+            encryption_key: keys,
             last_state_key: Arc::new(Mutex::new(None)),
             authorize_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -368,7 +368,7 @@ impl Store<String, InternalStateData> for DbStateStore {
 impl StateStore for DbStateStore {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use atrium_oauth::TokenSet;
 
@@ -405,7 +405,7 @@ mod tests {
     async fn a_session_is_sealed_on_write_and_opened_on_read() {
         let pool = sessions_pool().await;
         let did = Did::new("did:plc:sealed".to_string()).unwrap();
-        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(KEY.into()));
 
         store
             .set(did.clone(), sample_session("tok-secret"))
@@ -430,7 +430,7 @@ mod tests {
             .await
             .unwrap();
 
-        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+        let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(KEY.into()));
         assert_eq!(
             store
                 .get(&did)
@@ -455,13 +455,13 @@ mod tests {
     async fn a_session_another_key_sealed_reads_as_none_and_stays_stored() {
         let pool = sessions_pool().await;
         let did = Did::new("did:plc:other".to_string()).unwrap();
-        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY))
+        DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(KEY.into()))
             .set(did.clone(), sample_session("tok"))
             .await
             .unwrap();
         let before = raw_row(&pool, did.as_ref()).await;
 
-        for key in [Some(&[3u8; 32]), None] {
+        for key in [Some(Keyring::from([3u8; 32])), None] {
             let store = DbSessionStore::new(pool.clone(), DatabaseBackend::Sqlite, key);
             assert!(store.get(&did).await.unwrap().is_none());
         }
@@ -503,7 +503,7 @@ mod tests {
                 DatabaseBackend::Sqlite,
                 table,
                 "did:plc:a",
-                Some(&KEY),
+                Some(&KEY.into()),
             )
             .await
             .unwrap();
@@ -511,7 +511,7 @@ mod tests {
         }
     }
 
-    fn sample_state() -> InternalStateData {
+    pub(crate) fn sample_state() -> InternalStateData {
         let key = crate::oauth::client_keys::generate_client_key("test-owner").unwrap();
         InternalStateData {
             iss: "https://issuer.example".to_string(),
@@ -533,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn sign_in_state_is_sealed_and_opens_for_the_callback() {
         let pool = crate::test_support::migrated_memory_pool().await;
-        let store = DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY));
+        let store = DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(KEY.into()));
 
         store.set("k".to_string(), sample_state()).await.unwrap();
 
@@ -569,20 +569,24 @@ mod tests {
     #[tokio::test]
     async fn sign_in_state_another_key_sealed_reads_as_none() {
         let pool = crate::test_support::migrated_memory_pool().await;
-        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&[3u8; 32]))
-            .set("k".to_string(), sample_state())
-            .await
-            .unwrap();
+        DbStateStore::new(
+            pool.clone(),
+            DatabaseBackend::Sqlite,
+            Some(Keyring::from([3u8; 32])),
+        )
+        .set("k".to_string(), sample_state())
+        .await
+        .unwrap();
 
         let store = state_store_with_key(&pool);
         assert!(store.get(&"k".to_string()).await.unwrap().is_none());
     }
 
     fn state_store_with_key(pool: &AnyPool) -> DbStateStore {
-        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(&KEY))
+        DbStateStore::new(pool.clone(), DatabaseBackend::Sqlite, Some(KEY.into()))
     }
 
-    fn sample_session(access_token: &str) -> Session {
+    pub(crate) fn sample_session(access_token: &str) -> Session {
         let key = crate::oauth::client_keys::generate_client_key("test-owner").unwrap();
         let dpop_key = crate::oauth::client_keys::to_atrium_jwk(&key).unwrap().key;
         let token_set: TokenSet = serde_json::from_value(serde_json::json!({

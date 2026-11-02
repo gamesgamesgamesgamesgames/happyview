@@ -66,6 +66,9 @@ fn run_config(config: Config, fixture: &Config) -> Config {
         // Space writes sign with a key stored under the encryption key, so a
         // project that sets none still gets the fixture's.
         token_encryption_key: config.token_encryption_key.or(fixture.token_encryption_key),
+        token_encryption_key_previous: config
+            .token_encryption_key
+            .and(config.token_encryption_key_previous),
         // In-process requests name `/xrpc/...` at the root, and a test run
         // serves no dashboard.
         base_path: None,

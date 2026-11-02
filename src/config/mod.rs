@@ -82,6 +82,10 @@ pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> Str
 /// invalid" (`Err`), so a botched key is reported loudly at startup instead of
 /// being silently discarded and failing per-call later (M12).
 pub fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    parse_named_key("TOKEN_ENCRYPTION_KEY", raw)
+}
+
+fn parse_named_key(name: &str, raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
     use base64::Engine;
     let raw = match raw {
         None | Some("") => return Ok(None),
@@ -89,11 +93,29 @@ pub fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>,
     };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw)
-        .map_err(|e| format!("TOKEN_ENCRYPTION_KEY is not valid base64: {e}"))?;
+        .map_err(|e| format!("{name} is not valid base64: {e}"))?;
     let len = bytes.len();
     <[u8; 32]>::try_from(bytes)
         .map(Some)
-        .map_err(|_| format!("TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes (got {len})"))
+        .map_err(|_| format!("{name} must decode to exactly 32 bytes (got {len})"))
+}
+
+/// Parse the optional `TOKEN_ENCRYPTION_KEY_PREVIOUS`: the key being rotated
+/// away from, which stored values still open with until they are re-sealed.
+/// It means nothing without a current key, which is what seals.
+pub fn parse_previous_token_encryption_key(
+    raw: Option<&str>,
+    current: Option<&[u8; 32]>,
+) -> Result<Option<[u8; 32]>, String> {
+    let previous = parse_named_key("TOKEN_ENCRYPTION_KEY_PREVIOUS", raw)?;
+    if previous.is_some() && current.is_none() {
+        return Err(
+            "TOKEN_ENCRYPTION_KEY_PREVIOUS is set without TOKEN_ENCRYPTION_KEY, which seals \
+             every value; set TOKEN_ENCRYPTION_KEY to the new key"
+                .into(),
+        );
+    }
+    Ok(previous)
 }
 
 /// Parse `PLATFORM_API_KEY_HASH`: the hex SHA-256 of the key a managed-hosting
@@ -224,6 +246,9 @@ pub struct Config {
     pub app_name: Option<String>,
     pub logo_uri: Option<String>,
     pub token_encryption_key: Option<[u8; 32]>,
+    /// The key a rotation is moving away from. Stored values open with it
+    /// after `token_encryption_key`; nothing is sealed with it.
+    pub token_encryption_key_previous: Option<[u8; 32]>,
     pub default_rate_limit_capacity: u32,
     pub default_rate_limit_refill_rate: f64,
     /// Where compiled plugin modules are kept between restarts, when there
@@ -273,6 +298,13 @@ pub fn plugin_cache_dir(override_dir: Option<String>, database_url: &str) -> Opt
 }
 
 impl Config {
+    /// The keys stored values open with, when the instance has a key at all.
+    pub fn keyring(&self) -> Option<crate::plugin::encryption::Keyring> {
+        self.token_encryption_key.map(|current| {
+            crate::plugin::encryption::Keyring::new(current, self.token_encryption_key_previous)
+        })
+    }
+
     /// Build the configuration for this process. `HAPPYVIEW_PROJECT` names
     /// a project root; without it the instance runs from the environment
     /// alone, as it always has.
@@ -337,6 +369,18 @@ impl Config {
         if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
             return Err(project::ProjectConfigError::InvalidSetting { message });
         }
+        // A rotation is under way when the previous key is set: dropping a
+        // bad one would leave every value sealed with it unreadable, and the
+        // operator would only find out when sessions and secrets stop opening.
+        if let Err(message) = parse_previous_token_encryption_key(
+            var("TOKEN_ENCRYPTION_KEY_PREVIOUS").as_deref(),
+            parse_token_encryption_key(var("TOKEN_ENCRYPTION_KEY").as_deref())
+                .ok()
+                .flatten()
+                .as_ref(),
+        ) {
+            return Err(project::ProjectConfigError::InvalidSetting { message });
+        }
         // Read as unmanaged, a misspelt platform name would let the operator
         // turn off reporting the platform requires.
         if let Err(message) = parse_telemetry_managed_by(var("TELEMETRY_MANAGED_BY").as_deref()) {
@@ -387,6 +431,27 @@ impl Config {
 
         let public_url = var("PUBLIC_URL").expect("PUBLIC_URL must be set");
 
+        let token_encryption_key =
+            match parse_token_encryption_key(var("TOKEN_ENCRYPTION_KEY").as_deref()) {
+                Ok(key) => key,
+                Err(reason) => {
+                    // Set-but-invalid is an operator mistake: surface it loudly at
+                    // startup instead of silently disabling encryption.
+                    tracing::error!(
+                        "{reason}. The key is being IGNORED — encryption-dependent features \
+                         (DPoP sessions, spaces, service identity) are DISABLED until it is fixed."
+                    );
+                    None
+                }
+            };
+        // `finish_load` refuses a bad previous key before any caller sees the
+        // config, so an error here was already reported.
+        let token_encryption_key_previous = parse_previous_token_encryption_key(
+            var("TOKEN_ENCRYPTION_KEY_PREVIOUS").as_deref(),
+            token_encryption_key.as_ref(),
+        )
+        .unwrap_or_default();
+
         Self {
             host: var("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port: var("PORT").and_then(|p| p.parse().ok()).unwrap_or(3000),
@@ -428,20 +493,8 @@ impl Config {
             }),
             app_name: var("APP_NAME"),
             logo_uri: var("LOGO_URI"),
-            token_encryption_key: match parse_token_encryption_key(
-                var("TOKEN_ENCRYPTION_KEY").as_deref(),
-            ) {
-                Ok(key) => key,
-                Err(reason) => {
-                    // Set-but-invalid is an operator mistake: surface it loudly at
-                    // startup instead of silently disabling encryption.
-                    tracing::error!(
-                        "{reason}. The key is being IGNORED — encryption-dependent features \
-                         (DPoP sessions, spaces, service identity) are DISABLED until it is fixed."
-                    );
-                    None
-                }
-            },
+            token_encryption_key,
+            token_encryption_key_previous,
             default_rate_limit_capacity: var("DEFAULT_RATE_LIMIT_CAPACITY")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
@@ -564,6 +617,8 @@ mod tests {
             "JOB_WORKER_CONCURRENCY",
             "SUPERADMIN_DID",
             "TELEMETRY_MANAGED_BY",
+            "TOKEN_ENCRYPTION_KEY",
+            "TOKEN_ENCRYPTION_KEY_PREVIOUS",
             "HAPPYVIEW_PROJECT",
             "PLUGIN_DIR",
             "HAPPYVIEW_SCRIPT_ENV_FILE",
@@ -738,6 +793,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1192,6 +1248,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1229,6 +1286,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1266,6 +1324,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1303,6 +1362,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1370,6 +1430,7 @@ mod tests {
             app_name: None,
             logo_uri: None,
             token_encryption_key: None,
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -1651,6 +1712,77 @@ mod tests {
         }
         assert!(parse_telemetry_managed_by(Some(&"a".repeat(65))).is_err());
         assert!(parse_telemetry_managed_by(Some(&"a".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn previous_token_encryption_key_parsing() {
+        use base64::Engine;
+        let current = [1u8; 32];
+        let encoded = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        assert_eq!(
+            parse_previous_token_encryption_key(None, Some(&current)),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_previous_token_encryption_key(Some(""), None),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_previous_token_encryption_key(Some(&encoded), Some(&current)),
+            Ok(Some([2u8; 32]))
+        );
+        let err = parse_previous_token_encryption_key(Some("not base64 @@@"), Some(&current))
+            .unwrap_err();
+        assert!(err.contains("TOKEN_ENCRYPTION_KEY_PREVIOUS"), "{err}");
+        let err = parse_previous_token_encryption_key(Some(&encoded), None).unwrap_err();
+        assert!(err.contains("without TOKEN_ENCRYPTION_KEY"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalid_previous_token_encryption_key_refuses_boot() {
+        use base64::Engine;
+        let current = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        for (current, previous) in [
+            (Some(current.as_str()), "too-short"),
+            (None, current.as_str()),
+        ] {
+            unsafe {
+                clear_env();
+                set_required_env();
+                match current {
+                    Some(key) => env::set_var("TOKEN_ENCRYPTION_KEY", key),
+                    None => env::remove_var("TOKEN_ENCRYPTION_KEY"),
+                }
+                env::set_var("TOKEN_ENCRYPTION_KEY_PREVIOUS", previous);
+            }
+            let _reset = vars::LayerReset;
+            let err = Config::load_from(None, ConfigMode::Serve).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("TOKEN_ENCRYPTION_KEY_PREVIOUS"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn the_keyring_holds_both_keys_during_a_rotation() {
+        use base64::Engine;
+        let encode = |k: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(k);
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("TOKEN_ENCRYPTION_KEY", encode([1u8; 32]));
+            env::set_var("TOKEN_ENCRYPTION_KEY_PREVIOUS", encode([2u8; 32]));
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load_from(None, ConfigMode::Serve).unwrap();
+        let keys = config.keyring().unwrap();
+        assert_eq!(keys.current(), &[1u8; 32]);
+        assert!(keys.has_previous());
+        assert_eq!(config.token_encryption_key_previous, Some([2u8; 32]));
     }
 
     #[test]

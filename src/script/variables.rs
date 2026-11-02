@@ -4,14 +4,15 @@
 //! A value is AES-256-GCM under `TOKEN_ENCRYPTION_KEY` when the instance has
 //! that key. The key is optional, so an instance without one stores and serves
 //! plaintext rather than refusing, and [`encrypt_stored`] seals those rows at
-//! the first boot that has a key. A row that won't open under the current key,
+//! the first boot that has a key. A row opens under the current key or, during
+//! a rotation, `TOKEN_ENCRYPTION_KEY_PREVIOUS`. One that opens under neither,
 //! because the key changed, is kept as it is: its value can't be recovered any
 //! other way, and setting the variable again replaces it.
 
 use std::collections::BTreeMap;
 
 use crate::db::{DatabaseBackend, adapt_sql};
-pub use crate::plugin::encryption::{Sealed, open, seal};
+pub use crate::plugin::encryption::{Keyring, Sealed, open, seal};
 
 /// What every variable shows in place of its value. Fixed, so it gives away
 /// neither the value nor its length.
@@ -23,7 +24,7 @@ pub const MASK: &str = "****";
 pub async fn load(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    key: Option<&[u8; 32]>,
+    keys: Option<&Keyring>,
 ) -> BTreeMap<String, String> {
     let sql = adapt_sql(
         "SELECT key, value, CAST(encrypted AS BIGINT) FROM happyview_script_variables",
@@ -34,7 +35,7 @@ pub async fn load(
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(name, stored, encrypted)| Some((name, open(key, &stored, encrypted != 0)?)))
+        .filter_map(|(name, stored, encrypted)| Some((name, open(keys, &stored, encrypted != 0)?)))
         .collect()
 }
 
@@ -44,7 +45,7 @@ pub struct EncryptReport {
     pub encrypted: usize,
     /// Rows left in plaintext: there's no key, or sealing one failed.
     pub plaintext: usize,
-    /// Rows that won't open under the current key.
+    /// Rows that open under no configured key.
     pub unreadable: usize,
 }
 
@@ -55,7 +56,7 @@ pub struct EncryptReport {
 pub async fn encrypt_stored(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    key: Option<&[u8; 32]>,
+    keys: Option<&Keyring>,
 ) -> Result<EncryptReport, sqlx::Error> {
     let select = adapt_sql(
         "SELECT key, value, CAST(encrypted AS BIGINT) FROM happyview_script_variables",
@@ -66,16 +67,16 @@ pub async fn encrypt_stored(
     let mut report = EncryptReport::default();
     for (name, stored, encrypted) in rows {
         if encrypted != 0 {
-            if open(key, &stored, true).is_none() {
+            if open(keys, &stored, true).is_none() {
                 report.unreadable += 1;
             }
             continue;
         }
-        let Some(key) = key else {
+        let Some(keys) = keys else {
             report.plaintext += 1;
             continue;
         };
-        let Ok(sealed) = seal(Some(key), &stored) else {
+        let Ok(sealed) = seal(Some(keys), &stored) else {
             report.plaintext += 1;
             continue;
         };
@@ -119,9 +120,9 @@ async fn store_sealed(
 pub async fn encrypt_at_boot(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    key: Option<&[u8; 32]>,
+    keys: Option<&Keyring>,
 ) {
-    let report = match encrypt_stored(pool, backend, key).await {
+    let report = match encrypt_stored(pool, backend, keys).await {
         Ok(report) => report,
         Err(e) => {
             tracing::error!(error = %e, "script variable encryption failed; will retry on next startup");
@@ -153,8 +154,8 @@ mod tests {
     use super::*;
     use crate::test_support::migrated_memory_pool;
 
-    const KEY: [u8; 32] = [7; 32];
-    const OTHER_KEY: [u8; 32] = [9; 32];
+    const KEY: Keyring = Keyring::single([7; 32]);
+    const OTHER_KEY: Keyring = Keyring::single([9; 32]);
     const BACKEND: DatabaseBackend = DatabaseBackend::Sqlite;
 
     async fn pool_with_plaintext(name: &str, value: &str) -> sqlx::AnyPool {

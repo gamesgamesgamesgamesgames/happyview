@@ -612,7 +612,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -626,7 +626,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -635,7 +635,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     let (pending, _) = happyview::oauth::client_keys::stage_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         happyview::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -705,7 +705,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -719,7 +719,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -785,7 +785,7 @@ async fn revoking_the_current_instance_key_is_refused_with_400() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -856,7 +856,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -869,7 +869,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await

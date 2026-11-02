@@ -189,10 +189,9 @@ pub(crate) async fn handle_procedure(
     if test_auth.is_none()
         && let Some(client_key) = claims.client_key()
     {
-        let encryption_key = state
+        let encryption_key = &state
             .config
-            .token_encryption_key
-            .as_ref()
+            .keyring()
             .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
         let api_client_id = repo::get_dpop_client_id(state, client_key).await?;
@@ -463,7 +462,7 @@ async fn handle_dpop_procedure(
     collection: &str,
     action: &ProcedureAction,
     api_client_id: &str,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
     // If delegating, verify the caller has write access and resolve the

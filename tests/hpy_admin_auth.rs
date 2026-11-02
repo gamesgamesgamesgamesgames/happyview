@@ -666,7 +666,8 @@ async fn a_sign_in_keeps_its_key_across_a_promotion() {
     let app = seeded_app().await;
     let pool = &app.state.db;
     let backend = app.state.db_backend;
-    let enc = app.state.config.token_encryption_key.as_ref();
+    let keys = app.state.config.keyring();
+    let enc = keys.as_ref();
     let did = "did:plc:keepsitskey";
     let server =
         authorization_server(&app, did, true, &[token_response(did, ADMIN_GRANT, 3600)]).await;

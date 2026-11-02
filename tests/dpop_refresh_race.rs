@@ -195,7 +195,7 @@ async fn concurrent_refresh_does_not_destroy_session() {
                 &http,
                 &pool,
                 backend,
-                &encryption_key,
+                &happyview::plugin::encryption::Keyring::from(encryption_key),
                 &registry,
                 &plc_url,
                 &client_id,

@@ -9,7 +9,6 @@ use std::sync::{Arc, LazyLock};
 use crate::auth::OAuthClientRegistry;
 use crate::db::DatabaseBackend;
 use crate::error::AppError;
-use crate::plugin::encryption::decrypt;
 
 use super::sessions::DpopSession;
 
@@ -24,7 +23,7 @@ struct DpopCredentials {
 async fn load_dpop_private_jwk(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     dpop_key_id: &str,
 ) -> Result<serde_json::Value, AppError> {
     let key_sql = crate::db::adapt_sql(
@@ -39,7 +38,8 @@ async fn load_dpop_private_jwk(
 
     let (encrypted_key,) = row.ok_or_else(|| AppError::Internal("DPoP key not found".into()))?;
 
-    let key_bytes = decrypt(encryption_key, &encrypted_key)
+    let key_bytes = encryption_key
+        .decrypt(&encrypted_key)
         .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
 
     serde_json::from_slice(&key_bytes)
@@ -52,7 +52,7 @@ async fn resolve_credentials(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     plc_url: &str,
     api_client_id: &str,
     user_did: &str,
@@ -273,7 +273,7 @@ async fn dpop_request_with_retry(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
     http_method: &str,
@@ -340,7 +340,7 @@ async fn retry_after_refresh(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
     http_method: &str,
@@ -454,7 +454,7 @@ pub async fn dpop_pds_post(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -513,7 +513,7 @@ pub async fn dpop_pds_post_with_headers(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -577,7 +577,7 @@ pub async fn dpop_pds_get(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -645,7 +645,7 @@ pub async fn dpop_pds_post_blob(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -734,7 +734,7 @@ async fn refresh_access_token(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
 ) -> Result<Option<String>, AppError> {
@@ -827,7 +827,7 @@ async fn refresh_access_token(
     let body = String::from_utf8_lossy(&buffered.body).to_string();
 
     if status.is_success() {
-        return apply_refresh_response(pool, backend, encryption_key, creds, &body).await;
+        return apply_refresh_response(pool, backend, encryption_key.current(), creds, &body).await;
     }
 
     Err(AppError::Auth(format!(
@@ -853,7 +853,7 @@ pub async fn verified_granted_scope(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -1042,7 +1042,7 @@ pub async fn revoke_dpop_session_at_as(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     api_client_id: &str,
     user_did: &str,

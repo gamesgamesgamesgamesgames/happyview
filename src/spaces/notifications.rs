@@ -105,7 +105,7 @@ pub fn announce_space_deleted(
                         .await
                 }
                 NotifyDelivery::Xrpc => {
-                    let Some(key) = state.config.token_encryption_key.as_ref() else {
+                    let Some(key) = &state.config.keyring() else {
                         tracing::warn!("TOKEN_ENCRYPTION_KEY is required to sign a space deletion");
                         continue;
                     };
@@ -218,7 +218,7 @@ async fn deliver_repo_update(
         return Ok(());
     }
 
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign write notifications".into())
     })?;
     let body = update.body();
@@ -307,7 +307,7 @@ async fn deliver_revocations(
     if instance.ok().as_deref() != Some(space.authority_did.as_str()) {
         return Ok(());
     }
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign revocations".into())
     })?;
     let space_uri = format!(

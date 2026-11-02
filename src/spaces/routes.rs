@@ -1191,7 +1191,7 @@ async fn get_delegation_token(
     )
     .await?;
 
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
@@ -1885,7 +1885,7 @@ async fn get_space_credential(
         .to_string();
     let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
 
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 

@@ -81,7 +81,7 @@ pub(crate) async fn verify_space_credential(
     space: &Space,
     token: &str,
 ) -> Result<crate::spaces::credential::SpaceCredentialClaims, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
     let key = crate::spaces::auth::space_verifying_key(
@@ -240,9 +240,14 @@ pub(crate) struct AppliedOp {
 pub async fn signing_key_from_pool(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    crate::verification_methods::ensure_atproto_space_method(pool, backend, encryption_key).await?;
+    crate::verification_methods::ensure_atproto_space_method(
+        pool,
+        backend,
+        encryption_key.current(),
+    )
+    .await?;
     load_signing_key(pool, backend, encryption_key).await
 }
 
@@ -250,7 +255,7 @@ pub async fn signing_key_from_pool(
 pub async fn load_signing_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
     let key_bytes = crate::verification_methods::get_private_key_bytes(
         pool,
@@ -282,7 +287,7 @@ pub async fn load_signing_key(
 pub(crate) async fn service_signing_key(
     state: &AppState,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal(
             "spaces require a token encryption key to sign commits; set TOKEN_ENCRYPTION_KEY"
                 .into(),

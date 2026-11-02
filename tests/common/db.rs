@@ -54,7 +54,7 @@ pub async fn provision_space_signing_key(
         pool,
         backend,
         "#atproto_space",
-        encryption_key,
+        &happyview::plugin::encryption::Keyring::from(*encryption_key),
     )
     .await
     .ok()

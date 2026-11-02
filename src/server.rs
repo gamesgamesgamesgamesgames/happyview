@@ -459,11 +459,11 @@ fn extract_public_key_multibase(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let private_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
 
     let signing_key = p256::ecdsa::SigningKey::from_slice(private_bytes.as_slice())
