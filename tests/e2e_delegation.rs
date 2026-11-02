@@ -969,6 +969,56 @@ async fn seed_procedure_lexicon(app: &common::app::TestApp) {
     );
 }
 
+/// A procedure acts only through its script, so the delegated-write tests give
+/// `createGame` one: a directive for the echo interpreter calling the
+/// `sdk_caller` fixture's `create_record`, which writes as the caller or the
+/// account it is delegated to. The row is seeded directly because the
+/// endpoint would judge the directive as Lua.
+async fn seed_create_game_script(app: &common::app::TestApp) {
+    let plugin = happyview::plugin::loader::load_from_file(std::path::Path::new(
+        "tests/fixtures/sdk_caller",
+    ))
+    .await
+    .expect(
+        "sdk_caller fixture not built. Run: cargo build --manifest-path \
+         tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release",
+    );
+    app.state.plugin_registry.install(plugin).await.unwrap();
+    let now = happyview::db::now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind("xrpc.procedure:games.gamesgamesgamesgames.createGame")
+        .bind("host:require")
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed the createGame script");
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
+}
+
+/// A `createGame` body: the script's call to `create_record`, writing a game
+/// to the default repo, which is the delegated account when there is one.
+fn create_game(title: &str, delegate_did: &str) -> Value {
+    json!({
+        "library": "sdk_caller",
+        "function": "create_record",
+        "args": [{
+            "collection": "games.gamesgamesgamesgames.game",
+            "record": { "title": title },
+            "validate": false
+        }],
+        "delegateDid": delegate_did
+    })
+}
+
 async fn update_session_pds_url(app: &common::app::TestApp, user_did: &str, pds_url: &str) {
     let sql = adapt_sql(
         "UPDATE happyview_dpop_sessions SET pds_url = ? WHERE user_did = ?",
@@ -992,6 +1042,7 @@ async fn delegated_write_non_delegate_rejected() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:dw_owner1";
     let target_did = "did:plc:dw_studio1";
@@ -1004,7 +1055,7 @@ async fn delegated_write_non_delegate_rejected() {
     let resp = dpop_post(
         &app,
         "/xrpc/games.gamesgamesgamesgames.createGame",
-        &json!({ "title": "Hacked Game", "delegateDid": target_did }),
+        &create_game("Hacked Game", target_did),
         &out_key,
         &out_dpop,
         &out_token,
@@ -1019,6 +1070,7 @@ async fn delegated_write_member_rejected() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:dw_owner2";
     let member_did = "did:plc:dw_member2";
@@ -1045,7 +1097,7 @@ async fn delegated_write_member_rejected() {
     let resp = dpop_post(
         &app,
         "/xrpc/games.gamesgamesgamesgames.createGame",
-        &json!({ "title": "Member Game", "delegateDid": target_did }),
+        &create_game("Member Game", target_did),
         &owner_key,
         &mem_dpop,
         &mem_token,
@@ -1064,6 +1116,7 @@ async fn delegated_write_without_dpop_rejected() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:dw_owner5";
     let target_did = "did:plc:dw_studio5";
@@ -1081,7 +1134,7 @@ async fn delegated_write_without_dpop_rejected() {
     let mut req = admin_post_request(
         "/xrpc/games.gamesgamesgamesgames.createGame",
         app.admin_cookie(),
-        &json!({ "title": "Cookie Game", "delegateDid": target_did }),
+        &create_game("Cookie Game", target_did),
     );
     req.headers_mut()
         .insert("x-client-key", "hvc_cookie_caller".parse().unwrap());
@@ -1101,6 +1154,7 @@ async fn delegated_write_owner_success() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:dw_owner3";
     let target_did = "did:plc:dw_studio3";
@@ -1127,15 +1181,15 @@ async fn delegated_write_owner_success() {
     let resp = dpop_post(
         &app,
         "/xrpc/games.gamesgamesgamesgames.createGame",
-        &json!({ "title": "Studio Game", "delegateDid": target_did }),
+        &create_game("Studio Game", target_did),
         &owner_key,
         &owner_dpop,
         &owner_token,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
+    let status = resp.status();
     let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["uri"],
         format!("at://{target_did}/games.gamesgamesgamesgames.game/abc123")
@@ -1149,6 +1203,7 @@ async fn delegated_write_admin_success() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:dw_owner4";
     let admin_did = "did:plc:dw_admin4";
@@ -1190,15 +1245,15 @@ async fn delegated_write_admin_success() {
     let resp = dpop_post(
         &app,
         "/xrpc/games.gamesgamesgamesgames.createGame",
-        &json!({ "title": "Admin Game", "delegateDid": target_did }),
+        &create_game("Admin Game", target_did),
         &owner_key,
         &adm_dpop,
         &adm_token,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
+    let status = resp.status();
     let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cid"], "bafyadmin456");
 }
 
@@ -1458,7 +1513,9 @@ async fn owner_can_remove_admin() {
         &owner_token,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     // Verify only owner remains
     let resp = dpop_get(
@@ -1538,6 +1595,7 @@ async fn cross_client_delegated_write_rejected() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
 
     let owner_did = "did:plc:xc_dw_owner";
     let admin_did = "did:plc:xc_dw_admin";
@@ -1562,7 +1620,7 @@ async fn cross_client_delegated_write_rejected() {
     let resp = dpop_post(
         &app,
         "/xrpc/games.gamesgamesgamesgames.createGame",
-        &json!({ "title": "Cross-client Game", "delegateDid": target_did }),
+        &create_game("Cross-client Game", target_did),
         &other_key,
         &other_dpop,
         &other_token,

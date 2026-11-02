@@ -487,7 +487,7 @@ async fn post(
     body: &Value,
 ) -> Result<Value, CallerError> {
     let response = caller
-        .pds_auth
+        .auth_for(repo)
         .post_json(&caller.app_state, repo, method, body)
         .await
         .map_err(pds_failure)?;
@@ -821,6 +821,7 @@ mod tests {
                 )),
                 pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
                 app_state: state.clone(),
+                delegate_pds_auth: None,
             };
             let err = get_session(&caller, json!({})).await.unwrap_err();
             assert_eq!(err.code(), "NO_SESSION", "{err}");
@@ -883,6 +884,7 @@ mod tests {
                 session,
             ))),
             app_state: state,
+            delegate_pds_auth: None,
         };
         (caller, pds)
     }
@@ -966,6 +968,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,
@@ -1018,6 +1021,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,

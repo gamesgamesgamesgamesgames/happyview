@@ -181,6 +181,7 @@ pub async fn execute_procedure_script(
     let script_source = script.body.clone();
     let input_json = input.clone();
 
+    let mut delegate_pds_auth: Option<Arc<repo::PdsAuth>> = None;
     let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
         Some(auth)
     } else if let Some(client_key) = claims.client_key() {
@@ -218,6 +219,23 @@ pub async fn execute_procedure_script(
             .dpop_key_id()
             .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
             .to_string();
+        // The procedure handler has already checked that the caller may write
+        // for `delegate_did` under this same api client.
+        if let Some(did) = delegate_did {
+            let target = crate::oauth::sessions::get_dpop_session_for_user(
+                &state.db,
+                backend,
+                encryption_key,
+                &api_client_id,
+                did,
+            )
+            .await?;
+            delegate_pds_auth = Some(Arc::new(repo::PdsAuth::Dpop {
+                api_client_id: api_client_id.clone(),
+                dpop_key_id: target.dpop_key_id,
+                encryption_key: *encryption_key,
+            }));
+        }
         Some(repo::PdsAuth::Dpop {
             api_client_id,
             dpop_key_id,
@@ -237,6 +255,7 @@ pub async fn execute_procedure_script(
             delegate_did: delegate_did.map(|s| s.to_string()),
             claims: claims_arc.clone(),
             pds_auth: Arc::new(pds_auth),
+            delegate_pds_auth: delegate_pds_auth.clone(),
             app_state: state.clone(),
         })
     });

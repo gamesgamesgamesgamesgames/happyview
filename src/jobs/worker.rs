@@ -298,6 +298,7 @@ async fn execute_job_under(state: &AppState, job: &super::Job, lease: &db::Lease
             claims,
             pds_auth,
             app_state: state.clone(),
+            delegate_pds_auth: None,
         })
     });
     let has_pds_auth = caller_session.is_some();

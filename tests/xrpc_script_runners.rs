@@ -231,10 +231,8 @@ async fn a_query_hands_the_interpreter_its_params_and_its_context() {
     assert_eq!(sent["input"]["limit"], 5);
     assert_eq!(sent["context"]["trigger"], format!("xrpc.query:{QUERY}"));
     assert_eq!(sent["context"]["method"], QUERY);
-    assert_eq!(
-        sent["context"]["collection"],
-        "games.gamesgamesgamesgames.game"
-    );
+    // A query names no collection; its script writes the NSID it reads.
+    assert!(sent["context"].get("collection").is_none(), "{sent}");
     assert_eq!(sent["context"]["has_pds_auth"], false);
     assert_eq!(sent["context"]["env"]["API_KEY"], "k");
     assert!(sent["context"].get("params").is_none(), "{sent}");
