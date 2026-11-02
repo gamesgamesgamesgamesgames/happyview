@@ -60,6 +60,22 @@ where
     sqlx_query_scalar(AssertSqlSafe(sql.to_owned()))
 }
 
+/// Begin a transaction that writes. On SQLite it opens with `BEGIN IMMEDIATE`,
+/// taking the write lock up front: a deferred transaction reads its snapshot
+/// at its first `SELECT`, and a write another connection commits before its
+/// own first write then fails that write with `SQLITE_BUSY_SNAPSHOT` at once,
+/// whatever `busy_timeout` is. Taken up front, the lock is waited for as any
+/// other is. Postgres gets a plain `BEGIN`.
+pub async fn begin_write(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
+    match backend {
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => pool.begin().await,
+    }
+}
+
 /// Escape the `LIKE` wildcard metacharacters (`%`, `_`) and the escape character
 /// (`\`) in a value that will be embedded as a *literal* inside a `LIKE` pattern.
 /// Must be paired with an explicit `ESCAPE '\'` clause — SQLite has no default
@@ -541,6 +557,59 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    /// `begin_write` takes SQLite's write lock as it begins, where a deferred
+    /// `BEGIN` takes none until its first write.
+    #[tokio::test]
+    async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.
+        let pool = || {
+            PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        query("PRAGMA busy_timeout = 0").execute(&mut *conn).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+        };
+        let first = pool().await.expect("connect first");
+        query("PRAGMA journal_mode = WAL")
+            .execute(&first)
+            .await
+            .expect("enable WAL");
+        let second = pool().await.expect("connect second");
+
+        let held = begin_write(&first, DatabaseBackend::Sqlite)
+            .await
+            .expect("begin the first write transaction");
+        let deferred = second
+            .begin()
+            .await
+            .expect("a deferred BEGIN takes no lock");
+        deferred.rollback().await.expect("roll back");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect_err("the write lock is already held");
+
+        held.commit().await.expect("release the write lock");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect("the lock is free again")
+            .commit()
+            .await
+            .expect("commit");
+
+        drop(first);
+        drop(second);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     const CAST_ON_READ: &[&str] = &[
         "service_identity.setup_complete",
