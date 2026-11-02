@@ -9,6 +9,8 @@
 use crate::AppState;
 use crate::error::AppError;
 use crate::spaces::commit::{SignedCommit, SpaceVerifyingKey, decode_lex_bytes};
+use crate::spaces::space_mac;
+use atrium_xrpc::http::{HeaderName, HeaderValue};
 
 /// What an oplog entry did to its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,12 +165,55 @@ pub fn parse_signed_commit(commit: &serde_json::Value) -> Result<SignedCommit, A
         ikm: decode_32(commit, "ikm")?,
         sig: decode_lex_bytes(commit, "sig")?,
         mac: decode_32(commit, "mac")?,
-        rev: commit
-            .get("rev")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::Internal("commit is missing rev".into()))?
-            .to_string(),
+        rev: str_field(commit, "rev")?,
     })
+}
+
+/// Parse a proposal 0016 `commit`, which carries `data` where a signed commit
+/// carried `hash`.
+pub fn parse_mac_commit(commit: &serde_json::Value) -> Result<space_mac::Commit, AppError> {
+    let ver = commit.get("ver").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok(space_mac::Commit {
+        ver,
+        repo: str_field(commit, "repo")?,
+        space: str_field(commit, "space")?,
+        rev: str_field(commit, "rev")?,
+        data: decode_32(commit, "data")?,
+    })
+}
+
+fn str_field(commit: &serde_json::Value, field: &str) -> Result<String, AppError> {
+    commit
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Internal(format!("commit is missing {field}")))
+}
+
+/// A commit from a repo's host, after it has been authenticated.
+#[derive(Debug, Clone)]
+pub enum VerifiedCommit {
+    /// The pre-0016 shape, signed by the author's `#atproto` key.
+    Signed(SignedCommit),
+    /// The 0016 shape, authenticated by the MAC its response carried.
+    Mac(space_mac::Commit),
+}
+
+impl VerifiedCommit {
+    pub fn rev(&self) -> &str {
+        match self {
+            Self::Signed(c) => &c.rev,
+            Self::Mac(c) => &c.rev,
+        }
+    }
+
+    /// The sha256 of the repo's LtHash state.
+    pub fn hash(&self) -> &[u8; 32] {
+        match self {
+            Self::Signed(c) => &c.hash,
+            Self::Mac(c) => &c.data,
+        }
+    }
 }
 
 /// Resolve the key a repo's commits are signed with: the **author's** account
@@ -184,6 +229,13 @@ pub async fn author_signing_key(
     author_did: &str,
 ) -> Result<SpaceVerifyingKey, AppError> {
     let did_doc = crate::profile::resolve_did_document(http, plc_url, author_did).await?;
+    signing_key_from_doc(&did_doc, author_did)
+}
+
+fn signing_key_from_doc(
+    did_doc: &crate::profile::DidDocument,
+    author_did: &str,
+) -> Result<SpaceVerifyingKey, AppError> {
     let vm = did_doc
         .verification_method
         .iter()
@@ -199,30 +251,108 @@ pub async fn author_signing_key(
     crate::spaces::credential::multikey_to_space_key(multibase)
 }
 
-/// The current signed commit for a repo on its host.
-pub async fn get_latest_commit(
+/// The current commit for a repo on its host, authenticated.
+///
+/// Hosts are mid-transition between two commit models, so this accepts both
+/// and lets the host's answer pick the check. When the author publishes a
+/// `#atproto_kem` key we always ask for a MAC: under OAuth 0016 makes it
+/// optional, but it is what ties the answer to the author's DID document, as
+/// the signature did. A host that predates 0016 ignores the header.
+pub async fn get_verified_commit(
     state: &AppState,
     session: &crate::HappyViewOAuthSession,
     space_uri: &str,
     author_did: &str,
-) -> Result<SignedCommit, AppError> {
-    let body = crate::repo::pds::pds_get_json(
+) -> Result<VerifiedCommit, AppError> {
+    let did_doc =
+        crate::profile::resolve_did_document(&state.http, &state.config.plc_url, author_did)
+            .await?;
+    let exchange = space_mac::author_kem_key(&did_doc)?.map(|key| space_mac::encapsulate(&key));
+
+    let params = [
+        ("space", space_uri.to_string()),
+        // `repo`, not `did`: ZDS answers InvalidRequest "Missing repo"
+        // without it.
+        ("repo", author_did.to_string()),
+    ];
+    let request = crate::repo::pds::pds_get_json(
         state,
         session,
         "com.atproto.space.getLatestCommit",
-        &[
-            ("space", space_uri.to_string()),
-            // `repo`, not `did`: ZDS answers InvalidRequest "Missing repo"
-            // without it.
-            ("repo", author_did.to_string()),
-        ],
-    )
-    .await?;
+        &params,
+    );
+    let (body, mac_header) = match &exchange {
+        Some(exchange) => {
+            let want = space_mac::want_mac_header(&exchange.key_share)?;
+            let (body, received) = crate::http_retry::with_header_exchange(
+                (
+                    HeaderName::from_static(space_mac::WANT_MAC_HEADER),
+                    HeaderValue::from_str(&want)
+                        .map_err(|_| AppError::Internal("unsendable MAC request".into()))?,
+                ),
+                HeaderName::from_static(space_mac::MAC_HEADER),
+                request,
+            )
+            .await;
+            (body?, received)
+        }
+        None => (request.await?, None),
+    };
 
     let commit = body
         .get("commit")
         .ok_or_else(|| AppError::Internal("getLatestCommit returned no commit".into()))?;
-    parse_signed_commit(commit)
+    verify_remote_commit(
+        commit,
+        space_uri,
+        author_did,
+        &did_doc,
+        exchange.as_ref(),
+        mac_header.as_ref(),
+    )
+}
+
+/// Authenticate a commit as one of the two shapes a host may answer with.
+pub fn verify_remote_commit(
+    commit: &serde_json::Value,
+    space_uri: &str,
+    author_did: &str,
+    did_doc: &crate::profile::DidDocument,
+    exchange: Option<&space_mac::Encapsulation>,
+    mac_header: Option<&HeaderValue>,
+) -> Result<VerifiedCommit, AppError> {
+    if commit.get("data").is_none() {
+        let commit = parse_signed_commit(commit)?;
+        let key = signing_key_from_doc(did_doc, author_did)?;
+        crate::spaces::commit::verify_commit(&commit, space_uri, author_did, &key)?;
+        return Ok(VerifiedCommit::Signed(commit));
+    }
+
+    let commit = parse_mac_commit(commit)?;
+    let exchange = exchange.ok_or_else(|| {
+        AppError::Auth(format!(
+            "author {author_did} publishes no #atproto_kem key, so their host's commit \
+             cannot be authenticated"
+        ))
+    })?;
+    let mac_header = mac_header.ok_or_else(|| {
+        AppError::Auth(format!(
+            "the repo host sent a commit without the {} header it was asked for",
+            space_mac::MAC_HEADER
+        ))
+    })?;
+    let mac =
+        space_mac::parse_mac_header(mac_header.to_str().map_err(|_| {
+            AppError::Auth(format!("{} header is not text", space_mac::MAC_HEADER))
+        })?)?;
+    space_mac::verify_commit(
+        &commit,
+        space_uri,
+        author_did,
+        &exchange.shared_secret,
+        &mac,
+    )?;
+    Ok(VerifiedCommit::Mac(commit))
 }
 
 /// A repo's full operation log since `since`, inlining record values.
@@ -429,6 +559,130 @@ mod tests {
             ours.hash(),
             "a set-hash mismatch must be visible after the signature verifies"
         );
+    }
+
+    /// A DID document for `AUTHOR` publishing the given keys as multikeys.
+    fn did_doc(
+        signing: Option<&p256::ecdsa::SigningKey>,
+        kem: Option<&p256::SecretKey>,
+    ) -> crate::profile::DidDocument {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let multikey = |point: &[u8]| {
+            let mut bytes = vec![0x80, 0x24];
+            bytes.extend_from_slice(point);
+            multibase::encode(multibase::Base::Base58Btc, bytes)
+        };
+        let mut methods = Vec::new();
+        if let Some(key) = signing {
+            methods.push(serde_json::json!({
+                "id": format!("{AUTHOR}#atproto"),
+                "type": "Multikey",
+                "publicKeyMultibase": multikey(key.verifying_key().to_sec1_point(true).as_bytes()),
+            }));
+        }
+        if let Some(key) = kem {
+            methods.push(serde_json::json!({
+                "id": format!("{AUTHOR}#atproto_kem"),
+                "type": "Multikey",
+                "publicKeyMultibase": multikey(key.public_key().to_sec1_point(true).as_bytes()),
+            }));
+        }
+        serde_json::from_value(serde_json::json!({ "verificationMethod": methods })).unwrap()
+    }
+
+    fn kem_key() -> p256::SecretKey {
+        p256::SecretKey::from_slice(&[0x11u8; 32]).unwrap()
+    }
+
+    /// A 0016 commit, and the MAC header its host would send for `exchange`.
+    fn mac_commit(
+        exchange: &space_mac::Encapsulation,
+        data: [u8; 32],
+    ) -> (serde_json::Value, HeaderValue) {
+        use base64::Engine;
+        let commit = space_mac::Commit {
+            ver: 1,
+            repo: AUTHOR.into(),
+            space: SPACE.into(),
+            rev: "3krev".into(),
+            data,
+        };
+        let mac = space_mac::commit_mac(&exchange.shared_secret, &commit).unwrap();
+        let header = format!(
+            "type=\"atproto-space-repo\", ver=1, mac=:{}:",
+            base64::engine::general_purpose::STANDARD.encode(mac)
+        );
+        let json = serde_json::json!({
+            "ver": 1,
+            "repo": AUTHOR,
+            "space": SPACE,
+            "rev": "3krev",
+            "data": encode_lex_bytes(&data),
+        });
+        (json, HeaderValue::from_str(&header).unwrap())
+    }
+
+    #[test]
+    fn a_0016_commit_verifies_by_its_mac() {
+        let doc = did_doc(None, Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let (json, header) = mac_commit(&exchange, [0xAA; 32]);
+
+        let commit =
+            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), Some(&header))
+                .expect("a MACed commit must verify");
+        assert!(matches!(commit, VerifiedCommit::Mac(_)));
+        assert_eq!(commit.hash(), &[0xAA; 32]);
+        assert_eq!(commit.rev(), "3krev");
+    }
+
+    #[test]
+    fn a_0016_commit_is_refused_without_a_mac_or_a_kem_key() {
+        let doc = did_doc(None, Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let (json, header) = mac_commit(&exchange, [0xAA; 32]);
+
+        // The host ignored the request for a MAC.
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), None).is_err());
+        // The author publishes no KEM key, so no MAC could be asked for.
+        assert!(
+            verify_remote_commit(
+                &json,
+                SPACE,
+                AUTHOR,
+                &did_doc(None, None),
+                None,
+                Some(&header)
+            )
+            .is_err()
+        );
+        // A MAC computed under another exchange is not this request's.
+        let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        assert!(
+            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), Some(&header)).is_err()
+        );
+    }
+
+    #[test]
+    fn a_signed_commit_still_verifies_when_a_mac_was_asked_for() {
+        // A host that predates 0016 ignores the request header and answers with
+        // the signed shape.
+        let signing = p256::ecdsa::SigningKey::from_slice(&[0x61u8; 32]).unwrap();
+        let doc = did_doc(Some(&signing), Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let signed = sign_commit(&[0xAAu8; 32], SPACE, AUTHOR, "3krev", &signing).unwrap();
+
+        let commit = verify_remote_commit(
+            &commit_json(&signed),
+            SPACE,
+            AUTHOR,
+            &doc,
+            Some(&exchange),
+            None,
+        )
+        .expect("a signed commit must verify");
+        assert!(matches!(commit, VerifiedCommit::Signed(_)));
+        assert_eq!(commit.hash(), &[0xAA; 32]);
     }
 
     #[test]

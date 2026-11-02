@@ -13,9 +13,7 @@
 mod interop_support;
 
 use base64::Engine;
-use happyview::spaces::commit::{SpaceVerifyingKey, verify_commit};
 use happyview::spaces::lthash::{LtHashState, record_element};
-use happyview::spaces::native_client::parse_signed_commit;
 use happyview::spaces::types::{AppAccess, MemberAccess, Policy, ResolvedMember};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -84,8 +82,57 @@ async fn new_account() -> (String, String) {
     )
 }
 
+/// Which spaces alpha the ZDS under test speaks. The October 29 alpha replaced
+/// `simplespace`'s read policy, write policy and app access with one `policy`
+/// union under `space.*`, moved members to `memberspace.*`, and kept no alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generation {
+    Oct22,
+    Oct29,
+}
+
+/// Read from ZDS's own method descriptor, so each test asks the host rather
+/// than assuming the pinned image.
+async fn generation() -> Generation {
+    let (status, body) = get_json(
+        &format!("{ZDS}/xrpc/community.lexicon.service.describe"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "describe failed: {body}");
+    let has = |nsid: &str| {
+        body["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .any(|m| m["value"].as_str() == Some(nsid))
+    };
+    if has("com.atproto.space.createSpace") {
+        Generation::Oct29
+    } else {
+        Generation::Oct22
+    }
+}
+
+/// An October 29 space under `policy`, with the same type and key the October
+/// 22 helper uses.
+async fn create_space_with_policy(token: &str, policy: Value) -> String {
+    let (status, body) = post_json(
+        &format!("{ZDS}/xrpc/com.atproto.space.createSpace"),
+        Some(token),
+        json!({
+            "spaceType": "com.example.forum",
+            "skey": "self",
+            "policy": policy,
+        }),
+    )
+    .await;
+    assert!(status < 300, "createSpace failed ({status}): {body}");
+    body["uri"].as_str().expect("space uri").to_string()
+}
+
 /// A space created with HappyView's own policy and app-access types, so ZDS
-/// accepting it checks how we encode the unions.
+/// accepting it checks how we encode the unions. October 22 only.
 async fn create_space(token: &str, read: &Policy, write: &Policy, app: &AppAccess) -> String {
     let (status, body) = post_json(
         &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
@@ -105,14 +152,33 @@ async fn create_space(token: &str, read: &Policy, write: &Policy, app: &AppAcces
     body["uri"].as_str().expect("space uri").to_string()
 }
 
+/// A space whose reads and writes are limited to members, on either
+/// generation.
 async fn default_space(token: &str) -> String {
-    create_space(
-        token,
-        &Policy::MemberList,
-        &Policy::MemberList,
-        &AppAccess::Open,
-    )
-    .await
+    match generation().await {
+        Generation::Oct22 => {
+            create_space(
+                token,
+                &Policy::MemberList,
+                &Policy::MemberList,
+                &AppAccess::Open,
+            )
+            .await
+        }
+        Generation::Oct29 => {
+            create_space_with_policy(token, json!({ "$type": MEMBERSPACE_POLICY })).await
+        }
+    }
+}
+
+const MEMBERSPACE_POLICY: &str = "com.atproto.memberspace.policy";
+
+/// The member methods' namespace for this ZDS.
+async fn members_ns() -> &'static str {
+    match generation().await {
+        Generation::Oct22 => "com.atproto.simplespace",
+        Generation::Oct29 => "com.atproto.memberspace",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +215,8 @@ async fn detection_reports_the_same_build_with_spaces_off_as_unsupported() {
 #[ignore]
 async fn zds_advertises_put_member_under_its_current_name() {
     // Detection still accepts addMember for pds.js, but ZDS should satisfy the
-    // required list with canonical spellings alone.
+    // required list with canonical spellings alone: `simplespace.putMember` on
+    // the October 22 alpha, `memberspace.putMember` from October 29.
     let (status, body) = get_json(
         &format!("{ZDS}/xrpc/community.lexicon.service.describe"),
         None,
@@ -164,7 +231,11 @@ async fn zds_advertises_put_member_under_its_current_name() {
         .map(|m| m["value"].as_str().unwrap())
         .collect();
 
-    assert!(methods.contains(&"com.atproto.simplespace.putMember"));
+    let put_member = format!("{}.putMember", members_ns().await);
+    assert!(
+        methods.contains(&put_member.as_str()),
+        "{put_member} missing from {methods:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +246,30 @@ async fn zds_advertises_put_member_under_its_current_name() {
 #[ignore]
 async fn our_policy_and_app_access_unions_round_trip_through_zds() {
     let (_, token) = new_account().await;
+    if generation().await == Generation::Oct29 {
+        // HappyView has no October 29 policy types yet, so the policy is
+        // checked as JSON: what ZDS stores is what `getSpace` gives back.
+        let policy = json!({
+            "$type": MEMBERSPACE_POLICY,
+            "publicRead": true,
+            "allowedApps": ["https://app.example/client-metadata.json"],
+        });
+        let space = create_space_with_policy(&token, policy.clone()).await;
+        let (status, body) = get_json(
+            &format!(
+                "{ZDS}/xrpc/com.atproto.space.getSpace?space={}",
+                enc(&space)
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "getSpace failed: {body}");
+        assert_eq!(body["uri"], json!(space));
+        for (field, value) in policy.as_object().unwrap() {
+            assert_eq!(&body["policy"][field], value, "policy.{field}: {body}");
+        }
+        return;
+    }
     let read = Policy::Public;
     let write = Policy::ManagingApp {
         managing_app: "did:web:app.example#atproto_space".into(),
@@ -216,7 +311,7 @@ async fn our_member_shape_round_trips_through_put_member_and_list_members() {
             let mut body = serde_json::to_value(ResolvedMember { did: other, access }).unwrap();
             body["space"] = json!(space);
             post_json(
-                &format!("{ZDS}/xrpc/com.atproto.simplespace.putMember"),
+                &format!("{ZDS}/xrpc/{}.putMember", members_ns().await),
                 Some(&token),
                 body,
             )
@@ -239,7 +334,8 @@ async fn our_member_shape_round_trips_through_put_member_and_list_members() {
 
     let (status, body) = get_json(
         &format!(
-            "{ZDS}/xrpc/com.atproto.simplespace.listMembers?space={}",
+            "{ZDS}/xrpc/{}.listMembers?space={}",
+            members_ns().await,
             enc(&space)
         ),
         Some(&token),
@@ -286,55 +382,18 @@ async fn a_commit_written_by_zds_verifies_and_agrees_with_our_set_hash() {
         expected.add(&record_element("com.example.note", rkey, cid));
     }
 
-    let (status, body) = get_json(
-        &format!(
-            "{ZDS}/xrpc/com.atproto.space.getLatestCommit?space={}&repo={}",
-            enc(&space_uri),
-            enc(&did)
-        ),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, 200, "getLatestCommit failed: {body}");
-
-    let commit = parse_signed_commit(&body["commit"]).expect("commit parses");
-    assert_eq!(commit.ver, 1);
-
-    let key = author_key(&did).await;
-    verify_commit(&commit, &space_uri, &did, &key)
-        .expect("a commit written by ZDS must verify with our own code");
+    // Fetched and authenticated as native sync does, whichever commit model
+    // ZDS speaks: a signed commit, or a proposal 0016 one with a MAC.
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space_uri, &did).await;
 
     // The migration turns on this check: our element encoding and LtHash must
     // produce the digest an independent implementation did over the same
     // records.
     assert_eq!(
-        commit.hash,
+        *commit.hash(),
         expected.hash(),
         "our set hash disagrees with ZDS's over the same two records"
     );
-}
-
-/// The account's `#atproto` signing key, from the DID document ZDS published.
-///
-/// Resolved through the PLC directory rather than the PDS: `describeRepo`
-/// returns a didDoc carrying only the service entry, and a commit is verified
-/// against the author's key.
-async fn author_key(did: &str) -> SpaceVerifyingKey {
-    let (status, body) = get_json(&format!("{PLC}/{}", enc(did)), None).await;
-    assert_eq!(status, 200, "PLC resolution failed: {body}");
-
-    let vm = body["verificationMethod"]
-        .as_array()
-        .expect("verificationMethod")
-        .iter()
-        .find(|v| v["id"].as_str().unwrap_or_default().ends_with("#atproto"))
-        .expect("an #atproto verification method");
-
-    let multibase = vm["publicKeyMultibase"]
-        .as_str()
-        .expect("publicKeyMultibase");
-    happyview::spaces::credential::multikey_to_space_key(multibase)
-        .expect("the published key must decode")
 }
 
 #[tokio::test]
@@ -411,17 +470,8 @@ async fn replaying_the_zds_oplog_across_pages_reproduces_its_commit() {
         }
     }
 
-    let (_, body) = get_json(
-        &format!(
-            "{ZDS}/xrpc/com.atproto.space.getLatestCommit?space={}&repo={}",
-            enc(&space_uri),
-            enc(&did)
-        ),
-        Some(&token),
-    )
-    .await;
-    let commit = parse_signed_commit(&body["commit"]).expect("commit parses");
-    assert_eq!(fold.hash(), commit.hash);
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space_uri, &did).await;
+    assert_eq!(fold.hash(), *commit.hash());
 }
 
 #[tokio::test]
@@ -454,8 +504,17 @@ async fn zds_encodes_commit_bytes_as_lexicon_bytes_not_bare_strings() {
     )
     .await;
 
-    for field in ["hash", "ikm", "sig", "mac"] {
-        let value = &body["commit"][field];
+    // A proposal 0016 commit carries its digest as `data` and is authenticated
+    // by a MAC header; a signed commit carries `hash` with its signature
+    // material.
+    let commit = &body["commit"];
+    let fields: &[&str] = if commit.get("data").is_some() {
+        &["data"]
+    } else {
+        &["hash", "ikm", "sig", "mac"]
+    };
+    for field in fields {
+        let value = &commit[*field];
         assert!(
             value.get("$bytes").and_then(|b| b.as_str()).is_some(),
             "{field} should be a lexicon bytes value, got {value}"
@@ -477,13 +536,12 @@ async fn the_migration_replay_lands_on_zds_with_the_hash_it_expects() {
 
     let records =
         interop_support::records_awaiting_migration(&space, &did, interop_support::Sample::Full);
-    let commit = interop_support::replay_as_migration(ZDS, &token, &space, &did, &records).await;
+    interop_support::replay_as_migration(ZDS, &token, &space, &did, &records).await;
 
     let disagreements =
         interop_support::cid_disagreements(ZDS, &token, &space, &did, &records).await;
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 
-    let commit = parse_signed_commit(&commit).expect("parses");
-    verify_commit(&commit, &space, &did, &author_key(&did).await).expect("authentic");
-    assert_eq!(commit.hash, interop_support::migration_expects(&records));
+    let commit = interop_support::verified_latest_commit(ZDS, PLC, &token, &space, &did).await;
+    assert_eq!(*commit.hash(), interop_support::migration_expects(&records));
 }
