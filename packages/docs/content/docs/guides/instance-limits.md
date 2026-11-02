@@ -9,6 +9,8 @@ Limits are checked inside the instance, against limits it already holds. A check
 ## What each limit refuses
 
 - **`seats`:** adding an admin through the admin API (`POST /admin/users`) when the instance already has `max` admins, the super user included. The owner's own ways in are never refused: the first sign-in, the configured superadmin, and a host setting its owner.
+- **`api_clients`:** creating an API client through the admin API (`POST /admin/api-clients`), or turning an inactive one back on, when the instance already has `max` active ones. Only the clients the instance's admins register count: not clients an app registers under its own, nor hpy, which every instance has built in.
+- **`anonymous_xrpc`:** with `allowed: false`, an XRPC call that names no API client, or names one that doesn't check out (an unknown key, the wrong Origin or secret). A call from a signed-in app, or another service using service auth, isn't anonymous. The admin API, OAuth and `/health` are never affected.
 
 ## The limits
 

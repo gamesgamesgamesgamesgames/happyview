@@ -239,6 +239,25 @@ pub async fn seats_in_use(
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
+/// The API clients the `api_clients` limit counts: active ones the
+/// instance's admins registered. A client an app registers under its own
+/// (a child, with a parent) isn't one of them, nor is hpy, built into every
+/// instance.
+pub async fn api_clients_in_use(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> Result<u32, crate::error::AppError> {
+    let (n,): (i64,) = crate::db::query_as(&crate::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_api_clients WHERE is_active = 1 AND parent_client_id IS NULL AND id <> ?",
+        backend,
+    ))
+    .bind(crate::auth::cli_client::CLIENT_ID)
+    .fetch_one(db)
+    .await
+    .map_err(|e| crate::error::AppError::Internal(format!("API client count failed: {e}")))?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

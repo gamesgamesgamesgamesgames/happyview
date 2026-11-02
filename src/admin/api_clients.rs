@@ -45,6 +45,14 @@ pub(super) async fn create_api_client(
         )));
     }
 
+    // The api_clients limit (HAP-226), after the request is known to be
+    // good, so a refusal says only what the limit allows.
+    let in_use = crate::limits::api_clients_in_use(&state.db, state.db_backend).await?;
+    state
+        .limits
+        .limits()
+        .check(happyview_provider::Limit::ApiClients, in_use)?;
+
     // Generate the client key: "hvc_" + 32 random hex chars.
     let mut random_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut random_bytes);
@@ -361,6 +369,25 @@ pub(super) async fn update_api_client(
         .is_active
         .map(|a| if a { 1i32 } else { 0i32 })
         .unwrap_or(cur_active);
+    // Turning a client back on takes a place under the api_clients limit
+    // again (HAP-226), unless it's one an app registered under its own.
+    if cur_active == 0 && is_active != 0 {
+        let (parent,): (Option<String>,) = crate::db::query_as(&adapt_sql(
+            "SELECT parent_client_id FROM happyview_api_clients WHERE id = ?",
+            state.db_backend,
+        ))
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get api client: {e}")))?;
+        if parent.is_none() {
+            let in_use = crate::limits::api_clients_in_use(&state.db, state.db_backend).await?;
+            state
+                .limits
+                .limits()
+                .check(happyview_provider::Limit::ApiClients, in_use)?;
+        }
+    }
     let now = now_rfc3339();
 
     let update_sql = adapt_sql(
