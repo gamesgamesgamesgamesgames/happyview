@@ -152,9 +152,7 @@ fn audited_setting_events(
     };
     match key {
         FeatureFlag::SPACE_INSPECTOR => {
-            // What the setting says, which the inspector follows once this
-            // build can turn it on, so the trail records the operator's choice.
-            let on = |v: &Option<String>| space_access::setting_says_on(v.as_deref(), None);
+            let on = |v: &Option<String>| space_access::switch_is_on(v.as_deref(), None);
             match (on(before), on(after)) {
                 (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
                 (true, false) => vec![event(
@@ -380,7 +378,6 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
-    space_access::refuse_switch_on(&key, &body.value)?;
 
     write_audited(
         &state.db,
@@ -856,10 +853,8 @@ mod tests {
         rows.into_iter().map(|(t,)| t).collect()
     }
 
-    /// Turning the inspector on or off is a protected event, judged by what
-    /// the setting says rather than by this build holding the inspector off,
-    /// since the setting is what takes effect once it can be on. `upsert`
-    /// refuses `true` until then, so this drives the write beneath it.
+    /// Turning the inspector on or off is a protected event, logged only when
+    /// the switch actually changes.
     #[tokio::test]
     #[serial]
     async fn the_inspector_switch_logs_each_effective_change() {
@@ -893,11 +888,11 @@ mod tests {
         );
     }
 
-    /// Configuration that says `true` leaves the inspector off in this build,
-    /// and storing `false` over it is recorded as the operator turning it off.
+    /// Configuration that says `true` turns the inspector on, and storing
+    /// `false` over it is recorded as turning it off.
     #[tokio::test]
     #[serial]
-    async fn a_configured_inspector_switch_is_held_off() {
+    async fn a_configured_inspector_switch_turns_it_on() {
         unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
         set_project_layer([("SPACE_INSPECTOR_ENABLED".to_string(), "true".to_string())].into());
         let _reset = LayerReset;
@@ -910,10 +905,7 @@ mod tests {
             Some("true"),
             "the value is configured"
         );
-        assert!(
-            !space_access::inspector_enabled(&pool, DatabaseBackend::Sqlite).await,
-            "and ignored"
-        );
+        assert!(space_access::inspector_enabled(&pool, DatabaseBackend::Sqlite).await);
         put_audited(&pool, FeatureFlag::SPACE_INSPECTOR, "false").await;
         assert_eq!(inspector_events(&pool).await, ["space_inspector.disabled"]);
     }
