@@ -10,7 +10,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::jobs::native::reseal;
 
-use super::auth::UserAuth;
+use super::auth::{AllowPlatform, UserAuth};
 use super::permissions::Permission;
 
 /// `GET /admin/encryption/rotation`
@@ -20,9 +20,9 @@ use super::permissions::Permission;
 /// is never true while one still needs the previous key.
 pub(super) async fn rotation_status(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_rotation_read().await?;
     let Some(keys) = state.config.keyring() else {
         return Ok(Json(json!({
             "key_configured": false,
