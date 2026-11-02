@@ -402,6 +402,10 @@ need a database where setup has not happened.
 
 The `happyview-provider` crate is the contract that record sources and stores implement, and it is licensed MIT OR Apache-2.0 so providers can be built under any terms. A change to it is a contract change. If the change breaks existing providers, bump `CONTRACT_VERSION` in `crates/happyview-provider/src/types.rs`. See [Record providers](packages/docs/content/docs/guides/record-providers.md).
 
+## License of contributions
+
+HappyView is licensed under the MIT License ([LICENSE.md](LICENSE.md)). By contributing, you agree that your contribution is licensed under the same terms as the file or package it changes, and your `Signed-off-by` line certifies the [Developer Certificate of Origin](https://developercertificate.org/) for it.
+
 ## Code of conduct
 
 Participation in this project is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
