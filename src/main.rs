@@ -281,6 +281,7 @@ async fn main() {
         &db_pool,
         db_backend,
         &config.public_url,
+        config.token_encryption_key.as_ref(),
     )
     .await
     {

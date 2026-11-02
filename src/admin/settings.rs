@@ -14,6 +14,20 @@ use super::auth::UserAuth;
 use super::permissions::Permission;
 use super::types::{SettingEntry, UpsertSettingBody};
 
+/// Keys the settings routes neither show nor change. Each is owned by code that
+/// stores it properly; a row left under one of these names is a leftover from
+/// before that.
+const RESERVED_KEYS: &[&str] = &[crate::plugin::attestation::LEGACY_KEY_SETTING];
+
+fn refuse_if_reserved(key: &str) -> Result<(), AppError> {
+    if RESERVED_KEYS.contains(&key) {
+        return Err(AppError::BadRequest(format!(
+            "'{key}' can't be changed through settings"
+        )));
+    }
+    Ok(())
+}
+
 const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("app_name", "APP_NAME"),
     (
@@ -77,7 +91,10 @@ pub(super) async fn list(
     let rows: Vec<(String, String)> = crate::db::query_as(&sql)
         .fetch_all(&state.db)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?
+        .into_iter()
+        .filter(|(key, _): &(String, String)| !RESERVED_KEYS.contains(&key.as_str()))
+        .collect();
 
     let db_keys: std::collections::HashSet<String> = rows.iter().map(|(k, _)| k.clone()).collect();
 
@@ -114,6 +131,7 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertSettingBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    refuse_if_reserved(&key)?;
 
     let backend = state.db_backend;
     let now = now_rfc3339();
@@ -158,6 +176,7 @@ pub(super) async fn delete(
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    refuse_if_reserved(&key)?;
 
     let backend = state.db_backend;
     let sql = adapt_sql(
