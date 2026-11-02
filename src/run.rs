@@ -177,11 +177,6 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
         });
     }
 
-    // Reads the switch once so a stored or configured `true`, which this
-    // build holds off, is reported at startup rather than at the first space
-    // request.
-    crate::admin::space_access::inspector_enabled(&state.db, state.db_backend).await;
-
     tokio::spawn(crate::event_log::spawn_retention_cleanup(
         state.db.clone(),
         state.db_backend,
@@ -358,7 +353,7 @@ async fn boot(
     );
 
     // The backfill re-mints commits, so it needs the space signing key.
-    let space_signing_key = match config.token_encryption_key.as_ref() {
+    let space_signing_key = match config.keyring().as_ref() {
         Some(key) => crate::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
             .await
             .ok(),
@@ -425,12 +420,8 @@ async fn boot(
         }
     }
 
-    crate::script::variables::encrypt_at_boot(
-        &db_pool,
-        db_backend,
-        config.token_encryption_key.as_ref(),
-    )
-    .await;
+    crate::script::variables::encrypt_at_boot(&db_pool, db_backend, config.keyring().as_ref())
+        .await;
 
     match crate::maintenance::vacuum::run_if_requested(&db_pool, db_backend, &config.database_url)
         .await
@@ -536,7 +527,7 @@ async fn boot(
         &db_pool,
         db_backend,
         &config.public_url,
-        config.token_encryption_key.as_ref(),
+        config.keyring().as_ref(),
     )
     .await
     {
@@ -751,11 +742,7 @@ async fn boot(
         protected_resource_metadata: Default::default(),
     };
 
-    let oauth_state_store = DbStateStore::new(
-        db_pool.clone(),
-        db_backend,
-        config.token_encryption_key.as_ref(),
-    );
+    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend, config.keyring());
 
     let oauth_scopes = crate::oauth::rotation::instance_scopes();
 
@@ -771,7 +758,7 @@ async fn boot(
     let instance_key = crate::oauth::client_keys::ensure_instance_key(
         &db_pool,
         db_backend,
-        config.token_encryption_key.as_ref(),
+        config.keyring().as_ref(),
     )
     .await
     .expect("Failed to load OAuth client authentication key");
@@ -793,11 +780,7 @@ async fn boot(
             },
             keys: None,
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(
-                db_pool.clone(),
-                db_backend,
-                config.token_encryption_key.as_ref(),
-            ),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring()),
             resolver: resolver_config,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -816,12 +799,8 @@ async fn boot(
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(
-                db_pool.clone(),
-                db_backend,
-                config.token_encryption_key.as_ref(),
-            )
-            .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring())
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -855,7 +834,7 @@ async fn boot(
             db_pool.clone(),
             db_backend,
             Some(client_jwks.clone()),
-            config.token_encryption_key.as_ref(),
+            config.keyring(),
         )
         .expect("Failed to create linked-repo OAuth client"),
     );
@@ -875,7 +854,7 @@ async fn boot(
     let oauth_registry = Arc::new(crate::auth::OAuthClientRegistry::new_with_kid(
         Arc::clone(&oauth_client_arc),
         instance_signing_kid.clone(),
-        config.token_encryption_key.as_ref(),
+        config.keyring(),
     ));
     oauth_registry
         .load_from_db(
@@ -944,12 +923,8 @@ async fn boot(
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(
-                db_pool.clone(),
-                db_backend,
-                config.token_encryption_key.as_ref(),
-            )
-            .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring())
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
@@ -981,7 +956,7 @@ async fn boot(
     let instance_keys = crate::oauth::client_keys::load_keys(
         &db_pool,
         db_backend,
-        config.token_encryption_key.as_ref(),
+        config.keyring().as_ref(),
         crate::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -998,7 +973,7 @@ async fn boot(
             db_pool.clone(),
             db_backend,
             key,
-            config.token_encryption_key.as_ref(),
+            config.keyring(),
         ) {
             Ok(client) => {
                 oauth_registry.register_for_kid(
@@ -1034,7 +1009,7 @@ async fn boot(
                 db_pool.clone(),
                 db_backend,
                 key,
-                config.token_encryption_key.as_ref(),
+                config.keyring(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
@@ -1068,7 +1043,7 @@ async fn boot(
                 db_pool.clone(),
                 db_backend,
                 Some(vec![jwk]),
-                config.token_encryption_key.as_ref(),
+                config.keyring(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));

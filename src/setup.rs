@@ -177,8 +177,7 @@ async fn plc_register(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Decrypt signing key
@@ -186,7 +185,7 @@ async fn plc_register(
         .signing_key_enc
         .as_ref()
         .ok_or_else(|| AppError::Internal("no signing key stored".into()))?;
-    let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, encryption_key)?;
+    let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, &encryption_key)?;
     let signing_key_did = happyview_plc::private_key_to_did_key(&signing_key_bytes)?;
 
     // Decrypt rotation key
@@ -201,7 +200,7 @@ async fn plc_register(
     let rotation_key_enc = row
         .and_then(|(k,)| k)
         .ok_or_else(|| AppError::Internal("no rotation key stored".into()))?;
-    let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, encryption_key)?;
+    let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, &encryption_key)?;
     let rotation_key_did = happyview_plc::private_key_to_did_key(&rotation_key_bytes)?;
 
     let rotation_signing_key =
@@ -565,11 +564,11 @@ async fn export_rotation_key(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let key_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let key_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt rotation key: {e}")))?;
 
     Ok((

@@ -85,7 +85,7 @@ pub async fn granted_scopes(state: &AppState) -> Result<HashMap<String, String>,
         "SELECT did, session_data, CAST(encrypted AS BIGINT) FROM happyview_linked_repo_sessions",
         state.db_backend,
     );
-    let key = state.config.token_encryption_key.as_ref();
+    let keys = state.config.keyring();
     let rows: Vec<(String, String, i64)> = crate::db::query_as(&sql)
         .fetch_all(&state.db)
         .await
@@ -93,7 +93,7 @@ pub async fn granted_scopes(state: &AppState) -> Result<HashMap<String, String>,
     Ok(rows
         .into_iter()
         .filter_map(|(did, data, encrypted)| {
-            let data = crate::plugin::encryption::open(key, &data, encrypted != 0)?;
+            let data = crate::plugin::encryption::open(keys.as_ref(), &data, encrypted != 0)?;
             Some((did, session_scope(&data)?))
         })
         .collect())

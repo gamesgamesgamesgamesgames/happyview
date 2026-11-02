@@ -284,10 +284,9 @@ async fn require_admin_grant(state: &AppState, claims: &Claims) -> Result<(), Ap
     let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {
         return Ok(());
     };
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
     let client =
         crate::oauth::client_auth::resolve_client_by_key(&state.db, state.db_backend, client_key)

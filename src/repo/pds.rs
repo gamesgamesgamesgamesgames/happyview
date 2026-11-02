@@ -20,7 +20,7 @@ pub(crate) enum PdsAuth {
     Dpop {
         api_client_id: String,
         dpop_key_id: String,
-        encryption_key: [u8; 32],
+        encryption_key: crate::plugin::encryption::Keyring,
     },
     /// The in-process PDS of a test run. Only `test_pds_auth` builds one.
     Fake(Arc<crate::testing::FakePds>),
@@ -334,10 +334,9 @@ pub(crate) async fn pds_auth_for_claims(
         )));
     };
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     let api_client_id = super::session::get_dpop_client_id(state, client_key).await?;

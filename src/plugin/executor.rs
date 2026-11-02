@@ -614,7 +614,7 @@ pub struct PluginExecutor {
     db_backend: DatabaseBackend,
     http_client: reqwest::Client,
     lexicons: Arc<LexiconCatalog>,
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<crate::plugin::encryption::Keyring>,
     /// Set only by [`AppState::plugin_executor`](crate::AppState::plugin_executor).
     /// A library reaching a host import that speaks to the wider instance —
     /// today, `host_caller_xrpc_query` run with no session — needs this; the
@@ -686,7 +686,7 @@ impl PluginExecutor {
 
     /// Key for decrypting stored plugin secrets. Without it, library calls
     /// only see `PLUGIN_<ID>_*` environment variables.
-    pub fn with_encryption_key(mut self, key: Option<[u8; 32]>) -> Self {
+    pub fn with_encryption_key(mut self, key: Option<crate::plugin::encryption::Keyring>) -> Self {
         self.encryption_key = key;
         self
     }

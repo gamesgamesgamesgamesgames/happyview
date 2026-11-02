@@ -16,7 +16,7 @@ use sqlx::AnyPool;
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::{Keyring, encrypt};
 
 /// The delegation key, generating and storing one if the instance has none.
 ///
@@ -25,7 +25,7 @@ use crate::plugin::encryption::{decrypt, encrypt};
 pub async fn load_or_create(
     pool: &AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &Keyring,
 ) -> Result<SigningKey, AppError> {
     if let Some(key) = load(pool, backend, encryption_key).await? {
         return Ok(key);
@@ -53,7 +53,7 @@ pub async fn load_or_create(
 pub async fn load(
     pool: &AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &Keyring,
 ) -> Result<Option<SigningKey>, AppError> {
     let sql = adapt_sql(
         "SELECT private_key FROM happyview_delegation_key WHERE id = 1",
@@ -82,17 +82,18 @@ fn generate() -> Result<SigningKey, AppError> {
     ))
 }
 
-fn seal(encryption_key: &[u8; 32], key: &SigningKey) -> Result<String, AppError> {
-    let sealed = encrypt(encryption_key, key.to_bytes().as_slice())
+fn seal(encryption_key: &Keyring, key: &SigningKey) -> Result<String, AppError> {
+    let sealed = encrypt(encryption_key.current(), key.to_bytes().as_slice())
         .map_err(|e| AppError::Internal(format!("failed to seal delegation key: {e}")))?;
     Ok(STANDARD.encode(sealed))
 }
 
-fn open(encryption_key: &[u8; 32], sealed: &str) -> Result<SigningKey, AppError> {
+fn open(encryption_key: &Keyring, sealed: &str) -> Result<SigningKey, AppError> {
     let bytes = STANDARD
         .decode(sealed)
         .map_err(|e| AppError::Internal(format!("failed to decode delegation key: {e}")))?;
-    let plain = decrypt(encryption_key, &bytes)
+    let plain = encryption_key
+        .decrypt(&bytes)
         .map_err(|e| AppError::Internal(format!("failed to open delegation key: {e}")))?;
     SigningKey::from_slice(&plain)
         .map_err(|e| AppError::Internal(format!("invalid delegation key: {e}")))
@@ -103,9 +104,10 @@ mod tests {
     use super::*;
     use crate::test_support::test_pools;
 
-    const KEY: [u8; 32] = [0x42; 32];
+    const KEY: Keyring = Keyring::single([0x42; 32]);
 
     #[tokio::test]
+    #[serial_test::serial(delegation_key)]
     async fn generated_once_and_reused() {
         for (pool, backend) in test_pools().await {
             crate::db::query("DELETE FROM happyview_delegation_key")
@@ -129,6 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(delegation_key)]
     async fn not_the_encryption_key_and_never_stored_unsealed() {
         for (pool, backend) in test_pools().await {
             crate::db::query("DELETE FROM happyview_delegation_key")
@@ -136,7 +139,7 @@ mod tests {
                 .await
                 .unwrap();
             let key = load_or_create(&pool, backend, &KEY).await.unwrap();
-            assert_ne!(key.to_bytes().as_slice(), KEY.as_slice());
+            assert_ne!(key.to_bytes().as_slice(), KEY.current().as_slice());
 
             let (stored,): (String,) =
                 crate::db::query_as("SELECT private_key FROM happyview_delegation_key")
@@ -149,7 +152,7 @@ mod tests {
                 "the stored row must not hold the key in the clear"
             );
             assert!(
-                open(&[0x43; 32], &stored).is_err(),
+                open(&Keyring::single([0x43; 32]), &stored).is_err(),
                 "another key cannot open it"
             );
         }

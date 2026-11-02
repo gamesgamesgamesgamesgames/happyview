@@ -52,25 +52,6 @@ async fn put_setting(app: &TestApp, key: &str, value: &str) {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
-/// Store the inspector switch directly, and let this process's inspector
-/// follow it. The settings API refuses to turn it on, and this build holds it
-/// off whatever is stored, until the dashboard can request a grant.
-async fn store_switch(app: &TestApp, value: &str) {
-    common::let_space_inspector_follow_its_setting();
-    let sql = adapt_sql(
-        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        app.state.db_backend,
-    );
-    happyview::db::query(&sql)
-        .bind("feature.space_inspector_enabled")
-        .bind(value)
-        .bind(happyview::db::now_rfc3339())
-        .execute(&app.state.db)
-        .await
-        .unwrap();
-}
-
 async fn events_of(app: &TestApp, event_type: &str) -> Vec<(Option<String>, String)> {
     let sql = adapt_sql(
         "SELECT subject, detail FROM happyview_event_logs WHERE event_type = ? ORDER BY created_at",
@@ -91,7 +72,7 @@ async fn config_reports_the_inspector_switch() {
     let body = json_body(send(&app, "GET", "/config", None).await).await;
     assert_eq!(body["features"]["space_inspector"], false);
 
-    store_switch(&app, "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
     let body = json_body(send(&app, "GET", "/config", None).await).await;
     assert_eq!(body["features"]["space_inspector"], true);
 }
@@ -111,38 +92,13 @@ async fn inspector_is_off_by_default() {
 
 #[tokio::test]
 #[serial]
-async fn turning_the_inspector_off_logs_once() {
+async fn toggling_the_inspector_logs_each_change() {
     common::require_db!();
     let app = TestApp::new().await;
-    store_switch(&app, "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
     put_setting(&app, "feature.space_inspector_enabled", "false").await;
-    put_setting(&app, "feature.space_inspector_enabled", "false").await;
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
     assert_eq!(events_of(&app, "space_inspector.disabled").await.len(), 1);
-}
-
-/// Until the dashboard can request a grant, an inspector turned on would only
-/// answer `SpaceAccessGrantRequired`, so the settings API will not turn it on.
-#[tokio::test]
-#[serial]
-async fn the_settings_api_will_not_turn_the_inspector_on() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    for value in ["true", " TRUE "] {
-        let resp = send(
-            &app,
-            "PUT",
-            "/admin/settings/feature.space_inspector_enabled",
-            Some(json!({ "value": value })),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let message = json_body(resp).await["error"].as_str().unwrap().to_string();
-        assert!(message.contains("dashboard"), "{message}");
-    }
-    let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
-    assert_eq!(body["enabled"], false);
-    assert!(events_of(&app, "space_inspector.enabled").await.is_empty());
-    assert!(events_of(&app, "setting.updated").await.is_empty());
 }
 
 #[tokio::test]
@@ -150,9 +106,10 @@ async fn the_settings_api_will_not_turn_the_inspector_on() {
 async fn padded_true_turns_the_inspector_on() {
     common::require_db!();
     let app = TestApp::new().await;
-    store_switch(&app, " true ").await;
+    put_setting(&app, "feature.space_inspector_enabled", " true ").await;
     let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
     assert_eq!(body["enabled"], true);
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
 }
 
 #[tokio::test]
@@ -160,8 +117,11 @@ async fn padded_true_turns_the_inspector_on() {
 async fn saving_the_same_value_twice_logs_once() {
     common::require_db!();
     let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
     put_setting(&app, "event_log_retention_days", "14").await;
     put_setting(&app, "event_log_retention_days", "14").await;
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
     let changes = events_of(&app, "event_logs.retention_changed").await;
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].0.as_deref(), Some("event_log_retention_days"));
@@ -197,7 +157,7 @@ async fn saving_a_retention_default_logs_nothing() {
 async fn deleting_the_setting_counts_as_disabling() {
     common::require_db!();
     let app = TestApp::new().await;
-    store_switch(&app, "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
     let resp = send(
         &app,
         "DELETE",
@@ -210,7 +170,7 @@ async fn deleting_the_setting_counts_as_disabling() {
 }
 
 async fn enable(app: &TestApp) {
-    store_switch(app, "true").await;
+    put_setting(app, "feature.space_inspector_enabled", "true").await;
 }
 
 async fn create_grant(app: &TestApp, body: Value) -> axum::response::Response {
@@ -612,17 +572,16 @@ async fn active_listing_keeps_an_old_grant_past_newer_ones() {
 
 #[tokio::test]
 #[serial]
-async fn the_inspector_stays_on_when_its_audit_event_cannot_be_written() {
+async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
     common::require_db!();
     let app = TestApp::new().await;
-    store_switch(&app, "true").await;
 
     rename_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
     let resp = send(
         &app,
         "PUT",
         "/admin/settings/feature.space_inspector_enabled",
-        Some(json!({ "value": "false" })),
+        Some(json!({ "value": "true" })),
     )
     .await;
     let status = resp.status();
@@ -635,7 +594,7 @@ async fn the_inspector_stays_on_when_its_audit_event_cannot_be_written() {
     rename_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(enabled, "the setting rolls back with its audit event");
+    assert!(!enabled, "the setting rolls back with its audit event");
 }
 
 #[tokio::test]

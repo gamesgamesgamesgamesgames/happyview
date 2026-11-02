@@ -29,10 +29,9 @@ pub fn secret_env_prefix(plugin_id: &str) -> String {
 pub async fn load_plugin_secrets(
     db: &sqlx::AnyPool,
     db_backend: crate::db::DatabaseBackend,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&crate::plugin::encryption::Keyring>,
     plugin_id: &str,
 ) -> HashMap<String, String> {
-    use crate::plugin::encryption::decrypt;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     // Try to load from database first (if encryption key is available)
@@ -58,7 +57,7 @@ pub async fn load_plugin_secrets(
                     v.as_str().and_then(|encrypted_b64| {
                         // Decode base64 and decrypt
                         let encrypted = BASE64.decode(encrypted_b64).ok()?;
-                        let decrypted = decrypt(key, &encrypted).ok()?;
+                        let decrypted = key.decrypt(&encrypted).ok()?;
                         let value = String::from_utf8(decrypted).ok()?;
                         // Strip prefix from key to get short name
                         let short_key = k.strip_prefix(&prefix).unwrap_or(k).to_string();

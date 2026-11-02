@@ -255,10 +255,9 @@ pub async fn resolve_dpop_claims(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::Auth("DPoP auth requires DPoP header".into()))?;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Resolve the API client

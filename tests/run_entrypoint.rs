@@ -305,7 +305,8 @@ async fn boot_encrypts_stored_script_variables() {
     .await
     .unwrap();
     assert!(!value.contains("secret"));
-    let env = happyview::script::variables::load(&state.db, state.db_backend, Some(&key)).await;
+    let env =
+        happyview::script::variables::load(&state.db, state.db_backend, Some(&key.into())).await;
     assert_eq!(env["API_KEY"], "secret");
 
     let (session,): (String,) = happyview::db::query_as(
@@ -349,7 +350,7 @@ async fn stage_instance_key_due_at(state: &AppState, at: chrono::DateTime<chrono
     let (staged, _) = happyview::oauth::client_keys::stage_key(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         happyview::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -428,4 +429,124 @@ async fn boot_starts_promoting_staged_keys_as_they_come_due() {
         instance_key_status(&second, &old).await,
         Some(happyview::oauth::client_keys::KeyStatus::Retiring)
     );
+}
+
+/// A rotation's first boot: the instance's stored keys and sessions were
+/// sealed under the old key, the new key is now current and the old one is
+/// `TOKEN_ENCRYPTION_KEY_PREVIOUS`. The instance boots around the same OAuth
+/// client key, which it opens with the previous key, and what it stored is
+/// still read. On SQLite, and on Postgres when `TEST_DATABASE_URL` names one.
+#[tokio::test]
+async fn boot_opens_what_the_previous_key_sealed() {
+    let old = [0x31u8; 32];
+    let new = [0x32u8; 32];
+    for target in BootTarget::all().await {
+        let boot = |current, previous| {
+            let mut config = target.config();
+            config.token_encryption_key = Some(current);
+            config.token_encryption_key_previous = previous;
+            happyview::run::boot_for_test(
+                config,
+                Providers {
+                    source: Arc::new(Double::default()),
+                    storage: None,
+                },
+            )
+        };
+
+        let state = boot(old, None).await;
+        let kid = booted_kid(&state);
+        let sealed = happyview::script::variables::seal(Some(&old.into()), "secret").unwrap();
+        happyview::db::query(&happyview::db::adapt_sql(
+            "INSERT INTO happyview_script_variables (key, value, encrypted, created_at) VALUES ('API_KEY', ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .bind(happyview::db::now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        state.db.close().await;
+
+        let state = boot(new, Some(old)).await;
+        assert_eq!(booted_kid(&state), kid, "{}", target.name());
+        let env = happyview::script::variables::load(
+            &state.db,
+            state.db_backend,
+            state.config.keyring().as_ref(),
+        )
+        .await;
+        assert_eq!(env["API_KEY"], "secret", "{}", target.name());
+        state.db.close().await;
+        target.finish().await;
+    }
+}
+
+/// Where a boot test runs: its own SQLite file, and a scratch Postgres
+/// database when `TEST_DATABASE_URL` names a Postgres server.
+enum BootTarget {
+    Sqlite(tempfile::TempDir),
+    Postgres {
+        dir: tempfile::TempDir,
+        server: String,
+        name: String,
+        admin: sqlx::AnyPool,
+    },
+}
+
+impl BootTarget {
+    async fn all() -> Vec<Self> {
+        let mut out = vec![Self::Sqlite(tempfile::tempdir().unwrap())];
+        if let Ok(url) = std::env::var("TEST_DATABASE_URL")
+            && happyview::db::DatabaseBackend::from_url(&url)
+                == happyview::db::DatabaseBackend::Postgres
+        {
+            happyview::db::install_drivers();
+            let admin = sqlx::AnyPool::connect(&url).await.unwrap();
+            let name = format!("hv_boot_{}", uuid::Uuid::new_v4().simple());
+            happyview::db::query(&format!("CREATE DATABASE {name}"))
+                .execute(&admin)
+                .await
+                .unwrap();
+            let (server, _) = url.rsplit_once('/').unwrap();
+            out.push(Self::Postgres {
+                dir: tempfile::tempdir().unwrap(),
+                server: server.to_string(),
+                name,
+                admin,
+            });
+        }
+        out
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Sqlite(_) => "sqlite",
+            Self::Postgres { .. } => "postgres",
+        }
+    }
+
+    fn config(&self) -> happyview::config::Config {
+        match self {
+            Self::Sqlite(dir) => config(dir.path()),
+            Self::Postgres {
+                dir, server, name, ..
+            } => {
+                let mut config = config(dir.path());
+                config.database_url = format!("{server}/{name}");
+                config.database_backend = happyview::db::DatabaseBackend::Postgres;
+                config
+            }
+        }
+    }
+
+    async fn finish(self) {
+        if let Self::Postgres { name, admin, .. } = self {
+            let _ = happyview::db::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .execute(&admin)
+                .await;
+            admin.close().await;
+        }
+    }
 }

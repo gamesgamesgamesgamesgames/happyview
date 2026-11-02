@@ -11,6 +11,7 @@ use crate::HappyViewOAuthClient;
 use crate::auth::oauth_store::{DbSessionStore, DbStateStore};
 use crate::db::DatabaseBackend;
 use crate::dns::NativeDnsResolver;
+use crate::plugin::encryption::Keyring;
 
 pub const LINKED_SESSIONS_TABLE: &str = "happyview_linked_repo_sessions";
 
@@ -26,7 +27,7 @@ pub fn build(
     pool: sqlx::AnyPool,
     backend: DatabaseBackend,
     client_keys: Option<Vec<jose_jwk::Jwk>>,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<Keyring>,
 ) -> Result<HappyViewOAuthClient, String> {
     let http = Arc::new(crate::http_retry::HappyViewHttpClient::new(
         crate::http_retry::shared_client().clone(),

@@ -418,7 +418,7 @@ fn seal_key(
 }
 
 fn open_key(
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&crate::plugin::encryption::Keyring>,
     stored: &str,
     encrypted: bool,
 ) -> Result<String, AttestationError> {
@@ -433,7 +433,7 @@ fn open_key(
     };
     let key = encryption_key.ok_or_else(unreadable)?;
     let bytes = BASE64.decode(stored).map_err(|_| unreadable())?;
-    let plain = crate::plugin::encryption::decrypt(key, &bytes).map_err(|_| unreadable())?;
+    let plain = key.decrypt(&bytes).map_err(|_| unreadable())?;
     String::from_utf8(plain).map_err(|_| unreadable())
 }
 
@@ -535,13 +535,13 @@ pub async fn load_or_generate(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
     public_url: &str,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&crate::plugin::encryption::Keyring>,
 ) -> Result<AttestationSigner, AttestationError> {
     use crate::db::adapt_sql;
 
     // Before the environment is consulted, so a key from an earlier boot is
     // moved even on an instance that now signs with one from its environment.
-    migrate_key(db, backend, encryption_key).await?;
+    migrate_key(db, backend, encryption_key.map(|k| k.current())).await?;
 
     if let Some(signer) = load_from_env()? {
         tracing::info!("Attestation signer loaded from environment variables");
@@ -601,7 +601,7 @@ pub async fn load_or_generate(
         hex::encode(key_bytes)
     };
 
-    insert_key(db, backend, encryption_key, &hex_key).await?;
+    insert_key(db, backend, encryption_key.map(|k| k.current()), &hex_key).await?;
 
     let upsert_sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
@@ -1086,9 +1086,14 @@ mod tests {
     async fn an_existing_key_moves_out_of_settings_unchanged_and_encrypted() {
         let pool = pool_with_legacy_key().await;
 
-        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
+        let signer = load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(signer.public_key_bytes(), legacy_public_key());
         assert_eq!(legacy_rows(&pool).await, 0);
@@ -1101,12 +1106,22 @@ mod tests {
     async fn a_new_key_is_stored_encrypted_and_never_in_settings() {
         let pool = crate::test_support::migrated_memory_pool().await;
 
-        let first = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
-        let again = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
+        let first = load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
+        let again = load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(first.public_key_bytes(), again.public_key_bytes());
         assert_eq!(legacy_rows(&pool).await, 0);
@@ -1124,9 +1139,14 @@ mod tests {
         assert_eq!(legacy_rows(&pool).await, 0);
         assert_eq!(read_key(&pool, BACKEND).await.unwrap().unwrap().1, 0);
 
-        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
+        let signer = load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
         assert_eq!(signer.public_key_bytes(), legacy_public_key());
         assert_eq!(read_key(&pool, BACKEND).await.unwrap().unwrap().1, 1);
     }
@@ -1135,18 +1155,31 @@ mod tests {
     #[tokio::test]
     async fn a_key_that_will_not_open_is_an_error_and_is_not_replaced() {
         let pool = pool_with_legacy_key().await;
-        load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
+        load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
         let before = read_key(&pool, BACKEND).await.unwrap();
 
-        for key in [Some(&[8u8; 32]), None] {
+        for key in [
+            Some(&crate::plugin::encryption::Keyring::single([8u8; 32])),
+            None,
+        ] {
             assert!(load_or_generate(&pool, BACKEND, URL, key).await.is_err());
             assert_eq!(read_key(&pool, BACKEND).await.unwrap(), before);
         }
-        let signer = load_or_generate(&pool, BACKEND, URL, Some(&KEY))
-            .await
-            .unwrap();
+        let signer = load_or_generate(
+            &pool,
+            BACKEND,
+            URL,
+            Some(&crate::plugin::encryption::Keyring::from(KEY)),
+        )
+        .await
+        .unwrap();
         assert_eq!(signer.public_key_bytes(), legacy_public_key());
     }
 

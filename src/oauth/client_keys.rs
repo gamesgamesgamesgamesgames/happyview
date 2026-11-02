@@ -12,7 +12,7 @@ use rand::Rng;
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 
 /// `owner` value for the instance's own key, as opposed to an API client's.
 pub const INSTANCE_OWNER: &str = "instance";
@@ -119,14 +119,14 @@ pub fn generate_client_key(owner: &str) -> Result<ClientKey, AppError> {
 /// `happyview_oauth_sessions.session_data`, which already stores refresh tokens
 /// and DPoP private keys in the clear.
 pub fn seal_private_jwk(
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     jwk: &serde_json::Value,
 ) -> Result<(Vec<u8>, bool), AppError> {
     let bytes = serde_json::to_vec(jwk)
         .map_err(|e| AppError::Internal(format!("failed to serialise client key: {e}")))?;
     match enc {
         Some(key) => {
-            let sealed = encrypt(key, &bytes)
+            let sealed = encrypt(key.current(), &bytes)
                 .map_err(|e| AppError::Internal(format!("failed to encrypt client key: {e}")))?;
             Ok((sealed, true))
         }
@@ -136,7 +136,7 @@ pub fn seal_private_jwk(
 
 /// Inverse of [`seal_private_jwk`].
 pub fn unseal_private_jwk(
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     blob: &[u8],
     encrypted: bool,
 ) -> Result<serde_json::Value, AppError> {
@@ -144,7 +144,7 @@ pub fn unseal_private_jwk(
         let key = enc.ok_or_else(|| {
             AppError::Internal("client key is encrypted but TOKEN_ENCRYPTION_KEY is not set".into())
         })?;
-        decrypt(key, blob)
+        key.decrypt(blob)
             .map_err(|e| AppError::Internal(format!("failed to decrypt client key: {e}")))?
     } else {
         blob.to_vec()
@@ -171,7 +171,7 @@ pub fn render_jwks(keys: &[ClientKey]) -> serde_json::Value {
 pub async fn insert_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     key: &ClientKey,
 ) -> Result<(), AppError> {
     let (blob, encrypted) = seal_private_jwk(enc, &key.private_jwk)?;
@@ -206,7 +206,7 @@ pub async fn insert_key(
 pub async fn load_keys(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     owner: &str,
 ) -> Result<Vec<ClientKey>, AppError> {
     let sql = adapt_sql(
@@ -394,7 +394,7 @@ pub const ROTATION_OVERLAP: chrono::Duration = chrono::Duration::minutes(75);
 pub async fn rotate_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     owner: &str,
 ) -> Result<ClientKey, AppError> {
     if let Some(pending) = load_keys(pool, backend, enc, owner)
@@ -463,7 +463,7 @@ pub async fn rotate_key(
 pub async fn stage_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
     owner: &str,
 ) -> Result<(ClientKey, Option<String>), AppError> {
     let listed = list_keys_for_owner(pool, backend, owner).await?;
@@ -663,7 +663,7 @@ pub async fn count_unstamped_sessions(
 pub async fn ensure_instance_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    enc: Option<&[u8; 32]>,
+    enc: Option<&crate::plugin::encryption::Keyring>,
 ) -> Result<ClientKey, AppError> {
     if let Some(existing) = load_keys(pool, backend, enc, INSTANCE_OWNER)
         .await?
@@ -707,10 +707,10 @@ mod tests {
     fn seal_round_trips_with_a_key() {
         let enc = [7u8; 32];
         let key = generate_client_key(INSTANCE_OWNER).unwrap();
-        let (blob, encrypted) = seal_private_jwk(Some(&enc), &key.private_jwk).unwrap();
+        let (blob, encrypted) = seal_private_jwk(Some(&enc.into()), &key.private_jwk).unwrap();
         assert!(encrypted);
         assert_ne!(blob, serde_json::to_vec(&key.private_jwk).unwrap());
-        let back = unseal_private_jwk(Some(&enc), &blob, true).unwrap();
+        let back = unseal_private_jwk(Some(&enc.into()), &blob, true).unwrap();
         assert_eq!(back, key.private_jwk);
     }
 
@@ -727,7 +727,7 @@ mod tests {
     fn unsealing_an_encrypted_row_without_a_key_is_an_error() {
         let enc = [7u8; 32];
         let key = generate_client_key(INSTANCE_OWNER).unwrap();
-        let (blob, _) = seal_private_jwk(Some(&enc), &key.private_jwk).unwrap();
+        let (blob, _) = seal_private_jwk(Some(&enc.into()), &key.private_jwk).unwrap();
         assert!(unseal_private_jwk(None, &blob, true).is_err());
     }
 

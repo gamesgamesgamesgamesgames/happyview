@@ -30,8 +30,7 @@ pub fn state_with_pool_on(
     } else {
         config.public_url.trim_end_matches('/').to_string()
     };
-    let encryption_key = config.token_encryption_key;
-    let encryption_key = encryption_key.as_ref();
+    let encryption_key = config.keyring();
     let metadata_url = format!("{public_url}/oauth-client-metadata.json");
     let callback = format!("{public_url}/auth/callback");
     let (tx, _) = watch::channel(vec![]);

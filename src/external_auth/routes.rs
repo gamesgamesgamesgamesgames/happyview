@@ -108,7 +108,7 @@ async fn authorize(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &plugin_id,
     )
     .await;
@@ -220,7 +220,7 @@ async fn callback_inner(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &stored_state.plugin_id,
     )
     .await;
@@ -301,7 +301,7 @@ async fn connect_with_config(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &plugin_id,
     )
     .await;

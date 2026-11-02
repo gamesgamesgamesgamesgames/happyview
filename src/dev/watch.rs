@@ -35,6 +35,8 @@ pub enum Change {
     /// Something in `PLUGIN_DIR`, or the directory itself, which hpy
     /// places plugins in. Only `happyview dev` watches it.
     Plugins,
+    /// `happyview.lock`, whose plugins load only at boot.
+    Lock,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -43,6 +45,7 @@ struct Batch {
     src_dir: bool,
     build_dir: bool,
     plugins: bool,
+    lock: bool,
 }
 
 fn build_dir(root: &Path) -> PathBuf {
@@ -86,6 +89,9 @@ pub fn classify(root: &Path, plugins: Option<&Path>, path: &Path) -> Option<Chan
     if rel == Path::new(".env.test") {
         return Some(Change::TestEnv);
     }
+    if rel == Path::new("happyview.lock") {
+        return Some(Change::Lock);
+    }
     if rel == Path::new("src") {
         return Some(Change::SrcDir);
     }
@@ -127,6 +133,7 @@ async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
             Change::SrcDir => batch.src_dir = true,
             Change::BuildDir => batch.build_dir = true,
             Change::Plugins => batch.plugins = true,
+            Change::Lock => batch.lock = true,
             Change::Source | Change::TestEnv => {}
         }
     }
@@ -333,6 +340,8 @@ pub fn spawn_with(
 
     let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
+    // What hpy placed the plugins from, to tell a real change from a rewrite.
+    let lock_at_boot = std::fs::read(root.join("happyview.lock")).ok();
     tokio::spawn(async move {
         // The boot build is already installed; its types come first, in the
         // same task as every later pass so two never write at once.
@@ -340,8 +349,16 @@ pub fn spawn_with(
             out(line);
         }
         while let Some(batch) = next_batch(&mut rx).await {
-            let lines =
-                handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+            let lines = handle_batch(
+                &state,
+                &session,
+                &rewatch,
+                &plugins,
+                &mut declared,
+                lock_at_boot.as_deref(),
+                batch,
+            )
+            .await;
             for line in lines {
                 out(line);
             }
@@ -429,7 +446,8 @@ fn watch_dir_again<W: Watch>(rewatch: &Weak<Mutex<W>>, path: &Path, recursive: R
 
 /// One batch's work: watch again any directory that was recreated, load
 /// and unload plugins if `PLUGIN_DIR` changed, reload the config if it
-/// changed, then build. Answers the plugins' line, if they changed, and the
+/// changed, say so if the lock changed, then build. Answers the plugins'
+/// line, if they changed, the lock's, if it needs a restart, and the
 /// build's.
 ///
 /// `plugins` is the canonical `PLUGIN_DIR` the watcher uses; the registry is
@@ -441,6 +459,7 @@ async fn handle_batch<W: Watch>(
     rewatch: &Weak<Mutex<W>>,
     plugins: &Path,
     declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
+    lock_at_boot: Option<&[u8]>,
     batch: Batch,
 ) -> Vec<String> {
     watch_again(rewatch, &session.root, batch.src_dir, batch.build_dir);
@@ -452,6 +471,13 @@ async fn handle_batch<W: Watch>(
         lines.extend(
             crate::dev::plugins::sync(&state.plugin_registry, &state.config.plugin_dir).await,
         );
+    }
+    if batch.lock {
+        let now = std::fs::read(session.root.join("happyview.lock")).ok();
+        lines.extend(crate::dev::reload::lock_notice(
+            lock_at_boot,
+            now.as_deref(),
+        ));
     }
     if batch.config
         && let Err(e) = crate::dev::reload::reload(state, session, declared).await
@@ -520,6 +546,10 @@ mod tests {
         assert_eq!(
             classify(root, None, Path::new("/p/.env.test")),
             Some(Change::TestEnv)
+        );
+        assert_eq!(
+            classify(root, None, Path::new("/p/happyview.lock")),
+            Some(Change::Lock)
         );
         assert_eq!(classify(root, None, Path::new("/p/srcery/x.lua")), None);
         assert_eq!(
@@ -692,6 +722,7 @@ mod tests {
         tx.send(Change::BuildDir).unwrap();
         tx.send(Change::Plugins).unwrap();
         tx.send(Change::Plugins).unwrap();
+        tx.send(Change::Lock).unwrap();
         assert_eq!(
             next_batch(&mut rx).await,
             Some(Batch {
@@ -699,6 +730,7 @@ mod tests {
                 src_dir: true,
                 build_dir: true,
                 plugins: true,
+                lock: true,
             })
         );
         assert!(
@@ -913,6 +945,7 @@ mod tests {
             &rewatch,
             &plugins,
             &mut declared,
+            None,
             src_and_build,
         )
         .await;
@@ -929,6 +962,7 @@ mod tests {
             &rewatch,
             &plugins,
             &mut declared,
+            None,
             Batch::default(),
         )
         .await;
@@ -981,7 +1015,16 @@ mod tests {
             plugins: true,
             ..Batch::default()
         };
-        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+        let lines = handle_batch(
+            &state,
+            &session,
+            &rewatch,
+            &plugins,
+            &mut declared,
+            None,
+            batch,
+        )
+        .await;
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0], "plugins: loaded happyview-db 1.0.0-alpha.7");
         assert_eq!(
@@ -995,7 +1038,16 @@ mod tests {
             plugins: true,
             ..Batch::default()
         };
-        let lines = handle_batch(&state, &session, &rewatch, &plugins, &mut declared, batch).await;
+        let lines = handle_batch(
+            &state,
+            &session,
+            &rewatch,
+            &plugins,
+            &mut declared,
+            None,
+            batch,
+        )
+        .await;
         assert_eq!(lines[0], "plugins: removed happyview-db");
         assert!(state.plugin_registry.get("happyview-db").await.is_none());
     }

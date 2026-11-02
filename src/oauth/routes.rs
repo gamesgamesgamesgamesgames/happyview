@@ -44,7 +44,7 @@ async fn client_jwks(
     let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -125,10 +125,10 @@ async fn mint_client_assertion(
             )
             .await?;
 
-            let encryption_key =
-                state.config.token_encryption_key.as_ref().ok_or_else(|| {
-                    AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into())
-                })?;
+            let encryption_key = &state
+                .config
+                .keyring()
+                .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
             let (_dpop_key_id, dpop_client_id, _private_jwk, _thumbprint, pkce_challenge) =
                 keys::get_dpop_key(&state.db, state.db_backend, encryption_key, provision_id)
@@ -165,7 +165,7 @@ async fn mint_client_assertion(
     let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &client.id,
     )
     .await?;
@@ -471,10 +471,9 @@ async fn register_session(
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?
         .0;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Look up the DPoP key by provision_id
@@ -560,7 +559,7 @@ async fn register_session(
     let client_keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &client.id,
     )
     .await?;
@@ -583,7 +582,7 @@ async fn register_session(
     sessions::store_dpop_session(
         &state.db,
         state.db_backend,
-        encryption_key,
+        encryption_key.current(),
         &session_id,
         &client.id,
         &dpop_key_id,
@@ -696,10 +695,9 @@ async fn get_session(
     let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     let authenticated = authenticate_request_client(&state, &headers, &request_path, "GET").await?;
@@ -744,7 +742,7 @@ async fn revoke_sessions_best_effort(
     did: &str,
     dpop_key_ids: &[String],
 ) {
-    let Some(encryption_key) = state.config.token_encryption_key.as_ref() else {
+    let Some(encryption_key) = &state.config.keyring() else {
         return;
     };
 
