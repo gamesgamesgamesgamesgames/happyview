@@ -203,7 +203,7 @@ async fn load_env(state: &AppState) -> BTreeMap<String, String> {
     let mut env = crate::script::variables::load(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
     )
     .await;
     if let Some(path) = &state.config.script_env_file {
@@ -292,7 +292,7 @@ mod tests {
         let mut state = test_state_with_pool(migrated_memory_pool().await);
         let key = [3u8; 32];
         state.config.token_encryption_key = Some(key);
-        let sealed = crate::script::variables::seal(Some(&key), "secret").unwrap();
+        let sealed = crate::script::variables::seal(Some(&key.into()), "secret").unwrap();
         crate::db::query(
             "INSERT INTO happyview_script_variables (key, value, encrypted) VALUES ('API_KEY', ?, ?)",
         )

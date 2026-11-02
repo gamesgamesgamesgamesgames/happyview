@@ -163,7 +163,7 @@ pub const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
 /// Idempotent, and safe to race: every test uses [`TEST_ENCRYPTION_KEY`], so an
 /// existing row is always one this state can decrypt.
 pub async fn provision_space_signing_key(state: &AppState) {
-    let Some(key) = state.config.token_encryption_key.as_ref() else {
+    let Some(key) = &state.config.keyring() else {
         return;
     };
 
@@ -192,9 +192,13 @@ pub async fn provision_space_signing_key(state: &AppState) {
             .await;
     }
 
-    crate::verification_methods::ensure_atproto_space_method(&state.db, state.db_backend, key)
-        .await
-        .expect("provision #atproto_space key");
+    crate::verification_methods::ensure_atproto_space_method(
+        &state.db,
+        state.db_backend,
+        key.current(),
+    )
+    .await
+    .expect("provision #atproto_space key");
 }
 
 /// A state on the database `TEST_DATABASE_URL` names, or `None` when it names
@@ -249,6 +253,7 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         // Spaces sign every commit with the `#atproto_space` key, which is
         // stored encrypted, so space writes need this set.
         token_encryption_key: Some(TEST_ENCRYPTION_KEY),
+        token_encryption_key_previous: None,
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
         telemetry_collector_url: String::new(),

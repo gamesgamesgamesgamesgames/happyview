@@ -16,6 +16,8 @@ pub mod dev_happyview;
 pub mod dns;
 pub mod domain;
 pub mod domain_middleware;
+#[cfg(test)]
+mod encryption_rotation_tests;
 pub mod error;
 pub mod event_log;
 pub mod external_auth;
@@ -192,7 +194,7 @@ impl AppState {
             self.http.clone(),
             Arc::new(self.lexicons.clone()),
         )
-        .with_encryption_key(self.config.token_encryption_key)
+        .with_encryption_key(self.config.keyring())
         .with_app_state(self.clone())
     }
 }

@@ -43,6 +43,10 @@ pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> 
             running.token_encryption_key != edited.token_encryption_key,
         ),
         (
+            "TOKEN_ENCRYPTION_KEY_PREVIOUS",
+            running.token_encryption_key_previous != edited.token_encryption_key_previous,
+        ),
+        (
             "JETSTREAM_URL",
             running.jetstream_url != edited.jetstream_url,
         ),

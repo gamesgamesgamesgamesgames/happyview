@@ -80,12 +80,16 @@ pub async fn fetch_last_operation(
 }
 
 /// Decrypt an encrypted key from the database and return the raw bytes.
-pub fn decrypt_key(enc_b64: &str, encryption_key: &[u8; 32]) -> Result<Vec<u8>, AppError> {
+pub fn decrypt_key(
+    enc_b64: &str,
+    encryption_key: &crate::plugin::encryption::Keyring,
+) -> Result<Vec<u8>, AppError> {
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(enc_b64)
         .map_err(|e| AppError::Internal(format!("failed to decode key: {e}")))?;
 
-    crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt key: {e}")))
 }
 
@@ -96,7 +100,10 @@ mod tests {
     #[test]
     fn decrypt_key_invalid_base64() {
         let encryption_key = [0x42u8; 32];
-        let result = decrypt_key("not valid base64!!!", &encryption_key);
+        let result = decrypt_key(
+            "not valid base64!!!",
+            &crate::plugin::encryption::Keyring::from(encryption_key),
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -114,7 +121,10 @@ mod tests {
         let encrypted = crate::plugin::encryption::encrypt(&correct_key, &plaintext).unwrap();
         let enc_b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
 
-        let result = decrypt_key(&enc_b64, &wrong_key);
+        let result = decrypt_key(
+            &enc_b64,
+            &crate::plugin::encryption::Keyring::from(wrong_key),
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(

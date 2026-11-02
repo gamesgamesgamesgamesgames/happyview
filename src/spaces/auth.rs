@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 use crate::spaces::credential::{
     DEFAULT_CREDENTIAL_TTL_SECS, SpaceCredentialClaims, make_jti, sign_credential,
 };
@@ -26,7 +26,7 @@ pub struct IssuedCredential {
 pub struct ServiceAuthCtx<'a> {
     pub pool: &'a sqlx::AnyPool,
     pub backend: DatabaseBackend,
-    pub encryption_key: &'a [u8; 32],
+    pub encryption_key: &'a crate::plugin::encryption::Keyring,
     pub public_url: &'a str,
     pub plc_url: &'a str,
 }
@@ -36,7 +36,7 @@ pub async fn issue_credential(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     http: &reqwest::Client,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     public_url: &str,
     plc_url: &str,
     space: &Space,
@@ -214,7 +214,7 @@ pub(crate) async fn writer_admitted(
     space: &Space,
     writer_did: &str,
 ) -> Result<bool, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space policy checks".into())
     })?;
     let auth_ctx = ServiceAuthCtx {
@@ -493,7 +493,7 @@ pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Resu
 pub(crate) async fn space_verifying_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     public_url: &str,
     space: &Space,
 ) -> Result<crate::spaces::commit::SpaceVerifyingKey, AppError> {
@@ -515,7 +515,8 @@ pub(crate) async fn space_verifying_key(
     .map_err(|e| AppError::Internal(format!("failed to look up space signing key: {e}")))?;
     let (encrypted,) =
         row.ok_or_else(|| AppError::Auth("this space has issued no credentials".into()))?;
-    let decrypted = decrypt(encryption_key, &encrypted)
+    let decrypted = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
     let jwk: serde_json::Value = serde_json::from_slice(&decrypted)
         .map_err(|e| AppError::Internal(format!("failed to parse signing key: {e}")))?;
@@ -544,7 +545,7 @@ async fn is_instance_authority(
 async fn get_or_create_signing_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     space: &Space,
 ) -> Result<serde_json::Value, AppError> {
     let sql = adapt_sql(
@@ -558,7 +559,8 @@ async fn get_or_create_signing_key(
         .map_err(|e| AppError::Internal(format!("failed to look up space signing key: {e}")))?;
 
     if let Some((encrypted,)) = row {
-        let decrypted = decrypt(encryption_key, &encrypted)
+        let decrypted = encryption_key
+            .decrypt(&encrypted)
             .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
         let jwk: serde_json::Value = serde_json::from_slice(&decrypted)
             .map_err(|e| AppError::Internal(format!("failed to parse signing key: {e}")))?;
@@ -568,14 +570,14 @@ async fn get_or_create_signing_key(
     let keypair = generate_space_keypair()?;
     let key_bytes = serde_json::to_vec(&keypair.private_jwk)
         .map_err(|e| AppError::Internal(format!("failed to serialize signing key: {e}")))?;
-    let encrypted_signing = encrypt(encryption_key, &key_bytes)
+    let encrypted_signing = encrypt(encryption_key.current(), &key_bytes)
         .map_err(|e| AppError::Internal(format!("failed to encrypt signing key: {e}")))?;
 
     // Rotation key is a separate keypair for recovery
     let rotation_keypair = generate_space_keypair()?;
     let rotation_bytes = serde_json::to_vec(&rotation_keypair.private_jwk)
         .map_err(|e| AppError::Internal(format!("failed to serialize rotation key: {e}")))?;
-    let encrypted_rotation = encrypt(encryption_key, &rotation_bytes)
+    let encrypted_rotation = encrypt(encryption_key.current(), &rotation_bytes)
         .map_err(|e| AppError::Internal(format!("failed to encrypt rotation key: {e}")))?;
 
     let now = now_rfc3339();
@@ -782,7 +784,7 @@ mod tests {
             &pool,
             backend,
             &reqwest::Client::new(),
-            &crate::test_support::TEST_ENCRYPTION_KEY,
+            &crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY),
             "http://happyview.test",
             "http://plc.test",
             &space,
@@ -868,7 +870,7 @@ mod tests {
             &pool,
             backend,
             &reqwest::Client::new(),
-            &key,
+            &crate::plugin::encryption::Keyring::from(key),
             "http://happyview.test",
             "http://plc.test",
             &space,
@@ -901,7 +903,7 @@ mod tests {
             &pool,
             DatabaseBackend::Sqlite,
             &reqwest::Client::new(),
-            &crate::test_support::TEST_ENCRYPTION_KEY,
+            &crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY),
             "http://happyview.test",
             "http://plc.test",
             &space,

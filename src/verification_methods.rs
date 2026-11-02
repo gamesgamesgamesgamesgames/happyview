@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 use happyview_plc::private_key_to_did_key;
 
 // ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ pub async fn get_private_key_bytes(
     db: &AnyPool,
     backend: DatabaseBackend,
     fragment_id: &str,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<Option<Vec<u8>>, AppError> {
     let sql = adapt_sql(
         "SELECT private_key_enc FROM happyview_verification_methods WHERE fragment_id = ?",
@@ -161,7 +161,8 @@ pub async fn get_private_key_bytes(
     let encrypted = STANDARD
         .decode(&encrypted_b64)
         .map_err(|e| AppError::Internal(format!("failed to decode private_key_enc: {e}")))?;
-    let key_bytes = decrypt(encryption_key, &encrypted)
+    let key_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt verification key: {e}")))?;
 
     Ok(Some(key_bytes))
