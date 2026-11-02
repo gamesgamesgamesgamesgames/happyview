@@ -1137,18 +1137,57 @@ jobs:
     # cancellable job, so an informational one failing (coverage, audit)
     # would skip this after a version was already cut, leaving a release
     # with no binaries or images (v3.0.0-alpha.45).
+    #
+    # An alpha cut gets native binaries at most once a day. They cost about $2
+    # a cut, three quarters of it the two macOS legs, and alpha was cutting
+    # twenty a week. The tag and the container images still come with every
+    # cut. A cut skips the build while another native build has succeeded, or
+    # is still running, within `NATIVE_ALPHA_INTERVAL_HOURS`, so a quiet day
+    # builds nothing. `hpy` pins the newest alpha whose release has this
+    # machine's binary, so it follows the last built cut. Any other version
+    # always builds. To build a skipped cut, dispatch it by hand:
+    #
+    #   gh workflow run release.yml --ref vX.Y.Z-alpha.N -f tag=vX.Y.Z-alpha.N
     if: always() && needs.release.result == 'success' && needs.release.outputs.version != ''
     runs-on: depot-ubuntu-24.04
     permissions: {}
+    env:
+      GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+      TAG: v${{ needs.release.outputs.version }}
+      NATIVE_ALPHA_INTERVAL_HOURS: "20"
     steps:
+      - name: Decide whether this cut gets native binaries
+        id: due
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            *-alpha.*) ;;
+            *) echo "due=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          since=$(date -u -d "-$NATIVE_ALPHA_INTERVAL_HOURS hours" +%Y-%m-%dT%H:%M:%SZ)
+          # Only alpha builds count, and one that failed or was cancelled left
+          # no binaries, so it doesn't hold the next cut back. A dispatched
+          # run's head branch is the tag it built.
+          recent=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml \
+            --event workflow_dispatch --limit 100 \
+            --json createdAt,status,conclusion,headBranch \
+            --jq "[.[] | select(.createdAt >= \"$since\")
+                       | select(.headBranch | contains(\"-alpha.\"))
+                       | select(.status != \"completed\" or .conclusion == \"success\")] | length")
+          if [ "$recent" -gt 0 ]; then
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "No native binaries for $TAG: another native build ran in the last $NATIVE_ALPHA_INTERVAL_HOURS hours."
+              echo
+              echo "To build them now: \`gh workflow run release.yml --ref $TAG -f tag=$TAG\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "due=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build native binaries
-        env:
-          GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-        run: >-
-          gh workflow run release.yml
-          --repo "${{ github.repository }}"
-          --ref "v${{ needs.release.outputs.version }}"
-          -f tag="v${{ needs.release.outputs.version }}"
+        if: steps.due.outputs.due == 'true'
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG"
 
   # ---------------------------------------------------------------------------
   # Build + Docker — compile per-platform, push image
