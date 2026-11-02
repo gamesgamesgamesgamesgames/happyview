@@ -96,6 +96,12 @@ async function spaceRowFor(
 }
 
 test.describe("Space inspector", () => {
+  // `page.request` runs outside the browser and sends no fetch metadata, and
+  // the session cookie counts on XRPC only on a request from the instance's
+  // own pages. The browser's own requests carry it as they would for an
+  // operator.
+  test.use({ extraHTTPHeaders: { "sec-fetch-site": "same-origin" } });
+
   let spaceUri: string | null = null;
   let spacesSetting: string | null = null;
 
