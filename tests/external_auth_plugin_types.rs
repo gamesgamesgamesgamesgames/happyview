@@ -67,6 +67,10 @@ async fn only_auth_plugins_are_sign_in_providers() {
     registry
         .register(plugin("kinds_interpreter", "interpreter"))
         .await;
+    // A plugin with no manifest is an auth plugin.
+    let mut bare = plugin("kinds_bare", "auth");
+    bare.manifest = None;
+    registry.register(bare).await;
 
     let providers = app.get_json("/external-auth/providers").await;
     let ids: Vec<&str> = providers
@@ -76,6 +80,7 @@ async fn only_auth_plugins_are_sign_in_providers() {
         .filter_map(|p| p["id"].as_str())
         .collect();
     assert!(ids.contains(&"kinds_auth"), "{ids:?}");
+    assert!(ids.contains(&"kinds_bare"), "{ids:?}");
     assert!(!ids.contains(&"kinds_library"), "{ids:?}");
     assert!(!ids.contains(&"kinds_interpreter"), "{ids:?}");
 
