@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::AppState;
 
 /// Register the `http` table with async HTTP request functions.
-pub fn register_http_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
+pub fn register_http_api(lua: &Lua, _state: Arc<AppState>) -> LuaResult<()> {
     let http_table = lua.create_table()?;
 
     let methods = [
@@ -18,13 +18,14 @@ pub fn register_http_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     ];
 
     for (name, method) in methods {
-        let state_clone = state.clone();
         let func =
             lua.create_async_function(move |lua, (url, opts): (String, Option<mlua::Table>)| {
-                let state = state_clone.clone();
                 let method = method.clone();
                 async move {
-                    let mut builder = state.http.request(method.clone(), &url);
+                    // The script names this URL itself, so it goes through the
+                    // client `ALLOW_PRIVATE_HOSTS` reaches; see `crate::outbound`.
+                    let mut builder =
+                        crate::http_retry::plugin_client().request(method.clone(), &url);
 
                     if let Some(ref opts) = opts {
                         if let Ok(headers_table) = opts.get::<mlua::Table>("headers") {
