@@ -106,6 +106,7 @@ mod tests {
     const KEY: [u8; 32] = [0x42; 32];
 
     #[tokio::test]
+    #[serial_test::serial(delegation_key)]
     async fn generated_once_and_reused() {
         for (pool, backend) in test_pools().await {
             crate::db::query("DELETE FROM happyview_delegation_key")
@@ -129,6 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(delegation_key)]
     async fn not_the_encryption_key_and_never_stored_unsealed() {
         for (pool, backend) in test_pools().await {
             crate::db::query("DELETE FROM happyview_delegation_key")
