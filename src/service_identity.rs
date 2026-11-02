@@ -37,6 +37,7 @@ impl IdentityMode {
 pub struct ServiceIdentity {
     pub mode: IdentityMode,
     pub did: Option<String>,
+    #[serde(skip_serializing)]
     pub signing_key_enc: Option<String>,
     pub attached_account_did: Option<String>,
     pub setup_complete: bool,

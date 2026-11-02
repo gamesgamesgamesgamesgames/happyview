@@ -199,6 +199,7 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_labeler_subscriptions",
                 "happyview_labels",
                 "happyview_instance_settings",
+                "happyview_attestation_key",
                 "happyview_domains",
                 "happyview_jobs",
                 "happyview_oauth_sessions",

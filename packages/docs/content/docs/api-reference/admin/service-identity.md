@@ -74,7 +74,6 @@ Returns the current service identity configuration, or `null` if no identity has
 | ---------------------- | ----------- | ------------------------------------------------- |
 | `mode`                 | string      | Identity mode (see below)                         |
 | `did`                  | string/null | The service DID                                   |
-| `signing_key_enc`      | string/null | Encrypted signing key (present for `did_plc`)     |
 | `attached_account_did` | string/null | Linked account DID (present for `attach_account`) |
 | `setup_complete`       | boolean     | Whether identity setup has been completed         |
 | `created_at`           | string      | ISO 8601 timestamp                                |
@@ -156,5 +155,7 @@ curl -X PUT http://127.0.0.1:3000/admin/service-identity \
 | `signing_key_enc`      | string | No       | Encrypted signing key (for `did_plc`)                    |
 | `rotation_key_enc`     | string | No       | Encrypted rotation key (for `did_plc`)                   |
 | `attached_account_did` | string | No       | Account DID to attach (for `attach_account`)             |
+
+Keys aren't returned by `GET`. An update that keeps the same `mode` leaves stored keys in place when it omits them; changing `mode` clears any it omits.
 
 **Response**: `204 No Content`
