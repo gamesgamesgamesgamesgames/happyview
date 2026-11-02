@@ -80,6 +80,15 @@ pub(super) async fn create_user(
         return Err(AppError::Conflict(format!("user '{did}' already exists")));
     }
 
+    // The seats limit (HAP-225). Only this route adds a seat: the owner's
+    // own paths (the first sign-in, the configured superadmin, the platform
+    // setting its owner) are never refused, so an instance always has one.
+    let in_use = crate::limits::seats_in_use(&state.db, backend).await?;
+    state
+        .limits
+        .limits()
+        .check(happyview_provider::Limit::Seats, in_use)?;
+
     crate::db::query(&insert_sql)
         .bind(&user_id)
         .bind(&did)

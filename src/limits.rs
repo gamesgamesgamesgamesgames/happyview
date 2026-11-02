@@ -227,6 +227,18 @@ impl LimitsProvider for FileLimits {
     }
 }
 
+/// Admin users, the super user included: what the `seats` limit counts.
+pub async fn seats_in_use(
+    db: &sqlx::AnyPool,
+    _backend: crate::db::DatabaseBackend,
+) -> Result<u32, crate::error::AppError> {
+    let (n,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_users")
+        .fetch_one(db)
+        .await
+        .map_err(|e| crate::error::AppError::Internal(format!("user count failed: {e}")))?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

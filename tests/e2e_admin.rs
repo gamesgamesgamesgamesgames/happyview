@@ -1681,3 +1681,132 @@ async fn admin_create_duplicate_did_conflicts() {
         .unwrap();
     assert_eq!(second.status(), StatusCode::CONFLICT);
 }
+
+/// HAP-225: with a seats limit, adding an admin past it is refused with the
+/// host's words, and nothing is added; an existing admin still works.
+#[tokio::test]
+#[serial]
+async fn adding_an_admin_past_the_seats_limit_is_refused() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    // The test admin is one seat; a second fits a limit of 2, a third doesn't.
+    app.state.limits = std::sync::Arc::new(happyview_provider::FixedLimits::new(
+        happyview_provider::Limits {
+            seats: Some(happyview_provider::Cap {
+                max: 2,
+                wording: happyview_provider::Wording {
+                    message: Some("Your plan includes 2 seats.".into()),
+                    action_url: Some("https://host.example/plan".into()),
+                    action_label: Some("Change plan".into()),
+                },
+            }),
+            ..Default::default()
+        },
+    ));
+    app.rebuild_router();
+
+    let add = |did: &str| admin_post("/admin/users", app.admin_cookie(), &json!({ "did": did }));
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:second"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:third"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(resp).await,
+        json!({
+            "error": "LimitReached",
+            "limit": "seats",
+            "max": 2,
+            "current": 2,
+            "message": "Your plan includes 2 seats.",
+            "actionUrl": "https://host.example/plan",
+            "actionLabel": "Change plan",
+        })
+    );
+
+    let (count,): (i64,) = happyview::db::query_as("SELECT COUNT(*) FROM happyview_users")
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "the refused admin was not added");
+
+    // Re-adding someone already there is still a conflict, not a limit.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:second"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// HAP-225: a limit lowered under the admins already there takes none away.
+#[tokio::test]
+#[serial]
+async fn a_lowered_seats_limit_keeps_every_admin() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/users",
+            app.admin_cookie(),
+            &json!({ "did": "did:plc:kept" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    app.state.limits = std::sync::Arc::new(happyview_provider::FixedLimits::new(
+        happyview_provider::Limits {
+            seats: Some(happyview_provider::Cap {
+                max: 1,
+                wording: Default::default(),
+            }),
+            ..Default::default()
+        },
+    ));
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/lexicons",
+            common::auth::admin_cookie_header("did:plc:kept", &app.state.cookie_key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an admin over the limit keeps working"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/users",
+            app.admin_cookie(),
+            &json!({ "did": "did:plc:more" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(resp).await["message"],
+        "This instance allows 1 admin."
+    );
+}

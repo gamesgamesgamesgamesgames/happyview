@@ -6,7 +6,9 @@ Whoever hosts a HappyView instance can limit what it holds: how many admins, how
 
 Limits are checked inside the instance, against limits it already holds. A check never calls out to the host, so an instance keeps answering while whatever set its limits is down.
 
-> No limit is enforced yet. This page describes how limits are set and how a refusal looks; each limit is enforced in a later release.
+## What each limit refuses
+
+- **`seats`:** adding an admin through the admin API (`POST /admin/users`) when the instance already has `max` admins, the super user included. The owner's own ways in are never refused: the first sign-in, the configured superadmin, and a host setting its owner.
 
 ## The limits
 
