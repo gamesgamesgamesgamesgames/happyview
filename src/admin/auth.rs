@@ -19,7 +19,8 @@ use super::permissions::Permission;
 pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
-/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately tiny.
+/// (`require_domain_read`, `require_domain_write`, `require_rotation_read`,
+/// `is_platform`). Deliberately tiny.
 const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
 
 #[derive(Clone)]
@@ -45,6 +46,17 @@ impl UserAuth {
     /// can manage domains without receiving `settings:manage`, which covers far
     /// more than domains.
     pub async fn require_domain_read(&self) -> Result<(), AppError> {
+        if self.is_platform {
+            return Ok(());
+        }
+        self.require(Permission::SettingsManage).await
+    }
+
+    /// Reading what a key rotation still has to re-seal: the platform
+    /// principal, so its hosting platform can tell when the previous key can
+    /// go, or anyone holding `settings:manage`. It sees counts only, never a
+    /// value, and starting a re-seal still needs `settings:manage`.
+    pub async fn require_rotation_read(&self) -> Result<(), AppError> {
         if self.is_platform {
             return Ok(());
         }
