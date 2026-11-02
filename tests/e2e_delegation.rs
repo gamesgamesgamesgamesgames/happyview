@@ -8,7 +8,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1255,217 @@ async fn delegated_write_admin_success() {
     let body = response_json(resp).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cid"], "bafyadmin456");
+}
+
+/// A `createGame` body calling `function` with `args`, under `delegate_did`.
+fn delegated_call(function: &str, args: Value, delegate_did: &str) -> Value {
+    json!({
+        "library": "sdk_caller",
+        "function": function,
+        "args": [args],
+        "delegateDid": delegate_did
+    })
+}
+
+async fn delete_sessions_of(app: &common::app::TestApp, user_did: &str) {
+    let sql = adapt_sql(
+        "DELETE FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(user_did)
+        .execute(&app.state.db)
+        .await
+        .expect("delete the sessions");
+}
+
+/// A delegated account with no session under the app still lets a script run
+/// that writes only to the caller's repo; a write to its own repo is refused
+/// with the account named, and nothing reaches a PDS for it.
+#[tokio::test]
+#[serial]
+async fn a_delegated_account_without_a_session_refuses_only_writes_to_its_repo() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
+
+    let owner_did = "did:plc:dw_owner6";
+    let target_did = "did:plc:dw_studio6";
+    let (owner_key, _secret, owner_dpop, owner_token) =
+        setup_linked_account(&app, owner_did, target_did).await;
+    delete_sessions_of(&app, target_did).await;
+    update_session_pds_url(&app, owner_did, &app.mock_server.uri()).await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.createRecord"))
+        .and(body_partial_json(json!({ "repo": owner_did })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{owner_did}/games.gamesgamesgamesgames.game/own1"),
+            "cid": "bafyown"
+        })))
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+
+    let own = delegated_call(
+        "create_record",
+        json!({
+            "repo": owner_did,
+            "collection": "games.gamesgamesgamesgames.game",
+            "record": { "title": "Mine" },
+            "validate": false
+        }),
+        target_did,
+    );
+    let resp = dpop_post(
+        &app,
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        &own,
+        &owner_key,
+        &owner_dpop,
+        &owner_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cid"], "bafyown");
+
+    let resp = dpop_post(
+        &app,
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        &create_game("Studio Game", target_did),
+        &owner_key,
+        &owner_dpop,
+        &owner_token,
+    )
+    .await;
+    let body = response_json(resp).await;
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("{target_did} has no session with this app")),
+        "{body}"
+    );
+}
+
+/// With several sessions for the delegated account, a write goes out under
+/// the most recently stored one. The stale session is the first stored and
+/// the fresh one has the highest key id, so an unordered lookup reads the
+/// stale one first whether it scans by row or by the key index.
+#[tokio::test]
+#[serial]
+async fn a_delegated_write_uses_the_delegated_accounts_newest_session() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
+
+    let owner_did = "did:plc:dw_owner7";
+    let target_did = "did:plc:dw_studio7";
+    let (owner_key, _secret, owner_dpop, owner_token) =
+        setup_linked_account(&app, owner_did, target_did).await;
+    update_session_pds_url(&app, target_did, &app.mock_server.uri()).await;
+
+    let fresh_key = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    for (sql, binds) in [
+        (
+            "INSERT INTO happyview_dpop_keys (id, provision_id, api_client_id, private_key_enc, jwk_thumbprint, pkce_challenge, created_at) \
+             SELECT ?, 'fresh-provision', k.api_client_id, k.private_key_enc, k.jwk_thumbprint, k.pkce_challenge, k.created_at \
+             FROM happyview_dpop_keys k JOIN happyview_dpop_sessions s ON s.dpop_key_id = k.id WHERE s.user_did = ?",
+            [fresh_key, target_did],
+        ),
+        (
+            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at) \
+             SELECT 'fresh-session', api_client_id, ?, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at \
+             FROM happyview_dpop_sessions WHERE user_did = ?",
+            [fresh_key, target_did],
+        ),
+        (
+            "UPDATE happyview_dpop_sessions SET pds_url = 'http://127.0.0.1:9', updated_at = '2000-01-01T00:00:00+00:00' \
+             WHERE dpop_key_id <> ? AND user_did = ?",
+            [fresh_key, target_did],
+        ),
+    ] {
+        happyview::db::query(&adapt_sql(sql, app.state.db_backend))
+            .bind(binds[0])
+            .bind(binds[1])
+            .execute(&app.state.db)
+            .await
+            .expect("arrange a stale and a fresh session");
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.createRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{target_did}/games.gamesgamesgamesgames.game/new1"),
+            "cid": "bafynewest"
+        })))
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+
+    let resp = dpop_post(
+        &app,
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        &create_game("Studio Game", target_did),
+        &owner_key,
+        &owner_dpop,
+        &owner_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cid"], "bafynewest");
+}
+
+/// A delegated script's blob goes to the delegated account's repo, where a
+/// record it writes can reference it. Only that account's session points at
+/// the mock PDS.
+#[tokio::test]
+#[serial]
+async fn a_delegated_blob_upload_goes_to_the_delegated_accounts_repo() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    seed_procedure_lexicon(&app).await;
+    seed_create_game_script(&app).await;
+
+    let owner_did = "did:plc:dw_owner8";
+    let target_did = "did:plc:dw_studio8";
+    let (owner_key, _secret, owner_dpop, owner_token) =
+        setup_linked_account(&app, owner_did, target_did).await;
+    update_session_pds_url(&app, target_did, &app.mock_server.uri()).await;
+
+    let blob = json!({
+        "$type": "blob",
+        "ref": { "$link": "bafkreiblob" },
+        "mimeType": "image/png",
+        "size": 2
+    });
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.uploadBlob"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "blob": blob })))
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+
+    let resp = dpop_post(
+        &app,
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        &delegated_call(
+            "upload_blob",
+            json!({ "bytes": "hi", "mime_type": "image/png" }),
+            target_did,
+        ),
+        &owner_key,
+        &owner_dpop,
+        &owner_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 // ---------------------------------------------------------------------------

@@ -33,11 +33,14 @@ impl CallerSession {
         self.delegate_did.as_deref().unwrap_or(&self.did)
     }
 
-    /// The session a write to `repo` goes out under.
-    pub(crate) fn auth_for(&self, repo: &str) -> &PdsAuth {
-        match &self.delegate_pds_auth {
-            Some(auth) if self.delegate_did.as_deref() == Some(repo) => auth,
-            _ => &self.pds_auth,
+    /// The session a write to `repo` goes out under: the delegated account's
+    /// own for its repo, the caller's for anything else. `None` names the
+    /// delegated account that has no session with this app.
+    pub(crate) fn auth_for(&self, repo: &str) -> Result<&PdsAuth, &str> {
+        match (self.delegate_did.as_deref(), &self.delegate_pds_auth) {
+            (Some(did), Some(auth)) if did == repo => Ok(auth),
+            (Some(did), None) if did == repo => Err(did),
+            _ => Ok(&self.pds_auth),
         }
     }
 }

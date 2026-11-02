@@ -220,21 +220,29 @@ pub async fn execute_procedure_script(
             .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
             .to_string();
         // The procedure handler has already checked that the caller may write
-        // for `delegate_did` under this same api client.
+        // for `delegate_did` under this same api client. A delegated account
+        // with no session here can still run a script that never writes to
+        // its repo; a write that does is refused by `auth_for`.
         if let Some(did) = delegate_did {
-            let target = crate::oauth::sessions::get_dpop_session_for_user(
+            match crate::oauth::sessions::get_dpop_session_for_user(
                 &state.db,
                 backend,
                 encryption_key,
                 &api_client_id,
                 did,
             )
-            .await?;
-            delegate_pds_auth = Some(Arc::new(repo::PdsAuth::Dpop {
-                api_client_id: api_client_id.clone(),
-                dpop_key_id: target.dpop_key_id,
-                encryption_key: *encryption_key,
-            }));
+            .await
+            {
+                Ok(target) => {
+                    delegate_pds_auth = Some(Arc::new(repo::PdsAuth::Dpop {
+                        api_client_id: api_client_id.clone(),
+                        dpop_key_id: target.dpop_key_id,
+                        encryption_key: *encryption_key,
+                    }));
+                }
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         Some(repo::PdsAuth::Dpop {
             api_client_id,
