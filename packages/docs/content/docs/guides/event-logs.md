@@ -110,6 +110,14 @@ Logged when [record/label scripts](./record-scripts.md) run. `script.executed` f
 
 See [Backfill](./backfill.md) for background on backfill jobs.
 
+### Audit log events
+
+| Event Type                     | Severity | Subject                                                                       | Detail       |
+| ------------------------------ | -------- | ----------------------------------------------------------------------------- | ------------ |
+| `event_logs.retention_changed` | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
+
+Logged when a retention setting's effective value changes, fallbacks included. An unset or unparseable value counts as its default: 30 days for `event_log_retention_days`, and for `space_access_log_retention_days` 0 (keep forever) while `event_log_retention_days` is 0 and 365 otherwise. Saving a setting back to its current or default value logs nothing. Because protected retention can follow the general setting, one change can log an event for each key. `from` and `to` are the effective day counts. The setting and its event are saved together: if the event can't be written, the setting isn't changed. See [Protected events](#protected-events) below.
+
 ### Jetstream events
 
 | Event Type                          | Severity | Subject     | Detail                                                                |
@@ -315,13 +323,31 @@ See the [Admin API reference](../api-reference/admin/events.md#list-event-logs) 
 
 ## Retention
 
-Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period. Background jobs' own log lines are deleted on the same schedule.
+Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period. Background jobs' own log lines are deleted on the same schedule. [Protected events](#protected-events) follow a schedule of their own.
 
 Set `EVENT_LOG_RETENTION_DAYS=0` to disable automatic cleanup and keep logs indefinitely.
 
 [Stored script metrics](../api-reference/admin/metrics.md#retention) follow the same retention, so one setting covers both.
 
 See [Configuration](../getting-started/configuration.md) for all environment variables.
+
+## Protected events
+
+Some event types record access to private space data, or changes to the audit trail itself, and can't be purged by hand:
+
+- `space.access_granted`
+- `space.access_revoked`
+- `space.moderator_read`
+- `space_inspector.enabled`
+- `space_inspector.disabled`
+- `event_logs.purged`
+- `event_logs.retention_changed`
+
+`POST /admin/events/purge` excludes them: a filter naming one of these types, or a category that contains one, returns `400 Bad Request`. `GET /admin/events/count`, the purge preview, never counts them either.
+
+They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever; when unset it follows an `event_log_retention_days` of `0`). The events tied to an access grant that still exists, meaning its grant and revocation events and the reads made under it, are kept whatever their age, so a grant's reason and reads last as long as the grant does. Other protected events keep their own schedule. The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
+
+Protected events live in the same database table as every other event log row. This is a safeguard against a routine or accidental purge, not a tamper-proof audit log — anyone with direct access to the database can still delete them.
 
 ## Dead Letters
 

@@ -6,7 +6,7 @@
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql};
-use crate::event_log::EventFilter;
+use crate::event_log::{EventFilter, ProtectedEvents};
 
 use super::super::{Job, db};
 use super::NativeOutcome;
@@ -39,6 +39,9 @@ fn filter_from_input(input: &serde_json::Value) -> EventFilter {
         subject: field("subject"),
         after: field("after"),
         before: field("before"),
+        // Protected events are never purged, whatever the input says; see
+        // `event_log::PROTECTED_EVENT_TYPES`.
+        protected: ProtectedEvents::Exclude,
     }
 }
 
