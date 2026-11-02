@@ -33,7 +33,16 @@ fn post_json_with_headers(uri: &str, body: &Value, headers: Vec<(&str, &str)>) -
 
 /// Set up a full DPoP session and return `(client_key, dpop_key, access_token)`.
 async fn setup_dpop_session(app: &common::app::TestApp, user_did: &str) -> (String, Value, String) {
-    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let (client_key, dpop_key, access_token, _id) = setup_app_session(app, user_did).await;
+    (client_key, dpop_key, access_token)
+}
+
+/// [`setup_dpop_session`], also returning the new top-level app's id.
+async fn setup_app_session(
+    app: &common::app::TestApp,
+    user_did: &str,
+) -> (String, Value, String, String) {
+    let (client_key, client_secret, id) = app.create_api_client("confidential", None).await;
 
     // 1. Provision DPoP key
     let key_req = post_json_with_headers(
@@ -78,7 +87,232 @@ async fn setup_dpop_session(app: &common::app::TestApp, user_did: &str) -> (Stri
         "session registration failed"
     );
 
-    (client_key, dpop_key, access_token)
+    (client_key, dpop_key, access_token, id)
+}
+
+/// Inserts a client owned by `owner_did` as if `parent_id` had created it.
+async fn insert_child_client(
+    app: &common::app::TestApp,
+    owner_did: &str,
+    parent_id: &str,
+    name: &str,
+) -> String {
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did, parent_client_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&client_id)
+        .bind(format!("hvc_{}", uuid::Uuid::new_v4().simple()))
+        .bind("dummyhash")
+        .bind(name)
+        .bind(format!("https://{name}.example.com/oauth/{client_id}"))
+        .bind(format!("https://{name}.example.com"))
+        .bind("[]")
+        .bind("atproto")
+        .bind("confidential")
+        .bind::<Option<String>>(None)
+        .bind(owner_did)
+        .bind(&now)
+        .bind(&now)
+        .bind(owner_did)
+        .bind(parent_id)
+        .execute(&app.state.db)
+        .await
+        .expect("failed to insert child client");
+    client_id
+}
+
+/// A request to one of the endpoints below, as the app holding `session`.
+fn app_request(
+    session: &(String, Value, String),
+    method: &str,
+    nsid: &str,
+    query: &str,
+    body: Option<&Value>,
+) -> Request<Body> {
+    let (client_key, dpop_key, access_token) = session;
+    let url = format!("http://127.0.0.1:0/xrpc/{nsid}");
+    let proof = generate_dpop_proof(dpop_key, method, &url, access_token, None)
+        .expect("failed to generate DPoP proof");
+    let builder = Request::builder()
+        .method(method)
+        .uri(format!("/xrpc/{nsid}{query}"))
+        .header("host", "127.0.0.1:0")
+        .header("x-client-key", client_key)
+        .header("authorization", format!("DPoP {access_token}"))
+        .header("dpop", proof);
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+async fn send(app: &common::app::TestApp, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, response_json(resp).await)
+}
+
+fn listed_ids(body: &Value) -> Vec<String> {
+    body["clients"]
+        .as_array()
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|c| c["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Scope across apps
+// ---------------------------------------------------------------------------
+
+/// An app holding a user's session reaches only the clients it created, not
+/// those the same user created through another app.
+#[tokio::test]
+#[serial]
+async fn an_app_manages_only_the_clients_it_created() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let user_did = "did:plc:testownerscope";
+    let (a_key, a_dpop, a_token, a_id) = setup_app_session(&app, user_did).await;
+    let a = (a_key, a_dpop, a_token);
+    let (b_key, b_dpop, b_token, b_id) = setup_app_session(&app, user_did).await;
+    let b = (b_key, b_dpop, b_token);
+    let of_a = insert_child_client(&app, user_did, &a_id, "of-a").await;
+    let of_b = insert_child_client(&app, user_did, &b_id, "of-b").await;
+    let get = |id: &str| format!("?id={id}");
+
+    let (status, body) = send(
+        &app,
+        app_request(&b, "GET", "dev.happyview.listApiClients", "", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&body), vec![of_b.clone()], "{body}");
+
+    let (status, _) = send(
+        &app,
+        app_request(&b, "GET", "dev.happyview.getApiClient", &get(&of_a), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another app's client is not found"
+    );
+
+    let (status, _) = send(
+        &app,
+        app_request(
+            &b,
+            "POST",
+            "dev.happyview.deleteApiClient",
+            "",
+            Some(&json!({ "id": of_a })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another app's client is not deleted"
+    );
+
+    let (status, body) = send(
+        &app,
+        app_request(&a, "GET", "dev.happyview.getApiClient", &get(&of_a), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the creating app still reads it");
+    assert_eq!(body["client"]["id"], json!(of_a));
+
+    let (status, body) = send(
+        &app,
+        app_request(&a, "GET", "dev.happyview.listApiClients", "", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&body), vec![of_a.clone()], "{body}");
+
+    let (status, _) = send(
+        &app,
+        app_request(
+            &a,
+            "POST",
+            "dev.happyview.deleteApiClient",
+            "",
+            Some(&json!({ "id": of_a })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the creating app deletes it");
+}
+
+/// A child client manages no clients, its siblings included.
+#[tokio::test]
+#[serial]
+async fn a_child_client_manages_none() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let user_did = "did:plc:testownerchild";
+    let (_, _, _, parent_id) = setup_app_session(&app, user_did).await;
+    let (c_key, c_dpop, c_token, c_id) = setup_app_session(&app, user_did).await;
+    let child = (c_key, c_dpop, c_token);
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_api_clients SET parent_client_id = ?, owner_did = ? WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&parent_id)
+        .bind(user_did)
+        .bind(&c_id)
+        .execute(&app.state.db)
+        .await
+        .expect("failed to make the client a child");
+    let sibling = insert_child_client(&app, user_did, &parent_id, "sibling").await;
+
+    for req in [
+        app_request(&child, "GET", "dev.happyview.listApiClients", "", None),
+        app_request(
+            &child,
+            "GET",
+            "dev.happyview.getApiClient",
+            &format!("?id={sibling}"),
+            None,
+        ),
+        app_request(
+            &child,
+            "POST",
+            "dev.happyview.deleteApiClient",
+            "",
+            Some(&json!({ "id": sibling })),
+        ),
+    ] {
+        let uri = req.uri().to_string();
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+
+    let sql = happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_api_clients WHERE id = ?",
+        app.state.db_backend,
+    );
+    let (count,): (i64,) = happyview::db::query_as(&sql)
+        .bind(&sibling)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the sibling survives");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,14 +529,14 @@ async fn delete_api_client_success() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     let user_did = "did:plc:testownerdelete";
-    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, user_did).await;
+    let (client_key, dpop_key, access_token, app_id) = setup_app_session(&app, user_did).await;
 
-    // Insert a client owned by user_did.
+    // Insert a client the session's app created for user_did.
     let client_id = uuid::Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
-        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did, parent_client_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     happyview::db::query(&sql)
@@ -320,6 +554,7 @@ async fn delete_api_client_success() {
         .bind(&now)
         .bind(&now)
         .bind(user_did)
+        .bind(&app_id)
         .execute(&app.state.db)
         .await
         .expect("failed to insert client for deletion test");
@@ -408,14 +643,14 @@ async fn get_api_client_returns_client() {
     common::require_db!();
     let app = common::app::TestApp::new_with_encryption().await;
     let user_did = "did:plc:testownerget";
-    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, user_did).await;
+    let (client_key, dpop_key, access_token, app_id) = setup_app_session(&app, user_did).await;
 
-    // Insert a child client owned by user_did directly.
+    // Insert a client the session's app created for user_did.
     let client_id = uuid::Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
-        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did, parent_client_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     happyview::db::query(&sql)
@@ -433,6 +668,7 @@ async fn get_api_client_returns_client() {
         .bind(&now)
         .bind(&now)
         .bind(user_did)
+        .bind(&app_id)
         .execute(&app.state.db)
         .await
         .expect("failed to insert owned client");

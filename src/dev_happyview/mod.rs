@@ -10,6 +10,54 @@ pub use list_clients::list_api_clients;
 
 use serde::{Deserialize, Serialize};
 
+use crate::AppState;
+use crate::auth::Claims;
+use crate::db::adapt_sql;
+use crate::error::AppError;
+
+/// Whose API clients a request may read or delete.
+pub(crate) enum Manager {
+    /// The user at this instance, with no client key: all the clients they own.
+    Owner,
+    /// A top-level app: only the clients it created, by its `id`. Holding a
+    /// user's session does not let one app reach the clients the user made
+    /// through another.
+    App(String),
+}
+
+impl Manager {
+    pub(crate) async fn of(state: &AppState, claims: &Claims) -> Result<Self, AppError> {
+        let Some(client_key) = claims.client_key() else {
+            return Ok(Self::Owner);
+        };
+        let sql = adapt_sql(
+            "SELECT id, parent_client_id FROM happyview_api_clients WHERE client_key = ?",
+            state.db_backend,
+        );
+        let row: Option<(String, Option<String>)> = crate::db::query_as(&sql)
+            .bind(client_key)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("client lookup failed: {e}")))?;
+        match row {
+            Some((id, None)) => Ok(Self::App(id)),
+            Some((_, Some(_))) => Err(AppError::Forbidden(
+                "Child clients cannot manage API clients".into(),
+            )),
+            None => Err(AppError::Auth("Invalid client".into())),
+        }
+    }
+
+    /// The condition to add to a query already filtered by `owner_did`, and
+    /// the app id it binds, if any.
+    pub(crate) fn filter(self) -> (&'static str, Option<String>) {
+        match self {
+            Self::Owner => ("", None),
+            Self::App(id) => (" AND parent_client_id = ?", Some(id)),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiClientView {

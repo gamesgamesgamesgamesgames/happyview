@@ -283,3 +283,51 @@ async fn refuses_a_delegation_token_that_was_already_exchanged() {
         json!("InvalidDelegationToken")
     );
 }
+
+/// HappyView signs its delegation tokens with a key of its own, stored sealed,
+/// not with the encryption key used as a signing key. A token signed that way,
+/// as every token was before, is refused, and asking again gets a good one.
+#[tokio::test]
+#[serial]
+async fn refuses_a_delegation_token_signed_with_the_encryption_key() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let fresh = setup_and_get_delegation_token(&app).await;
+
+    let legacy_key = k256::ecdsa::SigningKey::from_slice(&common::db::TEST_ENCRYPTION_KEY).unwrap();
+    let now = chrono::Utc::now().timestamp() as u64;
+    let token = sign_delegation_token(
+        &DelegationTokenClaims {
+            iss: MEMBER.to_string(),
+            sub: space_uri(),
+            aud: format!("{AUTHORITY}#atproto_space_host"),
+            iat: now,
+            exp: now + 60,
+            jti: Uuid::new_v4().to_string(),
+        },
+        &legacy_key,
+    )
+    .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidDelegationToken")
+    );
+
+    let retry = app
+        .router
+        .clone()
+        .oneshot(credential_req(&fresh, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+}

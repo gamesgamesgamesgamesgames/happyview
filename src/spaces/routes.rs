@@ -3,7 +3,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
-use k256;
 use serde::Deserialize;
 
 use crate::AppState;
@@ -553,7 +552,15 @@ async fn list_spaces(
     Query(query): Query<ListSpacesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let did = query.did.unwrap_or_else(|| claims.did().to_string());
+    let caller = claims.did();
+    let did = query.did.unwrap_or_else(|| caller.to_string());
+    // Another account's memberships are its own business; only a super admin
+    // may ask for them, as with `getSpace`.
+    if did != caller && !service::is_super_admin(&state, caller).await? {
+        return Err(AppError::Forbidden(
+            "listSpaces lists only the caller's own spaces".into(),
+        ));
+    }
     let limit = query.limit.unwrap_or(50).min(100);
 
     let (views, cursor) = db::list_spaces_for_user(
@@ -1188,8 +1195,9 @@ async fn get_delegation_token(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+    let signing_key =
+        crate::spaces::delegation_key::load_or_create(&state.db, state.db_backend, encryption_key)
+            .await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1891,22 +1899,37 @@ async fn get_space_credential(
     // A PDS that serves spaces mints delegation tokens with the account's own
     // key. For accounts on one that does not, HappyView mints them with its own
     // delegation key.
-    let delegation_claims =
-        match verify_local_delegation_token(encryption_key, &token, &accepted_aud) {
-            Ok(claims) => claims,
-            Err(_) => crate::spaces::credential::verify_account_delegation_token(
-                &token,
-                &state.http,
-                &state.config.plc_url,
-                &accepted_aud,
-            )
+    // A key that cannot be read leaves only the account's own key to try, as
+    // a token this instance signed cannot be verified without it anyway.
+    let local_key =
+        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
             .await
-            .map_err(|e| AppError::XrpcError {
-                status: StatusCode::BAD_REQUEST,
-                code: "InvalidDelegationToken",
-                message: e.to_string(),
-            })?,
-        };
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "delegation key unreadable");
+                None
+            });
+    let local_claims = local_key.as_ref().map(|key| {
+        crate::spaces::credential::verify_delegation_token(
+            &token,
+            key.verifying_key(),
+            &accepted_aud,
+        )
+    });
+    let delegation_claims = match local_claims {
+        Some(Ok(claims)) => claims,
+        _ => crate::spaces::credential::verify_account_delegation_token(
+            &token,
+            &state.http,
+            &state.config.plc_url,
+            &accepted_aud,
+        )
+        .await
+        .map_err(|e| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: e.to_string(),
+        })?,
+    };
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
@@ -1971,21 +1994,6 @@ async fn get_space_credential(
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
-}
-
-/// Verify a delegation token HappyView minted with its own delegation key.
-fn verify_local_delegation_token(
-    encryption_key: &[u8; 32],
-    token: &str,
-    accepted_aud: &[&str],
-) -> Result<crate::spaces::credential::DelegationTokenClaims, AppError> {
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
-    crate::spaces::credential::verify_delegation_token(
-        token,
-        &k256::ecdsa::VerifyingKey::from(&signing_key),
-        accepted_aud,
-    )
 }
 
 #[cfg(test)]

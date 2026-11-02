@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 
-use super::DeleteApiClientInput;
+use super::{DeleteApiClientInput, Manager};
 use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::adapt_sql;
@@ -45,15 +45,20 @@ pub async fn delete_api_client(
 
     let user_did = claims.did().to_string();
     let id = input.id;
+    let (filter, app_id) = Manager::of(&state, &claims).await?.filter();
 
-    // 3. Look up client_id_url and client_key before deleting (scoped to owner)
+    // 3. Look up client_id_url and client_key before deleting (scoped to owner and app)
     let lookup_sql = adapt_sql(
-        "SELECT client_id_url, client_key FROM happyview_api_clients WHERE id = ? AND owner_did = ?",
+        &format!(
+            "SELECT client_id_url, client_key FROM happyview_api_clients WHERE id = ? AND owner_did = ?{filter}"
+        ),
         state.db_backend,
     );
-    let client_info: Option<(String, String)> = crate::db::query_as(&lookup_sql)
-        .bind(&id)
-        .bind(&user_did)
+    let mut lookup = crate::db::query_as(&lookup_sql).bind(&id).bind(&user_did);
+    if let Some(app_id) = &app_id {
+        lookup = lookup.bind(app_id);
+    }
+    let client_info: Option<(String, String)> = lookup
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to look up api client: {e}")))?;
@@ -69,14 +74,16 @@ pub async fn delete_api_client(
         .await
         .unwrap_or_default();
 
-    // 5. Delete from DB — scoped to owner_did so users cannot delete others' clients
+    // 5. Delete from DB, scoped as the lookup is
     let delete_sql = adapt_sql(
-        "DELETE FROM happyview_api_clients WHERE id = ? AND owner_did = ?",
+        &format!("DELETE FROM happyview_api_clients WHERE id = ? AND owner_did = ?{filter}"),
         state.db_backend,
     );
-    let result = crate::db::query(&delete_sql)
-        .bind(&id)
-        .bind(&user_did)
+    let mut delete = crate::db::query(&delete_sql).bind(&id).bind(&user_did);
+    if let Some(app_id) = &app_id {
+        delete = delete.bind(app_id);
+    }
+    let result = delete
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete api client: {e}")))?;

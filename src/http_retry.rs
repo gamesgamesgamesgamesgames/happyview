@@ -69,10 +69,16 @@ fn client_builder_with_timeouts(
     read: Duration,
     user_agent: &str,
 ) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(connect)
-        .read_timeout(read)
-        .user_agent(user_agent)
+    // Every outbound client screens the addresses it connects to; see
+    // `crate::outbound`. Ten redirects is reqwest's own default.
+    crate::outbound::screened(
+        reqwest::Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .user_agent(user_agent),
+        crate::outbound::Source::Installed,
+        Some(10),
+    )
 }
 
 /// Wraps our shared, UA-and-timeout-configured `reqwest::Client` so it can

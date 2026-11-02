@@ -147,6 +147,10 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             }
         },
     };
+    // Before the first outbound request: every shared client reads it. Here
+    // rather than in `boot`, which tests also run against local mocks.
+    crate::outbound::install_for(&config, dev.is_some());
+
     let Booted {
         state,
         labeler_subscriptions_rx,
@@ -527,6 +531,7 @@ async fn boot(
         &db_pool,
         db_backend,
         &config.public_url,
+        config.token_encryption_key.as_ref(),
     )
     .await
     {
@@ -661,29 +666,13 @@ async fn boot(
                     },
                 );
             }
-            if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: *cap as u32,
-                        refill_rate: *refill,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            } else {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: config.default_rate_limit_capacity,
-                        refill_rate: config.default_rate_limit_refill_rate,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            }
+            rate_limiter.register_client_limit(
+                client_key.clone(),
+                *capacity,
+                *refill_rate,
+                config.default_rate_limit_capacity,
+                config.default_rate_limit_refill_rate,
+            );
         }
     }
 

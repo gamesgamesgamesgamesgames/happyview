@@ -108,14 +108,17 @@ tokio-tungstenite = "0.29"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors", "fs", "trace"] }
 http-body-util = "0.1"
 hickory-resolver = "0.26"
+# For the connected peer address `outbound` checks.
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 ipnet = "2"
 lru = "0.16"
 mlua = { version = "0.12", optional = true, features = ["lua54", "async", "serialize", "vendored", "send"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
 urlencoding = "2.1.3"
 webpki-roots = "1.0"
 zstd = "0.14.3"

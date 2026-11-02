@@ -107,6 +107,9 @@ services:
       # put an "update available" toast on screen and broke two unrelated
       # specs.
       PLUGIN_REGISTRY_URL: ""
+      # The PDS is `pds.localhost` on this network's private addresses, which
+      # a serving instance otherwise refuses to connect to.
+      ALLOW_PRIVATE_DESTINATIONS: "true"
     ports:
       - "3200:3000"
     volumes:

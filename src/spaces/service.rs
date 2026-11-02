@@ -36,9 +36,16 @@ pub(crate) async fn require_space_admin(
     space: &Space,
     did: &str,
 ) -> Result<(), AppError> {
-    if space.creator_did == did {
+    if space.creator_did == did || is_super_admin(state, did).await? {
         return Ok(());
     }
+    Err(AppError::Forbidden(
+        "Only the space's creator can perform this action".into(),
+    ))
+}
+
+/// Whether `did` is a HappyView super admin.
+pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "SELECT is_super FROM happyview_users WHERE did = ?",
         state.db_backend,
@@ -48,12 +55,7 @@ pub(crate) async fn require_space_admin(
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space's creator can perform this action".into(),
-    ))
+    Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
@@ -1167,8 +1169,19 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-    db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
+    match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
+        db::InviteClaim::Joined => {}
+        db::InviteClaim::Unavailable => {
+            return Err(AppError::BadRequest(
+                "This invite has been revoked or has reached its maximum uses".into(),
+            ));
+        }
+        db::InviteClaim::AlreadyMember => {
+            return Err(AppError::Conflict(
+                "You are already a member of this space".into(),
+            ));
+        }
+    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))

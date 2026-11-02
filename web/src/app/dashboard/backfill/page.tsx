@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { formatBytes, toastError } from "@/lib/format";
 import { backfillTargetLabel } from "@/lib/backfill-target";
+import { AnimatedNumber } from "./animated-number";
 import { RecordsProgress } from "./records-progress-bar";
 import {
   hookDetail,
@@ -435,40 +436,6 @@ function PdsPlaceholderIcon() {
   );
 }
 
-function AnimatedNumber({ value }: { value: number }) {
-  const targetRef = useRef(value);
-  const displayedRef = useRef(value);
-  const [displayed, setDisplayed] = useState(value);
-  const rafRef = useRef<number>(0);
-
-  useEffect(() => {
-    targetRef.current = value;
-    cancelAnimationFrame(rafRef.current);
-
-    function tick() {
-      const current = displayedRef.current;
-      const target = targetRef.current;
-      const diff = target - current;
-
-      if (Math.abs(diff) < 0.5) {
-        displayedRef.current = target;
-        setDisplayed(target);
-        return;
-      }
-
-      const next = current + diff * 0.06;
-      displayedRef.current = next;
-      setDisplayed(next);
-      rafRef.current = requestAnimationFrame(tick);
-    }
-
-    tick();
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [value]);
-
-  return <>{Math.round(displayed).toLocaleString()}</>;
-}
-
 function CompactRepoRow({
   did,
   profile,
@@ -779,8 +746,7 @@ export default function BackfillPage() {
     <>
       <SiteHeader title="Backfills" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Backfills</h2>
+        <div className="flex items-center justify-end">
           <div className="flex items-center gap-2">
             {canFlush && (
               <AlertDialog>
@@ -1150,6 +1116,16 @@ function JobDetail({
   const replayView = job.source === "replay" || isReplayStage(job.stage);
   // Live while this instance holds the job; what it kept once it ended.
   const hookStats = job.hooks ?? job.hook_stats ?? null;
+  // A finished job that only left a note, such as one whose collections all
+  // run as their own backfills, has no progress to show.
+  const nothingRan =
+    !isActive &&
+    !byExecutor &&
+    !replayView &&
+    !hookStats &&
+    Boolean(job.note) &&
+    (job.total_repos ?? 0) === 0 &&
+    (job.processed_repos ?? 0) === 0;
 
   const discoveredReached = hasReached("discovering_repos");
   const pdsReached = hasReached("resolving_pds");
@@ -1431,7 +1407,7 @@ function JobDetail({
           </div>
         )}
 
-        <div>
+        <div hidden={nothingRan}>
           <span className="text-muted-foreground text-sm">Progress</span>
           <div className="mt-1 rounded-md border divide-y">
             {replayView && job.replay && (
