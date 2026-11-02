@@ -12,6 +12,7 @@ pub mod encoding;
 pub mod input;
 pub mod prepared;
 pub mod response;
+pub mod variables;
 
 pub use dispatch::{DispatchError, dispatch, no_interpreter_message};
 pub use encoding::Encoding;

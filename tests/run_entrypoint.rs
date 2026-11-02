@@ -265,6 +265,44 @@ async fn boot_installs_the_default_plugins() {
     assert!(state.plugin_registry.get("lua").await.is_some());
 }
 
+/// Variables stored before an instance had a key are encrypted by the first
+/// boot that has one, and scripts still read them.
+#[tokio::test]
+async fn boot_encrypts_stored_script_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let boot = |key| {
+        let mut config = config(dir.path());
+        config.token_encryption_key = key;
+        happyview::run::boot_for_test(
+            config,
+            Providers {
+                source: Arc::new(Double::default()),
+                storage: None,
+            },
+        )
+    };
+    let state = boot(None).await;
+    happyview::db::query(
+        "INSERT INTO happyview_script_variables (key, value) VALUES ('API_KEY', 'secret')",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let key = [5u8; 32];
+    let state = boot(Some(key)).await;
+
+    let (value,): (String,) = happyview::db::query_as(
+        "SELECT value FROM happyview_script_variables WHERE key = 'API_KEY'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert!(!value.contains("secret"));
+    let env = happyview::script::variables::load(&state.db, state.db_backend, Some(&key)).await;
+    assert_eq!(env["API_KEY"], "secret");
+}
+
 async fn boot_in(dir: &std::path::Path) -> AppState {
     happyview::run::boot_for_test(
         config(dir),
