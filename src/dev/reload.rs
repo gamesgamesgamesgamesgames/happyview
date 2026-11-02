@@ -1,10 +1,11 @@
 //! What an edit to `happyview.toml` means for a running dev server.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::AppState;
 use crate::config::Config;
-use crate::config::project::ProjectConfig;
+use crate::config::project::{PluginEntry, ProjectConfig};
 use crate::dev::DevSession;
 
 /// Settings read once at startup. `state.config` is the boot copy, so an
@@ -19,6 +20,10 @@ use crate::dev::DevSession;
 /// `JETSTREAM_PROTOCOL` and `JETSTREAM_COMPRESSION` are not `Config` fields:
 /// the consumer reads them through `vars::var` once, when it is spawned, so
 /// they are judged by [`jetstream_changed`] against the boot file instead.
+///
+/// `[interpreters]` and `[libraries]` name plugins, which are loaded from
+/// `PLUGIN_DIR` once, at boot, so a plugin added or moved by an edit (as
+/// `hpy happyview add` makes) is not loaded until a restart either.
 pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> {
     let checks = [
         ("HOST", running.host != edited.host),
@@ -90,6 +95,14 @@ pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> 
             "JETSTREAM_COMPRESSION",
             jetstream_changed("JETSTREAM_COMPRESSION", running, edited),
         ),
+        (
+            "[interpreters]",
+            plugins_changed(running, edited, |p| &p.interpreters),
+        ),
+        (
+            "[libraries]",
+            plugins_changed(running, edited, |p| &p.libraries),
+        ),
     ];
     checks
         .into_iter()
@@ -111,6 +124,26 @@ fn jetstream_changed(name: &str, running: &Config, edited: &Config) -> bool {
             .and_then(|p| p.env_layer(crate::config::ConfigMode::Dev).remove(name))
     };
     file_value(running) != file_value(edited)
+}
+
+/// Whether one of the project's plugin tables differs between the boot file
+/// and the edited one.
+fn plugins_changed(
+    running: &Config,
+    edited: &Config,
+    table: fn(&ProjectConfig) -> &BTreeMap<String, PluginEntry>,
+) -> bool {
+    let empty = BTreeMap::new();
+    let of = |config: &Config| config.project.as_deref().map_or(&empty, table).clone();
+    of(running) != of(edited)
+}
+
+/// The line for a `happyview.lock` that changed under a running server. The
+/// lock pins the plugins `hpy happyview dev` places in `PLUGIN_DIR` before
+/// boot, so a change to it waits for a restart. `None` when it holds what it
+/// held at boot, as when it is rewritten unchanged.
+pub fn lock_notice(at_boot: Option<&[u8]>, now: Option<&[u8]>) -> Option<String> {
+    (at_boot != now).then(|| "restart required to apply: happyview.lock".to_string())
 }
 
 pub fn dropped_declarations(before: &ProjectConfig, after: &ProjectConfig) -> Vec<String> {
@@ -218,6 +251,47 @@ mod tests {
                 "PLUGIN_DIR"
             ]
         );
+    }
+
+    fn with_plugins(toml: &str) -> Config {
+        let mut config = base();
+        config.project = Some(Arc::new(toml::from_str(toml).unwrap()));
+        config
+    }
+
+    #[test]
+    fn a_plugin_table_edit_needs_a_restart() {
+        let lua = r#"[interpreters]
+lua = { did = "did:plc:x", name = "happyview-lua", channel = "alpha" }
+"#;
+        let running = with_plugins(lua);
+        assert!(restart_required(&running, &with_plugins(lua)).is_empty());
+        let added = with_plugins(&format!(
+            "{lua}[libraries]\n\"happyview.db\" = {{ did = \"did:plc:x\", name = \"happyview-db\", channel = \"alpha\" }}\n"
+        ));
+        assert_eq!(restart_required(&running, &added), vec!["[libraries]"]);
+        let pinned = with_plugins(
+            r#"[interpreters]
+lua = { did = "did:plc:x", name = "happyview-lua", version = "1.0.0" }
+"#,
+        );
+        assert_eq!(restart_required(&running, &pinned), vec!["[interpreters]"]);
+    }
+
+    #[test]
+    fn a_lock_rewritten_unchanged_says_nothing() {
+        assert_eq!(lock_notice(Some(b"a"), Some(b"a")), None);
+        assert_eq!(lock_notice(None, None), None);
+        for (boot, now) in [
+            (Some(&b"a"[..]), Some(&b"b"[..])),
+            (None, Some(&b"a"[..])),
+            (Some(&b"a"[..]), None),
+        ] {
+            assert_eq!(
+                lock_notice(boot, now).as_deref(),
+                Some("restart required to apply: happyview.lock")
+            );
+        }
     }
 
     fn with_jetstream(
