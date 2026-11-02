@@ -121,7 +121,7 @@ The `dev.happyview.space.*` aliases are deprecated and kept until v3. Most endpo
 
 A space's creator administers it: they update and delete the space and manage its members and invites.
 
-Instance operators can browse any space for moderation through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Each read of a space's contents is recorded in the event log.
+With the [space inspector](#moderating-spaces) turned on, instance operators can browse any space's metadata and members through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Reading a space's contents also takes a time-limited grant, logged to the event log.
 
 Two independent **policies** decide who can use the space. See [Policies](./managing-spaces.md#policies).
 
@@ -166,6 +166,10 @@ HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/p
 - **`displayName`, `description` on spaces**: human-readable metadata
 - **`config` object**: `membership_public`, plus arbitrary extra fields. `records_public` is deprecated and not enforced.
 - **`read_self` access**: limits a member's reads to their own records
+
+## Moderating spaces
+
+The space inspector lets moderators read space contents while handling a report. It is off by default; see [Configuration](../../getting-started/configuration.md). With it on, a user with the `spaces:inspect` permission picks one space or one account, states why, and gets access for a limited time (an hour by default). The grant, the reason, and every record and blob opened under it go to the event log as [protected events](../../guides/event-logs.md#protected-events), which can't be purged by hand. See the [admin spaces API](../../api-reference/admin/spaces.md#access-grants).
 
 ## Next steps
 

@@ -57,6 +57,9 @@ type Fingerprint = BTreeMap<String, (i64, String)>;
 
 const GAME: &str = "games.gamesgamesgamesgames.game";
 
+/// The account the sweep's account-scoped space routes are called for.
+const SWEEP_ACCOUNT: &str = "did:plc:sweep-account";
+
 /// Every router whose `GET` routes end up under `/admin`, as
 /// `(file, the function that builds it)`.
 ///
@@ -334,22 +337,45 @@ fn differences(before: &Fingerprint, after: &Fingerprint) -> Vec<(String, String
     out
 }
 
-/// Writes a `GET` makes on purpose: `(route, table, event_type, why)`.
+/// Writes a `GET` makes on purpose: `(route, tables, event_type, why)`.
 ///
-/// Narrow by design. The route may move the table named here and nothing
-/// else, and the change must be exactly one new row carrying `event_type` —
-/// so a second write alongside the deliberate one, or a different kind of row
-/// in the same table, still fails. A read that records having happened is a
-/// real pattern and not an accident, but it is also still reachable cross-site
-/// with the session cookie attached, so each entry is a decision someone made
-/// rather than noise to be swept away.
-const AUDITED_READS: &[(&str, &str, &str, &str)] = &[(
-    "/spaces/{id}/records",
-    "happyview_event_logs",
-    "space.moderator_read",
-    "log_content_read: an operator reading the contents of a permissioned \
-     space is itself a privacy-relevant act, and spaces record it",
-)];
+/// Narrow by design. The route may move the tables named here and nothing
+/// else, and each call must add exactly one row carrying `event_type` — so a
+/// second write alongside the deliberate one, or a different kind of row in
+/// the same table, still fails. A read that records having happened is a real
+/// pattern and not an accident, but the CSRF guard lets every `GET` through,
+/// so each entry is a decision someone made rather than noise to be swept
+/// away, and has to say what stops another site from writing the row.
+const AUDITED_READS: &[(&str, &[&str], &str, &str)] = &[
+    (
+        "/spaces/{id}/records",
+        CONTENT_READ_TABLES,
+        "space.moderator_read",
+        CONTENT_READ,
+    ),
+    (
+        "/spaces/{id}/blob",
+        CONTENT_READ_TABLES,
+        "space.moderator_read",
+        CONTENT_READ,
+    ),
+    (
+        "/accounts/{did}/space-records",
+        CONTENT_READ_TABLES,
+        "space.moderator_read",
+        CONTENT_READ,
+    ),
+];
+
+/// A read of space contents writes its event and the row tying it to the
+/// grant that allowed it.
+const CONTENT_READ_TABLES: &[&str] = &["happyview_event_logs", "happyview_space_access_reads"];
+
+const CONTENT_READ: &str = "log_content_read: an operator reading the contents of a \
+     permissioned space is itself a privacy-relevant act, and every read is recorded \
+     against the grant that allowed it, failing the request if it cannot be. Another \
+     site cannot make an operator record a read they never made: `csrf::audited_read` \
+     serves these routes to the session cookie only from the dashboard's own pages";
 
 /// How many rows of `event_type` the event log holds.
 async fn audit_rows(app: &TestApp, event_type: &str) -> i64 {
@@ -373,10 +399,7 @@ const QUERY: &[(&str, &str)] = &[
     ("/editor/declarations", "language=sweep"),
     // So it reaches the blob lookup rather than stopping at query extraction,
     // which is what its EXEMPT_FROM_SEEDING reason describes.
-    (
-        "/spaces/{id}/blob",
-        "cid=bafyreibsrh5ijw2opbnpyopbnpyopbnpyopbnpyopbnpyopbnpyopbnpyop",
-    ),
+    ("/spaces/{id}/blob", "cid=bafkreisweepblob"),
 ];
 
 /// Routes the sweep cannot drive to a `2xx`, with the reason, and therefore
@@ -395,10 +418,9 @@ const EXEMPT_FROM_SEEDING: &[(&str, &str)] = &[
     ),
     (
         "/spaces/{id}/blob",
-        "it answers 404 until the space holds a record carrying a blob ref and the \
-     blob itself is stored; what it does after that lookup is the same \
-     log_content_read that /spaces/{id}/records is listed for in AUDITED_READS, \
-     then an outbound fetch",
+        "it records the read and then fetches the blob from its author's PDS, which \
+     this harness does not stub, so it answers 404 after the write AUDITED_READS \
+     lists it for. The fetch is its last step, and an outbound read",
     ),
 ];
 
@@ -596,7 +618,50 @@ async fn seed(app: &TestApp) -> BTreeMap<&'static str, String> {
     )
     .await
     .expect("could not seed a space");
+    // A record carrying a blob ref, so the blob read gets past its lookup.
+    spaces_db::upsert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &happyview::spaces::types::SpaceRecord {
+            uri: format!("at://did:plc:sweep-space/space/com.example.sweep/main/{SWEEP_ACCOUNT}/com.example.sweep.post/1"),
+            space_id: space_id.clone(),
+            author_did: SWEEP_ACCOUNT.to_string(),
+            collection: "com.example.sweep.post".to_string(),
+            rkey: "1".to_string(),
+            record: json!({ "image": { "$type": "blob", "ref": { "$link": "bafkreisweepblob" }, "mimeType": "image/png", "size": 1 } }),
+            cid: "bafyreisweeprecord".to_string(),
+            indexed_at: now.clone(),
+        },
+    )
+    .await
+    .expect("could not seed a space record");
+
+    // Space contents are read under a grant, with the inspector on. The
+    // switch is stored directly and this process's inspector let follow it:
+    // the settings API will not turn it on yet, and the build holds it off.
+    common::let_space_inspector_follow_its_setting();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, 'true', ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind("feature.space_inspector_enabled")
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("could not turn the inspector on");
+    for (scope, target) in [("space", space_id.as_str()), ("account", SWEEP_ACCOUNT)] {
+        let (status, body) = app
+            .post_json_status(
+                "/admin/spaces/access-grants",
+                json!({ "scope": scope, "target": target, "reason": "read-only sweep" }),
+            )
+            .await;
+        assert_eq!(status, 201, "seeding a {scope} grant: {body}");
+        ids.insert("grant", body["id"].as_str().unwrap().to_string());
+    }
     ids.insert("space", space_id);
+    ids.insert("account", SWEEP_ACCOUNT.to_string());
 
     let script_id = "sweep-script";
     let sql = adapt_sql(
@@ -711,7 +776,9 @@ fn concrete_path(path: &str, ids: &BTreeMap<&'static str, String>) -> String {
         ("/service-entries/", "service_entry"),
         ("/plugins/", "plugin"),
         ("/scripts/", "script"),
+        ("/spaces/access-grants/", "grant"),
         ("/spaces/", "space"),
+        ("/accounts/", "account"),
         ("/users/", "user"),
         ("/jobs/", "job"),
     ];
@@ -724,6 +791,7 @@ fn concrete_path(path: &str, ids: &BTreeMap<&'static str, String>) -> String {
     let trigger = ids.get("trigger").unwrap_or(&fallback);
     path.replace("{id}", value)
         .replace("{nsid}", value)
+        .replace("{did}", value)
         .replace("{trigger}", trigger)
 }
 
@@ -821,9 +889,9 @@ async fn no_admin_get_route_writes() {
 
             let current = settled_fingerprint(&app, &tables).await;
             for (table, sentence) in differences(&previous, &current) {
-                let audited = AUDITED_READS
-                    .iter()
-                    .find(|(route, audited_table, _, _)| route == path && *audited_table == table);
+                let audited = AUDITED_READS.iter().find(|(route, audited_tables, _, _)| {
+                    route == path && audited_tables.contains(&table.as_str())
+                });
                 match audited {
                     Some((_, _, event_type, _)) => {
                         let gained = audit_rows(&app, event_type).await - audit_before;

@@ -12,10 +12,12 @@ use crate::event_log::{
     DEFAULT_RETENTION_DAYS, EventLog, SPACE_ACCESS_RETENTION_SETTING, Severity,
     effective_protected_retention, log_event, write_event,
 };
+use crate::feature_flags::FeatureFlag;
 use crate::lua::limits as script_limits;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
+use super::space_access;
 use super::types::{SettingEntry, UpsertSettingBody};
 
 const ENV_FALLBACKS: &[(&str, &str)] = &[
@@ -32,6 +34,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
+    ("feature.space_inspector_enabled", "SPACE_INSPECTOR_ENABLED"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
     ("tos_uri", "TOS_URI"),
@@ -42,6 +45,10 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     (
         "space_access_log_retention_days",
         "SPACE_ACCESS_LOG_RETENTION_DAYS",
+    ),
+    (
+        "space_inspector_max_grant_minutes",
+        "SPACE_INSPECTOR_MAX_GRANT_MINUTES",
     ),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
@@ -69,7 +76,10 @@ pub const PLATFORM_LOCKED_SETTINGS: &str = "PLATFORM_LOCKED_SETTINGS";
 
 /// Fixed settings whose value has to be a positive number of days or minutes,
 /// so a platform can't fix them to `0`, which would keep records forever.
-const POSITIVE_WHEN_LOCKED: &[&str] = &[SPACE_ACCESS_RETENTION_SETTING];
+const POSITIVE_WHEN_LOCKED: &[&str] = &[
+    SPACE_ACCESS_RETENTION_SETTING,
+    super::space_access::MAX_GRANT_SETTING,
+];
 
 /// The keys `PLATFORM_LOCKED_SETTINGS` names.
 fn locked_keys() -> Vec<String> {
@@ -180,6 +190,23 @@ pub async fn try_get_setting(
     key: &str,
     backend: DatabaseBackend,
 ) -> Result<Option<String>, sqlx::Error> {
+    if let Some(value) = stored_setting(pool, key, backend).await? {
+        return Ok(Some(value));
+    }
+
+    Ok(env_var_for(key).and_then(vars::var))
+}
+
+/// A setting's stored row alone, without the fallback. A setting the
+/// platform fixes has none that counts.
+pub async fn stored_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
+    if platform_locked(key) {
+        return Ok(None);
+    }
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -188,18 +215,11 @@ pub async fn try_get_setting(
         .bind(key)
         .fetch_optional(pool)
         .await?;
-
-    if let Some((value,)) = row
-        && !platform_locked(key)
-    {
-        return Ok(Some(value));
-    }
-
-    Ok(env_var_for(key).and_then(vars::var))
+    Ok(row.map(|(value,)| value))
 }
 
-/// The protected events for an audited setting change: how long event logs
-/// are kept.
+/// The protected events for an audited setting change: turning the space
+/// inspector on or off, and changing how long event logs are kept.
 ///
 /// Compares effective values, fallbacks included, so a save that rewrites an
 /// unchanged value logs nothing.
@@ -218,6 +238,20 @@ fn audited_setting_events(
         detail,
     };
     match key {
+        FeatureFlag::SPACE_INSPECTOR => {
+            // What the setting says, which the inspector follows once this
+            // build can turn it on, so the trail records the operator's choice.
+            let on = |v: &Option<String>| space_access::setting_says_on(v.as_deref(), None);
+            match (on(before), on(after)) {
+                (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
+                (true, false) => vec![event(
+                    key,
+                    "space_inspector.disabled",
+                    serde_json::json!({}),
+                )],
+                _ => Vec::new(),
+            }
+        }
         GENERAL_RETENTION_SETTING | SPACE_ACCESS_RETENTION_SETTING => {
             // Effective values, as the retention sweep reads them: the protected
             // retention depends on the general one, so a change to either can
@@ -447,6 +481,7 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    space_access::refuse_switch_on(&key, &body.value)?;
 
     write_audited(
         &state.db,
@@ -895,7 +930,18 @@ mod tests {
         let zero = check_platform_locks();
         unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
         let unset = check_platform_locks();
-        unsafe { std::env::set_var(PLATFORM_LOCKED_SETTINGS, "a_later_build_s_setting") };
+        unsafe {
+            std::env::set_var(
+                PLATFORM_LOCKED_SETTINGS,
+                super::super::space_access::MAX_GRANT_SETTING,
+            );
+            std::env::set_var("SPACE_INSPECTOR_MAX_GRANT_MINUTES", "0");
+        }
+        let zero_grant = check_platform_locks();
+        unsafe {
+            std::env::remove_var("SPACE_INSPECTOR_MAX_GRANT_MINUTES");
+            std::env::set_var(PLATFORM_LOCKED_SETTINGS, "a_later_build_s_setting");
+        }
         let unknown = check_platform_locks();
         unsafe { std::env::remove_var(PLATFORM_LOCKED_SETTINGS) };
 
@@ -905,6 +951,10 @@ mod tests {
             "a fixed retention of 0 would keep records forever"
         );
         assert!(unset.is_err());
+        assert!(
+            zero_grant.is_err(),
+            "a fixed grant length of 0 is refused too"
+        );
         assert!(
             unknown.is_ok(),
             "a setting this build lacks has nothing to fix"
@@ -971,6 +1021,79 @@ mod tests {
         let changes = retention_changes(&pool).await;
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[2].1, serde_json::json!({ "from": 0, "to": 365 }));
+    }
+
+    async fn inspector_events(pool: &AnyPool) -> Vec<String> {
+        let rows: Vec<(String,)> = crate::db::query_as(
+            "SELECT event_type FROM happyview_event_logs \
+             WHERE event_type LIKE 'space_inspector.%' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter().map(|(t,)| t).collect()
+    }
+
+    /// Turning the inspector on or off is a protected event, judged by what
+    /// the setting says rather than by this build holding the inspector off,
+    /// since the setting is what takes effect once it can be on. `upsert`
+    /// refuses `true` until then, so this drives the write beneath it.
+    #[tokio::test]
+    #[serial]
+    async fn the_inspector_switch_logs_each_effective_change() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        let pool = migrated_memory_pool().await;
+        let key = FeatureFlag::SPACE_INSPECTOR;
+
+        put_audited(&pool, key, "false").await;
+        assert!(inspector_events(&pool).await.is_empty());
+        put_audited(&pool, key, " true ").await;
+        put_audited(&pool, key, "true").await;
+        put_audited(&pool, key, "false").await;
+        put_audited(&pool, key, "true").await;
+        write_audited(
+            &pool,
+            DatabaseBackend::Sqlite,
+            "did:plc:admin",
+            key,
+            SettingWrite::Delete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inspector_events(&pool).await,
+            [
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+            ]
+        );
+    }
+
+    /// Configuration that says `true` leaves the inspector off in this build,
+    /// and storing `false` over it is recorded as the operator turning it off.
+    #[tokio::test]
+    #[serial]
+    async fn a_configured_inspector_switch_is_held_off() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        set_project_layer([("SPACE_INSPECTOR_ENABLED".to_string(), "true".to_string())].into());
+        let _reset = LayerReset;
+        let pool = migrated_memory_pool().await;
+
+        assert_eq!(
+            get_setting(&pool, FeatureFlag::SPACE_INSPECTOR, DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("true"),
+            "the value is configured"
+        );
+        assert!(
+            !space_access::inspector_enabled(&pool, DatabaseBackend::Sqlite).await,
+            "and ignored"
+        );
+        put_audited(&pool, FeatureFlag::SPACE_INSPECTOR, "false").await;
+        assert_eq!(inspector_events(&pool).await, ["space_inspector.disabled"]);
     }
 
     #[test]

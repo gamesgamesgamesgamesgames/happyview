@@ -9,7 +9,9 @@ import {
 } from "@/components/instance-unavailable";
 import {
   type ConfigFailure,
+  type Features,
   classifyConfigFailure,
+  parseFeatures,
   retryDelayMs,
 } from "@/lib/config-load";
 
@@ -19,6 +21,7 @@ interface ConfigContextType {
   default_rate_limit_refill_rate: number;
   app_name: string | null;
   logo_url: string | null;
+  features: Features;
   platform_managed: boolean;
   configErrors: string[];
 }
@@ -29,6 +32,7 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  features: { spaces: false, space_inspector: false },
   platform_managed: false,
   configErrors: [],
 });
@@ -87,6 +91,7 @@ async function loadConfig(): Promise<
       default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
       app_name: data.app_name ?? null,
       logo_url: data.logo_url ?? null,
+      features: parseFeatures(data.features),
       platform_managed: data.platform_managed === true,
       configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
     },
