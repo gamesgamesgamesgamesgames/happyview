@@ -32,6 +32,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 default-run = "happyview"
+license = "MIT"
 repository = "https://github.com/gamesgamesgamesgamesgames/happyview"
 
 # Debug info dominates both codegen and link time on this workspace, and full
