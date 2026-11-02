@@ -245,6 +245,18 @@ The Postgres e2e shards run their tests under [`cargo-llvm-cov`](https://github.
 
 Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
 
+### Open a draft while you iterate
+
+A full run costs real money, so CI holds a **draft** pull request. Push to a draft as often as you like: `lint`, `unit-tests`, `e2e-tests` and `frontend` fail at once with "this pull request is a draft", and the other costly jobs don't run. That failure is deliberate. A skipped required check would count as passed, so a draft's gate reads red until the checks have really run.
+
+When the branch is ready, mark the pull request **Ready for review**. That starts the full run on the same commit, and its checks replace the draft's. A pull request can't merge while it's a draft, and a review should wait for that run.
+
+- **Open the pull request as a draft** (`gh pr create --draft`) whenever you expect to push more than once, and run the checks you can locally first.
+- **Mark it ready** (`gh pr ready`) once the work is done and green locally. Every push after that runs the full suite, so batch any follow-up fixes into one push.
+- **Agents follow the same rule.** An agent that opens a pull request opens it as a draft, runs the local checks, and marks it ready when it would otherwise say the pull request is done.
+
+This applies to pull requests into `alpha`, whose workflow carries the rule. Pull requests into `beta` and `main` run in full until it reaches those branches.
+
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
 - **PR builds**: when your PR touches the server, CI builds Docker images and binaries, and a bot comments with `docker pull ghcr.io/gamesgamesgamesgamesgames/happyview:pr-<number>` so reviewers can try it.

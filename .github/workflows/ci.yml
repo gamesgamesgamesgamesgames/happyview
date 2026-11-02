@@ -5,6 +5,9 @@ on:
     branches: [main, beta, alpha]
   pull_request:
     branches: [main, beta, alpha]
+    # `ready_for_review` is what runs the full suite on a pull request opened
+    # as a draft. See DRAFT_HOLD below.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       server:
@@ -52,6 +55,15 @@ permissions:
 # of its needs was cancelled: `always()` alone would let a run whose tests a
 # newer push cancelled cut a version anyway. The event name in the `ci-`
 # group keeps a branch deletion's run from cancelling a push's.
+#
+# DRAFT_HOLD: a draft pull request runs none of the costly jobs. Marking it
+# ready for review fires `ready_for_review` and runs everything on the same
+# commit, and that run's checks supersede the draft's. A required check is
+# never *skipped* for a draft, because a skipped check satisfies a ruleset as
+# a pass: `unit-tests`, `e2e-tests`, `frontend` and `lint` instead fail in
+# seconds, before checkout, so a draft cannot pass its gate on work that never
+# ran. The jobs no ruleset requires are skipped outright. `audit`, `changes`
+# and the package `test-*` jobs are cheap and keep their usual paths.
 jobs:
   # ---------------------------------------------------------------------------
   # Path detection — determines which job groups should run.
@@ -124,7 +136,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-build-server
       cancel-in-progress: true
     needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -166,6 +178,13 @@ jobs:
       # and coverage run those tests with everything present, without it.
       HAPPYVIEW_ALLOW_SKIPS: "1"
     steps:
+      - name: Hold a draft pull request
+        # DRAFT_HOLD: fails rather than skips, so a draft cannot pass this check.
+        if: github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so this check has not run. Mark it ready for review to run CI."
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -210,7 +229,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-shard-${{ matrix.shard }}
       cancel-in-progress: true
     needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -413,6 +432,13 @@ jobs:
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     steps:
+      - name: Hold a draft pull request
+        # DRAFT_HOLD: fails rather than skips, so a draft cannot pass this check.
+        if: github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so this check has not run. Mark it ready for review to run CI."
+          exit 1
+
       - name: Every shard passed
         env:
           RESULT: ${{ needs.e2e-tests-shard.result }}
@@ -426,7 +452,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-sqlite-shard-${{ matrix.shard }}
       cancel-in-progress: true
     needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -550,7 +576,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-e2e-tests-sqlite
       cancel-in-progress: true
     needs: [changes, e2e-tests-sqlite-shard]
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Every shard passed
@@ -568,7 +594,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-lua-differential
       cancel-in-progress: true
     needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -634,6 +660,7 @@ jobs:
       always()
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.e2e-tests-shard.result == 'success'
+      && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -686,6 +713,13 @@ jobs:
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     steps:
+      - name: Hold a draft pull request
+        # DRAFT_HOLD: fails rather than skips, so a draft cannot pass this check.
+        if: github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so this check has not run. Mark it ready for review to run CI."
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -745,6 +779,13 @@ jobs:
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     steps:
+      - name: Hold a draft pull request
+        # DRAFT_HOLD: fails rather than skips, so a draft cannot pass this check.
+        if: github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so this check has not run. Mark it ready for review to run CI."
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -789,7 +830,7 @@ jobs:
       group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-portability-${{ matrix.target }}
       cancel-in-progress: true
     needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
@@ -866,6 +907,7 @@ jobs:
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.frontend.result == 'success'
       && needs.build-server.result == 'success'
+      && !github.event.pull_request.draft
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: read
@@ -956,6 +998,7 @@ jobs:
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
+      && !github.event.pull_request.draft
       && !contains(fromJSON('["beta", "alpha"]'), github.head_ref)
       && needs.changes.outputs.server == 'true'
     runs-on: ${{ matrix.runs-on }}
