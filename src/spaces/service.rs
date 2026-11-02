@@ -2,6 +2,7 @@ use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
+use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
@@ -448,11 +449,16 @@ async fn forward_write_if_native(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
+    // Read only. Creating the row here, outside the write transaction and
+    // its lock on the space, would deadlock on Postgres against a write
+    // already holding that lock. A missing row is created as polyfill by the
+    // write itself.
+    let host_mode = db::read_repo_state(&mut conn, state.db_backend, &space.id, author_did)
+        .await?
+        .map_or(HostMode::Polyfill, |repo_state| repo_state.host_mode);
     drop(conn);
 
-    if repo_state.host_mode.is_authoritative_here() {
+    if host_mode.is_authoritative_here() {
         return Ok(None);
     }
 
