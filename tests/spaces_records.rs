@@ -1384,6 +1384,58 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
     assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A batch for a repo hosted on its author's PDS is checked against
+/// `allowedCollections` before it is forwarded, as a single write is: the
+/// answer is the collection's 400, not the forward's.
+#[tokio::test]
+#[serial]
+async fn apply_writes_checks_allowed_collections_before_forwarding() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space_with_config(
+        &app,
+        &authority,
+        &skey,
+        config_with_allowed_collections(&["com.example.allowed"]),
+    )
+    .await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut repo_state =
+        spaces_db::get_or_create_repo_state(&mut conn, app.state.db_backend, &space_id, &writer)
+            .await
+            .unwrap();
+    repo_state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    spaces_db::update_repo_state(&mut *conn, app.state.db_backend, &repo_state)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let writes = json!([write_op_create(
+        "com.example.denied",
+        None,
+        &json!({ "text": "should be rejected" }),
+    )]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// A space whose config declares `allowedCollections` must reject an
 /// applyWrites `update` op targeting a collection not on that list (400).
 #[tokio::test]

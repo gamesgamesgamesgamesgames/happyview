@@ -87,7 +87,7 @@ pub fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
 }
 
 /// Why a raw write to a claimed collection's records is refused.
-pub const CLAIMED_WRITE_REFUSED: &str = "writes to records of a collection stored outside this instance must go through records.indexPut";
+pub const CLAIMED_WRITE_REFUSED: &str = "writes to records of a collection stored outside this instance must go through save_local in happyview.record";
 
 /// The compat view raw SQL writes records through.
 const RECORDS_VIEW: &str = "happyview_records";

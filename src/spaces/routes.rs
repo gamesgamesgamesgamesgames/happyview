@@ -265,6 +265,71 @@ enum WriteOp {
     },
 }
 
+/// The PDS's `applyWrites` body for a batch: each write tagged by `$type`, as
+/// `com.atproto.space.applyWrites` takes it, where this route takes `action`.
+/// Optional fields are sent only when the caller gave them.
+fn pds_apply_writes_body(
+    space_uri: &str,
+    repo: &str,
+    swap_commit: Option<&str>,
+    writes: &[WriteOp],
+) -> serde_json::Value {
+    let writes: Vec<serde_json::Value> = writes
+        .iter()
+        .map(|write| {
+            let (kind, collection, rkey, value, swap_record) = match write {
+                WriteOp::Create {
+                    collection,
+                    rkey,
+                    value,
+                } => ("create", collection, rkey.as_deref(), Some(value), None),
+                WriteOp::Update {
+                    collection,
+                    rkey,
+                    value,
+                    swap_record,
+                } => (
+                    "update",
+                    collection,
+                    Some(rkey.as_str()),
+                    Some(value),
+                    swap_record.as_deref(),
+                ),
+                WriteOp::Delete {
+                    collection,
+                    rkey,
+                    swap_record,
+                } => (
+                    "delete",
+                    collection,
+                    Some(rkey.as_str()),
+                    None,
+                    swap_record.as_deref(),
+                ),
+            };
+            let mut op = serde_json::json!({
+                "$type": format!("com.atproto.space.applyWrites#{kind}"),
+                "collection": collection,
+            });
+            if let Some(rkey) = rkey {
+                op["rkey"] = rkey.into();
+            }
+            if let Some(value) = value {
+                op["value"] = value.clone();
+            }
+            if let Some(swap) = swap_record {
+                op["swapRecord"] = swap.into();
+            }
+            op
+        })
+        .collect();
+    let mut body = serde_json::json!({ "space": space_uri, "repo": repo, "writes": writes });
+    if let Some(swap) = swap_commit {
+        body["swapCommit"] = swap.into();
+    }
+    body
+}
+
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
@@ -752,6 +817,39 @@ async fn apply_writes(
             )
             .await?;
         }
+    }
+
+    // The single writes check the collection before they forward; a batch
+    // checks every op before it does, so it cannot carry a collection the
+    // space does not allow.
+    for write in &input.writes {
+        if let WriteOp::Create { collection, .. } | WriteOp::Update { collection, .. } = write {
+            service::check_collection_allowed(&space, collection)?;
+        }
+    }
+
+    // A repo hosted on its author's PDS takes the batch there, as the single
+    // writes do; writing only HappyView's copy would fork the two, and the
+    // next sync would drop what was written here.
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = service::forward_write_if_native(
+        &state,
+        &space,
+        &did,
+        "com.atproto.space.applyWrites",
+        pds_apply_writes_body(
+            &space_uri,
+            &did,
+            input.swap_commit.as_deref(),
+            &input.writes,
+        ),
+    )
+    .await?
+    {
+        return Ok(Json(forwarded));
     }
 
     if let Some(ref expected_rev) = input.swap_commit {
@@ -2033,6 +2131,37 @@ async fn get_space_credential(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_forwarded_batch_tags_each_write_by_type_and_sends_only_what_was_given() {
+        let writes: Vec<WriteOp> = serde_json::from_value(json!([
+            { "action": "create", "collection": "com.example.a", "value": { "n": 1 } },
+            { "action": "update", "collection": "com.example.a", "rkey": "r1",
+              "value": { "n": 2 }, "swapRecord": "bafyold" },
+            { "action": "delete", "collection": "com.example.b", "rkey": "r2" },
+        ]))
+        .unwrap();
+        let body = pds_apply_writes_body("at://did:web:s/space/t/k", "did:plc:me", None, &writes);
+        assert_eq!(
+            body,
+            json!({
+                "space": "at://did:web:s/space/t/k",
+                "repo": "did:plc:me",
+                "writes": [
+                    { "$type": "com.atproto.space.applyWrites#create",
+                      "collection": "com.example.a", "value": { "n": 1 } },
+                    { "$type": "com.atproto.space.applyWrites#update",
+                      "collection": "com.example.a", "rkey": "r1", "value": { "n": 2 },
+                      "swapRecord": "bafyold" },
+                    { "$type": "com.atproto.space.applyWrites#delete",
+                      "collection": "com.example.b", "rkey": "r2" },
+                ],
+            })
+        );
+        let with_swap =
+            pds_apply_writes_body("at://did:web:s/space/t/k", "did:plc:me", Some("3krev"), &[]);
+        assert_eq!(with_swap["swapCommit"], "3krev");
+    }
 
     #[test]
     fn content_cid_deterministic() {
