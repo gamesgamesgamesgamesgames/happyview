@@ -430,12 +430,16 @@ fn resolve_client_key(
     Ok(client_key)
 }
 
-/// The `anonymous_xrpc` limit (HAP-226): a call that names no API client,
-/// or one that didn't check out, is refused when the instance's limits say
-/// so. Service-auth calls are another service, not anonymous. Checked against
-/// the limits in memory, on every request.
-fn refuse_anonymous(state: &AppState, rate_key: &str) -> Result<(), AppError> {
-    if rate_key == ANONYMOUS_CLIENT_KEY {
+/// The `anonymous_xrpc` limit (HAP-226): a call from nobody is refused when
+/// the instance's limits say so. `identified` is whether the caller is someone
+/// (a signed-in session, a space credential or another service), which is
+/// what decides this, not `rate_key`: that says only whether a client key
+/// checked out, and a signed-in caller's can fail to, say on an instance that
+/// hasn't loaded the client yet. A key alone identifies nobody either, so a
+/// call with no caller needs one that checked out. Reads the limits in memory,
+/// on every request.
+fn refuse_anonymous(state: &AppState, identified: bool, rate_key: &str) -> Result<(), AppError> {
+    if !identified && rate_key == ANONYMOUS_CLIENT_KEY {
         state.limits.limits().allows_anonymous_xrpc()?;
     }
     Ok(())
@@ -521,7 +525,10 @@ pub async fn xrpc_get(
             |id| record_secret_use(&state, id),
         )?
     };
-    refuse_anonymous(&state, &rate_key)?;
+    let identified = claims.is_some()
+        || xrpc_claims.space_credential.is_some()
+        || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     let lexicon = state.lexicons.get(&method).await;
 
@@ -703,7 +710,10 @@ pub async fn xrpc_post(
             |id| record_secret_use(&state, id),
         )?
     };
-    refuse_anonymous(&state, &rate_key)?;
+    let identified = claims.is_some()
+        || xrpc_claims.space_credential.is_some()
+        || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     if claims.is_none()
         && xrpc_claims.space_credential.is_none()

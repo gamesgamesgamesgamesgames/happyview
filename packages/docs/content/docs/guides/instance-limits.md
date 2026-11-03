@@ -10,7 +10,7 @@ Limits are checked inside the instance, against limits it already holds. A check
 
 - **`seats`:** adding an admin through the admin API (`POST /admin/users`) when the instance already has `max` admins, the super user included. The owner's own ways in are never refused: the first sign-in, the configured superadmin, and a host setting its owner.
 - **`api_clients`:** creating an API client through the admin API (`POST /admin/api-clients`), or turning an inactive one back on, when the instance already has `max` active ones. Only the clients the instance's admins register count: not clients an app registers under its own, nor hpy, which every instance has built in.
-- **`anonymous_xrpc`:** with `allowed: false`, an XRPC call that names no API client, or names one that doesn't check out (an unknown key, the wrong Origin or secret). A call from a signed-in app, or another service using service auth, isn't anonymous. The admin API, OAuth and `/health` are never affected.
+- **`anonymous_xrpc`:** with `allowed: false`, a call to a lexicon's query or procedure, or one proxied onward, from a caller who isn't signed in and has no API client that checks out (none, an unknown key, or the wrong Origin or secret). A signed-in caller is never refused, whatever their client key, nor is a call with a space credential or another service's service auth. HappyView's built-in XRPC routes, such as `app.bsky.actor.getProfile`, `com.atproto.repo.uploadBlob` and `dev.happyview.*`, need a signed-in caller anyway, and the space routes keep their own access rules. The admin API, OAuth and `/health` are never affected.
 
 ## The limits
 
