@@ -231,6 +231,31 @@ pub(crate) fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, Stri
     Ok((uri.to_string(), cid.to_string()))
 }
 
+/// Index a write the PDS accepted, unless its answer names another record.
+async fn index_accepted(
+    state: &AppState,
+    did: &str,
+    collection: &str,
+    rkey: Option<&str>,
+    uri: &str,
+    cid: &str,
+    record: &Value,
+) {
+    if !crate::plugin::host::records::reply_names_written(uri, did, collection, rkey) {
+        tracing::warn!(
+            uri,
+            did,
+            collection,
+            "the PDS answered a linked-repo write with another record's uri; its index row is not written"
+        );
+        return;
+    }
+    if let Err(e) = index_write(state, did, collection, uri, cid, record).await {
+        let indexed = prepared_write(did, collection, uri, cid, record).uri();
+        state.records.report_index_failure(&indexed, &e).await;
+    }
+}
+
 pub async fn create_record(
     state: &AppState,
     grant: &LinkedRepo,
@@ -253,10 +278,7 @@ pub async fn create_record(
 
     let out = post_json(&session, "com.atproto.repo.createRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "createRecord")?;
-    if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
-        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
-        state.records.report_index_failure(&indexed, &e).await;
-    }
+    index_accepted(state, did, collection, rkey, &uri, &cid, &body["record"]).await;
     Ok((uri, cid))
 }
 
@@ -284,10 +306,16 @@ pub async fn put_record(
 
     let out = post_json(&session, "com.atproto.repo.putRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "putRecord")?;
-    if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
-        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
-        state.records.report_index_failure(&indexed, &e).await;
-    }
+    index_accepted(
+        state,
+        did,
+        collection,
+        Some(rkey),
+        &uri,
+        &cid,
+        &body["record"],
+    )
+    .await;
     Ok((uri, cid))
 }
 
@@ -394,6 +422,54 @@ pub async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What both writes index through: an answer naming another record
+    /// leaves the index alone, and the record written is indexed.
+    #[tokio::test]
+    async fn only_an_answer_naming_the_record_written_is_indexed() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let record = json!({"text": "hi"});
+        let indexed = |uri: &'static str| {
+            let db = state.db.clone();
+            async move {
+                let row: Option<(String,)> =
+                    crate::db::query_as("SELECT uri FROM happyview_records WHERE uri = ?")
+                        .bind(uri)
+                        .fetch_optional(&db)
+                        .await
+                        .unwrap();
+                row.is_some()
+            }
+        };
+
+        let other = "at://did:plc:a/app.test.rec/2";
+        index_accepted(
+            &state,
+            "did:plc:a",
+            "app.test.rec",
+            Some("1"),
+            other,
+            "bafy",
+            &record,
+        )
+        .await;
+        assert!(!indexed(other).await);
+
+        let written = "at://did:plc:a/app.test.rec/1";
+        index_accepted(
+            &state,
+            "did:plc:a",
+            "app.test.rec",
+            Some("1"),
+            written,
+            "bafy",
+            &record,
+        )
+        .await;
+        assert!(indexed(written).await);
+    }
 
     async fn bound_grant(state: &AppState) -> LinkedRepo {
         let grant = super::super::db::create(

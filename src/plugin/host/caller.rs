@@ -208,7 +208,12 @@ pub async fn create_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.createRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &spec.collection,
+        rkey: spec.rkey.as_deref(),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -234,7 +239,12 @@ pub async fn put_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.putRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &collection,
+        rkey: Some(&rkey),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -254,12 +264,42 @@ pub async fn delete_record(
     Ok(())
 }
 
+/// Where a write was sent: the repo and collection, and the record key when
+/// the caller chose one.
+#[derive(Clone, Copy)]
+struct Written<'a> {
+    repo: &'a str,
+    collection: &'a str,
+    rkey: Option<&'a str>,
+}
+
 /// The PDS has accepted the write, so the index is told what it holds.
 /// A mirror that fails leaves the index stale until Jetstream echoes the
 /// record; it never turns an accepted write into an error the script would
 /// have to undo.
-async fn mirror_write(caller: &CallerSession, reference: &RecordRef, record: &Value) {
+async fn mirror_write(
+    caller: &CallerSession,
+    written: Written<'_>,
+    reference: &RecordRef,
+    record: &Value,
+) {
     let state = &caller.app_state;
+    // The row is keyed by what the PDS answered, which only the write itself
+    // vouches for. An answer naming any other record is not indexed.
+    if !super::records::reply_names_written(
+        &reference.uri,
+        written.repo,
+        written.collection,
+        written.rkey,
+    ) {
+        tracing::warn!(
+            uri = %reference.uri,
+            repo = written.repo,
+            collection = written.collection,
+            "the PDS answered a write with another record's uri; its index row is not written"
+        );
+        return;
+    }
     let (did, collection, rkey) = match parse_at_uri(&reference.uri) {
         Ok(parts) => parts,
         Err(e) => {
@@ -899,6 +939,102 @@ mod tests {
             delegate_pds_auth: None,
         };
         (caller, pds)
+    }
+
+    fn write_reply(method: &str, uri: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/xrpc/{method}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({ "uri": uri, "cid": "bafyreply" })),
+            )
+            .up_to_n_times(1)
+    }
+
+    async fn indexed(caller: &CallerSession, uri: &str) -> bool {
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT uri FROM happyview_records WHERE uri = ?")
+                .bind(uri)
+                .fetch_optional(&caller.app_state.db)
+                .await
+                .unwrap();
+        row.is_some()
+    }
+
+    /// The index row is keyed by the PDS's answer, so an answer naming any
+    /// record but the one written must not be indexed: another account's, in
+    /// another collection, or at another key than the caller chose.
+    #[tokio::test]
+    async fn a_reply_naming_another_record_is_not_indexed() {
+        let (caller, pds) = cookie_caller("did:plc:alice").await;
+        let create = |rkey: &str| -> CallerRecordCreate {
+            serde_json::from_value(json!({
+                "collection": "app.test.rec", "rkey": rkey,
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap()
+        };
+
+        let elsewhere = [
+            "at://did:plc:victim/app.test.rec/1",
+            "at://did:plc:alice/app.test.other/1",
+            "at://did:plc:alice/app.test.rec/2",
+        ];
+        for uri in elsewhere {
+            write_reply("com.atproto.repo.createRecord", uri)
+                .mount(&pds)
+                .await;
+            create_record(&caller, create("1")).await.unwrap();
+            assert!(!indexed(&caller, uri).await, "{uri} was indexed");
+        }
+
+        // With no rkey chosen, the PDS picks one, but it must still be one.
+        let no_rkey: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.test.rec", "record": {"text": "hi"}, "validate": false,
+        }))
+        .unwrap();
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/a/b",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, no_rkey.clone()).await.unwrap();
+        let rows: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records WHERE uri LIKE 'at://did:plc:alice/app.test.rec/a%'",
+        )
+        .fetch_one(&caller.app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(rows.0, 0, "a malformed record key was indexed");
+
+        write_reply(
+            "com.atproto.repo.putRecord",
+            "at://did:plc:victim/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        put_record(
+            &caller,
+            serde_json::from_value(json!({
+                "uri": "at://did:plc:alice/app.test.rec/1",
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!indexed(&caller, "at://did:plc:victim/app.test.rec/1").await);
+
+        // The answer for the record written is still indexed.
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, create("1")).await.unwrap();
+        assert!(indexed(&caller, "at://did:plc:alice/app.test.rec/1").await);
     }
 
     fn get_session_mock(body: Value) -> wiremock::Mock {
