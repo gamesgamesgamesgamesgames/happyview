@@ -543,3 +543,108 @@ async fn a_native_repo_refuses_local_writes_and_keeps_its_mode() {
     );
     assert_eq!(after.sync_cursor.as_deref(), Some("3kcursor"));
 }
+
+async fn repo_state_rows(app: &TestApp) -> i64 {
+    let sql = happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_space_repo_state",
+        app.state.db_backend,
+    );
+    happyview::db::query_scalar(&sql)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("count repo states")
+}
+
+/// A sync read by `reader` of `method` for `author`, as status and body.
+async fn sync_read(
+    app: &TestApp,
+    method: &str,
+    space_uri: &str,
+    reader: &str,
+    author: &str,
+) -> (StatusCode, Value) {
+    let (name, value) = cookie_for(app, reader);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/xrpc/com.atproto.space.{method}?space={}&did={}",
+            urlencoding::encode(space_uri),
+            urlencoding::encode(author)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    (resp.status(), json_of(resp).await)
+}
+
+/// A space whose authority can read it and an author who is a member but has
+/// never written there, so has no repo state.
+async fn setup_unwritten_author(label: &str) -> (TestApp, String, String, String) {
+    let (app, space_id, space_uri, reader) = setup(label).await;
+    let author = rand_did(label);
+    add_member(&app, &space_id, &author, MemberAccess::WRITE).await;
+    (app, space_uri, reader, author)
+}
+
+#[tokio::test]
+#[serial]
+async fn get_latest_commit_for_an_unwritten_author_answers_empty_and_stores_nothing() {
+    common::require_db!();
+    let (app, space_uri, reader, author) = setup_unwritten_author("unwrittenlc").await;
+    let before = repo_state_rows(&app).await;
+
+    for method in ["getLatestCommit", "getRepoState"] {
+        let (status, body) = sync_read(&app, method, &space_uri, &reader, &author).await;
+        assert_eq!(status, StatusCode::OK, "{method}: {body}");
+        assert!(body["rev"].is_null(), "{method}: {body}");
+        assert!(body["commit"].is_null(), "{method}: {body}");
+    }
+
+    assert_eq!(repo_state_rows(&app).await, before);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_repo_for_an_unwritten_author_is_not_found_and_stores_nothing() {
+    common::require_db!();
+    let (app, space_uri, reader, author) = setup_unwritten_author("unwrittenrepo").await;
+    let before = repo_state_rows(&app).await;
+
+    let (status, body) = sync_read(&app, "getRepo", &space_uri, &reader, &author).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "no commit exists for this repo");
+
+    assert_eq!(repo_state_rows(&app).await, before);
+}
+
+#[tokio::test]
+#[serial]
+async fn list_repo_ops_for_an_unwritten_author_answers_empty_and_stores_nothing() {
+    common::require_db!();
+    let (app, space_uri, reader, author) = setup_unwritten_author("unwrittenops").await;
+    let before = repo_state_rows(&app).await;
+
+    let (status, body) = sync_read(&app, "listRepoOps", &space_uri, &reader, &author).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ops"], json!([]), "{body}");
+    assert!(body["commit"].is_null(), "{body}");
+
+    assert_eq!(repo_state_rows(&app).await, before);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unwritten_author_still_gets_state_on_first_write() {
+    common::require_db!();
+    let (app, space_uri, _reader, author) = setup_unwritten_author("unwrittenwrite").await;
+    sync_read(&app, "getLatestCommit", &space_uri, &author, &author).await;
+    let before = repo_state_rows(&app).await;
+
+    create_record(&app, &space_uri, &author, json!({ "text": "first" })).await;
+
+    assert_eq!(repo_state_rows(&app).await, before + 1);
+    let (status, body) = sync_read(&app, "getLatestCommit", &space_uri, &author, &author).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["commit"].is_null(), "{body}");
+}
