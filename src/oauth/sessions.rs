@@ -235,6 +235,55 @@ pub async fn get_dpop_session(
 
 /// Look up a DPoP session by api_client_id and dpop_key_id, decrypting tokens.
 /// Used by the auth middleware where the key ID is derived from the DPoP proof thumbprint.
+/// Whether a session's `pds_url` and issuer have been checked against the
+/// user's DID document, which registration does and an older row lacks.
+pub async fn is_verified(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Result<bool, AppError> {
+    let sql = adapt_sql(
+        "SELECT verified_at FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read a session's verification: {e}")))?;
+    Ok(row.and_then(|(at,)| at).is_some())
+}
+
+/// Record that a session's PDS is `pds_url`, resolved from the user's DID
+/// document, and that its issuer was checked against it.
+pub async fn mark_verified(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+    pds_url: &str,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_sessions SET pds_url = ?, verified_at = ? WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(pds_url)
+        .bind(now_rfc3339())
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to mark a session verified: {e}")))?;
+    Ok(())
+}
+
 /// Look up just the granted scopes for a session.
 ///
 /// Deliberately does not decrypt the tokens: a scope check has no business

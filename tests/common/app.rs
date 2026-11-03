@@ -838,6 +838,25 @@ impl TestApp {
             .await;
     }
 
+    /// Make the PDS [`Self::mock_session_verification`] resolves for `did`
+    /// name `issuer` as its authorization server, which a session
+    /// registration naming `issuer` checks.
+    pub async fn mock_pds_names_issuer(&self, did: &str, issuer: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/pds/{did}/.well-known/oauth-protected-resource"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "authorization_servers": [issuer] })),
+            )
+            .mount(&self.mock_server)
+            .await;
+    }
+
     /// Install a fake plugin directly into the registry at the given version.
     pub async fn install_fake_plugin(&self, id: &str, version: &str) {
         self.install_fake_plugin_from(id, version, &format!("https://example.com/{id}.wasm"))

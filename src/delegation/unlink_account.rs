@@ -76,6 +76,7 @@ pub async fn unlink_account(
                     state.db_backend,
                     encryption_key,
                     &state.oauth,
+                    &state.config.plc_url,
                     &api_client_id,
                     account_did,
                     dpop_key_id,

@@ -198,6 +198,22 @@ async fn sign_in_as(
     claimed_scope: &str,
     access_token: &str,
 ) -> (String, Value) {
+    let (status, answer, provision_id, dpop_key) =
+        register(app, client, did, issuer, claimed_scope, access_token).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    (provision_id, dpop_key)
+}
+
+/// A session registration as [`sign_in_as`] makes it, answering its status
+/// and body alongside the provision id and the DPoP key.
+async fn register(
+    app: &common::app::TestApp,
+    client: &Client,
+    did: &str,
+    issuer: &str,
+    claimed_scope: &str,
+    access_token: &str,
+) -> (StatusCode, Value, String, Value) {
     let verifier = "hpy-test-verifier-0123456789abcdef0123456789";
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let resp = app
@@ -233,8 +249,9 @@ async fn sign_in_as(
         .await
         .unwrap();
     let status = resp.status();
-    assert_eq!(status, StatusCode::CREATED, "{}", response_json(resp).await);
     (
+        status,
+        response_json(resp).await,
         body["provision_id"].as_str().unwrap().to_string(),
         body["dpop_key"].clone(),
     )
@@ -366,10 +383,21 @@ async fn an_issuer_the_pds_does_not_name_is_never_asked() {
         &[token_response(&did, ADMIN_GRANT, 3600)],
     )
     .await;
-    let (_, key) = sign_in(&app, &did, &server.uri(), ADMIN_GRANT, "app-token").await;
-
-    let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
+    // Refused at registration, so no session exists to send its tokens there.
+    let (status, body, _, _) = register(
+        &app,
+        &Client::hpy(),
+        &did,
+        &server.uri(),
+        ADMIN_GRANT,
+        "app-token",
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"], "the session's authorization server is not the account's",
+        "{body}"
+    );
     assert_eq!(token_requests(&server).await, 0);
 }
 
