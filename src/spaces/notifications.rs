@@ -63,7 +63,9 @@ static UNSIGNED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// so a receiver can check the token was minted for it and for this kind of
 /// notification. A legacy registration names its DID and its URL
 /// separately, so a token addressed to a DID only goes to a URL that DID
-/// publishes. The body is unchanged, so a receiver that ignores the header
+/// publishes. The match is by origin, not full URL, so a DID that lists an
+/// origin other parties also receive requests at (a shared, multi-tenant
+/// host) has its tokens reach any path there. The body is unchanged, so a receiver that ignores the header
 /// works as before. Without a signer, when the URL isn't one the DID lists,
 /// or when minting fails, the payload is still sent, without the header.
 async fn post_webhook(
