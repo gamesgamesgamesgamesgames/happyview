@@ -16,7 +16,7 @@ use crate::plugin::memory::{
 use crate::plugin::prepared::ArtifactStamp;
 use crate::plugin::runtime::{
     GuestDeadline, MemoryLimiter, UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling,
-    script_memory_ceiling,
+    script_memory_ceiling, slice_guest_deadline,
 };
 use crate::plugin::secrets::load_plugin_secrets;
 use crate::plugin::{
@@ -108,6 +108,16 @@ impl From<PluginEnvelopeError> for ExecutionError {
             retryable: e.retryable,
         }
     }
+}
+
+/// A store for `state` on `runtime`'s engine, with the memory limiter and the
+/// epoch callback that slices its guest deadline. Every store that runs a
+/// plugin's code is made here.
+pub(crate) fn new_store(runtime: &WasmRuntime, state: PluginState) -> Store<PluginState> {
+    let mut store = Store::new(runtime.engine(), state);
+    store.limiter(|state| &mut state.limiter);
+    slice_guest_deadline(&mut store, |state| &mut state.deadline);
+    store
 }
 
 /// Single-use wrapper around a WASM instance
@@ -1430,8 +1440,7 @@ impl PluginExecutor {
         let link = linking.elapsed();
         let state = self.build_state(plugin, scope, secrets, config).await?;
 
-        let mut store = Store::new(self.runtime.engine(), state);
-        store.limiter(|state| &mut state.limiter);
+        let mut store = new_store(&self.runtime, state);
         // Instantiation itself burns fuel where the data image is copied
         // rather than mapped, and each call refuels before it starts, so a
         // library's first call never begins with a budget instantiation
@@ -1441,8 +1450,10 @@ impl PluginExecutor {
             .map_err(|e| ExecutionError::Instantiation(e.into()))?;
         // A store without a deadline traps on its first instruction, and
         // instantiation already runs compiled code. Library and auth stores
-        // stay bounded by fuel.
-        store.set_epoch_deadline(UNBOUNDED_TICKS);
+        // stay bounded by fuel; their deadline is unbounded, so it only ever
+        // yields.
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
         // Fuel does not bound an interpreter, so its store leaves here
         // already under the operator's wall clock; a runner re-arms per run
         // and the job runner lifts it. A runner that forgets fails closed.
@@ -2010,7 +2021,7 @@ mod deadline {
             .build_state(&plugin, "test", HashMap::new(), serde_json::Value::Null)
             .await
             .unwrap();
-        let mut store = Store::new(executor.runtime.engine(), state);
+        let mut store = new_store(&executor.runtime, state);
         // Fuel is not the boundary under test.
         store.set_fuel(u64::MAX).unwrap();
         store.set_epoch_deadline(UNBOUNDED_TICKS);
@@ -2157,6 +2168,125 @@ mod deadline {
         store.set_epoch_deadline(delta);
         let started = Instant::now();
         let err = f.call_async(&mut store, 50).await.unwrap_err();
+        assert!(is_interrupt(&err), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// Wakes every 10 ms until `stop`, answering the longest it waited
+    /// between two wakes: how long the worker it shares was held from it.
+    async fn longest_tick_gap(stop: Arc<std::sync::atomic::AtomicBool>) -> Duration {
+        let mut longest = Duration::ZERO;
+        let mut last = Instant::now();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let now = Instant::now();
+            longest = longest.max(now - last);
+            last = now;
+        }
+        longest
+    }
+
+    /// The longest a task beside a spinning guest may wait. One slice
+    /// apart is what yielding gives, about 50 ms on an idle machine; a
+    /// guest that held the worker would hold it for the whole run, a
+    /// second or more. Four slices leaves room for a machine running the
+    /// rest of the suite at once and still tells the two apart.
+    const HELD_CEILING: Duration = crate::plugin::runtime::EPOCH_TICK
+        .saturating_mul(4 * crate::plugin::runtime::EPOCH_SLICE as u32);
+
+    /// On a runtime with one worker, a guest spinning under a one-second
+    /// wall clock with no instruction budget to stop it still ends at that
+    /// second as a timeout, and a task beside it on the same worker keeps
+    /// running: the deadline yields the worker every slice rather than
+    /// holding it until it traps.
+    /// `cargo test --lib plugin::executor::deadline::a_spinning_guest_yields -- --nocapture`
+    /// prints the end time and the longest gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_spinning_guest_yields_its_worker_and_still_times_out() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let budget = Duration::from_secs(1);
+        arm(&mut store, budget);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = tokio::spawn(longest_tick_gap(stop.clone()));
+        let guest = tokio::spawn(async move {
+            let started = Instant::now();
+            let err = spin.call_async(&mut store, ()).await.unwrap_err();
+            let elapsed = started.elapsed();
+            let interrupted = is_interrupt(&err);
+            (elapsed, interrupted, classify_error(store.data(), err))
+        });
+        let (elapsed, interrupted, error) = guest.await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let gap = ticker.await.unwrap();
+        println!(
+            "sliced deadline {budget:?}: interrupted after {elapsed:?}, longest tick gap {gap:?}"
+        );
+        assert!(interrupted);
+        assert!(matches!(error, ExecutionError::Timeout), "{error}");
+        assert_interrupted_near(elapsed, budget, Duration::from_millis(200));
+        assert!(gap < HELD_CEILING, "the worker was held for {gap:?}");
+    }
+
+    /// A lifted deadline, as a job runs under, never traps: the guest keeps
+    /// yielding past any wall clock, and the task beside it keeps running.
+    /// The run is stopped from outside, by dropping it at a yield.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_lifted_deadline_yields_forever_and_never_traps() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = tokio::spawn(longest_tick_gap(stop.clone()));
+        let bound = Duration::from_millis(1500);
+        let guest = tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(bound, spin.call_async(&mut store, ())).await;
+            (started.elapsed(), outcome.is_err())
+        });
+        let (elapsed, still_running) = guest.await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let gap = ticker.await.unwrap();
+        println!("lifted deadline: still running after {elapsed:?}, longest tick gap {gap:?}");
+        assert!(still_running, "the guest ended on its own");
+        assert!(elapsed >= bound);
+        assert!(gap < HELD_CEILING, "the worker was held for {gap:?}");
+    }
+
+    /// A job whose worker loses its lease while the guest is in a host
+    /// import is interrupted as soon as it resumes, lifted deadline or not.
+    #[tokio::test]
+    async fn a_lost_lease_interrupts_a_lifted_guest_on_resume() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let f = instance
+            .get_typed_func::<i32, ()>(&mut store, "sleep_then_spin")
+            .unwrap();
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store.data_mut().script_run = Some(ScriptRun {
+            lease_lost: Some(lost.clone()),
+            ..Default::default()
+        });
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), f.call_async(&mut store, 100))
+            .await
+            .expect("the guest kept running after its lease was lost")
+            .unwrap_err();
         assert!(is_interrupt(&err), "{err}");
         assert!(started.elapsed() < Duration::from_millis(500));
     }
@@ -2434,6 +2564,66 @@ mod deadline {
                 "{name} bypasses the wrapper"
             );
         }
+    }
+
+    /// Every store `new_store` builds yields at its epoch deadline, and
+    /// wasmtime traps a yield from a guest entered synchronously. That trap
+    /// would come at the first slice boundary, 50 ms in, so a short test
+    /// could pass while a production path was broken. Production plugin
+    /// code must therefore enter guests only through the `*_async` calls:
+    /// no `.call(`, no `Instance::new(`, and no linker
+    /// `.instantiate(&mut …)` outside a test module. The scan covers
+    /// `src/plugin` and the two places that drive plugin stores,
+    /// `src/project/script_module` and `src/script`. It cuts each file at
+    /// its test *module*, not its first `#[cfg(test)]`: several files mark a
+    /// single helper test-only well before production code that must be
+    /// scanned, such as `PluginExecutor::instantiate`.
+    #[test]
+    fn production_plugin_code_enters_guests_only_asynchronously() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        for dir in ["plugin", "project/script_module", "script"] {
+            sources(&src.join(dir), &mut files);
+        }
+        assert!(files.len() > 5, "{files:?}");
+        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s").unwrap();
+        let sync_entry =
+            regex::Regex::new(r"\.call\(|Instance::new\(|\.instantiate\(\s*&mut").unwrap();
+        for sync in [
+            "func.call(&mut store, ())",
+            "Instance::new(&mut store, &module, &[])",
+            "linker.instantiate(&mut store, &module)",
+        ] {
+            assert!(sync_entry.is_match(sync), "{sync}");
+        }
+        assert!(!sync_entry.is_match("func.call_async(&mut store, ()).await"));
+        let mut found = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            // Only the code before a file's test module runs in production.
+            let production = test_module.split(&text).next().unwrap_or("");
+            for (i, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if sync_entry.is_match(code) {
+                    found.push(format!("{}:{}: {}", file.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "synchronous guest entry:\n{}",
+            found.join("\n")
+        );
     }
 
     fn bindings_test_state(runtime: &WasmRuntime) -> PluginState {

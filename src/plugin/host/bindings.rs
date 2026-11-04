@@ -1342,11 +1342,15 @@ fn suspend_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
 /// interrupted as soon as it resumes rather than repeating the job's side
 /// effects alongside the run that took the job over.
 fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
-    let remaining = caller.data_mut().deadline.resume();
     let lost = lease_lost(caller);
-    caller
-        .as_context_mut()
-        .set_epoch_deadline(if lost { 0 } else { remaining });
+    let deadline = &mut caller.data_mut().deadline;
+    if lost {
+        // Spent rather than only re-armed at zero: the epoch callback would
+        // otherwise find budget left and let the guest carry on.
+        deadline.exhaust();
+    }
+    let delta = deadline.resume();
+    caller.as_context_mut().set_epoch_deadline(delta);
 }
 
 /// Why a job run that lost its lease stops at a host import.
