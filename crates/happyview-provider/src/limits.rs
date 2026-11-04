@@ -191,6 +191,20 @@ impl std::fmt::Display for LimitReached {
 impl std::error::Error for LimitReached {}
 
 impl Limits {
+    /// `Err` naming the limit when the snapshot sets something no host can
+    /// mean. A retention ceiling of 0 days would read as "forever" in every
+    /// setting it caps, and refuse every value an owner could set, so it
+    /// keeps logs forever with no way out. A provider checks this when it
+    /// takes in limits; `0` stays valid for the counted limits.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.log_retention_days.as_ref().is_some_and(|c| c.max == 0) {
+            return Err(
+                "log_retention_days must be at least 1 day: 0 would keep logs forever".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The cap on a counted or ceiling limit, `None` when unlimited. A gate
     /// has no cap: see [`Limits::allows_anonymous_xrpc`].
     pub fn cap_of(&self, limit: Limit) -> Option<&Cap> {
@@ -514,5 +528,28 @@ mod tests {
         let fixed = FixedLimits::new(limited());
         assert_eq!(*fixed.limits(), limited());
         assert_eq!(*FixedLimits::default().limits(), Limits::default());
+    }
+
+    #[test]
+    fn a_retention_ceiling_of_zero_is_refused_and_zero_counts_are_not() {
+        let zero = |limit: &str| -> Limits {
+            serde_json::from_str(&format!(r#"{{"{limit}": {{"max": 0}}}}"#)).unwrap()
+        };
+        let err = zero("log_retention_days").validate().unwrap_err();
+        assert!(err.contains("log_retention_days"), "{err}");
+        assert_eq!(zero("seats").validate(), Ok(()));
+        assert_eq!(zero("api_clients").validate(), Ok(()));
+        assert_eq!(cap_limits(1).validate(), Ok(()));
+        assert_eq!(Limits::default().validate(), Ok(()));
+    }
+
+    fn cap_limits(days: u32) -> Limits {
+        Limits {
+            log_retention_days: Some(Cap {
+                max: days,
+                wording: Wording::default(),
+            }),
+            ..Limits::default()
+        }
     }
 }

@@ -111,18 +111,26 @@ fn from_vars(get: &impl Fn(&str) -> Option<String>) -> Result<Limits, String> {
             allowed,
             wording: Wording::default(),
         });
-    Ok(Limits {
+    let limits = Limits {
         seats: number(Limit::Seats)?,
         api_clients: number(Limit::ApiClients)?,
         anonymous_xrpc: anonymous,
         log_retention_days: number(Limit::LogRetentionDays)?,
-    })
+    };
+    limits
+        .validate()
+        .map_err(|e| format!("{}: {e}", var_name(Limit::LogRetentionDays)))?;
+    Ok(limits)
 }
 
 /// Parse a limits file's text.
 fn parse(path: &Path, text: &str) -> Result<Limits, String> {
-    serde_json::from_str(text)
-        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))
+    let limits: Limits = serde_json::from_str(text)
+        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))?;
+    limits
+        .validate()
+        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))?;
+    Ok(limits)
 }
 
 /// Read and parse a limits file.
@@ -459,5 +467,33 @@ mod tests {
             check_retention_setting(&Limits::default(), "event_log_retention_days", "0"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_retention_ceiling_of_zero_stops_boot_and_a_changed_file_keeps_its_limits() {
+        let err = limits_of(&[("HAPPYVIEW_LIMIT_LOG_RETENTION_DAYS", "0")]).unwrap_err();
+        assert!(err.contains("HAPPYVIEW_LIMIT_LOG_RETENTION_DAYS"), "{err}");
+        assert_eq!(
+            limits_of(&[("HAPPYVIEW_LIMIT_SEATS", "0")])
+                .unwrap()
+                .seats
+                .unwrap()
+                .max,
+            0
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        write(&path, r#"{"log_retention_days": {"max": 0}}"#);
+        let err = load_from(lookup(&[(FILE_VAR, path.to_str().unwrap())]))
+            .err()
+            .unwrap();
+        assert!(err.contains("at least 1"), "{err}");
+
+        write(&path, r#"{"log_retention_days": {"max": 7}}"#);
+        let file = FileLimits::open(path.clone()).unwrap();
+        write(&path, r#"{"log_retention_days": {"max": 0}}"#);
+        assert!(matches!(file.reload(), Reload::Kept(_)));
+        assert_eq!(file.limits().log_retention_days.as_ref().unwrap().max, 7);
     }
 }
