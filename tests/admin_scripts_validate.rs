@@ -606,6 +606,12 @@ async fn a_replaced_or_deleted_body_leaves_the_cache() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(cached(first).is_some());
 
+    // The limit counts characters: 300 two-byte ones fit, 301 do not.
+    let resp = patch_script(&app, ECHO_ID, &json!({"description": "é".repeat(300)})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = patch_script(&app, ECHO_ID, &json!({"description": "é".repeat(301)})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     let second = "returns:{\"n\":3}";
     let resp = patch_script(&app, ECHO_ID, &json!({"body": second})).await;
     assert_eq!(resp.status(), StatusCode::OK);

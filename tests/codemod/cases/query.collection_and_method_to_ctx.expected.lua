@@ -1,3 +1,3 @@
 function handle(input, ctx)
-  return { collection = ctx.collection, method = ctx.method }
+  return { collection = "games.gamesgamesgamesgames.game", method = ctx.method }
 end

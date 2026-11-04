@@ -11,10 +11,9 @@
 
 mod interop_support;
 
-use happyview::spaces::commit::{SpaceVerifyingKey, verify_commit};
 use happyview::spaces::lthash::{LtHashState, record_element};
 use happyview::spaces::native_client::{
-    OpAction, RepoOp, collect_repo_ops, latest_op_per_record, parse_signed_commit,
+    OpAction, RepoOp, VerifiedCommit, collect_repo_ops, latest_op_per_record, verify_remote_commit,
 };
 use happyview::spaces::pds_support::{self, DetectionTier};
 use happyview::spaces::types::Policy;
@@ -147,15 +146,9 @@ impl Account {
         .await;
     }
 
-    async fn latest_commit(&self, space: &str) -> Value {
-        let (status, body) = self
-            .get(
-                "com.atproto.space.getLatestCommit",
-                &[("space", space.to_string()), ("repo", self.did.clone())],
-            )
-            .await;
-        assert_eq!(status, 200, "getLatestCommit failed: {body}");
-        body["commit"].clone()
+    /// The latest commit, fetched and authenticated as native sync does.
+    async fn verified_commit(&self, space: &str) -> VerifiedCommit {
+        interop_support::verified_latest_commit(PDS, PLC, &self.token, space, &self.did).await
     }
 
     async fn oplog(&self, space: &str, since: Option<&str>, page_size: u32) -> Vec<RepoOp> {
@@ -168,25 +161,6 @@ impl Account {
         .await
         .expect("the oplog collects")
     }
-}
-
-async fn author_key(did: &str) -> SpaceVerifyingKey {
-    let doc: Value = client()
-        .get(format!("{PLC}/{did}"))
-        .send()
-        .await
-        .expect("PLC request failed")
-        .json()
-        .await
-        .expect("PLC json");
-    let multibase = doc["verificationMethod"]
-        .as_array()
-        .expect("verificationMethod")
-        .iter()
-        .find(|v| v["id"].as_str().unwrap_or_default().ends_with("#atproto"))
-        .and_then(|v| v["publicKeyMultibase"].as_str())
-        .expect("an #atproto key");
-    happyview::spaces::credential::multikey_to_space_key(multibase).expect("the key decodes")
 }
 
 fn fold_latest(ops: &[RepoOp]) -> LtHashState {
@@ -248,15 +222,8 @@ async fn a_commit_written_by_atproto_pds_verifies_and_agrees_with_our_set_hash()
     let mut expected = LtHashState::new();
     expected.add(&record_element(NOTE, "b", b2["cid"].as_str().unwrap()));
 
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).expect("parses");
-    verify_commit(
-        &commit,
-        &space,
-        &account.did,
-        &author_key(&account.did).await,
-    )
-    .expect("a commit written by atproto-pds must verify with our own code");
-    assert_eq!(commit.hash, expected.hash());
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(*commit.hash(), expected.hash());
 }
 
 #[tokio::test]
@@ -267,9 +234,31 @@ async fn a_commit_from_another_repo_does_not_verify_as_ours() {
     let space = alice.new_space().await;
     alice.put_note(&space, "a", "a").await;
 
-    let commit = parse_signed_commit(&alice.latest_commit(&space).await).unwrap();
-    assert!(verify_commit(&commit, &space, &bob.did, &author_key(&alice.did).await).is_err());
-    assert!(verify_commit(&commit, &space, &alice.did, &author_key(&bob.did).await).is_err());
+    let alice_doc = interop_support::did_doc(PLC, &alice.did).await;
+    let bob_doc = interop_support::did_doc(PLC, &bob.did).await;
+    let verify = |fetched: &interop_support::FetchedCommit, repo: &str, doc| {
+        verify_remote_commit(
+            &fetched.json,
+            &space,
+            repo,
+            doc,
+            fetched.exchange.as_ref(),
+            fetched.mac_header.as_ref(),
+        )
+    };
+
+    // Alice's commit, presented as Bob's.
+    let fetched =
+        interop_support::fetch_latest_commit(PDS, &alice.token, &space, &alice.did, &alice_doc)
+            .await;
+    assert!(verify(&fetched, &alice.did, &alice_doc).is_ok());
+    assert!(verify(&fetched, &bob.did, &bob_doc).is_err());
+
+    // Alice's commit, checked against Bob's keys: his signing key for a signed
+    // commit, and a MAC keyed to his KEM key for a 0016 one.
+    let fetched =
+        interop_support::fetch_latest_commit(PDS, &alice.token, &space, &alice.did, &bob_doc).await;
+    assert!(verify(&fetched, &alice.did, &bob_doc).is_err());
 }
 
 #[tokio::test]
@@ -297,8 +286,8 @@ async fn replaying_the_atproto_pds_oplog_across_pages_reproduces_its_commit() {
         ]
     );
 
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).unwrap();
-    assert_eq!(fold_latest(&ops).hash(), commit.hash);
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(fold_latest(&ops).hash(), *commit.hash());
 
     let cursor = ops.last().unwrap().rev.clone();
     account.put_note(&space, "d", "d").await;
@@ -336,8 +325,8 @@ async fn a_page_ending_inside_a_batch_loses_nothing() {
 
     let ops = account.oplog(&space, None, 2).await;
     assert_eq!(ops.len(), 3);
-    let commit = parse_signed_commit(&account.latest_commit(&space).await).unwrap();
-    assert_eq!(fold_latest(&ops).hash(), commit.hash);
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(fold_latest(&ops).hash(), *commit.hash());
 }
 
 #[tokio::test]
@@ -347,24 +336,15 @@ async fn the_migration_replay_lands_on_atproto_pds_with_the_hash_it_expects() {
     let space = account.new_space().await;
 
     let records = interop_support::records_awaiting_migration(&space, &account.did, Sample::Full);
-    let commit =
-        interop_support::replay_as_migration(PDS, &account.token, &space, &account.did, &records)
-            .await;
+    interop_support::replay_as_migration(PDS, &account.token, &space, &account.did, &records).await;
 
     let disagreements =
         interop_support::cid_disagreements(PDS, &account.token, &space, &account.did, &records)
             .await;
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 
-    let commit = parse_signed_commit(&commit).expect("parses");
-    verify_commit(
-        &commit,
-        &space,
-        &account.did,
-        &author_key(&account.did).await,
-    )
-    .expect("authentic");
-    assert_eq!(commit.hash, interop_support::migration_expects(&records));
+    let commit = account.verified_commit(&space).await;
+    assert_eq!(*commit.hash(), interop_support::migration_expects(&records));
 }
 
 // ---------------------------------------------------------------------------

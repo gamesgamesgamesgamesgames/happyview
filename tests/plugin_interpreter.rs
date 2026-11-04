@@ -354,7 +354,7 @@ async fn a_spinning_script_is_interrupted_at_the_wall_clock_and_classifies_as_ti
 /// The burn is sized to this machine, since no one count outlasts the budget
 /// on every machine without costing seconds on some. The non-job arms prove
 /// it outlasted the budget whatever it was sized to — a burn too short comes
-/// back from them returned rather than timed out — and the floor below is
+/// back from them returned rather than timed out — and the budget check below is
 /// checked first only so a burn the guest never spent is reported as that
 /// rather than as a deadline that stopped working.
 #[tokio::test]
@@ -381,7 +381,7 @@ async fn only_a_job_run_outlives_the_wall_clock() {
     );
     let burned = started.elapsed();
     assert_eq!(value["source"], source);
-    burn.assert_outlasted(burned);
+    burn.assert_outlasted(burned, std::time::Duration::from_secs(1));
 
     for kind in [ScriptKind::XrpcQuery, ScriptKind::RecordEvent] {
         let err = app

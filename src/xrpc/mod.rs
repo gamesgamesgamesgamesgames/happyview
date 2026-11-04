@@ -2,6 +2,7 @@ pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
+pub(crate) mod validate;
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
@@ -363,25 +364,29 @@ fn extract_client_key(
     }
 }
 
-/// Resolve the client key and run origin/secret validation.
+/// The rate key of a request: the client it names, once that client is
+/// proven, and `anonymous` otherwise.
 ///
-/// A request that names no client is rate limited as `anonymous` and logs
-/// nothing: it is the ordinary case for a public query. A key that is named
-/// but not registered is warned about.
+/// A client is proven by the session it signed in through, by its registered
+/// Origin, or by one of its live secrets. A key that is unknown, or arrives
+/// with the wrong Origin, a wrong secret or neither, is warned about and
+/// limited as `anonymous`: the key is public, so taking it on its word would
+/// let any caller spend that client's bucket. A request that names no client
+/// is the ordinary case for a public query and logs nothing.
 fn resolve_client_key(
     rate_limiter: &RateLimiter,
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
+    secret_used: impl FnOnce(String),
 ) -> Result<String, AppError> {
     let Some(client_key) = extract_client_key(claims, parts, query_params)? else {
         return Ok(ANONYMOUS_CLIENT_KEY.to_string());
     };
 
-    // Log validation warnings but always return the key for rate limiting.
     if !rate_limiter.is_valid_client_key(&client_key) {
         tracing::warn!("Unknown client key: {client_key}");
-        return Ok(client_key);
+        return Ok(ANONYMOUS_CLIENT_KEY.to_string());
     }
 
     // If the key came from a session cookie, it was already validated at login time.
@@ -396,6 +401,7 @@ fn resolve_client_key(
         if let Some(origin) = origin {
             if !rate_limiter.validate_client_origin(&client_key, origin) {
                 tracing::warn!("Origin mismatch for client {client_key}: got {origin}");
+                return Ok(ANONYMOUS_CLIENT_KEY.to_string());
             }
         } else {
             let secret = parts
@@ -403,19 +409,48 @@ fn resolve_client_key(
                 .get("x-client-secret")
                 .and_then(|v| v.to_str().ok());
 
-            match secret {
-                Some(s) if rate_limiter.validate_client_secret(&client_key, s) => {}
-                Some(_) => {
+            match secret.map(|s| rate_limiter.match_client_secret(&client_key, s)) {
+                Some(Some(secret_id)) => {
+                    if rate_limiter.note_secret_use(&secret_id) {
+                        secret_used(secret_id);
+                    }
+                }
+                Some(None) => {
                     tracing::warn!("Invalid client secret for {client_key}");
+                    return Ok(ANONYMOUS_CLIENT_KEY.to_string());
                 }
                 None => {
                     tracing::warn!("No Origin or X-Client-Secret for client {client_key}");
+                    return Ok(ANONYMOUS_CLIENT_KEY.to_string());
                 }
             }
         }
     }
 
     Ok(client_key)
+}
+
+/// The `anonymous_xrpc` limit (HAP-226): a call from nobody is refused when
+/// the instance's limits say so. `identified` is whether the caller is someone
+/// (a signed-in session, a space credential or another service), which is
+/// what decides this, not `rate_key`: that says only whether a client key
+/// checked out, and a signed-in caller's can fail to, say on an instance that
+/// hasn't loaded the client yet. A key alone identifies nobody either, so a
+/// call with no caller needs one that checked out. Reads the limits in memory,
+/// on every request.
+fn refuse_anonymous(state: &AppState, identified: bool, rate_key: &str) -> Result<(), AppError> {
+    if !identified && rate_key == ANONYMOUS_CLIENT_KEY {
+        state.limits.limits().allows_anonymous_xrpc()?;
+    }
+    Ok(())
+}
+
+/// Record, off the request path, that a client secret authenticated a request.
+fn record_secret_use(state: &AppState, secret_id: String) {
+    let (db, backend) = (state.db.clone(), state.db_backend);
+    tokio::spawn(async move {
+        crate::oauth::client_secrets::record_use(&db, backend, &secret_id).await;
+    });
 }
 
 /// Apply rate limit headers to a response.
@@ -482,8 +517,18 @@ pub async fn xrpc_get(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
+    let identified = claims.is_some()
+        || xrpc_claims.space_credential.is_some()
+        || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     let lexicon = state.lexicons.get(&method).await;
 
@@ -566,6 +611,7 @@ pub async fn xrpc_get(
 
     if let Some(ref param_schema) = lexicon.parameters {
         coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
     }
 
     let mut response =
@@ -656,8 +702,18 @@ pub async fn xrpc_post(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state.rate_limiter, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
+    let identified = claims.is_some()
+        || xrpc_claims.space_credential.is_some()
+        || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     if claims.is_none()
         && xrpc_claims.space_credential.is_none()
@@ -755,10 +811,6 @@ pub async fn xrpc_post(
         )));
     }
 
-    if let Some(ref param_schema) = lexicon.parameters {
-        coerce_params(&mut params, param_schema);
-    }
-
     // For service auth, synthesise Claims from the caller's DID so the
     // procedure handler has an identity to work with.
     let service_auth_claims_owned;
@@ -773,6 +825,13 @@ pub async fn xrpc_post(
         (&service_auth_claims_owned, None)
     };
 
+    // After auth, so a caller who may not call the procedure learns nothing
+    // about its lexicon from a validation error.
+    if let Some(ref param_schema) = lexicon.parameters {
+        coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
+    }
+
     // `input.encoding` decides what the script receives. Bytes are stored
     // before the script runs and reach it as an ordinary blob ref, so a script
     // authorizes and records a body without ever carrying it — which is the
@@ -780,7 +839,9 @@ pub async fn xrpc_post(
     let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
         ingest_body(&state, &parts, &lexicon, &raw_body).await?
     } else {
-        json_body(&parts, &raw_body)?
+        let body = json_body(&parts, &raw_body)?;
+        validate::input(&state, &lexicon, &body).await?;
+        body
     };
 
     let mut response =
@@ -1035,15 +1096,24 @@ mod tests {
         }
     }
 
+    fn rate_limiter() -> std::sync::Arc<crate::rate_limit::RateLimiter> {
+        crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
+            query_cost: 1,
+            procedure_cost: 1,
+            proxy_cost: 1,
+        })
+    }
+
     /// What `resolve_client_key` answers for `parts`, and what it logged at
     /// warn level or above.
     fn resolve_logging_warnings(parts: &Parts) -> (String, String) {
-        let rate_limiter =
-            crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
-                query_cost: 1,
-                procedure_cost: 1,
-                proxy_cost: 1,
-            });
+        resolve_against(&rate_limiter(), parts)
+    }
+
+    fn resolve_against(
+        rate_limiter: &crate::rate_limit::RateLimiter,
+        parts: &Parts,
+    ) -> (String, String) {
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -1052,7 +1122,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         let key = tracing::subscriber::with_default(subscriber, || {
-            resolve_client_key(&rate_limiter, None, parts, &HashMap::new()).unwrap()
+            resolve_client_key(rate_limiter, None, parts, &HashMap::new(), |_| {}).unwrap()
         });
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         (key, log)
@@ -1066,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_key_nobody_registered_is_still_warned_about() {
+    fn a_client_key_nobody_registered_is_warned_about_and_limited_as_anonymous() {
         for named in ["hvc_nobody", "anonymous"] {
             let (parts, _) = axum::http::Request::builder()
                 .uri("/xrpc/test")
@@ -1075,12 +1145,118 @@ mod tests {
                 .unwrap()
                 .into_parts();
             let (key, log) = resolve_logging_warnings(&parts);
-            assert_eq!(key, named);
+            assert_eq!(key, "anonymous");
             assert!(
                 log.contains(&format!("Unknown client key: {named}")),
                 "got: {log}"
             );
         }
+    }
+
+    const VICTIM: &str = "hvc_victim";
+    const VICTIM_URI: &str = "https://victim.example";
+    const VICTIM_SECRET: &str = "hvs_victim_secret";
+
+    /// A limiter knowing one client, with a bucket of `capacity` that does
+    /// not refill within a test.
+    fn limiter_with_victim(capacity: u32) -> std::sync::Arc<crate::rate_limit::RateLimiter> {
+        let rate_limiter = rate_limiter();
+        rate_limiter.register_client_identity(
+            VICTIM.into(),
+            crate::rate_limit::ClientIdentity {
+                secrets: vec![crate::rate_limit::SecretHash {
+                    id: "secret-1".into(),
+                    hash: crate::oauth::client_secrets::hash(VICTIM_SECRET),
+                }],
+                client_uri: VICTIM_URI.into(),
+            },
+        );
+        rate_limiter.register_client_config(
+            VICTIM.into(),
+            crate::rate_limit::RateLimitConfig {
+                capacity,
+                refill_rate: 0.000_001,
+                default_query_cost: 1,
+                default_procedure_cost: 1,
+                default_proxy_cost: 1,
+            },
+        );
+        rate_limiter
+    }
+
+    #[test]
+    fn a_registered_key_without_proof_is_limited_as_anonymous() {
+        let rate_limiter = limiter_with_victim(10);
+        for (case, headers, warning) in [
+            (
+                "the wrong Origin",
+                vec![
+                    ("x-client-key", VICTIM),
+                    ("origin", "https://attacker.example"),
+                ],
+                "Origin mismatch",
+            ),
+            (
+                "a wrong secret",
+                vec![("x-client-key", VICTIM), ("x-client-secret", "hvs_guess")],
+                "Invalid client secret",
+            ),
+            (
+                "neither",
+                vec![("x-client-key", VICTIM)],
+                "No Origin or X-Client-Secret",
+            ),
+        ] {
+            let (key, log) = resolve_against(&rate_limiter, &parts_with(&headers));
+            assert_eq!(key, "anonymous", "{case}");
+            assert!(log.contains(warning), "{case}: got {log}");
+        }
+    }
+
+    #[test]
+    fn a_registered_key_with_proof_is_limited_as_itself() {
+        let rate_limiter = limiter_with_victim(10);
+        for (case, headers) in [
+            (
+                "its Origin",
+                vec![("x-client-key", VICTIM), ("origin", VICTIM_URI)],
+            ),
+            (
+                "its secret",
+                vec![("x-client-key", VICTIM), ("x-client-secret", VICTIM_SECRET)],
+            ),
+        ] {
+            let (key, log) = resolve_against(&rate_limiter, &parts_with(&headers));
+            assert_eq!(key, VICTIM, "{case}");
+            assert_eq!(log, "", "{case}");
+        }
+
+        let claims = crate::auth::Claims::with_client_key("did:plc:test".into(), VICTIM.into());
+        let key = resolve_client_key(
+            &rate_limiter,
+            Some(&claims),
+            &parts_with(&[]),
+            &HashMap::new(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(key, VICTIM, "its session");
+    }
+
+    /// The end of the chain: requests naming a client they cannot prove
+    /// leave that client's bucket untouched.
+    #[test]
+    fn naming_another_client_does_not_spend_its_bucket() {
+        let rate_limiter = limiter_with_victim(1);
+        let forged = parts_with(&[("x-client-key", VICTIM), ("x-client-secret", "hvs_guess")]);
+        for _ in 0..5 {
+            let (key, _) = resolve_against(&rate_limiter, &forged);
+            rate_limiter.check(&key, 1);
+        }
+        assert!(matches!(
+            rate_limiter.check(VICTIM, 1),
+            crate::rate_limit::CheckResult::Allowed { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------

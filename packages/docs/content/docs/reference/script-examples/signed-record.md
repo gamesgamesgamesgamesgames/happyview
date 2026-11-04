@@ -13,7 +13,7 @@ local atproto = require("happyview.atproto")
 
 function handle(input, ctx)
   local body = { text = input.text, createdAt = time.to_iso8601(time.now()) }
-  local ref = record.create(ctx.collection, body)
+  local ref = record.create("xyz.example.post", body)
 
   local ok, sig = pcall(atproto.sign, body)
   if not ok then

@@ -21,6 +21,7 @@ use happyview_plugin_sdk::wire::{
 };
 
 use crate::plugin::caller::{CallerSession, check_writable_repo};
+use crate::repo::PdsAuth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CallerError {
@@ -207,7 +208,12 @@ pub async fn create_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.createRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &spec.collection,
+        rkey: spec.rkey.as_deref(),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -233,7 +239,12 @@ pub async fn put_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.putRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &collection,
+        rkey: Some(&rkey),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -253,12 +264,42 @@ pub async fn delete_record(
     Ok(())
 }
 
+/// Where a write was sent: the repo and collection, and the record key when
+/// the caller chose one.
+#[derive(Clone, Copy)]
+struct Written<'a> {
+    repo: &'a str,
+    collection: &'a str,
+    rkey: Option<&'a str>,
+}
+
 /// The PDS has accepted the write, so the index is told what it holds.
 /// A mirror that fails leaves the index stale until Jetstream echoes the
 /// record; it never turns an accepted write into an error the script would
 /// have to undo.
-async fn mirror_write(caller: &CallerSession, reference: &RecordRef, record: &Value) {
+async fn mirror_write(
+    caller: &CallerSession,
+    written: Written<'_>,
+    reference: &RecordRef,
+    record: &Value,
+) {
     let state = &caller.app_state;
+    // The row is keyed by what the PDS answered, which only the write itself
+    // vouches for. An answer naming any other record is not indexed.
+    if !super::records::reply_names_written(
+        &reference.uri,
+        written.repo,
+        written.collection,
+        written.rkey,
+    ) {
+        tracing::warn!(
+            uri = %reference.uri,
+            repo = written.repo,
+            collection = written.collection,
+            "the PDS answered a write with another record's uri; its index row is not written"
+        );
+        return;
+    }
     let (did, collection, rkey) = match parse_at_uri(&reference.uri) {
         Ok(parts) => parts,
         Err(e) => {
@@ -304,10 +345,13 @@ pub async fn upload_blob(
     caller: &CallerSession,
     spec: CallerBlobUpload,
 ) -> Result<Value, CallerError> {
+    // A blob goes to the repo a record write would default to, so a record
+    // a delegated script writes can reference it.
+    let repo = caller.default_repo();
     crate::repo::upload_blob_to_pds(
         &caller.app_state,
-        &caller.did,
-        &caller.pds_auth,
+        repo,
+        auth_for(caller, repo)?,
         &spec.mime_type,
         Bytes::from(spec.bytes),
     )
@@ -480,14 +524,22 @@ async fn check_against_lexicon(
     validate_required_fields(record, &schema).map_err(CallerError::Validation)
 }
 
+fn auth_for<'a>(caller: &'a CallerSession, repo: &str) -> Result<&'a PdsAuth, CallerError> {
+    caller.auth_for(repo).map_err(|did| {
+        CallerError::NoSession(format!(
+            "{did} has no session with this app, so nothing can sign a write to its \
+             repo; the account has to sign in to the app again"
+        ))
+    })
+}
+
 async fn post(
     caller: &CallerSession,
     repo: &str,
     method: &str,
     body: &Value,
 ) -> Result<Value, CallerError> {
-    let response = caller
-        .pds_auth
+    let response = auth_for(caller, repo)?
         .post_json(&caller.app_state, repo, method, body)
         .await
         .map_err(pds_failure)?;
@@ -821,6 +873,7 @@ mod tests {
                 )),
                 pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
                 app_state: state.clone(),
+                delegate_pds_auth: None,
             };
             let err = get_session(&caller, json!({})).await.unwrap_err();
             assert_eq!(err.code(), "NO_SESSION", "{err}");
@@ -868,6 +921,7 @@ mod tests {
             state.db.clone(),
             state.db_backend,
             crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+            state.config.keyring(),
         );
         let did_value = atrium_api::types::string::Did::new(did.to_string()).unwrap();
         Store::set(&store, did_value.clone(), session)
@@ -882,8 +936,105 @@ mod tests {
                 session,
             ))),
             app_state: state,
+            delegate_pds_auth: None,
         };
         (caller, pds)
+    }
+
+    fn write_reply(method: &str, uri: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/xrpc/{method}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({ "uri": uri, "cid": "bafyreply" })),
+            )
+            .up_to_n_times(1)
+    }
+
+    async fn indexed(caller: &CallerSession, uri: &str) -> bool {
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT uri FROM happyview_records WHERE uri = ?")
+                .bind(uri)
+                .fetch_optional(&caller.app_state.db)
+                .await
+                .unwrap();
+        row.is_some()
+    }
+
+    /// The index row is keyed by the PDS's answer, so an answer naming any
+    /// record but the one written must not be indexed: another account's, in
+    /// another collection, or at another key than the caller chose.
+    #[tokio::test]
+    async fn a_reply_naming_another_record_is_not_indexed() {
+        let (caller, pds) = cookie_caller("did:plc:alice").await;
+        let create = |rkey: &str| -> CallerRecordCreate {
+            serde_json::from_value(json!({
+                "collection": "app.test.rec", "rkey": rkey,
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap()
+        };
+
+        let elsewhere = [
+            "at://did:plc:victim/app.test.rec/1",
+            "at://did:plc:alice/app.test.other/1",
+            "at://did:plc:alice/app.test.rec/2",
+        ];
+        for uri in elsewhere {
+            write_reply("com.atproto.repo.createRecord", uri)
+                .mount(&pds)
+                .await;
+            create_record(&caller, create("1")).await.unwrap();
+            assert!(!indexed(&caller, uri).await, "{uri} was indexed");
+        }
+
+        // With no rkey chosen, the PDS picks one, but it must still be one.
+        let no_rkey: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.test.rec", "record": {"text": "hi"}, "validate": false,
+        }))
+        .unwrap();
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/a/b",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, no_rkey.clone()).await.unwrap();
+        let rows: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records WHERE uri LIKE 'at://did:plc:alice/app.test.rec/a%'",
+        )
+        .fetch_one(&caller.app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(rows.0, 0, "a malformed record key was indexed");
+
+        write_reply(
+            "com.atproto.repo.putRecord",
+            "at://did:plc:victim/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        put_record(
+            &caller,
+            serde_json::from_value(json!({
+                "uri": "at://did:plc:alice/app.test.rec/1",
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!indexed(&caller, "at://did:plc:victim/app.test.rec/1").await);
+
+        // The answer for the record written is still indexed.
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, create("1")).await.unwrap();
+        assert!(indexed(&caller, "at://did:plc:alice/app.test.rec/1").await);
     }
 
     fn get_session_mock(body: Value) -> wiremock::Mock {
@@ -965,6 +1116,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,
@@ -1006,8 +1158,6 @@ mod tests {
             }),
             1,
             None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
         )
         .unwrap();
         state.lexicons.upsert_unindexed(parsed).await;
@@ -1019,6 +1169,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,

@@ -612,7 +612,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -626,7 +626,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -635,7 +635,7 @@ async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     let (pending, _) = happyview::oauth::client_keys::stage_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         happyview::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -705,7 +705,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -719,7 +719,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -785,7 +785,7 @@ async fn revoking_the_current_instance_key_is_refused_with_400() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -856,7 +856,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -869,7 +869,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -958,4 +958,65 @@ async fn the_listing_reports_a_project_file_value_with_its_source() {
         .expect("app_name entry not found in settings");
     assert_eq!(entry["value"], "From The File");
     assert_eq!(entry["source"], "project");
+}
+
+/// A setting the hosting platform fixes can't be changed or removed through
+/// the settings routes, and lists with `platform` as its source.
+#[tokio::test]
+#[serial]
+async fn a_platform_fixed_setting_is_refused_and_listed_as_the_platform() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    unsafe {
+        std::env::set_var(
+            "PLATFORM_LOCKED_SETTINGS",
+            "space_access_log_retention_days",
+        );
+        std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "364");
+    }
+
+    let put = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/space_access_log_retention_days",
+            app.admin_cookie(),
+            &json!({ "value": "0" }),
+        ))
+        .await
+        .unwrap()
+        .status();
+    let delete = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/settings/space_access_log_retention_days",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap()
+        .status();
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    unsafe {
+        std::env::remove_var("PLATFORM_LOCKED_SETTINGS");
+        std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS");
+    }
+
+    assert_eq!(put, StatusCode::CONFLICT);
+    assert_eq!(delete, StatusCode::CONFLICT);
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "space_access_log_retention_days")
+        .expect("the fixed setting is listed");
+    assert_eq!(entry["value"], "364");
+    assert_eq!(entry["source"], "platform");
 }

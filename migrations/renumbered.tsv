@@ -1,0 +1,7 @@
+# Migrations a stable branch applied under a version that alpha had already
+# given to another migration. Alpha carries each one byte for byte under a new
+# version, and boot moves a database's record of it there before migrating.
+# The same list is used by the drift check (scripts/check-migration-drift.sh).
+#
+# stable_version	alpha_version	sqlx description
+20261008000000	20261008000001	space access grant events

@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 51 permissions organized by category:
+HappyView defines 54 permissions organized by category:
 
 ### Lexicons
 
@@ -36,7 +36,7 @@ HappyView defines 51 permissions organized by category:
 
 | Permission                | Description                                        |
 | ------------------------- | -------------------------------------------------- |
-| `script-variables:create` | Add or update environment variables for Lua scripts |
+| `script-variables:create` | Add or update environment variables for scripts |
 | `script-variables:read`   | View script environment variable keys and values   |
 | `script-variables:delete` | Remove script environment variables                |
 
@@ -112,8 +112,11 @@ HappyView defines 51 permissions organized by category:
 | `spaces:delete`             | Remove spaces and their data               |
 | `spaces:manage-members`     | Add or remove space members and roles      |
 | `spaces:manage-invites`     | Create and revoke space invitations        |
-| `spaces:manage-records`     | Read and write records within spaces       |
+| `spaces:manage-records`     | Reserved; grants no access. Use `spaces:inspect` to read space contents. |
 | `spaces:manage-credentials` | Issue and revoke space access credentials  |
+| `spaces:inspect`            | Request time-limited access to read records and blobs in private spaces |
+
+No template grants `spaces:inspect` except Full Access. It is assigned individually to the users who should be able to request access to a space's or an account's contents. See [Spaces: Moderating spaces](../experimental/spaces/index.md#moderating-spaces).
 
 ### Jobs
 
@@ -148,6 +151,7 @@ It also covers reading what is deployed. A deploy can add, change and remove eve
 | `stats:read` | View collection statistics and record counts |
 | `events:read` | View the event log                      |
 | `events:purge` | Bulk-delete event log entries matching a filter |
+| `metrics:read` | View script run counts, latency, errors and resource use |
 
 ## Permission templates
 
@@ -155,19 +159,21 @@ Templates are predefined sets of permissions that simplify user creation. Pass a
 
 ### Viewer
 
-Read-only access. Can browse lexicons, records, scripts, stats, events, dead letters, and user lists but cannot modify anything.
+Read-only access. Can browse lexicons, records, scripts, stats, events, metrics, dead letters, and user lists but cannot modify anything.
 
-Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `dead-letters:read`
+Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `metrics:read`, `dead-letters:read`
 
-### Operator
+### Maintainer
 
 Everything in Viewer, plus the ability to run backfill jobs, manage API keys, and manage dead letters.
+
+This template used to be called Operator. `POST /admin/users` still accepts `"template": "operator"` and grants the same permissions.
 
 Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`, `dead-letters:manage`
 
 ### Manager
 
-Everything in Operator, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces, and to deploy the project.
+Everything in Maintainer, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces, and to deploy the project.
 
 Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`, `project:deploy`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
 

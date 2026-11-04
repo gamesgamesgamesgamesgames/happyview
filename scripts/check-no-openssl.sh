@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# A release binary has to link statically on musl and build on Windows with
-# no system OpenSSL, so nothing in the graph may pull it in. Checked across
-# every target, because native-tls only reaches OpenSSL off Apple and Windows.
+# A release binary has to link statically on musl with no system OpenSSL, so
+# nothing in the graph may pull it in. Checked across every target, because
+# native-tls reaches OpenSSL everywhere but Apple's.
 #
 # The second assertion stops the first from passing for the wrong reason: if
 # `cargo tree` resolved nothing, rustls would be absent too.

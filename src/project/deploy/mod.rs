@@ -174,6 +174,9 @@ pub async fn deploy(
     BOOT_PROBLEMS.lock().unwrap().clear();
 
     apply_declarations(state, &config).await;
+    // A deployed lexicon is publishable, so an auto-publish rule may now
+    // cover one nothing has published yet.
+    crate::lexicon_publishing::spawn_reconcile(state);
     if !changes.labelers.added.is_empty() {
         let _ = state.labeler_subscriptions_tx.send(());
     }

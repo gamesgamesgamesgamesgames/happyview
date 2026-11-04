@@ -5,6 +5,7 @@ import { Upload, Trash2 } from "lucide-react";
 import Link from "next/link";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
 import {
   getSettings,
   getDbInfo,
@@ -27,20 +28,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-type FieldKey =
-  | "app_name"
-  | "backfill_concurrent_dids_per_pds"
-  | "backfill_concurrent_pds"
-  | "backfill_concurrent_resolution"
-  | "backfill_retention_days"
-  | "client_uri"
-  | "event_log_retention_days"
-  | "logo_uri"
-  | "tos_uri"
-  | "policy_uri"
-  | "script_instruction_limit"
-  | "script_wall_clock_seconds"
-  | "verbose_event_logging";
+import {
+  type FieldKey,
+  type SettingSource,
+  settingWrites,
+} from "./saved-settings";
 
 type FieldConfig = {
   key: FieldKey;
@@ -98,24 +90,10 @@ const SCRIPT_LIMIT_FIELDS: {
   },
   {
     key: "script_wall_clock_seconds",
-    label: "Request wall clock (seconds)",
+    label: "Script wall clock (seconds)",
     description:
-      "How long a query or procedure's handle may run by the clock, including time spent awaiting the host; jobs are exempt.",
+      "How long a query, procedure, record or label script may run by the clock. Time spent waiting on the host isn't counted, and jobs are exempt.",
   },
-];
-
-// Every key the Save button writes, in the order it writes them. An empty
-// value clears the stored setting so the env var or the default applies.
-const SAVED_KEYS: readonly FieldKey[] = [
-  ...FIELDS.map((field) => field.key),
-  "backfill_concurrent_dids_per_pds",
-  "backfill_concurrent_pds",
-  "backfill_concurrent_resolution",
-  "backfill_retention_days",
-  "event_log_retention_days",
-  "script_instruction_limit",
-  "script_wall_clock_seconds",
-  "verbose_event_logging",
 ];
 
 // A number input hands over "1e6", "1.5" and "-1" as typed, and the
@@ -132,17 +110,21 @@ function scriptLimitError(
   return `Enter a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`;
 }
 
-function SourceLabel({ source }: { source: SettingEntry["source"] | "unset" }) {
-  if (source !== "env" && source !== "project") return null;
-  return (
-    <span className="text-xs text-muted-foreground">
-      {source === "env" ? "from env var" : "from happyview.toml"}
-    </span>
-  );
+const SOURCE_LABELS: Partial<Record<SettingSource, string>> = {
+  env: "from env var",
+  project: "from happyview.toml",
+  platform: "set by your hosting provider",
+};
+
+function SourceLabel({ source }: { source: SettingSource }) {
+  const label = SOURCE_LABELS[source];
+  if (!label) return null;
+  return <span className="text-xs text-muted-foreground">{label}</span>;
 }
 
 export default function GeneralSettingsPage() {
   const { hasPermission } = useCurrentUser();
+  const { refreshConfig } = useConfig();
   const canManage = hasPermission("settings:manage");
   const canReadEvents = hasPermission("events:read");
   const canPurgeEvents = hasPermission("events:purge");
@@ -155,16 +137,17 @@ export default function GeneralSettingsPage() {
     backfill_retention_days: "28",
     client_uri: "",
     event_log_retention_days: "30",
+    "feature.space_inspector_enabled": "",
     logo_uri: "",
     tos_uri: "",
     policy_uri: "",
     script_instruction_limit: "",
     script_wall_clock_seconds: "",
+    space_access_log_retention_days: "",
+    space_inspector_max_grant_minutes: "60",
     verbose_event_logging: "",
   });
-  const [sources, setSources] = useState<
-    Record<FieldKey, SettingEntry["source"] | "unset">
-  >({
+  const [sources, setSources] = useState<Record<FieldKey, SettingSource>>({
     app_name: "unset",
     backfill_concurrent_dids_per_pds: "unset",
     backfill_concurrent_pds: "unset",
@@ -172,11 +155,14 @@ export default function GeneralSettingsPage() {
     backfill_retention_days: "unset",
     client_uri: "unset",
     event_log_retention_days: "unset",
+    "feature.space_inspector_enabled": "unset",
     logo_uri: "unset",
     tos_uri: "unset",
     policy_uri: "unset",
     script_instruction_limit: "unset",
     script_wall_clock_seconds: "unset",
+    space_access_log_retention_days: "unset",
+    space_inspector_max_grant_minutes: "unset",
     verbose_event_logging: "unset",
   });
   const [logoUploaded, setLogoUploaded] = useState(false);
@@ -214,11 +200,25 @@ export default function GeneralSettingsPage() {
         backfill_retention_days: val("backfill_retention_days", "28"),
         client_uri: val("client_uri", ""),
         event_log_retention_days: val("event_log_retention_days", "30"),
+        "feature.space_inspector_enabled": val(
+          "feature.space_inspector_enabled",
+          "",
+        ),
         logo_uri: val("logo_uri", ""),
         tos_uri: val("tos_uri", ""),
         policy_uri: val("policy_uri", ""),
         script_instruction_limit: val("script_instruction_limit", ""),
         script_wall_clock_seconds: val("script_wall_clock_seconds", ""),
+        // Left empty when unset: an empty field isn't saved, so the setting
+        // keeps following the event log retention.
+        space_access_log_retention_days: val(
+          "space_access_log_retention_days",
+          "",
+        ),
+        space_inspector_max_grant_minutes: val(
+          "space_inspector_max_grant_minutes",
+          "60",
+        ),
         verbose_event_logging: val("verbose_event_logging", ""),
       });
       setSources({
@@ -231,11 +231,18 @@ export default function GeneralSettingsPage() {
         backfill_retention_days: src("backfill_retention_days"),
         client_uri: src("client_uri"),
         event_log_retention_days: src("event_log_retention_days"),
+        "feature.space_inspector_enabled": src(
+          "feature.space_inspector_enabled",
+        ),
         logo_uri: src("logo_uri"),
         tos_uri: src("tos_uri"),
         policy_uri: src("policy_uri"),
         script_instruction_limit: src("script_instruction_limit"),
         script_wall_clock_seconds: src("script_wall_clock_seconds"),
+        space_access_log_retention_days: src("space_access_log_retention_days"),
+        space_inspector_max_grant_minutes: src(
+          "space_inspector_max_grant_minutes",
+        ),
         verbose_event_logging: src("verbose_event_logging"),
       });
       setLogoUploaded(byKey.has("logo_data"));
@@ -273,21 +280,22 @@ export default function GeneralSettingsPage() {
     setNotice(null);
     setSaving(true);
     const failed: { key: FieldKey; value: string; message: string }[] = [];
-    for (const key of SAVED_KEYS) {
-      const value = values[key];
+    for (const write of settingWrites(values, sources)) {
       try {
-        if (value === "") {
-          if (sources[key] === "database") await deleteSetting(key);
+        if (write.action === "delete") {
+          await deleteSetting(write.key);
         } else {
-          await upsertSetting(key, value);
+          await upsertSetting(write.key, write.value);
         }
       } catch (e: unknown) {
         const message = e instanceof Error ? e.message : String(e);
-        failed.push({ key, value, message });
+        failed.push({ key: write.key, value: values[write.key], message });
       }
     }
     try {
       await load();
+      // The inspector switch changes which pages the dashboard shows.
+      await refreshConfig();
       if (failed.length === 0) {
         setNotice("Settings saved.");
       } else {
@@ -299,6 +307,8 @@ export default function GeneralSettingsPage() {
           `Could not save ${failed.map((f) => `${f.key} (${f.message})`).join(", ")}. Every other setting was saved.`,
         );
       }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
@@ -618,6 +628,78 @@ export default function GeneralSettingsPage() {
         ))}
 
         <div>
+          <h2 className="text-lg font-semibold">Space Inspector</h2>
+          <p className="text-muted-foreground text-sm">
+            Let moderators read private space contents during an investigation.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="feature.space_inspector_enabled">
+                Enable Space Inspector
+              </Label>
+              <SourceLabel
+                source={sources["feature.space_inspector_enabled"]}
+              />
+            </div>
+            <p className="text-muted-foreground text-xs">
+              Users with the Inspect Space Contents permission can read records
+              and blobs in private spaces after they give a reason. Access
+              expires, and every grant and read is logged under their account.
+            </p>
+          </div>
+          <Switch
+            id="feature.space_inspector_enabled"
+            checked={
+              values["feature.space_inspector_enabled"].trim().toLowerCase() ===
+              "true"
+            }
+            onCheckedChange={(checked) =>
+              setValues((v) => ({
+                ...v,
+                "feature.space_inspector_enabled": checked ? "true" : "false",
+              }))
+            }
+            disabled={!canManage}
+          />
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="space_inspector_max_grant_minutes">
+              Maximum Access Length (minutes)
+            </Label>
+            <SourceLabel
+              source={sources["space_inspector_max_grant_minutes"]}
+            />
+          </div>
+          <Input
+            id="space_inspector_max_grant_minutes"
+            type="number"
+            min={5}
+            step={5}
+            value={values["space_inspector_max_grant_minutes"]}
+            onChange={(e) =>
+              setValues((v) => ({
+                ...v,
+                space_inspector_max_grant_minutes: e.target.value,
+              }))
+            }
+            placeholder="60"
+            disabled={
+              !canManage ||
+              sources["space_inspector_max_grant_minutes"] === "platform"
+            }
+          />
+          <p className="text-muted-foreground text-xs">
+            The longest a moderator can request access for. Requests default to
+            60 minutes or this value, whichever is shorter.
+          </p>
+        </div>
+
+        <div>
           <h2 className="text-lg font-semibold">Event Logs</h2>
           <p className="text-muted-foreground text-sm">
             Configure event log verbosity and retention.
@@ -649,6 +731,41 @@ export default function GeneralSettingsPage() {
           <p className="text-muted-foreground text-xs">
             Delete event log entries older than this many days. 0 disables
             automatic cleanup. Changes take effect within an hour.
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="space_access_log_retention_days">
+              Space Access Log Retention (days)
+            </Label>
+            <SourceLabel source={sources["space_access_log_retention_days"]} />
+          </div>
+          <Input
+            id="space_access_log_retention_days"
+            type="number"
+            min={0}
+            step={1}
+            value={values["space_access_log_retention_days"]}
+            onChange={(e) =>
+              setValues((v) => ({
+                ...v,
+                space_access_log_retention_days: e.target.value,
+              }))
+            }
+            placeholder={
+              values.event_log_retention_days.trim() === "0" ? "0" : "365"
+            }
+            disabled={
+              !canManage ||
+              sources["space_access_log_retention_days"] === "platform"
+            }
+          />
+          <p className="text-muted-foreground text-xs">
+            How long to keep records of space access: grants, the reads made
+            under them, inspector changes, and purges. These can&apos;t be
+            purged by hand. 0 keeps them forever. Left blank, it keeps them
+            forever while event log retention is 0, and for 365 days otherwise.
           </p>
         </div>
 

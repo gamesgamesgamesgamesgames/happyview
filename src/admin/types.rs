@@ -11,8 +11,6 @@ pub(super) struct LexiconSummary {
     pub(super) revision: i32,
     pub(super) lexicon_type: String,
     pub(super) backfill: bool,
-    pub(super) action: Option<String>,
-    pub(super) target_collection: Option<String>,
     /// The layer answering for this id, under the name the dashboard has
     /// always read. `layer` says the same and is what new clients should read.
     pub(super) source: String,
@@ -40,14 +38,8 @@ pub(super) struct LexiconSummary {
 
 impl From<crate::catalog::LexiconListing> for LexiconSummary {
     fn from(l: crate::catalog::LexiconListing) -> Self {
-        use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
-        let parsed = ParsedLexicon::parse(
-            l.lexicon_json,
-            l.revision,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        );
+        use crate::lexicon::{LexiconType, ParsedLexicon};
+        let parsed = ParsedLexicon::parse(l.lexicon_json, l.revision, None);
         let lexicon_type = parsed
             .as_ref()
             .map(|p| format!("{:?}", p.lexicon_type).to_lowercase())
@@ -61,8 +53,6 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             revision: l.revision,
             lexicon_type,
             backfill: l.backfill,
-            action: l.action,
-            target_collection: l.target_collection,
             source: l.layer.as_str().to_string(),
             layer: l.layer,
             path: l.path.as_deref().map(crate::catalog::path_string),
@@ -84,8 +74,6 @@ pub(super) struct UploadLexiconBody {
     pub(super) lexicon_json: Value,
     #[serde(default = "default_backfill")]
     pub(super) backfill: bool,
-    pub(super) target_collection: Option<String>,
-    pub(super) action: Option<String>,
     pub(super) token_cost: Option<i32>,
     /// Left out, an update keeps the stored setting and a new lexicon is
     /// indexed, so a client that predates the field never flips it.
@@ -132,7 +120,6 @@ pub(super) struct AddNetworkLexiconBody {
     pub(super) nsid: String,
     #[serde(default)]
     pub(super) backfill: bool,
-    pub(super) target_collection: Option<String>,
     /// Left out, an existing lexicon keeps its setting and a new one is indexed.
     pub(super) indexed: Option<bool>,
 }
@@ -141,7 +128,6 @@ pub(super) struct AddNetworkLexiconBody {
 pub(super) struct NetworkLexiconSummary {
     pub(super) nsid: String,
     pub(super) authority_did: String,
-    pub(super) target_collection: Option<String>,
     pub(super) last_fetched_at: Option<String>,
     pub(super) created_at: String,
     pub(super) declared: bool,
@@ -207,6 +193,9 @@ pub(super) struct CreateApiKeyResponse {
 pub(super) struct ScriptVariableSummary {
     pub(super) key: String,
     pub(super) preview: String,
+    /// The value can't be read with this instance's key. Setting the variable
+    /// again replaces it.
+    pub(super) unreadable: bool,
     pub(super) created_at: String,
     pub(super) updated_at: String,
 }
@@ -584,10 +573,24 @@ pub(super) struct UpdateApiClientBody {
     pub(super) client_uri: Option<String>,
     pub(super) redirect_uris: Option<Vec<String>>,
     pub(super) scopes: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) allowed_origins: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) rate_limit_capacity: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub(super) rate_limit_refill_rate: Option<Option<f64>>,
     pub(super) is_active: Option<bool>,
+}
+
+/// A field that may be cleared: absent is `None` (leave it), `null` is
+/// `Some(None)` (clear it), and a value is `Some(Some(_))`. A plain
+/// `Option<Option<T>>` reads `null` as `None`, so a clear was ignored.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]

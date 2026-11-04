@@ -14,8 +14,8 @@ pub(crate) async fn handle_query(
     lexicon: &crate::lexicon::ParsedLexicon,
     claims: Option<&Claims>,
 ) -> Result<Response, AppError> {
-    // Trigger-keyed dispatch: a script bound at `xrpc.query:<id>`
-    // overrides the default list / get-record flow.
+    // A query is its script, bound at `xrpc.query:<id>`. Without one, only
+    // fetching a single record by `uri` needs nothing the lexicon cannot say.
     let trigger = crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcQuery, &lexicon.id);
     let project = state.project.load_full();
     if let Some(resolved) = state.scripts.resolve_in(&project, &trigger).await {
@@ -25,66 +25,21 @@ pub(crate) async fn handle_query(
         .await;
     }
 
-    // Single-record query: has a `uri` parameter
     if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
         return handle_get_record(state, uri).await;
     }
 
-    // List query: needs a target collection to know what to query
-    let collection = lexicon.target_collection.as_deref().ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "{method} has no target_collection configured for list queries"
-        ))
-    })?;
+    Err(no_script("query", method))
+}
 
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(20)
-        .min(100);
-
-    let offset: i64 = params
-        .get("cursor")
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(0);
-
-    let did = params.get("did").and_then(|v| v.as_str());
-
-    let rows = state
-        .records
-        .list_recent(collection, did, limit, offset)
-        .await
-        .map_err(|e| read_error(state, collection, e))?;
-
-    let has_next_page = rows.len() as i64 == limit;
-
-    let records: Vec<Value> = rows
-        .into_iter()
-        .filter_map(|rec| {
-            let mut record: Value = serde_json::from_str(&rec.record).ok()?;
-            record
-                .as_object_mut()
-                .map(|obj| obj.insert("uri".to_string(), json!(rec.uri)));
-            Some(record)
-        })
-        .collect();
-
-    let mut result = json!({ "records": records });
-    if has_next_page {
-        let next_cursor = (offset + limit).to_string();
-        result
-            .as_object_mut()
-            .unwrap()
-            .insert("cursor".to_string(), json!(next_cursor));
+/// The answer for a query or procedure with no script to run. A script names
+/// the collection it reads or writes, so there is no default to fall back on.
+pub(super) fn no_script(kind: &str, method: &str) -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::NOT_IMPLEMENTED,
+        code: "MethodNotImplemented",
+        message: format!("{method} has no script. Add one for the trigger xrpc.{kind}:{method}"),
     }
-
-    Ok(Json(result).into_response())
 }
 
 pub(super) async fn handle_get_record(state: &AppState, uri: &str) -> Result<Response, AppError> {

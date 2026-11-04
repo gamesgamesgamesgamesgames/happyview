@@ -1,3 +1,4 @@
+mod api_client_secrets;
 pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
@@ -6,6 +7,7 @@ mod dead_letters;
 pub mod default_plugins;
 mod domains;
 mod editor;
+mod encryption;
 mod events;
 mod feature_flags;
 mod identity;
@@ -14,6 +16,7 @@ mod labelers;
 mod lexicon_publishing;
 mod lexicons;
 mod linked_repos;
+mod metrics;
 pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
@@ -26,6 +29,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub(crate) mod space_access;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
@@ -40,6 +44,11 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 
+/// Re-exported for [`crate::jobs::native::delete_collection`], which guards on
+/// it as well: the admin handlers refuse a request for a collection a shared
+/// store serves, and the job refuses one that was already queued.
+pub(crate) use lexicons::records_not_locally_deletable;
+
 pub fn admin_routes(state: AppState) -> Router<AppState> {
     // The record source's routes, each behind the admin auth layer. Its
     // router carries its own state, so it joins this one as a stateless one.
@@ -51,6 +60,8 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             auth::require_admin_caller,
         ))
         .with_state(());
+    let audited_read =
+        axum::middleware::from_fn_with_state(state.clone(), crate::csrf::audited_read);
     Router::new()
         .merge(source_routes)
         .route(
@@ -64,6 +75,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route(
             "/lexicons/{id}",
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
+        )
+        .route(
+            "/lexicons/{id}/record-count",
+            get(lexicons::lexicon_record_count),
         )
         .route("/lexicon-publishing", get(lexicon_publishing::overview))
         .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
@@ -102,9 +117,40 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             get(spaces_migration::migration_status),
         )
         .route("/spaces", get(spaces::list_spaces))
+        .route("/spaces/inspector", get(space_access::inspector_status))
+        .route(
+            "/spaces/access-grants",
+            get(space_access::list_grants).post(space_access::create_grant),
+        )
+        .route(
+            "/spaces/access-grants/{id}",
+            delete(space_access::revoke_grant),
+        )
+        .route(
+            "/spaces/access-grants/{id}/reads",
+            get(space_access::grant_reads),
+        )
         .route("/spaces/{id}", get(spaces::get_space))
-        .route("/spaces/{id}/records", get(spaces::list_space_records))
-        .route("/spaces/{id}/blob", get(spaces::get_space_blob))
+        .route("/spaces/{id}/access", get(spaces::covering_grant))
+        // Each of these records the read it serves, so a cookie only counts
+        // on a request from the dashboard itself; see `csrf::audited_read`.
+        .route(
+            "/spaces/{id}/records",
+            get(spaces::list_space_records).layer(audited_read.clone()),
+        )
+        .route(
+            "/spaces/{id}/blob",
+            get(spaces::get_space_blob).layer(audited_read.clone()),
+        )
+        .route("/accounts/{did}/spaces", get(spaces::list_account_spaces))
+        .route(
+            "/accounts/{did}/access",
+            get(spaces::account_covering_grant),
+        )
+        .route(
+            "/accounts/{did}/space-records",
+            get(spaces::list_account_space_records).layer(audited_read),
+        )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))
@@ -136,6 +182,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             delete(linked_repos::revoke_linked_repo_invite),
         )
         .route("/events", get(events::list_events))
+        .route("/metrics/scripts", get(metrics::scripts))
+        .route("/metrics/scripts/{trigger}", get(metrics::script))
+        .route("/metrics/ingest", get(metrics::ingest))
+        .route("/metrics/live", get(metrics::live))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))
         .route("/identity/resolve", get(identity::resolve_identity))
@@ -167,6 +217,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/database/status", get(database::status))
         .route(
+            "/encryption/rotation",
+            get(encryption::rotation_status).post(encryption::start_reseal),
+        )
+        .route(
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
@@ -188,6 +242,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/editor/declarations", get(editor::declarations))
         .route("/scripts", get(scripts::list).post(scripts::upsert))
         .route("/scripts/languages", get(scripts::languages))
+        .route("/scripts/modules", get(scripts::modules))
         .route(
             "/scripts/{id}",
             get(scripts::get)
@@ -245,6 +300,14 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             get(api_clients::get_api_client)
                 .put(api_clients::update_api_client)
                 .delete(api_clients::delete_api_client),
+        )
+        .route(
+            "/api-clients/{id}/secrets",
+            get(api_client_secrets::list).post(api_client_secrets::create),
+        )
+        .route(
+            "/api-clients/{id}/secrets/{secret_id}",
+            delete(api_client_secrets::revoke),
         )
         .route(
             "/api-clients/{id}/auth-key",

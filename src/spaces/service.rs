@@ -1,6 +1,7 @@
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
+use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
@@ -36,9 +37,16 @@ pub(crate) async fn require_space_admin(
     space: &Space,
     did: &str,
 ) -> Result<(), AppError> {
-    if space.creator_did == did {
+    if space.creator_did == did || is_super_admin(state, did).await? {
         return Ok(());
     }
+    Err(AppError::Forbidden(
+        "Only the space's creator can perform this action".into(),
+    ))
+}
+
+/// Whether `did` is a HappyView super admin.
+pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "SELECT is_super FROM happyview_users WHERE did = ?",
         state.db_backend,
@@ -48,12 +56,7 @@ pub(crate) async fn require_space_admin(
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space's creator can perform this action".into(),
-    ))
+    Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
@@ -79,7 +82,7 @@ pub(crate) async fn verify_space_credential(
     space: &Space,
     token: &str,
 ) -> Result<crate::spaces::credential::SpaceCredentialClaims, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
     let key = crate::spaces::auth::space_verifying_key(
@@ -238,9 +241,14 @@ pub(crate) struct AppliedOp {
 pub async fn signing_key_from_pool(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    crate::verification_methods::ensure_atproto_space_method(pool, backend, encryption_key).await?;
+    crate::verification_methods::ensure_atproto_space_method(
+        pool,
+        backend,
+        encryption_key.current(),
+    )
+    .await?;
     load_signing_key(pool, backend, encryption_key).await
 }
 
@@ -248,7 +256,7 @@ pub async fn signing_key_from_pool(
 pub async fn load_signing_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
     let key_bytes = crate::verification_methods::get_private_key_bytes(
         pool,
@@ -280,7 +288,7 @@ pub async fn load_signing_key(
 pub(crate) async fn service_signing_key(
     state: &AppState,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal(
             "spaces require a token encryption key to sign commits; set TOKEN_ENCRYPTION_KEY"
                 .into(),
@@ -421,19 +429,18 @@ pub(crate) async fn notify_ops(
         );
     }
 
-    for op in ops {
-        let _ = notifications::dispatch_write_notification(
-            &state.db,
-            state.db_backend,
-            &state.http,
-            &space.id,
-            author_did,
-            &op.collection,
-            &op.rkey,
-            op.new_cid.as_deref(),
-        )
-        .await;
-    }
+    notifications::announce_writes(
+        state,
+        &space.id,
+        author_did,
+        ops.iter()
+            .map(|op| notifications::WebhookWrite {
+                collection: op.collection.clone(),
+                rkey: op.rkey.clone(),
+                cid: op.new_cid.clone(),
+            })
+            .collect(),
+    );
 }
 
 /// Whether this repo's writes still belong to HappyView, and if not, forward them.
@@ -445,7 +452,7 @@ pub(crate) async fn notify_ops(
 ///
 /// This bridge is deprecated. It keeps existing clients working once their
 /// repos migrate. Remove it once clients write to PDSes directly.
-async fn forward_write_if_native(
+pub(crate) async fn forward_write_if_native(
     state: &AppState,
     space: &Space,
     author_did: &str,
@@ -457,11 +464,16 @@ async fn forward_write_if_native(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
+    // Read only. Creating the row here, outside the write transaction and
+    // its lock on the space, would deadlock on Postgres against a write
+    // already holding that lock. A missing row is created as polyfill by the
+    // write itself.
+    let host_mode = db::read_repo_state(&mut conn, state.db_backend, &space.id, author_did)
+        .await?
+        .map_or(HostMode::Polyfill, |repo_state| repo_state.host_mode);
     drop(conn);
 
-    if repo_state.host_mode.is_authoritative_here() {
+    if host_mode.is_authoritative_here() {
         return Ok(None);
     }
 
@@ -1096,6 +1108,37 @@ pub(crate) async fn remove_member(
     Ok(())
 }
 
+/// An invite's `expiresAt` as given at creation, as the UTC timestamp it is
+/// stored as: the form [`now_rfc3339`] writes, so every stored expiry reads the
+/// same way. A value that isn't a lexicon `datetime` is refused, naming the
+/// field the way lexicon validation does.
+///
+/// An expiry already in the past is kept, not refused: creation takes the
+/// other limits as given too (`maxUses: 0` is stored), and such an invite is
+/// simply one redemption refuses.
+fn normalize_invite_expiry(raw: &str) -> Result<String, AppError> {
+    crate::xrpc::validate::parse_datetime(raw)
+        .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
+        .ok_or_else(|| AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "Input/expiresAt must be a valid datetime (ISO 8601 with a timezone)".into(),
+        })
+}
+
+/// Whether a stored invite expiry has passed at `now`, compared as times. A
+/// stored value that doesn't parse as a timestamp (one written before creation
+/// parsed it) counts as passed, so an invite is never open-ended by accident.
+fn invite_expired(stored: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(stored) {
+        Ok(at) => now > at.with_timezone(&chrono::Utc),
+        Err(err) => {
+            tracing::warn!(expires_at = stored, "unparseable invite expiry: {err}");
+            true
+        }
+    }
+}
+
 pub(crate) async fn create_invite(
     state: &AppState,
     actor_did: &str,
@@ -1104,6 +1147,10 @@ pub(crate) async fn create_invite(
     max_uses: Option<i64>,
     expires_at: Option<String>,
 ) -> Result<(SpaceInvite, String), AppError> {
+    let expires_at = expires_at
+        .as_deref()
+        .map(normalize_invite_expiry)
+        .transpose()?;
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
     let mut token_bytes = [0u8; 24];
@@ -1146,7 +1193,7 @@ pub(crate) async fn accept_invite(
         ));
     }
     if let Some(ref expires) = invite.expires_at
-        && now_rfc3339() > *expires
+        && invite_expired(expires, chrono::Utc::now())
     {
         return Err(AppError::BadRequest("This invite has expired".into()));
     }
@@ -1167,8 +1214,19 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-    db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
+    match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
+        db::InviteClaim::Joined => {}
+        db::InviteClaim::Unavailable => {
+            return Err(AppError::BadRequest(
+                "This invite has been revoked or has reached its maximum uses".into(),
+            ));
+        }
+        db::InviteClaim::AlreadyMember => {
+            return Err(AppError::Conflict(
+                "You are already a member of this space".into(),
+            ));
+        }
+    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))
@@ -1409,7 +1467,7 @@ mod tests {
             super::create_invite(&state, &authority, &space_uri, None, None, None)
                 .await
                 .expect("authority creates invite");
-        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.id)
+        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.space_id, &invite.id)
             .await
             .expect("revoke should succeed");
         assert!(revoked);
@@ -1455,6 +1513,204 @@ mod tests {
             }
             other => panic!("expected BadRequest, got: {other:?}"),
         }
+    }
+
+    /// An invite created with `expires_at` exactly as given, the way one was
+    /// stored before creation parsed it.
+    async fn seed_raw_invite(state: &AppState, space_uri: &str, expires_at: &str) -> String {
+        let space = super::resolve_space(state, space_uri)
+            .await
+            .expect("space resolves");
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let invite = SpaceInvite {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space.id,
+            token_hash: hex::encode(Sha256::digest(token.as_bytes())),
+            created_by: space.authority_did,
+            access: MemberAccess::READ,
+            max_uses: None,
+            uses: 0,
+            expires_at: Some(expires_at.to_string()),
+            revoked: false,
+            created_at: now_rfc3339(),
+        };
+        db::create_invite(&state.db, state.db_backend, &invite)
+            .await
+            .expect("failed to seed invite");
+        token
+    }
+
+    fn assert_expired(err: crate::error::AppError) {
+        match err {
+            crate::error::AppError::BadRequest(msg) => assert!(
+                msg.to_lowercase().contains("expired"),
+                "expected 'expired' in message, got: {msg}"
+            ),
+            other => panic!("expected BadRequest, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offset_expiry_in_the_past_is_refused_at_redeem() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        // One hour ago, written in +02:00: its local clock reads an hour
+        // later than UTC now, so as text it sorts after the current time.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let (_invite, token) =
+            super::create_invite(&state, &authority, &space_uri, None, None, Some(past))
+                .await
+                .expect("authority creates invite");
+
+        let err = super::accept_invite(&state, "did:plc:joiner-offset-past", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[tokio::test]
+    async fn an_offset_expiry_in_the_future_is_accepted_at_redeem() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+        let future = at
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let (invite, token) =
+            super::create_invite(&state, &authority, &space_uri, None, None, Some(future))
+                .await
+                .expect("authority creates invite");
+        assert_eq!(
+            invite.expires_at.as_deref(),
+            Some(at.to_rfc3339().as_str()),
+            "the expiry is stored in UTC, in the form now_rfc3339 writes"
+        );
+
+        super::accept_invite(&state, "did:plc:joiner-offset-future", &token)
+            .await
+            .expect("an unexpired invite is redeemed");
+    }
+
+    #[tokio::test]
+    async fn a_utc_expiry_still_works() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        let (invite, token) = super::create_invite(
+            &state,
+            &authority,
+            &space_uri,
+            None,
+            None,
+            Some("2999-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .expect("authority creates invite");
+        assert_eq!(
+            invite.expires_at.as_deref(),
+            Some("2999-01-01T00:00:00+00:00")
+        );
+        let stored = db::get_invite_by_token_hash(
+            &state.db,
+            state.db_backend,
+            &hex::encode(Sha256::digest(token.as_bytes())),
+        )
+        .await
+        .unwrap()
+        .expect("invite stored");
+        assert_eq!(stored.expires_at, invite.expires_at);
+
+        super::accept_invite(&state, "did:plc:joiner-utc-future", &token)
+            .await
+            .expect("an unexpired invite is redeemed");
+    }
+
+    #[tokio::test]
+    async fn a_non_timestamp_expiry_is_refused_at_creation() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        for bad in ["next tuesday", "2026-06-01", "2026-06-01 00:00:00Z", ""] {
+            let err = super::create_invite(
+                &state,
+                &authority,
+                &space_uri,
+                None,
+                None,
+                Some(bad.to_string()),
+            )
+            .await
+            .unwrap_err();
+            match err {
+                crate::error::AppError::XrpcError {
+                    status,
+                    code,
+                    message,
+                } => {
+                    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{bad:?}");
+                    assert_eq!(code, "InvalidRequest", "{bad:?}");
+                    assert!(message.contains("expiresAt"), "{bad:?}: {message}");
+                }
+                other => panic!("{bad:?}: expected InvalidRequest, got: {other:?}"),
+            }
+        }
+        let space = super::resolve_space(&state, &space_uri).await.unwrap();
+        let invites = db::list_invites(&state.db, state.db_backend, &space.id)
+            .await
+            .unwrap();
+        assert!(invites.is_empty(), "a refused invite is not stored");
+    }
+
+    #[tokio::test]
+    async fn a_stored_expiry_that_does_not_parse_counts_as_expired() {
+        require_test_db!();
+        let (state, space_uri, _authority) = service_test_db().await;
+        let token = seed_raw_invite(&state, &space_uri, "never").await;
+
+        let err = super::accept_invite(&state, "did:plc:joiner-legacy", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[tokio::test]
+    async fn a_stored_offset_expiry_is_compared_as_a_time() {
+        require_test_db!();
+        let (state, space_uri, _authority) = service_test_db().await;
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let token = seed_raw_invite(&state, &space_uri, &past).await;
+
+        let err = super::accept_invite(&state, "did:plc:joiner-legacy-offset", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[test]
+    fn invite_expiry_is_normalized_to_utc() {
+        assert_eq!(
+            super::normalize_invite_expiry("2026-06-01T02:00:00+02:00").unwrap(),
+            "2026-06-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            super::normalize_invite_expiry("2026-06-01T00:00:00.5Z").unwrap(),
+            "2026-06-01T00:00:00.500+00:00"
+        );
+        assert!(super::normalize_invite_expiry("2026-06-01T00:00:00-00:00").is_err());
+    }
+
+    #[test]
+    fn invite_expiry_compares_times_not_text() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 2026-06-01T00:00:00Z: passed, though it sorts after `now` as text.
+        assert!(super::invite_expired("2026-06-01T02:00:00+02:00", now));
+        // 2026-06-01T01:00:00Z: not passed, though it sorts before `now`.
+        assert!(!super::invite_expired("2026-05-31T20:00:00-05:00", now));
+        assert!(super::invite_expired("not a date", now));
     }
 
     #[tokio::test]

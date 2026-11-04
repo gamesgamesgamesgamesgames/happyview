@@ -108,6 +108,10 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `DELETE /admin/backfill/{id}/details`    | `backfill:create`          |
 | `DELETE /admin/backfill/details`         | `backfill:create`          |
 | `GET /admin/events`                      | `events:read`              |
+| `GET /admin/metrics/scripts`             | `metrics:read`             |
+| `GET /admin/metrics/scripts/{trigger}`   | `metrics:read`             |
+| `GET /admin/metrics/ingest`              | `metrics:read`             |
+| `GET /admin/metrics/live`                | `metrics:read`             |
 | `POST /admin/api-keys`                   | `api-keys:create`          |
 | `GET /admin/api-keys`                    | `api-keys:read`            |
 | `DELETE /admin/api-keys/{id}`            | `api-keys:delete`          |
@@ -123,6 +127,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/scripts`                     | `scripts:read`             |
 | `POST /admin/scripts`                    | `scripts:manage`           |
 | `GET /admin/scripts/languages`           | `scripts:read`             |
+| `GET /admin/scripts/modules`             | `scripts:read`             |
 | `GET /admin/scripts/{id}`                | `scripts:read`             |
 | `PATCH /admin/scripts/{id}`              | `scripts:manage`           |
 | `DELETE /admin/scripts/{id}`             | `scripts:manage`           |
@@ -136,9 +141,18 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `DELETE /admin/records/collection`       | `records:delete-collection`|
 | `POST /admin/records/collection/reconcile` | `records:read` (dry run), `records:delete` |
 | `GET /admin/spaces`                      | `spaces:read`              |
+| `GET /admin/spaces/inspector`            | `spaces:read` or `spaces:inspect` |
+| `GET /admin/spaces/access-grants`        | `spaces:inspect`           |
+| `POST /admin/spaces/access-grants`       | `spaces:inspect`           |
+| `DELETE /admin/spaces/access-grants/{id}`| `spaces:inspect` (own) or `users:update` (others) |
+| `GET /admin/spaces/access-grants/{id}/reads` | `events:read`          |
 | `GET /admin/spaces/{id}`                 | `spaces:read`              |
-| `GET /admin/spaces/{id}/records`         | `spaces:manage-records`    |
-| `GET /admin/spaces/{id}/blob`            | `spaces:manage-records`    |
+| `GET /admin/spaces/{id}/access`          | `spaces:inspect`           |
+| `GET /admin/spaces/{id}/records`         | `spaces:inspect`           |
+| `GET /admin/spaces/{id}/blob`            | `spaces:inspect`           |
+| `GET /admin/accounts/{did}/access`       | `spaces:inspect`           |
+| `GET /admin/accounts/{did}/spaces`       | `spaces:read`              |
+| `GET /admin/accounts/{did}/space-records`| `spaces:inspect`           |
 | `GET /admin/database/status`             | `settings:manage`          |
 | `POST /admin/database/vacuum/schedule`   | `settings:manage`          |
 | `DELETE /admin/database/vacuum/schedule` | `settings:manage`          |

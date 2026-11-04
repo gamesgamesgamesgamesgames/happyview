@@ -32,7 +32,6 @@ test.describe("Linked Repos — invitee-facing pages", () => {
       data: {
         lexicon_json: TEST_LEXICON,
         backfill: false,
-        target_collection: TEST_NSID,
       },
     });
     if (!lex.ok() && !(await lex.text()).includes("already exists")) {

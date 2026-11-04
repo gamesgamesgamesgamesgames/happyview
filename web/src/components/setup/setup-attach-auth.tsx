@@ -1,13 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { confirmAttachAuth } from "@/lib/api";
 import { ATTACHED_ACCOUNT_SCOPE } from "@/lib/attached-account-scope";
@@ -141,7 +135,7 @@ export function SetupAttachAuth({
           restored and you&apos;ll continue from where you left off.
           <br />
           <a
-            href={docsUrl("/getting-started/service-identity#linked-account")}
+            href={docsUrl("/docs/guides/service-identity#attached-account")}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline underline-offset-4 hover:text-primary/80"

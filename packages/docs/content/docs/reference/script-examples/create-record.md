@@ -10,13 +10,13 @@ The simplest write: take the request body, save it as a record, and return the U
 local record = require("happyview.record")
 
 function handle(input, ctx)
-  return record.create(ctx.collection, input)
+  return record.create("com.example.post", input)
 end
 ```
 
 ## How it works
 
-1. `record.create` on [`happyview.record`](../../api-reference/lua/libraries.md) takes the target collection and the fields from the request body, validates them against the collection's lexicon, and creates the record on the caller's PDS.
+1. `record.create` on [`happyview.record`](../../api-reference/lua/libraries.md) takes the collection NSID and the fields from the request body, validates them against the collection's lexicon, and creates the record on the caller's PDS.
 2. The write is mirrored into the local index at once.
 3. `create` answers `{ uri, cid }`, which is returned as the response.
 

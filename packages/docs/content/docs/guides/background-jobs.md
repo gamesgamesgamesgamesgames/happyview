@@ -90,7 +90,7 @@ end
 
 ### Logging
 
-`internal.logging`'s `info`, `warn` and `error` write to the job's own log as well as the event log, so the dashboard's job detail shows them alongside progress:
+`internal.logging`'s `info`, `warn` and `error` write to the job's own log as well as the event log, so the dashboard's job detail shows them alongside progress. A job's log lines are kept for `EVENT_LOG_RETENTION_DAYS` (default 30), like the event log:
 
 ```lua
 local log = require("internal.logging")
@@ -111,7 +111,7 @@ local jobs = require("happyview.jobs")
 -- In a procedure script
 function handle(input, ctx)
   local job_id = jobs.create("export", {
-    collection = ctx.collection,
+    collection = "com.example.record",
     format = input.format,
   })
   return { job_id = job_id, status = "queued" }
@@ -162,10 +162,10 @@ To give a job access to the creator's PDS session, pass `{ auth = true }` as the
 local jobs = require("happyview.jobs")
 
 -- Without auth (default) - local-only operations
-jobs.create("stats.rebuild", { collection = ctx.collection })
+jobs.create("stats.rebuild", { collection = "com.example.record" })
 
 -- With auth - can write to the creator's PDS
-jobs.create("sync-records", { collection = ctx.collection }, { auth = true })
+jobs.create("sync-records", { collection = "com.example.record" }, { auth = true })
 ```
 
 `{ auth = true }` requires the enqueuing script to hold a DPoP session itself, so it works from a procedure called by an authenticated client and raises `NO_SESSION` from a runner that has none. When the job runs, the worker loads the creator's OAuth session. If the session is no longer valid (expired, revoked, or the user has no session), the job fails immediately with an error. The creating user must have a valid OAuth session when the job runs, not just when it was enqueued.

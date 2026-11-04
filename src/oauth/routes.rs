@@ -44,7 +44,7 @@ async fn client_jwks(
     let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -125,10 +125,10 @@ async fn mint_client_assertion(
             )
             .await?;
 
-            let encryption_key =
-                state.config.token_encryption_key.as_ref().ok_or_else(|| {
-                    AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into())
-                })?;
+            let encryption_key = &state
+                .config
+                .keyring()
+                .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
             let (_dpop_key_id, dpop_client_id, _private_jwk, _thumbprint, pkce_challenge) =
                 keys::get_dpop_key(&state.db, state.db_backend, encryption_key, provision_id)
@@ -165,7 +165,7 @@ async fn mint_client_assertion(
     let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &client.id,
     )
     .await?;
@@ -291,7 +291,10 @@ struct RegisterSessionBody {
     refresh_token: Option<String>,
     expires_at: Option<String>,
     scopes: String,
-    pds_url: Option<String>,
+    /// Accepted for older clients and ignored: the session is stored with the
+    /// PDS resolved from the DID document, which verification reached.
+    #[serde(default, rename = "pds_url")]
+    _pds_url: Option<String>,
     issuer: Option<String>,
 }
 
@@ -471,10 +474,9 @@ async fn register_session(
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?
         .0;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Look up the DPoP key by provision_id
@@ -533,7 +535,7 @@ async fn register_session(
     // the request body is client-supplied and untrusted; without this check any
     // holder of a provisioned DPoP key could register a session for an arbitrary
     // victim DID and be authenticated as them on every DPoP-accepting route.
-    let verified_did = super::pds_write::verify_access_token_did(
+    let (verified_did, pds_url) = super::pds_write::verify_access_token_did(
         &state.http,
         &state.config.plc_url,
         &private_jwk,
@@ -554,13 +556,20 @@ async fn register_session(
         ));
     }
 
+    // The issuer is the app's word too, and a refresh and a revocation later
+    // send this session's tokens to it. Checked once here, against the PDS
+    // verification reached, so every later path holds a verified one.
+    if let Some(issuer) = body.issuer.as_deref() {
+        super::pds_write::verify_issuer_of(&state.http, &pds_url, issuer).await?;
+    }
+
     // Pin the session to the key that signed its token exchange, not the one
     // current now: a staged key may have taken over in between, and a
     // refresh signed by another key than the session's destroys it.
     let client_keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &client.id,
     )
     .await?;
@@ -583,7 +592,7 @@ async fn register_session(
     sessions::store_dpop_session(
         &state.db,
         state.db_backend,
-        encryption_key,
+        encryption_key.current(),
         &session_id,
         &client.id,
         &dpop_key_id,
@@ -592,9 +601,21 @@ async fn register_session(
         body.refresh_token.as_deref(),
         body.expires_at.as_deref(),
         &body.scopes,
-        body.pds_url.as_deref(),
+        Some(pds_url.as_str()),
         body.issuer.as_deref(),
         signing_kid.as_deref(),
+    )
+    .await?;
+
+    // Checked above: the PDS was resolved from the DID document, and the
+    // issuer, when given, was verified against it.
+    sessions::mark_verified(
+        &state.db,
+        state.db_backend,
+        &client.id,
+        &body.did,
+        &dpop_key_id,
+        &pds_url,
     )
     .await?;
 
@@ -696,10 +717,9 @@ async fn get_session(
     let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     let authenticated = authenticate_request_client(&state, &headers, &request_path, "GET").await?;
@@ -744,7 +764,7 @@ async fn revoke_sessions_best_effort(
     did: &str,
     dpop_key_ids: &[String],
 ) {
-    let Some(encryption_key) = state.config.token_encryption_key.as_ref() else {
+    let Some(encryption_key) = &state.config.keyring() else {
         return;
     };
 
@@ -755,6 +775,7 @@ async fn revoke_sessions_best_effort(
             state.db_backend,
             encryption_key,
             &state.oauth,
+            &state.config.plc_url,
             api_client_id,
             did,
             dpop_key_id,

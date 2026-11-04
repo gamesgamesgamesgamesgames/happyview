@@ -13,7 +13,6 @@ use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
 use crate::script::{DispatchError, Invocation, ScriptOrigin, dispatch};
-use crate::telemetry::counters::Counters;
 
 use super::context;
 use super::scripts::{ResolvedScript, trigger_of};
@@ -22,21 +21,6 @@ use super::scripts::{ResolvedScript, trigger_of};
 /// host's, so the sentence is the host's rather than whatever text the
 /// interpreter raised on its way out.
 const EXECUTION_LIMIT_MESSAGE: &str = "script exceeded execution time limit";
-
-struct ScriptTimingGuard {
-    counters: Arc<Counters>,
-    start: Instant,
-}
-
-impl Drop for ScriptTimingGuard {
-    fn drop(&mut self) {
-        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
-        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_us, elapsed_us);
-        self.counters
-            .script_executions
-            .fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 /// The text after the auth-error prefix, wherever it sits in the message.
 /// An interpreter wraps a raised error in context of its own, so the prefix is
@@ -184,10 +168,6 @@ pub async fn execute_procedure_script(
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
-    let _script_timing = ScriptTimingGuard {
-        counters: state.telemetry_counters.clone(),
-        start,
-    };
     let backend = state.db_backend;
     let span = tracing::info_span!(
         "script.execute",
@@ -196,19 +176,18 @@ pub async fn execute_procedure_script(
         caller_did = %claims.did(),
     );
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source and input for error logging before anything is consumed.
     let script_source = script.body.clone();
     let input_json = input.clone();
 
+    let mut delegate_pds_auth: Option<Arc<repo::PdsAuth>> = None;
     let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
         Some(auth)
     } else if let Some(client_key) = claims.client_key() {
-        let encryption_key = state
+        let encryption_key = &state
             .config
-            .token_encryption_key
-            .as_ref()
+            .keyring()
             .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
         let api_client_id = match repo::get_dpop_client_id(state, client_key).await {
             Ok(id) => id,
@@ -240,6 +219,31 @@ pub async fn execute_procedure_script(
             .dpop_key_id()
             .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
             .to_string();
+        // The procedure handler has already checked that the caller may write
+        // for `delegate_did` under this same api client. A delegated account
+        // with no session here can still run a script that never writes to
+        // its repo; a write that does is refused by `auth_for`.
+        if let Some(did) = delegate_did {
+            match crate::oauth::sessions::get_dpop_session_for_user(
+                &state.db,
+                backend,
+                encryption_key,
+                &api_client_id,
+                did,
+            )
+            .await
+            {
+                Ok(target) => {
+                    delegate_pds_auth = Some(Arc::new(repo::PdsAuth::Dpop {
+                        api_client_id: api_client_id.clone(),
+                        dpop_key_id: target.dpop_key_id,
+                        encryption_key: *encryption_key,
+                    }));
+                }
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Some(repo::PdsAuth::Dpop {
             api_client_id,
             dpop_key_id,
@@ -259,6 +263,7 @@ pub async fn execute_procedure_script(
             delegate_did: delegate_did.map(|s| s.to_string()),
             claims: claims_arc.clone(),
             pds_auth: Arc::new(pds_auth),
+            delegate_pds_auth: delegate_pds_auth.clone(),
             app_state: state.clone(),
         })
     });
@@ -276,7 +281,7 @@ pub async fn execute_procedure_script(
             caller_did: Some(claims.did()),
             has_pds_auth,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: Some(params),
             delegate_did,
             space: space.as_ref(),
@@ -369,14 +374,9 @@ pub async fn execute_query_script(
     space_ctx: Option<&context::SpaceContext>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
-    let _script_timing = ScriptTimingGuard {
-        counters: state.telemetry_counters.clone(),
-        start,
-    };
     let backend = state.db_backend;
     let span = tracing::info_span!("script.execute", method = method, script_type = "query",);
     span.in_scope(|| tracing::info!("script execution started"));
-    let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source for error logging.
     let script_source = script.body.clone();
@@ -398,7 +398,7 @@ pub async fn execute_query_script(
             caller_did: claims.map(|c| c.did()),
             has_pds_auth: false,
             method: Some(method),
-            collection: Some(collection),
+            collection: None,
             params: None,
             delegate_did: None,
             space: space.as_ref(),
@@ -479,7 +479,7 @@ pub async fn execute_query_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::lexicon::LexiconType;
     use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
     use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
     use axum::response::IntoResponse;
@@ -495,8 +495,6 @@ mod tests {
             record_schema: None,
             raw: serde_json::json!({ "id": "com.example.probe" }),
             revision: 1,
-            target_collection: Some("com.example.probe".to_string()),
-            action: ProcedureAction::Upsert,
             token_cost: None,
             space_type: None,
             space_name: None,
@@ -802,8 +800,8 @@ mod tests {
         assert!(message.contains("plugins page"), "{body}");
     }
 
-    /// The guard reports a run whatever became of it, so a counter cannot be
-    /// lost to a path that returns early.
+    /// Dispatch counts a run whatever became of it, so a counter cannot be
+    /// lost to a path that returns early, and counts it once.
     #[tokio::test]
     async fn a_run_that_reached_no_interpreter_still_moves_the_script_counters() {
         let state = test_state_with_pool(memory_pool().await);
@@ -823,6 +821,9 @@ mod tests {
         .expect_err("no interpreter is installed, so the run cannot happen");
 
         assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+        let rows = state.metrics.scripts(crate::metrics::Window::Hour);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stats.outcomes.get("no_interpreter"), Some(&1));
     }
 
     async fn executed_event_count(state: &AppState) -> i64 {

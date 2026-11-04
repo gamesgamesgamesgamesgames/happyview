@@ -490,8 +490,6 @@ pub(crate) fn same_lexicon(a: &ProjectLexicon, b: &ProjectLexicon) -> bool {
     a.path == b.path
         && a.backfill == b.backfill
         && a.parsed.raw == b.parsed.raw
-        && a.parsed.target_collection == b.parsed.target_collection
-        && a.parsed.action == b.parsed.action
         && a.parsed.token_cost == b.parsed.token_cost
 }
 
@@ -589,7 +587,7 @@ mod tests {
         project(&[
             (
                 "happyview.toml",
-                "[lexicons.\"com.example.getThing\"]\ntarget_collection = \"com.example.thing\"\n",
+                "[lexicons.\"com.example.getThing\"]\ntoken_cost = 3\n",
             ),
             (
                 &format!("{LEX}/getThing.json"),
@@ -632,11 +630,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            snap.lexicons["com.example.getThing"]
-                .parsed
-                .target_collection
-                .as_deref(),
-            Some("com.example.thing")
+            snap.lexicons["com.example.getThing"].parsed.token_cost,
+            Some(3)
         );
         assert_eq!(
             snap.scripts.keys().collect::<Vec<_>>(),
@@ -1156,8 +1151,6 @@ mod tests {
                     ))
                     .unwrap(),
                     backfill: false,
-                    target_collection: None,
-                    action: crate::lexicon::ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,
@@ -1244,10 +1237,7 @@ mod tests {
             .get("com.example.getThing")
             .await
             .expect("the project query");
-        assert_eq!(
-            query.target_collection.as_deref(),
-            Some("com.example.thing")
-        );
+        assert_eq!(query.token_cost, Some(3));
         assert!(
             state
                 .lexicons

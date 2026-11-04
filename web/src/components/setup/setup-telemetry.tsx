@@ -23,7 +23,7 @@ const OPTIONS = [
   {
     value: "off" as const,
     label: "Don't send anything",
-    hint: "This is the default. You can turn this on later in Settings → Telemetry.",
+    hint: "This is the default. You can turn this on later in System → Telemetry.",
   },
   {
     value: "manual" as const,
@@ -61,7 +61,7 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
             how the instance is doing: how much data it holds, which features
             are used, and where it is struggling. It never includes records,
             handles, DIDs, contact details, or the contents of anything you have
-            indexed. You can read the exact payload under Settings → Telemetry.
+            indexed. You can read the exact payload under System → Telemetry.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex justify-end">
@@ -103,7 +103,7 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
           how much data it holds, which features you use, and where it is
           struggling. It never includes records, handles, DIDs, or the contents
           of anything you have indexed. You can read the exact payload — and
-          change your mind — any time under Settings → Telemetry.
+          change your mind — any time under System → Telemetry.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

@@ -143,6 +143,16 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// the delta to the current epoch, and that sum must not overflow.
 pub const UNBOUNDED_TICKS: u64 = u64::MAX / 2;
 
+/// The ticks a guest runs before its store's epoch callback hands the worker
+/// back to the async executor: 50 ms at the 10 ms tick. A deadline is armed a
+/// slice at a time, so however long a budget is, a guest that spins in its
+/// own code yields its tokio worker at least this often, and the tasks queued
+/// behind it wait at most about one slice. Smaller would yield more often for
+/// no gain an operator could see; larger would let a spinning guest stall its
+/// neighbours for longer. The callback is a few atomic loads and a boxed
+/// future, so at twenty a second per running guest its cost is noise.
+pub const EPOCH_SLICE: u64 = 5;
+
 /// The native stack a guest's frames may take, which wasmtime's default holds
 /// to 512 KiB. A guest cannot see this stack at all: a C interpreter measures
 /// the shadow stack in its own linear memory, and each level of its recursion
@@ -170,6 +180,21 @@ pub struct WasmRuntime {
     epoch: Arc<AtomicU64>,
     ticker_stop: Arc<AtomicBool>,
     modules: Arc<ModuleCache>,
+    /// The linkers every instance on this engine is made with, built once.
+    /// They live here, beside the engine they are bound to, because an
+    /// executor is made per call and would rebuild them every time.
+    linkers: SharedLinkers,
+}
+
+/// One linker without WASI preview 1 and one with it, each built on first
+/// use. Building one registers every host function, which profiled at about
+/// a fifth of a record hook's CPU when it was done per instance. Host
+/// functions reach a run's state only through the store's data, so one
+/// linker serves every store.
+#[derive(Default)]
+pub(crate) struct SharedLinkers {
+    pub(crate) env: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
+    pub(crate) wasi: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
 }
 
 /// The WebAssembly proposal HappyView turns off that `bytes` needs, if one
@@ -265,7 +290,13 @@ impl WasmRuntime {
             epoch: Arc::new(AtomicU64::new(0)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
             modules: Arc::default(),
+            linkers: SharedLinkers::default(),
         })
+    }
+
+    /// The linkers instances on this engine share.
+    pub(crate) fn linkers(&self) -> &SharedLinkers {
+        &self.linkers
     }
 
     /// This runtime, compiling every module it does not hold itself rather
@@ -313,13 +344,27 @@ impl WasmRuntime {
     /// ones above it. Everything past this runtime's memory runs on a
     /// blocking thread: a compile takes up to seconds.
     pub async fn module_for(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
+        self.module_lookup(plugin).await.map(|(module, _)| module)
+    }
+
+    /// As [`WasmRuntime::module_for`], saying whether this lookup was served
+    /// from this runtime's memory. Anything else (disk, the process's
+    /// compiled modules, a compile) is a miss.
+    pub async fn module_lookup(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Result<(Module, bool), anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
-            return Ok(module);
+            self.modules.count_lookup(true);
+            return Ok((module, true));
         }
         let engine = self.engine.clone();
         let modules = self.modules.clone();
         let plugin = plugin.clone();
-        tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
+        let (module, hit) =
+            tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await??;
+        self.modules.count_lookup(hit);
+        Ok((module, hit))
     }
 
     /// Start compiling `plugin`'s module on a blocking thread, so its first
@@ -349,9 +394,12 @@ impl WasmRuntime {
     /// already off the async workers.
     pub fn module_for_blocking(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
+            self.modules.count_lookup(true);
             return Ok(module);
         }
-        resolve(&self.engine, &self.modules, plugin)
+        let (module, hit) = resolve(&self.engine, &self.modules, plugin)?;
+        self.modules.count_lookup(hit);
+        Ok(module)
     }
 
     /// Drop the in-memory module held for `plugin_id`.
@@ -362,6 +410,17 @@ impl WasmRuntime {
     /// Compiles performed by this runtime, cache hits excluded.
     pub fn compile_count(&self) -> u64 {
         self.modules.compiles.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups served from this runtime's memory.
+    pub fn cache_hits(&self) -> u64 {
+        self.modules.hits.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups that had to go to disk, the process's compiled
+    /// modules, or the compiler.
+    pub fn cache_misses(&self) -> u64 {
+        self.modules.misses.load(Ordering::Relaxed)
     }
 
     /// The file stem a module's serialized form is kept under: the wasm
@@ -423,33 +482,36 @@ fn cache_key(engine: &Engine, wasm_sha256: &str) -> String {
 
 /// `plugin`'s module past the identity check: by hash in memory, from
 /// disk, or through [`compile`].
+/// The module for `plugin` and whether this runtime's memory held it. A
+/// caller that waited out another's compile finds it in memory, which counts
+/// as a hit: the wait was not this caller's compile.
 fn resolve(
     engine: &Engine,
     modules: &ModuleCache,
     plugin: &Arc<LoadedPlugin>,
-) -> Result<Module, anyhow::Error> {
+) -> Result<(Module, bool), anyhow::Error> {
     let id = plugin.info.id.as_str();
     let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
     if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
-        return Ok(module);
+        return Ok((module, true));
     }
     let key = cache_key(engine, &sha);
     // One compile per key at a time: whoever waited here finds the module
     // the holder inserted.
     let slot = modules.compiling(&key);
     let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
-    let result = (|| -> Result<Module, anyhow::Error> {
+    let result = (|| -> Result<(Module, bool), anyhow::Error> {
         if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
-            return Ok(module);
+            return Ok((module, true));
         }
         if let Some(module) = modules.load_from_disk(engine, &key) {
             modules.insert(id, plugin, &sha, module.clone());
-            return Ok(module);
+            return Ok((module, false));
         }
         let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
         modules.write_to_disk(&key, &module, serialized.as_deref());
         modules.insert(id, plugin, &sha, module.clone());
-        Ok(module)
+        Ok((module, false))
     })();
     modules.done_compiling(&key, &slot);
     result
@@ -643,6 +705,8 @@ struct ModuleCache {
     entries: Mutex<HashMap<String, CachedModule>>,
     dir: Option<PathBuf>,
     compiles: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
     warned: AtomicBool,
     /// Set by [`WasmRuntime::without_shared_modules`].
     unshared: bool,
@@ -652,6 +716,11 @@ struct ModuleCache {
 }
 
 impl ModuleCache {
+    fn count_lookup(&self, hit: bool) {
+        let counter = if hit { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn compiling(&self, key: &str) -> Arc<Mutex<()>> {
         self.in_flight
             .lock()
@@ -925,6 +994,26 @@ impl ResourceLimiter for MemoryLimiter {
 /// is not charged for the host's latency. The methods keep the books; the
 /// caller applies the returned delta with `set_epoch_deadline`, since the
 /// store owns this value and cannot be borrowed through it.
+///
+/// The delta is never more than [`EPOCH_SLICE`]: the store's deadline is
+/// armed a slice at a time, and the callback [`slice_guest_deadline`]
+/// installs charges each slice here and either yields with the next one or,
+/// once the budget is spent, interrupts the guest. The time a yielded guest
+/// waits to be polled again is charged: the clock is running through it, as
+/// it was before there were yields, when the same wait fell on the tasks the
+/// guest held the worker from. A run therefore still ends within its wall
+/// clock however busy the runtime is, short of its host imports.
+///
+/// The cost is in the oversubscribed case. With N CPU-bound guests sharing
+/// M workers (N > M), each takes about N/M times its CPU in wall time and is
+/// charged all of it, so once that passes the budget they all time out
+/// together, where without yields the first ones would have finished and
+/// only the later ones would have waited. At the default instruction limit a
+/// run is tens of milliseconds of CPU, so this needs hundreds of guests per
+/// worker against a 10 s clock; it gets nearer as an operator raises
+/// `script_instruction_limit`. Charging only the slices a guest ran would
+/// avoid it, at the price of runs outlasting their wall clock on a saturated
+/// runtime.
 pub struct GuestDeadline {
     epoch: Arc<AtomicU64>,
     remaining: u64,
@@ -963,12 +1052,17 @@ impl GuestDeadline {
         self.armed_at = now;
     }
 
+    /// The delta for `set_epoch_deadline`: what is left, a slice at most.
+    fn slice(&self) -> u64 {
+        self.remaining.min(EPOCH_SLICE)
+    }
+
     /// Start a fresh budget. Returns the delta for `set_epoch_deadline`.
     pub fn arm(&mut self, ticks: u64) -> u64 {
         self.remaining = ticks;
         self.armed_at = self.now();
         self.running = true;
-        ticks
+        self.slice()
     }
 
     /// The guest has entered a host import: spend what it ran and stop
@@ -985,12 +1079,67 @@ impl GuestDeadline {
     pub fn resume(&mut self) -> u64 {
         self.settle();
         self.running = true;
-        self.remaining
+        self.slice()
+    }
+
+    /// Spend the whole budget, so the guest is interrupted at its next
+    /// epoch check. Used when the host decides a run must stop, as when a
+    /// job's worker loses its lease, and a lifted deadline is spent all the same.
+    pub fn exhaust(&mut self) {
+        self.settle();
+        self.remaining = 0;
+    }
+
+    /// The store's epoch deadline has been reached. Charges the slice the
+    /// guest ran and answers the next slice, or `None` once the budget is
+    /// spent.
+    fn on_deadline(&mut self) -> Option<u64> {
+        self.settle();
+        (self.remaining > 0).then(|| self.slice())
     }
 
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
+}
+
+/// What a guest's yield awaits: its tokio worker, given back.
+///
+/// Two of tokio's yields rather than one. A yield is deferred until the
+/// worker next polls its timers and I/O, and the tasks that poll wakes are
+/// queued behind the yielding one, which a tokio worker runs first as its
+/// most recently woken: with one yield, a timer task beside a spinning guest
+/// on a one-worker runtime ran every other slice (gaps of about 100 ms at a
+/// 50 ms slice). The second yield, taken at once, puts the guest behind
+/// everything the first one woke.
+async fn give_back_the_worker() {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+}
+
+/// Install the epoch callback every store that runs guest code needs. When a
+/// store reaches the deadline its [`GuestDeadline`] last armed, the slice is
+/// charged; a spent budget interrupts the guest with
+/// [`Trap::Interrupt`], the trap a deadline raised before there was a
+/// callback, so it still classifies as a timeout. Otherwise the guest yields
+/// its tokio worker and resumes with the next slice. A lifted or unbounded
+/// deadline therefore yields every slice and never traps.
+///
+/// A yield needs the guest to have been entered through an `*_async` call:
+/// from a synchronous one wasmtime raises a trap instead. Every store with
+/// this callback is only ever called through `call_async` and
+/// `instantiate_async`.
+pub fn slice_guest_deadline<T: 'static>(
+    store: &mut Store<T>,
+    deadline: fn(&mut T) -> &mut GuestDeadline,
+) {
+    store.epoch_deadline_callback(move |mut state| {
+        let deadline = deadline(state.data_mut());
+        Ok(match deadline.on_deadline() {
+            None => UpdateDeadline::Interrupt,
+            Some(delta) => UpdateDeadline::YieldCustom(delta, Box::pin(give_back_the_worker())),
+        })
+    });
 }
 
 #[cfg(test)]
@@ -1234,19 +1383,21 @@ mod tests {
     }
 
     /// Ticks that pass while suspended are not charged; ticks that pass
-    /// while running are, and the budget re-arms with what is left.
+    /// while running are, and the budget re-arms with what is left, a slice
+    /// at a time.
     #[test]
     fn a_suspended_deadline_does_not_spend_host_time() {
         let epoch = Arc::new(AtomicU64::new(0));
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
-        assert_eq!(deadline.arm(10), 10);
+        assert_eq!(deadline.arm(10), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), 10);
 
         epoch.fetch_add(3, Ordering::Relaxed);
         deadline.suspend();
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(100, Ordering::Relaxed);
-        assert_eq!(deadline.resume(), 7);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(2, Ordering::Relaxed);
@@ -1256,9 +1407,32 @@ mod tests {
 
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 5);
+        epoch.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(deadline.resume(), 2);
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 0);
         assert_eq!(deadline.resume(), 0);
+    }
+
+    /// Each slice the callback sees is charged and answered with the next,
+    /// the last one short; a spent budget answers nothing.
+    #[test]
+    fn the_deadline_is_charged_a_slice_at_a_time() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut deadline = GuestDeadline::unbounded(epoch.clone());
+        assert_eq!(deadline.arm(12), EPOCH_SLICE);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(EPOCH_SLICE));
+        assert_eq!(deadline.remaining(), 7);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(2));
+        epoch.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), None);
+
+        // An exhausted budget answers nothing even when lifted before.
+        deadline.arm(UNBOUNDED_TICKS);
+        deadline.exhaust();
+        assert_eq!(deadline.on_deadline(), None);
     }
 
     #[test]
@@ -1498,6 +1672,22 @@ mod tests {
         assert_eq!(answer(&runtime, &second), 7);
     }
 
+    /// Each lookup says whether memory served it, and the runtime keeps the
+    /// tally: a lookup that compiled or loaded is a miss.
+    #[tokio::test]
+    async fn a_lookup_reports_whether_memory_held_the_module() {
+        let runtime = WasmRuntime::without_ticker()
+            .unwrap()
+            .without_shared_modules();
+        let plugin = plugin("p", &answering(7));
+        let (_, first) = runtime.module_lookup(&plugin).await.unwrap();
+        let (_, second) = runtime.module_lookup(&plugin).await.unwrap();
+        assert!(!first);
+        assert!(second);
+        runtime.module_for_blocking(&plugin).unwrap();
+        assert_eq!((runtime.cache_hits(), runtime.cache_misses()), (2, 1));
+    }
+
     /// The same bytes under a fresh registration hit by hash; different
     /// bytes under the same id miss and replace the entry.
     #[test]
@@ -1711,9 +1901,11 @@ mod tests {
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert_eq!(deadline.resume(), UNBOUNDED_TICKS);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), UNBOUNDED_TICKS);
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert!(deadline.resume() > UNBOUNDED_TICKS - 2_000_000);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert!(deadline.remaining() > UNBOUNDED_TICKS - 2_000_000);
     }
 }

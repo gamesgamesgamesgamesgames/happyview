@@ -50,17 +50,17 @@ fn parse_input(input: &serde_json::Value) -> Option<Input> {
 /// login: the two differ whenever a user declines part of a consent screen, and
 /// acting on the request would enqueue migrations that cannot run.
 pub async fn granted_scope(state: &AppState, did: &str) -> Result<Option<String>, AppError> {
-    let sql = crate::db::adapt_sql(
-        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+    let data = crate::auth::oauth_store::stored_session_json(
+        &state.db,
         state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        did,
+        state.config.keyring().as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
 
-    let Some((data,)) = row else {
+    let Some(data) = data else {
         return Ok(None);
     };
     let parsed: serde_json::Value = serde_json::from_str(&data)
@@ -156,20 +156,27 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
 
     match migrate(state, job, &input).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            // Any failure returns the repo to polyfill. Migration never modifies
-            // the local copy, so the user's repo keeps working as it did.
-            if let Err(revert) = set_mode(state, &input, HostMode::Polyfill).await {
-                tracing::error!(
-                    space_id = %input.space_id,
-                    author_did = %input.author_did,
-                    error = %revert,
-                    "failed to return repo to polyfill after a failed migration"
-                );
-            }
-            NativeOutcome::Failed(format!("{e}"))
-        }
+        Err(e) => failed(state, job, &input, e).await,
     }
+}
+
+/// The outcome of a run that failed. A failure returns the repo to
+/// polyfill: migration never modifies the local copy, so the user's repo
+/// keeps working as it did. Unless the run's job was taken over while it
+/// failed (a run stuck in a call to the PDS across the takeover): the run
+/// that took it may have moved the repo on already, and the mode is its.
+async fn failed(state: &AppState, job: &Job, input: &Input, e: AppError) -> NativeOutcome {
+    if jobs_db::should_stop(state, &job.id).await != Some("lost")
+        && let Err(revert) = set_mode(state, input, HostMode::Polyfill).await
+    {
+        tracing::error!(
+            space_id = %input.space_id,
+            author_did = %input.author_did,
+            error = %revert,
+            "failed to return repo to polyfill after a failed migration"
+        );
+    }
+    NativeOutcome::Failed(format!("{e}"))
 }
 
 async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOutcome, AppError> {
@@ -277,18 +284,13 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     }
 
     // Verify with two independent checks. Both must pass.
+    // Authenticity: the commit is signed by, or MACed under, the author's key.
     let commit =
-        native_client::get_latest_commit(state, &session, &space_uri, &input.author_did).await?;
+        native_client::get_verified_commit(state, &session, &space_uri, &input.author_did).await?;
 
-    // Authenticity: the commit carries a valid signature from the author's key.
-    let key =
-        native_client::author_signing_key(&state.http, &state.config.plc_url, &input.author_did)
-            .await?;
-    crate::spaces::commit::verify_commit(&commit, &space_uri, &input.author_did, &key)?;
-
-    // Agreement: the signed hash describes the records we sent. An authentic
-    // commit can still summarise a different record set.
-    if commit.hash != expected_commit_hash(&records) {
+    // Agreement: the authenticated hash describes the records we sent. An
+    // authentic commit can still summarise a different record set.
+    if *commit.hash() != expected_commit_hash(&records) {
         return Err(AppError::Internal(format!(
             "the PDS's commit does not describe the {total} records we replayed; \
              leaving this repo on HappyView"
@@ -296,14 +298,14 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     }
 
     // Handoff confirmed.
-    if let Some(reason) = hand_off(state, job, input, &commit.rev).await? {
+    if let Some(reason) = hand_off(state, job, input, commit.rev()).await? {
         return Ok(stopped(state, input, reason, total, total).await);
     }
 
     Ok(NativeOutcome::Completed(serde_json::json!({
         "status": "migrated",
         "records": total,
-        "rev": commit.rev,
+        "rev": commit.rev(),
     })))
 }
 
@@ -695,6 +697,50 @@ mod tests {
                 "{reason}"
             );
             assert_eq!(repo(&state, &input).await.host_mode, mode, "{reason}");
+        }
+    }
+
+    /// A failed run returns the repo to polyfill, unless its job was taken
+    /// over: the run that took it may have finished the move, and a stale
+    /// run failing late must not undo it.
+    #[tokio::test]
+    async fn a_failed_run_returns_the_repo_unless_its_job_was_taken_over() {
+        use super::super::super::held::{Held, Lease, run_under};
+
+        for (case, taken_over, mode) in [
+            ("its own", false, HostMode::Polyfill),
+            ("taken over", true, HostMode::Native),
+        ] {
+            let (state, job, input) = migrating().await;
+            let claimed = jobs_db::hold_job(&state, &job.id, "here")
+                .await
+                .unwrap()
+                .unwrap();
+            // The repo as the run that took the job over left it.
+            if taken_over {
+                set_mode(&state, &input, HostMode::Native).await.unwrap();
+            }
+            let attempt = claimed.attempt + i64::from(taken_over);
+            let run = Held::new(
+                &job.id,
+                Lease {
+                    owner: "here".into(),
+                    attempt,
+                },
+            );
+            let out = run_under(
+                run,
+                failed(
+                    &state,
+                    &job,
+                    &input,
+                    AppError::Internal("the PDS went away".into()),
+                ),
+            )
+            .await;
+
+            assert!(matches!(out, NativeOutcome::Failed(_)), "{case}");
+            assert_eq!(repo(&state, &input).await.host_mode, mode, "{case}");
         }
     }
 }

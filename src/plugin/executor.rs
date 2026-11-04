@@ -16,13 +16,13 @@ use crate::plugin::memory::{
 use crate::plugin::prepared::ArtifactStamp;
 use crate::plugin::runtime::{
     GuestDeadline, MemoryLimiter, UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling,
-    script_memory_ceiling,
+    script_memory_ceiling, slice_guest_deadline,
 };
 use crate::plugin::secrets::load_plugin_secrets;
 use crate::plugin::{
     ChunkRole, ExternalProfile, LoadedPlugin, ModuleScope, PluginInfo, PluginRegistry,
-    ScriptExecuteInput, ScriptExecuteOutput, ScriptKind, ScriptValidateInput, ScriptValidateOutput,
-    TokenSet,
+    ScriptExecuteInput, ScriptExecuteOutput, ScriptExecuteReport, ScriptKind, ScriptValidateInput,
+    ScriptValidateOutput, TokenSet,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -108,6 +108,16 @@ impl From<PluginEnvelopeError> for ExecutionError {
             retryable: e.retryable,
         }
     }
+}
+
+/// A store for `state` on `runtime`'s engine, with the memory limiter and the
+/// epoch callback that slices its guest deadline. Every store that runs a
+/// plugin's code is made here.
+pub(crate) fn new_store(runtime: &WasmRuntime, state: PluginState) -> Store<PluginState> {
+    let mut store = Store::new(runtime.engine(), state);
+    store.limiter(|state| &mut state.limiter);
+    slice_guest_deadline(&mut store, |state| &mut state.deadline);
+    store
 }
 
 /// Single-use wrapper around a WASM instance
@@ -222,7 +232,11 @@ impl PluginInstance {
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
         let input = serde_json::to_value(input)
             .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
-        self.call_plugin_function("execute", &input).await
+        let report: ScriptExecuteReport = self.call_plugin_function("execute", &input).await?;
+        if let Some(used) = report.instructions_used {
+            crate::metrics::run::record_instructions(used);
+        }
+        Ok(report.output)
     }
 
     /// Call `validate` on an interpreter.
@@ -610,7 +624,7 @@ pub struct PluginExecutor {
     db_backend: DatabaseBackend,
     http_client: reqwest::Client,
     lexicons: Arc<LexiconCatalog>,
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<crate::plugin::encryption::Keyring>,
     /// Set only by [`AppState::plugin_executor`](crate::AppState::plugin_executor).
     /// A library reaching a host import that speaks to the wider instance —
     /// today, `host_caller_xrpc_query` run with no session — needs this; the
@@ -621,6 +635,13 @@ pub struct PluginExecutor {
     /// tests under `tests/`) have no full `AppState` to give it and don't
     /// exercise that import.
     app_state: Option<crate::AppState>,
+}
+
+/// Whether `module` imports WASI preview 1.
+fn imports_wasi(module: &wasmtime::Module) -> bool {
+    module
+        .imports()
+        .any(|import| import.module() == capabilities::WASI_MODULE)
 }
 
 /// Guest time a test file may spend outside the triggers it fires. Each
@@ -675,7 +696,7 @@ impl PluginExecutor {
 
     /// Key for decrypting stored plugin secrets. Without it, library calls
     /// only see `PLUGIN_<ID>_*` environment variables.
-    pub fn with_encryption_key(mut self, key: Option<[u8; 32]>) -> Self {
+    pub fn with_encryption_key(mut self, key: Option<crate::plugin::encryption::Keyring>) -> Self {
         self.encryption_key = key;
         self
     }
@@ -836,9 +857,28 @@ impl PluginExecutor {
         modules: ModuleScope,
         options: RunOptions,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
-        let mut inst = self
-            .instantiate_interpreter(plugin, Some(input), caller, modules)
+        let started = std::time::Instant::now();
+        let (mut inst, cache_hit, link) = self
+            .instantiate_interpreter_reporting(plugin, Some(input), caller, modules)
             .await?;
+        crate::metrics::run::record_instantiate(started.elapsed(), link, cache_hit);
+        let output = self.call_instance(&mut inst, input, options).await;
+        // The store and its instance go here, fiber stack and all, which is
+        // the run's cost as much as building them was.
+        let started = std::time::Instant::now();
+        drop(inst);
+        crate::metrics::run::record_teardown(started.elapsed());
+        output
+    }
+
+    /// The run itself, on an instance [`execute_loaded`](Self::execute_loaded)
+    /// built and drops.
+    async fn call_instance(
+        &self,
+        inst: &mut PluginInstance,
+        input: &ScriptExecuteInput,
+        options: RunOptions,
+    ) -> Result<ScriptExecuteOutput, ExecutionError> {
         // The guard list is the host's, whatever the caller sent: see
         // `host_removed_globals`.
         let mut input = ScriptExecuteInput {
@@ -867,7 +907,11 @@ impl PluginExecutor {
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
-        let output = match inst.call_execute(input).await {
+        let started = std::time::Instant::now();
+        let called = inst.call_execute(input).await;
+        crate::metrics::run::record_guest_call(started.elapsed());
+        report_run_resources(inst, options.call_fuel);
+        let output = match called {
             Ok(output) => output,
             // A guest that reported a panic answered the run; the trap is only
             // how an aborting guest stops. A timeout or a refused growth after
@@ -881,7 +925,9 @@ impl PluginExecutor {
             }
             Err(e) => return Err(e),
         };
+        let started = std::time::Instant::now();
         inst.settle_pending_calls(self.script_wall_clock()).await;
+        crate::metrics::run::record_settle(started.elapsed());
         Ok(output)
     }
 
@@ -1134,6 +1180,21 @@ impl PluginExecutor {
         caller: Option<Arc<CallerSession>>,
         modules: ModuleScope,
     ) -> Result<PluginInstance, ExecutionError> {
+        self.instantiate_interpreter_reporting(plugin, input, caller, modules)
+            .await
+            .map(|(inst, _, _)| inst)
+    }
+
+    /// As [`instantiate_interpreter`](Self::instantiate_interpreter), saying
+    /// whether the module came from the runtime's memory and how long its
+    /// linker took to build.
+    async fn instantiate_interpreter_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: Option<&ScriptExecuteInput>,
+        caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
+    ) -> Result<(PluginInstance, bool, std::time::Duration), ExecutionError> {
         let ctx = input
             .map(|input| LibraryCallContext {
                 caller_did: input.context.caller_did.clone(),
@@ -1152,8 +1213,8 @@ impl PluginExecutor {
             .map(str::to_string)
             .collect();
         let stamp = self.registry.artifact_stamp_for(plugin);
-        let mut inst = self
-            .instantiate_loaded(plugin, &scope, HashMap::new(), serde_json::Value::Null)
+        let (mut inst, cache_hit, link) = self
+            .instantiate_loaded_reporting(plugin, &scope, HashMap::new(), serde_json::Value::Null)
             .await?;
         let state = inst.store.data_mut();
         state.call_ctx = ctx;
@@ -1180,8 +1241,9 @@ impl PluginExecutor {
             stamp,
             modules,
             waited_ms: Default::default(),
+            metrics: crate::metrics::run::current(),
         });
-        Ok(inst)
+        Ok((inst, cache_hit, link))
     }
 
     /// The interpreter registered as `plugin_id`, fetched once so everything
@@ -1227,22 +1289,43 @@ impl PluginExecutor {
 
     /// The host functions, plus preview 1 only when the module's import
     /// section names it, so a `wasm32-unknown-unknown` plugin's linker
-    /// defines nothing but `env`.
+    /// defines nothing but `env`. A test that adds to its own linker builds
+    /// one; instances share [`Self::linker_for`]'s.
+    #[cfg(test)]
     fn build_linker(
         &self,
         module: &wasmtime::Module,
     ) -> Result<Linker<PluginState>, ExecutionError> {
+        self.new_linker(imports_wasi(module))
+    }
+
+    fn new_linker(&self, wasi: bool) -> Result<Linker<PluginState>, ExecutionError> {
         let mut linker = Linker::new(self.runtime.engine());
         register_host_functions(&mut linker)
             .map_err(|e| ExecutionError::Instantiation(e.into()))?;
-        if module
-            .imports()
-            .any(|import| import.module() == capabilities::WASI_MODULE)
-        {
+        if wasi {
             wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state| &mut state.wasi)
                 .map_err(|e| ExecutionError::Instantiation(e.into()))?;
         }
         Ok(linker)
+    }
+
+    /// [`Self::build_linker`]'s linker for `module`, built once per kind on
+    /// the runtime and shared by every instance after, whichever executor
+    /// makes it.
+    fn linker_for(
+        &self,
+        module: &wasmtime::Module,
+    ) -> Result<Arc<Linker<PluginState>>, ExecutionError> {
+        let wasi = imports_wasi(module);
+        let linkers = self.runtime.linkers();
+        let cell = if wasi { &linkers.wasi } else { &linkers.env };
+        if let Some(linker) = cell.get() {
+            return Ok(Arc::clone(linker));
+        }
+        let built = Arc::new(self.new_linker(wasi)?);
+        // A racing first use may have set it meanwhile; either is the same.
+        Ok(Arc::clone(cell.get_or_init(|| built)))
     }
 
     /// The store state for one instance of `plugin`.
@@ -1329,17 +1412,35 @@ impl PluginExecutor {
         secrets: HashMap<String, String>,
         config: serde_json::Value,
     ) -> Result<PluginInstance, ExecutionError> {
-        let module = self
+        self.instantiate_loaded_reporting(plugin, scope, secrets, config)
+            .await
+            .map(|(inst, _, _)| inst)
+    }
+
+    /// As [`instantiate_loaded`](Self::instantiate_loaded), saying whether
+    /// the module came from the runtime's memory and how long its linker took
+    /// to build. Answered rather than reported: a library call instantiates
+    /// on the task of the script that made it, and would overwrite the
+    /// script's own figure.
+    async fn instantiate_loaded_reporting(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        scope: &str,
+        secrets: HashMap<String, String>,
+        config: serde_json::Value,
+    ) -> Result<(PluginInstance, bool, std::time::Duration), ExecutionError> {
+        let (module, cache_hit) = self
             .runtime
-            .module_for(plugin)
+            .module_lookup(plugin)
             .await
             .map_err(ExecutionError::Instantiation)?;
 
-        let linker = self.build_linker(&module)?;
+        let linking = std::time::Instant::now();
+        let linker = self.linker_for(&module)?;
+        let link = linking.elapsed();
         let state = self.build_state(plugin, scope, secrets, config).await?;
 
-        let mut store = Store::new(self.runtime.engine(), state);
-        store.limiter(|state| &mut state.limiter);
+        let mut store = new_store(&self.runtime, state);
         // Instantiation itself burns fuel where the data image is copied
         // rather than mapped, and each call refuels before it starts, so a
         // library's first call never begins with a budget instantiation
@@ -1349,8 +1450,10 @@ impl PluginExecutor {
             .map_err(|e| ExecutionError::Instantiation(e.into()))?;
         // A store without a deadline traps on its first instruction, and
         // instantiation already runs compiled code. Library and auth stores
-        // stay bounded by fuel.
-        store.set_epoch_deadline(UNBOUNDED_TICKS);
+        // stay bounded by fuel; their deadline is unbounded, so it only ever
+        // yields.
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
         // Fuel does not bound an interpreter, so its store leaves here
         // already under the operator's wall clock; a runner re-arms per run
         // and the job runner lifts it. A runner that forgets fails closed.
@@ -1398,13 +1501,33 @@ impl PluginExecutor {
         store.data_mut().alloc = Some(alloc.clone());
         store.data_mut().dealloc = Some(dealloc.clone());
 
-        Ok(PluginInstance {
-            store,
-            instance,
-            memory,
-            alloc,
-            dealloc,
-        })
+        Ok((
+            PluginInstance {
+                store,
+                instance,
+                memory,
+                alloc,
+                dealloc,
+            },
+            cache_hit,
+            link,
+        ))
+    }
+}
+
+/// Report what a script run's guest left behind: its linear memory, which
+/// never shrinks and so is the run's high-water mark, and, for a compiled
+/// module, the fuel it spent in the instructions its budget is set in. An
+/// interpreter's fuel says nothing: it is unbounded, and a frame that catches
+/// a `throw` loses what it spent, so an interpreter counts its own.
+fn report_run_resources(inst: &mut PluginInstance, call_fuel: Option<u64>) {
+    crate::metrics::run::record_memory_peak(inst.memory.data_size(&inst.store) as u64);
+    if let Some(call_fuel) = call_fuel
+        && let Ok(remaining) = inst.store.get_fuel()
+    {
+        crate::metrics::run::record_instructions(
+            call_fuel.saturating_sub(remaining) / crate::plugin::runtime::FUEL_PER_INSTRUCTION,
+        );
     }
 }
 
@@ -1898,7 +2021,7 @@ mod deadline {
             .build_state(&plugin, "test", HashMap::new(), serde_json::Value::Null)
             .await
             .unwrap();
-        let mut store = Store::new(executor.runtime.engine(), state);
+        let mut store = new_store(&executor.runtime, state);
         // Fuel is not the boundary under test.
         store.set_fuel(u64::MAX).unwrap();
         store.set_epoch_deadline(UNBOUNDED_TICKS);
@@ -2045,6 +2168,125 @@ mod deadline {
         store.set_epoch_deadline(delta);
         let started = Instant::now();
         let err = f.call_async(&mut store, 50).await.unwrap_err();
+        assert!(is_interrupt(&err), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// Wakes every 10 ms until `stop`, answering the longest it waited
+    /// between two wakes: how long the worker it shares was held from it.
+    async fn longest_tick_gap(stop: Arc<std::sync::atomic::AtomicBool>) -> Duration {
+        let mut longest = Duration::ZERO;
+        let mut last = Instant::now();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let now = Instant::now();
+            longest = longest.max(now - last);
+            last = now;
+        }
+        longest
+    }
+
+    /// The longest a task beside a spinning guest may wait. One slice
+    /// apart is what yielding gives, about 50 ms on an idle machine; a
+    /// guest that held the worker would hold it for the whole run, a
+    /// second or more. Four slices leaves room for a machine running the
+    /// rest of the suite at once and still tells the two apart.
+    const HELD_CEILING: Duration = crate::plugin::runtime::EPOCH_TICK
+        .saturating_mul(4 * crate::plugin::runtime::EPOCH_SLICE as u32);
+
+    /// On a runtime with one worker, a guest spinning under a one-second
+    /// wall clock with no instruction budget to stop it still ends at that
+    /// second as a timeout, and a task beside it on the same worker keeps
+    /// running: the deadline yields the worker every slice rather than
+    /// holding it until it traps.
+    /// `cargo test --lib plugin::executor::deadline::a_spinning_guest_yields -- --nocapture`
+    /// prints the end time and the longest gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_spinning_guest_yields_its_worker_and_still_times_out() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let budget = Duration::from_secs(1);
+        arm(&mut store, budget);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = tokio::spawn(longest_tick_gap(stop.clone()));
+        let guest = tokio::spawn(async move {
+            let started = Instant::now();
+            let err = spin.call_async(&mut store, ()).await.unwrap_err();
+            let elapsed = started.elapsed();
+            let interrupted = is_interrupt(&err);
+            (elapsed, interrupted, classify_error(store.data(), err))
+        });
+        let (elapsed, interrupted, error) = guest.await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let gap = ticker.await.unwrap();
+        println!(
+            "sliced deadline {budget:?}: interrupted after {elapsed:?}, longest tick gap {gap:?}"
+        );
+        assert!(interrupted);
+        assert!(matches!(error, ExecutionError::Timeout), "{error}");
+        assert_interrupted_near(elapsed, budget, Duration::from_millis(200));
+        assert!(gap < HELD_CEILING, "the worker was held for {gap:?}");
+    }
+
+    /// A lifted deadline, as a job runs under, never traps: the guest keeps
+    /// yielding past any wall clock, and the task beside it keeps running.
+    /// The run is stopped from outside, by dropping it at a yield.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_lifted_deadline_yields_forever_and_never_traps() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = tokio::spawn(longest_tick_gap(stop.clone()));
+        let bound = Duration::from_millis(1500);
+        let guest = tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(bound, spin.call_async(&mut store, ())).await;
+            (started.elapsed(), outcome.is_err())
+        });
+        let (elapsed, still_running) = guest.await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let gap = ticker.await.unwrap();
+        println!("lifted deadline: still running after {elapsed:?}, longest tick gap {gap:?}");
+        assert!(still_running, "the guest ended on its own");
+        assert!(elapsed >= bound);
+        assert!(gap < HELD_CEILING, "the worker was held for {gap:?}");
+    }
+
+    /// A job whose worker loses its lease while the guest is in a host
+    /// import is interrupted as soon as it resumes, lifted deadline or not.
+    #[tokio::test]
+    async fn a_lost_lease_interrupts_a_lifted_guest_on_resume() {
+        let executor = executor(vec![]).await;
+        let (mut store, instance) = guest_store(&executor).await;
+        let f = instance
+            .get_typed_func::<i32, ()>(&mut store, "sleep_then_spin")
+            .unwrap();
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store.data_mut().script_run = Some(ScriptRun {
+            lease_lost: Some(lost.clone()),
+            ..Default::default()
+        });
+        let delta = store.data_mut().deadline.arm(UNBOUNDED_TICKS);
+        store.set_epoch_deadline(delta);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), f.call_async(&mut store, 100))
+            .await
+            .expect("the guest kept running after its lease was lost")
+            .unwrap_err();
         assert!(is_interrupt(&err), "{err}");
         assert!(started.elapsed() < Duration::from_millis(500));
     }
@@ -2324,6 +2566,66 @@ mod deadline {
         }
     }
 
+    /// Every store `new_store` builds yields at its epoch deadline, and
+    /// wasmtime traps a yield from a guest entered synchronously. That trap
+    /// would come at the first slice boundary, 50 ms in, so a short test
+    /// could pass while a production path was broken. Production plugin
+    /// code must therefore enter guests only through the `*_async` calls:
+    /// no `.call(`, no `Instance::new(`, and no linker
+    /// `.instantiate(&mut …)` outside a test module. The scan covers
+    /// `src/plugin` and the two places that drive plugin stores,
+    /// `src/project/script_module` and `src/script`. It cuts each file at
+    /// its test *module*, not its first `#[cfg(test)]`: several files mark a
+    /// single helper test-only well before production code that must be
+    /// scanned, such as `PluginExecutor::instantiate`.
+    #[test]
+    fn production_plugin_code_enters_guests_only_asynchronously() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        for dir in ["plugin", "project/script_module", "script"] {
+            sources(&src.join(dir), &mut files);
+        }
+        assert!(files.len() > 5, "{files:?}");
+        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s").unwrap();
+        let sync_entry =
+            regex::Regex::new(r"\.call\(|Instance::new\(|\.instantiate\(\s*&mut").unwrap();
+        for sync in [
+            "func.call(&mut store, ())",
+            "Instance::new(&mut store, &module, &[])",
+            "linker.instantiate(&mut store, &module)",
+        ] {
+            assert!(sync_entry.is_match(sync), "{sync}");
+        }
+        assert!(!sync_entry.is_match("func.call_async(&mut store, ()).await"));
+        let mut found = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            // Only the code before a file's test module runs in production.
+            let production = test_module.split(&text).next().unwrap_or("");
+            for (i, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if sync_entry.is_match(code) {
+                    found.push(format!("{}:{}: {}", file.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "synchronous guest entry:\n{}",
+            found.join("\n")
+        );
+    }
+
     fn bindings_test_state(runtime: &WasmRuntime) -> PluginState {
         crate::db::install_drivers();
         PluginState {
@@ -2453,6 +2755,65 @@ mod interpreter {
 
     fn run_input(source: &str) -> ScriptExecuteInput {
         serde_json::from_value(directive(source)).unwrap()
+    }
+
+    /// Instances share one linker, and each still sees only its own store:
+    /// two runs in flight at once, through the same linker, each get back
+    /// the input written into their own instance. The second run goes
+    /// through a separate executor over the same runtime, as
+    /// `AppState::plugin_executor` makes one per call.
+    #[tokio::test]
+    async fn runs_sharing_a_linker_each_see_only_their_own_store() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, _, current) = superseded().await;
+        let per_call = PluginExecutor::new(
+            Arc::clone(&executor.runtime),
+            Arc::clone(&executor.registry),
+            executor.db.clone(),
+            executor.db_backend,
+            executor.http_client.clone(),
+            Arc::clone(&executor.lexicons),
+        );
+        let module = executor.runtime.module_for(&current).await.unwrap();
+        assert!(
+            Arc::ptr_eq(
+                &executor.linker_for(&module).unwrap(),
+                &per_call.linker_for(&module).unwrap()
+            ),
+            "the linker is built once per runtime, not per executor"
+        );
+        let mut first = run_input("echo the first run");
+        first.input = serde_json::json!({"run": "first"});
+        let mut second = run_input("echo the second run");
+        second.input = serde_json::json!({"run": "second"});
+
+        let run = |executor: PluginExecutor, input| {
+            let current = Arc::clone(&current);
+            async move {
+                match executor
+                    .execute_loaded(
+                        &current,
+                        &input,
+                        None,
+                        ModuleScope::Dashboard,
+                        RunOptions::default(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    ScriptExecuteOutput::Returned { value, .. } => value,
+                    other => panic!("expected the input echoed, got {other:?}"),
+                }
+            }
+        };
+        let (a, b) = tokio::join!(run(executor.clone(), first), run(per_call, second));
+
+        assert_eq!(a["input"], serde_json::json!({"run": "first"}));
+        assert_eq!(a["source"], "echo the first run");
+        assert_eq!(b["input"], serde_json::json!({"run": "second"}));
+        assert_eq!(b["source"], "echo the second run");
     }
 
     /// The same bytes registered twice stamp alike, so only identity tells

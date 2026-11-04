@@ -16,6 +16,8 @@ pub mod dev_happyview;
 pub mod dns;
 pub mod domain;
 pub mod domain_middleware;
+#[cfg(test)]
+mod encryption_rotation_tests;
 pub mod error;
 pub mod event_log;
 pub mod external_auth;
@@ -33,11 +35,14 @@ pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
 pub mod lexicon_publishing;
+pub mod limits;
 pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
 pub mod maintenance;
+pub mod metrics;
 pub mod oauth;
+pub mod outbound;
 pub mod plc;
 pub mod plugin;
 pub mod profile;
@@ -50,6 +55,7 @@ pub mod record_handler;
 pub mod record_refs;
 pub mod record_store;
 pub mod repo;
+pub mod reseal;
 pub mod resolve;
 pub mod run;
 pub mod script;
@@ -140,8 +146,11 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
-    /// The origins listed in `cookie_integration_origins`, read briefly cached.
-    pub integration_origins: Arc<csrf::IntegrationOrigins>,
+    /// What this instance may hold or do (`limits`); unlimited unless set.
+    pub limits: Arc<dyn happyview_provider::LimitsProvider>,
+    /// Per-script run metrics: the last day in memory, longer in
+    /// `happyview_script_metrics`.
+    pub metrics: Arc<metrics::ScriptMetrics>,
     /// Present only in a state the test command built for one test file.
     /// Every behaviour a test run changes — the in-process PDS, forged
     /// callers, mocks, single-attempt record scripts — is keyed on this, and
@@ -189,7 +198,7 @@ impl AppState {
             self.http.clone(),
             Arc::new(self.lexicons.clone()),
         )
-        .with_encryption_key(self.config.token_encryption_key)
+        .with_encryption_key(self.config.keyring())
         .with_app_state(self.clone())
     }
 }

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::config::project::{LexiconOverride, PROJECT_FILE};
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 
 use super::diagnostic::Diagnostic;
 use super::snapshot::ProjectLexicon;
@@ -89,18 +89,8 @@ pub fn load_lexicon(
     }
 
     let overrides = overrides.get(&id);
-    let action = overrides
-        .and_then(|o| o.action)
-        .map(ProcedureAction::from)
-        .unwrap_or(ProcedureAction::Upsert);
-    let parsed = ParsedLexicon::parse(
-        raw,
-        1,
-        overrides.and_then(|o| o.target_collection.clone()),
-        action,
-        overrides.and_then(|o| o.token_cost),
-    )
-    .map_err(|e| Diagnostic::error(&path, format!("failed to parse lexicon: {e}")))?;
+    let parsed = ParsedLexicon::parse(raw, 1, overrides.and_then(|o| o.token_cost))
+        .map_err(|e| Diagnostic::error(&path, format!("failed to parse lexicon: {e}")))?;
     Ok(project_lexicon(
         parsed,
         path,
@@ -193,8 +183,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::config::project::{LexiconOverride, OverrideAction};
-    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::config::project::LexiconOverride;
+    use crate::lexicon::LexiconType;
     use serde_json::json;
 
     fn write(dir: &tempfile::TempDir, rel: &str, contents: &str) -> SrcFile {
@@ -222,7 +212,6 @@ mod tests {
         let overrides = BTreeMap::from([(
             "com.example.getThing".to_string(),
             LexiconOverride {
-                target_collection: Some("com.example.thing".into()),
                 token_cost: Some(5),
                 backfill: Some(true),
                 ..Default::default()
@@ -231,10 +220,6 @@ mod tests {
         let lexicon = load_lexicon(&file, &overrides).unwrap();
         assert_eq!(lexicon.parsed.id, "com.example.getThing");
         assert_eq!(lexicon.parsed.lexicon_type, LexiconType::Query);
-        assert_eq!(
-            lexicon.parsed.target_collection.as_deref(),
-            Some("com.example.thing")
-        );
         assert_eq!(lexicon.parsed.token_cost, Some(5));
         assert!(lexicon.backfill);
         assert_eq!(
@@ -244,7 +229,7 @@ mod tests {
 
         let plain = load_lexicon(&file, &BTreeMap::new()).unwrap();
         assert!(!plain.backfill);
-        assert!(plain.parsed.target_collection.is_none());
+        assert_eq!(plain.parsed.token_cost, None);
     }
 
     #[test]
@@ -359,31 +344,6 @@ mod tests {
         assert!(
             err.message.contains("unsupported lexicon version: 2"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn an_action_override_reaches_the_parsed_lexicon() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = write(
-            &dir,
-            "lexicons/com/example/putThing.json",
-            &json!({"lexicon": 1, "id": "com.example.putThing", "defs": {"main": {"type": "procedure"}}}).to_string(),
-        );
-        let overrides = BTreeMap::from([(
-            "com.example.putThing".to_string(),
-            LexiconOverride {
-                action: Some(OverrideAction::Create),
-                ..Default::default()
-            },
-        )]);
-        assert_eq!(
-            load_lexicon(&file, &overrides).unwrap().parsed.action,
-            ProcedureAction::Create
-        );
-        assert_eq!(
-            load_lexicon(&file, &BTreeMap::new()).unwrap().parsed.action,
-            ProcedureAction::Upsert
         );
     }
 

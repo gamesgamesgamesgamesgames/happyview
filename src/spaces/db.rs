@@ -149,6 +149,40 @@ pub async fn count_space_records_by_collection(
         .map_err(|e| AppError::Internal(format!("failed to count space records: {e}")))
 }
 
+/// Which of `dids` belong to a space, as a member or as the author of a record
+/// in it. Bounded by `dids`, not by the size of the space.
+pub async fn space_accounts_among(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    dids: &[String],
+) -> Result<Vec<String>, AppError> {
+    if dids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; dids.len()].join(", ");
+    let sql = adapt_sql(
+        &format!(
+            "SELECT member_did FROM happyview_space_members WHERE space_id = ? AND member_did IN ({placeholders}) \
+             UNION SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? AND author_did IN ({placeholders})"
+        ),
+        backend,
+    );
+    let mut q = crate::db::query_as::<(String,)>(&sql).bind(space_id);
+    for did in dids {
+        q = q.bind(did);
+    }
+    q = q.bind(space_id);
+    for did in dids {
+        q = q.bind(did);
+    }
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to match space accounts: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 pub struct SpaceView {
     pub uri: String,
     pub is_owner: bool,
@@ -641,22 +675,41 @@ pub async fn get_space_record(
     row.map(parse_record_row).transpose()
 }
 
+/// Which repo a by-parts lookup reads.
+pub enum RecordRepo<'a> {
+    /// Exactly this author's record.
+    Author(&'a str),
+    /// Any author's, preferring this DID's own, then the lowest author DID, so
+    /// one collection and rkey written by several authors always answers the
+    /// same record.
+    Prefer(&'a str),
+}
+
 pub async fn get_space_record_by_parts(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
+    repo: RecordRepo<'_>,
     collection: &str,
     rkey: &str,
 ) -> Result<Option<SpaceRecord>, AppError> {
-    let sql = adapt_sql(
-        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND collection = ? AND rkey = ? LIMIT 1",
-        backend,
-    );
+    const COLUMNS: &str = "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND collection = ? AND rkey = ?";
+    let (sql, did) = match repo {
+        RecordRepo::Author(did) => (format!("{COLUMNS} AND author_did = ? LIMIT 1"), did),
+        RecordRepo::Prefer(did) => (
+            format!(
+                "{COLUMNS} ORDER BY CASE WHEN author_did = ? THEN 0 ELSE 1 END, author_did LIMIT 1"
+            ),
+            did,
+        ),
+    };
+    let sql = adapt_sql(&sql, backend);
 
     let row: Option<RecordRow> = crate::db::query_as(&sql)
         .bind(space_id)
         .bind(collection)
         .bind(rkey)
+        .bind(did)
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space record: {e}")))?;
@@ -727,6 +780,100 @@ pub async fn list_space_records(
     };
 
     Ok((records, next_cursor))
+}
+
+/// One author's records across every space, newest first.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_author_space_records(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    author_did: &str,
+    space_id: Option<&str>,
+    collection: Option<&str>,
+    limit: i64,
+    cursor: Option<&str>,
+) -> Result<(Vec<SpaceRecord>, Option<String>), AppError> {
+    let decoded_cursor = cursor.and_then(decode_cursor);
+    let mut conditions = vec!["author_did = ?".to_string()];
+    if space_id.is_some() {
+        conditions.push("space_id = ?".to_string());
+    }
+    if collection.is_some() {
+        conditions.push("collection = ?".to_string());
+    }
+    if decoded_cursor.is_some() {
+        conditions.push("(indexed_at < ? OR (indexed_at = ? AND uri < ?))".to_string());
+    }
+    let sql = adapt_sql(
+        &format!(
+            "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE {} ORDER BY indexed_at DESC, uri DESC LIMIT ?",
+            conditions.join(" AND ")
+        ),
+        backend,
+    );
+    let mut query = crate::db::query_as::<RecordRow>(&sql).bind(author_did);
+    if let Some(s) = space_id {
+        query = query.bind(s);
+    }
+    if let Some(c) = collection {
+        query = query.bind(c);
+    }
+    if let Some((ref ts, ref uri)) = decoded_cursor {
+        query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
+    }
+    let rows = query
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list author space records: {e}")))?;
+    let records: Vec<SpaceRecord> = rows
+        .into_iter()
+        .map(parse_record_row)
+        .collect::<Result<_, _>>()?;
+    let next_cursor = (records.len() as i64 == limit)
+        .then(|| records.last().map(|r| encode_cursor(&r.indexed_at, &r.uri)))
+        .flatten();
+    Ok((records, next_cursor))
+}
+
+/// Spaces an account belongs to or has written in, with how many records it
+/// has in each.
+pub async fn list_author_spaces(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+) -> Result<Vec<(Space, i64)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id IN (SELECT space_id FROM happyview_space_members WHERE member_did = ? UNION SELECT space_id FROM happyview_space_records WHERE author_did = ?) ORDER BY created_at DESC, id DESC",
+        backend,
+    );
+    let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
+        .bind(did)
+        .bind(did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list account spaces: {e}")))?;
+
+    let count_sql = adapt_sql(
+        "SELECT space_id, COUNT(*) FROM happyview_space_records WHERE author_did = ? GROUP BY space_id",
+        backend,
+    );
+    let counts: std::collections::HashMap<String, i64> =
+        crate::db::query_as::<(String, i64)>(&count_sql)
+            .bind(did)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count account records: {e}")))?
+            .into_iter()
+            .collect();
+
+    rows.into_iter()
+        .map(|r| {
+            let space = parse_space_row(r)?;
+            let count = counts.get(&space.id).copied().unwrap_or(0);
+            Ok((space, count))
+        })
+        .collect()
 }
 
 pub async fn list_all_space_records(
@@ -927,7 +1074,10 @@ pub async fn get_or_create_repo_state(
         .ok_or_else(|| AppError::Internal("repo state missing after insert".into()))
 }
 
-async fn read_repo_state(
+/// An author's repo state, or `None` when they have never written here.
+/// Unlike [`get_or_create_repo_state`] it writes nothing, so it is safe
+/// outside a space write transaction.
+pub async fn read_repo_state(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &str,
@@ -1173,6 +1323,13 @@ fn parse_record_row(r: RecordRow) -> Result<SpaceRecord, AppError> {
     })
 }
 
+/// A LIKE pattern matching a record that references `blob_cid` as a `$link`.
+/// LIKE metacharacters in the caller-supplied CID are escaped, so `%` and `_`
+/// match literally and can't be used to match another author's record.
+fn blob_link_pattern(blob_cid: &str) -> String {
+    format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid))
+}
+
 /// Find the author DID of any record in the space that contains a blob ref
 /// with the given CID. The CID appears in serialised record JSON as the
 /// `$link` value inside an ATProto blob ref object.
@@ -1182,20 +1339,37 @@ pub async fn find_blob_author_did(
     space_id: &str,
     blob_cid: &str,
 ) -> Result<Option<String>, AppError> {
-    // Escape LIKE metacharacters in the caller-supplied CID so `%`/`_` are matched
-    // literally and can't be used to match another author's record (L8).
-    let pattern = format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid));
     let sql = adapt_sql(
         "SELECT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\' LIMIT 1",
         backend,
     );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
+    let row = crate::db::query_as::<(String,)>(&sql)
         .bind(space_id)
-        .bind(&pattern)
+        .bind(blob_link_pattern(blob_cid))
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to find blob author: {e}")))?;
     Ok(row.map(|(did,)| did))
+}
+
+/// Every author whose record in the space references `blob_cid`.
+pub async fn find_blob_authors(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    blob_cid: &str,
+) -> Result<Vec<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\'",
+        backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(space_id)
+        .bind(blob_link_pattern(blob_cid))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to find blob authors: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,37 +1468,86 @@ pub async fn get_invite_by_token_hash(
     row.map(parse_invite_row).transpose()
 }
 
-pub async fn increment_invite_uses(
+/// What [`claim_invite`] came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteClaim {
+    Joined,
+    /// Revoked, or every use already taken.
+    Unavailable,
+    AlreadyMember,
+}
+
+/// Takes one use of an invite and adds its member, or does neither.
+///
+/// The use is taken by an `UPDATE` whose `WHERE` re-checks the limit, so two
+/// accepts racing for an invite's last use cannot both get it: on Postgres the
+/// second waits on the row lock and re-reads `uses`, and on SQLite
+/// `BEGIN IMMEDIATE` serializes them. A member who is already in the space
+/// gives the use back by rolling the transaction back.
+pub async fn claim_invite(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     invite_id: &str,
-) -> Result<(), AppError> {
-    let sql = adapt_sql(
-        "UPDATE happyview_space_invites SET uses = uses + 1 WHERE id = ?",
+    member: &SpaceMember,
+) -> Result<InviteClaim, AppError> {
+    let take_use = adapt_sql(
+        "UPDATE happyview_space_invites SET uses = uses + 1 \
+         WHERE id = ? AND revoked = 0 AND (max_uses IS NULL OR uses < max_uses)",
         backend,
     );
-
-    crate::db::query(&sql)
-        .bind(invite_id)
-        .execute(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to increment invite uses: {e}")))?;
-
-    Ok(())
+    let insert_member = adapt_sql(
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, member_did) DO NOTHING",
+        backend,
+    );
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        let taken = crate::db::query(&take_use)
+            .bind(invite_id)
+            .execute(&mut *tx)
+            .await?;
+        if taken.rows_affected() == 0 {
+            return Ok(InviteClaim::Unavailable);
+        }
+        let inserted = crate::db::query(&insert_member)
+            .bind(&member.id)
+            .bind(&member.space_id)
+            .bind(&member.did)
+            .bind(member.access.read as i32)
+            .bind(member.access.write as i32)
+            .bind(member.access.read_self as i32)
+            .bind(member.is_delegation as i32)
+            .bind(&member.granted_by)
+            .bind(&member.created_at)
+            .execute(&mut *tx)
+            .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(InviteClaim::AlreadyMember);
+        }
+        tx.commit().await?;
+        Ok(InviteClaim::Joined)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to accept invite: {e}")))
 }
 
+/// Revoke one of `space_id`'s invites. An id belonging to another space
+/// matches nothing, so it reads as not found.
 pub async fn revoke_invite(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
+    space_id: &str,
     invite_id: &str,
 ) -> Result<bool, AppError> {
     let sql = adapt_sql(
-        "UPDATE happyview_space_invites SET revoked = 1 WHERE id = ?",
+        "UPDATE happyview_space_invites SET revoked = 1 WHERE id = ? AND space_id = ?",
         backend,
     );
 
     let result = crate::db::query(&sql)
         .bind(invite_id)
+        .bind(space_id)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke invite: {e}")))?;

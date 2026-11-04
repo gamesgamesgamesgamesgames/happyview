@@ -449,12 +449,28 @@ async fn callback(
             .unwrap_or(None);
 
             if is_attached_account.is_none() {
-                let login_url = state
-                    .config
-                    .base_path
-                    .as_ref()
-                    .map(|bp| format!("{}/login?error=not_authorized", bp))
-                    .unwrap_or_else(|| "/login?error=not_authorized".into());
+                // Name the refused account so the person can tell which one
+                // they signed in with. Its handle is shown only when it
+                // verifies both ways; a slow or failed lookup leaves just the
+                // DID rather than hold the redirect.
+                let handle = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    crate::identity::resolve_verified(
+                        &state.http,
+                        &state.config.plc_url,
+                        did.as_ref(),
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|identity| identity.handle);
+                let login_url = not_authorized_url(
+                    state.config.base_path.as_deref(),
+                    did.as_ref(),
+                    handle.as_deref(),
+                    crate::auth::client_registry::is_loopback_url(&state.config.public_url),
+                );
                 return Ok((jar, Redirect::to(&login_url)).into_response());
             }
         }
@@ -665,9 +681,54 @@ async fn me(
     }))
 }
 
+/// Where a sign-in by an account that isn't a dashboard user is sent back
+/// to: the login page, naming that account. It never says who *is* allowed.
+/// `local` adds a hint for an instance reachable only from this machine,
+/// such as one under `happyview dev`, where the usual cause is a project
+/// whose `[instance] superadmin` is another account.
+fn not_authorized_url(
+    base_path: Option<&str>,
+    did: &str,
+    handle: Option<&str>,
+    local: bool,
+) -> String {
+    let mut url = format!(
+        "{}/login?error=not_authorized&did={}",
+        base_path.unwrap_or(""),
+        urlencoding::encode(did)
+    );
+    if let Some(handle) = handle {
+        url.push_str(&format!("&handle={}", urlencoding::encode(handle)));
+    }
+    if local {
+        url.push_str("&hint=local");
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_authorized_url_names_the_account() {
+        assert_eq!(
+            not_authorized_url(None, "did:plc:abc", Some("alice.test"), false),
+            "/login?error=not_authorized&did=did%3Aplc%3Aabc&handle=alice.test"
+        );
+        assert_eq!(
+            not_authorized_url(Some("/hv"), "did:plc:abc", None, false),
+            "/hv/login?error=not_authorized&did=did%3Aplc%3Aabc"
+        );
+    }
+
+    #[test]
+    fn not_authorized_url_hints_only_on_a_local_instance() {
+        assert_eq!(
+            not_authorized_url(None, "did:plc:abc", None, true),
+            "/login?error=not_authorized&did=did%3Aplc%3Aabc&hint=local"
+        );
+    }
 
     #[test]
     fn parse_scope_string_maps_known_scopes() {

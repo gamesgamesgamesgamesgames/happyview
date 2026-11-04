@@ -35,11 +35,23 @@ async fn keys_round_trip_encrypted() {
     let enc = [3u8; 32];
 
     let key = generate_client_key(INSTANCE_OWNER).unwrap();
-    insert_key(&pool, backend, Some(&enc), &key).await.unwrap();
+    insert_key(
+        &pool,
+        backend,
+        Some(&happyview::plugin::encryption::Keyring::from(enc)),
+        &key,
+    )
+    .await
+    .unwrap();
 
-    let loaded = load_keys(&pool, backend, Some(&enc), INSTANCE_OWNER)
-        .await
-        .unwrap();
+    let loaded = load_keys(
+        &pool,
+        backend,
+        Some(&happyview::plugin::encryption::Keyring::from(enc)),
+        INSTANCE_OWNER,
+    )
+    .await
+    .unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].kid, key.kid);
     assert_eq!(loaded[0].private_jwk, key.private_jwk);
@@ -143,7 +155,14 @@ async fn a_stored_dpop_session_remembers_its_signing_kid() {
         app.create_api_client("confidential", None).await;
 
     let key = generate_client_key(&api_client_id).unwrap();
-    insert_key(pool, backend, Some(&enc), &key).await.unwrap();
+    insert_key(
+        pool,
+        backend,
+        Some(&happyview::plugin::encryption::Keyring::from(enc)),
+        &key,
+    )
+    .await
+    .unwrap();
 
     let dpop_keypair = happyview::oauth::keys::generate_dpop_keypair().unwrap();
     happyview::oauth::keys::store_dpop_key(
@@ -181,7 +200,7 @@ async fn a_stored_dpop_session_remembers_its_signing_kid() {
     let loaded = happyview::oauth::sessions::get_dpop_session(
         pool,
         backend,
-        &enc,
+        &happyview::plugin::encryption::Keyring::from(enc),
         &api_client_id,
         "did:plc:example",
         "dpop-key-1",
@@ -260,7 +279,7 @@ async fn refreshing_a_session_does_not_change_its_signing_kid() {
     let loaded = happyview::oauth::sessions::get_dpop_session(
         pool,
         backend,
-        &enc,
+        &happyview::plugin::encryption::Keyring::from(enc),
         &api_client_id,
         "did:plc:example",
         "dpop-key-1",
@@ -292,7 +311,14 @@ async fn re_registering_a_dpop_session_after_rotation_moves_its_signing_kid() {
         app.create_api_client("confidential", None).await;
 
     let key_a = generate_client_key(&api_client_id).unwrap();
-    insert_key(pool, backend, Some(&enc), &key_a).await.unwrap();
+    insert_key(
+        pool,
+        backend,
+        Some(&happyview::plugin::encryption::Keyring::from(enc)),
+        &key_a,
+    )
+    .await
+    .unwrap();
 
     let dpop_keypair = happyview::oauth::keys::generate_dpop_keypair().unwrap();
     happyview::oauth::keys::store_dpop_key(
@@ -328,10 +354,14 @@ async fn re_registering_a_dpop_session_after_rotation_moves_its_signing_kid() {
     .await
     .unwrap();
 
-    let key_b =
-        happyview::oauth::client_keys::rotate_key(pool, backend, Some(&enc), &api_client_id)
-            .await
-            .unwrap();
+    let key_b = happyview::oauth::client_keys::rotate_key(
+        pool,
+        backend,
+        Some(&happyview::plugin::encryption::Keyring::from(enc)),
+        &api_client_id,
+    )
+    .await
+    .unwrap();
     assert_ne!(key_a.kid, key_b.kid, "rotation must mint a distinct key");
 
     happyview::oauth::sessions::store_dpop_session(
@@ -356,7 +386,7 @@ async fn re_registering_a_dpop_session_after_rotation_moves_its_signing_kid() {
     let stale = happyview::oauth::sessions::get_dpop_session(
         pool,
         backend,
-        &enc,
+        &happyview::plugin::encryption::Keyring::from(enc),
         &api_client_id,
         "did:plc:example",
         "dpop-key-1",
@@ -383,7 +413,7 @@ async fn re_registering_a_dpop_session_after_rotation_moves_its_signing_kid() {
     let fixed = happyview::oauth::sessions::get_dpop_session(
         pool,
         backend,
-        &enc,
+        &happyview::plugin::encryption::Keyring::from(enc),
         &api_client_id,
         "did:plc:example",
         "dpop-key-1",
@@ -627,6 +657,7 @@ async fn rotation_survives_for_a_session_pinned_to_the_old_key() {
         pool.clone(),
         backend,
         &key_a,
+        app.state.config.keyring(),
     )
     .unwrap();
     app.state.oauth.register_for_kid(
@@ -650,7 +681,7 @@ async fn rotation_survives_for_a_session_pinned_to_the_old_key() {
     let keys = happyview::oauth::client_keys::load_keys(
         pool,
         backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         happyview::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -706,8 +737,12 @@ async fn a_second_login_after_rotation_moves_the_pin_to_the_new_key() {
         .unwrap();
     assert_ne!(key_a.kid, key_b.kid, "rotation must mint a distinct key");
 
-    let store_for_b = happyview::auth::oauth_store::DbSessionStore::new(pool.clone(), backend)
-        .with_signing_kid(Some(key_b.kid.clone()));
+    let store_for_b = happyview::auth::oauth_store::DbSessionStore::new(
+        pool.clone(),
+        backend,
+        Some(common::db::TEST_ENCRYPTION_KEY.into()),
+    )
+    .with_signing_kid(Some(key_b.kid.clone()));
     let session_did = atrium_api::types::string::Did::new(did.to_string()).unwrap();
     store_for_b
         .set(session_did.clone(), sample_session())

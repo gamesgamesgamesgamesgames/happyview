@@ -551,22 +551,44 @@ pub async fn finish(
 #[cfg(test)]
 mod lease_tests {
     use super::*;
-    use crate::test_support::{test_pools, test_state_with_pool_on};
+    use crate::test_support::{
+        PreUpgradePool, pre_upgrade_pools, test_pools, test_state_with_pool_on,
+    };
 
-    /// Two instances on one database: two states over the same pool, which
-    /// claim as two owners. Only the database coordinates them, as in
-    /// production.
-    async fn instances() -> Vec<(AppState, AppState)> {
-        test_pools()
-            .await
-            .into_iter()
-            .map(|(pool, backend)| {
-                (
-                    test_state_with_pool_on(pool.clone(), backend),
-                    test_state_with_pool_on(pool, backend),
-                )
-            })
-            .collect()
+    /// The databases one test runs against, its own: an in-memory SQLite
+    /// database, and a scratch database on the `TEST_DATABASE_URL` server when
+    /// that is Postgres. Never the shared test database: `expire` makes a job
+    /// any recovery's to take, and `recover_expired_jobs` sweeps every
+    /// expired job in the database it runs on, so another test's recovery
+    /// running between this test's `expire` and its next step would requeue
+    /// this test's job.
+    struct Databases(Vec<PreUpgradePool>);
+
+    impl Databases {
+        async fn open() -> Self {
+            Self(pre_upgrade_pools().await)
+        }
+
+        /// Two instances on each database: two states over the same pool,
+        /// which claim as two owners. Only the database coordinates them, as
+        /// in production.
+        fn instances(&self) -> Vec<(AppState, AppState)> {
+            self.0
+                .iter()
+                .map(|db| {
+                    (
+                        test_state_with_pool_on(db.pool.clone(), db.backend),
+                        test_state_with_pool_on(db.pool.clone(), db.backend),
+                    )
+                })
+                .collect()
+        }
+
+        async fn finish(self) {
+            for db in self.0 {
+                db.finish().await;
+            }
+        }
     }
 
     async fn new_job(state: &AppState) -> String {
@@ -622,7 +644,8 @@ mod lease_tests {
     /// job, another instance's live ones included, and they ran twice.
     #[tokio::test]
     async fn another_instances_recovery_leaves_a_live_lease_alone() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             hold_job(&a, &id, "a").await.unwrap().expect("a holds it");
 
@@ -632,11 +655,13 @@ mod lease_tests {
             assert_eq!(held.status, "running", "{:?}", a.db_backend);
             assert_eq!(owner_of(&a, &id).await.as_deref(), Some("a"));
         }
+        dbs.finish().await;
     }
 
     #[tokio::test]
     async fn only_one_instance_holds_a_job() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             assert!(hold_job(&a, &id, "a").await.unwrap().is_some());
             assert!(
@@ -645,11 +670,13 @@ mod lease_tests {
                 a.db_backend
             );
         }
+        dbs.finish().await;
     }
 
     #[tokio::test]
     async fn an_expired_lease_is_queued_again_and_counts_as_an_attempt() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
             assert_eq!(first.attempt, 1);
@@ -663,13 +690,15 @@ mod lease_tests {
             let second = hold_job(&b, &id, "b").await.unwrap().unwrap();
             assert_eq!(second.attempt, 2);
         }
+        dbs.finish().await;
     }
 
     /// The worker that lost its lease may still be running the job. Its
     /// outcome must not land over the run that took the job over.
     #[tokio::test]
     async fn a_worker_that_lost_its_lease_cannot_finish_the_job() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
             expire(&a, &id).await;
@@ -695,13 +724,15 @@ mod lease_tests {
             assert_eq!(done.status, "completed", "{:?}", a.db_backend);
             assert_eq!(done.result, Some(fresh));
         }
+        dbs.finish().await;
     }
 
     /// A job that takes its worker down with it fails after a few tries
     /// rather than doing so forever.
     #[tokio::test]
     async fn a_job_that_keeps_losing_its_worker_fails() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             for attempt in 1..=MAX_LOST_LEASES {
                 let held = hold_job(&a, &id, "a")
@@ -724,11 +755,13 @@ mod lease_tests {
                 failed.error
             );
         }
+        dbs.finish().await;
     }
 
     #[tokio::test]
     async fn a_held_lease_renews() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
             expire(&a, &id).await;
@@ -736,13 +769,15 @@ mod lease_tests {
             recover_expired_jobs(&a).await.unwrap();
             assert_eq!(job(&a, &id).await.status, "running", "renewed in time");
         }
+        dbs.finish().await;
     }
 
     /// A row claimed before leases existed has none, and its worker went with
     /// the upgrade that added them.
     #[tokio::test]
     async fn a_running_job_from_before_leases_is_queued_again() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             crate::db::query(&adapt_sql(
                 "UPDATE happyview_jobs SET status = 'running' WHERE id = ?",
@@ -755,11 +790,13 @@ mod lease_tests {
             recover_expired_jobs(&a).await.unwrap();
             assert_eq!(job(&a, &id).await.status, "pending", "{:?}", a.db_backend);
         }
+        dbs.finish().await;
     }
 
     #[tokio::test]
     async fn a_stop_request_whose_worker_stopped_is_settled() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             for (asked, settled) in [("cancelling", "cancelled"), ("pausing", "paused")] {
                 let id = new_job(&a).await;
                 hold_job(&a, &id, "a").await.unwrap().unwrap();
@@ -769,6 +806,7 @@ mod lease_tests {
                 assert_eq!(job(&a, &id).await.status, settled, "{:?}", a.db_backend);
             }
         }
+        dbs.finish().await;
     }
 
     async fn progress_of(state: &AppState, id: &str) -> Value {
@@ -790,7 +828,8 @@ mod lease_tests {
     /// A stale run's progress lands nowhere, and the loss stops it.
     #[tokio::test]
     async fn a_run_that_lost_its_lease_writes_no_progress_and_is_told_to_stop() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let held = Held::new(&id, lease("a", &first));
@@ -819,12 +858,14 @@ mod lease_tests {
             assert!(held.is_lost());
             assert_eq!(stop, Some("lost"));
         }
+        dbs.finish().await;
     }
 
     /// `should_stop` finds the loss itself, before any write has.
     #[tokio::test]
     async fn should_stop_answers_lost_once_the_job_is_taken_over() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let held = Held::new(&id, lease("a", &first));
@@ -835,6 +876,7 @@ mod lease_tests {
             assert_eq!(after, Some("lost"), "{:?}", a.db_backend);
             assert!(held.is_lost());
         }
+        dbs.finish().await;
     }
 
     /// Two runs of one job in one process: the lease expired here while its
@@ -844,7 +886,8 @@ mod lease_tests {
     /// is told to stop, before and after the newer run ends.
     #[tokio::test]
     async fn a_stale_run_is_fenced_when_its_job_is_reclaimed_in_the_same_process() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "x").await.unwrap().unwrap();
             let stale = Held::new(&id, lease("x", &first));
@@ -898,12 +941,14 @@ mod lease_tests {
                 serde_json::json!({ "run": "fresh" })
             );
         }
+        dbs.finish().await;
     }
 
     /// Each half of the progress fence holds on its own.
     #[tokio::test]
     async fn a_progress_write_needs_both_the_owner_and_the_attempt() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let before = progress_of(&a, &id).await;
@@ -939,13 +984,15 @@ mod lease_tests {
                 assert!(run.is_lost(), "{case}");
             }
         }
+        dbs.finish().await;
     }
 
     /// Progress belongs to a job's run: written from anywhere else, it lands
     /// nowhere.
     #[tokio::test]
     async fn progress_written_outside_the_jobs_run_lands_nowhere() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let before = progress_of(&a, &id).await;
@@ -962,13 +1009,15 @@ mod lease_tests {
             .await;
             assert_eq!(progress_of(&a, &id).await, before, "{:?}", a.db_backend);
         }
+        dbs.finish().await;
     }
 
     /// The renewal loop is what notices a lease lost while the run makes no
     /// writes at all.
     #[tokio::test]
     async fn renewal_marks_a_lease_lost_once_the_job_is_taken_over() {
-        for (a, b) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, b) in dbs.instances() {
             let id = new_job(&a).await;
             let first = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let held = Held::new(&id, lease("a", &first));
@@ -1001,13 +1050,15 @@ mod lease_tests {
             }
             renewal.abort();
         }
+        dbs.finish().await;
     }
 
     /// Each half of the fence holds on its own: another owner at the same
     /// attempt, and the same owner at another attempt, are both refused.
     #[tokio::test]
     async fn the_fence_needs_both_owner_and_attempt() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let done = serde_json::json!({ "ok": true });
@@ -1038,13 +1089,15 @@ mod lease_tests {
                     .unwrap()
             );
         }
+        dbs.finish().await;
     }
 
     /// Pausing and resuming claims the job again without losing anything,
     /// so it never counts toward the limit on lost workers.
     #[tokio::test]
     async fn pausing_and_resuming_does_not_count_as_a_lost_worker() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             for _ in 0..MAX_LOST_LEASES + 1 {
                 let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
@@ -1061,13 +1114,15 @@ mod lease_tests {
             recover_expired_jobs(&a).await.unwrap();
             assert_eq!(job(&a, &id).await.status, "pending", "{:?}", a.db_backend);
         }
+        dbs.finish().await;
     }
 
     /// An operator's pause read against a running job doesn't land on one
     /// that finished meanwhile.
     #[tokio::test]
     async fn a_status_change_lands_only_on_the_status_it_was_read_against() {
-        for (a, _) in instances().await {
+        let dbs = Databases::open().await;
+        for (a, _) in dbs.instances() {
             let id = new_job(&a).await;
             let held = hold_job(&a, &id, "a").await.unwrap().unwrap();
             let done = serde_json::json!({});
@@ -1079,6 +1134,7 @@ mod lease_tests {
             assert!(!change_status(&a, &id, "running", "pausing").await.unwrap());
             assert_eq!(job(&a, &id).await.status, "completed", "{:?}", a.db_backend);
         }
+        dbs.finish().await;
     }
 
     /// Two workers claiming at once: one gets the job. On the SQLite pool

@@ -28,7 +28,6 @@ pub async fn apply_at_boot(
             backend,
             lexicons,
             &nsid,
-            None,
             false,
             None,
         )
@@ -84,7 +83,7 @@ pub async fn apply_project_declarations(
 ) {
     declare_with(project, db, backend, lexicons, |nsid| async move {
         crate::admin::network_lexicons::track_network_lexicon(
-            http, plc_url, db, backend, lexicons, &nsid, None, false, None,
+            http, plc_url, db, backend, lexicons, &nsid, false, None,
         )
         .await
     })

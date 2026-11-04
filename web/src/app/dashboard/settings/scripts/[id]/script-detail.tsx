@@ -36,6 +36,7 @@ import {
   stateFromScript,
 } from "../script-form";
 import { MigrateScriptDialog } from "../migrate-dialog";
+import { ScriptMetricsSummary } from "../performance/script-metrics-summary";
 import { ScriptModulePanel } from "./script-module-panel";
 
 export default function ScriptDetail() {
@@ -164,6 +165,9 @@ export default function ScriptDetail() {
   }
 
   const canManage = hasPermission("scripts:manage");
+  const metrics = hasPermission("metrics:read") ? (
+    <ScriptMetricsSummary trigger={id} />
+  ) : null;
   // A project file owns this script: it changes by editing the file, so the
   // page offers nothing that would write.
   const projectPath = script?.layer === "project" ? script.path : null;
@@ -187,6 +191,7 @@ export default function ScriptDetail() {
               </Badge>
             </div>
           )}
+          {metrics}
           <ScriptModulePanel module={script.module} />
         </div>
       </>
@@ -268,6 +273,8 @@ export default function ScriptDetail() {
               )}
             </div>
           )}
+
+          {metrics}
 
           {projectPath && script?.shadows_stored && (
             <p className="text-muted-foreground text-xs">

@@ -156,7 +156,7 @@ fn watch_project(
     let (tx, changes) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (recreated_tx, mut recreated) = tokio::sync::mpsc::unbounded_channel::<Change>();
     let watched_root = root.clone();
-    let watcher = start_watcher(&root, mode, move |change, path| {
+    let watcher = start_watcher(&root, None, mode, move |change, path| {
         if matches!(change, Change::SrcDir | Change::BuildDir) {
             let _ = recreated_tx.send(change);
         }

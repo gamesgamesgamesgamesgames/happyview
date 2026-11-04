@@ -33,11 +33,11 @@ pub use types::*;
 pub use happyview_plugin_sdk::wire::{
     ChunkRole, DEFAULT_CHUNK_NAME, ExecuteContext as ScriptExecuteContext,
     ExecuteInput as ScriptExecuteInput, ExecuteLimits as ScriptExecuteLimits,
-    ExecuteOutput as ScriptExecuteOutput, ImportRef, JobProgressRequest, JobShouldStopRequest,
-    JobWaitRequest, LibraryRef as ScriptLibraryRef, ModuleResolve, PreparedArtifact,
-    ResolvedModule, ScriptErrorKind, ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace,
-    ScriptValueKind, ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
-    ValidateOutput as ScriptValidateOutput,
+    ExecuteOutput as ScriptExecuteOutput, ExecuteReport as ScriptExecuteReport, ImportRef,
+    JobProgressRequest, JobShouldStopRequest, JobWaitRequest, LibraryRef as ScriptLibraryRef,
+    ModuleResolve, PreparedArtifact, ResolvedModule, ScriptErrorKind, ScriptJob, ScriptKind,
+    ScriptLogRequest, ScriptSpace, ScriptValueKind, ValidateError as ScriptValidateError,
+    ValidateInput as ScriptValidateInput, ValidateOutput as ScriptValidateOutput,
 };
 
 /// The test runner's wire types: what a `*.test.<ext>` file's five `script:test`

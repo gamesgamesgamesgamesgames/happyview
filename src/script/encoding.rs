@@ -57,7 +57,6 @@ pub fn of_input(lexicon: &ParsedLexicon) -> Encoding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::ProcedureAction;
     use serde_json::json;
 
     /// A lexicon declaring whichever encodings the caller names.
@@ -77,8 +76,6 @@ mod tests {
                 } }
             }),
             1,
-            None,
-            ProcedureAction::Create,
             None,
         )
         .expect("the fixture lexicon should parse")

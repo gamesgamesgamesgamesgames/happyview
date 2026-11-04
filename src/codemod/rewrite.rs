@@ -31,6 +31,7 @@ const MARK_AUTHOR_DID: &str =
     "v3 space records spell it author_did -- rename this read to author_did";
 const MARK_HANDLE_PARAMS: &str = "handle takes exactly (input, ctx) in v3 -- cut this parameter list down to two, then re-run the codemod";
 const MARK_READ_AT_LOAD: &str = "this runs while the script loads, before handle receives input and ctx -- move the read into handle, or into a function handle calls";
+const MARK_COLLECTION: &str = "v3 supplies no collection to a query or procedure -- write the NSID of the collection this script reads or writes";
 const MARK_NO_HANDLE: &str = "input and ctx are handle's parameters in v3 -- declare function handle(input, ctx) and read them there";
 
 fn never_nil_message(name: &str) -> String {
@@ -75,6 +76,17 @@ fn blocked_message(name: &str) -> String {
 }
 
 pub fn rewrite(source: &str, kind: ScriptKind) -> Result<Rewrite, CodemodError> {
+    rewrite_for(source, kind, None)
+}
+
+/// [`rewrite`] for a query or procedure whose lexicon named the collection it
+/// served. v3 supplies none, so `collection` and `ctx.collection` become that
+/// NSID written out; without one they are marked.
+pub fn rewrite_for(
+    source: &str,
+    kind: ScriptKind,
+    collection: Option<&str>,
+) -> Result<Rewrite, CodemodError> {
     let ast = full_moon::parse(source).map_err(|errors| {
         CodemodError::Parse(
             errors
@@ -85,7 +97,7 @@ pub fn rewrite(source: &str, kind: ScriptKind) -> Result<Rewrite, CodemodError> 
         )
     })?;
 
-    let mut planner = Planner::new(source, &ast, kind);
+    let mut planner = Planner::new(source, &ast, kind, collection);
     planner.visit_ast(&ast);
     let declare_hoist = planner.plan_handle(&ast);
     // The requires block goes in before the markers so that where both land on
@@ -115,18 +127,36 @@ pub fn rewrite(source: &str, kind: ScriptKind) -> Result<Rewrite, CodemodError> 
     })
 }
 
+/// The kinds whose lexicon named a collection in v2.
+fn serves_a_collection(kind: ScriptKind) -> bool {
+    matches!(kind, ScriptKind::Procedure | ScriptKind::Query)
+}
+
+/// `text` as a Lua string literal.
+fn lua_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The globals whose meaning comes from the trigger rather than the runtime.
 fn kind_global(kind: ScriptKind, name: &str) -> Option<&'static str> {
     let table: &[(&str, &str)] = match kind {
         // `input` keeps its name. It is listed so a read of it counts as a
         // read of the contract, which is what hoists it for a helper outside
         // `handle`.
-        ScriptKind::Procedure => &[
-            ("input", "input"),
-            ("params", "ctx.params"),
-            ("collection", "ctx.collection"),
-        ],
-        ScriptKind::Query => &[("params", "input"), ("collection", "ctx.collection")],
+        ScriptKind::Procedure => &[("input", "input"), ("params", "ctx.params")],
+        ScriptKind::Query => &[("params", "input")],
         ScriptKind::RecordEvent => &[
             ("event", "input"),
             ("record", "input.record"),
@@ -173,6 +203,12 @@ struct HandleSite {
 struct Planner<'a> {
     source: &'a str,
     kind: ScriptKind,
+    /// The collection a query's or procedure's lexicon named, written as a
+    /// Lua string, for the reads of it v3 no longer answers.
+    collection: Option<String>,
+    /// The name `handle` gives its context, whose `collection` is one of
+    /// those reads.
+    ctx_name: Option<String>,
     bindings: Bindings,
     /// Module names the script binds to something of its own. A rewrite that
     /// would need one of these is refused rather than shadowed.
@@ -214,7 +250,7 @@ struct Planner<'a> {
 }
 
 impl<'a> Planner<'a> {
-    fn new(source: &'a str, ast: &Ast, kind: ScriptKind) -> Self {
+    fn new(source: &'a str, ast: &Ast, kind: ScriptKind, collection: Option<&str>) -> Self {
         let bindings = bindings(ast);
         let required = requires::already_required(ast);
         let mut blocked: HashSet<&'static str> = requires::MODULES
@@ -248,9 +284,15 @@ impl<'a> Planner<'a> {
             Some(names) if names.len() > 2 => Some(MARK_HANDLE_PARAMS),
             Some(_) => None,
         };
+        let ctx_name = scan
+            .handle_parameters
+            .as_ref()
+            .and_then(|names| names.get(1).cloned());
         Planner {
             source,
             kind,
+            collection: collection.map(lua_string),
+            ctx_name,
             bindings,
             blocked,
             contract_refused,
@@ -636,6 +678,10 @@ impl<'a> Planner<'a> {
             return;
         };
         if self.bindings.in_scope(name, path.start().unwrap_or(0)) {
+            if self.reads_ctx_collection(name, &path) {
+                self.visit_collection(&path, 1);
+                return;
+            }
             if self.linked_repo_handles.contains(name)
                 && let Some(Seg::Dot(field)) = path.segs.first()
                 && identifier(field).is_some_and(|f| GRANT_FIELDS.contains(&f))
@@ -730,6 +776,9 @@ impl<'a> Planner<'a> {
     }
 
     fn visit_kind_global(&mut self, name: &str, path: &Path<'_>) {
+        if name == "collection" && serves_a_collection(self.kind) {
+            return self.visit_collection(path, 0);
+        }
         match kind_global(self.kind, name) {
             Some(text) => self.rename_head(path, 0, text, &[]),
             None if self.kind == ScriptKind::Unknown => self.mark(
@@ -745,6 +794,23 @@ impl<'a> Planner<'a> {
                     self.kind.as_str()
                 ),
             ),
+        }
+    }
+
+    /// Whether `path` reads `collection` off the context `handle` was given,
+    /// or off the hoisted `ctx` a helper outside it reads.
+    fn reads_ctx_collection(&self, name: &str, path: &Path<'_>) -> bool {
+        serves_a_collection(self.kind)
+            && (self.ctx_name.as_deref() == Some(name) || name == CONTRACT_PARAMS[1])
+            && path.dots().first() == Some(&"collection")
+    }
+
+    /// A query's or procedure's collection, through the first `dots` names of
+    /// `path`: the lexicon's NSID where it is known, a marker where it is not.
+    fn visit_collection(&mut self, path: &Path<'_>, dots: usize) {
+        match self.collection.clone() {
+            Some(literal) => self.rename_head(path, dots, &literal, &[]),
+            None => self.mark(path, MARK_COLLECTION.into()),
         }
     }
 
@@ -1640,7 +1706,7 @@ fn source_piece(expression: &Expression) -> Option<Piece> {
 #[cfg(test)]
 mod tests {
     use super::ScriptKind;
-    use super::rewrite;
+    use super::{lua_string, rewrite, rewrite_for};
 
     fn query(source: &str) -> String {
         rewrite(source, ScriptKind::Query).unwrap().source
@@ -2555,5 +2621,55 @@ mod tests {
         );
         assert!(result.contains("nope = ctx.caller_did"), "{result}");
         assert!(result.contains("-- codemod: db.query"), "{result}");
+    }
+
+    #[test]
+    fn a_collection_is_written_as_a_lua_string_whatever_it_holds() {
+        assert_eq!(lua_string("app.example.thing"), "\"app.example.thing\"");
+        assert_eq!(lua_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+
+    /// A record event is given its collection in v3 as in v2, so neither
+    /// spelling of it is written out, whatever collection is known.
+    #[test]
+    fn a_record_scripts_collection_stays_its_events() {
+        let result = rewrite_for(
+            "function handle(input, ctx)\n  return { a = collection, b = ctx.collection }\nend\n",
+            ScriptKind::RecordEvent,
+            Some("app.example.thing"),
+        )
+        .unwrap();
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
+        assert!(
+            result
+                .source
+                .contains("a = input.collection, b = ctx.collection"),
+            "{}",
+            result.source
+        );
+    }
+
+    /// A context passed under another name is still the context.
+    #[test]
+    fn a_renamed_context_reads_its_collection_as_the_literal() {
+        let result = rewrite_for(
+            "function handle(params, c)\n  return c.collection\nend\n",
+            ScriptKind::Query,
+            Some("app.example.thing"),
+        )
+        .unwrap();
+        assert!(
+            result.source.contains("return \"app.example.thing\""),
+            "{}",
+            result.source
+        );
+    }
+
+    /// Only `collection` is the lexicon's; the rest of the context stays.
+    #[test]
+    fn another_context_field_is_left_alone() {
+        let source = "function handle(input, ctx)\n  return ctx.method\nend\n";
+        let result = rewrite_for(source, ScriptKind::Procedure, Some("app.example.thing")).unwrap();
+        assert_eq!(result.source, source);
     }
 }

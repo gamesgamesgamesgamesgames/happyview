@@ -586,6 +586,231 @@ async fn provision_and_register(
     (provision_id, dpop_key, session_id)
 }
 
+/// The body's `pds_url` is the app's word. The session is stored with the PDS
+/// resolved from the DID document, which verification reached, so an app
+/// cannot point a user's writes, or the index rows they mirror, elsewhere.
+#[tokio::test]
+#[serial]
+async fn test_register_session_stores_the_resolved_pds_not_the_bodys() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:resolvedpds";
+
+    provision_and_register(&app, &client_key, &client_secret, did, "token-resolved").await;
+
+    let (pds_url,): (Option<String>,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT pds_url FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        pds_url.as_deref(),
+        Some(format!("{}/pds/{did}", app.mock_server.uri()).as_str()),
+        "the body named https://pds.example.com"
+    );
+}
+
+/// An issuer the user's PDS does not name is refused before the session is
+/// stored: a refresh or a revocation would send its tokens there.
+#[tokio::test]
+#[serial]
+async fn test_register_session_refuses_an_issuer_the_pds_does_not_name() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:unnamedissuer";
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let provision_id = response_json(key_resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    app.mock_session_verification(did, did).await;
+    app.mock_pds_names_issuer(did, "https://the-real-issuer.example")
+        .await;
+
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": did,
+            "access_token": "token-unnamed-issuer",
+            "scopes": "atproto",
+            "issuer": "https://attacker.example",
+        }),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let (count,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// Turns the session `did` holds under `client_id` into one stored before
+/// registration checked its PDS and issuer, with `pds_url` and `issuer` as an
+/// app could have sent them. Answers the session's key id.
+async fn make_unverified(
+    app: &common::app::TestApp,
+    did: &str,
+    pds_url: &str,
+    issuer: Option<&str>,
+) -> String {
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_dpop_sessions SET pds_url = ?, issuer = ?, verified_at = NULL WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(pds_url)
+    .bind(issuer)
+    .bind(did)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let (key,): (String,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    key
+}
+
+/// A GET through the session, as a library call or write would make one.
+async fn session_get(
+    app: &common::app::TestApp,
+    client_id: &str,
+    did: &str,
+    key: &str,
+) -> Result<u16, happyview::error::AppError> {
+    happyview::oauth::pds_write::dpop_pds_get(
+        &app.state.http,
+        &app.state.db,
+        app.state.db_backend,
+        &happyview::plugin::encryption::Keyring::from(
+            app.state.config.token_encryption_key.unwrap(),
+        ),
+        &app.state.oauth,
+        &app.state.config.plc_url,
+        client_id,
+        did,
+        key,
+        "com.example.ping",
+        "",
+        &[],
+    )
+    .await
+    .map(|r| r.status().as_u16())
+}
+
+/// A session stored before registration checked its PDS is checked at its
+/// first use: requests go to the PDS the DID document names, not the stored
+/// one, and the row says so from then on.
+#[tokio::test]
+#[serial]
+async fn test_an_unverified_session_is_sent_to_its_resolved_pds() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:legacypds";
+    provision_and_register(&app, &client_key, &client_secret, did, "token-legacy").await;
+    let key = make_unverified(&app, did, "http://127.0.0.1:9", None).await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "/pds/{did}/xrpc/com.example.ping"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+
+    assert_eq!(session_get(&app, &client_id, did, &key).await.unwrap(), 200);
+
+    let (pds_url, verified_at): (Option<String>, Option<String>) =
+        happyview::db::query_as(&happyview::db::adapt_sql(
+            "SELECT pds_url, verified_at FROM happyview_dpop_sessions WHERE user_did = ?",
+            app.state.db_backend,
+        ))
+        .bind(did)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        pds_url.as_deref(),
+        Some(format!("{}/pds/{did}", app.mock_server.uri()).as_str())
+    );
+    assert!(verified_at.is_some());
+}
+
+/// A session stored before registration checked its issuer, naming one the
+/// user's PDS does not list, is refused at its first use, and nothing is sent.
+#[tokio::test]
+#[serial]
+async fn test_an_unverified_session_with_an_unlisted_issuer_is_refused() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:legacyissuer";
+    provision_and_register(
+        &app,
+        &client_key,
+        &client_secret,
+        did,
+        "token-legacy-issuer",
+    )
+    .await;
+    let key = make_unverified(
+        &app,
+        did,
+        &format!("{}/pds/{did}", app.mock_server.uri()),
+        Some("https://attacker.example"),
+    )
+    .await;
+    app.mock_pds_names_issuer(did, "https://the-real-issuer.example")
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "/pds/{did}/xrpc/com.example.ping"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&app.mock_server)
+        .await;
+
+    let err = session_get(&app, &client_id, did, &key).await.unwrap_err();
+    assert!(
+        matches!(err, happyview::error::AppError::Forbidden(_)),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_multi_device_sessions_coexist() {

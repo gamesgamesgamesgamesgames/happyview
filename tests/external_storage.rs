@@ -12,7 +12,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use happyview::AppState;
 use happyview::db::DatabaseBackend;
-use happyview::lexicon::ProcedureAction;
 use happyview::plugin::library::LibraryCallContext;
 use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
 use happyview::record_store::{PreparedRecord, RecordStore};
@@ -107,7 +106,7 @@ fn query_lexicon(id: &str) -> Value {
     })
 }
 
-async fn put_lexicon(state: &AppState, lexicon: Value, target: Option<&str>) {
+async fn put_lexicon(state: &AppState, lexicon: Value) {
     state
         .lexicons
         .put_manual(
@@ -116,8 +115,6 @@ async fn put_lexicon(state: &AppState, lexicon: Value, target: Option<&str>) {
             happyview::catalog::LexiconWrite {
                 lexicon_json: lexicon,
                 backfill: false,
-                target_collection: target.map(str::to_string),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,
@@ -146,12 +143,9 @@ async fn instance(storage: Option<Arc<FakeStorage>>) -> AppState {
             updated_at: happyview::db::now_rfc3339(),
         })
         .await;
-    for (record, query, collection) in [
-        (CLAIMED, CLAIMED_QUERY, CLAIMED),
-        (LOCAL, LOCAL_QUERY, LOCAL),
-    ] {
-        put_lexicon(&state, record_lexicon(record), Some(collection)).await;
-        put_lexicon(&state, query_lexicon(query), Some(collection)).await;
+    for (record, query) in [(CLAIMED, CLAIMED_QUERY), (LOCAL, LOCAL_QUERY)] {
+        put_lexicon(&state, record_lexicon(record)).await;
+        put_lexicon(&state, query_lexicon(query)).await;
     }
     happyview::db::query(
         "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, 1, ?)",
@@ -243,42 +237,35 @@ async fn a_claimed_collection_is_read_from_the_external_storage() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["record"]["text"], "elsewhere");
 
-    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
-    assert_eq!(body["records"][0]["uri"], uri(CLAIMED, "g1"));
+    let listed = state
+        .records
+        .list_recent(CLAIMED, None, 20, 0)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].uri, uri(CLAIMED, "g1"));
 
     assert_eq!(state.records.count_collection(CLAIMED).await.unwrap(), 1);
     assert_eq!(local_rows(&state).await, 0);
 }
 
 #[tokio::test]
-async fn a_procedure_write_to_a_claimed_collection_is_a_pending_delta() {
+async fn a_script_write_to_a_claimed_collection_is_a_pending_delta() {
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
-    let mut state = instance(Some(storage.clone())).await;
-    put_lexicon(
-        &state,
-        common::fixtures::create_game_procedure_lexicon(),
-        Some(CLAIMED),
-    )
-    .await;
-    // The `happyview test` harness: the caller is forged and the write goes
-    // to its in-process PDS, through the same procedure handler a session's
-    // write takes.
-    state.test = Some(Arc::new(happyview::testing::TestHarness::new("procedure")));
-    let mut request = Request::post("/xrpc/games.gamesgamesgamesgames.createGame")
-        .header("host", "127.0.0.1")
-        .header("x-client-key", happyview::testing::TEST_CLIENT_KEY)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"title": "Pending", "createdAt": "2026-01-02T03:04:05.000Z"}).to_string(),
-        ))
+    let state = instance(Some(storage.clone())).await;
+    // A script's PDS write lands in the index the way the PDS echo would.
+    let mut written = prepared(
+        CLAIMED,
+        "w1",
+        json!({"$type": CLAIMED, "title": "Pending", "createdAt": "2026-01-02T03:04:05.000Z"}),
+    );
+    written.cid = "bafy-pending".to_string();
+    state
+        .records
+        .write_local(happyview::record_store::WriteKind::Echoed, &written)
+        .await
         .unwrap();
-    request
-        .extensions_mut()
-        .insert(happyview::testing::ForgedCaller::new(DID));
-    let (status, body) = send(&state, request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = json!({"uri": uri(CLAIMED, "w1"), "cid": written.cid});
 
     let deltas = storage.deltas();
     assert_eq!(deltas.len(), 1, "{deltas:?}");
@@ -658,17 +645,20 @@ async fn external_storage_down_is_503_and_local_reads_work() {
         .unwrap();
     storage.down.store(true, Ordering::SeqCst);
 
-    for path in [
-        format!("/xrpc/{CLAIMED_QUERY}?uri={}", uri(CLAIMED, "g1")),
-        format!("/xrpc/{CLAIMED_QUERY}"),
-    ] {
-        let (status, body) = get(&state, &path).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
-        assert_eq!(
-            body,
-            json!({"error": "ServiceUnavailable", "message": "the record store is unavailable"})
-        );
-    }
+    let path = format!("/xrpc/{CLAIMED_QUERY}?uri={}", uri(CLAIMED, "g1"));
+    let (status, body) = get(&state, &path).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+    assert_eq!(
+        body,
+        json!({"error": "ServiceUnavailable", "message": "the record store is unavailable"})
+    );
+    assert!(
+        state
+            .records
+            .list_recent(CLAIMED, None, 20, 0)
+            .await
+            .is_err()
+    );
 
     let (status, body) = get(
         &state,
@@ -677,9 +667,8 @@ async fn external_storage_down_is_503_and_local_reads_work() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["record"]["text"], "here");
-    let (status, body) = get(&state, &format!("/xrpc/{LOCAL_QUERY}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+    let listed = state.records.list_recent(LOCAL, None, 20, 0).await.unwrap();
+    assert_eq!(listed.len(), 1);
 }
 
 /// The real Lua interpreter plugin, registered on `state` with the
@@ -987,7 +976,13 @@ fn sql_library() -> LoadedPlugin {
         wasm_bytes: std::fs::read(
             "tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm",
         )
-        .expect("test_library fixture not built"),
+        .expect(
+            "test_library fixture not built. Run: bash scripts/build-plugin-fixtures.sh \
+             (or cargo build --manifest-path tests/fixtures/test_library/Cargo.toml \
+             --target wasm32-unknown-unknown --release). This target panics rather than \
+             skipping, so a missing fixture fails several tests at once and reads like a \
+             regression.",
+        ),
         manifest: Some(manifest),
     }
 }
@@ -1024,7 +1019,7 @@ async fn raw_sql_writes_to_a_claimed_collection_are_refused() {
     assert!(err.contains(CLAIMED), "{err}");
     assert!(
         err.contains(
-            "writes to records of a collection stored outside this instance must go through records.indexPut"
+            "writes to records of a collection stored outside this instance must go through save_local in happyview.record"
         ),
         "{err}"
     );
@@ -1382,13 +1377,12 @@ async fn local_cycle(state: &AppState) -> Vec<Value> {
     )
     .await;
     out.push(json!(format!("{outcome:?}")));
-    for path in [
-        format!("/xrpc/{LOCAL_QUERY}?uri={}", uri(LOCAL, "c1")),
-        format!("/xrpc/{LOCAL_QUERY}"),
-    ] {
-        let (status, body) = get(state, &path).await;
-        out.push(json!([status.as_u16(), body]));
-    }
+    let (status, body) = get(
+        state,
+        &format!("/xrpc/{LOCAL_QUERY}?uri={}", uri(LOCAL, "c1")),
+    )
+    .await;
+    out.push(json!([status.as_u16(), body]));
     out.push(json!(state.records.count_collection(LOCAL).await.unwrap()));
     out.push(json!(state.records.count_all().await.unwrap()));
     out.push(json!(state.records.count_by_collection().await.unwrap()));
@@ -1409,7 +1403,6 @@ async fn no_external_storage_means_no_behaviour_change() {
     let expected = vec![
         json!("Matched"),
         json!([200, {"record": {"$type": LOCAL, "text": "hello", "uri": uri(LOCAL, "c1")}}]),
-        json!([200, {"records": [{"$type": LOCAL, "text": "hello", "uri": uri(LOCAL, "c1")}]}]),
         json!(1),
         json!(1),
         json!([[LOCAL, 1]]),

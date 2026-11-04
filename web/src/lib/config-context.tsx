@@ -1,6 +1,13 @@
 "use client";
 
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { TriangleAlert } from "lucide-react";
 
 import {
@@ -9,18 +16,26 @@ import {
 } from "@/components/instance-unavailable";
 import {
   type ConfigFailure,
+  type Features,
   classifyConfigFailure,
+  parseFeatures,
   retryDelayMs,
 } from "@/lib/config-load";
 
-interface ConfigContextType {
+interface Config {
   public_url: string;
   default_rate_limit_capacity: number;
   default_rate_limit_refill_rate: number;
   app_name: string | null;
   logo_url: string | null;
+  features: Features;
   platform_managed: boolean;
   configErrors: string[];
+}
+
+interface ConfigContextType extends Config {
+  /** Re-fetch `/config`, e.g. after a setting that changes a feature flag. */
+  refreshConfig: () => Promise<void>;
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -29,8 +44,10 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  features: { spaces: false, space_inspector: false },
   platform_managed: false,
   configErrors: [],
+  refreshConfig: async () => {},
 });
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
@@ -60,7 +77,7 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
 
 /** Fetch `/config`, answering a failure as what it means for the dashboard. */
 async function loadConfig(): Promise<
-  { config: ConfigContextType } | { failure: ConfigFailure }
+  { config: Config } | { failure: ConfigFailure }
 > {
   const host = window.location.host;
   let res: Response;
@@ -87,6 +104,7 @@ async function loadConfig(): Promise<
       default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
       app_name: data.app_name ?? null,
       logo_url: data.logo_url ?? null,
+      features: parseFeatures(data.features),
       platform_managed: data.platform_managed === true,
       configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
     },
@@ -94,10 +112,25 @@ async function loadConfig(): Promise<
 }
 
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<ConfigContextType | null>(null);
+  const [config, setConfig] = useState<Config | null>(null);
   const [failure, setFailure] = useState<ConfigFailure | null>(null);
   const [retrying, setRetrying] = useState(false);
   const retryNow = useRef<() => void>(() => {});
+
+  // Throws on failure, so a caller such as the settings page can report it;
+  // the config already loaded stays in place.
+  const refreshConfig = useCallback(async () => {
+    const outcome = await loadConfig();
+    if ("failure" in outcome) {
+      const { failure } = outcome;
+      throw new Error(
+        failure.kind === "unreachable"
+          ? failure.detail
+          : `The server does not serve ${failure.host}.`,
+      );
+    }
+    setConfig(outcome.config);
+  }, []);
 
   // An unreachable server is retried with backoff until it answers. A host
   // the server does not serve is not: asking again gets the same answer.
@@ -149,7 +182,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
   if (!config) return <InstanceConnecting />;
 
   return (
-    <ConfigContext.Provider value={config}>
+    <ConfigContext.Provider value={{ ...config, refreshConfig }}>
       {config.configErrors.length > 0 && (
         <ConfigErrorBanner errors={config.configErrors} />
       )}

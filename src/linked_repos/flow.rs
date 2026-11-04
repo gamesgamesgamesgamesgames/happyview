@@ -159,6 +159,7 @@ async fn resolve_grant_client(
         state.db.clone(),
         state.db_backend,
         None,
+        state.config.keyring(),
     )
     .map(|client| (Arc::new(client), None))
     .map_err(AppError::Internal)

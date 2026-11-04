@@ -245,7 +245,9 @@ pub fn get_secret(name: &str) -> Result<Option<String>, HostError> {
 }
 
 /// Send an outbound HTTP request. Needs `network:request` (limited to the
-/// manifest's `allowed_hosts`) or `network:request:unrestricted`.
+/// manifest's `allowed_hosts`), `network:request:defined` (limited to the
+/// hosts the operator lists in the plugin's settings) or
+/// `network:request:unrestricted`.
 pub fn http_request(request: &HttpRequest) -> Result<HttpResponse, HostError> {
     #[cfg(target_arch = "wasm32")]
     {

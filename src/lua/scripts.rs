@@ -258,11 +258,13 @@ pub async fn run_record_event_script(
     payload: RecordEventPayload<'_>,
 ) -> RecordHookOutcome {
     let project = state.project.load_full();
-    let resolved = match state
+    let started = std::time::Instant::now();
+    let resolved = state
         .scripts
         .resolve_record_event_in(&project, payload.nsid, payload.action)
-        .await
-    {
+        .await;
+    crate::metrics::ingest::note_resolve(started.elapsed(), resolved.is_some());
+    let resolved = match resolved {
         Some(s) => s,
         // No script for this trigger → index the event unchanged.
         None => return RecordHookOutcome::Proceed,
@@ -294,6 +296,7 @@ pub async fn run_record_event_script(
             payload.uri,
         )
         .await;
+        crate::metrics::ingest::note_dead_lettered();
         return RecordHookOutcome::Proceed;
     }
 
@@ -352,6 +355,7 @@ pub async fn run_record_event_script(
         payload.uri,
     )
     .await;
+    crate::metrics::ingest::note_dead_lettered();
 
     // Fail-open: index the event as if no script had run. For a delete this
     // means the delete still happens — the record body it lacks is not a

@@ -108,12 +108,14 @@ const response = await session.fetchHandler(
   { method: "GET" },
 );
 
-// Absolute URL — used as-is
+// Absolute URL on the instance — used as-is
 const response = await session.fetchHandler(
-  "https://other-service.example.com/xrpc/test.method",
+  "https://happyview.example.com/xrpc/com.example.getStuff",
   { method: "GET" },
 );
 ```
+
+`fetchHandler` sends requests only to the session's HappyView instance, under its base path if it has one. A URL anywhere else is refused with an error before anything is sent, so the session's credentials never reach another host.
 
 ## Session restoration
 

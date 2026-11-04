@@ -61,7 +61,11 @@ function ChartContainer({
         {...props}
       >
         <ChartStyle id={chartId} config={config} />
-        <RechartsPrimitive.ResponsiveContainer>
+        {/* A positive first size: a chart that mounts inside an opening
+            sheet measures -1 before layout, and Recharts warns about it. */}
+        <RechartsPrimitive.ResponsiveContainer
+          initialDimension={{ width: 320, height: 200 }}
+        >
           {children}
         </RechartsPrimitive.ResponsiveContainer>
       </div>

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    HostContext, MAX_HTTP_REQUEST_DURATION, MAX_HTTP_REQUESTS, MAX_HTTP_RESPONSE_SIZE,
-    MAX_HTTP_TOTAL_TRANSFER, ResourceUsage,
+    MAX_HTTP_REQUEST_DURATION, MAX_HTTP_REQUESTS, MAX_HTTP_RESPONSE_SIZE, MAX_HTTP_TOTAL_TRANSFER,
+    ResourceUsage,
 };
 
 /// The request the plugin sent and the response it gets back. Both are the
@@ -25,7 +25,6 @@ pub enum HttpError {
 }
 
 pub async fn http_request(
-    ctx: &HostContext,
     usage: &mut ResourceUsage,
     req: HttpRequest,
     follow_redirects: bool,
@@ -38,16 +37,18 @@ pub async fn http_request(
 
     // Build request
     let method = req.method.parse().unwrap_or(reqwest::Method::GET);
+    // Both clients are screened by the policy for plugins' own requests, the
+    // only one `ALLOW_PRIVATE_HOSTS` reaches (see `crate::outbound`).
     let mut builder = if follow_redirects {
-        ctx.http_client.request(method, &req.url)
+        plugin_client().request(method, &req.url)
     } else {
         // The `allowed_hosts` check covers the request URL only. The shared client
         // follows up to 10 redirects, so a 3xx from an allowed host could carry a
         // restricted plugin to one it may not reach. The restricted path therefore
         // sends through a client that follows nothing, and the plugin sees the 3xx
         // itself.
-        let client = no_redirect_client()?;
-        client.request(method, &req.url)
+        crate::http_retry::build_plugin_client(&crate::version::user_agent(), false)
+            .request(method, &req.url)
     };
 
     for (name, value) in &req.headers {
@@ -149,12 +150,20 @@ pub(crate) async fn send_bounded(
         .unwrap_or(Err(BoundedError::TimedOut(within)))
 }
 
-/// A client that follows no redirects, shared by every restricted fetch path:
-/// the unrestricted `host_http_request` branch above, and `blob_download`'s
-/// SSRF guard (`src/plugin/host/atproto.rs`), which likewise checks a host it
-/// doesn't fully trust and then must not let a redirect carry the request
-/// somewhere that check never saw. Built per call; caching one on
-/// `PluginState` is the fix if that ever shows up in a profile.
+/// The client an unrestricted plugin's requests go through, built once.
+fn plugin_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| crate::http_retry::build_plugin_client(&crate::version::user_agent(), true))
+}
+
+/// A client that follows no redirects, for `blob_download`'s endpoint check
+/// (`src/plugin/host/atproto.rs`), which checks a host it doesn't fully trust
+/// and then must not let a redirect carry the request somewhere that check
+/// never saw. Unlike the clients above it is screened like any request whose
+/// destination came from elsewhere: the endpoint is a DID document's, not the
+/// plugin's. Built per call; caching one on `PluginState` is the fix if that
+/// ever shows up in a profile.
 pub(crate) fn no_redirect_client() -> Result<reqwest::Client, reqwest::Error> {
     Ok(crate::http_retry::build_no_redirect_client(
         &crate::version::user_agent(),
@@ -410,29 +419,6 @@ mod tests {
         assert_eq!(response.headers.len(), 1);
     }
 
-    /// Only `ctx.http_client` matters to `http_request`; the rest of
-    /// `HostContext` is unused plumbing here, so a lazily-connected in-memory
-    /// SQLite pool (same pattern used elsewhere for host-context test
-    /// fixtures) is enough without a real database.
-    fn test_host_context() -> HostContext {
-        crate::db::install_drivers();
-        let db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        HostContext {
-            plugin_id: "test-plugin".into(),
-            scope: "did:example:test".into(),
-            secrets: std::collections::HashMap::new(),
-            config: serde_json::json!({}),
-            records: crate::record_store::RecordStore::new(
-                db.clone(),
-                crate::db::DatabaseBackend::Sqlite,
-            ),
-            db,
-            db_backend: crate::db::DatabaseBackend::Sqlite,
-            http_client: reqwest::Client::new(),
-            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),
-        }
-    }
-
     // Covers every restricted capability alike: `http_request`'s
     // `follow_redirects` flag has no notion of which capability chose the
     // restricted path, so this exercises `network:request:defined` too —
@@ -460,7 +446,6 @@ mod tests {
             .mount(&origin)
             .await;
 
-        let ctx = test_host_context();
         let mut usage = ResourceUsage::default();
         let req = HttpRequest {
             method: "GET".into(),
@@ -469,7 +454,7 @@ mod tests {
             body: None,
         };
 
-        let resp = http_request(&ctx, &mut usage, req, /* follow_redirects */ false)
+        let resp = http_request(&mut usage, req, /* follow_redirects */ false)
             .await
             .expect("request should succeed even though it is a redirect response");
 
@@ -509,7 +494,6 @@ mod tests {
             .mount(&origin)
             .await;
 
-        let ctx = test_host_context();
         let mut usage = ResourceUsage::default();
         let req = HttpRequest {
             method: "GET".into(),
@@ -518,7 +502,7 @@ mod tests {
             body: None,
         };
 
-        let resp = http_request(&ctx, &mut usage, req, /* follow_redirects */ true)
+        let resp = http_request(&mut usage, req, /* follow_redirects */ true)
             .await
             .expect("request should succeed");
 

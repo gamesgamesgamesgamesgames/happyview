@@ -28,3 +28,10 @@ export interface DeadLetterCountResponse {
 export interface BulkActionResponse {
   ok: boolean;
 }
+
+/** Retry and reindex answer for each dead letter they tried. */
+export interface BulkItemsResponse extends BulkActionResponse {
+  succeeded: number;
+  failed: number;
+  results: { id: string; ok: boolean; error?: string }[];
+}

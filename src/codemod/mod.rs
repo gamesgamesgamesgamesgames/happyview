@@ -15,7 +15,7 @@ mod rewrite;
 mod behaviour;
 
 pub use detect::{REMOVED_GLOBALS, UNPARSEABLE, needs_migration};
-pub use rewrite::rewrite;
+pub use rewrite::{rewrite, rewrite_for};
 
 /// What the runner hands `handle` as its first argument. A procedure receives
 /// its input body, a query its params, a record or label script its event, a
@@ -78,6 +78,35 @@ impl ScriptKind {
             ScriptKind::Unknown => "unknown",
         }
     }
+}
+
+/// The NSID a query or procedure trigger id names, in either spelling.
+fn endpoint_nsid(trigger_id: &str) -> Option<&str> {
+    ["xrpc.query:", "xrpc.procedure:", "query.", "procedure."]
+        .iter()
+        .find_map(|prefix| trigger_id.strip_prefix(prefix))
+}
+
+/// The collection a v2 query's or procedure's lexicon named, for
+/// [`rewrite_for`]. v3 dropped the setting, and the migration that dropped it
+/// kept each lexicon's value for this alone. `None` for any other trigger, or
+/// a lexicon that named none.
+pub async fn v2_collection(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    trigger_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(nsid) = endpoint_nsid(trigger_id) else {
+        return Ok(None);
+    };
+    let row: Option<(String,)> = crate::db::query_as(&crate::db::adapt_sql(
+        "SELECT collection FROM happyview_codemod_collections WHERE lexicon_id = ?",
+        backend,
+    ))
+    .bind(nsid)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(collection,)| collection))
 }
 
 /// A construct a person still has to deal with, at the line it sits on in the

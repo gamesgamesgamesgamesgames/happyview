@@ -14,7 +14,7 @@ function handle(input, ctx)
 
   -- Query params arrive as strings unless the lexicon types them, and a
   -- chain step given nil is skipped, so absent filters read as no filter.
-  return db.records(ctx.collection)
+  return db.records("COLLECTION")
     :did(input.did)
     :limit(tonumber(input.limit))
     :cursor(input.cursor)

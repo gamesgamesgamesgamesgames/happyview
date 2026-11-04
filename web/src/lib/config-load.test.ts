@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { classifyConfigFailure, retryDelayMs } from "./config-load";
+import {
+  classifyConfigFailure,
+  parseFeatures,
+  retryDelayMs,
+} from "./config-load";
 
 describe("classifyConfigFailure", () => {
   it("reads a 421 as a host the server does not serve", () => {
@@ -34,5 +38,29 @@ describe("retryDelayMs", () => {
     expect([0, 1, 2, 3, 4, 5, 6, 20].map(retryDelayMs)).toEqual([
       1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000,
     ]);
+  });
+});
+
+describe("parseFeatures", () => {
+  it("reads each feature the server turns on", () => {
+    expect(parseFeatures({ spaces: true, space_inspector: true })).toEqual({
+      spaces: true,
+      space_inspector: true,
+    });
+  });
+
+  it("reads anything but true as off, including a server without the field", () => {
+    expect(parseFeatures({ spaces: "true", space_inspector: 1 })).toEqual({
+      spaces: false,
+      space_inspector: false,
+    });
+    expect(parseFeatures({ spaces: true })).toEqual({
+      spaces: true,
+      space_inspector: false,
+    });
+    expect(parseFeatures(undefined)).toEqual({
+      spaces: false,
+      space_inspector: false,
+    });
   });
 });

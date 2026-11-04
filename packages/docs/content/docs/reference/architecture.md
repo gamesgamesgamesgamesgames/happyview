@@ -56,9 +56,11 @@ sequenceDiagram
         L->>D: happyview.db / happyview.sql
         D-->>L: Results
         L-->>X: Response table
+    else No script, uri param
+        R->>D: Look up the one record
+        D-->>X: Record
     else No script
-        R->>D: Default SQL query (collection from target_collection)
-        D-->>X: Results
+        R-->>X: 501 MethodNotImplemented
     end
     X-->>C: JSON response
 ```
@@ -82,13 +84,14 @@ sequenceDiagram
     alt Lua script attached
         R->>L: Execute script
         L->>S: happyview.record create/put
+        S->>P: Proxy write (createRecord or putRecord)
+        P-->>S: PDS response
+        S->>D: Upsert record locally
+        S-->>L: { uri, cid }
+        L-->>C: Response table
     else No script
-        R->>S: Default create/update (auto-detect from uri field)
+        R-->>C: 501 MethodNotImplemented
     end
-    S->>P: Proxy write (createRecord or putRecord)
-    P-->>S: PDS response
-    S->>D: Upsert record locally
-    S-->>C: Forward PDS response
 ```
 
 ### Admin endpoints
@@ -249,7 +252,6 @@ Recently deleted records (`uri`, `rev`, `deleted_at`) and deleted accounts (`did
 | `lexicon_json`      | jsonb       | Raw lexicon definition                          |
 | `lexicon_type`      | text        | record, query, procedure, definitions           |
 | `backfill`          | boolean     | Whether to backfill on upload                   |
-| `target_collection` | text        | For queries/procedures: which record collection |
 | `created_at`        | timestamptz |                                                 |
 | `updated_at`        | timestamptz |                                                 |
 

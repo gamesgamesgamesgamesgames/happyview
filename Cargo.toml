@@ -32,6 +32,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 default-run = "happyview"
+license = "MIT"
 repository = "https://github.com/gamesgamesgamesgamesgames/happyview"
 
 # Debug info dominates both codegen and link time on this workspace, and full
@@ -83,11 +84,11 @@ ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 libsqlite3-sys = { version = "0.30", default-features = false }
 multibase = "0.9"
-p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
+p256 = { version = "0.14", features = ["pkcs8", "ecdsa", "ecdh"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
 # rustls rather than the default native-tls: OpenSSL cannot link into a static
-# musl binary and is absent on Windows. Native roots keep the platform's trust
+# musl binary. Native roots keep the platform's trust
 # store, which is how an operator (and the e2e stack) adds a private CA.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -108,14 +109,17 @@ tokio-tungstenite = "0.29"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors", "fs", "trace"] }
 http-body-util = "0.1"
 hickory-resolver = "0.26"
+# For the connected peer address `outbound` checks.
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 ipnet = "2"
-lru = "0.16"
+lru = "0.18"
 mlua = { version = "0.12", optional = true, features = ["lua54", "async", "serialize", "vendored", "send"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
 urlencoding = "2.1.3"
 webpki-roots = "1.0"
 zstd = "0.14.3"
@@ -149,6 +153,7 @@ wasmtime = { version = ">=50.0.1, <51", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = ">=50.0.1, <51", default-features = false, features = ["p1"] }
 regex = "1.12.3"
+unicode-segmentation = "1.12"
 semver = "1.0"
 async-stream = "0.3.6"
 blake3 = "1"
@@ -219,3 +224,15 @@ futures = "0.3"
 rcgen = "0.14"
 wat = "1"
 tempfile = "3"
+
+# sqlx-core 0.9.0's pool maintenance task can spin a worker thread at 100% CPU
+# when `num_idle` underflows (launchbadge/sqlx#4289). Remove this section and
+# bump `sqlx` once a release includes that fix.
+[patch.crates-io]
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }

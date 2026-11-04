@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::AppState;
@@ -150,6 +151,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::csrf::guard,
         ))
+        .layer(CatchPanicLayer::custom(panic_response))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
         .layer(axum::middleware::from_fn_with_state(
@@ -157,6 +159,18 @@ pub fn router(state: AppState) -> Router {
             crate::telemetry_middleware::count_http_bytes,
         ))
         .with_state(state)
+}
+
+/// A handler that panics answers as an internal error does: a logged detail and
+/// a generic body. Left uncaught, the panic drops the connection with no
+/// response at all.
+fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    AppError::Internal(format!("handler panicked: {detail}")).into_response()
 }
 
 /// Allowed request methods, shared by both CORS policies.
@@ -182,8 +196,7 @@ const CORS_ALLOW_HEADERS_ANON: &str = "content-type, authorization, x-client-key
 ///   HappyView actually serves the dashboard/admin UI on) — get their origin
 ///   reflected *with* `Access-Control-Allow-Credentials: true`, so the
 ///   cookie-authenticated dashboard works cross-origin if ever hosted on a
-///   second registered domain. An origin an admin listed in
-///   `cookie_integration_origins` is trusted the same way.
+///   second registered domain.
 /// - **Any other origin** — e.g. a third-party app or an attacker page — gets a
 ///   credential-*less* grant: its origin is reflected but credentials are never
 ///   allowed. Third-party clients authenticate with explicit DPoP + client-key
@@ -209,10 +222,7 @@ async fn cors(
         return next.run(req).await;
     };
 
-    // A listed integration would otherwise pass the CSRF guard and still be
-    // unable to read a response or send a JSON body.
-    let credentialed = state.domain_cache.is_allowed_origin(&origin).await
-        || state.integration_origins.contains(&state, &origin).await;
+    let credentialed = state.domain_cache.is_allowed_origin(&origin).await;
 
     let is_preflight = req.method() == Method::OPTIONS
         && req
@@ -311,6 +321,8 @@ async fn config_endpoint(
         backend,
     )
     .await;
+    let space_inspector_enabled =
+        crate::admin::space_access::inspector_enabled(pool, backend).await;
 
     Json(serde_json::json!({
         "public_url": domain_url,
@@ -330,6 +342,7 @@ async fn config_endpoint(
         "cli_client_key": crate::auth::cli_client::CLIENT_KEY,
         "features": {
             "spaces": spaces_enabled,
+            "space_inspector": space_inspector_enabled,
         },
         // Startup configuration problems (e.g. an insecure SESSION_SECRET) so the
         // dashboard can surface them to an operator. Empty when healthy.
@@ -449,11 +462,11 @@ fn extract_public_key_multibase(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let private_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
 
     let signing_key = p256::ecdsa::SigningKey::from_slice(private_bytes.as_slice())

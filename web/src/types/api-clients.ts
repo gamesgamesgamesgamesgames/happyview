@@ -70,6 +70,27 @@ export interface RevokeAllApiClientAuthKeysResult {
   sessions_destroyed: number;
 }
 
+/** One of a confidential client's secrets. The secret itself is never listed. */
+export interface ApiClientSecret {
+  id: string;
+  label: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/** A secret just created: the only response that carries the plaintext. */
+export interface CreatedApiClientSecret extends ApiClientSecret {
+  client_secret: string;
+}
+
+export interface RevokeApiClientSecretResult {
+  /** False when it had been revoked already. */
+  revoked: boolean;
+  /** How many of the client's secrets still work. */
+  active_secrets: number;
+}
+
 export interface InstanceOauthKey {
   kid: string;
   status: "pending" | "current" | "retiring" | "revoked";

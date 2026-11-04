@@ -155,7 +155,10 @@ export default function InstalledPlugin() {
   const [updateOpen, setUpdateOpen] = useState(false);
   const [channelOpen, setChannelOpen] = useState(false);
 
-  const canManage = hasPermission("plugins:manage");
+  // The permissions the admin API checks: every change but removal is
+  // `plugins:create`.
+  const canChange = hasPermission("plugins:create");
+  const canRemove = hasPermission("plugins:delete");
 
   const load = useCallback(async () => {
     try {
@@ -296,7 +299,7 @@ export default function InstalledPlugin() {
 
   const hasSettings =
     plugin !== null &&
-    canManage &&
+    canChange &&
     (plugin.required_secrets.length > 0 || managesHosts(plugin));
 
   return (
@@ -336,15 +339,15 @@ export default function InstalledPlugin() {
             <PluginDetail
               plugin={view}
               actions={
-                canManage ? (
+                canChange || canRemove ? (
                   <>
-                    {plugin?.update_available && followsProject ? (
+                    {canChange && plugin?.update_available && followsProject ? (
                       <Button onClick={() => setUpdateOpen(true)}>
                         <ArrowUpCircle />
                         Update
                       </Button>
                     ) : null}
-                    {followsProject ? (
+                    {canChange && followsProject ? (
                       <Button
                         variant="outline"
                         onClick={() => setChannelOpen(true)}
@@ -354,42 +357,52 @@ export default function InstalledPlugin() {
                         Switch channel
                       </Button>
                     ) : null}
-                    <Button
-                      variant="outline"
-                      onClick={() => void run("reload", () => reloadPlugin(id))}
-                      disabled={busy !== null}
-                    >
-                      {busy === "reload" ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <RefreshCw />
-                      )}
-                      Reload
-                    </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() =>
-                        void run("check", () => checkPluginUpdate(id))
-                      }
-                      disabled={busy !== null}
-                    >
-                      {busy === "check" ? (
-                        <Loader2 className="animate-spin" />
-                      ) : null}
-                      Check for update
-                    </Button>
-                    <Button
-                      variant="destructive"
-                      onClick={() => void run("remove", () => removePlugin(id))}
-                      disabled={busy !== null}
-                    >
-                      {busy === "remove" ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <Trash2 />
-                      )}
-                      Remove
-                    </Button>
+                    {canChange ? (
+                      <>
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            void run("reload", () => reloadPlugin(id))
+                          }
+                          disabled={busy !== null}
+                        >
+                          {busy === "reload" ? (
+                            <Loader2 className="animate-spin" />
+                          ) : (
+                            <RefreshCw />
+                          )}
+                          Reload
+                        </Button>
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            void run("check", () => checkPluginUpdate(id))
+                          }
+                          disabled={busy !== null}
+                        >
+                          {busy === "check" ? (
+                            <Loader2 className="animate-spin" />
+                          ) : null}
+                          Check for update
+                        </Button>
+                      </>
+                    ) : null}
+                    {canRemove ? (
+                      <Button
+                        variant="destructive"
+                        onClick={() =>
+                          void run("remove", () => removePlugin(id))
+                        }
+                        disabled={busy !== null}
+                      >
+                        {busy === "remove" ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <Trash2 />
+                        )}
+                        Remove
+                      </Button>
+                    ) : null}
                   </>
                 ) : null
               }

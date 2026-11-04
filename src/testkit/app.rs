@@ -132,7 +132,7 @@ pub async fn truncate_all(pool: &AnyPool) {
         DatabaseBackend::Postgres => {
             // The catalog's tables by their constants: only `catalog` spells them.
             db::query(&format!(
-                "TRUNCATE happyview_records_v2, happyview_record_refs_v2, happyview_record_tombstones, happyview_did_tombstones, {lexicons}, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, {scripts}, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_api_client_probes, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs, happyview_jobs, happyview_spaces, happyview_space_members, happyview_space_records, happyview_space_repo_state, happyview_space_record_oplog, happyview_space_notify_registrations, happyview_space_invites, happyview_lexicon_publish_rules, happyview_lexicon_publications, happyview_linked_repo_sessions, happyview_linked_repo_auth_state, happyview_linked_repos, happyview_oauth_sessions, happyview_auth_login_redirects, happyview_oauth_client_keys, happyview_verification_methods, happyview_space_pds_support, happyview_project_deployments RESTART IDENTITY CASCADE",
+                "TRUNCATE happyview_records_v2, happyview_record_refs_v2, happyview_record_tombstones, happyview_did_tombstones, {lexicons}, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, {scripts}, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_api_client_probes, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs, happyview_jobs, happyview_spaces, happyview_space_members, happyview_space_records, happyview_space_repo_state, happyview_space_record_oplog, happyview_space_notify_registrations, happyview_space_invites, happyview_lexicon_publish_rules, happyview_lexicon_publications, happyview_linked_repo_sessions, happyview_linked_repo_auth_state, happyview_linked_repos, happyview_oauth_sessions, happyview_auth_login_redirects, happyview_oauth_client_keys, happyview_verification_methods, happyview_delegation_key, happyview_space_pds_support, happyview_project_deployments, happyview_codemod_collections, happyview_script_metrics, happyview_space_access_grants, happyview_space_access_grant_events, happyview_space_access_reads RESTART IDENTITY CASCADE",
                 lexicons = crate::catalog::lexicon_rows::TABLE,
                 scripts = crate::catalog::script_rows::TABLE,
             ))
@@ -146,10 +146,13 @@ pub async fn truncate_all(pool: &AnyPool) {
                 // key cannot be decrypted with the next test's, which surfaces
                 // as an opaque 500 on the first space write.
                 "happyview_verification_methods",
+                "happyview_delegation_key",
                 "happyview_space_pds_support",
                 "happyview_lexicon_publish_rules",
                 "happyview_lexicon_publications",
                 "happyview_project_deployments",
+                "happyview_codemod_collections",
+                "happyview_script_metrics",
                 "happyview_linked_repo_sessions",
                 "happyview_linked_repo_auth_state",
                 "happyview_linked_repos",
@@ -164,6 +167,10 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_space_records",
                 "happyview_space_members",
                 "happyview_spaces",
+                // Space access links before the event logs they reference.
+                "happyview_space_access_grant_events",
+                "happyview_space_access_reads",
+                "happyview_space_access_grants",
                 "happyview_service_entry_xrpcs",
                 "happyview_service_entries",
                 "happyview_service_identity",
@@ -198,6 +205,7 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_labeler_subscriptions",
                 "happyview_labels",
                 "happyview_instance_settings",
+                "happyview_attestation_key",
                 "happyview_domains",
                 "happyview_jobs",
                 "happyview_oauth_sessions",
@@ -444,10 +452,9 @@ mod provider_app {
             body["backfill_job_id"].as_str().map(str::to_string)
         }
 
-        /// Stores a query lexicon `nsid` over `collection`, which HappyView
-        /// then serves as a default XRPC query: a get with `uri`, a list
-        /// without.
-        pub async fn track_query(&self, nsid: &str, collection: &str) {
+        /// Stores a query lexicon `nsid`, which with no script answers a get
+        /// with `uri` and nothing else.
+        pub async fn track_query(&self, nsid: &str) {
             let lexicon = json!({
                 "lexicon": 1,
                 "id": nsid,
@@ -464,8 +471,6 @@ mod provider_app {
                     crate::catalog::LexiconWrite {
                         lexicon_json: lexicon,
                         backfill: false,
-                        target_collection: Some(collection.to_string()),
-                        action: crate::lexicon::ProcedureAction::Upsert,
                         token_cost: None,
                         authority_did: None,
                         indexed: true,

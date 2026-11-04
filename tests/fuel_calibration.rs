@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use common::lua_plugin::{identify, plugin_dir};
 use happyview::config::project::ModuleDecl;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ParsedLexicon;
 use happyview::lua::limits::DEFAULT_INSTRUCTION_LIMIT;
 use happyview::plugin::capabilities::PluginCapability;
 use happyview::plugin::{
@@ -86,8 +86,6 @@ fn lexicon(id: &str, kind: &str) -> (String, ProjectLexicon) {
     let parsed = ParsedLexicon::parse(
         json!({"lexicon": 1, "id": id, "defs": {"main": main}}),
         1,
-        None,
-        ProcedureAction::Upsert,
         None,
     )
     .unwrap();

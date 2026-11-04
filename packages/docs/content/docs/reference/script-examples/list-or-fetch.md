@@ -18,7 +18,7 @@ function handle(input, ctx)
     return { record = row }
   end
 
-  return db.records(ctx.collection)
+  return db.records("xyz.statusphere.record")
     :did(input.did)
     :limit(tonumber(input.limit) or 20)
     :cursor(input.cursor)
@@ -29,7 +29,7 @@ end
 ## How it works
 
 1. If a `uri` query parameter is provided, fetch that single record with `db.get` and return it. If it doesn't exist, return a structured error (using `error()` would trigger a 500 response).
-2. Otherwise, list records from the target collection with a `db.records` chain, with optional filtering by `did` and cursor-based pagination. The `cursor` is an opaque string from a previous response — pass it through directly. A `limit` the lexicon declares as an `integer` arrives as a number already; `tonumber()` covers a lexicon that leaves it untyped, where it arrives as a string.
+2. Otherwise, list records from the `xyz.statusphere.record` collection with a `db.records` chain, with optional filtering by `did` and cursor-based pagination. The `cursor` is an opaque string from a previous response — pass it through directly. A `limit` the lexicon declares as an `integer` arrives as a number already; `tonumber()` covers a lexicon that leaves it untyped, where it arrives as a string.
 
 ## Usage
 

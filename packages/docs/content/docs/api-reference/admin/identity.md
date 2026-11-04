@@ -35,6 +35,8 @@ Requires authentication. No specific permission is needed.
 interface ResolvedIdentity {
   did: string;
   handle: string | null;
+  display_name?: string; // with profile=true
+  avatar?: string; // with profile=true
 }
 
 const params = new URLSearchParams({ identifier: "alice.bsky.social" });
@@ -74,6 +76,7 @@ curl "http://127.0.0.1:3000/admin/identity/resolve?identifier=alice.bsky.social"
 | Parameter    | Type   | Required | Description                                        |
 | ------------ | ------ | -------- | -------------------------------------------------- |
 | `identifier` | string | yes      | A handle (a leading `@` is allowed) or a DID       |
+| `profile`    | bool   | no       | `true` adds `display_name` and `avatar`            |
 
 **Response**: `200 OK`
 
@@ -86,4 +89,6 @@ curl "http://127.0.0.1:3000/admin/identity/resolve?identifier=alice.bsky.social"
 
 `handle` is `null` unless the DID document lists the handle in `alsoKnownAs` and the handle resolves to the same DID.
 
-Returns `400` for malformed input, a handle that cannot be resolved, a DID whose document cannot be fetched, or a resolution that takes longer than 10 seconds. The error names the identifier and a general reason, never the underlying network error.
+With `profile=true`, the response also carries `display_name` and `avatar` (an image URL on the account's PDS) from the account's `app.bsky.actor.profile` record. Each is omitted when the profile record, or that field, is missing; a missing profile doesn't make the request fail.
+
+Returns `400` for malformed input, a handle that cannot be resolved, or a DID whose document is missing, forbidden or invalid. Returns `502` when resolution may succeed on a retry: it takes longer than 10 seconds, is rate limited, or can't reach the DID document host. The error names the identifier and a general reason, never the underlying network error.

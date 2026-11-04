@@ -685,6 +685,8 @@ Each API client has its own token bucket for rate limiting:
 
 If not set on the client, the instance defaults apply (`DEFAULT_RATE_LIMIT_CAPACITY` and `DEFAULT_RATE_LIMIT_REFILL_RATE`).
 
+A request is charged to a client's bucket only when it proves it is that client: through a DPoP session, an `Origin` matching the client's `client_uri`, or one of its secrets. A request that only names the key is handled as anonymous.
+
 Rate limit state is returned in response headers:
 
 | Header                | Description                                 |

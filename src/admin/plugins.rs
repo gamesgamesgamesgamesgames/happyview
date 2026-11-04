@@ -11,7 +11,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::plugin::capabilities;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
 use crate::plugin::official_registry::{
@@ -1384,10 +1384,9 @@ pub(super) async fn get_secrets(
 ) -> Result<Json<PluginSecretsResponse>, AppError> {
     auth.require(Permission::PluginsRead).await?;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("Encryption key not configured".into()))?;
 
     // Verify plugin exists
@@ -1416,25 +1415,7 @@ pub(super) async fn get_secrets(
 
             // Extract and decrypt secrets, then mask for display
             if let Some(secrets_obj) = config.get("secrets").and_then(|s| s.as_object()) {
-                secrets_obj
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str().and_then(|encrypted_b64| {
-                            // Decode base64 and decrypt
-                            let encrypted = BASE64.decode(encrypted_b64).ok()?;
-                            let decrypted = decrypt(encryption_key, &encrypted).ok()?;
-                            let val = String::from_utf8(decrypted).ok()?;
-
-                            // Mask the value for display
-                            let masked = if val.len() > 8 {
-                                format!("********{}", &val[val.len() - 4..])
-                            } else {
-                                "********".to_string()
-                            };
-                            Some((k.clone(), masked))
-                        })
-                    })
-                    .collect()
+                masked_secrets(secrets_obj, encryption_key)
             } else {
                 HashMap::new()
             }
@@ -1443,6 +1424,50 @@ pub(super) async fn get_secrets(
     };
 
     Ok(Json(PluginSecretsResponse { plugin_id, secrets }))
+}
+
+/// What every secret shows in place of its value. Fixed, so it gives away
+/// nothing of the value, and `update_plugin_secrets` reads it as "unchanged".
+const SECRET_MASK: &str = "********";
+
+/// Each secret that still opens, masked.
+fn masked_secrets(
+    secrets: &serde_json::Map<String, serde_json::Value>,
+    encryption_key: &crate::plugin::encryption::Keyring,
+) -> HashMap<String, String> {
+    secrets
+        .iter()
+        .filter_map(|(name, value)| {
+            let encrypted = BASE64.decode(value.as_str()?).ok()?;
+            let decrypted = encryption_key.decrypt(&encrypted).ok()?;
+            String::from_utf8(decrypted).ok()?;
+            Some((name.clone(), SECRET_MASK.to_string()))
+        })
+        .collect()
+}
+
+/// The secrets to store after an update. A value that is exactly
+/// [`SECRET_MASK`] keeps the stored one, an empty value clears it, and
+/// anything else is the new value. Only the exact mask counts, so a real
+/// secret that happens to start with asterisks is still saved.
+fn merge_secrets(
+    existing: &HashMap<String, String>,
+    incoming: HashMap<String, String>,
+    encryption_key: &[u8; 32],
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    let mut merged = serde_json::Map::new();
+    for (key, value) in incoming {
+        if value == SECRET_MASK {
+            if let Some(stored) = existing.get(&key) {
+                merged.insert(key, serde_json::Value::String(stored.clone()));
+            }
+        } else if !value.is_empty() {
+            let encrypted = encrypt(encryption_key, value.as_bytes())
+                .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
+            merged.insert(key, serde_json::Value::String(BASE64.encode(&encrypted)));
+        }
+    }
+    Ok(merged)
 }
 
 /// PUT /admin/plugins/{id}/secrets - update plugin secrets
@@ -1496,24 +1521,7 @@ pub(super) async fn update_secrets(
         })
         .unwrap_or_default();
 
-    // Merge secrets: if new value starts with "********", keep existing encrypted value
-    // Otherwise, encrypt the new value
-    let mut merged_secrets = serde_json::Map::new();
-    for (key, value) in body.secrets {
-        if value.starts_with("********") {
-            // Keep existing encrypted value if present
-            if let Some(existing) = existing_secrets.get(&key) {
-                merged_secrets.insert(key, serde_json::Value::String(existing.clone()));
-            }
-        } else if !value.is_empty() {
-            // Encrypt new value and store as base64
-            let encrypted = encrypt(encryption_key, value.as_bytes())
-                .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
-            let encoded = BASE64.encode(&encrypted);
-            merged_secrets.insert(key, serde_json::Value::String(encoded));
-        }
-        // Empty values are not stored (allows clearing a secret)
-    }
+    let merged_secrets = merge_secrets(&existing_secrets, body.secrets, encryption_key)?;
 
     // Update config with merged secrets
     config["secrets"] = serde_json::Value::Object(merged_secrets);
@@ -1750,6 +1758,53 @@ async fn refuse_a_bad_surface(state: &AppState, plugin: &LoadedPlugin) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value mustn't show through its mask, and one whose end falls inside a
+    /// multi-byte character mustn't take the request down.
+    #[test]
+    fn a_secret_masks_the_same_whatever_its_value() {
+        let key = [6u8; 32];
+        let seal = |value: &str| {
+            serde_json::Value::String(BASE64.encode(encrypt(&key, value.as_bytes()).unwrap()))
+        };
+        let secrets = serde_json::Map::from_iter([
+            ("LONG".to_string(), seal("abcdefghijkl")),
+            ("MULTIBYTE".to_string(), seal("pässwörd-✨✨✨")),
+            ("SHORT".to_string(), seal("ab")),
+        ]);
+
+        let masked = masked_secrets(&secrets, &crate::plugin::encryption::Keyring::from(key));
+
+        assert_eq!(masked.len(), 3);
+        assert!(masked.values().all(|value| value == SECRET_MASK));
+    }
+    /// Only the exact mask keeps a stored secret. A new value that merely
+    /// starts with asterisks is a new value.
+    #[test]
+    fn only_the_exact_mask_keeps_a_stored_secret() {
+        let key = [6u8; 32];
+        let existing = HashMap::from([
+            ("KEPT".to_string(), "stored-kept".to_string()),
+            ("REPLACED".to_string(), "stored-replaced".to_string()),
+            ("CLEARED".to_string(), "stored-cleared".to_string()),
+        ]);
+        let incoming = HashMap::from([
+            ("KEPT".to_string(), SECRET_MASK.to_string()),
+            ("REPLACED".to_string(), format!("{SECRET_MASK}-and-more")),
+            ("CLEARED".to_string(), String::new()),
+        ]);
+
+        let merged = merge_secrets(&existing, incoming, &key).unwrap();
+
+        assert_eq!(merged["KEPT"], "stored-kept");
+        let replaced = BASE64.decode(merged["REPLACED"].as_str().unwrap()).unwrap();
+        let replaced = crate::plugin::encryption::Keyring::from(key)
+            .decrypt(&replaced)
+            .unwrap();
+        assert_eq!(replaced, b"********-and-more");
+        assert!(!merged.contains_key("CLEARED"));
+    }
+
     use crate::plugin::official_registry::{CatalogueEntry, ChannelEntry, ReleaseEntry};
 
     fn release(version: &str) -> ReleaseEntry {

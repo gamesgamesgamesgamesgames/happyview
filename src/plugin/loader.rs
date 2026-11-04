@@ -653,8 +653,12 @@ pub fn validate_secrets(
     Ok(())
 }
 
-/// Parse PLUGIN_URLS environment variable
-/// Format: id|url|sha256:hash,id|url|sha256:hash,...
+/// Parse `PLUGIN_URLS`: `id|url|sha256:hash,id|url|sha256:hash,...`.
+///
+/// These plugins are loaded from the environment at every boot, so the
+/// operator's list wins over anything the owner changed. Plugins an instance
+/// should start with and then leave to its owner are
+/// `HAPPYVIEW_DEFAULT_PLUGINS` (`admin::default_plugins`), installed once.
 pub fn parse_plugin_urls(env_value: &str) -> Vec<(String, String, Option<String>)> {
     env_value
         .split(',')

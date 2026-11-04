@@ -88,7 +88,8 @@ pub async fn ensure_fresh_tokens(
     did: &str,
     plugin_id: &str,
 ) -> Result<RefreshOutcome, RefreshError> {
-    let encryption_key = app_state.config.token_encryption_key.as_ref();
+    let keys = app_state.config.keyring();
+    let encryption_key = keys.as_ref();
     let stored = tokens::get_tokens(
         &app_state.db,
         app_state.db_backend,
@@ -146,7 +147,7 @@ async fn refresh_through_plugin(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         plugin_id,
     )
     .await;

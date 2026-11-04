@@ -1281,6 +1281,10 @@ impl<'l> HostImports<'l> {
     /// charged to the script. A job run whose worker lost its lease traps on
     /// entry instead, so the import's side effect does not happen alongside
     /// the run that took the job over.
+    ///
+    /// A measured script run is told how long the import took. That span
+    /// includes the guest allocation `write_guest_response` makes for the
+    /// answer, a few microseconds of guest time counted as host time.
     pub(crate) fn define<Params, R, F>(
         &mut self,
         name: &'static str,
@@ -1308,7 +1312,17 @@ impl<'l> HostImports<'l> {
                         return Err(wasmtime::Error::msg(LEASE_LOST));
                     }
                     suspend_guest_deadline(&mut caller);
+                    let started = std::time::Instant::now();
                     let out = f(&mut caller, params).await;
+                    let elapsed = started.elapsed();
+                    if let Some(metrics) = caller
+                        .data()
+                        .script_run
+                        .as_ref()
+                        .and_then(|run| run.metrics.as_ref())
+                    {
+                        metrics.record_host(name, elapsed);
+                    }
                     resume_guest_deadline(&mut caller);
                     Ok(out)
                 })
@@ -1328,11 +1342,15 @@ fn suspend_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
 /// interrupted as soon as it resumes rather than repeating the job's side
 /// effects alongside the run that took the job over.
 fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
-    let remaining = caller.data_mut().deadline.resume();
     let lost = lease_lost(caller);
-    caller
-        .as_context_mut()
-        .set_epoch_deadline(if lost { 0 } else { remaining });
+    let deadline = &mut caller.data_mut().deadline;
+    if lost {
+        // Spent rather than only re-armed at zero: the epoch callback would
+        // otherwise find budget left and let the guest carry on.
+        deadline.exhaust();
+    }
+    let delta = deadline.resume();
+    caller.as_context_mut().set_epoch_deadline(delta);
 }
 
 /// Why a job run that lost its lease stops at a host import.
@@ -1681,17 +1699,9 @@ async fn host_http_request_impl(
         unrestricted
     };
 
-    let ctx = match build_host_context(caller.data()) {
-        Some(c) => c,
-        None => {
-            tracing::error!("host_http_request: failed to build host context (db missing?)");
-            return 0;
-        }
-    };
-
     let result = {
         let usage = &mut caller.data_mut().usage;
-        super::http_request(&ctx, usage, request, unrestricted).await
+        super::http_request(usage, request, unrestricted).await
     };
 
     let response_bytes = match result {

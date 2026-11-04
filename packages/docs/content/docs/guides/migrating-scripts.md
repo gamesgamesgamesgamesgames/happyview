@@ -16,7 +16,7 @@ A codemod does the rewrite for you — from the script editor or a CLI — and l
 |---|---|---|
 | Procedure | `input` | `input` — the name is unchanged, but it is now `handle`'s first parameter rather than a global, so a read outside `handle` is [hoisted](#hoisting-input-and-ctx) |
 | Procedure | `params` | `ctx.params` |
-| Procedure, Query | `collection` | `ctx.collection` |
+| Procedure, Query | `collection`, `ctx.collection` | The NSID the v2 lexicon's `target_collection` named, as a string literal; see [The collection a query or procedure names](#the-collection-a-query-or-procedure-names) |
 | Query | `params` | `input` |
 | Record event | `event` | `input` |
 | Record event | `record`, `action`, `uri`, `did`, `collection`, `rkey` | `input.record`, `input.action`, `input.uri`, `input.did`, `input.collection`, `input.rkey` |
@@ -25,6 +25,12 @@ A codemod does the rewrite for you — from the script editor or a CLI — and l
 | Job | `job.input` | `input` |
 | Job | `job.id`, `job.progress`, `job.should_stop`, `job.wait` | `ctx.job.id`, `ctx.job.progress`, `ctx.job.should_stop`, `ctx.job.wait` |
 | Job | `job.log(x)`, `job.warn(x)` | `log.info(x)`, `log.warn(x)` |
+
+### The collection a query or procedure names
+
+v3 gives a query or procedure no collection: `target_collection` is gone from lexicons, and `ctx.collection` is set only for record events. A v2 query or procedure that read its `collection` global, or `ctx.collection`, gets the NSID written in as a literal, so `db.records(collection)` becomes `db.records("xyz.statusphere.status")`.
+
+The NSID comes from the v2 lexicon. The upgrade's migration copies each lexicon's `target_collection` into a table before it drops the column, and database mode and the script editor's **Migrate** look the script's trigger NSID up there. In `--file` or `--stdin` mode, pass it with `--collection NSID`. When the codemod doesn't know the collection, because the v2 lexicon named none or no `--collection` was given, it leaves [marker 17](#markers) on the read.
 
 ### Hoisting `input` and `ctx`
 
@@ -123,13 +129,14 @@ These are the only markers the codemod emits, each substituting the specific nam
 14. `{name} depends on the script's trigger kind -- re-run the codemod with that kind, or rewrite it by hand` — a kind-dependent name (`record`, `uri`, `did`, `collection`, …) in a script whose trigger kind the codemod couldn't determine.
 15. `{name} is not a global in a {kind} script -- rewrite it by hand` — a removed global referenced in a script where that name never meant anything for its kind (e.g. `params` in a record script).
 16. `this runs while the script loads, before handle receives input and ctx -- move the read into handle, or into a function handle calls` — a read of `input` or any context global (`env`, `params`, `caller_did`, …) at file scope, outside every function, such as `local BASE = env.API_URL`. v2 set its globals before loading the script; v3 passes `input` and `ctx` to `handle`, which runs after the load, so nothing the codemod could write there would have a value yet.
+17. `v3 supplies no collection to a query or procedure -- write the NSID of the collection this script reads or writes` — a `collection` or `ctx.collection` read in a query or procedure whose collection the codemod doesn't know; see [The collection a query or procedure names](#the-collection-a-query-or-procedure-names).
 
 ## What happens to an unmigrated script
 
 A script stored before the upgrade stays in the table untouched, and the scripts list flags it with the globals it still references. It fails the first time it reads one of them, with an error that names the global:
 
 ```
-the 'params' global was removed in v3; run the script codemod (Settings → Scripts → Migrate, or happyview-codemod) -- see the Migrating scripts guide
+the 'params' global was removed in v3; run the script codemod (Migrate on the script's page under Integrations → Scripts, or happyview-codemod) -- see the Migrating scripts guide
 ```
 
 Only the removed names raise. Any other undefined name is `nil`, as in plain Lua, and a script may still assign its own globals, including one that reuses a removed name.
@@ -156,6 +163,10 @@ Migrate works on the stored script. When a save is refused for referencing a rem
 # A single file or stdin, given the kind (input's shape depends on it)
 happyview-codemod --file path/to/script.lua --kind procedure
 cat script.lua | happyview-codemod --stdin --kind query
+
+# A query or procedure that reads its collection takes the NSID the v2
+# lexicon's target_collection named
+happyview-codemod --file path/to/script.lua --kind query --collection xyz.statusphere.status
 
 # KIND is one of: procedure, query, record, label, job
 

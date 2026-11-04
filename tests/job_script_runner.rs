@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use common::app::TestApp;
 use common::echo_interpreter;
+use common::workers::Workers;
 
 const TYPE: &str = "test.probe";
 
@@ -184,9 +185,9 @@ async fn await_running(app: &TestApp, id: &str) {
 
 /// Run the worker until `id` reaches a terminal state, then stop it.
 async fn run_to_completion(app: &TestApp, id: &str) -> JobRow {
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let row = await_terminal(app, id).await;
-    worker.abort();
+    workers.stop().await;
     row
 }
 
@@ -462,17 +463,13 @@ async fn a_running_jobs_lease_is_renewed_while_it_runs() {
     seed_script(&app, TYPE, "host:job_wait").await;
     let id = seed_job(&app, TYPE, &json!({ "seconds": 1.0 })).await;
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker_renewing(
-        app.state.clone(),
-        "renewing".into(),
-        Duration::from_millis(100),
-    ));
+    let workers = Workers::renewing(&app.state, "renewing", Duration::from_millis(100));
     await_running(&app, &id).await;
     let claimed = lease_until(&app, &id).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     let renewed = lease_until(&app, &id).await;
     let row = await_terminal(&app, &id).await;
-    worker.abort();
+    workers.stop().await;
 
     assert!(
         renewed > claimed,
@@ -494,6 +491,41 @@ async fn lease_until(app: &TestApp, id: &str) -> Option<i64> {
     until
 }
 
+/// Stopping a worker lets the job it is running finish, and returns only once
+/// the job's thread has: after its outcome and its event log are written. A
+/// test that aborted the worker instead could drop its runtime while that
+/// thread still awaited the event log, and hang there.
+#[tokio::test]
+#[serial]
+async fn stopping_a_worker_waits_for_the_job_it_is_running() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    seed_script(&app, TYPE, "host:job_wait").await;
+    let id = seed_job(&app, TYPE, &json!({ "seconds": 1.0 })).await;
+
+    let workers = Workers::one(&app.state);
+    await_running(&app, &id).await;
+    workers.stop().await;
+
+    let row = job_row(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    let sql = happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = ? AND subject = ?",
+        app.state.db_backend,
+    );
+    let (logged,): (i64,) = happyview::db::query_as(&sql)
+        .bind("job.completed")
+        .bind(TYPE)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("count the job's completion events");
+    assert_eq!(
+        logged, 1,
+        "the job's completion was not logged before the worker stopped"
+    );
+}
+
 /// A cooperative exit is not a failure: the job lands in the state that was
 /// asked for and records neither a result nor an error.
 #[tokio::test]
@@ -509,11 +541,11 @@ async fn a_stop_asked_for_mid_run_lands_the_job_in_the_state_it_named() {
         seed_script(&app, &job_type, "host:job_wait").await;
         let id = seed_job(&app, &job_type, &json!({ "seconds": 1.0 })).await;
 
-        let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+        let workers = Workers::one(&app.state);
         await_running(&app, &id).await;
         set_status(&app, &id, asked).await;
         let row = await_terminal(&app, &id).await;
-        worker.abort();
+        workers.stop().await;
 
         assert_eq!(row.status, landed, "{asked}");
         assert!(row.result.is_none(), "{asked}: {:?}", row.result);

@@ -29,7 +29,7 @@ pub async fn rotate_instance_key(state: &AppState) -> Result<(ClientKey, u64), A
     let new_key = client_keys::rotate_key(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         INSTANCE_OWNER,
     )
     .await?;
@@ -50,7 +50,7 @@ pub async fn stage_instance_key(state: &AppState) -> Result<(ClientKey, Option<S
     let (key, activates_at) = client_keys::stage_key(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         INSTANCE_OWNER,
     )
     .await?;
@@ -93,7 +93,7 @@ pub async fn promote_and_install(state: &AppState) -> Result<(), AppError> {
     let current = client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         INSTANCE_OWNER,
     )
     .await?
@@ -136,6 +136,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
         state.db.clone(),
         state.db_backend,
         new_key,
+        state.config.keyring(),
     ) {
         Ok(client) => {
             let client = Arc::new(client);
@@ -203,6 +204,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
             state.db.clone(),
             state.db_backend,
             new_key,
+            state.config.keyring(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);
@@ -242,6 +244,7 @@ async fn install_instance_key(state: &AppState, new_key: &ClientKey) {
             state.db.clone(),
             state.db_backend,
             Some(vec![jwk]),
+            state.config.keyring(),
         ) {
             Ok(client) => {
                 let client = Arc::new(client);

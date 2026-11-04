@@ -5,7 +5,8 @@
 //! It interprets nothing: `source` is a directive. Anything it does not
 //! recognise echoes the whole `execute` input back as the returned value.
 //! `host:module_resolve` asks the host for `payload.specifier` imported from
-//! `payload.referrer`, the run's own chunk by default.
+//! `payload.referrer`, the run's own chunk by default. `counted:<n>` returns
+//! nothing and reports `n` instructions used.
 //!
 //! `validate` with `prepare` returns the source's own bytes as an
 //! `echo-source` artifact, unless the source starts `no-artifact`, and an
@@ -586,6 +587,11 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
 
     let out = if let Some(kind) = source.strip_prefix("error:") {
         failed(kind, &chunk)
+    } else if let Some(n) = source.strip_prefix("counted:") {
+        // An interpreter that counts what it ran, beside its output.
+        let mut out = returned(Value::Null, "none");
+        out["instructions_used"] = json!(n.parse::<u64>().unwrap_or(0));
+        out
     } else if let Some(literal) = source.strip_prefix("returns:") {
         // A value chosen by the caller, for a host branch that reads the
         // returned value's own fields rather than only its kind.

@@ -8,8 +8,8 @@ use tokio::sync::watch;
 
 use happyview_provider::{
     Action, BackfillError, BackfillRequest, BatchOutcome, Host, IngestCounters, IngestOutcome,
-    InstanceInfo, ProviderDb, ProviderError, ProviderEvent, RecordSource, ResolveError, Severity,
-    SourceEvent,
+    InstanceInfo, JobHookStats, ProviderDb, ProviderError, ProviderEvent, RecordSource,
+    ResolveError, Severity, SourceEvent,
 };
 use happyview_source_jetstream::JetstreamSource;
 use happyview_source_jetstream::archive::ArchiveConfig;
@@ -89,7 +89,28 @@ impl Host for AppHost {
     }
 
     async fn setting(&self, key: &str) -> Option<String> {
-        crate::admin::settings::get_setting(&self.state.db, key, self.state.db_backend).await
+        let value =
+            crate::admin::settings::get_setting(&self.state.db, key, self.state.db_backend).await;
+        // The log_retention_days ceiling holds the source's backfill history
+        // down too: what it reads is the setting, capped (HAP-227).
+        if key == "backfill_retention_days" {
+            let limits = self.state.limits.limits();
+            if limits
+                .cap_of(happyview_provider::Limit::LogRetentionDays)
+                .is_some()
+            {
+                let configured = value
+                    .as_deref()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(crate::limits::BACKFILL_RETENTION_DEFAULT_DAYS);
+                return Some(
+                    limits
+                        .cap(happyview_provider::Limit::LogRetentionDays, configured)
+                        .to_string(),
+                );
+            }
+        }
+        value
     }
 
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
@@ -148,6 +169,32 @@ impl Host for AppHost {
 
     fn counters(&self) -> Arc<IngestCounters> {
         Arc::clone(&self.state.telemetry_counters.ingest)
+    }
+
+    fn observe_job_stage(
+        &self,
+        job_id: &str,
+        stage: &'static str,
+        elapsed: std::time::Duration,
+        n: u64,
+    ) {
+        self.state.metrics.observe_job(job_id, stage, elapsed, n);
+    }
+
+    fn note_job_progress(&self, job_id: &str, processed: i64, total: Option<i64>) {
+        self.state.metrics.job_progress(job_id, processed, total);
+    }
+
+    fn job_hook_stats_due(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.job_stats_due(job_id)
+    }
+
+    fn job_hook_stats(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.job_stats(job_id)
+    }
+
+    fn finish_job_hook_stats(&self, job_id: &str) -> Option<JobHookStats> {
+        self.state.metrics.finish_job(job_id)
     }
 }
 
@@ -241,5 +288,60 @@ impl RecordSource for WeakSource {
             Some(source) => source.metrics().await,
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use happyview_provider::{Cap, FixedLimits, Limits};
+
+    fn ceiling(max: u32) -> Arc<FixedLimits> {
+        Arc::new(FixedLimits::new(Limits {
+            log_retention_days: Some(Cap {
+                max,
+                wording: Default::default(),
+            }),
+            ..Limits::default()
+        }))
+    }
+
+    /// HAP-227: the source's backfill history follows the log retention
+    /// ceiling, whether the setting is unset, forever or over it.
+    #[tokio::test]
+    async fn backfill_retention_reads_capped_by_the_ceiling() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let read = |state: &AppState| {
+            let host = AppHost::new(state.clone());
+            async move { host.setting("backfill_retention_days").await }
+        };
+        assert_eq!(
+            read(&state).await,
+            None,
+            "no ceiling, nothing set: the source's default"
+        );
+
+        state.limits = ceiling(3);
+        assert_eq!(
+            read(&state).await.as_deref(),
+            Some("3"),
+            "unset: the default, capped"
+        );
+        let (db, backend) = (state.db.clone(), state.db_backend);
+        for (stored, read_as) in [("0", "3"), ("30", "3"), ("2", "2")] {
+            crate::admin::settings::put_setting(&db, "backfill_retention_days", stored, backend)
+                .await
+                .unwrap();
+            assert_eq!(read(&state).await.as_deref(), Some(read_as), "{stored}");
+        }
+
+        // Other settings are read as stored.
+        crate::admin::settings::put_setting(&db, "app_name", "Mine", backend)
+            .await
+            .unwrap();
+        let host = AppHost::new(state.clone());
+        assert_eq!(host.setting("app_name").await.as_deref(), Some("Mine"));
     }
 }

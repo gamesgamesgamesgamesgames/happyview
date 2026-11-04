@@ -1,7 +1,7 @@
 export type SettingEntry = {
   key: string;
   value: string;
-  source: "database" | "env" | "project";
+  source: "database" | "env" | "project" | "platform";
 };
 
 export type InstanceSettings = {

@@ -20,6 +20,10 @@ pub struct CallerSession {
     /// Crate-visible because `PdsAuth` is: how this instance holds the user's
     /// credentials is not a plugin's business.
     pub(crate) pds_auth: Arc<PdsAuth>,
+    /// The delegated account's own session, for writes to its repo. A DPoP
+    /// session is keyed by the account it signs for, so the caller's session
+    /// cannot write there; reads of the caller's account still use theirs.
+    pub(crate) delegate_pds_auth: Option<Arc<PdsAuth>>,
     pub app_state: AppState,
 }
 
@@ -27,6 +31,17 @@ impl CallerSession {
     /// The repo a record write targets when the caller names none.
     pub fn default_repo(&self) -> &str {
         self.delegate_did.as_deref().unwrap_or(&self.did)
+    }
+
+    /// The session a write to `repo` goes out under: the delegated account's
+    /// own for its repo, the caller's for anything else. `None` names the
+    /// delegated account that has no session with this app.
+    pub(crate) fn auth_for(&self, repo: &str) -> Result<&PdsAuth, &str> {
+        match (self.delegate_did.as_deref(), &self.delegate_pds_auth) {
+            (Some(did), Some(auth)) if did == repo => Ok(auth),
+            (Some(did), None) if did == repo => Err(did),
+            _ => Ok(&self.pds_auth),
+        }
     }
 }
 

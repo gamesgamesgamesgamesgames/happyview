@@ -520,7 +520,6 @@ async fn put_record_creates_updates_and_rejects_stale_swap() {
     assert_eq!(resp4.status(), StatusCode::CREATED);
 }
 
-/// A non-member cannot putRecord into a space.
 /// Every write reads the author's repo state and then writes on it. Begun
 /// deferred on SQLite, a write whose read predates another's commit cannot
 /// take the write lock and fails at once with `SQLITE_BUSY_SNAPSHOT` instead
@@ -558,6 +557,66 @@ async fn concurrent_writes_to_one_space_all_land() {
     );
 }
 
+/// An author's first writes to a space, arriving together. On Postgres, one
+/// that created the author's repo state before taking the space lock
+/// deadlocked against one that already held the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_first_writes_to_fresh_spaces_all_land() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    const WRITERS: usize = 12;
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    for space in 0..20 {
+        let skey = rand_skey(&format!("first-{space}"));
+        let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
+        add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let writes: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let record = json!({ "$type": "com.example.doc", "n": i });
+                let cookie = Some(cookie_for(&app, &writer));
+                let req = match i % 3 {
+                    0 => create_record_req(&space_uri, "com.example.doc", &record, cookie),
+                    1 => put_record_req(
+                        &space_uri,
+                        "com.example.doc",
+                        &format!("rk{i}"),
+                        &record,
+                        None,
+                        cookie,
+                    ),
+                    _ => apply_writes_req(
+                        &space_uri,
+                        json!([{ "action": "create", "collection": "com.example.doc", "value": record }]),
+                        None,
+                        cookie,
+                    ),
+                };
+                let router = app.router.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    router.oneshot(req).await
+                })
+            })
+            .collect();
+        let mut statuses = Vec::new();
+        for write in writes {
+            statuses.push(write.await.unwrap().unwrap().status());
+        }
+        assert!(
+            statuses.iter().all(|s| s.is_success()),
+            "space {space}: {statuses:?}"
+        );
+    }
+}
+
+/// A non-member cannot putRecord into a space.
 #[tokio::test]
 #[serial]
 async fn put_record_rejects_non_member() {
@@ -1323,6 +1382,58 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
         .await
         .unwrap();
     assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A batch for a repo hosted on its author's PDS is checked against
+/// `allowedCollections` before it is forwarded, as a single write is: the
+/// answer is the collection's 400, not the forward's.
+#[tokio::test]
+#[serial]
+async fn apply_writes_checks_allowed_collections_before_forwarding() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space_with_config(
+        &app,
+        &authority,
+        &skey,
+        config_with_allowed_collections(&["com.example.allowed"]),
+    )
+    .await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut repo_state =
+        spaces_db::get_or_create_repo_state(&mut conn, app.state.db_backend, &space_id, &writer)
+            .await
+            .unwrap();
+    repo_state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    spaces_db::update_repo_state(&mut *conn, app.state.db_backend, &repo_state)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let writes = json!([write_op_create(
+        "com.example.denied",
+        None,
+        &json!({ "text": "should be rejected" }),
+    )]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// A space whose config declares `allowedCollections` must reject an

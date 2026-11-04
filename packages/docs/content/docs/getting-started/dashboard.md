@@ -59,7 +59,7 @@ Navigate to **Dead Letters** to view records that failed to index. Each entry sh
 
 ### Users
 
-Navigate to **Users** to manage who can access the admin API and dashboard. You can add users by DID, assign permissions individually or via a template (`viewer`, `operator`, `manager`, `full_access`), and remove users. The super user is highlighted and has all permissions by default. See [Permissions](../guides/permissions.md) for what each permission grants.
+Navigate to **Users** to manage who can access the admin API and dashboard. You can add users by DID, assign permissions individually or via a template (`viewer`, `maintainer`, `manager`, `full_access`), and remove users. The super user is highlighted and has all permissions by default. See [Permissions](../guides/permissions.md) for what each permission grants.
 
 ### API Keys
 
@@ -70,6 +70,18 @@ Create and revoke admin API keys for automation. Each key is scoped to specific 
 Register and manage third-party API clients. Each client gets an `hvc_…` client key and `hvs_…` client secret. You can configure the client type (confidential or public), allowed origins, scopes, and per-client rate limits. See [Authentication — API client identification](authentication.md#xrpc-api-client-identification) for how clients are used.
 
 ## Integrations
+
+### Script performance
+
+Navigate to **Script Performance** to see how your scripts are running. It needs the `metrics:read` [permission](../guides/permissions.md), and the entry is hidden without it. Pick a window of 1 hour, 24 hours, 7 days or 30 days.
+
+- **Scripts** lists every script that ran in the window: its runs, p50, p95 and max run time, errors and timeouts, peak memory, and the mean time spent in the script's own code and in the host calls it made. It is sorted by runs, and any column can be sorted.
+- Select a script to graph it over the window: runs, run time (p50 and p95, with max as a faint line) and errors and timeouts. **Where a run's time goes** splits a mean run into the script's part (its code and host calls, with the busiest host calls by name) and the platform's part (preparing the input, linking and allocating the instance, settling and teardown). This is how to tell a slow script from a slow platform.
+- **Record pipeline** shows, for each collection and action, how many records came in, their rate and p50 and p95, how much of a record's time its hook's script took against the platform, the mean of each stage, and how many records failed, timed out or were dead-lettered.
+
+A saved script's page also shows a one-line summary of its last hour, such as "Last hour: 12,400 runs · p95 3.1 ms · 0 errors", that links to its graphs. The line is left out when the script has not run in the last hour.
+
+If metrics are switched off with the `script_metrics_enabled` setting, the page says so. The 7- and 30-day windows show only what retention keeps. See [Metrics](../api-reference/admin/metrics.md) for what each number measures.
 
 ### Plugins
 

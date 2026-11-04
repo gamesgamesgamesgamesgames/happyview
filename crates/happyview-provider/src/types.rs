@@ -254,3 +254,45 @@ mod tests {
         assert_eq!(serde_json::to_string(&Severity::Warn).unwrap(), "\"warn\"");
     }
 }
+
+/// What a backfill job's records cost in hooks so far, as HappyView measured
+/// them ([`crate::Host::job_hook_stats`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobHookStats {
+    /// Records the job delivered that reached a hook decision, whether or not
+    /// a hook was set for them.
+    pub done: u64,
+    /// Records whose hook failed at least once, retries included.
+    pub failed: u64,
+    /// Records whose hook ran out of time at least once.
+    pub timeouts: u64,
+    /// Records whose hook was given up on and dead-lettered.
+    pub dead_lettered: u64,
+    /// Records not stored: the hook skipped them or their CID did not match.
+    pub skipped: u64,
+    /// `done` by what was decided: `proceed`, `replace`, `skip`,
+    /// `cid_mismatch`.
+    pub outcomes: std::collections::BTreeMap<String, u64>,
+    /// Records per second over about the last 30 seconds; the average until
+    /// a second has passed.
+    pub rate_per_s: f64,
+    /// Records per second since the job's first record.
+    pub avg_rate_per_s: f64,
+    /// Seconds left, from the job's reported progress against its total.
+    /// `None` without a total, or before progress has moved.
+    pub eta_s: Option<f64>,
+    pub record_ms_p50: Option<f64>,
+    /// The hook's own time: its guest code plus the host calls it made.
+    pub script_ms_p50: Option<f64>,
+    /// Script time over record time, from 0 to 1.
+    pub script_share: Option<f64>,
+    /// Per stage, the records it covered and their mean. A stage whose name
+    /// ends in `_skipped` is a count, and its mean is `None`.
+    pub stages: std::collections::BTreeMap<String, StageStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StageStats {
+    pub n: u64,
+    pub ms_mean: Option<f64>,
+}
