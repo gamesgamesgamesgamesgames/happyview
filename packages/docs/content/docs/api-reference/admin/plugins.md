@@ -386,7 +386,7 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 | `url`                    | string     | one of   | URL to the plugin's `manifest.json`                                                                  |
 | `registry`               | object     | one of   | `{ did, name, channel? , version?, expected_version? }`: a registry project and the channel to follow (`latest` by default) or the version to pin. `expected_version` is the version a preview showed: when the project now resolves to another, the install is refused with `409 Conflict`. The install records the project, the channel, the version and the CIDs its files were checked against, and the project's DID as its publisher |
 | `sha256`                 | string     | no       | Optional sha256 of the WASM binary, with `url` only. If provided, install fails when the downloaded hash mismatches |
-| `accepted_capabilities`  | string[]   | no       | Capability names the operator consents to grant (e.g. from a consent dialog built on `POST /admin/plugins/preview`'s `capabilities` report). When present, every capability the plugin would actually be granted must be covered, or the install is refused |
+| `accepted_capabilities`  | string[]   | yes, for a plugin that declares any | Capability names the operator consents to grant (e.g. from a consent dialog built on `POST /admin/plugins/preview`'s `capabilities` report). Every capability the plugin would actually be granted must be covered, or the install is refused. **Omitting it accepts nothing**, so a plugin that declares capabilities cannot be installed without listing them; a plugin that declares none installs either way |
 
 **Response**: `200 OK` returning the same `PluginSummary` shape as the list endpoint. `secrets_configured` will be `false` if the plugin requires any secrets — call `PUT /admin/plugins/{id}/secrets` to configure them before the plugin can run.
 
@@ -397,7 +397,7 @@ curl -X POST http://127.0.0.1:3000/admin/plugins \
 - The registry version may not be installed, its files don't match their CIDs, or its manifest names a plugin other than the project.
 - The plugin's `dependencies` aren't satisfied — a dependency isn't installed, an installed dependency's version doesn't satisfy the requirement, installing would create a dependency cycle, or the manifest depends on itself. The error names the specific dependency graph problem.
 - The manifest doesn't declare a capability its compiled imports require — the same check `preview` surfaces as `capabilities.undeclared`.
-- `accepted_capabilities` was provided but doesn't cover every capability the plugin would be granted — the error lists the missing capability names.
+- `accepted_capabilities` doesn't cover every capability the plugin would be granted — the error lists the missing capability names. An omitted `accepted_capabilities` accepts nothing, so every capability the plugin declares is listed as missing.
 
 A registry project or version that doesn't exist is `404 Not Found`; a registry that can't be read is `502 Bad Gateway`.
 
@@ -500,7 +500,7 @@ When a new URL is provided, the stored `sha256` is cleared (the new version has 
 
 A plugin that recorded a publisher stays with it, and no URL can be checked against a publisher, so a reload of such a plugin to a new URL is refused with `409 Conflict` and the installed version keeps running. Update it from the registry, or remove it and add it again from the URL. A plugin installed from a URL records no publisher and may be pointed at a new one.
 
-A reloaded version can import host functions the operator never consented to. `accepted_capabilities` guards a reload the same way it guards [`POST /admin/plugins`](#install-a-plugin): when present, every capability the reloaded plugin would be granted must be listed, or the reload is refused with `400 Bad Request` naming the missing ones. The check runs before the installed version is removed, so a refusal leaves it running.
+A reloaded version can import host functions the operator never consented to. `accepted_capabilities` guards a reload the same way it guards [`POST /admin/plugins`](#install-a-plugin): every capability the reloaded plugin would be granted must be listed, or the reload is refused with `400 Bad Request` naming the missing ones. Omitting the field — or the whole body — accepts nothing. The check runs before the installed version is removed, so a refusal leaves it running.
 
 ```json
 {

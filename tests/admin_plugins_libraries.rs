@@ -243,6 +243,70 @@ async fn install_requires_consent_to_cover_every_capability() {
     assert_eq!(status, 200);
 }
 
+/// Omitting `accepted_capabilities` grants nothing, rather than everything.
+///
+/// This is the shape the check used to miss: the field was optional, and an
+/// absent one skipped the comparison entirely, so a caller holding an admin
+/// credential installed a plugin with every capability it declared — here
+/// `caller:email` and `database:write`, both High risk — without any of them
+/// being accepted, and the install's event log recorded no capabilities at
+/// all. A body that says nothing cannot be read as consent to everything.
+#[tokio::test]
+#[serial]
+async fn install_without_an_accepted_list_accepts_nothing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    serve_plugin(
+        &app,
+        "silentplug",
+        &["caller:email", "database:write"],
+        &["host_caller_get_email", "host_db_execute"],
+    )
+    .await;
+    let url = format!("{}/silentplug/manifest.json", app.mock_server.uri());
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins", serde_json::json!({ "url": url }))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("caller:email"), "{error}");
+    assert!(error.contains("database:write"), "{error}");
+
+    // The refusal is about consent, not about the plugin: accepting both
+    // installs the very same plugin.
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            serde_json::json!({
+                "url": url,
+                "accepted_capabilities": ["caller:email", "database:write"],
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// A plugin that declares no capabilities still installs with no list.
+///
+/// Accepting nothing covers a declared set that is empty, so the stricter
+/// check costs nothing here. Worth pinning: it is why this change does not
+/// reach the registry and official-plugin tests, whose fixtures declare
+/// `"capabilities": []` and install without the field.
+#[tokio::test]
+#[serial]
+async fn a_plugin_declaring_no_capabilities_installs_without_an_accepted_list() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    serve_plugin(&app, "harmless", &[], &[]).await;
+    let url = format!("{}/harmless/manifest.json", app.mock_server.uri());
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins", serde_json::json!({ "url": url }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test]
 #[serial]
 async fn reload_requires_consent_to_cover_new_capabilities() {
@@ -309,6 +373,50 @@ async fn reload_requires_consent_to_cover_new_capabilities() {
         )
         .await;
     assert_eq!(status, 200);
+}
+
+/// A reload that names no accepted capabilities accepts none of them, and
+/// leaves the installed version running.
+///
+/// The reload body is optional in full, so this is the same hole as the
+/// install one and one step further: a caller could re-point an installed
+/// plugin at a build that imports anything and send no body at all. The
+/// refusal has to come before the old version is removed, or refusing the
+/// reload would still have uninstalled what was working.
+#[tokio::test]
+#[serial]
+async fn reload_without_an_accepted_list_accepts_nothing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    serve_plugin(&app, "quietplug", &["kv:read"], &["host_kv_get"]).await;
+    let v1_url = format!("{}/quietplug/manifest.json", app.mock_server.uri());
+    let (status, body) = app
+        .post_json_status(
+            "/admin/plugins",
+            serde_json::json!({"url": v1_url, "accepted_capabilities": ["kv:read"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = app
+        .post_json_status("/admin/plugins/quietplug/reload", serde_json::json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("kv:read"));
+
+    // Refused, and still installed with what it was installed with.
+    let body = app.get_json("/admin/plugins").await;
+    let still_there = body
+        .as_array()
+        .or_else(|| body["plugins"].as_array())
+        .expect("a list of plugins")
+        .iter()
+        .any(|p| p["id"] == "quietplug");
+    assert!(
+        still_there,
+        "the refused reload uninstalled the plugin: {body}"
+    );
 }
 
 /// A library module whose `get_api_surface` answers `surface` verbatim from a

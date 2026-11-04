@@ -809,19 +809,25 @@ pub(super) async fn preview(
     }))
 }
 
-/// If `accepted` was supplied, every capability `plugin` would actually be
-/// granted must be covered by it — used identically by `add` and `reload` so
-/// a reload can't silently bring in an import the operator never consented
-/// to. Returns the sorted, deduped capability names (for the event log
-/// detail) when a check was performed, or `None` when `accepted` was omitted
-/// (consent checking is opt-in on the wire).
+/// Every capability `plugin` would actually be granted must be covered by
+/// `accepted` — used identically by `add` and `reload`, so a reload can't
+/// silently bring in an import the operator never consented to. Returns the
+/// sorted, deduped capability names, for the event log detail.
+///
+/// **An omitted `accepted_capabilities` accepts nothing**, rather than
+/// skipping the check as it once did. Consent was opt-in on the wire: leaving
+/// the field out of the body installed the plugin with every capability it
+/// declared, `caller:email` and `database:write` included, and the event log
+/// then recorded no capabilities for an install that had granted them all.
+/// The consent dialog is the dashboard's, so the server cannot tell a caller
+/// who consented from one who never asked — all it can do is refuse the ones
+/// that did not say. A plugin declaring no capabilities still installs with
+/// the field absent, because there is then nothing to accept.
 fn check_capability_consent(
     plugin: &LoadedPlugin,
     accepted: &Option<Vec<String>>,
-) -> Result<Option<Vec<String>>, AppError> {
-    let Some(accepted) = accepted else {
-        return Ok(None);
-    };
+) -> Result<Vec<String>, AppError> {
+    let accepted: &[String] = accepted.as_deref().unwrap_or(&[]);
     let effective = capabilities::effective_set(plugin).map_err(AppError::BadRequest)?;
     let missing: Vec<&str> = effective
         .iter()
@@ -836,7 +842,8 @@ fn check_capability_consent(
     }
     let mut names: Vec<String> = effective.iter().map(|c| c.as_str().to_string()).collect();
     names.sort();
-    Ok(Some(names))
+    names.dedup();
+    Ok(names)
 }
 
 /// The registry release a loaded plugin was fetched from, if it was.
@@ -992,7 +999,7 @@ pub(super) async fn install(state: &AppState, req: Install<'_>) -> Result<Instal
     if let Consent::Operator = consent {
         tracing::info!(
             plugin = %plugin.info.id,
-            capabilities = %consented_capabilities.as_deref().unwrap_or_default().join(", "),
+            capabilities = %consented_capabilities.join(", "),
             "granting a default plugin every capability its manifest declares"
         );
     }
@@ -1042,9 +1049,7 @@ pub(super) async fn install(state: &AppState, req: Install<'_>) -> Result<Instal
         summary.sha256 = sha256.map(String::from);
     }
 
-    if let Some(caps) = consented_capabilities {
-        detail["capabilities"] = serde_json::json!(caps);
-    }
+    detail["capabilities"] = serde_json::json!(consented_capabilities);
 
     log_event(
         &state.db,
@@ -1324,9 +1329,7 @@ pub(super) async fn reload(
         }
     }
 
-    if let Some(caps) = consented_capabilities {
-        detail["capabilities"] = serde_json::json!(caps);
-    }
+    detail["capabilities"] = serde_json::json!(consented_capabilities);
 
     log_event(
         &state.db,
