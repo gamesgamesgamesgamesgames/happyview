@@ -149,11 +149,27 @@ async fn send_webhook(
     token: Option<&str>,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let mut request = http.post(&reg.endpoint).json(body);
+    webhook_request(http, reg, token, body).send().await
+}
+
+fn webhook_request(
+    http: &reqwest::Client,
+    reg: &NotifyRegistration,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    // A total bound, beyond the shared client's connect and read-inactivity
+    // timeouts: a receiver that answers a byte at a time would otherwise
+    // hold its space's delivery worker, and so every other webhook of the
+    // space, for as long as it liked.
+    let mut request = http
+        .post(&reg.endpoint)
+        .timeout(WEBHOOK_POST_TIMEOUT)
+        .json(body);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    request.send().await
+    request
 }
 
 /// One record a legacy webhook hears about.
@@ -200,6 +216,9 @@ pub async fn dispatch_write_notifications(
     Ok(())
 }
 
+/// How long one webhook POST may take in all.
+const WEBHOOK_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many writes may wait for one space's webhooks. Past that, a write's
 /// webhook deliveries are dropped with a warning: they are best effort, and
 /// a slow receiver mustn't hold an unbounded backlog.
@@ -243,7 +262,7 @@ pub fn announce_writes(
     };
     // Sending under the lock means a worker that removes itself (also under
     // the lock) can't miss a batch: see `webhook_worker`.
-    let mut queues = webhook_queues().lock().unwrap();
+    let mut queues = webhook_queues().lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..2 {
         let sender = queues
             .entry(space_id.to_string())
@@ -287,7 +306,7 @@ async fn webhook_worker(
             Err(_idle) => {
                 // Stop only if nothing arrived meanwhile: senders send under
                 // the same lock, so after this nothing reaches `rx`.
-                let mut queues = webhook_queues().lock().unwrap();
+                let mut queues = webhook_queues().lock().unwrap_or_else(|e| e.into_inner());
                 if rx.is_empty() {
                     queues.remove(&space_id);
                     return;
@@ -959,6 +978,24 @@ mod tests {
             ],
             "the delete must not overtake the put"
         );
+    }
+
+    #[test]
+    fn a_webhook_post_has_a_total_time_limit() {
+        let reg = NotifyRegistration {
+            id: "reg".into(),
+            space_id: "space".into(),
+            service: SERVICE.into(),
+            endpoint: "https://receiver.example/hook".into(),
+            registered_by: "did:plc:member".into(),
+            expires_at: "2999-01-01T00:00:00+00:00".into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            delivery: NotifyDelivery::Webhook,
+        };
+        let request = webhook_request(&reqwest::Client::new(), &reg, None, &payload())
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout(), Some(&WEBHOOK_POST_TIMEOUT));
     }
 
     #[tokio::test]
