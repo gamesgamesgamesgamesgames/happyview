@@ -429,11 +429,20 @@ pub(crate) async fn notify_ops(
         );
     }
 
+    let keyring = state.config.keyring();
+    let signer = keyring
+        .as_ref()
+        .map(|encryption_key| notifications::WebhookSigner {
+            encryption_key,
+            public_url: &state.config.public_url,
+            plc_url: &state.config.plc_url,
+        });
     for op in ops {
         let _ = notifications::dispatch_write_notification(
             &state.db,
             state.db_backend,
             &state.http,
+            signer,
             &space.id,
             author_did,
             &op.collection,

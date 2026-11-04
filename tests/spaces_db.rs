@@ -663,6 +663,7 @@ async fn a_registered_syncer_is_notified_of_every_writer() {
             &pool,
             backend,
             &http,
+            None,
             &space_id,
             author,
             "com.example.post",

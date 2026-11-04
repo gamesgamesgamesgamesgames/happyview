@@ -1967,10 +1967,18 @@ async fn notify_write(
     }
 
     if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
+        let keyring = state.config.keyring();
         notifications::dispatch_write_notification(
             &state.db,
             state.db_backend,
             &state.http,
+            keyring
+                .as_ref()
+                .map(|encryption_key| notifications::WebhookSigner {
+                    encryption_key,
+                    public_url: &state.config.public_url,
+                    plc_url: &state.config.plc_url,
+                }),
             &space.id,
             &writer,
             collection,
