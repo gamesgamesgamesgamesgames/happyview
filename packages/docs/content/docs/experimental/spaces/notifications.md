@@ -268,7 +268,7 @@ HappyView also checks every repo hosted on its author's PDS every 5 minutes, so 
 
 ## Notifying space deletion
 
-When a space is deleted, HappyView tells every service registered for it. A service registered by identifier receives `com.atproto.space.notifySpaceDeleted` at its endpoint, with service auth from HappyView and the body `{ "space": "<space URI>" }`. A legacy webhook receives `{ "space": "<space id>" }`. Delivery is best effort.
+When a space is deleted, HappyView tells every service registered for it. A service registered by identifier receives `com.atproto.space.notifySpaceDeleted` at its endpoint, with service auth from HappyView and the body `{ "space": "<space URI>" }`. A legacy webhook receives `{ "space": "<space id>" }`, with service auth whose `lxm` is `com.atproto.space.notifySpaceDeleted` (see [Verifying a webhook](#legacy-webhooks)). Delivery is best effort.
 
 The space's creator or a HappyView super admin can also send the same notification for a space that still exists by calling `com.atproto.space.notifySpaceDeleted` with `{ "space": "<space URI>" }`. HappyView responds with `{ "success": true }`.
 
@@ -285,7 +285,7 @@ The following forms are deprecated and kept until v3.
 }
 ```
 
-HappyView POSTs a JSON payload to the endpoint for each record created, updated, or deleted in the space, without authentication:
+HappyView POSTs a JSON payload to the endpoint for each record created, updated, or deleted in the space:
 
 | Field        | Type          | Description |
 | ------------ | ------------- | ----------- |
@@ -294,5 +294,14 @@ HappyView POSTs a JSON payload to the endpoint for each record created, updated,
 | `collection` | string (NSID) | Collection of the record |
 | `rkey`       | string        | Record key |
 | `cid`        | string?       | CID of the new record value, `null` for deletes |
+
+**Verifying a webhook.** Each webhook POST carries service auth from HappyView in `Authorization: Bearer <token>`, the same kind of JWT a registration by identifier receives:
+
+- `iss` is HappyView's instance DID. Verify the signature (`ES256`) against the `#atproto` key in that DID's document.
+- `aud` is the `serviceDid` the webhook was registered with. Refuse a token whose `aud` isn't your own DID.
+- `lxm` names what the payload is: `com.atproto.space.notifyWrite` for a record change, and `com.atproto.space.notifySpaceDeleted` for a space deletion.
+- `exp` is a short time after `iat`. Refuse an expired token.
+
+The payload is unchanged, so a receiver that doesn't check the header keeps working. An instance with no `TOKEN_ENCRYPTION_KEY`, or one that can't mint the token, still sends the payload, without the header.
 
 **Per-record notifyWrite.** `notifyWrite` also accepts `{space, did, collection, rkey, cid}` from the author, the space's creator, or a super admin. HappyView syncs the author's repo and sends the per-record payload to webhook registrations.
