@@ -1259,22 +1259,33 @@ impl RecordStore {
             return ext.delete_collection_batch(collection, limit).await;
         }
         let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
-        let ids: Vec<i64> = crate::db::query_as::<(i64,)>(&adapt_sql(
-            &format!(
-                "SELECT id FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID} LIMIT ?"
-            ),
-            self.backend,
-        ))
-        .bind(collection)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|(id,)| id)
-        .collect();
+        let ids: Vec<i64> =
+            crate::db::query_as::<(i64,)>(&Self::collection_batch_sql(self.backend))
+                .bind(collection)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect();
         let deleted = self.delete_ids(&mut tx, &ids).await?;
         tx.commit().await?;
         Ok(deleted)
+    }
+
+    /// The SQL picking a collection's next batch to delete. Ordered as
+    /// `idx_records_v2_collection_created_at_id` is, so the batch is read from
+    /// that index (pinned by a test): unordered, Postgres can't estimate a
+    /// collection named through a subquery, assumes it is most of the table
+    /// and scans every record to find a small collection's few.
+    pub(crate) fn collection_batch_sql(backend: DatabaseBackend) -> String {
+        adapt_sql(
+            &format!(
+                "SELECT id FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID} \
+                 ORDER BY created_at DESC, id DESC LIMIT ?"
+            ),
+            backend,
+        )
     }
 
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
@@ -2542,6 +2553,27 @@ mod tests {
                     backend,
                 );
             }
+        }
+    }
+
+    /// The ordered batch is read from the collection index with no sort. A
+    /// test table is too small to show the plan the order exists to avoid,
+    /// which only a large table's estimate produces; this pins that adding it
+    /// costs no sort.
+    #[tokio::test]
+    async fn a_collection_delete_batch_reads_the_collection_index() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let sql = crate::test_support::inline_binds_on(
+                &RecordStore::collection_batch_sql(backend),
+                backend,
+                &["'app.test.post'", "5000"],
+            );
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_v2_collection_created_at_id",
+                backend,
+            );
         }
     }
 
