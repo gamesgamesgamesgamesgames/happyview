@@ -188,6 +188,70 @@ curl http://127.0.0.1:3000/admin/scripts/languages -H "$AUTH"
 ["javascript", "lua", "typescript"]
 ```
 
+## List project modules
+
+```
+GET /admin/scripts/modules
+```
+
+**Permission:** `scripts:read`, the same as reading a script's body.
+
+The interpreter modules of the project this instance serves: the files under `src/` that an installed interpreter claims, that scripts import, and that are not handlers or tests themselves, with their source as the project's files hold it. Entries are sorted by `id`. The response is an empty array when no project is deployed.
+
+Only files from the project are listed. What an interpreter prepared from a file stays on the instance, and compiled modules declared under `[modules.*]` in `happyview.toml` are not listed, because they have no source here.
+
+```ts tab="TypeScript" tab-group="language"
+interface ProjectModule {
+  // The module id an import resolves to: the project-relative path.
+  id: string;
+  // Project-relative and /-separated, always under src/.
+  path: string;
+  // The language of the interpreter that claims the file's extension.
+  language: string;
+  source: string;
+}
+
+const response = await fetch("http://127.0.0.1:3000/admin/scripts/modules", {
+  headers,
+});
+const modules: ProjectModule[] = await response.json();
+```
+```js tab="JavaScript" tab-group="language"
+const response = await fetch("http://127.0.0.1:3000/admin/scripts/modules", {
+  headers,
+});
+const modules = await response.json();
+```
+```rust tab="Rust" tab-group="language"
+let response = client
+    .get("http://127.0.0.1:3000/admin/scripts/modules")
+    .bearer_auth(token)
+    .send()
+    .await?;
+let modules: serde_json::Value = response.json().await?;
+```
+```go tab="Go" tab-group="language"
+req, _ := http.NewRequest("GET", "http://127.0.0.1:3000/admin/scripts/modules", nil)
+req.Header.Set("Authorization", "Bearer "+token)
+resp, err := http.DefaultClient.Do(req)
+```
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/scripts/modules -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+```json
+[
+  {
+    "id": "src/lib/format.lua",
+    "path": "src/lib/format.lua",
+    "language": "lua",
+    "source": "local M = {}\n\nfunction M.title(s)\n  return (s:gsub(\"^%l\", string.upper))\nend\n\nreturn M\n"
+  }
+]
+```
+
 ## Get a script
 
 ```

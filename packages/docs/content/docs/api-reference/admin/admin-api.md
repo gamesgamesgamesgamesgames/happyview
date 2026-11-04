@@ -127,6 +127,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/scripts`                     | `scripts:read`             |
 | `POST /admin/scripts`                    | `scripts:manage`           |
 | `GET /admin/scripts/languages`           | `scripts:read`             |
+| `GET /admin/scripts/modules`             | `scripts:read`             |
 | `GET /admin/scripts/{id}`                | `scripts:read`             |
 | `PATCH /admin/scripts/{id}`              | `scripts:manage`           |
 | `DELETE /admin/scripts/{id}`             | `scripts:manage`           |

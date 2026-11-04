@@ -239,6 +239,44 @@ pub(super) async fn languages(
     Ok(Json(languages))
 }
 
+/// One interpreter module of the deployed project: a file under `src/` that
+/// scripts import and that is not itself a handler. Only what the project's
+/// files hold; what an interpreter prepared from it stays on the instance.
+#[derive(Debug, Serialize)]
+pub(super) struct ModuleSourceResponse {
+    /// The module id: its project-relative path, the string an import
+    /// resolves to.
+    pub id: String,
+    /// Project-relative and `/`-separated (`src/lib/format.lua`).
+    pub path: String,
+    /// The language of the interpreter that claims the file's extension.
+    pub language: String,
+    pub source: String,
+}
+
+/// `GET /admin/scripts/modules` — the interpreter modules of the project the
+/// instance serves, sorted by id. Empty when no project is deployed. Compiled
+/// modules have no source here and are not listed. Like `languages`, the path
+/// can't shadow a script, because no trigger id lacks a colon.
+pub(super) async fn modules(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<Vec<ModuleSourceResponse>>, AppError> {
+    auth.require(Permission::ScriptsRead).await?;
+    let snapshot = state.project.load_full();
+    let modules = snapshot
+        .modules
+        .values()
+        .map(|m| ModuleSourceResponse {
+            id: m.id.clone(),
+            path: crate::catalog::path_string(&m.path),
+            language: m.language_id.clone(),
+            source: m.source.to_string(),
+        })
+        .collect();
+    Ok(Json(modules))
+}
+
 /// `GET /admin/scripts/{id}` — fetch one row.
 pub(super) async fn get(
     State(state): State<AppState>,
