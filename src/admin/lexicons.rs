@@ -232,11 +232,15 @@ pub(super) async fn lexicon_record_count(
     if lexicon.lexicon_type != LexiconType::Record {
         return Err(AppError::BadRequest(not_a_record_lexicon(&id, &lexicon)));
     }
-    let count = state
-        .records
-        .count_collection(&id)
-        .await
-        .map_err(|e| AppError::Internal(format!("could not count '{id}': {e}")))?;
+    // The count only informs the confirm. One that fails leaves `count` null
+    // and the delete still offered, since deleting does not depend on it.
+    let count = match state.records.count_collection(&id).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(collection = %id, "could not count the collection for the delete confirm: {e}");
+            None
+        }
+    };
     // So the confirm can offer the option only where it would be honoured,
     // rather than showing a control the delete would refuse.
     let refusal = records_not_locally_deletable(&state, &id);

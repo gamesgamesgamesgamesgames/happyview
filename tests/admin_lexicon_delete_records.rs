@@ -137,7 +137,7 @@ async fn deleting_a_lexicon_can_also_delete_its_records() {
 #[tokio::test]
 async fn a_shared_collection_refuses_the_records_option() {
     let storage = std::sync::Arc::new(common::fake_storage::FakeStorage::claiming(&[GAME]).await);
-    let app = TestApp::new_with_external_storage(storage).await;
+    let app = TestApp::new_with_external_storage(storage.clone()).await;
 
     let (status, body) = app
         .post_json_status(
@@ -160,6 +160,20 @@ async fn a_shared_collection_refuses_the_records_option() {
             .is_some_and(|r| r.contains("shared record store")),
         "{counted}"
     );
+
+    // A count that fails answers null rather than failing the confirm.
+    storage
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let counted = app
+        .get_json(&format!("/admin/lexicons/{GAME}/record-count"))
+        .await;
+    storage
+        .down
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(counted["collection"], GAME, "{counted}");
+    assert!(counted["count"].is_null(), "{counted}");
+    assert_eq!(counted["deletable"], false, "{counted}");
 
     let (status, body) = app
         .delete_json(&format!("/admin/lexicons/{GAME}?delete_records=true"))

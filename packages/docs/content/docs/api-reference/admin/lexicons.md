@@ -499,6 +499,11 @@ collection, which is far more expensive than reading the lexicon. The dashboard
 asks for it when the delete confirmation opens. Record lexicons only; anything
 else is a `400`. Requires `lexicons:read` and `records:read`.
 
+`count` is `null` when the collection could not be counted, for example when
+the count timed out. Deleting the records doesn't depend on the count, so
+`deletable` still says whether they can be deleted, and a delete job run without
+a count reports its `total` as `null`.
+
 ## Lexicons a project file defines
 
 When the instance runs a project, a lexicon defined by a file under `src/` answers ahead of any stored row with the same id. Uploading, deleting, adding as a network lexicon or removing as one is refused with `409 Conflict`:

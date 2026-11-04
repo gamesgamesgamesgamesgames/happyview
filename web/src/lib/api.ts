@@ -323,7 +323,8 @@ export function deleteLexicon(id: string, deleteRecords = false) {
 export function getLexiconRecordCount(id: string) {
   return apiFetch<{
     collection: string;
-    count: number;
+    /** Null when the count could not be read; the delete does not need it. */
+    count: number | null;
     /** False when a shared record store serves this collection. */
     deletable: boolean;
     not_deletable_reason: string | null;

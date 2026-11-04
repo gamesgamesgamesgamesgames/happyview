@@ -42,6 +42,8 @@ export function DeleteLexiconDialog({
   const [deleteRecords, setDeleteRecords] = useState(false);
   const [count, setCount] = useState<number | null>(null);
   const [countFailed, setCountFailed] = useState(false);
+  /** The server answered but could not count the collection. */
+  const [countUnavailable, setCountUnavailable] = useState(false);
   /** Null until the count answers; false when a shared store serves it. */
   const [deletable, setDeletable] = useState<boolean | null>(null);
   const [notDeletable, setNotDeletable] = useState<string | null>(null);
@@ -64,10 +66,17 @@ export function DeleteLexiconDialog({
       setDeleteRecords(false);
       return;
     }
-    if (!hasRecords || !canDeleteRecords || count !== null) return;
+    if (
+      !hasRecords ||
+      !canDeleteRecords ||
+      count !== null ||
+      deletable !== null
+    )
+      return;
     getLexiconRecordCount(lexicon.id)
       .then((r) => {
         setCount(r.count);
+        setCountUnavailable(r.count === null);
         setDeletable(r.deletable);
         setNotDeletable(r.not_deletable_reason);
       })
@@ -76,8 +85,8 @@ export function DeleteLexiconDialog({
 
   const recordLabel =
     count === null
-      ? countFailed
-        ? "Also delete this collection's indexed records"
+      ? countFailed || countUnavailable
+        ? "Also delete this collection's indexed records (the count isn't available)"
         : "Also delete this collection's indexed records (counting…)"
       : `Also delete this collection's ${count.toLocaleString()} indexed ${
           count === 1 ? "record" : "records"
@@ -136,7 +145,7 @@ export function DeleteLexiconDialog({
             {!canDeleteRecords
               ? "The collection's indexed records will stay. Deleting them needs the records:delete-collection permission."
               : countFailed
-                ? "The collection's indexed records will stay: its record count could not be read."
+                ? "The collection's indexed records will stay: whether they can be deleted could not be checked."
                 : (notDeletable ??
                   "Checking whether this collection's records can be deleted…")}
           </p>
