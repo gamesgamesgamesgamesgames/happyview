@@ -1415,13 +1415,17 @@ async fn get_latest_commit(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    // An author who has never written here has no state, so no rev and no
+    // commit: what an unwritten state would hold.
     let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-
-    let commit = repo_state_commit_json(&repo_state, &params.space)?;
+        db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    let commit = match &repo_state {
+        Some(repo_state) => repo_state_commit_json(repo_state, &params.space)?,
+        None => None,
+    };
 
     Ok(Json(serde_json::json!({
-        "rev": repo_state.rev,
+        "rev": repo_state.and_then(|s| s.rev),
         "commit": commit,
     })))
 }
@@ -1459,16 +1463,15 @@ async fn get_repo(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    let no_commit = || AppError::NotFound("no commit exists for this repo".into());
+    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did)
+        .await?
+        .ok_or_else(no_commit)?;
     drop(conn);
     let records =
         db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
 
-    let hash = repo_state
-        .hash
-        .as_deref()
-        .ok_or_else(|| AppError::NotFound("no commit exists for this repo".into()))?;
+    let hash = repo_state.hash.as_deref().ok_or_else(no_commit)?;
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
@@ -1574,9 +1577,11 @@ async fn list_repo_ops(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-    let commit = repo_state_commit_json(&repo_state, &params.space)?;
+    let commit =
+        match db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await? {
+            Some(repo_state) => repo_state_commit_json(&repo_state, &params.space)?,
+            None => None,
+        };
 
     Ok(Json(serde_json::json!({
         "ops": ops,
