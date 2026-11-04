@@ -255,8 +255,9 @@ async fn a_credential_alone_is_anonymous_on_the_catch_all_when_the_gate_is_close
 }
 
 /// With the gate open, which is the default, the same calls go on to the
-/// method, unchanged from before. No lexicon serves it, so they reach the
-/// proxy, which can't resolve the NSID's authority and answers 502.
+/// method, unchanged from before: the gate doesn't refuse them. What the
+/// method then answers (no lexicon serves it, so the proxy tries the NSID's
+/// authority) depends on the network, so only the gate's answer is checked.
 #[tokio::test]
 #[serial]
 async fn a_credential_alone_reaches_the_catch_all_when_the_gate_is_open() {
@@ -279,8 +280,10 @@ async fn a_credential_alone_reaches_the_catch_all_when_the_gate_is_open() {
         .await;
         let status = resp.status();
         let body = json_of(resp).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{method}: {body}");
-        assert_ne!(body["error"], "LimitReached", "{method}: {body}");
+        assert!(
+            !(status == StatusCode::FORBIDDEN && body["error"] == "LimitReached"),
+            "{method}: the open gate refused it: {status} {body}"
+        );
     }
 }
 
