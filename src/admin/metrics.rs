@@ -64,8 +64,10 @@ fn read_failed(e: sqlx::Error) -> AppError {
 /// instance's memory and carry neither.
 async fn stored_fields(state: &AppState, window: Window, instances: Option<u64>, body: &mut Value) {
     if window.is_stored() {
-        body["retention_days"] =
-            json!(crate::metrics::retention::retention_days(&state.db, state.db_backend).await);
+        body["retention_days"] = json!(state.limits.limits().cap(
+            happyview_provider::Limit::LogRetentionDays,
+            crate::metrics::retention::retention_days(&state.db, state.db_backend).await
+        ));
         if let Some(instances) = instances {
             body["instances"] = json!(instances);
         }

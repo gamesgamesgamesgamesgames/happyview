@@ -462,6 +462,7 @@ pub async fn spawn_retention_cleanup(
     backend: DatabaseBackend,
     dead_letter_retention_days: u32,
     tombstone_retention_hours: u32,
+    limits: std::sync::Arc<dyn happyview_provider::LimitsProvider>,
 ) {
     let interval = tokio::time::Duration::from_secs(3600);
 
@@ -472,6 +473,7 @@ pub async fn spawn_retention_cleanup(
             backend,
             dead_letter_retention_days,
             tombstone_retention_hours,
+            &limits.limits(),
         )
         .await;
     }
@@ -491,6 +493,7 @@ pub(crate) async fn retention_pass(
     backend: DatabaseBackend,
     dead_letter_retention_days: u32,
     tombstone_retention_hours: u32,
+    limits: &happyview_provider::Limits,
 ) {
     let dead_letters = sweep_resolved_dead_letters(db, dead_letter_retention_days, backend).await;
     if dead_letters > 0 {
@@ -520,6 +523,10 @@ pub(crate) async fn retention_pass(
             .await
             .as_deref(),
     );
+    // The host's ceiling holds event and job logs to at most its days, a
+    // setting of 0 (forever) included. Protected events keep their own
+    // retention, worked out above from the setting as configured.
+    let retention_days = limits.cap(happyview_provider::Limit::LogRetentionDays, retention_days);
 
     // Ended grants go before the event sweep, so the protected pass sees the
     // hold their deletion lifts in the same tick.
@@ -1008,7 +1015,7 @@ mod tests {
         crate::admin::settings::put_setting(&pool, "event_log_retention_days", "0", backend)
             .await
             .unwrap();
-        retention_pass(&pool, backend, 30, 24).await;
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
         assert_eq!(
             messages().await,
             vec!["fifteen-days", "five-days"],
@@ -1018,8 +1025,54 @@ mod tests {
         crate::admin::settings::put_setting(&pool, "event_log_retention_days", "10", backend)
             .await
             .unwrap();
-        retention_pass(&pool, backend, 30, 24).await;
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
         assert_eq!(messages().await, vec!["five-days"]);
+    }
+
+    /// HAP-227: the host's log retention ceiling holds job logs and events to
+    /// its days, a setting of forever included, and leaves protected events
+    /// to their own retention.
+    #[tokio::test]
+    async fn the_hosts_ceiling_holds_logs_to_its_days() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let days_ago = |d: i64| (chrono::Utc::now() - chrono::Duration::days(d)).to_rfc3339();
+        insert_typed(&pool, "old-event", "record.created", &days_ago(5)).await;
+        insert_typed(&pool, "new-event", "record.created", &days_ago(1)).await;
+        insert_typed(&pool, "old-protected", "space.access_granted", &days_ago(5)).await;
+        crate::db::query(
+            "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) \
+             VALUES ('log', 'job-1', 'info', 'five-days', ?)",
+        )
+        .bind(days_ago(5))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ceiling = happyview_provider::Limits {
+            log_retention_days: Some(happyview_provider::Cap {
+                max: 3,
+                wording: Default::default(),
+            }),
+            ..Default::default()
+        };
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "0", backend)
+            .await
+            .unwrap();
+
+        retention_pass(&pool, backend, 30, 24, &ceiling).await;
+
+        let ids: Vec<(String,)> =
+            crate::db::query_as("SELECT id FROM happyview_event_logs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let ids: Vec<&str> = ids.iter().map(|(id,)| id.as_str()).collect();
+        assert_eq!(ids, ["new-event", "old-protected"]);
+        let (logs,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_job_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(logs, 0);
     }
 
     /// A grant that ended past the protected retention goes in the same pass
@@ -1048,7 +1101,7 @@ mod tests {
         .await
         .unwrap();
 
-        retention_pass(&pool, backend, 30, 24).await;
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
 
         let grants: (i64,) =
             crate::db::query_as("SELECT COUNT(*) FROM happyview_space_access_grants")

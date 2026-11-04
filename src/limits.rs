@@ -111,18 +111,26 @@ fn from_vars(get: &impl Fn(&str) -> Option<String>) -> Result<Limits, String> {
             allowed,
             wording: Wording::default(),
         });
-    Ok(Limits {
+    let limits = Limits {
         seats: number(Limit::Seats)?,
         api_clients: number(Limit::ApiClients)?,
         anonymous_xrpc: anonymous,
         log_retention_days: number(Limit::LogRetentionDays)?,
-    })
+    };
+    limits
+        .validate()
+        .map_err(|e| format!("{}: {e}", var_name(Limit::LogRetentionDays)))?;
+    Ok(limits)
 }
 
 /// Parse a limits file's text.
 fn parse(path: &Path, text: &str) -> Result<Limits, String> {
-    serde_json::from_str(text)
-        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))
+    let limits: Limits = serde_json::from_str(text)
+        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))?;
+    limits
+        .validate()
+        .map_err(|e| format!("the limits file {} is not valid: {e}", path.display()))?;
+    Ok(limits)
 }
 
 /// Read and parse a limits file.
@@ -256,6 +264,34 @@ pub async fn api_clients_in_use(
     .await
     .map_err(|e| crate::error::AppError::Internal(format!("API client count failed: {e}")))?;
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// The retention settings the `log_retention_days` ceiling holds down: the
+/// event log (with job logs and stored metrics, which follow it) and
+/// backfill history. Not the space access log: that's a security record,
+/// whose retention a host fixes for its own reasons.
+pub const CEILED_RETENTION_SETTINGS: &[&str] =
+    &["event_log_retention_days", "backfill_retention_days"];
+
+/// What the Jetstream source keeps backfill history for when nothing is set
+/// (`happyview-source-jetstream`'s retention sweep).
+pub const BACKFILL_RETENTION_DEFAULT_DAYS: u32 = 28;
+
+/// `Err` when a write would set a ceiled retention setting above the
+/// ceiling, or to `0` (forever). A value that isn't a whole number is left to
+/// the setting's own validation.
+pub fn check_retention_setting(
+    limits: &happyview_provider::Limits,
+    key: &str,
+    value: &str,
+) -> Result<(), happyview_provider::LimitReached> {
+    if !CEILED_RETENTION_SETTINGS.contains(&key) {
+        return Ok(());
+    }
+    match value.trim().parse::<u32>() {
+        Ok(days) => limits.check_ceiling(Limit::LogRetentionDays, days),
+        Err(_) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +434,66 @@ mod tests {
         write(&path, r#"{"seats": {"max": 9}}"#);
         assert_eq!(file.reload(), Reload::Applied);
         assert_eq!(file.limits().seats.as_ref().unwrap().max, 9);
+    }
+
+    #[test]
+    fn only_the_ceiled_retention_settings_are_held_to_the_ceiling() {
+        let limits = Limits {
+            log_retention_days: Some(Cap {
+                max: 7,
+                wording: Wording::default(),
+            }),
+            ..Limits::default()
+        };
+        for key in CEILED_RETENTION_SETTINGS {
+            assert_eq!(check_retention_setting(&limits, key, "7"), Ok(()));
+            assert_eq!(check_retention_setting(&limits, key, " 3 "), Ok(()));
+            assert!(check_retention_setting(&limits, key, "8").is_err(), "{key}");
+            assert!(
+                check_retention_setting(&limits, key, "0").is_err(),
+                "{key}: forever"
+            );
+            assert_eq!(
+                check_retention_setting(&limits, key, "soon"),
+                Ok(()),
+                "left to validation"
+            );
+        }
+        assert_eq!(
+            check_retention_setting(&limits, "space_access_log_retention_days", "365"),
+            Ok(())
+        );
+        assert_eq!(
+            check_retention_setting(&Limits::default(), "event_log_retention_days", "0"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_retention_ceiling_of_zero_stops_boot_and_a_changed_file_keeps_its_limits() {
+        let err = limits_of(&[("HAPPYVIEW_LIMIT_LOG_RETENTION_DAYS", "0")]).unwrap_err();
+        assert!(err.contains("HAPPYVIEW_LIMIT_LOG_RETENTION_DAYS"), "{err}");
+        assert_eq!(
+            limits_of(&[("HAPPYVIEW_LIMIT_SEATS", "0")])
+                .unwrap()
+                .seats
+                .unwrap()
+                .max,
+            0
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        write(&path, r#"{"log_retention_days": {"max": 0}}"#);
+        let err = load_from(lookup(&[(FILE_VAR, path.to_str().unwrap())]))
+            .err()
+            .unwrap();
+        assert!(err.contains("at least 1"), "{err}");
+
+        write(&path, r#"{"log_retention_days": {"max": 7}}"#);
+        let file = FileLimits::open(path.clone()).unwrap();
+        write(&path, r#"{"log_retention_days": {"max": 0}}"#);
+        assert!(matches!(file.reload(), Reload::Kept(_)));
+        assert_eq!(file.limits().log_retention_days.as_ref().unwrap().max, 7);
     }
 }

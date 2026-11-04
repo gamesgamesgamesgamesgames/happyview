@@ -184,6 +184,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             crate::config::vars::var("DEAD_LETTER_RETENTION_DAYS").as_deref(),
         ),
         crate::tombstones::retention_hours(),
+        state.limits.clone(),
     ));
 
     {
@@ -1268,6 +1269,7 @@ async fn boot(
         state.metrics.clone(),
         state.db.clone(),
         state.db_backend,
+        state.limits.clone(),
     ));
 
     // Staged OAuth client keys take over when they come due. In the boot,
