@@ -77,57 +77,67 @@ async fn post_webhook(
     lxm: &str,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let token = webhook_token(http, pool, backend, signer, reg, lxm).await;
+    let signer = signer_for(http, signer, reg).await;
+    let token = mint(pool, backend, signer, reg, lxm).await;
     send_webhook(http, reg, token.as_deref(), body).await
 }
 
-/// The service auth for a webhook registration's deliveries, or `None` to
-/// send them without it: see [`post_webhook`]. One token serves every
-/// delivery of one dispatch, so the DID is resolved and the token minted
-/// once per registration, not once per record.
-async fn webhook_token(
+/// The signer to use for a registration's deliveries, or `None` to send them
+/// without service auth: see [`post_webhook`]. This resolves the
+/// registration's DID, so a batch asks once per registration; each post
+/// still gets a token of its own from [`mint`], so a slow receiver never
+/// sees one that expired mid-batch, or the same `jti` twice.
+async fn signer_for<'a>(
     http: &reqwest::Client,
+    signer: Option<WebhookSigner<'a>>,
+    reg: &NotifyRegistration,
+) -> Option<WebhookSigner<'a>> {
+    let Some(signer) = signer else {
+        if !UNSIGNED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "TOKEN_ENCRYPTION_KEY is unset, so webhook deliveries are sent without service auth"
+            );
+        }
+        return None;
+    };
+    if crate::spaces::auth::did_lists_endpoint_origin(
+        http,
+        signer.plc_url,
+        &reg.service,
+        &reg.endpoint,
+    )
+    .await
+    {
+        Some(signer)
+    } else {
+        tracing::debug!(service = %reg.service, "webhook URL isn't listed by its service DID; sending it without service auth");
+        None
+    }
+}
+
+/// A fresh service-auth token for one delivery, or `None` when there is no
+/// signer or minting fails.
+async fn mint(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     signer: Option<WebhookSigner<'_>>,
     reg: &NotifyRegistration,
     lxm: &str,
 ) -> Option<String> {
-    match signer {
-        Some(signer)
-            if !crate::spaces::auth::did_lists_endpoint_origin(
-                http,
-                signer.plc_url,
-                &reg.service,
-                &reg.endpoint,
-            )
-            .await =>
-        {
-            tracing::debug!(service = %reg.service, "webhook URL isn't listed by its service DID; sending it without service auth");
-            None
-        }
-        Some(signer) => match crate::auth::service_auth::mint_service_auth(
-            pool,
-            backend,
-            signer.encryption_key,
-            signer.public_url,
-            &reg.service,
-            lxm,
-        )
-        .await
-        {
-            Ok(token) => Some(token),
-            Err(e) => {
-                tracing::warn!(service = %reg.service, error = %e, "could not sign a webhook delivery; sending it unsigned");
-                None
-            }
-        },
-        None => {
-            if !UNSIGNED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    "TOKEN_ENCRYPTION_KEY is unset, so webhook deliveries are sent without service auth"
-                );
-            }
+    let signer = signer?;
+    match crate::auth::service_auth::mint_service_auth(
+        pool,
+        backend,
+        signer.encryption_key,
+        signer.public_url,
+        &reg.service,
+        lxm,
+    )
+    .await
+    {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::warn!(service = %reg.service, error = %e, "could not sign a webhook delivery; sending it unsigned");
             None
         }
     }
@@ -155,8 +165,8 @@ pub struct WebhookWrite {
 }
 
 /// Send each write to every webhook registered for the space, in order.
-/// The registrations are read once, and each one's service auth is worked
-/// out once for the whole batch.
+/// The registrations are read once, and each one's DID is resolved once for
+/// the whole batch; every post carries a token of its own.
 pub async fn dispatch_write_notifications(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -174,7 +184,7 @@ pub async fn dispatch_write_notifications(
         .iter()
         .filter(|r| r.delivery == NotifyDelivery::Webhook)
     {
-        let token = webhook_token(http, pool, backend, signer, reg, NOTIFY_WRITE_LXM).await;
+        let reg_signer = signer_for(http, signer, reg).await;
         for write in writes {
             let payload = serde_json::json!({
                 "space": space_id,
@@ -183,15 +193,41 @@ pub async fn dispatch_write_notifications(
                 "rkey": write.rkey,
                 "cid": write.cid,
             });
+            let token = mint(pool, backend, reg_signer, reg, NOTIFY_WRITE_LXM).await;
             let _ = send_webhook(http, reg, token.as_deref(), &payload).await;
         }
     }
     Ok(())
 }
 
-/// Tell the space's legacy webhooks about `writes`, in the background, so a
-/// write never waits on a receiver or on resolving its DID. Delivery is best
-/// effort, as it always was.
+/// How many writes may wait for one space's webhooks. Past that, a write's
+/// webhook deliveries are dropped with a warning: they are best effort, and
+/// a slow receiver mustn't hold an unbounded backlog.
+const WEBHOOK_QUEUE: usize = 256;
+
+/// How long a space's delivery worker waits for more writes before it stops.
+const WEBHOOK_WORKER_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct WebhookBatch {
+    author_did: String,
+    writes: Vec<WebhookWrite>,
+}
+
+type WebhookQueues =
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<WebhookBatch>>>;
+
+/// Each space's delivery worker, by space id.
+fn webhook_queues() -> &'static WebhookQueues {
+    static QUEUES: std::sync::OnceLock<WebhookQueues> = std::sync::OnceLock::new();
+    QUEUES.get_or_init(Default::default)
+}
+
+/// Tell the space's legacy webhooks about `writes`, without the write waiting
+/// on any receiver or on resolving a DID. Each space has one delivery worker,
+/// so its webhooks hear about writes in the order they were announced, which
+/// is the order they committed. The worker's queue is bounded: when it is
+/// full the writes are dropped, with a warning. Delivery is best effort, as
+/// it always was.
 pub fn announce_writes(
     state: &crate::AppState,
     space_id: &str,
@@ -201,10 +237,64 @@ pub fn announce_writes(
     if writes.is_empty() {
         return;
     }
-    let state = state.clone();
-    let space_id = space_id.to_string();
-    let author_did = author_did.to_string();
-    tokio::spawn(async move {
+    let mut batch = WebhookBatch {
+        author_did: author_did.to_string(),
+        writes,
+    };
+    // Sending under the lock means a worker that removes itself (also under
+    // the lock) can't miss a batch: see `webhook_worker`.
+    let mut queues = webhook_queues().lock().unwrap();
+    for _ in 0..2 {
+        let sender = queues
+            .entry(space_id.to_string())
+            .or_insert_with(|| spawn_webhook_worker(state, space_id));
+        match sender.try_send(batch) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    space_id,
+                    "a space's webhook queue is full, so a write's webhook deliveries were dropped"
+                );
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(back)) => {
+                // Its worker stopped; start another and send again.
+                queues.remove(space_id);
+                batch = back;
+            }
+        }
+    }
+}
+
+fn spawn_webhook_worker(
+    state: &crate::AppState,
+    space_id: &str,
+) -> tokio::sync::mpsc::Sender<WebhookBatch> {
+    let (tx, rx) = tokio::sync::mpsc::channel(WEBHOOK_QUEUE);
+    tokio::spawn(webhook_worker(state.clone(), space_id.to_string(), rx));
+    tx
+}
+
+async fn webhook_worker(
+    state: crate::AppState,
+    space_id: String,
+    mut rx: tokio::sync::mpsc::Receiver<WebhookBatch>,
+) {
+    loop {
+        let batch = match tokio::time::timeout(WEBHOOK_WORKER_IDLE, rx.recv()).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return,
+            Err(_idle) => {
+                // Stop only if nothing arrived meanwhile: senders send under
+                // the same lock, so after this nothing reaches `rx`.
+                let mut queues = webhook_queues().lock().unwrap();
+                if rx.is_empty() {
+                    queues.remove(&space_id);
+                    return;
+                }
+                continue;
+            }
+        };
         let keyring = state.config.keyring();
         let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
             encryption_key,
@@ -217,14 +307,14 @@ pub fn announce_writes(
             &state.http,
             signer,
             &space_id,
-            &author_did,
-            &writes,
+            &batch.author_did,
+            &batch.writes,
         )
         .await
         {
             tracing::warn!(space_id, error = %e, "could not notify a space's webhooks of a write");
         }
-    });
+    }
 }
 
 /// Tell the services registered for a space that it was deleted.
@@ -669,9 +759,9 @@ mod tests {
     }
 
     /// A batch of writes reaches each webhook in order, with one DID lookup
-    /// and one token for the whole batch rather than one per record.
+    /// for the whole batch, and a token of its own for each post.
     #[tokio::test]
-    async fn a_batch_of_writes_resolves_and_signs_once_per_webhook() {
+    async fn a_batch_of_writes_resolves_once_and_signs_each_post() {
         use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
         let (pool, backend) = pool(true).await;
         let now = crate::db::now_rfc3339();
@@ -763,8 +853,112 @@ mod tests {
             .iter()
             .map(|r| r.headers["authorization"].to_str().unwrap().to_string())
             .collect();
-        assert_eq!(tokens.len(), 1, "one token for the batch");
+        assert_eq!(tokens.len(), 3, "a fresh token for each post");
         // The PLC mock's expect(1) is checked when it drops.
+    }
+
+    /// A put then a delete of one record reach the webhook in that order,
+    /// even when the put waits behind a slow delivery earlier in its own
+    /// write: each space has one delivery worker, so a later write never
+    /// overtakes an earlier one.
+    #[tokio::test]
+    async fn writes_reach_a_webhook_in_the_order_they_were_announced() {
+        use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+        let (pool, backend) = pool(false).await;
+        let space_id = format!("space-{}", uuid::Uuid::new_v4());
+        let now = crate::db::now_rfc3339();
+        crate::spaces::db::create_space(
+            &pool,
+            backend,
+            &Space {
+                id: space_id.clone(),
+                did: "did:plc:instance".into(),
+                authority_did: "did:plc:instance".into(),
+                creator_did: "did:plc:instance".into(),
+                type_nsid: "com.example.forum".into(),
+                skey: space_id.clone(),
+                display_name: None,
+                description: None,
+                read_policy: Policy::MemberList,
+                write_policy: Policy::MemberList,
+                app_access: AppAccess::Open,
+                config: SpaceConfig::default(),
+                revision: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let receiver = MockServer::start().await;
+        // The write's first record is answered slowly; everything else at once.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "cid": "bafyslow" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(400)),
+            )
+            .mount(&receiver)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+        register(
+            &pool,
+            backend,
+            &space_id,
+            SERVICE,
+            &format!("{}/hook", receiver.uri()),
+            "did:plc:member",
+            NotifyDelivery::Webhook,
+        )
+        .await
+        .unwrap();
+
+        let mut config = crate::test_support::test_config(backend);
+        config.token_encryption_key = None;
+        let state = crate::state::state_with_pool_on(config, pool, backend);
+        let record = |rkey: &str, cid: Option<&str>| WebhookWrite {
+            collection: "com.example.post".into(),
+            rkey: rkey.into(),
+            cid: cid.map(str::to_string),
+        };
+        // One write touching two records, the second a put of `rk`; then a
+        // write deleting `rk`.
+        announce_writes(
+            &state,
+            &space_id,
+            "did:plc:alice",
+            vec![
+                record("other", Some("bafyslow")),
+                record("rk", Some("bafyput")),
+            ],
+        );
+        announce_writes(&state, &space_id, "did:plc:alice", vec![record("rk", None)]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let got = loop {
+            let got = receiver.received_requests().await.unwrap();
+            if got.len() >= 3 || tokio::time::Instant::now() > deadline {
+                break got;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let cids: Vec<serde_json::Value> = got
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["cid"].clone())
+            .collect();
+        assert_eq!(
+            cids,
+            [
+                serde_json::json!("bafyslow"),
+                serde_json::json!("bafyput"),
+                serde_json::Value::Null
+            ],
+            "the delete must not overtake the put"
+        );
     }
 
     #[tokio::test]
