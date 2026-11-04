@@ -168,6 +168,33 @@ export function hookDetail(stats: HookStats, finished: boolean): HookDetail {
 }
 
 /**
+ * An executor-run job's progress row. A `starting` row has only its label to
+ * show: no count and no bar.
+ */
+export type ExecutorProgress = {
+  label: string;
+  starting?: boolean;
+} & RecordsCount;
+
+/**
+ * Whether an executor-run job is running but has neither done anything nor
+ * learned its total yet, and isn't waiting for the Network store's crawl.
+ */
+export function executorStarting(
+  job: Pick<
+    BackfillJob,
+    "status" | "stage" | "processed_repos" | "total_repos"
+  >,
+): boolean {
+  return (
+    (job.status === "running" || job.status === "pausing") &&
+    !waitingForCrawl(job) &&
+    !job.processed_repos &&
+    !job.total_repos
+  );
+}
+
+/**
  * What an executor-run job's progress row says. The total is the estimate
  * the store took when the pass began, and the pass leaves out records the
  * live feed delivers itself, so a finished pass routinely hooks a little
@@ -179,8 +206,20 @@ export function executorProgress(
     BackfillJob,
     "status" | "stage" | "processed_repos" | "total_repos" | "total_records"
   >,
-): { label: string } & RecordsCount {
+): ExecutorProgress {
   const done = job.processed_repos ?? 0;
+  if (executorStarting(job)) {
+    // The pass keeps its stage `pending` for as long as it runs, so the
+    // stage alone can't say it has only just begun. With nothing done and
+    // no total yet there is nothing to count, and a count or a bar would
+    // only read as "0 of about 0".
+    return {
+      label: "Checking the Network store",
+      done,
+      total: null,
+      starting: true,
+    };
+  }
   if (waitingForCrawl(job)) {
     // Records the crawl stores reach this instance as they are stored, and
     // their record scripts run then, so the count grows with no total.

@@ -18,6 +18,7 @@ import {
   isUnmigratedRefusal,
   upsertScript,
 } from "@/lib/api";
+import { withAddedScript } from "@/lib/backfill-hint";
 import type { LexiconSummary } from "@/types/lexicons";
 import { defaultBodyFor, defaultLanguage } from "@/lib/script-templates";
 import type { ScriptLanguage, TriggerKind } from "@/types/scripts";
@@ -144,10 +145,15 @@ function NewScriptInner() {
         description: state.description.trim() || null,
       });
       savedRef.current = true;
+      // A record script carries its collection to the page it lands on, which
+      // suggests a backfill if records are already here.
       router.push(
-        searchParams.has("lexicon")
-          ? returnHref
-          : `/dashboard/settings/scripts/${encodeURIComponent(id)}`,
+        withAddedScript(
+          searchParams.has("lexicon")
+            ? returnHref
+            : `/dashboard/settings/scripts/${encodeURIComponent(id)}`,
+          id,
+        ),
       );
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));

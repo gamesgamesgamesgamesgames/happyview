@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import type { LexiconDetail, LexiconSummary } from "@/types/lexicons";
 import type { Script, TriggerKind } from "@/types/scripts";
+import { BackfillHint } from "@/components/backfill-hint";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -201,6 +202,10 @@ export default function LexiconDetailPage() {
       <div className="flex flex-col flex-1 min-h-0 gap-6 items-stretch overflow-hidden">
         <div className="p-4 md:p-6">
           {error && <p className="text-destructive text-sm mb-4">{error}</p>}
+
+          <div className="empty:hidden mb-4">
+            <BackfillHint />
+          </div>
 
           {/* Metadata */}
           <div className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-3 lg:grid-cols-4">

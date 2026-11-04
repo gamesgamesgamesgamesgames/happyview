@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import type { Script, TriggerFamily } from "@/types/scripts";
 import { TRIGGER_KIND_LABELS, familyOf, parseTriggerId } from "@/types/scripts";
+import { BackfillHint } from "@/components/backfill-hint";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -226,6 +227,8 @@ export default function ScriptDetail() {
               )}
             </div>
           )}
+
+          <BackfillHint />
 
           {script?.runnable === false && (
             <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
