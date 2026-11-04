@@ -346,15 +346,19 @@ pub struct XrpcClaims {
     pub service_auth: Option<ServiceAuthClaims>,
 }
 
-/// Whether a path serves space data, the only routes a space credential opens.
+/// Whether a path serves space data, the only routes a space credential opens:
+/// an XRPC method in one of the space namespaces.
 fn is_space_route(path: &str) -> bool {
+    let Some(method) = path.strip_prefix("/xrpc/") else {
+        return false;
+    };
     [
-        "/com.atproto.space.",
-        "/com.atproto.simplespace.",
-        "/dev.happyview.space.",
+        "com.atproto.space.",
+        "com.atproto.simplespace.",
+        "dev.happyview.space.",
     ]
     .iter()
-    .any(|ns| path.contains(ns))
+    .any(|ns| method.starts_with(ns))
 }
 
 #[derive(Debug, Clone)]
@@ -574,4 +578,38 @@ async fn try_parse_service_auth(
         aud_fragment: fragment,
         lxm: payload.lxm,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_space_route;
+
+    #[test]
+    fn a_space_route_is_an_xrpc_method_in_a_space_namespace() {
+        for path in [
+            "/xrpc/com.atproto.space.getRecord",
+            "/xrpc/com.atproto.simplespace.getSpace",
+            "/xrpc/dev.happyview.space.listSpaces",
+            "/xrpc/com.atproto.space.notARealMethod",
+        ] {
+            assert!(is_space_route(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn other_paths_are_not_space_routes() {
+        for path in [
+            "/xrpc/com.example.nothing",
+            "/xrpc/app.bsky.actor.getProfile",
+            "/xrpc/dev.happyview.listApiClients",
+            "/xrpc/com.atproto.spaces.getRecord",
+            "/xrpc/com.example.com.atproto.space.getRecord",
+            "/admin/lexicons/com.atproto.space.getRecord",
+            "/com.atproto.space.getRecord",
+            "/xrpc/",
+            "",
+        ] {
+            assert!(!is_space_route(path), "{path}");
+        }
+    }
 }
