@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -708,6 +709,7 @@ function ErrorKindGroup({
 
 export default function BackfillPage() {
   const { hasPermission } = useCurrentUser();
+  const linkedCollection = useSearchParams().get(COLLECTION_PARAM) || null;
   const [jobs, setJobs] = useState<BackfillJob[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
@@ -778,7 +780,10 @@ export default function BackfillPage() {
               </AlertDialog>
             )}
             {hasPermission("backfill:create") && (
-              <CreateDialog onSuccess={load} />
+              <CreateDialog
+                onSuccess={load}
+                linkedCollection={linkedCollection}
+              />
             )}
           </div>
         </div>
@@ -1946,13 +1951,34 @@ function ProgressRow({
   );
 }
 
-function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
-  const [collection, setCollection] = useState<string | null>(null);
+/**
+ * The search param that opens the New backfill form on a collection, as the
+ * note after adding a record script links to.
+ */
+const COLLECTION_PARAM = "collection";
+
+/** Drops {@link COLLECTION_PARAM}, so a reload doesn't open the form again. */
+function forgetLinkedCollection() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has(COLLECTION_PARAM)) return;
+  url.searchParams.delete(COLLECTION_PARAM);
+  window.history.replaceState(null, "", url);
+}
+
+function CreateDialog({
+  onSuccess,
+  linkedCollection,
+}: {
+  onSuccess: () => void;
+  /** Opens the form with this collection chosen. */
+  linkedCollection: string | null;
+}) {
+  const [collection, setCollection] = useState<string | null>(linkedCollection);
   const [dids, setDids] = useState<string[]>([]);
   const [accountsBlocked, setAccountsBlocked] = useState(false);
   // "default" sends no source, so the server's BACKFILL_SOURCE decides.
   const [source, setSource] = useState<BackfillSource | "default">("default");
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(linkedCollection != null);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
   // Account backfills always crawl; the server refuses replay for them.
   const accountJob = dids.length > 0;
@@ -2017,15 +2043,20 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       setCollection(null);
       setDids([]);
       setSource("default");
-      setOpen(false);
+      changeOpen(false);
       onSuccess();
     } catch (e: unknown) {
       toastError("Couldn't create the backfill", e);
     }
   }
 
+  function changeOpen(next: boolean) {
+    setOpen(next);
+    if (!next) forgetLinkedCollection();
+  }
+
   return (
-    <ResponsiveDialog open={open} onOpenChange={setOpen}>
+    <ResponsiveDialog open={open} onOpenChange={changeOpen}>
       <ResponsiveDialogTrigger asChild>
         <Button>New backfill</Button>
       </ResponsiveDialogTrigger>
