@@ -462,6 +462,15 @@ fn is_record_key(s: &str) -> bool {
     s != "." && s != ".." && regex(&RKEY, r"^[a-zA-Z0-9_~.:-]{1,512}$").is_match(s)
 }
 
+/// A string in the lexicon `datetime` format: RFC 3339 with a `T` and a
+/// timezone, `-00:00` (an unknown offset) refused. `None` for anything else.
+pub(crate) fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if !s.contains('T') || s.ends_with("-00:00") {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(s).ok()
+}
+
 fn format_ok(format: &str, s: &str) -> bool {
     static URI: OnceLock<Regex> = OnceLock::new();
     static LANGUAGE: OnceLock<Regex> = OnceLock::new();
@@ -472,11 +481,7 @@ fn format_ok(format: &str, s: &str) -> bool {
         "at-identifier" => is_did(s) || is_handle(s),
         "nsid" => happyview_nsid::validate_nsid(s).is_ok(),
         "cid" => cid::Cid::try_from(s).is_ok(),
-        "datetime" => {
-            s.contains('T')
-                && !s.ends_with("-00:00")
-                && chrono::DateTime::parse_from_rfc3339(s).is_ok()
-        }
+        "datetime" => parse_datetime(s).is_some(),
         "uri" => s.len() <= 8192 && regex(&URI, r"^[a-z][a-z.+-]*:\S+$").is_match(s),
         "language" => regex(&LANGUAGE, r"^(i|[a-z]{2,3})(-[a-zA-Z0-9]+)*$").is_match(s),
         "tid" => regex(

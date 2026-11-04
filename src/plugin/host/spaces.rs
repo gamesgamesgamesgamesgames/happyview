@@ -64,7 +64,11 @@ impl From<AppError> for SpacesError {
             AppError::Forbidden(_) => Self::NotAuthorized(message),
             AppError::Conflict(_) => Self::Conflict(message),
             AppError::BadGateway(_) => Self::Pds(message),
-            AppError::BadRequest(_) => Self::BadInput(message),
+            AppError::BadRequest(_)
+            | AppError::XrpcError {
+                code: "InvalidRequest",
+                ..
+            } => Self::BadInput(message),
             _ => Self::Other(message),
         }
     }
@@ -515,6 +519,16 @@ mod tests {
                 return;
             }
         };
+    }
+
+    #[test]
+    fn an_invalid_request_reaches_a_plugin_as_bad_input() {
+        let err = SpacesError::from(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "Input/expiresAt must be a valid datetime".into(),
+        });
+        assert!(matches!(err, SpacesError::BadInput(_)), "got {err:?}");
     }
 
     /// A migrated Postgres `AppState` (`TEST_DATABASE_URL`), the same shape
