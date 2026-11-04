@@ -21,4 +21,20 @@ describe("RecordsProgress", () => {
     expect(hasBar(true, null)).toBe(true);
     expect(hasBar(false, null)).toBe(false);
   });
+
+  it("shows a starting row's label alone, with no count and no bar", () => {
+    const html = renderToStaticMarkup(
+      createElement(RecordsProgress, {
+        label: "Checking the Network store",
+        active: true,
+        starting: true,
+        done: 0,
+        total: null,
+      }),
+    );
+    expect(html).toContain("Checking the Network store");
+    expect(html).not.toContain('role="progressbar"');
+    expect(html).not.toContain("records");
+    expect(html).not.toContain("tabular-nums");
+  });
 });

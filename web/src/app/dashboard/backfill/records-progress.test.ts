@@ -263,6 +263,62 @@ describe("executorProgress", () => {
   });
 });
 
+describe("a store pass that has only just started", () => {
+  const job = (
+    over: Partial<Parameters<typeof executorProgress>[0]>,
+  ): Parameters<typeof executorProgress>[0] => ({
+    stage: "pending",
+    status: "running",
+    processed_repos: 0,
+    total_repos: 0,
+    total_records: null,
+    ...over,
+  });
+
+  it("checks the Network store, with nothing to count, until it has done something or knows its total", () => {
+    for (const status of ["running", "pausing"] as const) {
+      for (const processed_repos of [0, null]) {
+        for (const total_repos of [0, null]) {
+          const row = executorProgress(
+            job({ status, processed_repos, total_repos }),
+          );
+          expect(row.label).toBe("Checking the Network store");
+          expect(row.starting).toBe(true);
+          expect(recordsFraction(row)).toBeNull();
+        }
+      }
+    }
+  });
+
+  it("runs record scripts once records are done", () => {
+    const row = executorProgress(job({ processed_repos: 3, total_repos: 0 }));
+    expect(row.label).toBe("Running record scripts");
+    expect(row.starting).toBeFalsy();
+  });
+
+  it("runs record scripts once the total is known, though none are done", () => {
+    const row = executorProgress(job({ processed_repos: 0, total_repos: 500 }));
+    expect(row.label).toBe("Running record scripts");
+    expect(row.starting).toBeFalsy();
+    expect(recordsCountText(row)).toBe("0 of about 500 records");
+  });
+
+  it("still waits for the crawl, not checking", () => {
+    const row = executorProgress(job({ stage: "waiting_for_crawl" }));
+    expect(row.label).toBe("Waiting for the Network store's crawl");
+    expect(row.starting).toBeFalsy();
+    expect(recordsCountText(row)).toBe("0 records arrived so far");
+  });
+
+  it("keeps a paused, failed or cancelled pass's own label", () => {
+    for (const status of ["paused", "failed", "cancelled"] as const) {
+      const row = executorProgress(job({ status }));
+      expect(row.label).toBe("Record scripts");
+      expect(row.starting).toBeFalsy();
+    }
+  });
+});
+
 describe("a resumed pass's count", () => {
   it("counts what all its runs wrote once it completes", () => {
     const row = executorProgress({

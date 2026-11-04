@@ -10,11 +10,13 @@ import {
 /**
  * One progress row counting records: a label, the count, a bar when the
  * total is known, and a `detail` slot beside the count for whatever else the
- * row has to say (a rate, an ETA, failures).
+ * row has to say (a rate, an ETA, failures). A `starting` row has nothing to
+ * count yet, so it shows its label alone, with no count and no bar.
  */
 export function RecordsProgress({
   label,
   active,
+  starting = false,
   detail,
   ...count
 }: RecordsCount & {
@@ -24,6 +26,7 @@ export function RecordsProgress({
    * that isn't running and has no total to measure against has no bar.
    */
   active: boolean;
+  starting?: boolean;
   detail?: ReactNode;
 }) {
   const fraction = recordsFraction(count);
@@ -32,18 +35,20 @@ export function RecordsProgress({
     <div className="flex flex-col gap-2 px-3 py-2.5 text-sm">
       <div className="flex items-center justify-between gap-2">
         <span>{label}</span>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          <AnimatedNumber value={done} />
-          {total != null && (
-            <>
-              {` of ${estimated ? "about " : ""}`}
-              <AnimatedNumber value={total} />
-            </>
-          )}
-          {` ${noun}`}
-        </span>
+        {!starting && (
+          <span className="text-xs text-muted-foreground tabular-nums">
+            <AnimatedNumber value={done} />
+            {total != null && (
+              <>
+                {` of ${estimated ? "about " : ""}`}
+                <AnimatedNumber value={total} />
+              </>
+            )}
+            {` ${noun}`}
+          </span>
+        )}
       </div>
-      {(fraction != null || active) && (
+      {!starting && (fraction != null || active) && (
         <div
           role="progressbar"
           aria-label={label}
