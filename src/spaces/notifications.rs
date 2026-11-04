@@ -77,7 +77,22 @@ async fn post_webhook(
     lxm: &str,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let mut request = http.post(&reg.endpoint).json(body);
+    let token = webhook_token(http, pool, backend, signer, reg, lxm).await;
+    send_webhook(http, reg, token.as_deref(), body).await
+}
+
+/// The service auth for a webhook registration's deliveries, or `None` to
+/// send them without it: see [`post_webhook`]. One token serves every
+/// delivery of one dispatch, so the DID is resolved and the token minted
+/// once per registration, not once per record.
+async fn webhook_token(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    signer: Option<WebhookSigner<'_>>,
+    reg: &NotifyRegistration,
+    lxm: &str,
+) -> Option<String> {
     match signer {
         Some(signer)
             if !crate::spaces::auth::did_lists_endpoint_origin(
@@ -89,6 +104,7 @@ async fn post_webhook(
             .await =>
         {
             tracing::debug!(service = %reg.service, "webhook URL isn't listed by its service DID; sending it without service auth");
+            None
         }
         Some(signer) => match crate::auth::service_auth::mint_service_auth(
             pool,
@@ -100,9 +116,10 @@ async fn post_webhook(
         )
         .await
         {
-            Ok(token) => request = request.bearer_auth(token),
+            Ok(token) => Some(token),
             Err(e) => {
                 tracing::warn!(service = %reg.service, error = %e, "could not sign a webhook delivery; sending it unsigned");
+                None
             }
         },
         None => {
@@ -111,41 +128,103 @@ async fn post_webhook(
                     "TOKEN_ENCRYPTION_KEY is unset, so webhook deliveries are sent without service auth"
                 );
             }
+            None
         }
+    }
+}
+
+async fn send_webhook(
+    http: &reqwest::Client,
+    reg: &NotifyRegistration,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut request = http.post(&reg.endpoint).json(body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
     }
     request.send().await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn dispatch_write_notification(
+/// One record a legacy webhook hears about.
+#[derive(Debug, Clone)]
+pub struct WebhookWrite {
+    pub collection: String,
+    pub rkey: String,
+    pub cid: Option<String>,
+}
+
+/// Send each write to every webhook registered for the space, in order.
+/// The registrations are read once, and each one's service auth is worked
+/// out once for the whole batch.
+pub async fn dispatch_write_notifications(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     http: &reqwest::Client,
     signer: Option<WebhookSigner<'_>>,
     space_id: &str,
     author_did: &str,
-    collection: &str,
-    rkey: &str,
-    cid: Option<&str>,
+    writes: &[WebhookWrite],
 ) -> Result<(), AppError> {
+    if writes.is_empty() {
+        return Ok(());
+    }
     let registrations = db::list_notify_registrations(pool, backend, space_id).await?;
-
-    let payload = serde_json::json!({
-        "space": space_id,
-        "did": author_did,
-        "collection": collection,
-        "rkey": rkey,
-        "cid": cid,
-    });
-
     for reg in registrations
         .iter()
         .filter(|r| r.delivery == NotifyDelivery::Webhook)
     {
-        let _ = post_webhook(http, pool, backend, signer, reg, NOTIFY_WRITE_LXM, &payload).await;
+        let token = webhook_token(http, pool, backend, signer, reg, NOTIFY_WRITE_LXM).await;
+        for write in writes {
+            let payload = serde_json::json!({
+                "space": space_id,
+                "did": author_did,
+                "collection": write.collection,
+                "rkey": write.rkey,
+                "cid": write.cid,
+            });
+            let _ = send_webhook(http, reg, token.as_deref(), &payload).await;
+        }
     }
-
     Ok(())
+}
+
+/// Tell the space's legacy webhooks about `writes`, in the background, so a
+/// write never waits on a receiver or on resolving its DID. Delivery is best
+/// effort, as it always was.
+pub fn announce_writes(
+    state: &crate::AppState,
+    space_id: &str,
+    author_did: &str,
+    writes: Vec<WebhookWrite>,
+) {
+    if writes.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let space_id = space_id.to_string();
+    let author_did = author_did.to_string();
+    tokio::spawn(async move {
+        let keyring = state.config.keyring();
+        let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
+            encryption_key,
+            public_url: &state.config.public_url,
+            plc_url: &state.config.plc_url,
+        });
+        if let Err(e) = dispatch_write_notifications(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            signer,
+            &space_id,
+            &author_did,
+            &writes,
+        )
+        .await
+        {
+            tracing::warn!(space_id, error = %e, "could not notify a space's webhooks of a write");
+        }
+    });
 }
 
 /// Tell the services registered for a space that it was deleted.
@@ -587,6 +666,105 @@ mod tests {
         let parts: Vec<String> = token.split('.').map(str::to_string).collect();
         let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&parts[1]).unwrap()).unwrap();
         (claims, parts)
+    }
+
+    /// A batch of writes reaches each webhook in order, with one DID lookup
+    /// and one token for the whole batch rather than one per record.
+    #[tokio::test]
+    async fn a_batch_of_writes_resolves_and_signs_once_per_webhook() {
+        use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+        let (pool, backend) = pool(true).await;
+        let now = crate::db::now_rfc3339();
+        crate::spaces::db::create_space(
+            &pool,
+            backend,
+            &Space {
+                id: "space".into(),
+                did: "did:plc:instance".into(),
+                authority_did: "did:plc:instance".into(),
+                creator_did: "did:plc:instance".into(),
+                type_nsid: "com.example.forum".into(),
+                skey: "main".into(),
+                display_name: None,
+                description: None,
+                read_policy: Policy::MemberList,
+                write_policy: Policy::MemberList,
+                app_access: AppAccess::Open,
+                config: SpaceConfig::default(),
+                revision: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(3)
+            .mount(&receiver)
+            .await;
+        let plc = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{SERVICE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": SERVICE,
+                "service": [{ "id": "#s", "type": "S", "serviceEndpoint": receiver.uri() }],
+            })))
+            .expect(1)
+            .mount(&plc)
+            .await;
+        register(
+            &pool,
+            backend,
+            "space",
+            SERVICE,
+            &format!("{}/hook", receiver.uri()),
+            "did:plc:member",
+            NotifyDelivery::Webhook,
+        )
+        .await
+        .unwrap();
+
+        let writes: Vec<WebhookWrite> = ["a", "b", "c"]
+            .iter()
+            .map(|rkey| WebhookWrite {
+                collection: "com.example.post".into(),
+                rkey: rkey.to_string(),
+                cid: None,
+            })
+            .collect();
+        let keyring = keyring();
+        dispatch_write_notifications(
+            &pool,
+            backend,
+            &reqwest::Client::new(),
+            Some(signer(&keyring, &plc.uri())),
+            "space",
+            "did:plc:alice",
+            &writes,
+        )
+        .await
+        .unwrap();
+
+        let got = receiver.received_requests().await.unwrap();
+        let rkeys: Vec<String> = got
+            .iter()
+            .map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rkey"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(rkeys, ["a", "b", "c"], "in order");
+        let tokens: std::collections::BTreeSet<_> = got
+            .iter()
+            .map(|r| r.headers["authorization"].to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tokens.len(), 1, "one token for the batch");
+        // The PLC mock's expect(1) is checked when it drops.
     }
 
     #[tokio::test]

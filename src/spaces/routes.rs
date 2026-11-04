@@ -1967,25 +1967,16 @@ async fn notify_write(
     }
 
     if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
-        let keyring = state.config.keyring();
-        notifications::dispatch_write_notification(
-            &state.db,
-            state.db_backend,
-            &state.http,
-            keyring
-                .as_ref()
-                .map(|encryption_key| notifications::WebhookSigner {
-                    encryption_key,
-                    public_url: &state.config.public_url,
-                    plc_url: &state.config.plc_url,
-                }),
+        notifications::announce_writes(
+            &state,
             &space.id,
             &writer,
-            collection,
-            rkey,
-            input.cid.as_deref(),
-        )
-        .await?;
+            vec![notifications::WebhookWrite {
+                collection: collection.clone(),
+                rkey: rkey.clone(),
+                cid: input.cid.clone(),
+            }],
+        );
     }
 
     Ok(Json(serde_json::json!({ "success": true })))

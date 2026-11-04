@@ -429,28 +429,18 @@ pub(crate) async fn notify_ops(
         );
     }
 
-    let keyring = state.config.keyring();
-    let signer = keyring
-        .as_ref()
-        .map(|encryption_key| notifications::WebhookSigner {
-            encryption_key,
-            public_url: &state.config.public_url,
-            plc_url: &state.config.plc_url,
-        });
-    for op in ops {
-        let _ = notifications::dispatch_write_notification(
-            &state.db,
-            state.db_backend,
-            &state.http,
-            signer,
-            &space.id,
-            author_did,
-            &op.collection,
-            &op.rkey,
-            op.new_cid.as_deref(),
-        )
-        .await;
-    }
+    notifications::announce_writes(
+        state,
+        &space.id,
+        author_did,
+        ops.iter()
+            .map(|op| notifications::WebhookWrite {
+                collection: op.collection.clone(),
+                rkey: op.rkey.clone(),
+                cid: op.new_cid.clone(),
+            })
+            .collect(),
+    );
 }
 
 /// Whether this repo's writes still belong to HappyView, and if not, forward them.
