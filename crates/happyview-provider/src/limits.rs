@@ -248,9 +248,9 @@ impl Limits {
     /// limit. A configured `0`, which means "forever" in the settings it
     /// caps, becomes the limit when there is one.
     pub fn cap(&self, limit: Limit, configured: u32) -> u32 {
-        match self.cap_of(limit) {
-            Some(cap) if configured == 0 => cap.max,
-            Some(cap) => configured.min(cap.max),
+        match self.cap_of(limit).map(ceiling) {
+            Some(max) if configured == 0 => max,
+            Some(max) => configured.min(max),
             None => configured,
         }
     }
@@ -260,18 +260,36 @@ impl Limits {
     /// leave the owner thinking it took.
     pub fn check_ceiling(&self, limit: Limit, requested: u32) -> Result<(), LimitReached> {
         match self.cap_of(limit) {
-            Some(cap) if requested == 0 || requested > cap.max => {
-                Err(LimitReached::new(limit, Some(cap.max), None, &cap.wording))
-            }
+            Some(cap) if requested == 0 || requested > ceiling(cap) => Err(LimitReached::new(
+                limit,
+                Some(ceiling(cap)),
+                None,
+                &cap.wording,
+            )),
             _ => Ok(()),
         }
     }
+}
+
+/// A cap read as a ceiling on a setting: never below 1. In the settings a
+/// ceiling caps, 0 means "forever", so a ceiling of 0 would keep everything
+/// forever and refuse every value an owner could set. [`Limits::validate`]
+/// refuses one; this holds for a provider that never calls it, by reading it
+/// as the strictest ceiling that still means something.
+fn ceiling(cap: &Cap) -> u32 {
+    cap.max.max(1)
 }
 
 /// Where HappyView gets its limits. Asked for a snapshot each time it
 /// checks, so a provider whose limits change while the instance runs needs
 /// no other hook. It must answer from what it already holds: this is called
 /// on hot paths, including every XRPC request.
+///
+/// A provider must call [`Limits::validate`] on every snapshot it takes in,
+/// and refuse one that fails rather than hand it out: at boot by stopping,
+/// on a later change by keeping the last good snapshot. The checks hold a
+/// ceiling of 0 to 1 day if one gets through anyway, but that is a backstop,
+/// not the contract.
 pub trait LimitsProvider: Send + Sync {
     fn limits(&self) -> Arc<Limits>;
 }
@@ -551,5 +569,29 @@ mod tests {
             }),
             ..Limits::default()
         }
+    }
+
+    #[test]
+    fn a_ceiling_of_zero_that_skipped_validate_reads_as_one_day_not_forever() {
+        let zero = cap_limits(0);
+        assert!(zero.validate().is_err(), "validate still refuses it");
+        // As a provider that never called validate would hand it out:
+        assert_eq!(
+            zero.cap(Limit::LogRetentionDays, 0),
+            1,
+            "forever is held to 1 day"
+        );
+        assert_eq!(zero.cap(Limit::LogRetentionDays, 30), 1);
+        assert_eq!(
+            zero.check_ceiling(Limit::LogRetentionDays, 1),
+            Ok(()),
+            "an owner can still set 1"
+        );
+        let refused = zero.check_ceiling(Limit::LogRetentionDays, 2).unwrap_err();
+        assert_eq!(refused.max, Some(1));
+        assert!(zero.check_ceiling(Limit::LogRetentionDays, 0).is_err());
+        // The counted limits are untouched: a max of 0 still refuses the first.
+        let none_allowed: Limits = serde_json::from_str(r#"{"seats": {"max": 0}}"#).unwrap();
+        assert!(none_allowed.check(Limit::Seats, 0).is_err());
     }
 }
