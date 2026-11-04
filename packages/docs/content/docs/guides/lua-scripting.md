@@ -146,7 +146,7 @@ When a script fails, the client receives the Lua error message, its type and the
 
 ### Performance
 
-The dashboard's **Script Performance** page shows how often each script runs, how long it takes and where that time goes, split into the script's own code and the platform's work around it. See [Dashboard](../getting-started/dashboard.md#script-performance).
+The dashboard's **Script performance** page shows how often each script runs, how long it takes and where that time goes, split into the script's own code and the platform's work around it. See [Dashboard](../getting-started/dashboard.md#script-performance).
 
 ### Common mistakes
 

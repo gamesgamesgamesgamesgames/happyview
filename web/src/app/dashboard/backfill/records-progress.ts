@@ -124,7 +124,7 @@ export function shareText(share: number): string {
 export interface HookDetail {
   /** Rate, time left and anything that went wrong, in reading order. */
   progress: string[];
-  /** How much of a record's time its hook's script spent, when known. */
+  /** How much of a record's time its record script spent, when known. */
   scriptShare: string | null;
   /**
    * How many records went to Dead Letters, as a count to say beside a link

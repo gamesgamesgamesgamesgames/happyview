@@ -79,8 +79,8 @@ export default function EnvVariablesPage() {
           <div>
             <h2 className="text-lg font-semibold">Script Variables</h2>
             <p className="text-muted-foreground text-sm">
-              Define variables that Lua scripts can access via the{" "}
-              <code className="text-xs">env</code> global table.
+              Define variables that scripts can read from{" "}
+              <code className="text-xs">ctx.env</code>.
             </p>
           </div>
           {hasPermission("script-variables:create") && (
@@ -105,8 +105,8 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet. Variables defined here are
-                    accessible to Lua scripts via the env global table.
+                    No script variables yet. Variables defined here are readable
+                    by scripts as ctx.env.
                   </TableCell>
                 </TableRow>
               )}
