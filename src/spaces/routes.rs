@@ -1972,6 +1972,7 @@ async fn notify_write(
                 .map(|encryption_key| notifications::WebhookSigner {
                     encryption_key,
                     public_url: &state.config.public_url,
+                    plc_url: &state.config.plc_url,
                 }),
             &space.id,
             &writer,

@@ -435,6 +435,7 @@ pub(crate) async fn notify_ops(
         .map(|encryption_key| notifications::WebhookSigner {
             encryption_key,
             public_url: &state.config.public_url,
+            plc_url: &state.config.plc_url,
         });
     for op in ops {
         let _ = notifications::dispatch_write_notification(

@@ -43,21 +43,29 @@ pub async fn register(
 }
 
 /// What signs a webhook delivery: the instance's keyring, to open its
-/// `#atproto` signing key, and its public URL, which names its DID.
+/// `#atproto` signing key, its public URL, which names its DID, and the PLC
+/// directory, to resolve the registered service's DID document.
 #[derive(Clone, Copy)]
 pub struct WebhookSigner<'a> {
     pub encryption_key: &'a crate::plugin::encryption::Keyring,
     pub public_url: &'a str,
+    pub plc_url: &'a str,
 }
 
-/// POST `body` to a webhook registration. The request carries service auth
-/// from this instance in `Authorization: Bearer`, the same JWT a
-/// registration by identifier receives: `aud` is the registration's service
-/// DID and `lxm` the method the payload stands for, so a receiver can check
-/// the token was minted for it and for this kind of notification. The body
-/// is unchanged, so a receiver that ignores the header works as before.
-/// Without a signer, or when minting fails, the payload is still sent,
-/// unsigned, and the reason is logged.
+/// Whether the missing-key warning has been logged, so it is once a process.
+static UNSIGNED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// POST `body` to a webhook registration. When the registered service DID's
+/// document lists a service endpoint on the same origin as the webhook URL,
+/// the request carries service auth from this instance in
+/// `Authorization: Bearer`, the same JWT a registration by identifier
+/// receives: `aud` is that DID and `lxm` the method the payload stands for,
+/// so a receiver can check the token was minted for it and for this kind of
+/// notification. A legacy registration names its DID and its URL
+/// separately, so a token addressed to a DID only goes to a URL that DID
+/// publishes. The body is unchanged, so a receiver that ignores the header
+/// works as before. Without a signer, when the URL isn't one the DID lists,
+/// or when minting fails, the payload is still sent, without the header.
 async fn post_webhook(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
@@ -69,6 +77,17 @@ async fn post_webhook(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut request = http.post(&reg.endpoint).json(body);
     match signer {
+        Some(signer)
+            if !crate::spaces::auth::did_lists_endpoint_origin(
+                http,
+                signer.plc_url,
+                &reg.service,
+                &reg.endpoint,
+            )
+            .await =>
+        {
+            tracing::debug!(service = %reg.service, "webhook URL isn't listed by its service DID; sending it without service auth");
+        }
         Some(signer) => match crate::auth::service_auth::mint_service_auth(
             pool,
             backend,
@@ -85,7 +104,11 @@ async fn post_webhook(
             }
         },
         None => {
-            tracing::warn!(service = %reg.service, "TOKEN_ENCRYPTION_KEY is unset, so a webhook delivery is sent unsigned");
+            if !UNSIGNED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "TOKEN_ENCRYPTION_KEY is unset, so webhook deliveries are sent without service auth"
+                );
+            }
         }
     }
     request.send().await
@@ -151,6 +174,7 @@ pub fn announce_space_deleted(
                     let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
                         encryption_key,
                         public_url: &state.config.public_url,
+                        plc_url: &state.config.plc_url,
                     });
                     post_webhook(
                         &state.http,
@@ -432,10 +456,11 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::signature::Verifier;
-    use wiremock::matchers::method;
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const INSTANCE_KEY: [u8; 32] = [0x33; 32];
+    const SERVICE: &str = "did:plc:syncer";
 
     /// A pool whose service identity holds `INSTANCE_KEY`, sealed the way
     /// setup stores it, unless `with_identity` is false.
@@ -463,45 +488,88 @@ mod tests {
         (pool, backend)
     }
 
-    fn webhook(endpoint: String) -> NotifyRegistration {
-        NotifyRegistration {
-            id: "reg".into(),
-            space_id: "space".into(),
-            service: "did:web:syncer.example".into(),
-            endpoint,
-            registered_by: "did:web:syncer.example".into(),
-            expires_at: "2999-01-01T00:00:00+00:00".into(),
-            created_at: "2026-01-01T00:00:00+00:00".into(),
-            delivery: NotifyDelivery::Webhook,
+    /// A PLC directory whose document for `SERVICE` lists `listed` as its
+    /// syncer service endpoint.
+    async fn plc_listing(listed: &str) -> MockServer {
+        let plc = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{SERVICE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": SERVICE,
+                "service": [{
+                    "id": "#atproto_space_syncer",
+                    "type": "AtprotoSpaceSyncer",
+                    "serviceEndpoint": listed,
+                }],
+            })))
+            .mount(&plc)
+            .await;
+        plc
+    }
+
+    struct Delivery {
+        receiver: MockServer,
+    }
+
+    impl Delivery {
+        async fn new() -> Self {
+            let receiver = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&receiver)
+                .await;
+            Self { receiver }
+        }
+
+        /// Deliver `body` to this receiver, registered for `SERVICE`, and
+        /// answer the one request it saw.
+        async fn send(
+            &self,
+            pool: &sqlx::AnyPool,
+            backend: DatabaseBackend,
+            signer: Option<WebhookSigner<'_>>,
+            lxm: &str,
+            body: &serde_json::Value,
+        ) -> wiremock::Request {
+            let reg = NotifyRegistration {
+                id: "reg".into(),
+                space_id: "space".into(),
+                service: SERVICE.into(),
+                endpoint: format!("{}/hooks/space", self.receiver.uri()),
+                registered_by: "did:plc:member".into(),
+                expires_at: "2999-01-01T00:00:00+00:00".into(),
+                created_at: "2026-01-01T00:00:00+00:00".into(),
+                delivery: NotifyDelivery::Webhook,
+            };
+            post_webhook(
+                &reqwest::Client::new(),
+                pool,
+                backend,
+                signer,
+                &reg,
+                lxm,
+                body,
+            )
+            .await
+            .expect("delivered");
+            self.receiver.received_requests().await.unwrap().remove(0)
         }
     }
 
-    /// Deliver `body` once and answer the one request the receiver saw.
-    async fn deliver(
-        pool: &sqlx::AnyPool,
-        backend: DatabaseBackend,
-        signer: Option<WebhookSigner<'_>>,
-        lxm: &str,
-        body: &serde_json::Value,
-    ) -> wiremock::Request {
-        let receiver = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&receiver)
-            .await;
-        post_webhook(
-            &reqwest::Client::new(),
-            pool,
-            backend,
-            signer,
-            &webhook(receiver.uri()),
-            lxm,
-            body,
-        )
-        .await
-        .expect("delivered");
-        receiver.received_requests().await.unwrap().remove(0)
+    fn keyring() -> crate::plugin::encryption::Keyring {
+        crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY)
+    }
+
+    fn signer<'a>(
+        keyring: &'a crate::plugin::encryption::Keyring,
+        plc: &'a str,
+    ) -> WebhookSigner<'a> {
+        WebhookSigner {
+            encryption_key: keyring,
+            public_url: "https://hv.example",
+            plc_url: plc,
+        }
     }
 
     fn payload() -> serde_json::Value {
@@ -511,36 +579,45 @@ mod tests {
         })
     }
 
+    fn claims(request: &wiremock::Request) -> (serde_json::Value, Vec<String>) {
+        let auth = request.headers.get("authorization").expect("signed");
+        let token = auth.to_str().unwrap().strip_prefix("Bearer ").unwrap();
+        let parts: Vec<String> = token.split('.').map(str::to_string).collect();
+        let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&parts[1]).unwrap()).unwrap();
+        (claims, parts)
+    }
+
     #[tokio::test]
-    async fn a_webhook_delivery_carries_service_auth_for_its_receiver() {
+    async fn a_webhook_the_service_lists_carries_service_auth_for_it() {
         let (pool, backend) = pool(true).await;
-        let keyring =
-            crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY);
-        let signer = WebhookSigner {
-            encryption_key: &keyring,
-            public_url: "https://hv.example",
-        };
-        let request = deliver(&pool, backend, Some(signer), NOTIFY_WRITE_LXM, &payload()).await;
+        let delivery = Delivery::new().await;
+        let plc = plc_listing(&delivery.receiver.uri()).await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(signer(&keyring, &plc.uri())),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
 
         // The body is the payload as before.
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body, payload());
 
-        let auth = request.headers.get("authorization").expect("signed");
-        let token = auth.to_str().unwrap().strip_prefix("Bearer ").unwrap();
-        let parts: Vec<&str> = token.split('.').collect();
-        let claims: serde_json::Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        let (claims, parts) = claims(&request);
         assert_eq!(claims["iss"], "did:plc:instance");
-        assert_eq!(claims["aud"], "did:web:syncer.example");
+        assert_eq!(claims["aud"], SERVICE);
         assert_eq!(claims["lxm"], NOTIFY_WRITE_LXM);
 
         // It verifies against the instance's #atproto key.
         let verifying = *p256::ecdsa::SigningKey::from_slice(&INSTANCE_KEY)
             .unwrap()
             .verifying_key();
-        let sig =
-            p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
+        let sig = p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(&parts[2]).unwrap())
+            .unwrap();
         verifying
             .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
             .expect("the receiver can verify it against the instance's DID document key");
@@ -549,36 +626,73 @@ mod tests {
     #[tokio::test]
     async fn a_space_deletion_webhook_is_bound_to_its_own_method() {
         let (pool, backend) = pool(true).await;
-        let keyring =
-            crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY);
-        let signer = WebhookSigner {
-            encryption_key: &keyring,
-            public_url: "https://hv.example",
-        };
+        let delivery = Delivery::new().await;
+        let plc = plc_listing(&delivery.receiver.uri()).await;
+        let keyring = keyring();
         let body = serde_json::json!({ "space": "space" });
-        let request = deliver(
-            &pool,
-            backend,
-            Some(signer),
-            NOTIFY_SPACE_DELETED_LXM,
-            &body,
-        )
-        .await;
-        let token =
-            request.headers["authorization"].to_str().unwrap()["Bearer ".len()..].to_string();
-        let claims: serde_json::Value = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(token.split('.').nth(1).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(claims["lxm"], NOTIFY_SPACE_DELETED_LXM);
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(signer(&keyring, &plc.uri())),
+                NOTIFY_SPACE_DELETED_LXM,
+                &body,
+            )
+            .await;
+        assert_eq!(claims(&request).0["lxm"], NOTIFY_SPACE_DELETED_LXM);
+    }
+
+    /// The registered DID publishes a different host than the webhook URL,
+    /// so the two belong to different parties: the payload goes, without a
+    /// token addressed to that DID.
+    #[tokio::test]
+    async fn a_webhook_url_its_service_does_not_list_is_sent_without_service_auth() {
+        let (pool, backend) = pool(true).await;
+        let delivery = Delivery::new().await;
+        let plc = plc_listing("https://syncer.example").await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(signer(&keyring, &plc.uri())),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
+        assert!(request.headers.get("authorization").is_none());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            payload()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_that_does_not_resolve_gets_no_service_auth() {
+        let (pool, backend) = pool(true).await;
+        let delivery = Delivery::new().await;
+        // A PLC directory that knows no DIDs.
+        let plc = MockServer::start().await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(signer(&keyring, &plc.uri())),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
+        assert!(request.headers.get("authorization").is_none());
     }
 
     #[tokio::test]
     async fn without_a_signer_the_payload_is_still_delivered() {
         let (pool, backend) = pool(true).await;
-        let request = deliver(&pool, backend, None, NOTIFY_WRITE_LXM, &payload()).await;
+        let delivery = Delivery::new().await;
+        let request = delivery
+            .send(&pool, backend, None, NOTIFY_WRITE_LXM, &payload())
+            .await;
         assert!(request.headers.get("authorization").is_none());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
@@ -590,13 +704,18 @@ mod tests {
     async fn a_delivery_that_cannot_be_signed_is_still_sent() {
         // No service identity, so there is no key to mint with.
         let (pool, backend) = pool(false).await;
-        let keyring =
-            crate::plugin::encryption::Keyring::from(crate::test_support::TEST_ENCRYPTION_KEY);
-        let signer = WebhookSigner {
-            encryption_key: &keyring,
-            public_url: "https://hv.example",
-        };
-        let request = deliver(&pool, backend, Some(signer), NOTIFY_WRITE_LXM, &payload()).await;
+        let delivery = Delivery::new().await;
+        let plc = plc_listing(&delivery.receiver.uri()).await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(signer(&keyring, &plc.uri())),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
         assert!(request.headers.get("authorization").is_none());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),

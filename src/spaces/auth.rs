@@ -400,6 +400,36 @@ pub(crate) async fn resolve_service_identifier(
     }
 }
 
+/// Whether `did`'s document lists a service endpoint with the same origin
+/// (scheme, host and port) as `endpoint`. A fragment on `did` is ignored. Any
+/// resolution failure, or an endpoint that isn't a URL, answers `false`.
+pub(crate) async fn did_lists_endpoint_origin(
+    http: &reqwest::Client,
+    plc_url: &str,
+    did: &str,
+    endpoint: &str,
+) -> bool {
+    let did = did.split_once('#').map_or(did, |(did, _)| did);
+    let Some(wanted) = endpoint_origin(endpoint) else {
+        return false;
+    };
+    match fetch_did_services(http, plc_url, did).await {
+        Ok(services) => services
+            .iter()
+            .any(|(_, listed)| endpoint_origin(listed).as_ref() == Some(&wanted)),
+        Err(e) => {
+            tracing::warn!(did, error = %e, "could not resolve a DID to check a webhook endpoint");
+            false
+        }
+    }
+}
+
+/// The origin of a URL, or `None` when it isn't one with a host.
+fn endpoint_origin(url: &str) -> Option<url::Origin> {
+    let origin = url::Url::parse(url).ok()?.origin();
+    origin.is_tuple().then_some(origin)
+}
+
 /// A service entry's id may be relative (`#frag`) or carry the DID.
 fn find_service(services: &[(String, String)], did: &str, fragment: &str) -> Option<String> {
     let relative = format!("#{fragment}");
