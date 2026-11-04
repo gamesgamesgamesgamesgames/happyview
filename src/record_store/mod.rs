@@ -210,6 +210,10 @@ pub struct RecordStore {
     interner: Arc<Interner>,
     bodies: Arc<compression::BodyCodec>,
     external: Option<Arc<dyn RecordStorage>>,
+    /// Makes [`Self::count_collection`] fail, so a test can see what its
+    /// callers do without the count.
+    #[cfg(test)]
+    pub(crate) fail_counts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A row an upsert inserted or changed: its id, its collection's id, and
@@ -310,6 +314,8 @@ impl RecordStore {
             interner: Arc::new(Interner::new(DID_CACHE_CAPACITY)),
             bodies: Arc::new(bodies),
             external: None,
+            #[cfg(test)]
+            fail_counts: Arc::default(),
         }
     }
 
@@ -1272,6 +1278,10 @@ impl RecordStore {
     }
 
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
+        #[cfg(test)]
+        if self.fail_counts.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
         match self.external_route(collection) {
             Some(ext) => Self::count_claimed(ext, collection).await,
             None => Self::count_collection_on(&self.local_route(), collection).await,

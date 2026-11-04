@@ -33,9 +33,15 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
 
     let backend = state.db_backend;
 
-    let total: i64 = match state.records.count_collection(&collection).await {
-        Ok(n) => n,
-        Err(e) => return NativeOutcome::Failed(format!("failed to count records: {e}")),
+    // The total is only for progress. A count that fails, which on a large
+    // collection can mean it timed out, must not stop the delete, so the job
+    // runs on and reports the total as unknown.
+    let total: Option<i64> = match state.records.count_collection(&collection).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(job_id = %job.id, %collection, "could not count the collection; deleting without a total: {e}");
+            None
+        }
     };
 
     let mut deleted: i64 = 0;
@@ -109,5 +115,66 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
             "stopped": reason,
         })),
         None => NativeOutcome::Completed(serde_json::json!({ "deleted": deleted })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record_store::{PreparedRecord, WriteKind};
+
+    /// The count is only for progress, so one that fails still deletes the
+    /// collection.
+    #[tokio::test]
+    async fn a_failing_count_still_deletes_the_collection() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let collection = "app.test.doomed";
+        for rkey in ["a", "b", "c"] {
+            state
+                .records
+                .write_local(
+                    WriteKind::Echoed,
+                    &PreparedRecord {
+                        did: "did:plc:owner".into(),
+                        collection: collection.into(),
+                        rkey: rkey.into(),
+                        record_json: "{}".into(),
+                        cid: format!("bafy{rkey}"),
+                        rev: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let id = db::create_job(
+            &state,
+            "happyview.delete-collection",
+            &serde_json::json!({ "collection": collection }),
+            "did:plc:admin",
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let job = db::get_job(&state, &id).await.unwrap().unwrap();
+
+        state
+            .records
+            .fail_counts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = run(&state, &job).await;
+        state
+            .records
+            .fail_counts
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        match outcome {
+            NativeOutcome::Completed(result) => assert_eq!(result["deleted"], 3, "{result}"),
+            NativeOutcome::Failed(e) => panic!("the delete failed: {e}"),
+        }
+        assert_eq!(state.records.count_collection(collection).await.unwrap(), 0);
     }
 }
