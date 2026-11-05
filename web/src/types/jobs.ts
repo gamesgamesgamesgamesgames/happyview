@@ -1,32 +1,32 @@
 export interface Job {
-  id: string
-  job_type: string
-  status: string
-  input: unknown
-  progress: unknown
-  result: unknown | null
-  error: string | null
-  created_by: string
-  inherit_auth: boolean
-  started_at: string | null
-  completed_at: string | null
-  created_at: string
+  id: string;
+  job_type: string;
+  status: string;
+  input: unknown;
+  progress: unknown;
+  result: unknown | null;
+  error: string | null;
+  created_by: string;
+  inherit_auth: boolean;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }
 
 export interface JobsListResponse {
-  jobs: Job[]
-  cursor: string | null
+  jobs: Job[];
+  cursor: string | null;
 }
 
 export interface JobLog {
-  id: string
-  jobId: string
-  level: string
-  message: string
-  createdAt: string
+  id: string;
+  jobId: string;
+  level: string;
+  message: string;
+  createdAt: string;
 }
 
 export interface JobLogsResponse {
-  logs: JobLog[]
-  cursor: string | null
+  logs: JobLog[];
+  cursor: string | null;
 }

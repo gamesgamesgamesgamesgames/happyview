@@ -1,15 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { confirmAttachAuth } from "@/lib/api";
+import { ATTACHED_ACCOUNT_SCOPE } from "@/lib/attached-account-scope";
 import { docsUrl } from "@/lib/docs";
 
 const ATTACH_AUTH_STORAGE_KEY = "happyview_attach_auth";
@@ -97,9 +92,12 @@ export function SetupAttachAuth({
         localStorage.setItem(ATTACH_AUTH_STORAGE_KEY, JSON.stringify(payload));
 
         const handle = attachedHandle ?? attachedDid;
-        return fetch(`/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/setup")}`, {
-          credentials: "same-origin",
-        });
+        return fetch(
+          `/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent(ATTACHED_ACCOUNT_SCOPE)}&redirect_uri=${encodeURIComponent("/setup")}`,
+          {
+            credentials: "same-origin",
+          },
+        );
       })
       .then((resp) => {
         if (!resp.ok) throw new Error("Login request failed");
@@ -137,7 +135,7 @@ export function SetupAttachAuth({
           restored and you&apos;ll continue from where you left off.
           <br />
           <a
-            href={docsUrl("/getting-started/service-identity#linked-account")}
+            href={docsUrl("/docs/guides/service-identity#attached-account")}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline underline-offset-4 hover:text-primary/80"

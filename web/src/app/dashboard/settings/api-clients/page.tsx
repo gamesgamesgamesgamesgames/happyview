@@ -7,10 +7,10 @@ import {
   CopyPlus,
   Check,
   KeyRound,
+  LockKeyhole,
   RefreshCw,
   ShieldAlert,
   Trash2,
-  X,
   ExternalLink,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -32,6 +32,9 @@ import {
   listApiClientAuthKeys,
   revokeApiClientAuthKey,
   revokeAllApiClientAuthKeys,
+  listApiClientSecrets,
+  createApiClientSecret,
+  revokeApiClientSecret,
 } from "@/lib/api";
 import type {
   ApiClientSummary,
@@ -39,6 +42,8 @@ import type {
   ApiClientAuthKey,
   ApiClientAuthProbe,
   ApiClientAuthKeyListEntry,
+  ApiClientSecret,
+  CreatedApiClientSecret,
 } from "@/types/api-clients";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -55,6 +60,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MultiInput } from "@/components/ui/multi-input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
@@ -76,85 +82,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-
-function MultiInput({
-  values,
-  onChange,
-  placeholder,
-  readonlyValues = [],
-  id,
-}: {
-  values: string[];
-  onChange: (values: string[]) => void;
-  placeholder?: string;
-  readonlyValues?: string[];
-  id?: string;
-}) {
-  function handleChange(index: number, value: string) {
-    const next = [...values];
-    next[index] = value;
-    // If user typed into the last input, add an empty one
-    if (index === values.length - 1 && value.trim() !== "") {
-      next.push("");
-    }
-    onChange(next);
-  }
-
-  function handleRemove(index: number) {
-    const next = values.filter((_, i) => i !== index);
-    // Always keep at least one empty input
-    if (next.length === 0 || next[next.length - 1].trim() !== "") {
-      next.push("");
-    }
-    onChange(next);
-  }
-
-  function handleKeyDown(
-    index: number,
-    e: React.KeyboardEvent<HTMLInputElement>,
-  ) {
-    if (e.key === "Backspace" && values[index] === "" && values.length > 1) {
-      e.preventDefault();
-      handleRemove(index);
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      {readonlyValues.map((val, i) => (
-        <Input
-          key={`readonly-${i}`}
-          value={val}
-          readOnly
-          className="font-mono text-sm bg-muted"
-        />
-      ))}
-      {values.map((val, index) => (
-        <div key={index} className="flex gap-1.5">
-          <Input
-            id={index === 0 ? id : undefined}
-            value={val}
-            onChange={(e) => handleChange(index, e.target.value)}
-            onKeyDown={(e) => handleKeyDown(index, e)}
-            placeholder={placeholder}
-            className="font-mono text-sm"
-          />
-          {values.length > 1 && val.trim() !== "" && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0 size-9 text-muted-foreground hover:text-destructive"
-              onClick={() => handleRemove(index)}
-            >
-              <X className="size-4" />
-            </Button>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 function parseRedirectUris(uris: string[]): string[] {
   return uris.length > 0 ? [...uris, ""] : [""];
@@ -249,7 +176,7 @@ export default function ApiClientsPage() {
                 <TableHead>Created</TableHead>
                 <TableHead>Parent Client</TableHead>
                 <TableHead>Owner</TableHead>
-                <TableHead className="w-10 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -284,13 +211,18 @@ export default function ApiClientsPage() {
                     {client.client_id_url}
                   </TableCell>
                   <TableCell>
-                    <div className="flex flex-wrap gap-1">
+                    <div className="flex min-w-48 max-w-80 flex-wrap gap-1">
                       {client.scopes
                         .split(/\s+/)
                         .filter(Boolean)
                         .map((scope) => (
-                          <Badge key={scope} variant="secondary">
-                            {scope}
+                          <Badge
+                            key={scope}
+                            variant="secondary"
+                            className="max-w-full"
+                            title={scope}
+                          >
+                            <span className="truncate">{scope}</span>
                           </Badge>
                         ))}
                     </div>
@@ -312,8 +244,15 @@ export default function ApiClientsPage() {
                   <TableCell className="text-sm max-w-48 truncate">
                     {client.owner_did ?? "—"}
                   </TableCell>
-                  <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-10 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     <div className="flex gap-1">
+                      {client.client_type === "confidential" &&
+                        hasPermission("api-clients:view") && (
+                          <ApiClientSecretsDialog
+                            client={client}
+                            canEdit={hasPermission("api-clients:edit")}
+                          />
+                        )}
                       {hasPermission("api-clients:edit") && (
                         <ApiClientAuthDialog client={client} />
                       )}
@@ -549,7 +488,7 @@ function CreateApiClientDialog({
                 </p>
                 <a
                   href={docsUrl(
-                    "/getting-started/authentication#api-clients-confidential-vs-public",
+                    "/docs/reference/authentication#api-clients-confidential-vs-public",
                   )}
                   target="_blank"
                   rel="noopener noreferrer"
@@ -701,7 +640,7 @@ function CreateApiClientDialog({
                     <code>transition:generic</code> grants broad write access to
                     any collection. Prefer specific scopes or{" "}
                     <a
-                      href={docsUrl("/guides/api-clients#permission-sets")}
+                      href={docsUrl("/docs/guides/api-clients#permission-sets")}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline"
@@ -976,7 +915,7 @@ function EditApiClientDialog({
                   broad write access to any collection. Prefer specific scopes
                   or{" "}
                   <a
-                    href={docsUrl("/guides/api-clients#permission-sets")}
+                    href={docsUrl("/docs/guides/api-clients#permission-sets")}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline"
@@ -1063,6 +1002,272 @@ function EditApiClientDialog({
  * the probe is rendered verbatim; it is authored copy, not something this
  * component should summarise or reword.
  */
+function ApiClientSecretsDialog({
+  client,
+  canEdit,
+}: {
+  client: ApiClientSummary;
+  canEdit: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [secrets, setSecrets] = useState<ApiClientSecret[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [label, setLabel] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState<CreatedApiClientSecret | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<ApiClientSecret | null>(
+    null,
+  );
+  const [revoking, setRevoking] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    listApiClientSecrets(client.id)
+      .then((res) => setSecrets(res.secrets))
+      .catch((e: unknown) => toastError("Failed to load client secrets", e))
+      .finally(() => setLoading(false));
+  }, [client.id]);
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      setCreated(null);
+      setLabel("");
+      load();
+    }
+  }
+
+  async function handleCreate() {
+    setCreating(true);
+    try {
+      const secret = await createApiClientSecret(client.id, label);
+      setCreated(secret);
+      setLabel("");
+      load();
+    } catch (e: unknown) {
+      toastError("Failed to add secret", e);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokeTarget) return;
+    setRevoking(true);
+    try {
+      const result = await revokeApiClientSecret(client.id, revokeTarget.id);
+      setRevokeTarget(null);
+      toast.success(`Revoked “${revokeTarget.label}”`, {
+        description:
+          result.active_secrets === 0
+            ? `“${client.name}” has no working secret left. Add one before anything needs to authenticate.`
+            : `${result.active_secrets} other secret${result.active_secrets === 1 ? "" : "s"} still work${result.active_secrets === 1 ? "s" : ""}.`,
+      });
+      load();
+    } catch (e: unknown) {
+      toastError("Failed to revoke secret", e);
+    } finally {
+      setRevoking(false);
+    }
+  }
+
+  async function handleCopy(value: string) {
+    await navigator.clipboard.writeText(value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  const activeCount = secrets.filter((s) => !s.revoked_at).length;
+
+  return (
+    <>
+      <Sheet open={open} onOpenChange={handleOpenChange}>
+        <SheetTrigger asChild>
+          <Button
+            variant="outline"
+            size="icon"
+            className="size-8"
+            title="Client secrets"
+            aria-label={`Client secrets for ${client.name}`}
+          >
+            <LockKeyhole className="size-4" />
+          </Button>
+        </SheetTrigger>
+        <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
+          <SheetHeader>
+            <SheetTitle>Client Secrets</SheetTitle>
+            <SheetDescription>
+              Every secret here authenticates &ldquo;{client.name}&rdquo; on its
+              own. Give each place it runs its own secret. To rotate one, add a
+              new secret, move to it, then revoke the old one.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
+            {created && (
+              <div className="flex flex-col gap-2 rounded-lg border p-4 bg-muted/50">
+                <Label htmlFor="created-secret">
+                  New secret &ldquo;{created.label}&rdquo;
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="created-secret"
+                    readOnly
+                    value={created.client_secret}
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => handleCopy(created.client_secret)}
+                    title="Copy to clipboard"
+                    aria-label="Copy the new secret"
+                  >
+                    {copied ? (
+                      <Check className="size-4" />
+                    ) : (
+                      <Copy className="size-4" />
+                    )}
+                  </Button>
+                </div>
+                <p className="text-muted-foreground text-xs">
+                  Copy it now. It isn&apos;t shown again, and HappyView keeps
+                  only a hash of it.
+                </p>
+              </div>
+            )}
+
+            {canEdit && (
+              <form
+                className="flex flex-col gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (label.trim()) handleCreate();
+                }}
+              >
+                <Label htmlFor={`secret-label-${client.id}`}>
+                  Add a secret
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    id={`secret-label-${client.id}`}
+                    placeholder="Where it's used, like staging"
+                    maxLength={100}
+                    value={label}
+                    onChange={(e) => setLabel(e.target.value)}
+                  />
+                  <Button type="submit" disabled={creating || !label.trim()}>
+                    {creating ? "Adding..." : "Add"}
+                  </Button>
+                </div>
+              </form>
+            )}
+
+            {loading && secrets.length === 0 ? (
+              <p className="text-muted-foreground text-sm">Loading…</p>
+            ) : secrets.length === 0 ? (
+              <p className="text-muted-foreground text-sm">
+                This client has no secrets.
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Label</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Last used</TableHead>
+                    <TableHead>Status</TableHead>
+                    {canEdit && <TableHead className="w-10" />}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {secrets.map((secret) => (
+                    <TableRow
+                      key={secret.id}
+                      className={secret.revoked_at ? "opacity-50" : undefined}
+                    >
+                      <TableCell className="font-medium">
+                        {secret.label}
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {new Date(secret.created_at).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {secret.last_used_at
+                          ? new Date(secret.last_used_at).toLocaleString()
+                          : "Never"}
+                      </TableCell>
+                      <TableCell>
+                        {secret.revoked_at ? (
+                          <Badge variant="outline">Revoked</Badge>
+                        ) : (
+                          <Badge>Active</Badge>
+                        )}
+                      </TableCell>
+                      {canEdit && (
+                        <TableCell>
+                          {!secret.revoked_at && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8"
+                              title="Revoke"
+                              aria-label={`Revoke ${secret.label}`}
+                              onClick={() => setRevokeTarget(secret)}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          )}
+                        </TableCell>
+                      )}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      <AlertDialog
+        open={revokeTarget !== null}
+        onOpenChange={(next) => {
+          if (!next) setRevokeTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Revoke &ldquo;{revokeTarget?.label}&rdquo;?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Anything still sending this secret is refused from its next
+              request.{" "}
+              {activeCount <= 1
+                ? `It is the only working secret, so “${client.name}” can't authenticate with a secret until you add another.`
+                : "The client's other secrets keep working."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={revoking}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={revoking}
+              onClick={(e) => {
+                e.preventDefault();
+                handleRevoke();
+              }}
+            >
+              {revoking ? "Revoking..." : "Revoke"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
 function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -1170,19 +1375,26 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
     }
   }
 
-  async function handleRotate() {
+  async function handleRotate(immediate: boolean) {
     setRotating(true);
     try {
-      const result = await rotateApiClientAuthKey(client.id);
-      setAuthKey((prev) => (prev ? { ...prev, kid: result.kid } : prev));
-      setProbe(null);
+      const result = await rotateApiClientAuthKey(client.id, immediate);
+      // A staged key signs nothing yet; the key shown is the one signing.
+      if (result.status === "current") {
+        setAuthKey((prev) => (prev ? { ...prev, kid: result.kid } : prev));
+        setProbe(null);
+      }
       setRotateConfirmOpen(false);
+      const title =
+        result.status === "pending"
+          ? `Published a new key (${result.kid.slice(0, 8)}…); it takes over ${result.activates_at ? `at ${new Date(result.activates_at).toLocaleString()}` : "shortly"}`
+          : `Rotated to a new key (${result.kid.slice(0, 8)}…)`;
       if (result.orphaned_sessions > 0) {
-        toast.success(`Rotated to a new key (${result.kid.slice(0, 8)}…)`, {
+        toast.success(title, {
           description: `${result.orphaned_sessions} session${result.orphaned_sessions === 1 ? "" : "s"} predate key pinning and cannot be protected by this or any future rotation.`,
         });
       } else {
-        toast.success("Rotated to a new key");
+        toast.success(title);
       }
       loadKeys();
     } catch (e: unknown) {
@@ -1236,6 +1448,8 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
 
   function keyStatusBadge(status: ApiClientAuthKeyListEntry["status"]) {
     switch (status) {
+      case "pending":
+        return <Badge variant="secondary">Pending</Badge>;
       case "current":
         return <Badge>Current</Badge>;
       case "retiring":
@@ -1343,20 +1557,34 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                             Generate a new signing key?
                           </AlertDialogTitle>
                           <AlertDialogDescription>
-                            This costs nothing: the current key keeps signing
-                            every session already established with it. New
-                            logins and refreshes for &ldquo;{client.name}&rdquo;
-                            will use the new key from now on. The old key stays
+                            This costs nothing: the new key is published now and
+                            takes over new logins and refreshes for &ldquo;
+                            {client.name}&rdquo; in about 75 minutes, once
+                            authorization servers&rsquo; cached copies of its
+                            keys include it. The current key keeps signing every
+                            session already established with it, and stays
                             published until nothing references it any longer.
+                          </AlertDialogDescription>
+                          <AlertDialogDescription>
+                            If the current key has leaked, switch now instead.
+                            Sign-ins through a PDS that cached the old keys can
+                            fail for up to an hour.
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <AlertDialogFooter>
                           <AlertDialogCancel disabled={rotating}>
                             Cancel
                           </AlertDialogCancel>
+                          <Button
+                            variant="outline"
+                            disabled={rotating}
+                            onClick={() => handleRotate(true)}
+                          >
+                            Switch now
+                          </Button>
                           <AlertDialogAction
                             disabled={rotating}
-                            onClick={handleRotate}
+                            onClick={() => handleRotate(false)}
                           >
                             {rotating ? "Rotating..." : "Generate new key"}
                           </AlertDialogAction>
@@ -1476,11 +1704,12 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                 <div className="flex flex-col gap-2">
                   <Label>Retiring and revoked keys</Label>
                   <p className="text-muted-foreground text-xs">
-                    To contain a leaked key: rotate first (the leaked one
-                    becomes retiring, so the client keeps working), then revoke
-                    the retiring key below. Revoking is immediate and destroys
-                    every session pinned to that key — it is the correct
-                    response to a leak, not routine cleanup.
+                    To contain a leaked key: rotate and choose{" "}
+                    <em>Switch now</em> (the leaked one becomes retiring, so the
+                    client keeps working), then revoke the retiring key below.
+                    Revoking is immediate and destroys every session pinned to
+                    that key — it is the correct response to a leak, not routine
+                    cleanup.
                   </p>
 
                   {keysLoading && (
@@ -1519,7 +1748,14 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                           <p className="text-xs text-muted-foreground">
                             Created {new Date(key.created_at).toLocaleString()}{" "}
                             ·{" "}
-                            {key.status === "revoked" ? (
+                            {key.status === "pending" ? (
+                              <>
+                                Takes over{" "}
+                                {key.activates_at
+                                  ? `at ${new Date(key.activates_at).toLocaleString()}`
+                                  : "shortly"}
+                              </>
+                            ) : key.status === "revoked" ? (
                               <>
                                 {key.session_count} session
                                 {key.session_count === 1 ? "" : "s"} destroyed

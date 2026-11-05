@@ -1,0 +1,11 @@
+error: constant `happyview_handler_forgotten` is never used
+ --> tests/ui/unlisted_handler.rs:7:10
+  |
+7 | async fn forgotten(input: Value, _ctx: Ctx) -> Result<Value> { Ok(input) }
+  |          ^^^^^^^^^
+  |
+note: the lint level is defined here
+ --> tests/ui/unlisted_handler.rs:7:10
+  |
+7 | async fn forgotten(input: Value, _ctx: Ctx) -> Result<Value> { Ok(input) }
+  |          ^^^^^^^^^

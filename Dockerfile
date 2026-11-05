@@ -7,7 +7,7 @@ COPY web/ .
 ENV NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__
 RUN npm run build
 
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /app
 
@@ -18,14 +18,27 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/happyview-nsid/Cargo.toml crates/happyview-nsid/
 COPY crates/happyview-plc/Cargo.toml crates/happyview-plc/
+COPY crates/happyview-plugin-sdk/Cargo.toml crates/happyview-plugin-sdk/
+COPY crates/happyview-provider/Cargo.toml crates/happyview-provider/
 COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
-RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-scopes/src \
-    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-scopes/src/lib.rs
-RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs && echo "fn main() {}" > src/bin/migrate_space_cids.rs
+COPY crates/happyview-script/Cargo.toml crates/happyview-script/
+COPY crates/happyview-script-macros/Cargo.toml crates/happyview-script-macros/
+COPY crates/happyview-source-jetstream/Cargo.toml crates/happyview-source-jetstream/
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-provider/src crates/happyview-scopes/src crates/happyview-script/src crates/happyview-script-macros/src crates/happyview-source-jetstream/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-provider/src/lib.rs crates/happyview-scopes/src/lib.rs crates/happyview-script/src/lib.rs crates/happyview-script-macros/src/lib.rs crates/happyview-source-jetstream/src/lib.rs
+# Every target `Cargo.toml` declares needs a stub here, because cargo resolves
+# targets before it compiles anything: a declared `[[bin]]` with no file on disk
+# fails this layer with `can't find bin`, which surfaces as an image that never
+# built rather than as a missing file. Adding a binary means adding its stub.
+RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && echo "fn main() {}" > src/bin/migrate_lua_sql.rs \
+    && echo "fn main() {}" > src/bin/migrate_space_cids.rs \
+    && echo "fn main() {}" > src/bin/codemod.rs
 ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*
 
 # Build application code
+COPY build.rs ./
 COPY src/ src/
 COPY crates/ crates/
 COPY migrations/ migrations/
@@ -37,23 +50,14 @@ ENV HAPPYVIEW_VERSION=$HAPPYVIEW_VERSION
 # compiling so crate metadata matches the tag this image is built from --
 # telemetry reported 0.1.0 fleet-wide for exactly this reason. Local builds
 # pass no build-arg and keep the repo version. See src/version.rs.
-RUN set -eu; \
-    v="${HAPPYVIEW_VERSION#v}"; \
-    if [ -n "$v" ]; then \
-      test "$(grep -c '^version = ' Cargo.toml)" = 1 \
-        || { echo "Cargo.toml: expected exactly one top-level 'version =' line" >&2; exit 1; }; \
-      sed -i "s|^version = .*|version = \"$v\"|" Cargo.toml; \
-      grep -qx "version = \"$v\"" Cargo.toml \
-        || { echo "Cargo.toml: version stamp failed" >&2; exit 1; }; \
-      echo "stamped Cargo.toml version = $v"; \
-    else \
-      echo "no HAPPYVIEW_VERSION build-arg; keeping repo version"; \
-    fi
+COPY scripts/stamp-version.sh scripts/stamp-version.sh
+RUN bash scripts/stamp-version.sh "${HAPPYVIEW_VERSION}"
 
 RUN cargo build --release
 
 FROM scratch AS binary
 COPY --from=builder /app/target/release/happyview /target/release/happyview
+COPY --from=builder /app/target/release/happyview-codemod /target/release/happyview-codemod
 
 FROM debian:bookworm-slim
 
@@ -72,8 +76,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/happyview /usr/local/bin/happyview
-RUN chmod +x /usr/local/bin/happyview
-COPY migrations/ /app/migrations
+# The v2-to-v3 script rewrite, for `docker run <image> happyview-codemod ...` or
+# `docker exec` into a running container (see entrypoint.sh).
+COPY --from=builder /app/target/release/happyview-codemod /usr/local/bin/happyview-codemod
+# CI hands these in as downloaded artifacts, which keep no file modes.
+RUN chmod +x /usr/local/bin/happyview /usr/local/bin/happyview-codemod
 COPY --from=frontend /app/web/out /srv/static
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && touch /srv/static/.base-path-pending

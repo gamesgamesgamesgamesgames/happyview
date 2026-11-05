@@ -20,8 +20,9 @@ import {
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
-interface DataTableViewOptionsProps<TData>
-  extends React.ComponentProps<typeof PopoverContent> {
+interface DataTableViewOptionsProps<TData> extends React.ComponentProps<
+  typeof PopoverContent
+> {
   table: Table<TData>;
   disabled?: boolean;
 }

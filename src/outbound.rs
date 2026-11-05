@@ -16,7 +16,7 @@
 //!   URLs and redirect hops, which never reach a resolver.
 //!
 //! Hosts the operator configured (the PLC directory, relay, Jetstream,
-//! telemetry, plugin sources in `PLUGIN_URLS`, and any proxy) are exempt by name,
+//! telemetry, plugin registry and sources, and any proxy) are exempt by name,
 //! and the addresses they resolve to are exempt at connect time, each only on
 //! the port its URL names: a configured `http://127.0.0.1:2582` exempts that
 //! one service, not everything else listening on the machine. This
@@ -241,21 +241,28 @@ pub fn screened(
     }
 }
 
-/// Whether the filter should be off, from the process environment alone.
-pub fn private_destinations_allowed() -> bool {
-    std::env::var(ALLOW_PRIVATE_VAR)
+/// Whether the filter should be off, from the process environment alone:
+/// these are never read through `config::vars`, so neither a project file nor
+/// anything a dashboard user or plugin can set reaches them.
+/// `HAPPYVIEW_NETWORK=local` is what `hpy happyview dev --network local` sets,
+/// where the PDS and PLC are on this machine, and counts only under `dev`.
+pub fn private_destinations_allowed(dev: bool) -> bool {
+    let allow = std::env::var(ALLOW_PRIVATE_VAR)
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let local_network = std::env::var("HAPPYVIEW_NETWORK").is_ok_and(|v| v.trim() == "local");
+    allow || (dev && local_network)
 }
 
 /// Install the policy for this instance's configuration, or say loudly why
 /// not.
-pub fn install_for(config: &crate::config::Config) {
-    if private_destinations_allowed() {
+pub fn install_for(config: &crate::config::Config, dev: bool) {
+    if private_destinations_allowed(dev) {
         tracing::warn!(
             "outbound requests are not screened for private, loopback and link-local \
-             addresses ({ALLOW_PRIVATE_VAR} is set), including requests to endpoints from \
-             DID documents, handles, plugins, scripts and stored URLs"
+             addresses ({ALLOW_PRIVATE_VAR}, or HAPPYVIEW_NETWORK=local under dev, is set), \
+             including requests to endpoints from DID documents, handles, plugins and \
+             stored URLs"
         );
         return;
     }
@@ -265,8 +272,11 @@ pub fn install_for(config: &crate::config::Config) {
         config.jetstream_url.clone(),
         config.telemetry_collector_url.clone(),
     ];
-    if let Ok(value) = std::env::var("PLUGIN_URLS") {
-        urls.extend(value.split(',').map(str::to_string));
+    urls.extend(config.default_plugins.iter().cloned());
+    for var in ["PLUGIN_REGISTRY_URL", "PLUGIN_URLS"] {
+        if let Some(value) = crate::config::vars::var(var) {
+            urls.extend(value.split(',').map(str::to_string));
+        }
     }
     for var in [
         "HTTPS_PROXY",

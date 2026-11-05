@@ -71,7 +71,7 @@ export function SetupIdentityMode({ onComplete }: SetupIdentityModeProps) {
           AT Protocol apps.
           <br />
           <a
-            href={docsUrl("/getting-started/service-identity")}
+            href={docsUrl("/docs/guides/service-identity")}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline underline-offset-4 hover:text-primary/80"
@@ -100,7 +100,7 @@ export function SetupIdentityMode({ onComplete }: SetupIdentityModeProps) {
                 <span className="font-semibold">{mode.title}</span>
                 <HelpTip
                   label={mode.helpTip}
-                  href={docsUrl("/getting-started/service-identity")}
+                  href={docsUrl("/docs/guides/service-identity")}
                 />
                 {mode.badge && (
                   <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">

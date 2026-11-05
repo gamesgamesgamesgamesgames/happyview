@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS test_source_widgets (id INTEGER PRIMARY KEY);

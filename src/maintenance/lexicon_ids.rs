@@ -1,4 +1,4 @@
-//! Startup repair for `happyview_lexicons` rows whose id is not a usable NSID.
+//! Startup repair for stored lexicon rows whose id is not a usable NSID.
 //!
 //! The admin API validated nothing about a lexicon's `id` before issue #86, and
 //! the dashboard's boilerplate ships with `"id": ""`. Uploading it as-is stored
@@ -15,9 +15,9 @@
 use sqlx::AnyPool;
 use tracing::{info, warn};
 
-use crate::db::{DatabaseBackend, adapt_sql};
+use crate::db::DatabaseBackend;
 
-/// What a stored `happyview_lexicons.id` is.
+/// What a stored lexicon id is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexiconIdVerdict {
     /// A well-formed NSID.
@@ -51,9 +51,8 @@ pub fn classify_lexicon_id(id: &str) -> LexiconIdVerdict {
 /// Fail-open, like [`super::nsid_audit`]: a database error is logged and treated
 /// as "nothing found" so a hiccup at boot cannot stop the process from booting.
 pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> usize {
-    let sql = adapt_sql("SELECT id FROM happyview_lexicons", backend);
-    let rows: Vec<(String,)> = match crate::db::query_as(&sql).fetch_all(pool).await {
-        Ok(rows) => rows,
+    let ids = match crate::catalog::lexicon_rows::ids(pool, backend).await {
+        Ok(ids) => ids,
         Err(e) => {
             warn!(error = %e, "lexicon id sweep: failed to list lexicons; skipping");
             return 0;
@@ -61,7 +60,7 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> usize {
     };
 
     let mut removed = 0;
-    for (id,) in rows {
+    for id in ids {
         match classify_lexicon_id(&id) {
             LexiconIdVerdict::Valid => {}
             LexiconIdVerdict::Invalid(error) => {
@@ -74,15 +73,8 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> usize {
                 );
             }
             LexiconIdVerdict::Unaddressable => {
-                // Bound the delete to blank ids in SQL as well as in Rust, so a
-                // classifier change can never widen what this statement removes.
-                let delete = adapt_sql(
-                    "DELETE FROM happyview_lexicons WHERE id = ? AND trim(id) = ''",
-                    backend,
-                );
-                match crate::db::query(&delete).bind(&id).execute(pool).await {
-                    Ok(result) => {
-                        let affected = result.rows_affected();
+                match crate::catalog::lexicon_rows::delete_blank(pool, backend, &id).await {
+                    Ok(affected) => {
                         if affected > 0 {
                             removed += affected as usize;
                             info!(

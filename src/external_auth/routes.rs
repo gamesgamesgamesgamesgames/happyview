@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::auth::Claims;
+use crate::auth::middleware::PageClaims;
 use crate::error::AppError;
-use crate::external_auth::{pds_write, state, tokens};
-use crate::plugin::PluginExecutor;
-use crate::plugin::sync::SyncProcessor;
+use crate::external_auth::refresh::{RefreshError, RefreshOutcome, ensure_fresh_tokens};
+use crate::external_auth::{state, tokens};
+use crate::plugin::secrets::load_plugin_secrets;
+use crate::plugin::{LoadedPlugin, PluginExecutor, PluginType, TokenSetExt};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -22,8 +23,8 @@ pub fn routes() -> Router<AppState> {
         .route("/{plugin_id}/authorize", get(authorize))
         .route("/{plugin_id}/callback", get(callback))
         .route("/{plugin_id}/connect", post(connect_with_config))
-        .route("/{plugin_id}/sync", post(sync))
         .route("/{plugin_id}/unlink", post(unlink))
+        .route("/{plugin_id}/refresh", post(refresh))
 }
 
 #[derive(Serialize)]
@@ -36,6 +37,18 @@ struct ProviderInfo {
     config_schema: Option<serde_json::Value>,
 }
 
+/// The installed auth plugin `plugin_id`. Any other kind of plugin answers as
+/// if nothing by that id were installed, because these routes run sign-in
+/// exports that only an auth plugin has.
+async fn auth_plugin(state: &AppState, plugin_id: &str) -> Result<Arc<LoadedPlugin>, AppError> {
+    state
+        .plugin_registry
+        .get(plugin_id)
+        .await
+        .filter(|p| p.plugin_type() == PluginType::Auth)
+        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {plugin_id}")))
+}
+
 async fn list_providers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProviderInfo>>, AppError> {
@@ -43,6 +56,7 @@ async fn list_providers(
 
     let providers: Vec<ProviderInfo> = plugins
         .into_iter()
+        .filter(|p| p.plugin_type() == PluginType::Auth)
         .map(|p| ProviderInfo {
             id: p.info.id.clone(),
             name: p.info.name.clone(),
@@ -57,7 +71,7 @@ async fn list_providers(
 
 async fn list_accounts(
     State(app_state): State<AppState>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<Vec<tokens::LinkedAccountSummary>>, AppError> {
     let accounts = tokens::list_linked_accounts(&app_state.db, app_state.db_backend, claims.did())
         .await
@@ -76,13 +90,9 @@ async fn authorize(
     Path(plugin_id): Path<String>,
     Query(query): Query<AuthorizeQuery>,
     domain: Option<axum::extract::Extension<std::sync::Arc<crate::domain::Domain>>>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _plugin = app_state
-        .plugin_registry
-        .get(&plugin_id)
-        .await
-        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {}", plugin_id)))?;
+    auth_plugin(&app_state, &plugin_id).await?;
 
     // Generate state parameter for CSRF protection
     let state_param = uuid::Uuid::new_v4().to_string();
@@ -107,7 +117,7 @@ async fn authorize(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &plugin_id,
     )
     .await;
@@ -215,11 +225,14 @@ async fn callback_inner(
     stored_state: &state::StoredState,
     params: &HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    auth_plugin(app_state, &stored_state.plugin_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let config = serde_json::Value::Null;
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &stored_state.plugin_id,
     )
     .await;
@@ -248,7 +261,8 @@ async fn callback_inner(
         .call_get_profile(&token_set.access_token, &config)
         .await?;
 
-    let expires_at = token_set.expires_at.map(|dt| dt.to_rfc3339());
+    // An `expires_at` in any format but RFC 3339 fails the call here.
+    let expires_at = token_set.resolved_expires_at()?.map(|dt| dt.to_rfc3339());
 
     tokens::store_tokens(
         &app_state.db,
@@ -278,16 +292,12 @@ struct ConnectConfigBody {
 async fn connect_with_config(
     State(app_state): State<AppState>,
     Path(plugin_id): Path<String>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
     Json(body): Json<ConnectConfigBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_did = claims.did();
 
-    let plugin = app_state
-        .plugin_registry
-        .get(&plugin_id)
-        .await
-        .ok_or_else(|| AppError::NotFound(format!("Plugin not found: {}", plugin_id)))?;
+    let plugin = auth_plugin(&app_state, &plugin_id).await?;
 
     // Verify this is an API key plugin
     if plugin.info.auth_type != "api_key" {
@@ -299,7 +309,7 @@ async fn connect_with_config(
     let secrets = load_plugin_secrets(
         &app_state.db,
         app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
+        app_state.config.keyring().as_ref(),
         &plugin_id,
     )
     .await;
@@ -334,7 +344,10 @@ async fn connect_with_config(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // Format expires_at as RFC3339 string
-    let expires_at = token_set.expires_at.map(|dt| dt.to_rfc3339());
+    let expires_at = token_set
+        .resolved_expires_at()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map(|dt| dt.to_rfc3339());
 
     // Store encrypted tokens
     tokens::store_tokens(
@@ -360,79 +373,10 @@ async fn connect_with_config(
     })))
 }
 
-async fn sync(
-    State(app_state): State<AppState>,
-    Path(plugin_id): Path<String>,
-    claims: Claims,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let user_did = claims.did();
-
-    let config = serde_json::Value::Null;
-    let secrets = load_plugin_secrets(
-        &app_state.db,
-        app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
-        &plugin_id,
-    )
-    .await;
-
-    let executor = PluginExecutor::new(
-        app_state.wasm_runtime.clone(),
-        app_state.plugin_registry.clone(),
-        app_state.db.clone(),
-        app_state.db_backend,
-        app_state.http.clone(),
-        Arc::new(app_state.lexicons.clone()),
-    );
-
-    let mut instance = executor
-        .instantiate(&plugin_id, user_did, secrets, config.clone())
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // Get decrypted access token from DB
-    let stored = tokens::get_tokens(
-        &app_state.db,
-        app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
-        user_did,
-        &plugin_id,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut records = instance
-        .call_sync_account(&stored.access_token, &config)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // Resolve game references from database
-    crate::plugin::sync::resolve_game_references(&app_state.db, app_state.db_backend, &mut records)
-        .await;
-
-    // Process records: sign those with sign=true
-    let signer = app_state.attestation_signer.as_deref();
-    let processor = SyncProcessor::new(signer, user_did.to_string());
-    let processed = processor
-        .process_records(records)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let processed_count = processed.len();
-
-    // Write processed records to user's PDS
-    let write_results = pds_write::write_records_to_pds(&app_state, user_did, processed).await?;
-
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "processed": processed_count,
-        "written": write_results.len()
-    })))
-}
-
 async fn unlink(
     State(app_state): State<AppState>,
     Path(plugin_id): Path<String>,
-    claims: Claims,
+    PageClaims(claims): PageClaims,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_did = claims.did();
 
@@ -449,56 +393,29 @@ async fn unlink(
     })))
 }
 
-async fn load_plugin_secrets(
-    db: &sqlx::Pool<sqlx::Any>,
-    db_backend: crate::db::DatabaseBackend,
-    encryption_key: Option<&[u8; 32]>,
-    plugin_id: &str,
-) -> HashMap<String, String> {
-    use crate::plugin::encryption::decrypt;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-
-    // Try to load from database first (if encryption key is available)
-    if let Some(key) = encryption_key {
-        let sql = crate::db::adapt_sql(
-            "SELECT config FROM happyview_plugin_configs WHERE plugin_id = ?",
-            db_backend,
-        );
-
-        if let Ok(Some((config_json,))) = crate::db::query_as::<(String,)>(&sql)
-            .bind(plugin_id)
-            .fetch_optional(db)
-            .await
-            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_json)
-            && let Some(secrets_obj) = config.get("secrets").and_then(|s| s.as_object())
-        {
-            // DB keys are full env var names (e.g., PLUGIN_STEAM_API_KEY)
-            // Strip prefix to get short names for plugin (e.g., API_KEY)
-            let prefix = format!("PLUGIN_{}_", plugin_id.to_uppercase());
-            let db_secrets: HashMap<String, String> = secrets_obj
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_str().and_then(|encrypted_b64| {
-                        // Decode base64 and decrypt
-                        let encrypted = BASE64.decode(encrypted_b64).ok()?;
-                        let decrypted = decrypt(key, &encrypted).ok()?;
-                        let value = String::from_utf8(decrypted).ok()?;
-                        // Strip prefix from key to get short name
-                        let short_key = k.strip_prefix(&prefix).unwrap_or(k).to_string();
-                        Some((short_key, value))
-                    })
-                })
-                .collect();
-
-            if !db_secrets.is_empty() {
-                return db_secrets;
+/// Refresh the caller's own link on demand. The tokens themselves never leave
+/// the server; the response says whether an exchange happened and when the
+/// stored token now expires.
+async fn refresh(
+    State(app_state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    PageClaims(claims): PageClaims,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth_plugin(&app_state, &plugin_id).await?;
+    let outcome = ensure_fresh_tokens(&app_state, claims.did(), &plugin_id)
+        .await
+        .map_err(|e| match e {
+            RefreshError::NotLinked => {
+                AppError::NotFound(format!("No linked account for plugin: {plugin_id}"))
             }
-        }
-    }
+            RefreshError::NoRefreshToken => AppError::Conflict(e.to_string()),
+            RefreshError::Plugin(err) => AppError::BadGateway(err.to_string()),
+            RefreshError::Token(err) => AppError::Internal(err.to_string()),
+        })?;
 
-    // Fall back to environment variables
-    let prefix = format!("PLUGIN_{}_", plugin_id.to_uppercase());
-    std::env::vars()
-        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|name| (name.to_string(), v)))
-        .collect()
+    let refreshed = matches!(outcome, RefreshOutcome::Refreshed(_));
+    Ok(Json(serde_json::json!({
+        "refreshed": refreshed,
+        "expires_at": outcome.tokens().expires_at,
+    })))
 }

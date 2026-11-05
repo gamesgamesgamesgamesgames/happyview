@@ -835,9 +835,11 @@ async fn sync_plc_updates_did_document() {
         .await
         .unwrap()
         .unwrap();
-    let signing_key_bytes =
-        happyview::plc::decrypt_key(identity.signing_key_enc.as_ref().unwrap(), &encryption_key)
-            .unwrap();
+    let signing_key_bytes = happyview::plc::decrypt_key(
+        identity.signing_key_enc.as_ref().unwrap(),
+        &happyview::plugin::encryption::Keyring::from(encryption_key),
+    )
+    .unwrap();
     let signing_did_key = happyview_plc::private_key_to_did_key(&signing_key_bytes).unwrap();
 
     let genesis_doc = json!({
@@ -929,9 +931,11 @@ async fn sync_plc_publishes_verification_methods_as_did_keys() {
         .await
         .unwrap()
         .unwrap();
-    let signing_key_bytes =
-        happyview::plc::decrypt_key(identity.signing_key_enc.as_ref().unwrap(), &encryption_key)
-            .unwrap();
+    let signing_key_bytes = happyview::plc::decrypt_key(
+        identity.signing_key_enc.as_ref().unwrap(),
+        &happyview::plugin::encryption::Keyring::from(encryption_key),
+    )
+    .unwrap();
     let signing_did_key = happyview_plc::private_key_to_did_key(&signing_key_bytes).unwrap();
 
     let genesis_doc = json!({

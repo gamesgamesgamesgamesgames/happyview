@@ -224,27 +224,28 @@ Now add a query endpoint to read the indexed data:
 3. A [Lua script](../guides/lua-scripting.md) editor appears automatically. Replace the default script with:
 
 ```lua
-collection = "xyz.statusphere.status"
+local db = require("happyview.db")
 
-function handle()
-  if params.uri then
-    local record = db.get(params.uri)
-    if not record then
+local collection = "xyz.statusphere.status"
+
+function handle(input, ctx)
+  if input.uri then
+    local row = db.get(input.uri)
+    if not row then
       error("record not found")
     end
-    return { record = record }
+    return { record = row }
   end
 
-  return db.query({
-    collection = collection,
-    did = params.did,
-    limit = tonumber(params.limit) or 20,
-    cursor = params.cursor,
-  })
+  return db.records(collection)
+    :did(input.did)
+    :limit(tonumber(input.limit) or 20)
+    :cursor(input.cursor)
+    :run()
 end
 ```
 
-The `collection` variable at the top tells the script which record collection to query. The `handle()` function supports single-record lookups by URI and paginated listing with an optional DID filter.
+The `collection` local at the top tells the script which record collection to query. `handle(input, ctx)` receives the query parameters as `input` and supports single-record lookups by URI and paginated listing with an optional DID filter.
 
 4. Click **Upload**
 
@@ -287,13 +288,21 @@ curl "http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?limit=5" \
   "records": [
     {
       "uri": "at://did:plc:abc/xyz.statusphere.status/3abc123",
-      "status": "😊",
-      "createdAt": "2025-01-01T12:00:00Z"
+      "did": "did:plc:abc",
+      "collection": "xyz.statusphere.status",
+      "rkey": "3abc123",
+      "cid": "bafyreiabc123...",
+      "indexed_at": "2025-01-01T12:00:01Z",
+      "record": { "status": "😊", "createdAt": "2025-01-01T12:00:00Z" }
     },
     {
       "uri": "at://did:plc:def/xyz.statusphere.status/3def456",
-      "status": "🌟",
-      "createdAt": "2025-01-01T11:30:00Z"
+      "did": "did:plc:def",
+      "collection": "xyz.statusphere.status",
+      "rkey": "3def456",
+      "cid": "bafyreidef456...",
+      "indexed_at": "2025-01-01T11:30:01Z",
+      "record": { "status": "🌟", "createdAt": "2025-01-01T11:30:00Z" }
     }
   ],
   "cursor": "MjAyNS0wMS0wMVQxMjowMDowMFp8YXQ6Ly9kaWQ6..."
@@ -390,15 +399,16 @@ Add a write endpoint so users can set their status through your AppView:
 3. A default Lua script is generated — replace it with:
 
 ```lua
-collection = "xyz.statusphere.status"
+local time = require("internal.time")
+local record = require("happyview.record")
 
-function handle()
-  local r = Record(collection, {
+local collection = "xyz.statusphere.status"
+
+function handle(input, ctx)
+  return record.create(collection, {
     status = input.status,
-    createdAt = now(),
+    createdAt = time.to_iso8601(time.now()),
   })
-  r:save()
-  return { uri = r._uri, cid = r._cid }
 end
 ```
 

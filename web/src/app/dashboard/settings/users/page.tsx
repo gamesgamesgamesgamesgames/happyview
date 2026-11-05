@@ -316,7 +316,8 @@ export default function UsersPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No users yet. The first authenticated user is automatically granted owner permissions.
+                    No users yet. The first authenticated user is automatically
+                    granted owner permissions.
                   </TableCell>
                 </TableRow>
               )}
@@ -582,14 +583,28 @@ export default function UsersPage() {
                                 </AlertDialogTrigger>
                                 <AlertDialogContent>
                                   <AlertDialogHeader>
-                                    <AlertDialogTitle>Delete user?</AlertDialogTitle>
+                                    <AlertDialogTitle>
+                                      Delete user?
+                                    </AlertDialogTitle>
                                     <AlertDialogDescription>
-                                      This will permanently remove the user and revoke all their permissions. This action cannot be undone.
+                                      This will permanently remove the user and
+                                      revoke all their permissions. This action
+                                      cannot be undone.
                                     </AlertDialogDescription>
                                   </AlertDialogHeader>
                                   <AlertDialogFooter>
-                                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                    <AlertDialogAction variant="destructive" onClick={() => { handleDelete(selectedUser.id); setSelectedUserId(null); }}>Delete</AlertDialogAction>
+                                    <AlertDialogCancel>
+                                      Cancel
+                                    </AlertDialogCancel>
+                                    <AlertDialogAction
+                                      variant="destructive"
+                                      onClick={() => {
+                                        handleDelete(selectedUser.id);
+                                        setSelectedUserId(null);
+                                      }}
+                                    >
+                                      Delete
+                                    </AlertDialogAction>
                                   </AlertDialogFooter>
                                 </AlertDialogContent>
                               </AlertDialog>
@@ -874,7 +889,10 @@ function AddUserDialog({
           <ResponsiveDialogClose asChild>
             <Button variant="outline">Cancel</Button>
           </ResponsiveDialogClose>
-          <Button onClick={handleAdd} disabled={dids.length === 0 || accountBlocked}>
+          <Button
+            onClick={handleAdd}
+            disabled={dids.length === 0 || accountBlocked}
+          >
             Add
           </Button>
         </ResponsiveDialogFooter>

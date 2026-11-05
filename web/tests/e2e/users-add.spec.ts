@@ -24,9 +24,13 @@ async function openAddUserDialog(page: import("@playwright/test").Page) {
  * Synthetic DIDs have no DID document, so the real resolve endpoint refuses
  * them. Handles fall through to the server so resolution failures stay real.
  */
-async function mockSyntheticDidResolution(page: import("@playwright/test").Page) {
+async function mockSyntheticDidResolution(
+  page: import("@playwright/test").Page,
+) {
   await page.route("**/admin/identity/resolve?**", (route) => {
-    const identifier = new URL(route.request().url()).searchParams.get("identifier");
+    const identifier = new URL(route.request().url()).searchParams.get(
+      "identifier",
+    );
     if (identifier?.startsWith("did:plc:e2e")) {
       return route.fulfill({ json: { did: identifier, handle: null } });
     }
@@ -99,7 +103,9 @@ test.describe("Add User", () => {
     // Resolution happens as the account is entered, so the refusal shows
     // on the tag and the dialog cannot submit it.
     await expect(page.locator('[data-status="error"]')).toHaveCount(1);
-    await expect(page.getByRole("button", { name: "Add", exact: true })).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Add", exact: true }),
+    ).toBeDisabled();
 
     await page.keyboard.press("Escape");
     await page.reload();
@@ -128,6 +134,8 @@ test.describe("Add User", () => {
     // `toastError` collapses anything naming "already exists" into this copy;
     // a 500 from the UNIQUE constraint, which is what this returned before,
     // would fall through to the generic branch instead.
-    await expect(page.getByText("Failed to add user: already exists")).toBeVisible();
+    await expect(
+      page.getByText("Failed to add user: already exists"),
+    ).toBeVisible();
   });
 });

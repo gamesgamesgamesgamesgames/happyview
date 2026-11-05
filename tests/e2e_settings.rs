@@ -77,6 +77,49 @@ fn get_with_host(uri: &str, host: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// The kids an authorization server finds by following the metadata served
+/// on `host` to its `jwks_uri`. The key set is never inlined.
+async fn published_instance_kids(app: &TestApp, host: &str) -> Vec<String> {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_with_host("/oauth-client-metadata.json", host))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let metadata = json_body(resp).await;
+    assert!(
+        metadata.get("jwks").is_none(),
+        "the key set must be served by reference, got {metadata}"
+    );
+    let jwks_uri = metadata["jwks_uri"]
+        .as_str()
+        .expect("a confidential client's metadata names a jwks_uri");
+    let prefix = format!("https://{host}");
+    let path = jwks_uri
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("{jwks_uri} is not served from {prefix}"));
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_with_host(path, host))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await["keys"]
+        .as_array()
+        .expect("expected keys to be an array")
+        .iter()
+        .map(|k| {
+            k["kid"]
+                .as_str()
+                .expect("published key missing kid")
+                .to_string()
+        })
+        .collect()
+}
+
 async fn seed_domain(app: &TestApp, id: &str, url: &str, is_primary: bool) {
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
@@ -179,6 +222,118 @@ async fn settings_crud() {
         app_name_entry.is_none(),
         "app_name entry should have been deleted"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_script_budget_must_be_an_integer_inside_its_range() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let cases = [
+        (
+            "script_instruction_limit",
+            "1000",
+            "1000000000",
+            &["999", "1000000001", "4294967295"][..],
+        ),
+        (
+            "script_wall_clock_seconds",
+            "1",
+            "300",
+            &["0", "301", "600000"][..],
+        ),
+    ];
+    for (key, min, max, outside) in cases {
+        for bad in ["-1", "abc", "1.5", "", "1e6"].iter().chain(outside) {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["error"],
+                format!("{key} must be an integer from {min} to {max}")
+            );
+        }
+
+        for edge in [min, max] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": edge }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{key}={edge}");
+        }
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+    let entries = json_body(resp).await;
+    for (key, _, max, _) in cases {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {entries}"));
+        assert_eq!(entry["value"], max);
+        assert_eq!(entry["source"], "database");
+    }
+}
+
+/// A run reads the budget from the in-process cache and never queries for it,
+/// so a change made through the settings API has to reach that cache without a
+/// restart. That the cached value is what reaches an interpreter is pinned in
+/// `xrpc_script_runners.rs`; spending it is the interpreter's own, and only a
+/// target that loads a real one sees a run end on it.
+#[tokio::test]
+#[serial]
+async fn a_script_budget_change_reaches_the_cache_without_restart() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let default = app.state.script_limits.instruction_limit();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+            &json!({ "value": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(app.state.script_limits.instruction_limit(), 1_000);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(app.state.script_limits.instruction_limit(), default);
 }
 
 #[tokio::test]
@@ -419,7 +574,7 @@ async fn client_metadata_client_uri_overridden_by_setting() {
 
 #[tokio::test]
 #[serial]
-async fn client_metadata_jwks_includes_current_and_retiring_instance_keys() {
+async fn published_jwks_includes_current_pending_and_retiring_instance_keys() {
     common::require_db!();
     let mut app = TestApp::new_with_encryption().await;
 
@@ -457,7 +612,7 @@ async fn client_metadata_jwks_includes_current_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -471,35 +626,26 @@ async fn client_metadata_jwks_includes_current_and_retiring_instance_keys() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
     .expect("insert retiring instance key");
 
-    let resp = app
-        .router
-        .clone()
-        .oneshot(get_with_host(
-            "/oauth-client-metadata.json",
-            "confidential.task21-fix1-test.invalid",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = json_body(resp).await;
+    let (pending, _) = happyview::oauth::client_keys::stage_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.keyring().as_ref(),
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .expect("stage a pending instance key");
 
-    let kids: Vec<String> = json["jwks"]["keys"]
-        .as_array()
-        .expect("expected jwks.keys to be an array")
-        .iter()
-        .map(|k| {
-            k["kid"]
-                .as_str()
-                .expect("published key missing kid")
-                .to_string()
-        })
-        .collect();
+    let kids = published_instance_kids(&app, "confidential.task21-fix1-test.invalid").await;
+    assert!(
+        kids.contains(&pending.kid),
+        "a pending key must be published before it signs, got {kids:?}"
+    );
 
     assert!(
         kids.contains(&current.kid),
@@ -559,7 +705,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &current,
     )
     .await
@@ -573,7 +719,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -602,28 +748,7 @@ async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
         "no sessions were pinned to the retiring key in this test"
     );
 
-    let resp = app
-        .router
-        .clone()
-        .oneshot(get_with_host(
-            "/oauth-client-metadata.json",
-            "confidential.task22a-revoke-test.invalid",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = json_body(resp).await;
-    let kids: Vec<String> = json["jwks"]["keys"]
-        .as_array()
-        .expect("expected jwks.keys to be an array")
-        .iter()
-        .map(|k| {
-            k["kid"]
-                .as_str()
-                .expect("published key missing kid")
-                .to_string()
-        })
-        .collect();
+    let kids = published_instance_kids(&app, "confidential.task22a-revoke-test.invalid").await;
     assert!(
         !kids.contains(&retiring.kid),
         "revoked key must disappear from the published JWKS, got {:?}",
@@ -660,7 +785,7 @@ async fn revoking_the_current_instance_key_is_refused_with_400() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -731,7 +856,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     let current = happyview::oauth::client_keys::ensure_instance_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await
     .expect("ensure instance key");
@@ -744,7 +869,7 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
     happyview::oauth::client_keys::insert_key(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &retiring,
     )
     .await
@@ -792,4 +917,106 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
         retiring_entry["session_count"], 0,
         "a kid with no sessions must report zero, not be omitted"
     );
+}
+
+/// Clears the project layer and `APP_NAME` when dropped, so a failing
+/// assertion cannot leak either into the next test.
+struct ProjectLayerGuard;
+
+impl Drop for ProjectLayerGuard {
+    fn drop(&mut self) {
+        happyview::config::vars::set_project_layer(Default::default());
+        unsafe { std::env::remove_var("APP_NAME") };
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_listing_reports_a_project_file_value_with_its_source() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let _guard = ProjectLayerGuard;
+    unsafe { std::env::remove_var("APP_NAME") };
+    happyview::config::vars::set_project_layer(
+        [("APP_NAME".to_string(), "From The File".to_string())].into(),
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let entry = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "app_name")
+        .expect("app_name entry not found in settings");
+    assert_eq!(entry["value"], "From The File");
+    assert_eq!(entry["source"], "project");
+}
+
+/// A setting the hosting platform fixes can't be changed or removed through
+/// the settings routes, and lists with `platform` as its source.
+#[tokio::test]
+#[serial]
+async fn a_platform_fixed_setting_is_refused_and_listed_as_the_platform() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    unsafe {
+        std::env::set_var(
+            "PLATFORM_LOCKED_SETTINGS",
+            "space_access_log_retention_days",
+        );
+        std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "364");
+    }
+
+    let put = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/space_access_log_retention_days",
+            app.admin_cookie(),
+            &json!({ "value": "0" }),
+        ))
+        .await
+        .unwrap()
+        .status();
+    let delete = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/settings/space_access_log_retention_days",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap()
+        .status();
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    unsafe {
+        std::env::remove_var("PLATFORM_LOCKED_SETTINGS");
+        std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS");
+    }
+
+    assert_eq!(put, StatusCode::CONFLICT);
+    assert_eq!(delete, StatusCode::CONFLICT);
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "space_access_log_retention_days")
+        .expect("the fixed setting is listed");
+    assert_eq!(entry["value"], "364");
+    assert_eq!(entry["source"], "platform");
 }

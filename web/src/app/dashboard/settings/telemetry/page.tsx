@@ -70,7 +70,9 @@ const LEXICON_TOGGLES = [
 export default function TelemetryPage() {
   const [settings, setSettings] = useState<TelemetrySettings | null>(null);
   const [preview, setPreview] = useState<string>("");
-  const [benchmarks, setBenchmarks] = useState<TelemetryBenchmarks | null>(null);
+  const [benchmarks, setBenchmarks] = useState<TelemetryBenchmarks | null>(
+    null,
+  );
   const [sending, setSending] = useState(false);
   const [contactDraft, setContactDraft] = useState("");
   // Only seed the draft from the first load. Re-syncing on every `settings`
@@ -140,6 +142,7 @@ export default function TelemetryPage() {
 
   const mode = settings?.mode ?? "off";
   const sharing = mode !== "off";
+  const managed = settings?.managed ?? false;
 
   return (
     <>
@@ -149,13 +152,15 @@ export default function TelemetryPage() {
           <CardHeader>
             <CardTitle>What this instance shares</CardTitle>
             <CardDescription>
-              Off by default. Everything below is opt-in, each part separately,
-              and you can read the exact payload before you turn anything on.
+              {managed
+                ? "This instance's hosting platform requires a daily report, so these settings can't be changed here. The report covers the instance only: no contact details and no lexicon names or documents."
+                : "Off by default. Everything below is opt-in, each part separately, and you can read the exact payload before you turn anything on."}
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             <RadioGroup
               value={mode}
+              disabled={managed}
               onValueChange={(value) =>
                 void patch({ mode: value as TelemetrySettings["mode"] })
               }
@@ -173,63 +178,72 @@ export default function TelemetryPage() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Contact (optional)</CardTitle>
-            <CardDescription>
-              If you&apos;d like us to be able to reach you about what we see
-              in your reports, leave a way to reach you below. This is
-              separate from whether you send anything at all — you can report
-              without ever filling this in.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-2">
-            <Label htmlFor="contact">Contact</Label>
-            <Input
-              id="contact"
-              placeholder="you@example.com or @handle.bsky.social"
-              maxLength={MAX_CONTACT_LEN}
-              disabled={!sharing}
-              value={contactDraft}
-              onChange={(e) => setContactDraft(e.target.value)}
-              onBlur={commitContact}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-              }}
-            />
-            <p className="text-muted-foreground text-sm">
-              Optional, up to {MAX_CONTACT_LEN} characters. Only included in a
-              report if you provide it.
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Lexicon detail</CardTitle>
-            <CardDescription>
-              Counts and shapes are always included. These three add detail, and
-              each is separate — sharing structure does not share names.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-4">
-            {LEXICON_TOGGLES.map((t) => (
-              <div key={t.key} className="flex items-start justify-between gap-4">
-                <div className="grid gap-1">
-                  <Label htmlFor={t.key}>{t.label}</Label>
-                  <p className="text-muted-foreground text-sm">{t.hint}</p>
-                </div>
-                <Switch
-                  id={t.key}
-                  aria-label={t.label}
+        {!managed && (
+          <>
+            <Card>
+              <CardHeader>
+                <CardTitle>Contact (optional)</CardTitle>
+                <CardDescription>
+                  If you&apos;d like us to be able to reach you about what we
+                  see in your reports, leave a way to reach you below. This is
+                  separate from whether you send anything at all — you can
+                  report without ever filling this in.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-2">
+                <Label htmlFor="contact">Contact</Label>
+                <Input
+                  id="contact"
+                  placeholder="you@example.com or @handle.bsky.social"
+                  maxLength={MAX_CONTACT_LEN}
                   disabled={!sharing}
-                  checked={settings?.[t.key] ?? false}
-                  onCheckedChange={(checked) => void patch({ [t.key]: checked })}
+                  value={contactDraft}
+                  onChange={(e) => setContactDraft(e.target.value)}
+                  onBlur={commitContact}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.currentTarget.blur();
+                  }}
                 />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
+                <p className="text-muted-foreground text-sm">
+                  Optional, up to {MAX_CONTACT_LEN} characters. Only included in
+                  a report if you provide it.
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Lexicon detail</CardTitle>
+                <CardDescription>
+                  Counts and shapes are always included. These three add detail,
+                  and each is separate — sharing structure does not share names.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-4">
+                {LEXICON_TOGGLES.map((t) => (
+                  <div
+                    key={t.key}
+                    className="flex items-start justify-between gap-4"
+                  >
+                    <div className="grid gap-1">
+                      <Label htmlFor={t.key}>{t.label}</Label>
+                      <p className="text-muted-foreground text-sm">{t.hint}</p>
+                    </div>
+                    <Switch
+                      id={t.key}
+                      aria-label={t.label}
+                      disabled={!sharing}
+                      checked={settings?.[t.key] ?? false}
+                      onCheckedChange={(checked) =>
+                        void patch({ [t.key]: checked })
+                      }
+                    />
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          </>
+        )}
 
         <Card>
           <CardHeader>

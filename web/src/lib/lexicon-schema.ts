@@ -104,7 +104,10 @@ export const lexiconJsonSchema: Record<string, any> = {
         "A record type — stored in a user's repository. Must be the 'main' definition.",
       properties: {
         type: { type: "string", const: "record" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         key: {
           type: "string",
           description:
@@ -122,11 +125,13 @@ export const lexiconJsonSchema: Record<string, any> = {
 
     queryDef: {
       type: "object",
-      description:
-        "An XRPC query (HTTP GET). Must be the 'main' definition.",
+      description: "An XRPC query (HTTP GET). Must be the 'main' definition.",
       properties: {
         type: { type: "string", const: "query" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         parameters: { $ref: "#/definitions/paramsDef" },
         output: { $ref: "#/definitions/xrpcBody" },
         errors: { $ref: "#/definitions/xrpcErrors" },
@@ -141,7 +146,10 @@ export const lexiconJsonSchema: Record<string, any> = {
         "An XRPC procedure (HTTP POST). Must be the 'main' definition.",
       properties: {
         type: { type: "string", const: "procedure" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         parameters: { $ref: "#/definitions/paramsDef" },
         input: { $ref: "#/definitions/xrpcBody" },
         output: { $ref: "#/definitions/xrpcBody" },
@@ -157,7 +165,10 @@ export const lexiconJsonSchema: Record<string, any> = {
         "An XRPC subscription (WebSocket event stream). Must be the 'main' definition.",
       properties: {
         type: { type: "string", const: "subscription" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         parameters: { $ref: "#/definitions/paramsDef" },
         message: {
           type: "object",
@@ -182,7 +193,10 @@ export const lexiconJsonSchema: Record<string, any> = {
       description: "An object with named properties.",
       properties: {
         type: { type: "string", const: "object" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         properties: {
           type: "object",
           description: "Map of property names to their type schemas.",
@@ -212,7 +226,10 @@ export const lexiconJsonSchema: Record<string, any> = {
       description: "An array of items of a single type.",
       properties: {
         type: { type: "string", const: "array" },
-        description: { type: "string", description: "Human-readable description." },
+        description: {
+          type: "string",
+          description: "Human-readable description.",
+        },
         items: {
           $ref: "#/definitions/arrayItem",
           description: "Schema for each element in the array.",
@@ -238,7 +255,10 @@ export const lexiconJsonSchema: Record<string, any> = {
         "A named symbol with no data representation. Used as values in 'knownValues' string enumerations.",
       properties: {
         type: { type: "string", const: "token" },
-        description: { type: "string", description: "Clarifies the token's meaning." },
+        description: {
+          type: "string",
+          description: "Clarifies the token's meaning.",
+        },
       },
       required: ["type"],
       additionalProperties: false,
@@ -252,8 +272,14 @@ export const lexiconJsonSchema: Record<string, any> = {
       properties: {
         type: { type: "string", const: "boolean" },
         description: { type: "string" },
-        default: { type: "boolean", description: "Default value. Mutually exclusive with 'const'." },
-        const: { type: "boolean", description: "Fixed value. Mutually exclusive with 'default'." },
+        default: {
+          type: "boolean",
+          description: "Default value. Mutually exclusive with 'const'.",
+        },
+        const: {
+          type: "boolean",
+          description: "Fixed value. Mutually exclusive with 'default'.",
+        },
       },
       required: ["type"],
       additionalProperties: false,
@@ -261,20 +287,33 @@ export const lexiconJsonSchema: Record<string, any> = {
 
     integerDef: {
       type: "object",
-      description: "A 64-bit signed integer (limit to 53-bit for JS compatibility).",
+      description:
+        "A 64-bit signed integer (limit to 53-bit for JS compatibility).",
       properties: {
         type: { type: "string", const: "integer" },
         description: { type: "string" },
-        default: { type: "integer", description: "Default value. Mutually exclusive with 'const'." },
-        minimum: { type: "integer", description: "Minimum allowed value (inclusive)." },
-        maximum: { type: "integer", description: "Maximum allowed value (inclusive)." },
+        default: {
+          type: "integer",
+          description: "Default value. Mutually exclusive with 'const'.",
+        },
+        minimum: {
+          type: "integer",
+          description: "Minimum allowed value (inclusive).",
+        },
+        maximum: {
+          type: "integer",
+          description: "Maximum allowed value (inclusive).",
+        },
         enum: {
           type: "array",
           items: { type: "integer" },
           description: "Closed set of allowed values.",
           uniqueItems: true,
         },
-        const: { type: "integer", description: "Fixed value. Mutually exclusive with 'default'." },
+        const: {
+          type: "integer",
+          description: "Fixed value. Mutually exclusive with 'default'.",
+        },
       },
       required: ["type"],
       additionalProperties: false,
@@ -303,9 +342,20 @@ export const lexiconJsonSchema: Record<string, any> = {
             "record-key",
           ],
         },
-        default: { type: "string", description: "Default value. Mutually exclusive with 'const'." },
-        minLength: { type: "integer", description: "Minimum length in UTF-8 bytes.", minimum: 0 },
-        maxLength: { type: "integer", description: "Maximum length in UTF-8 bytes.", minimum: 0 },
+        default: {
+          type: "string",
+          description: "Default value. Mutually exclusive with 'const'.",
+        },
+        minLength: {
+          type: "integer",
+          description: "Minimum length in UTF-8 bytes.",
+          minimum: 0,
+        },
+        maxLength: {
+          type: "integer",
+          description: "Maximum length in UTF-8 bytes.",
+          minimum: 0,
+        },
         minGraphemes: {
           type: "integer",
           description: "Minimum length in Unicode grapheme clusters.",
@@ -322,7 +372,10 @@ export const lexiconJsonSchema: Record<string, any> = {
           description: "Closed set of allowed values.",
           uniqueItems: true,
         },
-        const: { type: "string", description: "Fixed value. Mutually exclusive with 'default'." },
+        const: {
+          type: "string",
+          description: "Fixed value. Mutually exclusive with 'default'.",
+        },
         knownValues: {
           type: "array",
           items: { type: "string" },
@@ -351,13 +404,20 @@ export const lexiconJsonSchema: Record<string, any> = {
 
     bytesDef: {
       type: "object",
-      description:
-        "Raw bytes. Encoded in JSON as { \"$bytes\": \"<base64>\" }.",
+      description: 'Raw bytes. Encoded in JSON as { "$bytes": "<base64>" }.',
       properties: {
         type: { type: "string", const: "bytes" },
         description: { type: "string" },
-        minLength: { type: "integer", description: "Minimum byte length.", minimum: 0 },
-        maxLength: { type: "integer", description: "Maximum byte length.", minimum: 0 },
+        minLength: {
+          type: "integer",
+          description: "Minimum byte length.",
+          minimum: 0,
+        },
+        maxLength: {
+          type: "integer",
+          description: "Maximum byte length.",
+          minimum: 0,
+        },
       },
       required: ["type"],
       additionalProperties: false,
@@ -366,7 +426,7 @@ export const lexiconJsonSchema: Record<string, any> = {
     cidLinkDef: {
       type: "object",
       description:
-        "A CID link to content-addressed data. Encoded in JSON as { \"$link\": \"<CID>\" }.",
+        'A CID link to content-addressed data. Encoded in JSON as { "$link": "<CID>" }.',
       properties: {
         type: { type: "string", const: "cid-link" },
         description: { type: "string" },
@@ -490,7 +550,8 @@ export const lexiconJsonSchema: Record<string, any> = {
         required: {
           type: "array",
           items: { type: "string" },
-          description: "Required parameter names. Each must be a key in 'properties'.",
+          description:
+            "Required parameter names. Each must be a key in 'properties'.",
           uniqueItems: true,
         },
         properties: {
@@ -518,7 +579,8 @@ export const lexiconJsonSchema: Record<string, any> = {
 
     primitiveArrayDef: {
       type: "object",
-      description: "An array whose items are a primitive type (for use in XRPC parameters).",
+      description:
+        "An array whose items are a primitive type (for use in XRPC parameters).",
       properties: {
         type: { type: "string", const: "array" },
         description: { type: "string" },
@@ -568,9 +630,13 @@ export const lexiconJsonSchema: Record<string, any> = {
         properties: {
           name: {
             type: "string",
-            description: "Short error name with no whitespace, e.g. 'InvalidRequest'.",
+            description:
+              "Short error name with no whitespace, e.g. 'InvalidRequest'.",
           },
-          description: { type: "string", description: "Human-readable error description." },
+          description: {
+            type: "string",
+            description: "Human-readable error description.",
+          },
         },
         required: ["name"],
         additionalProperties: false,

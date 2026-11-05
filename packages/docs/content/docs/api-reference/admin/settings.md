@@ -58,7 +58,7 @@ resp, err := http.DefaultClient.Do(req)
 curl http://127.0.0.1:3000/admin/settings -H "$AUTH"
 ```
 
-Returns all key/value pairs stored in the `happyview_instance_settings` table, plus any env-var fallback values for keys not stored in the database. Each entry includes a `source` field: `"database"` for stored values, `"env"` for env-var fallbacks.
+Returns all key/value pairs stored in the `happyview_instance_settings` table, plus any env-var fallback values for keys not stored in the database. Each entry includes a `source` field: `"database"` for stored values, `"env"` for env-var fallbacks, and `"project"` for values from the project's `happyview.toml`.
 
 ### Known settings
 
@@ -73,6 +73,7 @@ Returns all key/value pairs stored in the `happyview_instance_settings` table, p
 | `backfill_concurrent_dids_per_pds` | `BACKFILL_CONCURRENT_DIDS_PER_PDS` | `3` | How many repos to fetch concurrently from each PDS |
 | `backfill_concurrent_resolution` | `BACKFILL_CONCURRENT_RESOLUTION` | `100` | How many DID document lookups to run in parallel during PDS resolution |
 | `backfill_retention_days` | `BACKFILL_RETENTION_DAYS` | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` = keep indefinitely |
+| `script_metrics_enabled` | `SCRIPT_METRICS_ENABLED` | `true` | Record per-script run metrics for [`/admin/metrics`](./metrics.md), in memory and in the stored minutes behind its `7d` and `30d` windows. `"true"` or `"false"`; any other value is refused with `400` |
 | `verbose_event_logging` | `VERBOSE_EVENT_LOGGING` | `false` | Log every record index, record skip, and successful script run (record, label, and XRPC) to the event log. High write volume — recommended only for debugging |
 | `feature.spaces_enabled` | `FEATURE_SPACES_ENABLED` | --- | Enables the experimental Permissioned Spaces API. When `"true"`, space endpoints are available. When absent or any other value, space endpoints return `404 FeatureDisabled` |
 
@@ -151,7 +152,7 @@ curl http://127.0.0.1:3000/admin/settings/db-info -H "$AUTH"
   "backend": "sqlite",
   "server_max_connections": null,
   "main_pool_size": 32,
-  "backfill_pool_size": 64,
+  "backfill_pool_size": 16,
   "restart_recommended": false
 }
 ```

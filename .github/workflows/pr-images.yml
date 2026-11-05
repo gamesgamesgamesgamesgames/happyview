@@ -13,6 +13,15 @@ on:
     workflows: [CI]
     types: [completed]
 
+# A `workflow_run` event carries no `pull_request`, so a PR's runs are keyed
+# by its head repository and branch: a newer CI completion for the same PR
+# cancels a publish still running for an older one, which the PR-head check
+# below would skip anyway. Runs for pushes are keyed by commit and never
+# cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.event == 'pull_request' && format('pr-{0}-{1}', github.event.workflow_run.head_repository.full_name, github.event.workflow_run.head_branch) || github.event.workflow_run.head_sha }}
+  cancel-in-progress: ${{ github.event.workflow_run.event == 'pull_request' }}
+
 permissions: {}
 
 jobs:

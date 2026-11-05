@@ -1,0 +1,13 @@
+{
+  "id": "sdk_auth",
+  "name": "SDK Auth fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "auth",
+  "auth_type": "api_key",
+  "capabilities": ["secrets:read", "network:request:unrestricted"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "required_secrets": [{ "key": "PLUGIN_SDK_AUTH_API_KEY", "name": "API key" }],
+  "wasm_file": "target/wasm32-unknown-unknown/release/sdk_auth.wasm"
+}

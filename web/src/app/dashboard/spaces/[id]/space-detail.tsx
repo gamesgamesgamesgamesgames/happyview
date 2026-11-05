@@ -47,7 +47,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import {
   Table,
   TableBody,
@@ -73,7 +78,13 @@ function policyLabel(type: string): string {
   return POLICY_LABELS[name] ?? name;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-0.5">
       <span className="text-muted-foreground text-xs">{label}</span>
@@ -147,7 +158,8 @@ function SpaceDetailContent() {
       setLoading(true);
       try {
         const data = await getAdminSpaceRecords(id, {
-          collection: filters.collection === ALL ? undefined : filters.collection,
+          collection:
+            filters.collection === ALL ? undefined : filters.collection,
           repo: filters.repo === ALL ? undefined : filters.repo,
           limit: PAGE_SIZE,
           cursor,
@@ -157,7 +169,10 @@ function SpaceDetailContent() {
         setNextCursor(data.cursor);
       } catch (e: unknown) {
         if (request !== recordsRequest.current) return;
-        if (e instanceof ApiError && e.message === SPACE_ACCESS_GRANT_REQUIRED) {
+        if (
+          e instanceof ApiError &&
+          e.message === SPACE_ACCESS_GRANT_REQUIRED
+        ) {
           access.drop();
           return;
         }
@@ -263,7 +278,9 @@ function SpaceDetailContent() {
               {new Date(space.created_at).toLocaleString()}
             </Field>
             <Field label="Read policy">
-              <Badge variant="outline">{policyLabel(space.read_policy.$type)}</Badge>
+              <Badge variant="outline">
+                {policyLabel(space.read_policy.$type)}
+              </Badge>
             </Field>
             <Field label="Write policy">
               <Badge variant="outline">
@@ -271,7 +288,9 @@ function SpaceDetailContent() {
               </Badge>
             </Field>
             <Field label="App access">
-              <Badge variant="outline">{policyLabel(space.app_access.$type)}</Badge>
+              <Badge variant="outline">
+                {policyLabel(space.app_access.$type)}
+              </Badge>
             </Field>
           </CardContent>
         </Card>
@@ -308,7 +327,9 @@ function SpaceDetailContent() {
                         </TableCell>
                         <TableCell className="flex gap-1">
                           {member.read && <Badge variant="outline">read</Badge>}
-                          {member.write && <Badge variant="outline">write</Badge>}
+                          {member.write && (
+                            <Badge variant="outline">write</Badge>
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -373,12 +394,15 @@ function SpaceDetailContent() {
               ) : !access.grant ? (
                 <>
                   <CardDescription>
-                    This space is private to its members. To read its
-                    records, request access and give a reason. Access
-                    expires, and the reason and every read are logged.
+                    This space is private to its members. To read its records,
+                    request access and give a reason. Access expires, and the
+                    reason and every read are logged.
                   </CardDescription>
                   <CardAction>
-                    <Button variant="outline" onClick={() => setRequestOpen(true)}>
+                    <Button
+                      variant="outline"
+                      onClick={() => setRequestOpen(true)}
+                    >
                       Request access
                     </Button>
                   </CardAction>
@@ -391,7 +415,9 @@ function SpaceDetailContent() {
                   grant={access.grant}
                   remainingMs={access.remainingMs}
                   onEnd={() =>
-                    access.end().catch((e) => toastError("Couldn't end access", e))
+                    access
+                      .end()
+                      .catch((e) => toastError("Couldn't end access", e))
                   }
                 />
 
@@ -402,7 +428,10 @@ function SpaceDetailContent() {
                       applyFilters({ collection: value, repo })
                     }
                   >
-                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Collection">
+                    <SelectTrigger
+                      className="h-8 w-72 text-sm"
+                      aria-label="Collection"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -421,7 +450,10 @@ function SpaceDetailContent() {
                       applyFilters({ collection, repo: value })
                     }
                   >
-                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Author">
+                    <SelectTrigger
+                      className="h-8 w-72 text-sm"
+                      aria-label="Author"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -572,7 +604,9 @@ function SpaceDetailContent() {
                   )}
 
                   <Field label="Record">
-                    <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                    <CodeBlock
+                      code={JSON.stringify(viewRecord.record, null, 2)}
+                    />
                   </Field>
                 </div>
               </>
@@ -587,7 +621,11 @@ function SpaceDetailContent() {
             maxMinutes={inspector.max_grant_minutes}
             defaultMinutes={inspector.default_grant_minutes}
             scopeOptions={[
-              { scope: "space", target: id, label: "This space: every record and blob, from every author" },
+              {
+                scope: "space",
+                target: id,
+                label: "This space: every record and blob, from every author",
+              },
               ...memberDids.map((did) => ({
                 scope: "account" as const,
                 target: did,

@@ -42,7 +42,9 @@ function capitalize(word: string): string {
 }
 
 function joinActions(actions: string[]): string {
-  const verbs = actions.map((action, i) => (i === 0 ? capitalize(action) : action));
+  const verbs = actions.map((action, i) =>
+    i === 0 ? capitalize(action) : action,
+  );
   // "Create only" rather than a bare "Create": on a consent screen the useful
   // fact is as much what the app *can't* do afterwards as what it can.
   if (verbs.length <= 1) return verbs[0] ? `${verbs[0]} only` : "";
@@ -75,8 +77,12 @@ function describeBlobScope(rest: string): Described {
   const [target] = splitOnce(rest, "?");
   const [type, subtype] = target.split("/");
   if (!type || !subtype) return { heading: "Upload files", target: rest };
-  if (type === "*" && subtype === "*") return { heading: "Upload files", target: null };
-  return { heading: "Upload files of type", target: subtype === "*" ? `${type}/*` : target };
+  if (type === "*" && subtype === "*")
+    return { heading: "Upload files", target: null };
+  return {
+    heading: "Upload files of type",
+    target: subtype === "*" ? `${type}/*` : target,
+  };
 }
 
 function describeOtherScope(prefix: string, rest: string): Described {
@@ -126,7 +132,11 @@ export function describeScope(scope: string): ScopeDescription {
         : describeOtherScope(prefix, rest);
 
   // A repo scope we can't name falls back to the raw string as its own heading.
-  return { raw: scope, ...(described ?? { heading: scope, target: null }), quiet: false };
+  return {
+    raw: scope,
+    ...(described ?? { heading: scope, target: null }),
+    quiet: false,
+  };
 }
 
 /**
@@ -137,7 +147,8 @@ export function groupScopes(descriptions: ScopeDescription[]): ScopeGroup[] {
   const groups = new Map<string, ScopeGroup>();
   for (const { heading, target } of descriptions) {
     const group = groups.get(heading) ?? { heading, targets: [] };
-    if (target !== null && !group.targets.includes(target)) group.targets.push(target);
+    if (target !== null && !group.targets.includes(target))
+      group.targets.push(target);
     groups.set(heading, group);
   }
   return [...groups.values()];

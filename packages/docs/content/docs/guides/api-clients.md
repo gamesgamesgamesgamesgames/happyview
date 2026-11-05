@@ -496,6 +496,8 @@ Content-Type: application/json
 }
 ```
 
+`signing_kid` (optional) is the `kid` of the assertion that signed your token exchange. HappyView pins the session to it and signs its refreshes with that key. Without it, HappyView uses the key it recorded for the provision's assertions, or else the current one. That's wrong if a rotated key took over between your exchange and this call.
+
 **Public client** — omit the secret, include the PKCE verifier:
 
 ```http
@@ -682,6 +684,8 @@ Each API client has its own token bucket for rate limiting:
 - **Refill rate** — tokens added per second
 
 If not set on the client, the instance defaults apply (`DEFAULT_RATE_LIMIT_CAPACITY` and `DEFAULT_RATE_LIMIT_REFILL_RATE`).
+
+A request is charged to a client's bucket only when it proves it is that client: through a DPoP session, an `Origin` matching the client's `client_uri`, or one of its secrets. A request that only names the key is handled as anonymous.
 
 Rate limit state is returned in response headers:
 

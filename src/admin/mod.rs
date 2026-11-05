@@ -1,23 +1,27 @@
+mod api_client_secrets;
 pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
-pub mod backfill;
-pub mod backfill_errors;
-pub mod backfill_retry;
 mod database;
 mod dead_letters;
+pub mod default_plugins;
 mod domains;
+mod editor;
+mod encryption;
 mod events;
 mod feature_flags;
 mod identity;
 mod jobs;
 mod labelers;
+mod lexicon_publishing;
 mod lexicons;
 mod linked_repos;
-mod network_lexicons;
+mod metrics;
+pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
 mod plugins;
+mod project;
 mod proxy_config;
 mod records;
 mod script_variables;
@@ -29,6 +33,7 @@ pub(crate) mod space_access;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
+mod storage;
 mod telemetry;
 pub(crate) mod types;
 mod users;
@@ -39,8 +44,26 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 
-pub fn admin_routes(_state: AppState) -> Router<AppState> {
+/// Re-exported for [`crate::jobs::native::delete_collection`], which guards on
+/// it as well: the admin handlers refuse a request for a collection a shared
+/// store serves, and the job refuses one that was already queued.
+pub(crate) use lexicons::records_not_locally_deletable;
+
+pub fn admin_routes(state: AppState) -> Router<AppState> {
+    // The record source's routes, each behind the admin auth layer. Its
+    // router carries its own state, so it joins this one as a stateless one.
+    let source_routes = state
+        .source
+        .admin_routes()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin_caller,
+        ))
+        .with_state(());
+    let audited_read =
+        axum::middleware::from_fn_with_state(state.clone(), crate::csrf::audited_read);
     Router::new()
+        .merge(source_routes)
         .route(
             "/lexicons",
             post(lexicons::upload_lexicon).get(lexicons::list_lexicons),
@@ -53,31 +76,42 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/lexicons/{id}",
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
         )
+        .route(
+            "/lexicons/{id}/record-count",
+            get(lexicons::lexicon_record_count),
+        )
+        .route("/lexicon-publishing", get(lexicon_publishing::overview))
+        .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
+        .route(
+            "/lexicon-publishing/dns/{nsid}",
+            get(lexicon_publishing::dns_for_lexicon),
+        )
+        .route(
+            "/lexicon-publishing/rules",
+            post(lexicon_publishing::create_rule),
+        )
+        .route(
+            "/lexicon-publishing/rules/{id}",
+            patch(lexicon_publishing::update_rule).delete(lexicon_publishing::delete_rule),
+        )
+        .route(
+            "/lexicon-publishing/publish",
+            post(lexicon_publishing::publish),
+        )
+        .route(
+            "/lexicon-publishing/unpublish",
+            post(lexicon_publishing::unpublish),
+        )
+        .route(
+            "/project",
+            put(project::put_project).get(project::get_project).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::project::deploy::bundle::MAX_COMPRESSED_BYTES,
+                ),
+            ),
+        )
         .route("/stats", get(stats::stats))
-        .route("/backfill", post(backfill::create_backfill))
-        .route("/backfill/status", get(backfill::backfill_status))
-        .route(
-            "/backfill/details",
-            delete(backfill::flush_all_backfill_details),
-        )
-        .route("/backfill/{id}/cancel", post(backfill::cancel_backfill))
-        .route("/backfill/{id}/pause", post(backfill::pause_backfill))
-        .route("/backfill/{id}/resume", post(backfill::resume_backfill))
-        .route("/backfill/{id}/events", get(backfill::backfill_events))
-        .route("/backfill/{id}/repos", get(backfill::backfill_repos))
-        .route(
-            "/backfill/{id}/pds-summary",
-            get(backfill::backfill_pds_summary),
-        )
-        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
-        .route(
-            "/backfill/{id}/retry-failed",
-            post(backfill::retry_failed_backfill),
-        )
-        .route(
-            "/backfill/{id}/details",
-            delete(backfill::flush_backfill_details),
-        )
+        .route("/stats/counts", get(stats::counts))
         .route(
             "/spaces/migration-status",
             get(spaces_migration::migration_status),
@@ -98,8 +132,16 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         )
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/access", get(spaces::covering_grant))
-        .route("/spaces/{id}/records", get(spaces::list_space_records))
-        .route("/spaces/{id}/blob", get(spaces::get_space_blob))
+        // Each of these records the read it serves, so a cookie only counts
+        // on a request from the dashboard itself; see `csrf::audited_read`.
+        .route(
+            "/spaces/{id}/records",
+            get(spaces::list_space_records).layer(audited_read.clone()),
+        )
+        .route(
+            "/spaces/{id}/blob",
+            get(spaces::get_space_blob).layer(audited_read.clone()),
+        )
         .route("/accounts/{did}/spaces", get(spaces::list_account_spaces))
         .route(
             "/accounts/{did}/access",
@@ -107,7 +149,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         )
         .route(
             "/accounts/{did}/space-records",
-            get(spaces::list_account_space_records),
+            get(spaces::list_account_space_records).layer(audited_read),
         )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
@@ -140,6 +182,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             delete(linked_repos::revoke_linked_repo_invite),
         )
         .route("/events", get(events::list_events))
+        .route("/metrics/scripts", get(metrics::scripts))
+        .route("/metrics/scripts/{trigger}", get(metrics::script))
+        .route("/metrics/ingest", get(metrics::ingest))
+        .route("/metrics/live", get(metrics::live))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))
         .route("/identity/resolve", get(identity::resolve_identity))
@@ -162,14 +208,23 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         )
         .route("/records/collections", get(records::list_collections))
         .route(
+            "/records/collection/reconcile",
+            post(records::reconcile_collection),
+        )
+        .route(
             "/records/collection",
             delete(records::delete_collection_records),
         )
         .route("/database/status", get(database::status))
         .route(
+            "/encryption/rotation",
+            get(encryption::rotation_status).post(encryption::start_reseal),
+        )
+        .route(
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
+        .route("/storage/retrain", post(storage::retrain))
         .route(
             "/network-lexicons",
             post(network_lexicons::add).get(network_lexicons::list),
@@ -184,13 +239,17 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             post(script_variables::upsert).get(script_variables::list),
         )
         .route("/script-variables/{key}", delete(script_variables::delete))
+        .route("/editor/declarations", get(editor::declarations))
         .route("/scripts", get(scripts::list).post(scripts::upsert))
+        .route("/scripts/languages", get(scripts::languages))
+        .route("/scripts/modules", get(scripts::modules))
         .route(
             "/scripts/{id}",
             get(scripts::get)
                 .patch(scripts::patch)
                 .delete(scripts::delete),
         )
+        .route("/scripts/{id}/codemod", post(scripts::codemod_apply))
         .route("/labelers", post(labelers::add).get(labelers::list))
         .route(
             "/labelers/{did}",
@@ -229,6 +288,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(plugins::get_secrets).put(plugins::update_secrets),
         )
         .route(
+            "/plugins/{id}/allowed-hosts",
+            get(plugins::get_allowed_hosts).put(plugins::update_allowed_hosts),
+        )
+        .route(
             "/api-clients",
             post(api_clients::create_api_client).get(api_clients::list_api_clients),
         )
@@ -237,6 +300,14 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(api_clients::get_api_client)
                 .put(api_clients::update_api_client)
                 .delete(api_clients::delete_api_client),
+        )
+        .route(
+            "/api-clients/{id}/secrets",
+            get(api_client_secrets::list).post(api_client_secrets::create),
+        )
+        .route(
+            "/api-clients/{id}/secrets/{secret_id}",
+            delete(api_client_secrets::revoke),
         )
         .route(
             "/api-clients/{id}/auth-key",

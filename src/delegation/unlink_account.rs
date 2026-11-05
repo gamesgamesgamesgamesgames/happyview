@@ -59,7 +59,7 @@ pub async fn unlink_account(
     // unlinking that left the grants live on their PDS was the same leak as a
     // logout that never told anyone.
     if let Some(api_client_id) = stored_api_client_id {
-        if let Some(encryption_key) = state.config.token_encryption_key.as_ref() {
+        if let Some(encryption_key) = &state.config.keyring() {
             let key_ids = crate::oauth::sessions::dpop_key_ids_for_user(
                 &state.db,
                 state.db_backend,
@@ -76,6 +76,7 @@ pub async fn unlink_account(
                     state.db_backend,
                     encryption_key,
                     &state.oauth,
+                    &state.config.plc_url,
                     &api_client_id,
                     account_did,
                     dpop_key_id,

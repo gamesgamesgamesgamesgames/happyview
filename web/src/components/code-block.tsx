@@ -22,15 +22,8 @@ async function highlight(code: string, lang: BundledLanguage) {
     jsx,
     jsxs,
     components: {
-      pre: ({ className, style, ...props }: ComponentProps<"pre">) => (
-        <pre
-          className={cn(className, "p-4 text-xs")}
-          style={{
-            ...style,
-            backgroundColor: "transparent",
-          }}
-          {...props}
-        />
+      pre: ({ className, ...props }: ComponentProps<"pre">) => (
+        <pre className={cn(className, "p-4 text-xs")} {...props} />
       ),
       code: (props: ComponentProps<"code">) => (
         <code className="whitespace-pre" {...props} />
@@ -56,8 +49,15 @@ export function CodeBlock({ code, lang = "json", className }: CodeBlockProps) {
       });
   }, [code, lang]);
 
+  // The surface is this container's `bg-muted`, so the block gives up the
+  // theme's own background rather than painting a second box inside it.
   return (
-    <div className={cn("bg-muted min-w-0 overflow-auto", className)}>
+    <div
+      className={cn(
+        "bg-muted shiki-on-surface min-w-0 overflow-auto",
+        className,
+      )}
+    >
       <div className="w-fit min-w-full">
         {nodes ?? (
           <pre className="p-4 text-xs">

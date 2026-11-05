@@ -1,0 +1,5 @@
+{
+  "lexicon": 1,
+  "id": "com.example.broken.listThings",
+  "defs": { "main": { "type": "query" } }
+}

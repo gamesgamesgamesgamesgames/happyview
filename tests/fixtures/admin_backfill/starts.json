@@ -1,0 +1,17 @@
+[
+  {
+    "body": "{\"id\":\"<id>\"}",
+    "call": "POST /admin/backfill/job-failed/retry-failed",
+    "status": 201
+  },
+  {
+    "body": "{\"id\":\"job-paused\",\"status\":\"running\"}",
+    "call": "POST /admin/backfill/job-paused/resume",
+    "status": 200
+  },
+  {
+    "body": "{\"id\":\"<id>\",\"status\":\"running\"}",
+    "call": "POST /admin/backfill",
+    "status": 201
+  }
+]

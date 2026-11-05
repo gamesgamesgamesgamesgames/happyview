@@ -4,7 +4,7 @@ title: "XRPC API"
 
 [XRPC](https://atproto.com/specs/xrpc) is the HTTP-based RPC protocol used by the atproto. HappyView dynamically registers XRPC endpoints based on your uploaded [lexicons](../guides/lexicons.md): query lexicons become `GET /xrpc/{nsid}` routes, procedure lexicons become `POST /xrpc/{nsid}` routes.
 
-If a query or procedure lexicon has a [Lua script](../guides/lua-scripting.md) attached, the script handles the request. Otherwise, HappyView uses built-in default behavior (described below).
+A query or procedure is served by the [Lua script](../guides/lua-scripting.md) attached to it. Without one, a query answers only a single-record lookup by `uri`, and every other call answers `501 Not Implemented` (described below).
 
 ## Auth
 
@@ -232,7 +232,7 @@ curl -X POST http://127.0.0.1:3000/xrpc/com.atproto.repo.uploadBlob \
 
 ## Dynamic query endpoints
 
-Query endpoints are generated from lexicons with `type: "query"`. Without a [Lua script](../guides/lua-scripting.md), they support two built-in modes depending on whether a `uri` parameter is provided.
+Query endpoints are generated from lexicons with `type: "query"`. The method's [Lua script](../guides/lua-scripting.md) handles every call and decides what the response is. A query with no script answers one call, a single-record lookup by `uri`; any other call answers [`501`](#method-has-no-script).
 
 ### Single record
 
@@ -319,98 +319,15 @@ curl "http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?uri=at%3A%2F%2Fdid
 
 Media blobs are automatically enriched with a `url` field pointing to the user's PDS.
 
-### List records
-
-```
-GET /xrpc/{method}?limit=20&cursor=<opaque>&did=optional
-```
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `limit` | integer | 20 | Max records to return (max 100) |
-| `cursor` | string | --- | Opaque pagination cursor from a previous response |
-| `did` | string | --- | Filter records by DID |
-
-```ts tab="TypeScript" tab-group="language"
-const params = new URLSearchParams({ limit: "10", did: "did:plc:abc" });
-
-interface ListResponse {
-  records: Array<{
-    uri: string;
-    status: string;
-    createdAt: string;
-  }>;
-  cursor?: string;
-}
-
-const response = await fetch(
-  `http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?${params}`,
-  { headers: { "X-Client-Key": CLIENT_KEY } },
-);
-
-const data: ListResponse = await response.json();
-```
-```js tab="JavaScript" tab-group="language"
-const params = new URLSearchParams({ limit: "10", did: "did:plc:abc" });
-
-const response = await fetch(
-  `http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?${params}`,
-  { headers: { "X-Client-Key": CLIENT_KEY } },
-);
-
-const data = await response.json();
-```
-```rust tab="Rust" tab-group="language"
-let response = client
-    .get("http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses")
-    .query(&[("limit", "10"), ("did", "did:plc:abc")])
-    .header("X-Client-Key", client_key)
-    .send()
-    .await?;
-
-let data: serde_json::Value = response.json().await?;
-```
-```go tab="Go" tab-group="language"
-req, _ := http.NewRequest("GET",
-  "http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?limit=10&did=did:plc:abc",
-  nil)
-req.Header.Set("X-Client-Key", clientKey)
-
-resp, err := http.DefaultClient.Do(req)
-```
-```sh tab="cURL" tab-group="language"
-curl "http://127.0.0.1:3000/xrpc/xyz.statusphere.listStatuses?limit=10&did=did:plc:abc" \
-  -H "X-Client-Key: $CLIENT_KEY"
-```
-
-**Response**: `200 OK`
-
-```json
-{
-  "records": [
-    {
-      "uri": "at://did:plc:abc/xyz.statusphere.status/abc123",
-      "status": "\ud83d\ude0a",
-      "createdAt": "2025-01-01T12:00:00Z"
-    }
-  ],
-  "cursor": "MjAyNS0wMS0wMVQxMjowMDowMFp8YXQ6Ly9kaWQ6..."
-}
-```
-
-The `cursor` field is an opaque string present only when more records exist. Pass it back as-is to fetch the next page.
-
 ## Dynamic procedure endpoints
 
-Procedure endpoints are generated from lexicons with `type: "procedure"`. Without a [Lua script](../guides/lua-scripting.md), HappyView auto-detects create vs update based on whether the request body contains a `uri` field.
+Procedure endpoints are generated from lexicons with `type: "procedure"`. The method's [Lua script](../guides/lua-scripting.md) handles the call: it validates the body, writes whatever records it writes, and returns the response. A procedure with no script answers every call with [`501`](#method-has-no-script); HappyView writes nothing to the caller's PDS on its own.
 
-### Create a record
+### Calling a procedure
 
 ```
 POST /xrpc/{method}
 ```
-
-When the body does **not** contain a `uri` field, a new record is created.
 
 ```ts tab="TypeScript" tab-group="language"
 const CLIENT_KEY = "hvc_..."; // your API client key
@@ -498,96 +415,20 @@ curl -X POST http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus \
   -d '{ "status": "\ud83d\ude0a", "createdAt": "2025-01-01T12:00:00Z" }'
 ```
 
-HappyView proxies this to the user's PDS as `com.atproto.repo.createRecord`, then indexes the created record locally.
+**Response**: whatever the procedure's script returns.
 
-### Update a record
+### Method has no script
 
-When the body **contains** a `uri` field, the existing record is updated.
+A query called without a `uri`, or a procedure called at all, with no script attached answers `501 Not Implemented`:
 
-```ts tab="TypeScript" tab-group="language"
-const response = await fetch(
-  "http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus",
-  {
-    method: "POST",
-    headers: {
-      "X-Client-Key": CLIENT_KEY,
-      Authorization: `DPoP ${ACCESS_TOKEN}`,
-      DPoP: DPOP_PROOF,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      uri: "at://did:plc:abc/xyz.statusphere.status/abc123",
-      status: "\ud83c\udf1f",
-      createdAt: "2025-01-01T13:00:00Z",
-    }),
-  },
-);
-```
-```js tab="JavaScript" tab-group="language"
-const response = await fetch(
-  "http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus",
-  {
-    method: "POST",
-    headers: {
-      "X-Client-Key": CLIENT_KEY,
-      Authorization: `DPoP ${ACCESS_TOKEN}`,
-      DPoP: DPOP_PROOF,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      uri: "at://did:plc:abc/xyz.statusphere.status/abc123",
-      status: "\ud83c\udf1f",
-      createdAt: "2025-01-01T13:00:00Z",
-    }),
-  },
-);
-```
-```rust tab="Rust" tab-group="language"
-let response = client
-    .post("http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus")
-    .header("X-Client-Key", client_key)
-    .header("Authorization", format!("DPoP {}", access_token))
-    .header("DPoP", dpop_proof)
-    .json(&serde_json::json!({
-        "uri": "at://did:plc:abc/xyz.statusphere.status/abc123",
-        "status": "\ud83c\udf1f",
-        "createdAt": "2025-01-01T13:00:00Z"
-    }))
-    .send()
-    .await?;
-```
-```go tab="Go" tab-group="language"
-body := bytes.NewBufferString(`{
-  "uri": "at://did:plc:abc/xyz.statusphere.status/abc123",
-  "status": "\ud83c\udf1f",
-  "createdAt": "2025-01-01T13:00:00Z"
-}`)
-
-req, _ := http.NewRequest("POST",
-  "http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus", body)
-req.Header.Set("X-Client-Key", clientKey)
-req.Header.Set("Authorization", "DPoP "+accessToken)
-req.Header.Set("DPoP", dpopProof)
-req.Header.Set("Content-Type", "application/json")
-
-resp, err := http.DefaultClient.Do(req)
-```
-```sh tab="cURL" tab-group="language"
-curl -X POST http://127.0.0.1:3000/xrpc/xyz.statusphere.setStatus \
-  -H "X-Client-Key: $CLIENT_KEY" \
-  -H "Authorization: DPoP $ACCESS_TOKEN" \
-  -H "DPoP: $DPOP_PROOF" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "uri": "at://did:plc:abc/xyz.statusphere.status/abc123",
-    "status": "\ud83c\udf1f",
-    "createdAt": "2025-01-01T13:00:00Z"
-  }'
+```json
+{
+  "error": "MethodNotImplemented",
+  "message": "xyz.statusphere.setStatus has no script. Add one for the trigger xrpc.procedure:xyz.statusphere.setStatus"
+}
 ```
 
-HappyView proxies this to the user's PDS as `com.atproto.repo.putRecord`, then upserts the record locally.
-
-**Response** for both: proxied from the user's PDS.
+For a query the trigger in the message is `xrpc.query:<method>`.
 
 ## XRPC proxy
 
@@ -609,15 +450,29 @@ All error responses return JSON with an `error` field:
 | `401 Unauthorized` | Authentication failed | Missing or invalid client identification or DPoP authentication |
 | `404 Not Found` | Method or record not found | XRPC method has no matching lexicon, or the requested record doesn't exist |
 | `500 Internal Server Error` | Server-side failure | Lua script error, database error, or upstream PDS failure |
+| `501 Not Implemented` | Method has no script | A query or procedure lexicon with no script attached; see [Method has no script](#method-has-no-script) |
+
+### Lexicon validation errors
+
+Before a query or procedure's script runs, HappyView checks the call against the method's lexicon: its parameters against `parameters`, and a JSON body against `input.schema`. A call that breaks it is refused with `400` and an `InvalidRequest` body naming the first problem, in the atproto reference implementation's wording:
+
+```json
+{ "error": "InvalidRequest", "message": "Params/limit can not be greater than 100" }
+```
+
+Required properties, `const`, `enum`, `minLength` and `maxLength` (in UTF-8 bytes), `minGraphemes` and `maxGraphemes`, string `format`s, integer `minimum` and `maximum`, types, array lengths and items, `ref`s and closed `union`s are all checked. `knownValues` is a hint and isn't enforced, and a parameter the lexicon doesn't declare passes through to the script. A `ref` to a lexicon this instance doesn't hold isn't checked. A script calling another method with `xrpc.query` or `xrpc.procedure` meets the same checks.
 
 ### Lua script errors
 
-When a Lua script fails, the response is `500` with one of:
+When a Lua script fails, the response is a `script_error` body:
 
-- `{"error": "script execution failed"}`: syntax error, runtime error, or missing `handle()` function
-- `{"error": "script exceeded execution time limit"}`: the script hit the 1,000,000 instruction limit
+```json
+{ "error": "script_error", "errorType": "runtime", "message": "attempt to index a nil value (local 't')", "method": "xyz.statusphere.getStatus", "line": 3, "file": "src/lib/format.lua" }
+```
 
-The full error details are logged server-side but not exposed to the client. See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for how to diagnose script issues.
+`errorType` is `syntax`, `runtime` or `missing_handle` with status `500`, or `timeout` with status `408` when the script hit the instruction limit or the wall clock, both set in Settings → General. `line` is the script line that raised, or `null`. `file` is the project file `line` is in, relative to the project root: the handler itself, or a local module it imported. It is `null` for a script saved through the dashboard, which has no file.
+
+The same error is logged server-side with the script source and the caller's input. See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for how to diagnose script issues.
 
 ### PDS errors
 
@@ -625,6 +480,6 @@ When a procedure proxies a write to the user's PDS and the PDS returns an error,
 
 ## Next steps
 
-- [Lua Scripting](../guides/lua-scripting.md): Override the default query and procedure behavior with custom logic
+- [Lua Scripting](../guides/lua-scripting.md): Write the scripts that serve queries and procedures
 - [Lexicons](../guides/lexicons.md): Understand how lexicons generate these endpoints
 - [Admin API](admin/admin-api.md): Manage lexicons and monitor your instance

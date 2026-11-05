@@ -122,6 +122,22 @@ The consequence worth internalising: **the PDS will mint an identity-bearing ass
 
 There is no destination allowlist in HappyView for this, and that is deliberate — the decision of whether to sign for a given audience belongs to the party holding the key, which is the PDS. What *is* in your hands is who gets to make such a request at all: registering a third-party API client is the act that grants it. Register clients deliberately, and scope them as above.
 
+## Cross-site requests with the session cookie
+
+The session cookie belongs to the instance's own dashboard. It is `SameSite=Lax`, `HttpOnly`, and `Secure` on https, so a browser sends it with requests the instance's pages make and with a top-level navigation to the instance (the OAuth sign-in callbacks arrive that way), and not with a request another site starts in the background. A navigation still carries it, so HappyView also checks where each request came from.
+
+**Outside `/admin`** (XRPC, `/external-auth`, `/api/setup`), the cookie counts only on a request from the instance's own pages: the browser marks it `Sec-Fetch-Site: same-origin`, or, from a browser too old to send that, its `Origin` is one of the instance's [domains](../api-reference/admin/domains.md). Any other request carrying the cookie, including one with neither header, runs as anonymous. A link on another site can therefore never make a query script run as the signed-in admin. A third-party app calls these routes with DPoP or an API key instead.
+
+**On `/admin`**, a request that changes something (`POST`, `PUT`, `PATCH` or `DELETE`), carries the cookie and comes from another site is refused with `403`. It is allowed when:
+
+- the browser marks it as coming from the instance itself (`Sec-Fetch-Site: same-origin`, or `none` for one the user typed);
+- its `Origin` is one of the instance's domains;
+- or it carries neither header. Every browser sends `Origin` on such a request, including one too old to send `Sec-Fetch-Site`, so a request with neither did not come from a browser.
+
+Bearer tokens, DPoP sessions and API keys are not affected: a browser never attaches them on its own.
+
+An integration on another origin, including a sibling on the same site, cannot use the session cookie at all: it authenticates with OAuth (DPoP) or an API key. CORS allows credentials only to the instance's own domains.
+
 ## A checklist
 
 - [ ] Every API client registered with granular scopes, or a permission set, rather than `transition:generic`

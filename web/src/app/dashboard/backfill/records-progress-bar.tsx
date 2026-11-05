@@ -1,0 +1,81 @@
+import type { ReactNode } from "react";
+
+import { AnimatedNumber } from "./animated-number";
+import {
+  type RecordsCount,
+  recordsCountParts,
+  recordsFraction,
+} from "./records-progress";
+
+/**
+ * One progress row counting records: a label, the count, a bar when the
+ * total is known, and a `detail` slot beside the count for whatever else the
+ * row has to say (a rate, an ETA, failures). A `starting` row has nothing to
+ * count yet, so it shows its label alone, with no count and no bar.
+ */
+export function RecordsProgress({
+  label,
+  active,
+  starting = false,
+  detail,
+  ...count
+}: RecordsCount & {
+  label: string;
+  /**
+   * Running now: an unknown total pulses rather than sitting still. A row
+   * that isn't running and has no total to measure against has no bar.
+   */
+  active: boolean;
+  starting?: boolean;
+  detail?: ReactNode;
+}) {
+  const fraction = recordsFraction(count);
+  const { done, total, estimated, noun } = recordsCountParts(count);
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span>{label}</span>
+        {!starting && (
+          <span className="text-xs text-muted-foreground tabular-nums">
+            <AnimatedNumber value={done} />
+            {total != null && (
+              <>
+                {` of ${estimated ? "about " : ""}`}
+                <AnimatedNumber value={total} />
+              </>
+            )}
+            {` ${noun}`}
+          </span>
+        )}
+      </div>
+      {!starting && (fraction != null || active) && (
+        <div
+          role="progressbar"
+          aria-label={label}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={
+            fraction == null ? undefined : Math.round(fraction * 100)
+          }
+          className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+        >
+          <div
+            className={`h-full rounded-full bg-blue-500 ${
+              fraction == null
+                ? `w-1/3 ${active ? "animate-pulse" : ""}`
+                : "transition-[width]"
+            }`}
+            style={
+              fraction == null ? undefined : { width: `${fraction * 100}%` }
+            }
+          />
+        </div>
+      )}
+      {detail && (
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground tabular-nums">
+          {detail}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -219,6 +219,27 @@ export default function DatabaseSettingsPage() {
                   </span>
                   <AlignedBytes n={status.disk.wal_bytes} />
                 </div>
+                {status.checkpoint_interval_secs === 0 ? (
+                  <div className="flex justify-between gap-4">
+                    <span className="text-muted-foreground">Checkpoints</span>
+                    <span className="text-right">Disabled</span>
+                  </div>
+                ) : (
+                  status.checkpoint && (
+                    <div className="flex justify-between gap-4">
+                      <span className="text-muted-foreground">
+                        Last checkpoint
+                      </span>
+                      <span className="text-right tabular-nums">
+                        {status.checkpoint.busy
+                          ? "Busy, retrying"
+                          : `${status.checkpoint.checkpointed_frames} of ${status.checkpoint.wal_frames} frames`}
+                        {" · "}
+                        {new Date(status.checkpoint.at).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  )
+                )}
                 <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">
                     Free on <Mono>{status.disk.db_path}</Mono>

@@ -35,17 +35,14 @@ async fn call(
 }
 
 async fn seed_reserved_setting(app: &TestApp) {
-    let sql = adapt_sql(
-        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+    happyview::admin::settings::put_setting(
+        &app.state.db,
+        LEGACY_KEY_SETTING,
+        "left-behind",
         app.state.db_backend,
-    );
-    happyview::db::query(&sql)
-        .bind(LEGACY_KEY_SETTING)
-        .bind("left-behind")
-        .bind(happyview::db::now_rfc3339())
-        .execute(&app.state.db)
-        .await
-        .unwrap();
+    )
+    .await
+    .unwrap();
 }
 
 /// Even a row the boot step hasn't moved stays out of the listing.

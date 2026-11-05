@@ -1,3 +1,7 @@
+import jobBody from "./lua-templates/job.lua";
+import recordEventBody from "./lua-templates/record-event.lua";
+import triggerBody from "./lua-templates/trigger.lua";
+
 export const LEXICON_TEMPLATE = JSON.stringify(
   {
     $type: "com.atproto.lexicon.schema",
@@ -19,48 +23,15 @@ export const LEXICON_TEMPLATE = JSON.stringify(
   2,
 );
 
-export function procedureScript(collection: string): string {
-  const target = collection || "COLLECTION";
-  return `function handle()
-  local r = Record("${target}", input)
-  r:save()
-  return { uri = r._uri, cid = r._cid }
-end
-`;
-}
+/** Starter body for a trigger whose return value is the response. */
+export const DEFAULT_SCRIPT_BODY: string = triggerBody;
 
-export function indexHookScript(): string {
-  return `function handle()
-  if action == "delete" then
-    -- record was deleted
-    log("deleted " .. uri)
-  else
-    -- record was created or updated
-    log(action .. " " .. uri)
-  end
-end
-`;
-}
+/** Starter body for a `job.run:<type>` script. */
+export const DEFAULT_JOB_SCRIPT_BODY: string = jobBody;
 
-export function queryScript(collection: string): string {
-  const target = collection || "COLLECTION";
-  return `collection = "${target}"
-
-function handle()
-  if params.uri then
-    local record = db.get(params.uri)
-    if not record then
-      error("record not found")
-    end
-    return { record = record }
-  end
-
-  return db.query({
-    collection = collection,
-    did = params.did,
-    limit = params.limit,
-    cursor = params.cursor,
-  })
-end
-`;
-}
+/**
+ * Starter body for a `record.*` script. A record script's table return
+ * replaces the record body, so echoing `input` there would index the event
+ * envelope in place of every record; this body returns the record itself.
+ */
+export const DEFAULT_RECORD_SCRIPT_BODY: string = recordEventBody;

@@ -76,17 +76,24 @@ pub(super) async fn list_records(
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
 
-    let sql = adapt_sql(
-        "SELECT uri, did, collection, rkey, cid, indexed_at, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
-        backend,
-    );
-    let rows: Vec<RecordRow> = crate::db::query_as(&sql)
-        .bind(&params.collection)
-        .bind(limit + 1)
-        .bind(offset)
-        .fetch_all(&state.db)
+    let rows: Vec<RecordRow> = state
+        .records
+        .list_recent(&params.collection, None, limit + 1, offset)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list records: {e}")))?;
+        .map_err(|e| record_error(&state, Some(&params.collection), "list records", e))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.uri,
+                r.did,
+                r.collection,
+                r.rkey,
+                r.cid.unwrap_or_default(),
+                r.indexed_at,
+                r.record,
+            )
+        })
+        .collect();
 
     let has_more = rows.len() as i64 > limit;
     let visible_rows: Vec<RecordRow> = rows.into_iter().take(limit as usize).collect();
@@ -183,6 +190,12 @@ pub(super) struct DeleteCollectionParams {
 /// Returns `202` with a job id rather than deleting inline: a large collection
 /// takes long enough that a synchronous request would time out, and running it
 /// as a job gives progress, pause and cancel through the existing jobs UI.
+///
+/// A collection a shared record store serves is refused — see
+/// [`super::lexicons::records_not_locally_deletable`] for why. This is a
+/// change in behaviour: it used to answer `202`, run, and report success
+/// having emptied only this instance's overlay while the shared records it
+/// unions with stayed where they were.
 pub(super) async fn delete_collection_records(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -191,14 +204,98 @@ pub(super) async fn delete_collection_records(
     auth.require(Permission::RecordsDeleteCollection).await?;
     auth.require(Permission::RecordsDelete).await?;
 
-    if params.collection.trim().is_empty() {
+    let collection = params.collection.trim();
+    if collection.is_empty() {
         return Err(AppError::BadRequest("collection is required".into()));
+    }
+    if let Some(reason) = super::lexicons::records_not_locally_deletable(&state, collection) {
+        return Err(AppError::BadRequest(reason));
     }
 
     let job_id = crate::jobs::db::create_job(
         &state,
         "happyview.delete-collection",
         &serde_json::json!({ "collection": params.collection }),
+        &auth.did,
+        false,
+        None,
+        None,
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
+    ))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ReconcileBody {
+    pub collection: String,
+    #[serde(default = "reconcile_dry_run_default")]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub dids: Option<Vec<String>>,
+    #[serde(default)]
+    pub pds_requests_per_second: Option<u32>,
+    #[serde(default)]
+    pub allow_suspicious: Vec<String>,
+}
+
+fn reconcile_dry_run_default() -> bool {
+    true
+}
+
+/// POST /admin/records/collection/reconcile — enqueue a check of a
+/// collection's stored records against its accounts' PDSes, which in an
+/// apply deletes the ones the PDSes no longer hold.
+///
+/// A dry run (the default) only reads, so it needs `records:read`; an apply
+/// deletes, so it needs `records:delete`. Returns `202` with a job id.
+pub(super) async fn reconcile_collection(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Json(body): Json<ReconcileBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    if body.dry_run {
+        auth.require(Permission::RecordsRead).await?;
+    } else {
+        auth.require(Permission::RecordsDelete).await?;
+    }
+    use crate::jobs::native::reconcile_collection as reconcile;
+    if let Some(reason) = reconcile::refusal(&state, &body.collection) {
+        return Err(AppError::BadRequest(reason));
+    }
+    let is_record = state
+        .lexicons
+        .get(&body.collection)
+        .await
+        .is_some_and(|l| l.lexicon_type == crate::lexicon::LexiconType::Record);
+    if !is_record {
+        return Err(AppError::BadRequest(format!(
+            "'{}' is not a record collection this instance has a lexicon for",
+            body.collection
+        )));
+    }
+    if let Some(rate) = body.pds_requests_per_second
+        && !(1..=reconcile::MAX_REQUESTS_PER_SECOND).contains(&rate)
+    {
+        return Err(AppError::BadRequest(format!(
+            "pds_requests_per_second must be between 1 and {}",
+            reconcile::MAX_REQUESTS_PER_SECOND
+        )));
+    }
+
+    let job_id = crate::jobs::db::create_job(
+        &state,
+        reconcile::JOB_TYPE,
+        &serde_json::json!({
+            "collection": body.collection,
+            "dry_run": body.dry_run,
+            "dids": body.dids,
+            "pds_requests_per_second": body.pds_requests_per_second,
+            "allow_suspicious": body.allow_suspicious,
+        }),
         &auth.did,
         false,
         None,
@@ -219,18 +316,16 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql)
-        .bind(&params.uri)
-        .execute(&state.db)
+    let collection = crate::record_store::codec::parse_record_uri(&params.uri)
+        .map(|(_, collection, _)| collection);
+    let deleted = state
+        .records
+        .delete(&params.uri)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to delete record: {e}")))?;
-
-    if result.rows_affected() == 0 {
+        .map_err(|e| record_error(&state, collection, "delete record", e))?;
+    if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -241,15 +336,35 @@ pub(super) async fn list_collections(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::RecordsRead).await?;
 
-    let sql = adapt_sql(
-        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
-        state.db_backend,
-    );
-    let rows: Vec<(String,)> = crate::db::query_as(&sql)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list collections: {e}")))?;
+    let collections = state.lexicons.get_record_lexicon_ids().await;
+    // Which of them a shared record store serves, so a caller can tell
+    // before it asks that `DELETE /admin/records/collection` will refuse.
+    // Additive rather than a shape change: `collections` stays a plain list
+    // of names, as every existing caller reads it.
+    let shared: Vec<&String> = collections
+        .iter()
+        .filter(|c| state.records.external_route(c).is_some())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "collections": collections,
+        "shared": shared,
+    })))
+}
 
-    let collections: Vec<&str> = rows.iter().map(|(id,)| id.as_str()).collect();
-    Ok(Json(serde_json::json!({ "collections": collections })))
+/// A failed record call on `collection`: 503 when the external storage that
+/// claims it is unreachable, otherwise a 500.
+fn record_error(
+    state: &AppState,
+    collection: Option<&str>,
+    what: &str,
+    e: sqlx::Error,
+) -> AppError {
+    let storage_down = collection
+        .and_then(|collection| state.records.external_route(collection))
+        .is_some_and(|ext| ext.unavailable(&e));
+    if storage_down {
+        crate::error::storage_unavailable()
+    } else {
+        AppError::Internal(format!("failed to {what}: {e}"))
+    }
 }

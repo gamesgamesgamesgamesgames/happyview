@@ -18,6 +18,14 @@ Events follow a `category.action` naming convention. Each event has a severity l
 
 Logged when lexicons are uploaded, updated, or deleted via the [admin API](../api-reference/admin/lexicons.md). The `actor_did` is the user who performed the action.
 
+### Project events
+
+| Event Type         | Severity | Subject               | Detail                   |
+| ------------------ | -------- | --------------------- | ------------------------ |
+| `project.deployed` | info     | The bundle's sha256   | `changes`, `backfills`   |
+
+Logged when a project is deployed through [`PUT /admin/project`](../api-reference/admin/project.md). A dry run logs nothing. `changes` and `backfills` are the ones the deploy answered with.
+
 ### Record events
 
 | Event Type       | Severity | Subject       | Detail                                |
@@ -63,17 +71,17 @@ Logged when a user attempts to access an endpoint they don't have permission for
 
 ### Space events
 
-| Event Type                | Severity | Subject                                                           | Detail                                                                  |
-| -------------------------- | -------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `space.access_granted`     | info     | Space AT URI for a space grant, account DID for an account grant     | `grant_id`, `scope`, `target`, `reason`, `expires_at`, `user_id`           |
-| `space.access_revoked`     | info     | Same as `space.access_granted`; the raw space id if the space was deleted | `grant_id`, `revoked_by`, `user_id`                                        |
-| `space.moderator_read`     | info     | Space AT URI, or the account DID for an account-records read         | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below)   |
-| `space_inspector.enabled`  | warn     | Setting key                                                           | —                                                                            |
-| `space_inspector.disabled` | warn     | Setting key                                                           | —                                                                            |
+| Event Type                 | Severity | Subject                                                                     | Detail                                                                   |
+| -------------------------- | -------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `space.access_granted`     | info     | Space AT URI for a space grant, account DID for an account grant            | `grant_id`, `scope`, `target`, `reason`, `expires_at`, `user_id`         |
+| `space.access_revoked`     | info     | Same as `space.access_granted`; the raw space id if the space was deleted   | `grant_id`, `revoked_by`, `user_id`                                      |
+| `space.moderator_read`     | info     | Space AT URI, or the account's DID                                          | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below) |
+| `space_inspector.enabled`  | warn     | Setting key                                                                 | —                                                                        |
+| `space_inspector.disabled` | warn     | Setting key                                                                 | —                                                                        |
 
-Logged when a moderator requests, uses, or ends access to a space's contents through the [space inspector](../api-reference/admin/spaces.md#access-grants). `space.access_granted` and `space.access_revoked` record the request and the end of a grant; `space_inspector.enabled` and `space_inspector.disabled` record the inspector being turned on or off for the instance (see [Configuration](../getting-started/configuration.md)).
+Logged when a moderator requests, uses, or ends access to a space's contents through the [space inspector](../api-reference/admin/spaces.md#access-grants). `space.access_granted` and `space.access_revoked` record the request and the end of a grant; `space_inspector.enabled` and `space_inspector.disabled` record the inspector being turned on or off for the instance (see [Configuration](../getting-started/configuration.md)). In the dashboard, a `space.access_granted` event lists the reads made under that grant.
 
-`action` on `space.moderator_read` is `list_records`, `get_blob`, or `list_account_records`, and every such event carries the `grant_id` and `scope` of the grant that allowed it. A `list_records` event includes the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the blob `cid` and the `repo` that references it. A `list_account_records` event includes the `repo`, the `space_id` filter if given, the `collection` filter, and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
+`space.moderator_read` is logged when an admin reads space records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `grant_id` is the [access grant](../api-reference/admin/spaces.md#access-grants) the read was made under, and `scope` is that grant's scope (`space` or `account`). `action` is `list_records`, `get_blob` or `list_account_records`. A `list_records` event includes the `space_id`, the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the `space_id`, the blob `cid` and the `repo` that references it. A `list_account_records` event's subject is the account's DID, and it includes that `repo`, the `space_id` and `collection` filters and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
 
 ### API Key events
 
@@ -96,7 +104,7 @@ Logged when a moderator requests, uses, or ends access to a space's contents thr
 | `script.executed`      | info     | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `attempts` |
 | `script.dead_lettered` | error    | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `error`    |
 
-Logged when [record/label scripts](./record-scripts) run. `script.executed` fires once per record or label that reaches a script, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
+Logged when [record/label scripts](./record-scripts.md) run. `script.executed` fires once per record or label that reaches a script, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
 
 ### Backfill events
 
@@ -110,20 +118,43 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 
 ### Audit log events
 
-| Event Type                     | Severity | Subject                                                         | Detail        |
-| --------------------------------- | -------- | ------------------------------------------------------------------ | --------------- |
-| `event_logs.retention_changed`    | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
+| Event Type                     | Severity | Subject                                                                       | Detail       |
+| ------------------------------ | -------- | ----------------------------------------------------------------------------- | ------------ |
+| `event_logs.retention_changed` | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
 
-Logged when a retention setting's effective value changes, env fallback included. An unset or unparseable value counts as its default: 30 days for `event_log_retention_days`, and for `space_access_log_retention_days` 0 (keep forever) while `event_log_retention_days` is 0 and 365 otherwise. Saving a setting back to its current or default value logs nothing. Because protected retention can follow the general setting, one change can log an event for each key. `from` and `to` are the effective day counts. See [Protected events](#protected-events) below.
+Logged when a retention setting's effective value changes, fallbacks included. An unset or unparseable value counts as its default: 30 days for `event_log_retention_days`, and for `space_access_log_retention_days` 0 (keep forever) while `event_log_retention_days` is 0 and 365 otherwise. Saving a setting back to its current or default value logs nothing. Because protected retention can follow the general setting, one change can log an event for each key. `from` and `to` are the effective day counts. The setting and its event are saved together: if the event can't be written, the setting isn't changed. See [Protected events](#protected-events) below.
 
 ### Jetstream events
 
-| Event Type               | Severity | Subject | Detail   |
-| ------------------------ | -------- | ------- | -------- |
-| `jetstream.connected`    | info     | —       | `url`    |
-| `jetstream.disconnected` | warn     | —       | `reason` |
+| Event Type                          | Severity | Subject     | Detail                                                                |
+| ----------------------------------- | -------- | ----------- | --------------------------------------------------------------------- |
+| `jetstream.connected`               | info     | —           | `url`, `protocol`, `compression`, `dictionary_id`                     |
+| `jetstream.disconnected`            | warn     | —           | `reason`                                                              |
+| `jetstream.gap`                     | warn     | —           | `reason`, and more by reason (below)                                  |
+| `jetstream.invalid_request`         | error    | —           | `message`, `retry_in_secs`                                            |
+| `jetstream.account_deleted`         | info     | Account DID | `purged`, `seq`                                                       |
+| `jetstream.account_takendown`       | info     | Account DID | `purged`, `seq`, `status` (`takendown` or `suspended`)                |
+| `jetstream.account_inactive`        | info     | Account DID | `status` (`deactivated`, `desynchronized` or `throttled`)             |
+| `jetstream.account_status_mismatch` | warn     | Account DID | `status`, `pds`, `seq`                                                |
+| `jetstream.sync_purged`             | info     | Account DID | `purged`, `rev`                                                       |
+| `jetstream.record_invalid`          | warn     | Account DID | `uri`, `seq`, `error`                                                 |
+| `jetstream.apply_failed`            | error    | Account DID | `uri` (or `kind` and, for an account event, `status`), `seq`, `error` |
 
-Logged when the WebSocket connection to [Jetstream](https://github.com/bluesky-social/jetstream) is established or lost.
+`jetstream.connected` and `jetstream.disconnected` are logged when the WebSocket connection to [Jetstream](https://github.com/bluesky-social/jetstream) is established or lost.
+
+`jetstream.gap` means events may have been missed. The same gap (same reason and cursor) is logged once per run of the Jetstream consumer. Its `reason` is one of:
+
+- `cursor_too_old`: the saved cursor was past Jetstream's retention and no saved time could replace it, so HappyView resumed from the live tip. `after_seq` is the saved seq (the last one known applied), `resumed_at_seq` the first seq received after it, and `message` Jetstream's explanation. When HappyView replays the gap from the Jetstream archive instead, `resumed_at_seq` is the archive's sealed tip and `replay_job_id` names the [backfill](backfill.md) job that fills the gap.
+- `outdated_cursor`: Jetstream moved a time cursor older than its retention up to the oldest event it has. `message` names where it resumed.
+- `future_cursor`: the saved seq was past Jetstream's newest, because its seq numbering restarted. HappyView reconnects by the saved witnessed time, which Jetstream translates to the new numbering, or, with none saved, follows the new numbering from the live tip. `from_seq` is the cursor it asked for.
+
+`jetstream.invalid_request` means Jetstream refused the subscription as invalid, or kept refusing it without saying why after HappyView dropped what it could from the request. HappyView retries after `retry_in_secs` (an hour by default).
+
+`jetstream.account_deleted` is logged when an account this instance holds records for is deleted: its records (other than local writes not yet echoed back) are removed. `jetstream.account_takendown` is logged the same way for an account that is taken down or suspended. A tombstone is written for every deleted, taken-down or suspended account, but the event is logged only when this instance held, and purged, records for it. The tombstone means a late or replayed copy of the account's records is refused. `jetstream.account_status_mismatch` is logged instead when the relay reports an account deleted (`status`) but the account's current PDS (`pds`) says it is active: HappyView keeps its records and writes no tombstone. This happens when the relay is still relaying a PDS the account moved away from. Takedowns and suspensions are never checked this way, because a relay may impose them without the account's PDS knowing. `jetstream.account_inactive` is logged when such an account is deactivated, desynchronized or throttled; its records are kept. When an account becomes active again, its tombstone is lifted, but removed records come back only through a new [backfill](./backfill.md). `jetstream.sync_purged` is logged when a repo is resynced: its records in registered collections are removed, and the current ones that follow in the stream replace them. Events for accounts this instance holds nothing for are not logged.
+
+`jetstream.record_invalid` is logged once for an event HappyView skips immediately because retrying cannot help: a create or update with no record body, an unknown operation, data the database rejects, or a network lexicon schema that cannot be applied.
+
+`jetstream.apply_failed` is logged when an event keeps failing for a reason that is not a database outage. HappyView retries it for about 31 seconds, logs this event and skips it, so one bad event does not stall the stream. Database outages are never skipped: see [Real-time indexing](../reference/architecture.md#real-time-indexing).
 
 ## Querying events
 
@@ -298,9 +329,11 @@ See the [Admin API reference](../api-reference/admin/events.md#list-event-logs) 
 
 ## Retention
 
-Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period.
+Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` environment variable (default: 30 days). A background task runs hourly to delete events older than the configured retention period. Background jobs' own log lines are deleted on the same schedule. [Protected events](#protected-events) follow a schedule of their own.
 
 Set `EVENT_LOG_RETENTION_DAYS=0` to disable automatic cleanup and keep logs indefinitely.
+
+[Stored script metrics](../api-reference/admin/metrics.md#retention) follow the same retention, so one setting covers both.
 
 See [Configuration](../getting-started/configuration.md) for all environment variables.
 

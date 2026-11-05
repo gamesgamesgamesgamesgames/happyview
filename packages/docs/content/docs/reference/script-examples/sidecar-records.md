@@ -7,37 +7,34 @@ Create two records with different collection NSIDs but the same rkey, linking th
 **Lexicon type:** procedure
 
 ```lua
-function handle()
-  local rkey = TID()
+local time = require("internal.time")
+local tids = require("internal.tids")
+local record = require("happyview.record")
 
-  local post = Record("xyz.statusphere.post", {
+function handle(input, ctx)
+  local rkey = tids.create()
+  local ts = time.to_iso8601(time.now())
+
+  local post = record.create("xyz.statusphere.post", {
     text = input.text,
-    createdAt = now(),
-  })
-  post:set_rkey(rkey)
+    createdAt = ts,
+  }, { rkey = rkey })
 
-  local metadata = Record("xyz.statusphere.postMetadata", {
+  local metadata = record.create("xyz.statusphere.postMetadata", {
     lang = input.lang or "en",
     source = input.source or "web",
-    createdAt = now(),
-  })
-  metadata:set_rkey(rkey)
+    createdAt = ts,
+  }, { rkey = rkey })
 
-  Record.save_all({ post, metadata })
-
-  return {
-    post = { uri = post._uri, cid = post._cid },
-    metadata = { uri = metadata._uri, cid = metadata._cid },
-  }
+  return { post = post, metadata = metadata }
 end
 ```
 
 ## How it works
 
-1. Generate a single [`TID()`](../../guides/lua-scripting.md#utility-globals) to use as the rkey for both records.
-2. Create a `Record` for each collection and call `r:set_rkey()` with the shared rkey.
-3. Save both records in parallel with [`Record.save_all()`](../../api-reference/lua/record-api.md#static-methods).
-4. Return both URIs so the client knows the identity of each record.
+1. Mint a single TID with [`tids.create()`](../../api-reference/lua/built-in-modules.md#internaltids) to use as the rkey for both records.
+2. Create a record in each collection with `record.create`, passing the shared rkey in `opts`.
+3. Return both `{ uri, cid }` results so the client knows the identity of each record.
 
 ## Usage
 

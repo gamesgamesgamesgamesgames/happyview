@@ -19,6 +19,8 @@ pub enum Permission {
     LexiconsRead,
     #[serde(rename = "lexicons:delete")]
     LexiconsDelete,
+    #[serde(rename = "lexicons:publish")]
+    LexiconsPublish,
 
     #[serde(rename = "records:read")]
     RecordsRead,
@@ -62,6 +64,9 @@ pub enum Permission {
     EventsRead,
     #[serde(rename = "events:purge")]
     EventsPurge,
+
+    #[serde(rename = "metrics:read")]
+    MetricsRead,
 
     #[serde(rename = "labelers:create")]
     LabelersCreate,
@@ -131,6 +136,9 @@ pub enum Permission {
     LinkedReposCreate,
     #[serde(rename = "linked-repos:delete")]
     LinkedReposDelete,
+
+    #[serde(rename = "project:deploy")]
+    ProjectDeploy,
 }
 
 impl Permission {
@@ -140,6 +148,7 @@ impl Permission {
             Self::LexiconsCreate => "lexicons:create",
             Self::LexiconsRead => "lexicons:read",
             Self::LexiconsDelete => "lexicons:delete",
+            Self::LexiconsPublish => "lexicons:publish",
             Self::RecordsRead => "records:read",
             Self::RecordsDelete => "records:delete",
             Self::RecordsDeleteCollection => "records:delete-collection",
@@ -158,6 +167,7 @@ impl Permission {
             Self::StatsRead => "stats:read",
             Self::EventsRead => "events:read",
             Self::EventsPurge => "events:purge",
+            Self::MetricsRead => "metrics:read",
             Self::LabelersCreate => "labelers:create",
             Self::LabelersRead => "labelers:read",
             Self::LabelersDelete => "labelers:delete",
@@ -188,6 +198,7 @@ impl Permission {
             Self::LinkedReposRead => "linked-repos:read",
             Self::LinkedReposCreate => "linked-repos:create",
             Self::LinkedReposDelete => "linked-repos:delete",
+            Self::ProjectDeploy => "project:deploy",
         }
     }
 
@@ -211,6 +222,12 @@ impl Permission {
                 description: "Remove lexicon schemas",
                 category: "Lexicons",
             },
+            Self::LexiconsPublish => PermissionInfo {
+                key: "lexicons:publish",
+                name: "Publish Lexicons",
+                description: "Publish lexicons to the network and manage publishing rules",
+                category: "Lexicons",
+            },
             Self::RecordsRead => PermissionInfo {
                 key: "records:read",
                 name: "View Records",
@@ -232,43 +249,43 @@ impl Permission {
             Self::ScriptVariablesCreate => PermissionInfo {
                 key: "script-variables:create",
                 name: "Create Script Variables",
-                description: "Add or update environment variables for Lua scripts",
+                description: "Add or update script variables",
                 category: "Script Variables",
             },
             Self::ScriptVariablesRead => PermissionInfo {
                 key: "script-variables:read",
                 name: "View Script Variables",
-                description: "View script environment variable keys and values",
+                description: "View script variable keys, with values masked",
                 category: "Script Variables",
             },
             Self::ScriptVariablesDelete => PermissionInfo {
                 key: "script-variables:delete",
                 name: "Delete Script Variables",
-                description: "Remove script environment variables",
+                description: "Remove script variables",
                 category: "Script Variables",
             },
             Self::UsersCreate => PermissionInfo {
                 key: "users:create",
                 name: "Create Users",
-                description: "Add new dashboard users",
+                description: "Add operators to the instance",
                 category: "Users",
             },
             Self::UsersRead => PermissionInfo {
                 key: "users:read",
                 name: "View Users",
-                description: "View the user list and their permissions",
+                description: "View operators and their permissions",
                 category: "Users",
             },
             Self::UsersUpdate => PermissionInfo {
                 key: "users:update",
                 name: "Update Users",
-                description: "Modify user permissions",
+                description: "Change an operator's permissions",
                 category: "Users",
             },
             Self::UsersDelete => PermissionInfo {
                 key: "users:delete",
                 name: "Delete Users",
-                description: "Remove dashboard users",
+                description: "Remove operators from the instance",
                 category: "Users",
             },
             Self::ApiKeysCreate => PermissionInfo {
@@ -317,6 +334,12 @@ impl Permission {
                 key: "events:purge",
                 name: "Purge Events",
                 description: "Bulk-delete event log entries matching a filter",
+                category: "System",
+            },
+            Self::MetricsRead => PermissionInfo {
+                key: "metrics:read",
+                name: "View Metrics",
+                description: "View script run counts, latency, errors and resource use",
                 category: "System",
             },
             Self::LabelersCreate => PermissionInfo {
@@ -499,6 +522,12 @@ impl Permission {
                 description: "Revoke linked repos and delete their stored sessions",
                 category: "Linked Repos",
             },
+            Self::ProjectDeploy => PermissionInfo {
+                key: "project:deploy",
+                name: "Deploy Project",
+                description: "Replace the instance's project with a deployed bundle and start the backfills it declares",
+                category: "Project",
+            },
         }
     }
 
@@ -508,6 +537,7 @@ impl Permission {
             Self::LexiconsCreate,
             Self::LexiconsRead,
             Self::LexiconsDelete,
+            Self::LexiconsPublish,
             Self::RecordsRead,
             Self::RecordsDelete,
             Self::RecordsDeleteCollection,
@@ -526,6 +556,7 @@ impl Permission {
             Self::StatsRead,
             Self::EventsRead,
             Self::EventsPurge,
+            Self::MetricsRead,
             Self::LabelersCreate,
             Self::LabelersRead,
             Self::LabelersDelete,
@@ -556,6 +587,7 @@ impl Permission {
             Self::LinkedReposRead,
             Self::LinkedReposCreate,
             Self::LinkedReposDelete,
+            Self::ProjectDeploy,
         ])
     }
 }
@@ -567,6 +599,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         LexiconsCreate,
         LexiconsRead,
         LexiconsDelete,
+        LexiconsPublish,
         RecordsRead,
         RecordsDelete,
         RecordsDeleteCollection,
@@ -587,6 +620,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         StatsRead,
         EventsRead,
         EventsPurge,
+        MetricsRead,
         LabelersCreate,
         LabelersRead,
         LabelersDelete,
@@ -615,6 +649,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         LinkedReposRead,
         LinkedReposCreate,
         LinkedReposDelete,
+        ProjectDeploy,
     ]
     .iter()
     .map(|p| p.info())
@@ -632,7 +667,10 @@ pub fn is_valid(key: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum Template {
     Viewer,
-    Operator,
+    // Was called Operator, which the docs use for the person running the
+    // instance. The old name is still accepted wherever a template is sent.
+    #[serde(alias = "operator")]
+    Maintainer,
     Manager,
     FullAccess,
 }
@@ -647,7 +685,7 @@ pub struct TemplateInfo {
 impl Template {
     pub const ALL: &[Template] = &[
         Template::Viewer,
-        Template::Operator,
+        Template::Maintainer,
         Template::Manager,
         Template::FullAccess,
     ];
@@ -655,7 +693,7 @@ impl Template {
     pub fn key(&self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
-            Self::Operator => "operator",
+            Self::Maintainer => "maintainer",
             Self::Manager => "manager",
             Self::FullAccess => "full_access",
         }
@@ -664,7 +702,7 @@ impl Template {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Viewer => "Viewer",
-            Self::Operator => "Operator",
+            Self::Maintainer => "Maintainer",
             Self::Manager => "Manager",
             Self::FullAccess => "Full Access",
         }
@@ -690,9 +728,10 @@ impl Template {
                 Permission::BackfillRead,
                 Permission::StatsRead,
                 Permission::EventsRead,
+                Permission::MetricsRead,
                 Permission::DeadLettersRead,
             ]),
-            Self::Operator => {
+            Self::Maintainer => {
                 let mut perms = Self::Viewer.permissions();
                 perms.insert(Permission::BackfillCreate);
                 perms.insert(Permission::ApiKeysCreate);
@@ -701,12 +740,14 @@ impl Template {
                 perms
             }
             Self::Manager => {
-                let mut perms = Self::Operator.permissions();
+                let mut perms = Self::Maintainer.permissions();
                 perms.insert(Permission::LexiconsCreate);
                 perms.insert(Permission::LexiconsDelete);
+                perms.insert(Permission::LexiconsPublish);
                 perms.insert(Permission::ScriptVariablesCreate);
                 perms.insert(Permission::ScriptVariablesDelete);
                 perms.insert(Permission::ScriptsManage);
+                perms.insert(Permission::ProjectDeploy);
                 perms.insert(Permission::RecordsDelete);
                 perms.insert(Permission::LabelersCreate);
                 perms.insert(Permission::LabelersRead);
@@ -802,17 +843,29 @@ mod tests {
     }
 
     #[test]
-    fn template_viewer_is_subset_of_operator() {
+    fn template_viewer_is_subset_of_maintainer() {
         let viewer = Template::Viewer.permissions();
-        let operator = Template::Operator.permissions();
-        assert!(viewer.is_subset(&operator));
+        let maintainer = Template::Maintainer.permissions();
+        assert!(viewer.is_subset(&maintainer));
     }
 
     #[test]
-    fn template_operator_is_subset_of_manager() {
-        let operator = Template::Operator.permissions();
+    fn template_maintainer_is_subset_of_manager() {
+        let maintainer = Template::Maintainer.permissions();
         let manager = Template::Manager.permissions();
-        assert!(operator.is_subset(&manager));
+        assert!(maintainer.is_subset(&manager));
+    }
+
+    #[test]
+    fn template_operator_is_still_read_as_maintainer() {
+        for key in ["maintainer", "operator"] {
+            let template: Template = serde_json::from_value(serde_json::json!(key)).unwrap();
+            assert_eq!(template.key(), "maintainer", "{key}");
+        }
+        assert_eq!(
+            serde_json::to_value(Template::Maintainer).unwrap(),
+            "maintainer"
+        );
     }
 
     #[test]
@@ -838,11 +891,25 @@ mod tests {
         }
     }
 
+    /// Whoever can read the event log can read the metrics beside it.
+    #[test]
+    fn every_template_with_events_read_has_metrics_read() {
+        for template in Template::ALL {
+            let permissions = template.permissions();
+            if permissions.contains(&Permission::EventsRead) {
+                assert!(
+                    permissions.contains(&Permission::MetricsRead),
+                    "{template:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn events_purge_is_registered_and_not_granted_by_default_templates() {
         assert_eq!(Permission::EventsPurge.as_str(), "events:purge");
         assert!(Permission::all().contains(&Permission::EventsPurge));
-        for template in [Template::Viewer, Template::Operator, Template::Manager] {
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
             assert!(
                 !template.permissions().contains(&Permission::EventsPurge),
                 "purging the audit log must not come with a built-in role template"
@@ -855,11 +922,11 @@ mod tests {
         assert_eq!(Permission::SpacesInspect.as_str(), "spaces:inspect");
         assert!(is_valid("spaces:inspect"));
         assert!(Permission::all().contains(&Permission::SpacesInspect));
-        assert!(
-            !Template::Manager
-                .permissions()
-                .contains(&Permission::SpacesInspect),
-            "reading private space contents is granted deliberately, not by template"
-        );
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
+            assert!(
+                !template.permissions().contains(&Permission::SpacesInspect),
+                "reading private space contents is granted deliberately, not by template"
+            );
+        }
     }
 }

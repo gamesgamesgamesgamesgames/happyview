@@ -19,6 +19,7 @@ import {
   getAdminRecords,
   deleteRecord,
   deleteCollectionRecords,
+  reconcileCollection,
 } from "@/lib/api";
 import type { AdminRecord } from "@/types/records";
 import {
@@ -113,6 +114,9 @@ export default function RecordsPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteUri, setDeleteUri] = useState<string | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [reconcileOpen, setReconcileOpen] = useState(false);
+  const [reconcileDryRun, setReconcileDryRun] = useState(true);
+  const [reconciling, setReconciling] = useState(false);
   const [bulkDeleteMode, setBulkDeleteMode] = useState<"selected" | "all">(
     "selected",
   );
@@ -145,7 +149,11 @@ export default function RecordsPage() {
 
   // Auto-select collection from URL search param on initial load.
   useEffect(() => {
-    if (appliedInitial.current || !initialCollection || collections.length === 0)
+    if (
+      appliedInitial.current ||
+      !initialCollection ||
+      collections.length === 0
+    )
       return;
     if (collections.includes(initialCollection)) {
       appliedInitial.current = true;
@@ -225,21 +233,57 @@ export default function RecordsPage() {
     }
   }, [selectedCollection, router, vacuumNotDone]);
 
+  const handleReconcile = useCallback(async () => {
+    if (!selectedCollection) return;
+    setReconciling(true);
+    try {
+      const { job_id } = await reconcileCollection(
+        selectedCollection,
+        reconcileDryRun,
+      );
+      setReconcileOpen(false);
+      toast.success(
+        reconcileDryRun ? "Check started" : "Reconciliation started",
+        {
+          description:
+            "The job's result lists the records the PDSes no longer hold, and any it skipped.",
+          action: {
+            label: "View job",
+            onClick: () => router.push(`/dashboard/jobs?job=${job_id}`),
+          },
+        },
+      );
+    } catch (e: unknown) {
+      toastError("Failed to start the check", e);
+    } finally {
+      setReconciling(false);
+    }
+  }, [selectedCollection, reconcileDryRun, router]);
+
   const handleBulkDelete = useCallback(async () => {
     setDeleting(true);
     const selectedUris = Object.keys(rowSelection);
-    const results = await Promise.allSettled(selectedUris.map((uri) => deleteRecord(uri)));
-    const succeeded = selectedUris.filter((_, i) => results[i].status === "fulfilled");
+    const results = await Promise.allSettled(
+      selectedUris.map((uri) => deleteRecord(uri)),
+    );
+    const succeeded = selectedUris.filter(
+      (_, i) => results[i].status === "fulfilled",
+    );
     const failed = selectedUris.length - succeeded.length;
 
     if (failed === 0) {
-      toast.success(`Deleted ${succeeded.length} ${succeeded.length === 1 ? "record" : "records"}`);
+      toast.success(
+        `Deleted ${succeeded.length} ${succeeded.length === 1 ? "record" : "records"}`,
+      );
     } else if (succeeded.length === 0) {
       toast.error("Failed to delete records");
     } else {
-      toast.warning(`Deleted ${succeeded.length} of ${selectedUris.length} records`, {
-        description: `${failed} ${failed === 1 ? "record" : "records"} failed to delete.`,
-      });
+      toast.warning(
+        `Deleted ${succeeded.length} of ${selectedUris.length} records`,
+        {
+          description: `${failed} ${failed === 1 ? "record" : "records"} failed to delete.`,
+        },
+      );
     }
 
     setRowSelection({});
@@ -420,6 +464,20 @@ export default function RecordsPage() {
               </SelectContent>
             </Select>
             <div className="flex items-center gap-2">
+              {hasPermission("records:read") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  disabled={!selectedCollection}
+                  onClick={() => {
+                    setReconcileDryRun(true);
+                    setReconcileOpen(true);
+                  }}
+                >
+                  Check against PDSes
+                </Button>
+              )}
               {hasPermission("records:delete") && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -496,15 +554,21 @@ export default function RecordsPage() {
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div className="col-span-2">
                       <span className="text-muted-foreground">URI</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.uri}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.uri}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">DID</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.did}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.did}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">Collection</span>
-                      <p className="font-mono text-xs">{viewRecord.collection}</p>
+                      <p className="font-mono text-xs">
+                        {viewRecord.collection}
+                      </p>
                     </div>
                     <div>
                       <span className="text-muted-foreground">Record Key</span>
@@ -512,7 +576,9 @@ export default function RecordsPage() {
                     </div>
                     <div>
                       <span className="text-muted-foreground">CID</span>
-                      <p className="font-mono text-xs break-all">{viewRecord.cid}</p>
+                      <p className="font-mono text-xs break-all">
+                        {viewRecord.cid}
+                      </p>
                     </div>
                     {viewRecord.indexed_at && (
                       <div>
@@ -540,9 +606,13 @@ export default function RecordsPage() {
                   </div>
 
                   <div className="flex flex-col flex-1 min-h-0">
-                    <span className="text-muted-foreground text-sm">Record</span>
+                    <span className="text-muted-foreground text-sm">
+                      Record
+                    </span>
                     <div className="mt-1">
-                      <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                      <CodeBlock
+                        code={JSON.stringify(viewRecord.record, null, 2)}
+                      />
                     </div>
                   </div>
                 </div>
@@ -562,7 +632,61 @@ export default function RecordsPage() {
           </SheetContent>
         </Sheet>
 
-        <AlertDialog open={!!deleteUri} onOpenChange={(open) => { if (!open) setDeleteUri(null); }}>
+        <AlertDialog open={reconcileOpen} onOpenChange={setReconcileOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Check against PDSes?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Compares each account&apos;s stored {selectedCollection} records
+                with its PDS, and finds the ones the PDS no longer holds. A
+                record is only counted once its PDS confirms it is gone, and an
+                account whose PDS can&apos;t be read, or lists far fewer records
+                than are stored, is skipped. Requests are paced at five a
+                second.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <label className="flex items-start gap-2 text-sm">
+              <Checkbox
+                checked={reconcileDryRun}
+                disabled={!hasPermission("records:delete")}
+                onCheckedChange={(checked) =>
+                  setReconcileDryRun(checked === true)
+                }
+              />
+              <span>
+                Report only. Untick to delete the missing records too: each
+                delete runs the collection&apos;s delete hook, which can keep
+                the record.
+              </span>
+            </label>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={reconciling}>
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant={reconcileDryRun ? "default" : "destructive"}
+                disabled={reconciling}
+                onClick={(e) => {
+                  e.preventDefault();
+                  handleReconcile();
+                }}
+              >
+                {reconciling
+                  ? "Starting..."
+                  : reconcileDryRun
+                    ? "Check"
+                    : "Check and delete"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <AlertDialog
+          open={!!deleteUri}
+          onOpenChange={(open) => {
+            if (!open) setDeleteUri(null);
+          }}
+        >
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>Delete record?</AlertDialogTitle>
@@ -637,7 +761,9 @@ export default function RecordsPage() {
               return (
                 <>
                   <ResponsiveDialogHeader>
-                    <ResponsiveDialogTitle>Delete records?</ResponsiveDialogTitle>
+                    <ResponsiveDialogTitle>
+                      Delete records?
+                    </ResponsiveDialogTitle>
                     <ResponsiveDialogDescription>
                       This action cannot be undone.
                     </ResponsiveDialogDescription>
@@ -696,10 +822,7 @@ export default function RecordsPage() {
                           </Button>
                         </p>
                       )}
-                      <label
-                        className="text-sm"
-                        htmlFor="bulk-delete-confirm"
-                      >
+                      <label className="text-sm" htmlFor="bulk-delete-confirm">
                         Type{" "}
                         <code className="font-semibold">
                           {selectedCollection}
@@ -716,7 +839,10 @@ export default function RecordsPage() {
                   )}
                   <ResponsiveDialogFooter>
                     <ResponsiveDialogClose asChild>
-                      <Button variant="outline" disabled={deleting || deletingAll}>
+                      <Button
+                        variant="outline"
+                        disabled={deleting || deletingAll}
+                      >
                         Cancel
                       </Button>
                     </ResponsiveDialogClose>

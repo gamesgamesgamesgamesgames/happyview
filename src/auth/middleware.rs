@@ -19,6 +19,9 @@ pub struct Claims {
     client_key: Option<String>,
     /// The DPoP key ID identifying the specific device session.
     dpop_key_id: Option<String>,
+    /// Set when the request authenticated with a service-auth JWT, to the
+    /// method the token is bound to (`None` inside when it names none).
+    service_auth_lxm: Option<Option<String>>,
 }
 
 /// Separator used to encode `did` and `client_key` in a single cookie value.
@@ -34,6 +37,7 @@ impl Claims {
             did: did.to_string(),
             client_key: client_key.map(str::to_string),
             dpop_key_id: dpop_key_id.map(str::to_string),
+            service_auth_lxm: None,
         }
     }
 
@@ -52,12 +56,19 @@ impl Claims {
         self.dpop_key_id.as_deref()
     }
 
+    /// For a request authenticated with a service-auth JWT, the method the
+    /// token is bound to (`Some(None)` when it names none); `None` otherwise.
+    pub fn service_auth_lxm(&self) -> Option<Option<&str>> {
+        self.service_auth_lxm.as_ref().map(Option::as_deref)
+    }
+
     /// Create claims for an internal call (e.g. Lua xrpc lib) with no client key.
     pub fn internal(did: String) -> Self {
         Self {
             did,
             client_key: None,
             dpop_key_id: None,
+            service_auth_lxm: None,
         }
     }
 
@@ -73,6 +84,18 @@ impl Claims {
             did,
             client_key: Some(client_key),
             dpop_key_id: None,
+            service_auth_lxm: None,
+        }
+    }
+
+    /// Claims as a service-auth JWT bound to `lxm` produces them.
+    #[cfg(test)]
+    pub fn service_auth_for_test(did: String, lxm: Option<String>) -> Self {
+        Self {
+            did,
+            client_key: None,
+            dpop_key_id: None,
+            service_auth_lxm: Some(lxm),
         }
     }
 }
@@ -84,80 +107,109 @@ impl FromRequestParts<AppState> for Claims {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Path 1: Cookie auth (web UI)
-        let jar: SignedCookieJar<Key> = SignedCookieJar::from_request_parts(parts, state)
-            .await
-            .map_err(|_| AppError::Auth("failed to read cookies".into()))?;
+        claims_from_parts(parts, state, true).await
+    }
+}
 
-        if let Some(cookie) = jar.get(COOKIE_NAME) {
-            // Cookie auth relies on the SESSION_SECRET-derived signing key. If
-            // that secret is insecure the key is forgeable, so we refuse cookie
-            // auth outright with a clear error rather than trust it.
-            if !state.config.session_secret_secure() {
-                return Err(AppError::ServerMisconfigured(
-                    crate::auth::COOKIE_AUTH_DISABLED_MSG.into(),
-                ));
-            }
-            let value = cookie.value().to_string();
-            let (did, client_key) = if let Some((d, k)) = value.split_once(COOKIE_SEP) {
-                (d.to_string(), Some(k.to_string()))
-            } else {
-                (value, None)
-            };
+/// [`Claims`] for a route outside `/admin`: the session cookie counts only on
+/// a request from the instance's own pages
+/// ([`crate::csrf::cookie_request_is_same_origin`]), and any other request is
+/// read as if it carried none. `/admin` takes [`Claims`] through `UserAuth`,
+/// where the CSRF guard judges the cookie.
+pub struct PageClaims(pub Claims);
+
+impl FromRequestParts<AppState> for PageClaims {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let cookie_counts = crate::csrf::cookie_request_is_same_origin(state, &parts.headers).await;
+        claims_from_parts(parts, state, cookie_counts)
+            .await
+            .map(PageClaims)
+    }
+}
+
+async fn claims_from_parts(
+    parts: &mut Parts,
+    state: &AppState,
+    cookie_counts: bool,
+) -> Result<Claims, AppError> {
+    // Path 1: Cookie auth (web UI)
+    let jar: SignedCookieJar<Key> = SignedCookieJar::from_request_parts(parts, state)
+        .await
+        .map_err(|_| AppError::Auth("failed to read cookies".into()))?;
+
+    if cookie_counts && let Some(cookie) = jar.get(COOKIE_NAME) {
+        // Cookie auth relies on the SESSION_SECRET-derived signing key. If
+        // that secret is insecure the key is forgeable, so we refuse cookie
+        // auth outright with a clear error rather than trust it.
+        if !state.config.session_secret_secure() {
+            return Err(AppError::ServerMisconfigured(
+                crate::auth::COOKIE_AUTH_DISABLED_MSG.into(),
+            ));
+        }
+        let value = cookie.value().to_string();
+        let (did, client_key) = if let Some((d, k)) = value.split_once(COOKIE_SEP) {
+            (d.to_string(), Some(k.to_string()))
+        } else {
+            (value, None)
+        };
+        return Ok(Claims {
+            did,
+            client_key,
+            dpop_key_id: None,
+            service_auth_lxm: None,
+        });
+    }
+
+    // Path 2: Authorization header
+    let header = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Auth("missing Authorization header or session cookie".into()))?;
+
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        // API key tokens start with hv_ — let them through with a placeholder DID.
+        // The admin middleware (UserAuth) will resolve the actual DID from the API key.
+        if token.starts_with("hv_") {
+            // API key auth is handled by UserAuth extractor which looks up the key.
+            // We need to extract the DID from the api_keys table.
+            let did = resolve_api_key_did(state, token).await?;
             return Ok(Claims {
                 did,
-                client_key,
-                dpop_key_id: None,
-            });
-        }
-
-        // Path 2: Authorization header
-        let header = parts
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Auth("missing Authorization header or session cookie".into())
-            })?;
-
-        if let Some(token) = header.strip_prefix("Bearer ") {
-            // API key tokens start with hv_ — let them through with a placeholder DID.
-            // The admin middleware (UserAuth) will resolve the actual DID from the API key.
-            if token.starts_with("hv_") {
-                // API key auth is handled by UserAuth extractor which looks up the key.
-                // We need to extract the DID from the api_keys table.
-                let did = resolve_api_key_did(state, token).await?;
-                return Ok(Claims {
-                    did,
-                    client_key: None,
-                    dpop_key_id: None,
-                });
-            }
-
-            // Otherwise, try service auth JWT. Route through the same helper the
-            // XRPC path uses so the token's `aud` is verified against this
-            // instance's service DID — otherwise a JWT the user minted for a
-            // different audience would authenticate here and impersonate them
-            // (H6). `from_bearer` alone checks only the signature and `exp`.
-            let host = parts
-                .headers
-                .get(axum::http::header::HOST)
-                .and_then(|v| v.to_str().ok());
-            let service_claims =
-                try_parse_service_auth(token, state, host, parts.uri.path()).await?;
-            return Ok(Claims {
-                did: service_claims.did,
                 client_key: None,
                 dpop_key_id: None,
+                service_auth_lxm: None,
             });
         }
 
-        if let Some(token) = header.strip_prefix("DPoP ") {
-            return resolve_dpop_claims(state, parts, token).await;
-        }
-
-        Err(AppError::Auth("invalid Authorization scheme".into()))
+        // Otherwise, try service auth JWT. Route through the same helper the
+        // XRPC path uses so the token's `aud` is verified against this
+        // instance's service DID — otherwise a JWT the user minted for a
+        // different audience would authenticate here and impersonate them
+        // (H6). `from_bearer` alone checks only the signature and `exp`.
+        let host = parts
+            .headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok());
+        let service_claims = try_parse_service_auth(token, state, host, parts.uri.path()).await?;
+        return Ok(Claims {
+            did: service_claims.did,
+            client_key: None,
+            dpop_key_id: None,
+            service_auth_lxm: Some(service_claims.lxm),
+        });
     }
+
+    if let Some(token) = header.strip_prefix("DPoP ") {
+        return resolve_dpop_claims(state, parts, token).await;
+    }
+
+    Err(AppError::Auth("invalid Authorization scheme".into()))
 }
 
 /// Look up the DID associated with an API key.
@@ -203,10 +255,9 @@ pub async fn resolve_dpop_claims(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::Auth("DPoP auth requires DPoP header".into()))?;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Resolve the API client
@@ -245,7 +296,14 @@ pub async fn resolve_dpop_claims(
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
-    let request_url = format!("{}://{}{}", scheme, host, parts.uri.path());
+    // The client signed the path it sent. Inside a nested router such as
+    // `/admin`, `parts.uri` has the prefix stripped, so read the original.
+    let path = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path())
+        .unwrap_or_else(|| parts.uri.path());
+    let request_url = format!("{}://{}{}", scheme, host, path);
     let method = parts.method.as_str();
 
     // Validate the DPoP proof
@@ -261,6 +319,7 @@ pub async fn resolve_dpop_claims(
         did: session.user_did,
         client_key: Some(client_key.to_string()),
         dpop_key_id: Some(dpop_key_id),
+        service_auth_lxm: None,
     })
 }
 
@@ -269,8 +328,12 @@ pub async fn resolve_dpop_claims(
 /// Accepts DPoP auth (`Authorization: DPoP <token>`), space credentials
 /// (`Authorization: Atproto-Space <credential>` with an HTTP Message Signature
 /// by the credential's bound key), or Bearer service auth JWTs
-/// (`Authorization: Bearer <service_jwt>`). Cookie auth and Bearer API keys
-/// are rejected on XRPC routes.
+/// (`Authorization: Bearer <service_jwt>`). Bearer API keys are rejected on
+/// XRPC routes. With no `Authorization` header, the session cookie is the
+/// caller only on a request from the instance's own pages
+/// ([`crate::csrf::cookie_request_is_same_origin`]); otherwise the request is
+/// anonymous. The session belongs to the dashboard, and a navigation another
+/// site starts still carries it, while the CSRF guard lets every `GET` through.
 #[derive(Debug, Clone)]
 pub struct XrpcClaims {
     pub identity: Option<Claims>,
@@ -283,21 +346,27 @@ pub struct XrpcClaims {
     pub service_auth: Option<ServiceAuthClaims>,
 }
 
-/// Whether a path serves space data, the only routes a space credential opens.
+/// Whether a path serves space data, the only routes a space credential opens:
+/// an XRPC method in one of the space namespaces.
 fn is_space_route(path: &str) -> bool {
+    let Some(method) = path.strip_prefix("/xrpc/") else {
+        return false;
+    };
     [
-        "/com.atproto.space.",
-        "/com.atproto.simplespace.",
-        "/dev.happyview.space.",
+        "com.atproto.space.",
+        "com.atproto.simplespace.",
+        "dev.happyview.space.",
     ]
     .iter()
-    .any(|ns| path.contains(ns))
+    .any(|ns| method.starts_with(ns))
 }
 
 #[derive(Debug, Clone)]
 pub struct ServiceAuthClaims {
     pub did: String,
     pub aud_fragment: String,
+    /// The method the token is bound to, if it names one.
+    pub lxm: Option<String>,
 }
 
 impl FromRequestParts<AppState> for XrpcClaims {
@@ -307,6 +376,21 @@ impl FromRequestParts<AppState> for XrpcClaims {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // A test run forges its caller the way the browser suite forges a
+        // session cookie. The extension cannot arrive over a socket, and a
+        // state without a harness ignores it, so neither half alone opens
+        // anything.
+        if state.test.is_some()
+            && let Some(forged) = parts.extensions.get::<crate::testing::ForgedCaller>()
+        {
+            return Ok(XrpcClaims {
+                identity: Some(Claims::internal(forged.did().to_string())),
+                space_credential: None,
+                space_audience: None,
+                service_auth: None,
+            });
+        }
+
         let header = parts
             .headers
             .get("authorization")
@@ -387,9 +471,11 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 // Only trust the session cookie when the signing key is secure.
                 // When SESSION_SECRET is insecure we ignore the cookie and treat
                 // the request as anonymous, so public/DPoP reads keep working for
-                // clients that happen to carry a stale cookie.
+                // clients that happen to carry a stale cookie. A cookie on a
+                // request another site started is ignored the same way.
                 if state.config.session_secret_secure()
                     && let Some(cookie) = jar.get(COOKIE_NAME)
+                    && crate::csrf::cookie_request_is_same_origin(state, &parts.headers).await
                 {
                     let value = cookie.value().to_string();
                     let (did, client_key) = if let Some((d, k)) = value.split_once(COOKIE_SEP) {
@@ -402,6 +488,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                             did,
                             client_key,
                             dpop_key_id: None,
+                            service_auth_lxm: None,
                         }),
                         space_credential: None,
                         space_audience: None,
@@ -489,5 +576,40 @@ async fn try_parse_service_auth(
     Ok(ServiceAuthClaims {
         did: service_auth.did,
         aud_fragment: fragment,
+        lxm: payload.lxm,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_space_route;
+
+    #[test]
+    fn a_space_route_is_an_xrpc_method_in_a_space_namespace() {
+        for path in [
+            "/xrpc/com.atproto.space.getRecord",
+            "/xrpc/com.atproto.simplespace.getSpace",
+            "/xrpc/dev.happyview.space.listSpaces",
+            "/xrpc/com.atproto.space.notARealMethod",
+        ] {
+            assert!(is_space_route(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn other_paths_are_not_space_routes() {
+        for path in [
+            "/xrpc/com.example.nothing",
+            "/xrpc/app.bsky.actor.getProfile",
+            "/xrpc/dev.happyview.listApiClients",
+            "/xrpc/com.atproto.spaces.getRecord",
+            "/xrpc/com.example.com.atproto.space.getRecord",
+            "/admin/lexicons/com.atproto.space.getRecord",
+            "/com.atproto.space.getRecord",
+            "/xrpc/",
+            "",
+        ] {
+            assert!(!is_space_route(path), "{path}");
+        }
+    }
 }

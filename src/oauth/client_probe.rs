@@ -93,7 +93,7 @@ pub async fn probe(
     let held: Vec<String> = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         api_client_id,
     )
     .await?

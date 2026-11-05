@@ -370,7 +370,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rev = crate::lua::tid::generate_tid();
+        let rev = crate::tid::generate_tid();
         adopt_synced_commit(&state, &space, "did:plc:me", &rev, &[4; 32])
             .await
             .unwrap();

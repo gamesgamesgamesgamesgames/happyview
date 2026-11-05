@@ -1,16 +1,42 @@
+mod atproto;
 mod bindings;
+mod caller;
+mod db;
 mod http;
+mod jobs;
 mod kv;
+mod linked_repos;
 mod logging;
 mod lookup;
+mod pending_calls;
+pub(crate) mod records;
+pub mod script;
 mod secrets;
+mod spaces;
+mod wasi;
 
+pub use atproto::*;
+#[cfg(test)]
+pub(crate) use bindings::{HostImports, define_host_functions};
 pub use bindings::{PluginState, register_host_functions};
+pub use caller::*;
+pub use db::*;
 pub use http::*;
 pub use kv::*;
 pub use logging::*;
 pub use lookup::*;
+pub use pending_calls::PendingCalls;
+pub(crate) use pending_calls::outcome_of as pending_call_outcome;
+pub use records::*;
+pub use script::ScriptRun;
 pub use secrets::*;
+pub use wasi::build_context as build_wasi_context;
+
+// `jobs`, `linked_repos` and `spaces` are deliberately not glob-exported:
+// each defines functions sharing a name with another module's (`create`,
+// `create_record`, `put_record`, `delete_record`, `update`, `delete`,
+// `upload_blob`...) for a different operation. `bindings.rs` reaches them by
+// their full module path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,10 +47,13 @@ pub struct HostContext {
     pub scope: String, // user DID or OAuth state
     pub secrets: HashMap<String, String>,
     pub config: serde_json::Value,
+    /// The instance's record store (its routing included); a local store over
+    /// `db` for an instance built without the app state.
+    pub records: crate::record_store::RecordStore,
     pub db: sqlx::AnyPool,
     pub db_backend: crate::db::DatabaseBackend,
     pub http_client: reqwest::Client,
-    pub lexicons: Arc<crate::lexicon::LexiconRegistry>,
+    pub lexicons: Arc<crate::catalog::LexiconCatalog>,
 }
 
 /// Resource usage tracking for limits
@@ -39,5 +68,9 @@ pub struct ResourceUsage {
 pub const MAX_HTTP_REQUESTS: u32 = 100;
 pub const MAX_HTTP_RESPONSE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 pub const MAX_HTTP_TOTAL_TRANSFER: u64 = 500 * 1024 * 1024; // 500 MB
+/// How long one request may take, from connecting to the end of its body. A
+/// job has no other time limit, so without this a server that trickles bytes
+/// holds it for as long as it likes.
+pub const MAX_HTTP_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_secs(120);
 pub const MAX_HTTP_CONCURRENT: usize = 5;
 pub const MAX_KV_SIZE_PER_USER: u64 = 1024 * 1024; // 1 MB

@@ -9,10 +9,7 @@ const CONTENT_WARNING_LABELS = new Set([
   "gore",
 ]);
 
-const MODERATION_LABELS = new Set([
-  "spam",
-  "impersonation",
-]);
+const MODERATION_LABELS = new Set(["spam", "impersonation"]);
 
 function getLabelVariant(
   val: string,
@@ -25,7 +22,8 @@ function getLabelVariant(
 
 function getLabelClassName(val: string, isSelfLabel: boolean): string {
   if (isSelfLabel) return "";
-  if (MODERATION_LABELS.has(val)) return "bg-amber-500 text-white border-amber-500";
+  if (MODERATION_LABELS.has(val))
+    return "bg-amber-500 text-white border-amber-500";
   return "";
 }
 

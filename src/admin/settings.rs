@@ -3,20 +3,21 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use base64::Engine;
 use sqlx::AnyPool;
-use std::env;
 
 use crate::AppState;
+use crate::config::vars;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{
     DEFAULT_RETENTION_DAYS, EventLog, SPACE_ACCESS_RETENTION_SETTING, Severity,
     effective_protected_retention, log_event, write_event,
 };
-
-const GENERAL_RETENTION_SETTING: &str = "event_log_retention_days";
+use crate::feature_flags::FeatureFlag;
+use crate::lua::limits as script_limits;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
+use super::space_access;
 use super::types::{SettingEntry, UpsertSettingBody};
 
 const ENV_FALLBACKS: &[(&str, &str)] = &[
@@ -36,6 +37,11 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("feature.space_inspector_enabled", "SPACE_INSPECTOR_ENABLED"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
+    ("tos_uri", "TOS_URI"),
+    ("policy_uri", "POLICY_URI"),
+    ("script_instruction_limit", "SCRIPT_INSTRUCTION_LIMIT"),
+    (crate::metrics::ENABLED_KEY, "SCRIPT_METRICS_ENABLED"),
+    ("script_wall_clock_seconds", "SCRIPT_WALL_CLOCK_SECONDS"),
     (
         "space_access_log_retention_days",
         "SPACE_ACCESS_LOG_RETENTION_DAYS",
@@ -44,8 +50,6 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
         "space_inspector_max_grant_minutes",
         "SPACE_INSPECTOR_MAX_GRANT_MINUTES",
     ),
-    ("tos_uri", "TOS_URI"),
-    ("policy_uri", "POLICY_URI"),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
 
@@ -63,13 +67,164 @@ fn refuse_if_reserved(key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The protected event for an audited setting change: turning the space
+const GENERAL_RETENTION_SETTING: &str = "event_log_retention_days";
+
+/// The variable a hosting platform names the settings it fixes in, as a
+/// comma-separated list of keys. A fixed setting reads its environment value
+/// whatever is stored, and the settings routes refuse to change it.
+pub const PLATFORM_LOCKED_SETTINGS: &str = "PLATFORM_LOCKED_SETTINGS";
+
+/// Fixed settings whose value has to be a positive number of days or minutes,
+/// so a platform can't fix them to `0`, which would keep records forever.
+const POSITIVE_WHEN_LOCKED: &[&str] = &[
+    SPACE_ACCESS_RETENTION_SETTING,
+    super::space_access::MAX_GRANT_SETTING,
+];
+
+/// The keys `PLATFORM_LOCKED_SETTINGS` names.
+fn locked_keys() -> Vec<String> {
+    vars::var(PLATFORM_LOCKED_SETTINGS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the hosting platform fixes `key`.
+pub fn platform_locked(key: &str) -> bool {
+    locked_keys().iter().any(|locked| locked == key)
+}
+
+/// Refuse to start on a lock that can't hold: a variable left unset, or a
+/// retention fixed at `0`. Read as unlocked, either would hand the operator a
+/// setting the platform meant to fix. A key this build doesn't have is only
+/// warned about, because a platform names the settings of every build it
+/// runs, and a build without the setting has nothing to fix.
+pub fn check_platform_locks() -> Result<(), String> {
+    for key in locked_keys() {
+        let Some(env_var) = env_var_for(&key) else {
+            tracing::warn!(
+                key,
+                "{PLATFORM_LOCKED_SETTINGS} names a setting this build doesn't have"
+            );
+            continue;
+        };
+        let Some(value) = vars::var(env_var) else {
+            return Err(format!(
+                "{PLATFORM_LOCKED_SETTINGS} fixes '{key}', but {env_var} isn't set"
+            ));
+        };
+        if POSITIVE_WHEN_LOCKED.contains(&key.as_str())
+            && !value.trim().parse::<u32>().is_ok_and(|n| n > 0)
+        {
+            return Err(format!(
+                "{PLATFORM_LOCKED_SETTINGS} fixes '{key}', so {env_var} must be a positive number ('{value}')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_if_locked(key: &str) -> Result<(), AppError> {
+    if platform_locked(key) {
+        return Err(AppError::Conflict(format!(
+            "'{key}' is set by the hosting platform and can't be changed here"
+        )));
+    }
+    Ok(())
+}
+
+/// The environment variable a setting falls back to, if it has one.
+pub fn env_var_for(key: &str) -> Option<&'static str> {
+    ENV_FALLBACKS
+        .iter()
+        .find(|(setting_key, _)| *setting_key == key)
+        .map(|(_, env_var)| *env_var)
+}
+
+/// Resolve a setting value: check the DB first, then fall back to env var.
+/// A database that cannot be read counts as holding no row.
+pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
+    try_get_setting(pool, key, backend).await.ok().flatten()
+}
+
+/// Store a setting in `happyview_instance_settings`, replacing any value.
+pub async fn put_setting<'e, E>(
+    executor: E,
+    key: &str,
+    value: &str,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        r#"
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
+        "#,
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind(&now)
+        .bind(value)
+        .bind(&now)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// [`get_setting`] for a caller that must tell a missing row from a database
+/// it could not ask: the script budgets keep their cached values on the
+/// second, where the first means the env var or the default.
+pub async fn try_get_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
+    if let Some(value) = stored_setting(pool, key, backend).await? {
+        return Ok(Some(value));
+    }
+
+    Ok(env_var_for(key).and_then(vars::var))
+}
+
+/// A setting's stored row alone, without the fallback. A setting the
+/// platform fixes has none that counts.
+pub async fn stored_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
+    if platform_locked(key) {
+        return Ok(None);
+    }
+    let sql = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(value,)| value))
+}
+
+/// The protected events for an audited setting change: turning the space
 /// inspector on or off, and changing how long event logs are kept.
 ///
-/// Compares effective values, env fallback included, so a save that rewrites
-/// an unchanged value logs nothing.
+/// Compares effective values, fallbacks included, so a save that rewrites an
+/// unchanged value logs nothing.
 fn audited_setting_events(
-    auth: &UserAuth,
+    actor_did: &str,
     key: &str,
     before: &Option<String>,
     after: &Option<String>,
@@ -78,16 +233,13 @@ fn audited_setting_events(
     let event = |subject: &str, event_type: &str, detail: serde_json::Value| EventLog {
         event_type: event_type.to_string(),
         severity: Severity::Warn,
-        actor_did: Some(auth.did.clone()),
+        actor_did: Some(actor_did.to_string()),
         subject: Some(subject.to_string()),
         detail,
     };
     match key {
-        crate::feature_flags::FeatureFlag::SPACE_INSPECTOR => {
-            let on = |v: &Option<String>| {
-                v.as_deref()
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
-            };
+        FeatureFlag::SPACE_INSPECTOR => {
+            let on = |v: &Option<String>| space_access::switch_is_on(v.as_deref(), None);
             match (on(before), on(after)) {
                 (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
                 (true, false) => vec![event(
@@ -136,17 +288,12 @@ fn audited_setting_events(
     }
 }
 
-/// The env var value a key falls back to when it has no database row.
-fn env_fallback(key: &str) -> Option<String> {
-    ENV_FALLBACKS
-        .iter()
-        .find(|(setting_key, _)| *setting_key == key)
-        .and_then(|(_, env_var)| env::var(env_var).ok())
+/// The value a key falls back to when it has no database row.
+fn fallback_value(key: &str) -> Option<String> {
+    env_var_for(key).and_then(vars::var)
 }
 
-/// Write a setting change and its audit event together, so an audited setting
-/// never changes without its protected record.
-/// A setting's value inside a transaction, env fallback included.
+/// A setting's value inside a transaction, fallback included.
 async fn read_setting_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Any>,
     backend: DatabaseBackend,
@@ -160,19 +307,28 @@ async fn read_setting_in(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
-    Ok(stored.map(|(v,)| v).or_else(|| env_fallback(key)))
+    Ok(stored
+        .map(|(v,)| v)
+        .filter(|_| !platform_locked(key))
+        .or_else(|| fallback_value(key)))
 }
 
-async fn write_audited<'q>(
-    state: &AppState,
-    auth: &UserAuth,
+/// What [`write_audited`] does to a setting's row.
+enum SettingWrite<'a> {
+    Put(&'a str),
+    Delete,
+}
+
+/// Write a setting change and its audit events together, so an audited setting
+/// never changes without its protected record. Returns the rows affected.
+async fn write_audited(
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    actor_did: &str,
     key: &str,
-    change: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>,
-    after: Option<String>,
+    write: SettingWrite<'_>,
 ) -> Result<u64, AppError> {
-    let backend = state.db_backend;
-    let mut tx = state
-        .db
+    let mut tx = db
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
@@ -204,20 +360,29 @@ async fn write_audited<'q>(
         }
         _ => None,
     };
-    let events = audited_setting_events(auth, key, &before, &after, &other_retention);
+    let after = match write {
+        SettingWrite::Put(value) => Some(value.to_string()),
+        SettingWrite::Delete => fallback_value(key),
+    };
+    let events = audited_setting_events(actor_did, key, &before, &after, &other_retention);
 
-    let affected = change
+    let affected = match write {
+        SettingWrite::Put(value) => put_setting(&mut *tx, key, value, backend).await.map(|()| 1),
+        SettingWrite::Delete => crate::db::query(&adapt_sql(
+            "DELETE FROM happyview_instance_settings WHERE key = ?",
+            backend,
+        ))
+        .bind(key)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to write setting: {e}")))?
-        .rows_affected();
+        .map(|result| result.rows_affected()),
+    }
+    .map_err(|e| AppError::Internal(format!("failed to write setting: {e}")))?;
     if affected > 0 {
         for event in &events {
-            write_event(&mut *tx, event, state.db_backend)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("failed to record the setting change: {e}"))
-                })?;
+            write_event(&mut *tx, event, backend).await.map_err(|e| {
+                AppError::Internal(format!("failed to record the setting change: {e}"))
+            })?;
         }
     }
     tx.commit()
@@ -226,31 +391,39 @@ async fn write_audited<'q>(
     Ok(affected)
 }
 
-/// Resolve a setting value: check the DB first, then fall back to env var.
-pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
-    let sql = adapt_sql(
-        "SELECT value FROM happyview_instance_settings WHERE key = ?",
-        backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-
-    if let Some((value,)) = row {
-        return Some(value);
+/// The script budgets and the metrics switch are read from a cache rather
+/// than the database on every run, so a write to one of them is folded in
+/// here instead of waiting for the next poll.
+async fn refresh_cached_setting(state: &AppState, key: &str) {
+    if script_limits::is_limit_key(key) {
+        state
+            .script_limits
+            .refresh(&state.db, state.db_backend)
+            .await;
     }
-
-    // Fall back to env var if one is mapped for this key.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if *setting_key == key {
-            return env::var(env_var).ok();
-        }
+    if key == crate::metrics::ENABLED_KEY {
+        state.metrics.refresh(&state.db, state.db_backend).await;
     }
+}
 
-    None
+/// Fallback values for settings with no stored row, labelled with where
+/// they came from so the dashboard can say which file or variable to edit.
+fn fallback_entries(db_keys: &std::collections::HashSet<String>) -> Vec<SettingEntry> {
+    ENV_FALLBACKS
+        .iter()
+        .filter(|(setting_key, _)| !db_keys.contains(*setting_key))
+        .filter_map(|(setting_key, env_var)| {
+            vars::var_with_source(env_var).map(|(value, source)| SettingEntry {
+                key: setting_key.to_string(),
+                value,
+                source: if platform_locked(setting_key) {
+                    "platform".to_string()
+                } else {
+                    source.as_str().to_string()
+                },
+            })
+        })
+        .collect()
 }
 
 /// GET /admin/settings — list all settings with their source.
@@ -270,7 +443,9 @@ pub(super) async fn list(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list settings: {e}")))?
         .into_iter()
-        .filter(|(key, _): &(String, String)| !RESERVED_KEYS.contains(&key.as_str()))
+        .filter(|(key, _): &(String, String)| {
+            !RESERVED_KEYS.contains(&key.as_str()) && !platform_locked(key)
+        })
         .collect();
 
     let db_keys: std::collections::HashSet<String> = rows.iter().map(|(k, _)| k.clone()).collect();
@@ -284,18 +459,7 @@ pub(super) async fn list(
         })
         .collect();
 
-    // Add env-var fallback entries for keys not already present in DB.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if !db_keys.contains(*setting_key)
-            && let Ok(value) = env::var(env_var)
-        {
-            entries.push(SettingEntry {
-                key: setting_key.to_string(),
-                value,
-                source: "env".to_string(),
-            });
-        }
-    }
+    entries.extend(fallback_entries(&db_keys));
 
     Ok(Json(entries))
 }
@@ -309,24 +473,25 @@ pub(super) async fn upsert(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
     refuse_if_reserved(&key)?;
+    refuse_if_locked(&key)?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
+    script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    // The log_retention_days ceiling (HAP-227): an owner can keep logs for
+    // less, never for longer.
+    crate::limits::check_retention_setting(&state.limits.limits(), &key, &body.value)?;
 
-    let backend = state.db_backend;
-    let now = now_rfc3339();
-    let sql = adapt_sql(
-        r#"
-        INSERT INTO happyview_instance_settings (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
-        "#,
-        backend,
-    );
-    let change = crate::db::query(&sql)
-        .bind(&key)
-        .bind(&body.value)
-        .bind(&now)
-        .bind(&body.value)
-        .bind(&now);
-    write_audited(&state, &auth, &key, change, Some(body.value.clone())).await?;
+    write_audited(
+        &state.db,
+        state.db_backend,
+        &auth.did,
+        &key,
+        SettingWrite::Put(&body.value),
+    )
+    .await?;
+    refresh_cached_setting(&state, &key).await;
 
     log_event(
         &state.db,
@@ -352,16 +517,23 @@ pub(super) async fn delete(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
     refuse_if_reserved(&key)?;
+    refuse_if_locked(&key)?;
+    if key.starts_with("telemetry.") {
+        super::telemetry::refuse_if_managed(&state)?;
+    }
 
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "DELETE FROM happyview_instance_settings WHERE key = ?",
-        backend,
-    );
-    let change = crate::db::query(&sql).bind(&key);
-    if write_audited(&state, &auth, &key, change, env_fallback(&key)).await? == 0 {
+    let affected = write_audited(
+        &state.db,
+        state.db_backend,
+        &auth.did,
+        &key,
+        SettingWrite::Delete,
+    )
+    .await?;
+    if affected == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
+    refresh_cached_setting(&state, &key).await;
 
     log_event(
         &state.db,
@@ -369,7 +541,7 @@ pub(super) async fn delete(
             event_type: "setting.deleted".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(key.clone()),
+            subject: Some(key),
             detail: serde_json::json!({}),
         },
         state.db_backend,
@@ -377,6 +549,25 @@ pub(super) async fn delete(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The crawl's concurrency as a backfill job will run it: each value from its
+/// instance setting, then its environment variable, then its default, the
+/// order the job reads them in. The backfill pool is sized from this at boot,
+/// so a setting raised from the dashboard takes effect at the next restart.
+/// Returns `(pds, dids_per_pds, resolution)`.
+pub async fn backfill_concurrency(pool: &AnyPool, backend: DatabaseBackend) -> (u32, u32, u32) {
+    let read = |key: &'static str, default: u32| async move {
+        get_setting(pool, key, backend)
+            .await
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    (
+        read("backfill_concurrent_pds", 10).await,
+        read("backfill_concurrent_dids_per_pds", 3).await,
+        read("backfill_concurrent_resolution", 100).await,
+    )
 }
 
 /// GET /admin/settings/db-info — return database connection pool info.
@@ -400,26 +591,7 @@ pub(super) async fn db_info(
     let main_pool_size = state.db.options().get_max_connections() as i64;
     let backfill_pool_size = state.backfill_db.options().get_max_connections() as i64;
 
-    let pds: u32 = get_setting(&state.db, "backfill_concurrent_pds", state.db_backend)
-        .await
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-    let dids: u32 = get_setting(
-        &state.db,
-        "backfill_concurrent_dids_per_pds",
-        state.db_backend,
-    )
-    .await
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(3);
-    let resolution: u32 = get_setting(
-        &state.db,
-        "backfill_concurrent_resolution",
-        state.db_backend,
-    )
-    .await
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(100);
+    let (pds, dids, resolution) = backfill_concurrency(&state.db, state.db_backend).await;
     let would_be_pool_size =
         crate::db::compute_backfill_pool_size(state.db_backend, pds, dids, resolution);
     let restart_recommended = would_be_pool_size as i64 > backfill_pool_size;
@@ -576,5 +748,364 @@ pub(crate) async fn serve_logo(
                 .unwrap())
         }
         _ => Err(AppError::NotFound("no logo uploaded".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use serial_test::serial;
+
+    use super::*;
+    use crate::config::vars::{LayerReset, set_project_layer};
+    use crate::test_support::migrated_memory_pool;
+
+    fn file_says_app_name(value: &str) -> LayerReset {
+        set_project_layer([("APP_NAME".to_string(), value.to_string())].into());
+        LayerReset
+    }
+
+    /// Restores `APP_NAME` to unset even when the test panics.
+    struct AppNameEnv;
+
+    impl AppNameEnv {
+        fn set(value: Option<&str>) -> Self {
+            match value {
+                Some(v) => unsafe { std::env::set_var("APP_NAME", v) },
+                None => unsafe { std::env::remove_var("APP_NAME") },
+            }
+            Self
+        }
+    }
+
+    impl Drop for AppNameEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("APP_NAME") };
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_file_answers_when_neither_the_database_nor_the_env_does() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The File")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_env_wins_over_the_file() {
+        let _env = AppNameEnv::set(Some("From Env"));
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        let value = get_setting(&pool, "app_name", DatabaseBackend::Sqlite).await;
+        assert_eq!(value.as_deref(), Some("From Env"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_stored_setting_wins_over_the_file() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind("app_name")
+        .bind("From The Dashboard")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The Dashboard")
+        );
+    }
+
+    async fn retention_changes(pool: &AnyPool) -> Vec<(String, serde_json::Value)> {
+        let rows: Vec<(String, String)> = crate::db::query_as(
+            "SELECT subject, detail FROM happyview_event_logs \
+             WHERE event_type = 'event_logs.retention_changed' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(subject, detail)| (subject, serde_json::from_str(&detail).unwrap()))
+            .collect()
+    }
+
+    async fn put_audited(pool: &AnyPool, key: &str, value: &str) {
+        write_audited(
+            pool,
+            DatabaseBackend::Sqlite,
+            "did:plc:admin",
+            key,
+            SettingWrite::Put(value),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A value `happyview.toml` supplies is the one a change is compared
+    /// against: saving it again changes nothing, and changing it logs the
+    /// file's value as where it came from.
+    #[tokio::test]
+    #[serial]
+    async fn a_retention_from_the_file_is_the_value_before_a_change() {
+        unsafe { std::env::remove_var("EVENT_LOG_RETENTION_DAYS") };
+        set_project_layer([("EVENT_LOG_RETENTION_DAYS".to_string(), "14".to_string())].into());
+        let _reset = LayerReset;
+        let pool = migrated_memory_pool().await;
+
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "14").await;
+        assert!(retention_changes(&pool).await.is_empty());
+
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "7").await;
+        assert_eq!(
+            retention_changes(&pool).await,
+            vec![(
+                GENERAL_RETENTION_SETTING.to_string(),
+                serde_json::json!({ "from": 14, "to": 7 })
+            )]
+        );
+
+        // Deleting the row falls back to the file's value, which is a change
+        // back to it.
+        let affected = write_audited(
+            &pool,
+            DatabaseBackend::Sqlite,
+            "did:plc:admin",
+            GENERAL_RETENTION_SETTING,
+            SettingWrite::Delete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(affected, 1);
+        let changes = retention_changes(&pool).await;
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[1].1, serde_json::json!({ "from": 7, "to": 14 }));
+    }
+
+    /// A setting the platform fixes reads its environment value whatever row
+    /// is stored, and the lock refuses to start unless that value holds.
+    #[tokio::test]
+    #[serial]
+    async fn a_platform_fixed_setting_ignores_a_stored_row() {
+        unsafe {
+            std::env::set_var(PLATFORM_LOCKED_SETTINGS, SPACE_ACCESS_RETENTION_SETTING);
+            std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "364");
+        }
+        let pool = migrated_memory_pool().await;
+        put_setting(
+            &pool,
+            SPACE_ACCESS_RETENTION_SETTING,
+            "0",
+            DatabaseBackend::Sqlite,
+        )
+        .await
+        .unwrap();
+
+        let read = get_setting(
+            &pool,
+            SPACE_ACCESS_RETENTION_SETTING,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
+        assert!(check_platform_locks().is_ok());
+        assert!(refuse_if_locked(SPACE_ACCESS_RETENTION_SETTING).is_err());
+        assert!(refuse_if_locked(GENERAL_RETENTION_SETTING).is_ok());
+
+        unsafe { std::env::set_var("SPACE_ACCESS_LOG_RETENTION_DAYS", "0") };
+        let zero = check_platform_locks();
+        unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
+        let unset = check_platform_locks();
+        unsafe {
+            std::env::set_var(
+                PLATFORM_LOCKED_SETTINGS,
+                super::super::space_access::MAX_GRANT_SETTING,
+            );
+            std::env::set_var("SPACE_INSPECTOR_MAX_GRANT_MINUTES", "0");
+        }
+        let zero_grant = check_platform_locks();
+        unsafe {
+            std::env::remove_var("SPACE_INSPECTOR_MAX_GRANT_MINUTES");
+            std::env::set_var(PLATFORM_LOCKED_SETTINGS, "a_later_build_s_setting");
+        }
+        let unknown = check_platform_locks();
+        unsafe { std::env::remove_var(PLATFORM_LOCKED_SETTINGS) };
+
+        assert_eq!(read.as_deref(), Some("364"));
+        assert!(
+            zero.is_err(),
+            "a fixed retention of 0 would keep records forever"
+        );
+        assert!(unset.is_err());
+        assert!(
+            zero_grant.is_err(),
+            "a fixed grant length of 0 is refused too"
+        );
+        assert!(
+            unknown.is_ok(),
+            "a setting this build lacks has nothing to fix"
+        );
+        assert_eq!(
+            get_setting(
+                &pool,
+                SPACE_ACCESS_RETENTION_SETTING,
+                DatabaseBackend::Sqlite
+            )
+            .await
+            .as_deref(),
+            Some("0"),
+            "without the lock the stored row decides again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_a_change_to_an_effective_retention_is_logged() {
+        unsafe { std::env::remove_var("EVENT_LOG_RETENTION_DAYS") };
+        unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
+        let pool = migrated_memory_pool().await;
+
+        // Both settings already hold their defaults while unset.
+        put_audited(&pool, SPACE_ACCESS_RETENTION_SETTING, "365").await;
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "30").await;
+        assert!(retention_changes(&pool).await.is_empty());
+
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "14").await;
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "14").await;
+        assert_eq!(
+            retention_changes(&pool).await,
+            vec![(
+                GENERAL_RETENTION_SETTING.to_string(),
+                serde_json::json!({ "from": 30, "to": 14 })
+            )]
+        );
+    }
+
+    /// With protected retention unset, keeping every event keeps protected
+    /// ones too, so both effective values change.
+    #[tokio::test]
+    #[serial]
+    async fn a_general_retention_of_zero_changes_the_protected_one_too() {
+        unsafe { std::env::remove_var("EVENT_LOG_RETENTION_DAYS") };
+        unsafe { std::env::remove_var("SPACE_ACCESS_LOG_RETENTION_DAYS") };
+        let pool = migrated_memory_pool().await;
+
+        put_audited(&pool, GENERAL_RETENTION_SETTING, "0").await;
+        let changes = retention_changes(&pool).await;
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(changes.contains(&(
+            GENERAL_RETENTION_SETTING.to_string(),
+            serde_json::json!({ "from": 30, "to": 0 })
+        )));
+        assert!(changes.contains(&(
+            SPACE_ACCESS_RETENTION_SETTING.to_string(),
+            serde_json::json!({ "from": 365, "to": 0 })
+        )));
+
+        // Setting protected retention explicitly ends the follow.
+        put_audited(&pool, SPACE_ACCESS_RETENTION_SETTING, "365").await;
+        let changes = retention_changes(&pool).await;
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[2].1, serde_json::json!({ "from": 0, "to": 365 }));
+    }
+
+    async fn inspector_events(pool: &AnyPool) -> Vec<String> {
+        let rows: Vec<(String,)> = crate::db::query_as(
+            "SELECT event_type FROM happyview_event_logs \
+             WHERE event_type LIKE 'space_inspector.%' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter().map(|(t,)| t).collect()
+    }
+
+    /// Turning the inspector on or off is a protected event, logged only when
+    /// the switch actually changes.
+    #[tokio::test]
+    #[serial]
+    async fn the_inspector_switch_logs_each_effective_change() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        let pool = migrated_memory_pool().await;
+        let key = FeatureFlag::SPACE_INSPECTOR;
+
+        put_audited(&pool, key, "false").await;
+        assert!(inspector_events(&pool).await.is_empty());
+        put_audited(&pool, key, " true ").await;
+        put_audited(&pool, key, "true").await;
+        put_audited(&pool, key, "false").await;
+        put_audited(&pool, key, "true").await;
+        write_audited(
+            &pool,
+            DatabaseBackend::Sqlite,
+            "did:plc:admin",
+            key,
+            SettingWrite::Delete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inspector_events(&pool).await,
+            [
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+                "space_inspector.enabled",
+                "space_inspector.disabled",
+            ]
+        );
+    }
+
+    /// Configuration that says `true` turns the inspector on, and storing
+    /// `false` over it is recorded as turning it off.
+    #[tokio::test]
+    #[serial]
+    async fn a_configured_inspector_switch_turns_it_on() {
+        unsafe { std::env::remove_var("SPACE_INSPECTOR_ENABLED") };
+        set_project_layer([("SPACE_INSPECTOR_ENABLED".to_string(), "true".to_string())].into());
+        let _reset = LayerReset;
+        let pool = migrated_memory_pool().await;
+
+        assert_eq!(
+            get_setting(&pool, FeatureFlag::SPACE_INSPECTOR, DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("true"),
+            "the value is configured"
+        );
+        assert!(space_access::inspector_enabled(&pool, DatabaseBackend::Sqlite).await);
+        put_audited(&pool, FeatureFlag::SPACE_INSPECTOR, "false").await;
+        assert_eq!(inspector_events(&pool).await, ["space_inspector.disabled"]);
+    }
+
+    #[test]
+    #[serial]
+    fn the_listing_names_the_file_as_the_source() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let entries = fallback_entries(&HashSet::new());
+        let app_name = entries.iter().find(|e| e.key == "app_name").unwrap();
+        assert_eq!(app_name.value, "From The File");
+        assert_eq!(app_name.source, "project");
+
+        let stored: HashSet<String> = ["app_name".to_string()].into();
+        assert!(
+            fallback_entries(&stored)
+                .iter()
+                .all(|e| e.key != "app_name")
+        );
     }
 }

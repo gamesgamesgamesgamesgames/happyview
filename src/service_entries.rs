@@ -91,7 +91,18 @@ pub async fn create_entry(
         .bind(&now)
         .fetch_one(db)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to create service entry: {e}")))?;
+        .map_err(|e| {
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation())
+            {
+                AppError::Conflict(format!(
+                    "a service entry with fragment_id '{}' already exists",
+                    body.fragment_id
+                ))
+            } else {
+                AppError::Internal(format!("failed to create service entry: {e}"))
+            }
+        })?;
 
     let id = row.0;
 

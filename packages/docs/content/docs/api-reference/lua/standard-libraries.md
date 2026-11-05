@@ -76,4 +76,6 @@ Dangerous functions like `os.execute`, `os.remove`, `os.rename`, and `os.exit` a
 
 The following standard Lua modules are **removed** and unavailable in the sandbox:
 
-`io`, `debug`, `package`, `require`, `dofile`, `loadfile`, `load`, `collectgarbage`
+`io`, `debug`, `package`, `dofile`, `loadfile`, `load`, `collectgarbage`
+
+Lua's own `require` is removed too, but HappyView installs its own in its place: it loads installed library plugins and the `internal.*` built-ins — see [Built-in Modules](built-in-modules.md).

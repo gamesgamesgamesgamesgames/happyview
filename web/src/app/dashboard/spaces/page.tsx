@@ -155,7 +155,10 @@ function SpacesList() {
               onSubmit={(e) => {
                 e.preventDefault();
                 const did = lookupDid.trim();
-                if (did) router.push(`/dashboard/spaces/account/?did=${encodeURIComponent(did)}`);
+                if (did)
+                  router.push(
+                    `/dashboard/spaces/account/?did=${encodeURIComponent(did)}`,
+                  );
               }}
             >
               <Label htmlFor="account-did" className="sr-only">

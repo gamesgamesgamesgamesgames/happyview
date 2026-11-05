@@ -152,115 +152,115 @@ export function LinkRepoDialog({
         </SheetHeader>
 
         <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
-
-        {inviteResult ? (
-          <div className="flex flex-col gap-2 px-4">
-            <Label>Invite link</Label>
-            <div className="flex gap-2">
-              <Input
-                readOnly
-                value={inviteResult.invite_url}
-                className="font-mono text-xs"
-              />
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={copyInvite}
-                title="Copy to clipboard"
-              >
-                {copied ? (
-                  <Check className="size-4" />
-                ) : (
-                  <Copy className="size-4" />
-                )}
-              </Button>
-            </div>
-            <p className="text-muted-foreground text-xs">
-              Expires {new Date(inviteResult.expires_at).toLocaleString()}.
-            </p>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-4 px-4">
-            {repoId !== null ? (
-              <div className="rounded-lg border p-3 bg-muted/30 flex flex-col gap-1">
-                <p className="text-sm">
-                  This grant was already created
-                  {handleTrimmed ? ` for ${handleTrimmed}` : ""}. Scopes are
-                  immutable once created, so retry the action below rather
-                  than editing them here.
-                </p>
-                <p className="font-mono text-xs text-muted-foreground break-all">
-                  {scopes}
-                </p>
-              </div>
-            ) : (
-              <>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="linked-repo-handle">
-                    Handle or DID (optional)
-                  </Label>
-                  <Input
-                    id="linked-repo-handle"
-                    value={handle}
-                    onChange={(e) => setHandle(e.target.value)}
-                    placeholder="alice.bsky.social or did:plc:..."
-                  />
-                  <p className="text-muted-foreground text-xs">
-                    Leave this blank to create an open link whose repo is
-                    decided by whoever completes it. Fill it in to pin the
-                    grant to this account, so only they can complete it.
-                  </p>
-                </div>
-
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="linked-repo-reason">Reason (optional)</Label>
-                  <Textarea
-                    id="linked-repo-reason"
-                    value={reason}
-                    onChange={(e) => setReason(e.target.value)}
-                    placeholder="e.g. So the digest bot can post a weekly summary to your repo."
-                    rows={3}
-                  />
-                  <p className="text-muted-foreground text-xs">
-                    Shown to whoever opens the invite link, so write it for
-                    them — it&apos;s how they decide whether to grant access.
-                  </p>
-                </div>
-
-                <ScopeBuilder
-                  key={formKey}
-                  value={scopes}
-                  onChange={setScopes}
-                  onValidityChange={setScopeSelectionError}
+          {inviteResult ? (
+            <div className="flex flex-col gap-2 px-4">
+              <Label>Invite link</Label>
+              <div className="flex gap-2">
+                <Input
+                  readOnly
+                  value={inviteResult.invite_url}
+                  className="font-mono text-xs"
                 />
-              </>
-            )}
-
-            <p className="text-muted-foreground text-xs">
-              {handleTrimmed
-                ? "Authorize now sends you through OAuth immediately. Create link generates a single-use invite instead."
-                : "Authorize now is disabled without a handle or DID above — there's no identity to authorize against yet. Create link generates a single-use invite for whoever completes it."}
-            </p>
-
-            {error && (
-              <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive flex flex-col gap-2">
-                <span>{error}</span>
-                {lastAction && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="self-start"
-                    onClick={() => submit(lastAction)}
-                    disabled={submitting !== null}
-                  >
-                    Retry
-                  </Button>
-                )}
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={copyInvite}
+                  title="Copy to clipboard"
+                >
+                  {copied ? (
+                    <Check className="size-4" />
+                  ) : (
+                    <Copy className="size-4" />
+                  )}
+                </Button>
               </div>
-            )}
-          </div>
-        )}
+              <p className="text-muted-foreground text-xs">
+                Expires {new Date(inviteResult.expires_at).toLocaleString()}.
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4 px-4">
+              {repoId !== null ? (
+                <div className="rounded-lg border p-3 bg-muted/30 flex flex-col gap-1">
+                  <p className="text-sm">
+                    This grant was already created
+                    {handleTrimmed ? ` for ${handleTrimmed}` : ""}. Scopes are
+                    immutable once created, so retry the action below rather
+                    than editing them here.
+                  </p>
+                  <p className="font-mono text-xs text-muted-foreground break-all">
+                    {scopes}
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="linked-repo-handle">
+                      Handle or DID (optional)
+                    </Label>
+                    <Input
+                      id="linked-repo-handle"
+                      value={handle}
+                      onChange={(e) => setHandle(e.target.value)}
+                      placeholder="alice.bsky.social or did:plc:..."
+                    />
+                    <p className="text-muted-foreground text-xs">
+                      Leave this blank to create an open link whose repo is
+                      decided by whoever completes it. Fill it in to pin the
+                      grant to this account, so only they can complete it.
+                    </p>
+                  </div>
 
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="linked-repo-reason">
+                      Reason (optional)
+                    </Label>
+                    <Textarea
+                      id="linked-repo-reason"
+                      value={reason}
+                      onChange={(e) => setReason(e.target.value)}
+                      placeholder="e.g. So the digest bot can post a weekly summary to your repo."
+                      rows={3}
+                    />
+                    <p className="text-muted-foreground text-xs">
+                      Shown to whoever opens the invite link, so write it for
+                      them — it&apos;s how they decide whether to grant access.
+                    </p>
+                  </div>
+
+                  <ScopeBuilder
+                    key={formKey}
+                    value={scopes}
+                    onChange={setScopes}
+                    onValidityChange={setScopeSelectionError}
+                  />
+                </>
+              )}
+
+              <p className="text-muted-foreground text-xs">
+                {handleTrimmed
+                  ? "Authorize now sends you through OAuth immediately. Create link generates a single-use invite instead."
+                  : "Authorize now is disabled without a handle or DID above — there's no identity to authorize against yet. Create link generates a single-use invite for whoever completes it."}
+              </p>
+
+              {error && (
+                <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive flex flex-col gap-2">
+                  <span>{error}</span>
+                  {lastAction && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="self-start"
+                      onClick={() => submit(lastAction)}
+                      disabled={submitting !== null}
+                    >
+                      Retry
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <SheetFooter>

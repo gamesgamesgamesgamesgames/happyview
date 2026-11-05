@@ -211,6 +211,6 @@ curl -X DELETE http://127.0.0.1:3000/admin/verification-methods/attestation \
   -H "$AUTH"
 ```
 
-The `fragment_id` path parameter is the identifier without the leading `#` (e.g. `attestation` for `#attestation`).
+The `fragment_id` path parameter is the identifier without the leading `#` (e.g. `attestation` for `#attestation`). The encoded form, `%23attestation`, is accepted too.
 
 **Response**: `204 No Content`. Returns `404 Not Found` if no method with that fragment ID exists.

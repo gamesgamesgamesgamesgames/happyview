@@ -4,6 +4,8 @@ title: "Dead Letters"
 
 Events that failed all retry attempts are stored as dead letters for inspection and manual resolution. Dead letters come from two sources: legacy index hooks (`happyview_dead_letter_hooks`) and trigger-keyed scripts (`happyview_dead_letter_scripts`). Both tables are surfaced through a single unified API.
 
+Resolved script dead letters are deleted once they have been resolved for `DEAD_LETTER_RETENTION_DAYS` days (30 by default; see [Configuration](../../getting-started/configuration.md)). Unresolved ones are kept until someone deals with them.
+
 Read endpoints require `dead-letters:read`. Action endpoints (dismiss, retry, reindex) require `dead-letters:manage`.
 
 ```sh tab="cURL" tab-group="language"
@@ -183,7 +185,20 @@ curl -X POST "http://127.0.0.1:3000/admin/dead-letters/bulk/retry" \
   -d '{"all": true, "collection": "xyz.statusphere.status"}'
 ```
 
-**Response**: `200 OK` — `{"ok": true}`
+**Response**: `200 OK`, with one entry per dead letter in the order they were tried. A dead letter that fails doesn't stop the rest; its entry carries the error, and `ok` is `false` unless every one succeeded:
+
+```json
+{
+  "ok": false,
+  "succeeded": 2,
+  "failed": 1,
+  "results": [
+    { "id": "42", "ok": true },
+    { "id": "43", "ok": false, "error": "not found: dead letter 43 not found or already resolved" },
+    { "id": "44", "ok": true }
+  ]
+}
+```
 
 ## Bulk reindex
 
@@ -200,4 +215,4 @@ curl -X POST "http://127.0.0.1:3000/admin/dead-letters/bulk/reindex" \
   -d '{"all": true}'
 ```
 
-**Response**: `200 OK` — `{"ok": true}`
+**Response**: `200 OK`, in the same shape as [bulk retry](#bulk-retry): one entry per dead letter, and a failure doesn't stop the rest.

@@ -4,7 +4,9 @@ title: "Spaces"
 
 Browse the [spaces](../../experimental/spaces/index.md) on this instance for moderation. These endpoints give operators access to spaces they are not members of, so they live in the admin API rather than the space XRPC API.
 
-While the space inspector is off (see [Configuration](../../getting-started/configuration.md)), listing spaces and accounts, reading a space's metadata or contents, and creating access grants return `403 SpaceInspectorDisabled`. [Space inspector status](#space-inspector-status), listing your own grants, revoking a grant, and listing a grant's reads stay available, so access can still be ended and audited. Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand. The grant or revocation and its event are written together, and content is returned only after its read event is written: if the event can't be written, the request fails with `500` and nothing changes or is returned.
+The space inspector is off by default. An operator turns it on with **Enable Space Inspector** under **Settings > General** in the dashboard, the `feature.space_inspector_enabled` [setting](settings.md), or `SPACE_INSPECTOR_ENABLED` (see [Configuration](../../getting-started/configuration.md)). While it is off, listing spaces and accounts, reading a space's metadata or contents, and creating access grants return `403 SpaceInspectorDisabled`. [Space inspector status](#space-inspector-status), listing your own grants, revoking a grant, and listing a grant's reads stay available, so access can still be ended and audited. Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand. The grant or revocation and its event are written together, and content is returned only after its read event is written: if the event can't be written, the request fails with `500` and nothing changes or is returned.
+
+Because each content read is recorded against the user making it, [List records in a space](#list-records-in-a-space), [Get a blob in a space](#get-a-blob-in-a-space) and [List an account's records](#list-an-accounts-records) accept the dashboard's session cookie only on a request from the instance's own pages (`Sec-Fetch-Site: same-origin`, or an `Origin` that is one of the instance's domains), and answer `403` otherwise. API keys and other `Authorization` credentials are not affected. A browser that sends neither `Sec-Fetch-Site` nor `Origin`, such as Safari before 16.4, therefore can't load blobs with the session cookie.
 
 ```sh tab="cURL" tab-group="language"
 # All examples assume $TOKEN is an API key (hv_...)
@@ -17,7 +19,7 @@ AUTH="Authorization: Bearer $TOKEN"
 GET /admin/spaces/inspector
 ```
 
-Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read` or `spaces:inspect`. This route answers while the inspector is off, so the dashboard can show why the other routes are closed.
+Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read` or `spaces:inspect`. This route answers while the inspector is off, so a client can tell why the other routes are closed.
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/inspector -H "$AUTH"
@@ -319,7 +321,7 @@ curl "http://127.0.0.1:3000/admin/spaces/0b6c1f0e-.../blob?cid=bafkrei..." -H "$
 
 A space grant covering this space opens any blob a record in it references, regardless of author. Without one, each active account grant is checked in turn, longest-expiring first, and opens the blob only when that account's own record references it — if another author's record happens to share the CID, the account grant doesn't cover it.
 
-Returns `403 SpaceAccessGrantRequired` if no grant covers the space and the caller holds no account grant at all. If the caller holds an account grant but none of them reference this blob, the response is `404 Not Found` instead, the same as a CID no record references — an account grant that misses looks identical to the blob not existing. Also returns `502 Bad Gateway` if the author's PDS cannot serve it.
+Returns `403 SpaceAccessGrantRequired` if no grant covers the space and the caller holds no account grant at all. If the caller holds an account grant but none of them reference this blob, the response is `404 Not Found` instead, the same as a CID no record references. Also returns `502 Bad Gateway` if the author's PDS cannot serve it.
 
 ## List an account's spaces
 

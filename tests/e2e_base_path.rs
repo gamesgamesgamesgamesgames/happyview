@@ -125,3 +125,32 @@ async fn redirect_includes_base_path_prefix() {
         );
     }
 }
+
+/// The dashboard's static files are reached through `server::router`, so this
+/// fails if the router stops attaching the configured `STATIC_DIR`.
+#[tokio::test]
+#[serial]
+async fn router_serves_the_configured_static_dir() {
+    common::require_db!();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "from-static-dir").unwrap();
+
+    let mut app = common::app::TestApp::new().await;
+    app.state.config.static_dir = Some(dir.path().to_str().unwrap().to_string());
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/some/spa/route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"from-static-dir");
+}

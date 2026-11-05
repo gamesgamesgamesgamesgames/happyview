@@ -659,15 +659,18 @@ async fn a_registered_syncer_is_notified_of_every_writer() {
 
     let http = reqwest::Client::new();
     for author in ["did:plc:alice", "did:plc:bob"] {
-        notifications::dispatch_write_notification(
+        notifications::dispatch_write_notifications(
             &pool,
             backend,
             &http,
+            None,
             &space_id,
             author,
-            "com.example.post",
-            "rk",
-            None,
+            &[notifications::WebhookWrite {
+                collection: "com.example.post".into(),
+                rkey: "rk".into(),
+                cid: None,
+            }],
         )
         .await
         .expect("dispatch failed");

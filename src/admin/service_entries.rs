@@ -191,10 +191,9 @@ pub(super) async fn sync_plc(
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("no DID registered yet".into()))?;
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Fetch last PLC operation to get prev CID and preserve existing fields
@@ -346,14 +345,7 @@ pub(super) async fn sync_plc_request(
             }
             e
         })?;
-    let agent = Agent::new(session);
-
-    agent
-        .api
-        .com
-        .atproto
-        .identity
-        .request_plc_operation_signature()
+    crate::repo::pds::request_plc_operation_signature(&session)
         .await
         .map_err(|e| {
             if is_pds_session_expired(&e) {

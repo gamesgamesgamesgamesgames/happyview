@@ -506,6 +506,8 @@ curl -X POST https://happyview.example.com/oauth/client-assertion \
 
 Attach `client_assertion` and `client_assertion_type` as form parameters on the PAR request and, separately, on the token exchange request — each needs its own call to this endpoint.
 
+**Sign both with the same key.** The reference authorization server refuses a token exchange signed with a different key than its PAR request, and a rotated key can take over while the user is at their PDS. Pass the PAR assertion's `kid` back as `kid` when you request the exchange's assertion. A public client that sends `provision_id` and `pkce_verifier` gets this automatically: every assertion for a provision is signed with the key its first one used, as long as that key is still published. Then register the session with that `kid` as `signing_kid` (see `POST /oauth/sessions`), so its refreshes use the same key too.
+
 #### Refreshing a token: store the `kid`
 
 `kid` names the key that signed the assertion. **Store it alongside the session you establish**, and pass it back as the `kid` field whenever you request an assertion to *refresh* that session.

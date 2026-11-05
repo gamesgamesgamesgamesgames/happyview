@@ -22,7 +22,11 @@ import {
   bulkReindexDeadLetters,
   bulkDismissDeadLetters,
 } from "@/lib/api";
-import type { DeadLetterSummary, DeadLetterDetail } from "@/types/dead-letters";
+import type {
+  BulkItemsResponse,
+  DeadLetterSummary,
+  DeadLetterDetail,
+} from "@/types/dead-letters";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
@@ -195,8 +199,7 @@ export default function DeadLettersPage() {
     () =>
       (
         debouncedFilters.find((f) => f.id === "collection")?.value as
-          | string[]
-          | undefined
+          string[] | undefined
       )?.join(",") || undefined,
     [debouncedFilters],
   );
@@ -276,7 +279,13 @@ export default function DeadLettersPage() {
       if (action === "retry") await retryDeadLetter(viewDetail.id);
       else if (action === "reindex") await reindexDeadLetter(viewDetail.id);
       else await dismissDeadLetter(viewDetail.id);
-      toast.success(action === "retry" ? "Dead letter retried" : action === "reindex" ? "Dead letter re-indexed" : "Dead letter dismissed");
+      toast.success(
+        action === "retry"
+          ? "Dead letter retried"
+          : action === "reindex"
+            ? "Dead letter re-indexed"
+            : "Dead letter dismissed",
+      );
       setViewDetail(null);
       fetchItems();
     } catch (e: unknown) {
@@ -302,13 +311,28 @@ export default function DeadLettersPage() {
         scope === "all"
           ? { all: true, collection: collectionFilter }
           : { ids: selectedIds };
-      if (action === "retry") await bulkRetryDeadLetters(body);
-      else if (action === "reindex") await bulkReindexDeadLetters(body);
+      let items: BulkItemsResponse | null = null;
+      if (action === "retry") items = await bulkRetryDeadLetters(body);
+      else if (action === "reindex") items = await bulkReindexDeadLetters(body);
       else await bulkDismissDeadLetters(body);
-      const verb = action === "retry" ? "retried" : action === "reindex" ? "re-indexed" : "dismissed";
-      toast.success(scope === "all"
-        ? `All matching dead letters ${verb}`
-        : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`);
+      const verb =
+        action === "retry"
+          ? "retried"
+          : action === "reindex"
+            ? "re-indexed"
+            : "dismissed";
+      if (items && items.failed > 0) {
+        const firstError = items.results.find((r) => !r.ok)?.error;
+        toast.error(
+          `${items.succeeded} ${verb}, ${items.failed} failed${firstError ? `: ${firstError}` : ""}`,
+        );
+      } else {
+        toast.success(
+          scope === "all"
+            ? `All matching dead letters ${verb}`
+            : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`,
+        );
+      }
       setRowSelection({});
       fetchItems();
     } catch (e: unknown) {
@@ -521,14 +545,23 @@ export default function DeadLettersPage() {
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>Dismiss {selectedIds.length} dead {selectedIds.length === 1 ? "letter" : "letters"}?</AlertDialogTitle>
+                  <AlertDialogTitle>
+                    Dismiss {selectedIds.length} dead{" "}
+                    {selectedIds.length === 1 ? "letter" : "letters"}?
+                  </AlertDialogTitle>
                   <AlertDialogDescription>
-                    Dismissed dead letters will be marked as resolved and will not be retried.
+                    Dismissed dead letters will be marked as resolved and will
+                    not be retried.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "selected")}>Dismiss</AlertDialogAction>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={() => handleBulkAction("dismiss", "selected")}
+                  >
+                    Dismiss
+                  </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>
@@ -550,9 +583,7 @@ export default function DeadLettersPage() {
                 >
                   Re-index all matching
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setDismissAllOpen(true)}
-                >
+                <DropdownMenuItem onClick={() => setDismissAllOpen(true)}>
                   Dismiss all matching
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -635,7 +666,7 @@ export default function DeadLettersPage() {
                       onClick={() => handleDetailAction("retry")}
                     >
                       <RotateCcw className="mr-1 size-3.5" />
-                      Retry Hook
+                      Retry
                     </Button>
                     <Button
                       size="sm"
@@ -656,14 +687,22 @@ export default function DeadLettersPage() {
         <AlertDialog open={dismissAllOpen} onOpenChange={setDismissAllOpen}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Dismiss all matching dead letters?</AlertDialogTitle>
+              <AlertDialogTitle>
+                Dismiss all matching dead letters?
+              </AlertDialogTitle>
               <AlertDialogDescription>
-                All dead letters matching the current filters will be marked as resolved. This action cannot be undone.
+                All dead letters matching the current filters will be marked as
+                resolved. This action cannot be undone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "all")}>Dismiss All</AlertDialogAction>
+              <AlertDialogAction
+                variant="destructive"
+                onClick={() => handleBulkAction("dismiss", "all")}
+              >
+                Dismiss All
+              </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>

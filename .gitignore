@@ -1,6 +1,6 @@
 .DS_Store
 /data
-/target
+target/
 .env
 node_modules/
 .next/
@@ -13,3 +13,9 @@ build/
 next-env.d.ts
 bun.lock
 lcov.info
+
+# Fetched by scripts/fetch-lua-plugin.sh, not source.
+/tests/fixtures/lua-plugin/
+# Fetched by scripts/fetch-quickjs-plugins.sh, not source.
+/tests/fixtures/javascript-plugin/
+/tests/fixtures/typescript-plugin/

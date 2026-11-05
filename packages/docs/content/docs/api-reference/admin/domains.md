@@ -4,6 +4,8 @@ title: "Domains"
 
 Manage the domains a HappyView instance serves. Each domain gets its own atproto OAuth client identity. The primary domain is set from `PUBLIC_URL` on first boot. All endpoints require the `settings:manage` permission.
 
+On an instance run by a managed-hosting platform (one with `PLATFORM_API_KEY_HASH` set, which `GET /config` reports as `platform_managed`), the platform decides which hostnames reach the instance and which one is its public URL. There, adding, deleting and making a domain primary accept only the platform's key, and answer `403` to everyone else, the super user included. Listing domains still accepts `settings:manage`.
+
 ```ts tab="TypeScript" tab-group="language"
 const TOKEN = "hv_..."; // your API key
 const headers = { Authorization: `Bearer ${TOKEN}` };

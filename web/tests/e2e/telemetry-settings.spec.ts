@@ -24,31 +24,51 @@ test.describe("telemetry settings", () => {
     await page.goto("/dashboard/settings/telemetry");
   });
 
-  test("defaults to off with the lexicon toggles disabled", async ({ page }) => {
-    await expect(page.getByRole("radio", { name: /don't send/i })).toBeChecked();
+  test("defaults to off with the lexicon toggles disabled", async ({
+    page,
+  }) => {
+    await expect(
+      page.getByRole("radio", { name: /don't send/i }),
+    ).toBeChecked();
     // Nothing may be shared while the mode is off.
-    await expect(page.getByRole("switch", { name: /lexicon names/i })).toBeDisabled();
+    await expect(
+      page.getByRole("switch", { name: /lexicon names/i }),
+    ).toBeDisabled();
   });
 
-  test("shows the exact payload before anything is enabled", async ({ page }) => {
+  test("shows the exact payload before anything is enabled", async ({
+    page,
+  }) => {
     // The operator must be able to read what would be sent *before* consenting.
-    await expect(page.getByTestId("telemetry-preview")).toContainText("schema_version");
+    await expect(page.getByTestId("telemetry-preview")).toContainText(
+      "schema_version",
+    );
     await expect(page.getByTestId("telemetry-preview")).toContainText("totals");
   });
 
-  test("the preview omits lexicon names until the toggle is on", async ({ page }) => {
-    await expect(page.getByTestId("telemetry-preview")).not.toContainText('"names"');
+  test("the preview omits lexicon names until the toggle is on", async ({
+    page,
+  }) => {
+    await expect(page.getByTestId("telemetry-preview")).not.toContainText(
+      '"names"',
+    );
 
     await page.getByRole("radio", { name: /review each/i }).click();
     await page.getByRole("switch", { name: /lexicon names/i }).click();
-    await expect(page.getByTestId("telemetry-preview")).toContainText('"names"');
+    await expect(page.getByTestId("telemetry-preview")).toContainText(
+      '"names"',
+    );
   });
 
   test("manual mode reveals the send button", async ({ page }) => {
-    await expect(page.getByRole("button", { name: /send and compare/i })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: /send and compare/i }),
+    ).toHaveCount(0);
 
     await page.getByRole("radio", { name: /review each/i }).click();
-    await expect(page.getByRole("button", { name: /send and compare/i })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /send and compare/i }),
+    ).toBeVisible();
   });
 
   test("the contact input is disabled while mode is off", async ({ page }) => {
@@ -78,7 +98,9 @@ test.describe("telemetry settings", () => {
     await expect(page.getByLabel(/contact/i)).toHaveValue("ops@example.com");
   });
 
-  test("a send with no reachable collector reports a failure, not a silent no-op", async ({ page }) => {
+  test("a send with no reachable collector reports a failure, not a silent no-op", async ({
+    page,
+  }) => {
     await page.getByRole("radio", { name: /review each/i }).click();
     await page.getByRole("button", { name: /send and compare/i }).click();
 

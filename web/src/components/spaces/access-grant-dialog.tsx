@@ -2,6 +2,11 @@
 
 import { useState } from "react";
 
+import {
+  formatGrantDuration,
+  grantDurations,
+  grantRequest,
+} from "@/lib/access-grant";
 import { createAccessGrant } from "@/lib/api";
 import { toastError } from "@/lib/format";
 import type { AccessGrant, GrantScope } from "@/types/spaces";
@@ -28,8 +33,6 @@ export interface ScopeOption {
   label: React.ReactNode;
 }
 
-const DURATIONS = [5, 15, 30, 60, 120, 240, 480];
-
 export function AccessGrantDialog({
   open,
   onOpenChange,
@@ -50,20 +53,15 @@ export function AccessGrantDialog({
   const [minutes, setMinutes] = useState(String(defaultMinutes));
   const [busy, setBusy] = useState(false);
 
-  const durations = Array.from(
-    new Set([...DURATIONS.filter((d) => d <= maxMinutes), maxMinutes]),
-  ).sort((a, b) => a - b);
+  const durations = grantDurations(maxMinutes);
 
   async function submit() {
     const option = scopeOptions[Number(choice)];
     setBusy(true);
     try {
-      const grant = await createAccessGrant({
-        scope: option.scope,
-        target: option.target,
-        reason: reason.trim(),
-        duration_minutes: Number(minutes),
-      });
+      const grant = await createAccessGrant(
+        grantRequest(option, reason, minutes),
+      );
       setReason("");
       onGranted(grant);
       onOpenChange(false);
@@ -95,7 +93,10 @@ export function AccessGrantDialog({
                 </SelectTrigger>
                 <SelectContent>
                   {scopeOptions.map((o, i) => (
-                    <SelectItem key={`${o.scope}:${o.target}`} value={String(i)}>
+                    <SelectItem
+                      key={`${o.scope}:${o.target}`}
+                      value={String(i)}
+                    >
                       {o.label}
                     </SelectItem>
                   ))}
@@ -122,7 +123,7 @@ export function AccessGrantDialog({
               <SelectContent>
                 {durations.map((d) => (
                   <SelectItem key={d} value={String(d)}>
-                    {d < 60 ? `${d} minutes` : `${d / 60} hour${d === 60 ? "" : "s"}`}
+                    {formatGrantDuration(d)}
                   </SelectItem>
                 ))}
               </SelectContent>

@@ -1,7 +1,16 @@
 import { test, expect } from "@playwright/test";
-import { loginAsTestAdmin, resetServiceIdentity } from "./auth-helper";
+import {
+  getOauthSessionTokenState,
+  loginAsTestAdmin,
+  resetServiceIdentity,
+  restoreServiceIdentity,
+  setServiceIdentityMode,
+  snapshotServiceIdentity,
+} from "./auth-helper";
 
 const PDS_URL = "http://localhost:3100";
+const SCHEMA = "com.atproto.lexicon.schema";
+const SCHEMA_SCOPE = `repo:${SCHEMA}?action=create&action=update&action=delete`;
 
 async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   const suffix = Date.now().toString(36);
@@ -26,7 +35,18 @@ async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   return { did: data.did, handle: data.handle ?? handle };
 }
 
+async function getSchemaRecord(did: string, nsid: string) {
+  const url = new URL(`${PDS_URL}/xrpc/com.atproto.repo.getRecord`);
+  url.searchParams.set("repo", did);
+  url.searchParams.set("collection", SCHEMA);
+  url.searchParams.set("rkey", nsid);
+  return fetch(url);
+}
+
 test.describe("Setup - Attach Account", () => {
+  // The publishing test reuses the session the OAuth test leaves behind.
+  test.describe.configure({ mode: "serial" });
+
   let account: { did: string; handle: string };
 
   test.beforeAll(async () => {
@@ -113,7 +133,14 @@ test.describe("Setup - Attach Account", () => {
     const authButton = page.getByRole("button", {
       name: /authenticate as/i,
     });
+    // The attached account also publishes the instance's lexicons, so it is
+    // asked for the schema scope as well as identity:*.
+    const login = page.waitForRequest(/\/auth\/login\?/);
     await authButton.click();
+    const requested = new URL((await login).url()).searchParams.get("scope");
+    expect(requested?.split(" ")).toEqual(
+      expect.arrayContaining(["atproto", "identity:*", SCHEMA_SCOPE]),
+    );
 
     // Wait for redirect to PDS OAuth login page (served via Caddy at pds.localhost)
     await page.waitForURL(/pds\.localhost/, { timeout: 30000 });
@@ -158,6 +185,97 @@ test.describe("Setup - Attach Account", () => {
     await expect(
       page.getByRole("tab", { name: "Verify", selected: true }),
     ).toBeVisible({ timeout: 15000 });
+
+    // What the PDS granted, which is what it read from its copy of the client
+    // metadata: a copy cached without the schema scope would leave it out.
+    const { scope } = await getOauthSessionTokenState(account.did);
+    expect(scope?.split(" ")).toContain(SCHEMA_SCOPE);
+  });
+
+  test("a lexicon publishes to the attached account and unpublishes from it", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const nsid = `test.e2e.attached${Date.now().toString(36)}.note`;
+    // The wizard is still on its Verify step, which keeps the dashboard
+    // behind the setup gate; completing it here skips the steps after it.
+    const identity = await snapshotServiceIdentity();
+    let ruleId: string | undefined;
+    try {
+      await setServiceIdentityMode("attach_account", {
+        did: account.did,
+        attachedAccountDid: account.did,
+      });
+      await loginAsTestAdmin(page);
+
+      const seeded = await page.request.post("/admin/lexicons", {
+        data: {
+          lexicon_json: {
+            lexicon: 1,
+            id: nsid,
+            defs: {
+              main: {
+                type: "record",
+                key: "tid",
+                record: { type: "object", properties: {} },
+              },
+            },
+          },
+          backfill: false,
+        },
+      });
+      expect(seeded.ok(), await seeded.text()).toBeTruthy();
+
+      const created = await page.request.post(
+        "/admin/lexicon-publishing/rules",
+        {
+          data: { pattern: nsid, target_kind: "instance", auto_publish: false },
+        },
+      );
+      expect(created.status(), await created.text()).toBe(201);
+      const rule = await created.json();
+      ruleId = rule.id;
+      expect(rule.target.available).toBe(true);
+      expect(rule.target.can_unpublish).toBe(true);
+      expect(rule.target.did).toBe(account.did);
+
+      await page.goto(`/dashboard/lexicons/${nsid}`);
+      const panel = page.locator(
+        'section[aria-labelledby="publishing-panel-title"]',
+      );
+      await expect(panel).toContainText("Not published");
+      await panel.getByRole("button", { name: "Publish", exact: true }).click();
+      await expect(panel).toContainText("Published, but not resolvable", {
+        timeout: 30000,
+      });
+
+      const record = await getSchemaRecord(account.did, nsid);
+      expect(record.status, await record.clone().text()).toBe(200);
+      const body = await record.json();
+      expect(body.uri).toBe(`at://${account.did}/${SCHEMA}/${nsid}`);
+      expect(body.value.$type).toBe(SCHEMA);
+      expect(body.value.id).toBe(nsid);
+
+      await panel
+        .getByRole("button", { name: "Unpublish", exact: true })
+        .click();
+      const dialog = page.getByRole("alertdialog");
+      await expect(dialog).toContainText(`Unpublish ${nsid}?`);
+      await dialog.getByRole("button", { name: "Unpublish" }).click();
+      await expect(panel).toContainText("Unpublished", { timeout: 30000 });
+
+      const gone = await getSchemaRecord(account.did, nsid);
+      expect(gone.status).toBeGreaterThanOrEqual(400);
+      expect(gone.status).toBeLessThan(500);
+    } finally {
+      // The afterAll's skip flow expects the wizard where the OAuth test
+      // left it, so the identity goes back first.
+      await restoreServiceIdentity(identity);
+      if (ruleId) {
+        await page.request.delete(`/admin/lexicon-publishing/rules/${ruleId}`);
+      }
+      await page.request.delete(`/admin/lexicons/${nsid}`);
+    }
   });
 
   // Restore setup state for subsequent tests

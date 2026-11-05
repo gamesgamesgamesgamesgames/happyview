@@ -133,7 +133,10 @@ export function AccountName({
   return (
     <span
       ref={ref}
-      className={cn("inline-flex min-w-0 items-center gap-2 align-middle", className)}
+      className={cn(
+        "inline-flex min-w-0 items-center gap-2 align-middle",
+        className,
+      )}
       title={identity?.display_name ?? undefined}
     >
       <Avatar className="size-6">
