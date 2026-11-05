@@ -1,11 +1,5 @@
 {
   "name": "happyview",
   "private": true,
-  "workspaces": ["packages/*"],
-  "overrides": {
-    "webpack": "5.97.1"
-  },
-  "resolutions": {
-    "webpack": "5.97.1"
-  }
+  "workspaces": ["packages/*"]
 }
