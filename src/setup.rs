@@ -219,8 +219,12 @@ async fn plc_register(
         .collect();
 
     let params = happyview_plc::PlcGenesisParams {
-        rotation_key_did_key: rotation_key_did,
-        signing_key_did_key: signing_key_did,
+        rotation_keys: vec![rotation_key_did],
+        verification_methods: std::collections::BTreeMap::from([(
+            "atproto".to_string(),
+            signing_key_did,
+        )]),
+        also_known_as: vec![],
         service_entries,
     };
 
