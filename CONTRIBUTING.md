@@ -2,6 +2,8 @@
 
 Thanks for helping out! This guide covers what a pull request needs to get merged.
 
+The docs aren't in this repo. v3 docs live in [happyproto/happyview-docs](https://github.com/happyproto/happyview-docs), and v2 docs in [happyproto/happyview-docs-legacy](https://github.com/happyproto/happyview-docs-legacy). A change to documented behaviour needs a companion PR there; link it from the Docs checkbox in the pull request's description.
+
 ## Open pull requests against `beta`
 
 Work lands on `beta` first, and `main` is updated from `beta` when a release is cut. `alpha` carries the next major line, so target it only when a change belongs to that line rather than to the current one.
@@ -78,7 +80,7 @@ These checks must pass before merging:
 
 The `coverage` job also runs on server changes. It reruns the Rust suites under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
 
-Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
+Jobs only run when the files they cover change, so a PR that touches none of a job's paths skips it.
 
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.
 - **`audit`** fails when a new RustSec advisory affects a dependency. That usually comes from the base branch rather than your change; a maintainer will handle it.
