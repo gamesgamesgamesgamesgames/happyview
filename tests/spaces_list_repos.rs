@@ -39,7 +39,8 @@ async fn enable_spaces(app: &TestApp) {
     );
 }
 
-/// A space anyone may list, so these tests are about the listing alone.
+/// A space `AUTHORITY` is a member of and may list, so these tests are about
+/// the listing alone.
 async fn create_space(app: &TestApp) -> (String, String) {
     let now = now_rfc3339();
     let id = Uuid::new_v4().to_string();
@@ -56,10 +57,7 @@ async fn create_space(app: &TestApp) -> (String, String) {
         read_policy: Policy::MemberList,
         write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        config: SpaceConfig {
-            membership_public: true,
-            ..Default::default()
-        },
+        config: SpaceConfig::default(),
         revision: None,
         created_at: now.clone(),
         updated_at: now,
@@ -67,6 +65,21 @@ async fn create_space(app: &TestApp) -> (String, String) {
     spaces_db::create_space(&app.state.db, app.state.db_backend, &space)
         .await
         .expect("create_space failed");
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: id.clone(),
+            did: AUTHORITY.to_string(),
+            access: MemberAccess::READ,
+            is_delegation: false,
+            granted_by: Some(AUTHORITY.to_string()),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("add_member failed");
     (id, format!("at://{AUTHORITY}/space/{SPACE_TYPE}/{skey}"))
 }
 
@@ -105,8 +118,10 @@ async fn write(app: &TestApp, space_id: &str, repo: &str) -> String {
 }
 
 async fn list(app: &TestApp, query: &str) -> Value {
+    let (name, value) = common::auth::admin_cookie_header(AUTHORITY, &app.state.cookie_key);
     let req = Request::builder()
         .uri(format!("/xrpc/com.atproto.space.listRepos?{query}"))
+        .header(name, value)
         .body(Body::empty())
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
@@ -136,7 +151,9 @@ async fn lists_each_writer_with_its_revisions_and_hash() {
     let repo = &body["repos"][0];
     assert_eq!(repo["did"], json!("did:plc:alice"));
     assert!(repo["repoRev"].is_string());
-    assert!(repo["hash"]["$bytes"].is_string());
+    assert!(repo["data"]["$bytes"].is_string());
+    // Syncers that predate proposal 0016 read `hash`.
+    assert_eq!(repo["hash"], repo["data"]);
     assert_eq!(repo["spaceRev"], json!(space_rev));
     // Syncers on the alpha lexicon read `rev`. Sent until v3.
     assert_eq!(repo["rev"], repo["repoRev"]);

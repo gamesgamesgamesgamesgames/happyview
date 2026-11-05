@@ -139,7 +139,16 @@ function ResponsiveDialog({
   if (isMobile) {
     return (
       <StoreContext.Provider value={store}>
-        <Drawer open={open} onOpenChange={onOpenChange} {...props} />
+        {/* vaul's input repositioning pins the drawer to the height it had
+            when the keyboard first opened and never releases it, so content
+            added afterwards overflows the footer off screen. The browser's
+            own scroll-into-view handles the keyboard instead. */}
+        <Drawer
+          open={open}
+          onOpenChange={onOpenChange}
+          repositionInputs={false}
+          {...props}
+        />
       </StoreContext.Provider>
     );
   }
@@ -232,6 +241,31 @@ function ResponsiveDialogHeader({
   return <DialogHeader data-variant="dialog" {...props} />;
 }
 
+/**
+ * The scrollable region between the header and footer. Content taller than
+ * the drawer or dialog scrolls here, so the footer actions stay reachable.
+ */
+function ResponsiveDialogBody({
+  className,
+  ...props
+}: React.ComponentProps<"div">) {
+  const isMobile = useStore((state) => state.isMobile);
+
+  return (
+    <div
+      data-slot="responsive-dialog-body"
+      data-variant={isMobile ? "drawer" : "dialog"}
+      className={cn(
+        // The negative margin and matching padding keep focus rings from
+        // being clipped at the scroll container's edges.
+        "-m-1 min-h-0 flex-1 overflow-y-auto p-1",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
 function ResponsiveDialogFooter({
   ...props
 }: React.ComponentProps<typeof DialogFooter>) {
@@ -270,6 +304,7 @@ function ResponsiveDialogDescription({
 
 export {
   ResponsiveDialog,
+  ResponsiveDialogBody,
   ResponsiveDialogClose,
   ResponsiveDialogContent,
   ResponsiveDialogDescription,

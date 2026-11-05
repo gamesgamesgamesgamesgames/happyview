@@ -20,6 +20,7 @@ pub mod routes;
 pub mod scope;
 pub mod service;
 pub mod simplespace;
+pub mod space_mac;
 pub mod types;
 pub mod writers;
 

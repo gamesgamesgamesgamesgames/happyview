@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::AppState;
 
 /// Register the `http` table with async HTTP request functions.
-pub fn register_http_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
+pub fn register_http_api(lua: &Lua, _state: Arc<AppState>) -> LuaResult<()> {
     let http_table = lua.create_table()?;
 
     let methods = [
@@ -18,13 +18,14 @@ pub fn register_http_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     ];
 
     for (name, method) in methods {
-        let state_clone = state.clone();
         let func =
             lua.create_async_function(move |lua, (url, opts): (String, Option<mlua::Table>)| {
-                let state = state_clone.clone();
                 let method = method.clone();
                 async move {
-                    let mut builder = state.http.request(method.clone(), &url);
+                    // The script names this URL itself, so it goes through the
+                    // client `ALLOW_PRIVATE_HOSTS` reaches; see `crate::outbound`.
+                    let mut builder =
+                        crate::http_retry::plugin_client().request(method.clone(), &url);
 
                     if let Some(ref opts) = opts {
                         if let Ok(headers_table) = opts.get::<mlua::Table>("headers") {
@@ -110,6 +111,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
@@ -139,10 +142,12 @@ mod tests {
             state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             session_store: crate::auth::oauth_store::DbSessionStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
@@ -170,12 +175,14 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
+            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(
+                std::sync::Arc::new(oauth),
+                None,
+            )),
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
+                None,
             ),
             linked_repos_client: std::sync::Arc::new(
                 crate::linked_repos::client::build(
@@ -190,9 +197,11 @@ mod tests {
                     crate::auth::oauth_store::DbStateStore::new(
                         test_db.clone(),
                         crate::db::DatabaseBackend::Sqlite,
+                        None,
                     ),
                     test_db.clone(),
                     crate::db::DatabaseBackend::Sqlite,
+                    None,
                     None,
                 )
                 .expect("Failed to create test linked-repo OAuth client"),

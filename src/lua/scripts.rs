@@ -35,13 +35,14 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 
 static JOB_TYPE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 
 use super::{atproto_api, context, db_api, http_api, record, sandbox, xrpc_api};
@@ -341,23 +342,25 @@ pub async fn run_record_event_script(
         }
         match run_record_event_once(state, &resolved, payload).await {
             Ok(outcome) => {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.executed".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(payload.uri.to_string()),
-                        detail: serde_json::json!({
-                            "host_kind": "record",
-                            "host_id": host_id,
-                            "trigger": resolved.id,
-                            "attempts": attempt + 1,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "script.executed".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(payload.uri.to_string()),
+                            detail: serde_json::json!({
+                                "host_kind": "record",
+                                "host_id": host_id,
+                                "trigger": resolved.id,
+                                "attempts": attempt + 1,
+                            }),
+                        },
+                        state.db_backend,
+                    )
+                    .await;
+                }
                 return outcome;
             }
             Err(e) => {
@@ -463,8 +466,16 @@ pub async fn run_record_event_once(
         )
         .map_err(|e| format!("set event global: {e}"))?;
 
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    context::set_env_context(
+        &lua,
+        &crate::lua::variables::load(
+            &state.db,
+            state.db_backend,
+            state.config.token_encryption_key.as_ref(),
+        )
+        .await,
+    )
+    .map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -473,8 +484,7 @@ pub async fn run_record_event_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+    let result: mlua::Value = sandbox::call_handle(&lua, &handle, ())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -556,23 +566,25 @@ pub async fn run_label_applied_script(
         }
         match run_label_lua_once(state, &resolved, &event).await {
             Ok(outcome) => {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.executed".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(event.uri.clone()),
-                        detail: serde_json::json!({
-                            "host_kind": "label",
-                            "host_id": host_id,
-                            "trigger": resolved.id,
-                            "attempts": attempt + 1,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "script.executed".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(event.uri.clone()),
+                            detail: serde_json::json!({
+                                "host_kind": "label",
+                                "host_id": host_id,
+                                "trigger": resolved.id,
+                                "attempts": attempt + 1,
+                            }),
+                        },
+                        state.db_backend,
+                    )
+                    .await;
+                }
                 return outcome;
             }
             Err(e) => {
@@ -669,8 +681,16 @@ async fn run_label_lua_once(
                 .map_err(|e| format!("event lua-conv: {e}"))?,
         )
         .map_err(|e| format!("set event: {e}"))?;
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    context::set_env_context(
+        &lua,
+        &crate::lua::variables::load(
+            &state.db,
+            state.db_backend,
+            state.config.token_encryption_key.as_ref(),
+        )
+        .await,
+    )
+    .map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -679,8 +699,7 @@ async fn run_label_lua_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+    let result: mlua::Value = sandbox::call_handle(&lua, &handle, ())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -821,20 +840,6 @@ pub(crate) fn register_log_event_api(
     Ok(())
 }
 
-/// Load `script_variables` as a flat key→value map for the `env` global.
-async fn load_env_vars(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
-}
-
 struct DeadLetterEntry<'a> {
     script: &'a ResolvedScript,
     host_kind: &'a str,
@@ -912,6 +917,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
@@ -940,8 +947,16 @@ mod tests {
                 scopes: Some(scopes.clone()),
             },
             keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(test_db.clone(), backend),
+            state_store: crate::auth::oauth_store::DbStateStore::new(
+                test_db.clone(),
+                backend,
+                None,
+            ),
+            session_store: crate::auth::oauth_store::DbSessionStore::new(
+                test_db.clone(),
+                backend,
+                None,
+            ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -968,10 +983,11 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
+            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth), None)),
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 backend,
+                None,
             ),
             linked_repos_client: Arc::new(
                 crate::linked_repos::client::build(
@@ -981,9 +997,10 @@ mod tests {
                     "http://127.0.0.1:0/auth/callback".into(),
                     true,
                     scopes,
-                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
+                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend, None),
                     test_db.clone(),
                     backend,
+                    None,
                     None,
                 )
                 .expect("test linked-repo OAuth client"),

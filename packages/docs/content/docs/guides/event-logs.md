@@ -20,24 +20,25 @@ Logged when lexicons are uploaded, updated, or deleted via the [admin API](../ap
 
 ### Record events
 
-| Event Type       | Severity | Subject       | Detail                      |
-| ---------------- | -------- | ------------- | --------------------------- |
-| `record.created` | info     | Record AT URI | `collection`, `did`, `rkey` |
-| `record.deleted` | info     | Record AT URI | `collection`, `did`, `rkey` |
+| Event Type       | Severity | Subject       | Detail                                |
+| ---------------- | -------- | ------------- | ------------------------------------- |
+| `record.created` | info     | Record AT URI | `collection`, `did`, `rkey`           |
+| `record.deleted` | info     | Record AT URI | `collection`, `did`, `rkey`           |
+| `record.skipped` | info     | Record AT URI | `collection`, `did`, `rkey`, `reason` |
 
-Logged when records are received from Jetstream and stored or removed from the local database. These are system-triggered events (`actor_did` is null). If a database error occurs during the operation, the same event type is logged with `error` severity and the error message is included in the detail.
+Logged when records are received from Jetstream and stored or removed from the local database, or skipped because a record script returned `nil`. These are system-triggered events (`actor_did` is null). They write one row per record, so successful operations are only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. If a database error occurs, the same event type is logged with `error` severity regardless of that setting, and the error message is included in the detail.
 
 ### Script events
 
-| Event Type        | Severity | Subject     | Detail                                                    |
-| ----------------- | -------- | ----------- | --------------------------------------------------------- |
-| `script.executed` | info     | Method NSID | `method`, `caller_did`, `duration_ms`                     |
-| `script.error`    | error    | Method NSID | `error`, `script_source`, `input`, `caller_did`, `method` |
+| Event Type        | Severity | Subject     | Detail                                                                     |
+| ----------------- | -------- | ----------- | -------------------------------------------------------------------------- |
+| `script.executed` | info     | Method NSID | `method`, `caller_did`, `duration_ms`, `response_size`, `input`, `response` |
+| `script.error`    | error    | Method NSID | `error`, `script_source`, `input`, `caller_did`, `method`                  |
 
-Logged when Lua scripts run for XRPC query or procedure endpoints. Script errors capture the full context needed to reproduce and debug the issue: the error message, the complete Lua script source, the input that triggered it, and the caller's DID.
+Logged when Lua scripts run for XRPC query or procedure endpoints. `script.executed` is written on every call and stores the full request and response, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. `script.error` is always logged. Script errors capture the full context needed to reproduce and debug the issue: the error message, the complete Lua script source, the input that triggered it, and the caller's DID.
 
 <Callout type="info">
-For query scripts (unauthenticated), `caller_did` and `input` are omitted from the detail since queries don't have an authenticated user or request body.
+For query scripts (unauthenticated), `caller_did` is omitted from the detail and `input` is replaced by `params`, since queries don't have an authenticated user or request body.
 </Callout>
 
 ### User events
@@ -60,6 +61,20 @@ The `user.bootstrapped` event is logged when the first user is auto-promoted to 
 
 Logged when a user attempts to access an endpoint they don't have permission for.
 
+### Space events
+
+| Event Type                | Severity | Subject                                                           | Detail                                                                  |
+| -------------------------- | -------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `space.access_granted`     | info     | Space AT URI for a space grant, account DID for an account grant     | `grant_id`, `scope`, `target`, `reason`, `expires_at`, `user_id`           |
+| `space.access_revoked`     | info     | Same as `space.access_granted`; the raw space id if the space was deleted | `grant_id`, `revoked_by`, `user_id`                                        |
+| `space.moderator_read`     | info     | Space AT URI, or the account DID for an account-records read         | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below)   |
+| `space_inspector.enabled`  | warn     | Setting key                                                           | —                                                                            |
+| `space_inspector.disabled` | warn     | Setting key                                                           | —                                                                            |
+
+Logged when a moderator requests, uses, or ends access to a space's contents through the [space inspector](../api-reference/admin/spaces.md#access-grants). `space.access_granted` and `space.access_revoked` record the request and the end of a grant; `space_inspector.enabled` and `space_inspector.disabled` record the inspector being turned on or off for the instance (see [Configuration](../getting-started/configuration.md)).
+
+`action` on `space.moderator_read` is `list_records`, `get_blob`, or `list_account_records`, and every such event carries the `grant_id` and `scope` of the grant that allowed it. A `list_records` event includes the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the blob `cid` and the `repo` that references it. A `list_account_records` event includes the `repo`, the `space_id` filter if given, the `collection` filter, and the `uris` returned. Listing spaces and viewing their metadata or members is not logged.
+
 ### API Key events
 
 | Event Type        | Severity | Subject | Detail                |
@@ -76,12 +91,12 @@ Logged when a user attempts to access an endpoint they don't have permission for
 
 ### Hook events
 
-| Event Type             | Severity | Subject    | Detail                |
-| ---------------------- | -------- | ---------- | --------------------- |
-| `script.executed`      | info     | Trigger ID | `trigger_id`          |
-| `script.dead_lettered` | error    | Trigger ID | `trigger_id`, `error` |
+| Event Type             | Severity | Subject                | Detail                                        |
+| ---------------------- | -------- | ---------------------- | --------------------------------------------- |
+| `script.executed`      | info     | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `attempts` |
+| `script.dead_lettered` | error    | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `error`    |
 
-Logged when [record/label scripts](./record-scripts) run. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
+Logged when [record/label scripts](./record-scripts) run. `script.executed` fires once per record or label that reaches a script, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
 
 ### Backfill events
 
@@ -92,6 +107,14 @@ Logged when [record/label scripts](./record-scripts) run. Dead-lettered events i
 | `backfill.failed`    | error    | Collection NSID | `job_id`, `error`       |
 
 See [Backfill](./backfill.md) for background on backfill jobs.
+
+### Audit log events
+
+| Event Type                     | Severity | Subject                                                         | Detail        |
+| --------------------------------- | -------- | ------------------------------------------------------------------ | --------------- |
+| `event_logs.retention_changed`    | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
+
+Logged when a retention setting's effective value changes, env fallback included. An unset or unparseable value counts as its default: 30 days for `event_log_retention_days`, and for `space_access_log_retention_days` 0 (keep forever) while `event_log_retention_days` is 0 and 365 otherwise. Saving a setting back to its current or default value logs nothing. Because protected retention can follow the general setting, one change can log an event for each key. `from` and `to` are the effective day counts. See [Protected events](#protected-events) below.
 
 ### Jetstream events
 
@@ -280,6 +303,24 @@ Event logs are automatically cleaned up based on the `EVENT_LOG_RETENTION_DAYS` 
 Set `EVENT_LOG_RETENTION_DAYS=0` to disable automatic cleanup and keep logs indefinitely.
 
 See [Configuration](../getting-started/configuration.md) for all environment variables.
+
+## Protected events
+
+Some event types record access to private space data, or changes to the audit trail itself, and can't be purged by hand:
+
+- `space.access_granted`
+- `space.access_revoked`
+- `space.moderator_read`
+- `space_inspector.enabled`
+- `space_inspector.disabled`
+- `event_logs.purged`
+- `event_logs.retention_changed`
+
+`POST /admin/events/purge` excludes them: a filter naming one of these types, or a category that contains one, returns `400 Bad Request`. `GET /admin/events/count`, the purge preview, never counts them either.
+
+They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever; when unset it follows an `event_log_retention_days` of `0`). The events tied to an access grant that still exists, meaning its grant and revocation events and the reads made under it, are kept whatever their age, so a grant's reason and reads last as long as the grant does. Other protected events keep their own schedule. The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
+
+Protected events live in the same database table as every other event log row. This is a safeguard against a routine or accidental purge, not a tamper-proof audit log — anyone with direct access to the database can still delete them.
 
 ## Dead Letters
 

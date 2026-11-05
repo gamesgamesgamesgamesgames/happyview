@@ -646,6 +646,22 @@ async fn split_policies_take_precedence_over_a_legacy_policy() {
     );
 }
 
+/// Make `did` a read member of `space`, as its authority.
+async fn add_reader(app: &TestApp, authority: &str, space: &str, did: &str) {
+    let resp = post(
+        app,
+        "com.atproto.simplespace.addMember",
+        authority,
+        json!({ "space": space, "did": did, "access": "read" }),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "addMember failed: {}",
+        resp.status()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // unregisterNotify / listBlobs
 // ---------------------------------------------------------------------------
@@ -660,6 +676,8 @@ async fn unregister_notify_removes_a_registration_and_is_idempotent() {
     let authority = rand_did("auth");
     let syncer = rand_did("syncer");
     let space = create_space(&app, &authority, &rand_skey("s")).await;
+    // Registering is a whole-space read, so the syncer has to be a reader.
+    add_reader(&app, &authority, &space, &syncer).await;
 
     let reg = post(
         &app,
@@ -758,6 +776,8 @@ async fn register_notify_accepts_a_service_identifier() {
     let authority = rand_did("auth");
     let syncer = rand_did("syncer");
     let space = create_space(&app, &authority, &rand_skey("s")).await;
+    // Registering is a whole-space read, so the syncer has to be a reader.
+    add_reader(&app, &authority, &space, &syncer).await;
     publish_service(
         &app,
         &syncer,
@@ -787,6 +807,8 @@ async fn register_notify_rejects_a_service_it_cannot_resolve() {
     let authority = rand_did("auth");
     let syncer = rand_did("syncer");
     let space = create_space(&app, &authority, &rand_skey("s")).await;
+    // Registering is a whole-space read, so the syncer has to be a reader.
+    add_reader(&app, &authority, &space, &syncer).await;
     publish_service(
         &app,
         &syncer,

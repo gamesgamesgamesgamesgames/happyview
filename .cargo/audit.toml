@@ -1,6 +1,6 @@
 # cargo-audit configuration.
 #
-# The single ignored advisory below has been triaged and has no upstream fix.
+# The ignored advisories below have been triaged and have no upstream fix.
 # Every other advisory must fail CI (see .github/workflows/ci.yml `audit` job) so
 # new ones are caught. Re-review this list when dependencies are updated.
 [advisories]
@@ -8,4 +8,8 @@ ignore = [
     # fxhash: unmaintained (warning, not a vulnerability). Transitive dependency
     # of wasmtime (via fxprof-processed-profile); not removable independently.
     "RUSTSEC-2025-0057",
+    # crypto-bigint: timing side channels, fixed only in 0.7.6+. Our own 0.7 copy
+    # is on a fixed release; the 0.5 copy comes from atrium-oauth 0.1 (via
+    # elliptic-curve 0.13) and leaves only with the move to atrium-oauth 0.2.
+    "RUSTSEC-2026-0387",
 ]

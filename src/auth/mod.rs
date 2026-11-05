@@ -1,3 +1,4 @@
+pub mod atrium_panic;
 pub mod client_registry;
 pub mod middleware;
 pub mod oauth_store;

@@ -483,6 +483,58 @@ async fn worker_runs_pending_job_to_completion() {
     assert_eq!(result["ok"], true);
 }
 
+#[tokio::test]
+#[serial]
+async fn two_workers_run_two_jobs_at_once() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    // Each job sleeps long enough that a single worker could never have both
+    // running at the same moment.
+    seed_script(
+        &app,
+        "job.run:test.slow",
+        "function handle() job.wait(3) return { ok = true } end",
+    )
+    .await;
+    let a = seed_job(&app, "test.slow", "pending").await;
+    let b = seed_job(&app, "test.slow", "pending").await;
+
+    let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 2);
+
+    let mut both_running = false;
+    for _ in 0..20 {
+        let (sa, _, _) = job_row(&app, &a).await;
+        let (sb, _, _) = job_row(&app, &b).await;
+        if sa == "running" && sb == "running" {
+            both_running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for w in &workers {
+        w.abort();
+    }
+
+    assert_eq!(workers.len(), 2);
+    assert!(
+        both_running,
+        "expected both jobs to be running concurrently"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn spawn_workers_with_zero_still_starts_one() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 0);
+    for w in &workers {
+        w.abort();
+    }
+    assert_eq!(workers.len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Auth: unauthenticated requests
 // ---------------------------------------------------------------------------

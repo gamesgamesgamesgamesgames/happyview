@@ -21,6 +21,13 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
+| `ALLOW_PRIVATE_DESTINATIONS` | no | `false` | `true` lets outbound requests connect to loopback, private, link-local and other non-public addresses. By default HappyView refuses them for every destination it did not get from its own configuration, such as a PDS named in a DID document, a handle, a script's or plugin's request, or a stored webhook. The hosts in `PLC_URL`, `RELAY_URL`, `JETSTREAM_URL`, `TELEMETRY_COLLECTOR_URL`, `PLUGIN_URLS` and the proxy variables are always allowed, each only on the port its URL names (or its scheme's default), so a configured `http://127.0.0.1:2582` allows that service and nothing else on the machine. Set it only when the PDSes or labelers you index really are on a private network; HappyView logs a warning at every boot while it is set. Read from the process environment only |
+| `ALLOW_PRIVATE_HOSTS` | no | _(none)_ | Comma-separated hosts that scripts (`http.*`) and plugins may reach at private addresses: a bare name (`db`) allows any port on it, and `host:port` or a URL allows only that port, for services running beside this instance. It applies only to the requests a script or plugin sends itself: every other request, such as one to a PDS, an OAuth server or a webhook, still refuses these hosts. Prefer this to `ALLOW_PRIVATE_DESTINATIONS`. Read from the process environment only |
+| `SPACE_INSPECTOR_ENABLED` | no | `false` | Lets users with `spaces:inspect` request time-limited access to read records and blobs in private [spaces](../experimental/spaces/index.md) from the dashboard. Maps to **Enable Space Inspector** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_INSPECTOR_MAX_GRANT_MINUTES` | no | `60` | The longest an access grant can last. Requests default to 60 minutes or this value, whichever is shorter; unparseable values fall back to `60`, anything below `5` is raised to `5`, and anything above `525600` (one year) is lowered to it. Maps to **Maximum Access Length (minutes)** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_ACCESS_LOG_RETENTION_DAYS` | no | `365` | Days to keep [protected events](../guides/event-logs.md#protected-events) — space access grants and revocations, the reads made under them, inspector on/off switches, event log purges, and retention changes — before cleanup. Access grants that ended (expired or were revoked) longer ago than this are deleted on the same schedule. Set to `0` to keep them forever. When unset, it follows an `EVENT_LOG_RETENTION_DAYS` of `0` and is `365` otherwise. The events tied to an access grant that still exists (its grant and revocation events and the reads made under it) are kept regardless. Maps to **Space Access Log Retention (days)** under **Settings > General**. Overridden by database setting if set via admin API |
+| `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
+| `PLATFORM_API_KEY_HASH` | no | — | Hex SHA-256 of a key that a managed-hosting provider uses to administer this instance. Leave unset when self-hosting. See [Platform API](../api-reference/admin/platform.md) |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
 | `DEFAULT_RATE_LIMIT_CAPACITY` | no | `100` | Default token bucket capacity used when registering a new API client |
 | `DEFAULT_RATE_LIMIT_REFILL_RATE` | no | `2.0` | Default token bucket refill rate (tokens/second) for new API clients |
@@ -64,6 +71,9 @@ SESSION_SECRET=change-me-in-production
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
+# SPACE_INSPECTOR_ENABLED=false
+# SPACE_INSPECTOR_MAX_GRANT_MINUTES=60
+# SPACE_ACCESS_LOG_RETENTION_DAYS=365
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0

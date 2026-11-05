@@ -7,6 +7,7 @@ use base64::Engine;
 use bytes::Bytes;
 use http_body_util::Full;
 use std::convert::Infallible;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -188,6 +189,7 @@ pub fn router(state: AppState) -> Router {
     };
 
     outer
+        .layer(CatchPanicLayer::custom(panic_response))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
         .layer(axum::middleware::from_fn_with_state(
@@ -195,6 +197,18 @@ pub fn router(state: AppState) -> Router {
             crate::telemetry_middleware::count_http_bytes,
         ))
         .with_state(state)
+}
+
+/// A handler that panics answers as an internal error does: a logged detail and
+/// a generic body. Left uncaught, the panic drops the connection with no
+/// response at all.
+fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    AppError::Internal(format!("handler panicked: {detail}")).into_response()
 }
 
 /// Allowed request methods, shared by both CORS policies.
@@ -345,6 +359,12 @@ async fn config_endpoint(
         backend,
     )
     .await;
+    let space_inspector_enabled = crate::feature_flags::is_enabled(
+        pool,
+        crate::feature_flags::FeatureFlag::SPACE_INSPECTOR,
+        backend,
+    )
+    .await;
 
     Json(serde_json::json!({
         "public_url": domain_url,
@@ -356,9 +376,13 @@ async fn config_endpoint(
         "default_rate_limit_capacity": state.config.default_rate_limit_capacity,
         "default_rate_limit_refill_rate": state.config.default_rate_limit_refill_rate,
         "app_name": app_name,
+        // Whether a managed-hosting platform administers this instance, so the
+        // dashboard can say so.
+        "platform_managed": state.config.platform_api_key_hash.is_some(),
         "logo_url": logo_url,
         "features": {
             "spaces": spaces_enabled,
+            "space_inspector": space_inspector_enabled,
         },
         // Startup configuration problems (e.g. an insecure SESSION_SECRET) so the
         // dashboard can surface them to an operator. Empty when healthy.
@@ -722,5 +746,40 @@ mod tests {
             .collect();
         assert!(kids.contains(&current.kid.as_str()));
         assert!(kids.contains(&retiring.kid.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_without_its_detail() {
+        async fn panics() -> &'static str {
+            panic!("internal detail");
+        }
+        let app = Router::new()
+            .route("/", get(panics))
+            .layer(CatchPanicLayer::custom(panic_response));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("internal detail"));
     }
 }

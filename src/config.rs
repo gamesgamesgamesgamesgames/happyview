@@ -84,6 +84,39 @@ pub fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>,
         .map_err(|_| format!("TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes (got {len})"))
 }
 
+/// Parse `PLATFORM_API_KEY_HASH`: the hex SHA-256 of the key a managed-hosting
+/// provisioner uses to administer this instance. Unset or blank means the
+/// platform principal is disabled. Set-but-invalid is an operator error and is
+/// returned as `Err` so it can be reported loudly at startup.
+pub fn parse_platform_api_key_hash(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = match raw.map(str::trim) {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.len() != 64 || !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "PLATFORM_API_KEY_HASH must be 64 hex characters (a SHA-256 digest), got {} characters",
+            lower.len()
+        ));
+    }
+    Ok(Some(lower))
+}
+
+/// Upper bound on `JOB_WORKER_CONCURRENCY`. The cap bounds concurrent job load
+/// on the database pool, so an unbounded value could starve the request path.
+const MAX_JOB_WORKERS: usize = 32;
+
+/// Parse `JOB_WORKER_CONCURRENCY`. Defaults to 1 (the historical behaviour);
+/// anything unparseable or below 1 falls back to 1; values above
+/// `MAX_JOB_WORKERS` clamp to it.
+pub fn parse_job_worker_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .map(|n| (n as usize).min(MAX_JOB_WORKERS))
+        .unwrap_or(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
@@ -108,6 +141,12 @@ pub struct Config {
     pub token_encryption_key: Option<[u8; 32]>,
     pub default_rate_limit_capacity: u32,
     pub default_rate_limit_refill_rate: f64,
+    /// Hex SHA-256 of the managed-hosting platform key. `None` disables the
+    /// platform principal entirely.
+    pub platform_api_key_hash: Option<String>,
+    /// Number of background job workers. 1 unless `JOB_WORKER_CONCURRENCY` says
+    /// otherwise.
+    pub job_worker_concurrency: usize,
 }
 
 impl Config {
@@ -182,6 +221,20 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2.0),
+            platform_api_key_hash: match parse_platform_api_key_hash(
+                env::var("PLATFORM_API_KEY_HASH").ok().as_deref(),
+            ) {
+                Ok(hash) => hash,
+                Err(reason) => {
+                    tracing::error!(
+                        "{reason}. The platform principal is DISABLED until it is fixed."
+                    );
+                    None
+                }
+            },
+            job_worker_concurrency: parse_job_worker_concurrency(
+                env::var("JOB_WORKER_CONCURRENCY").ok().as_deref(),
+            ),
         }
     }
 
@@ -254,6 +307,8 @@ mod tests {
             "TOS_URI",
             "POLICY_URI",
             "BASE_PATH",
+            "PLATFORM_API_KEY_HASH",
+            "JOB_WORKER_CONCURRENCY",
         ] {
             unsafe {
                 env::remove_var(key);
@@ -293,6 +348,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(
             config.listen_addr(),
@@ -623,6 +680,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -652,6 +711,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -681,6 +742,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -710,6 +773,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -769,10 +834,73 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
             "https://otherdomain.com"
         );
+    }
+
+    #[test]
+    fn platform_hash_unset_or_empty_is_none() {
+        assert_eq!(parse_platform_api_key_hash(None), Ok(None));
+        assert_eq!(parse_platform_api_key_hash(Some("")), Ok(None));
+        assert_eq!(parse_platform_api_key_hash(Some("   ")), Ok(None));
+    }
+
+    #[test]
+    fn platform_hash_is_normalised_to_lowercase_and_trimmed() {
+        let upper = format!("  {}  ", "AB".repeat(32));
+        assert_eq!(
+            parse_platform_api_key_hash(Some(&upper)),
+            Ok(Some("ab".repeat(32)))
+        );
+    }
+
+    #[test]
+    fn platform_hash_rejects_wrong_length_and_non_hex() {
+        assert!(parse_platform_api_key_hash(Some(&"a".repeat(63))).is_err());
+        assert!(parse_platform_api_key_hash(Some(&"a".repeat(65))).is_err());
+        assert!(parse_platform_api_key_hash(Some(&"g".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn job_worker_concurrency_defaults_and_clamps() {
+        assert_eq!(parse_job_worker_concurrency(None), 1);
+        assert_eq!(parse_job_worker_concurrency(Some("")), 1);
+        assert_eq!(parse_job_worker_concurrency(Some("garbage")), 1);
+        assert_eq!(parse_job_worker_concurrency(Some("0")), 1);
+        assert_eq!(parse_job_worker_concurrency(Some("-3")), 1);
+        assert_eq!(parse_job_worker_concurrency(Some("4")), 4);
+        assert_eq!(parse_job_worker_concurrency(Some(" 8 ")), 8);
+        assert_eq!(parse_job_worker_concurrency(Some("1000")), 32);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_platform_and_worker_settings() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("PLATFORM_API_KEY_HASH", "cd".repeat(32));
+            env::set_var("JOB_WORKER_CONCURRENCY", "3");
+        }
+        let config = Config::from_env();
+        assert_eq!(config.platform_api_key_hash, Some("cd".repeat(32)));
+        assert_eq!(config.job_worker_concurrency, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_platform_and_worker_defaults() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let config = Config::from_env();
+        assert_eq!(config.platform_api_key_hash, None);
+        assert_eq!(config.job_worker_concurrency, 1);
     }
 }

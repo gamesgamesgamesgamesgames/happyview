@@ -5,14 +5,14 @@ use crate::AppState;
 use crate::db::adapt_sql;
 use crate::error::AppError;
 
-use super::auth::UserAuth;
+use super::auth::AllowPlatform;
 use super::permissions::Permission;
 use super::types::{CollectionStat, StatsResponse};
 
 /// GET /admin/stats — system statistics.
 pub(super) async fn stats(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<StatsResponse>, AppError> {
     auth.require(Permission::StatsRead).await?;
     let total: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_records")

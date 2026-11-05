@@ -77,6 +77,8 @@ impl TestApp {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
 
         let sql = adapt_sql(
@@ -126,8 +128,13 @@ impl TestApp {
             state_store: happyview::auth::oauth_store::DbStateStore::new(
                 oauth_pool.clone(),
                 backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
             ),
-            session_store: happyview::auth::oauth_store::DbSessionStore::new(oauth_pool, backend),
+            session_store: happyview::auth::oauth_store::DbSessionStore::new(
+                oauth_pool,
+                backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
+            ),
             resolver: OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -167,10 +174,12 @@ impl TestApp {
             ),
             oauth: std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
                 std::sync::Arc::new(oauth),
+                Some(&db::TEST_ENCRYPTION_KEY),
             )),
             oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(
                 pool.clone(),
                 backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
             ),
             linked_repos_client: std::sync::Arc::new(
                 happyview::linked_repos::client::build(
@@ -180,10 +189,15 @@ impl TestApp {
                     "http://127.0.0.1:0/auth/callback".into(),
                     true,
                     oauth_scopes,
-                    happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    happyview::auth::oauth_store::DbStateStore::new(
+                        pool.clone(),
+                        backend,
+                        Some(&db::TEST_ENCRYPTION_KEY),
+                    ),
                     pool.clone(),
                     backend,
                     None,
+                    Some(&db::TEST_ENCRYPTION_KEY),
                 )
                 .expect("Failed to create test linked-repo OAuth client"),
             ),
@@ -259,8 +273,11 @@ impl TestApp {
         let http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         // One store, shared: `/auth/login` reads back the state key the client
         // just stored through `oauth_state_store`.
-        let state_store =
-            happyview::auth::oauth_store::DbStateStore::new(self.state.db.clone(), backend);
+        let state_store = happyview::auth::oauth_store::DbStateStore::new(
+            self.state.db.clone(),
+            backend,
+            Some(&db::TEST_ENCRYPTION_KEY),
+        );
         let scopes: Vec<Scope> = scopes
             .iter()
             .map(|s| match *s {
@@ -279,6 +296,7 @@ impl TestApp {
             session_store: happyview::auth::oauth_store::DbSessionStore::new(
                 self.state.db.clone(),
                 backend,
+                Some(&db::TEST_ENCRYPTION_KEY),
             ),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -299,6 +317,7 @@ impl TestApp {
         self.state.config.plc_url = plc_url.to_string();
         self.state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            Some(&db::TEST_ENCRYPTION_KEY),
         ));
         self.state.oauth_state_store = state_store;
         self.rebuild_router();

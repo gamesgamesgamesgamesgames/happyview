@@ -201,7 +201,7 @@ curl -X DELETE http://127.0.0.1:3000/admin/domains/550e8400-e29b-41d4-a716-44665
   -H "$AUTH"
 ```
 
-Returns `400 Bad Request` if the domain is primary — set a different domain as primary first. Returns `404 Not Found` if the domain doesn't exist.
+Returns `400 Bad Request` if the domain is the primary domain (make another domain primary first), or if it's the instance's only domain. Returns `404 Not Found` if the domain doesn't exist.
 
 **Response**: `204 No Content`
 

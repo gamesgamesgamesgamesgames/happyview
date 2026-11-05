@@ -2,6 +2,7 @@ use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
+use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
@@ -36,9 +37,16 @@ pub(crate) async fn require_space_admin(
     space: &Space,
     did: &str,
 ) -> Result<(), AppError> {
-    if space.creator_did == did {
+    if space.creator_did == did || is_super_admin(state, did).await? {
         return Ok(());
     }
+    Err(AppError::Forbidden(
+        "Only the space's creator can perform this action".into(),
+    ))
+}
+
+/// Whether `did` is a HappyView super admin.
+pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "SELECT is_super FROM happyview_users WHERE did = ?",
         state.db_backend,
@@ -48,12 +56,7 @@ pub(crate) async fn require_space_admin(
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space's creator can perform this action".into(),
-    ))
+    Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
@@ -142,6 +145,68 @@ pub(crate) async fn require_membership(
     Ok(access)
 }
 
+/// Fetch a space blob from its author's PDS, with the content type the PDS
+/// reported.
+pub(crate) async fn fetch_space_blob(
+    state: &AppState,
+    author_did: &str,
+    cid: &str,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        axum::body::Bytes,
+    ),
+    AppError,
+> {
+    let pds_endpoint =
+        crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
+            .await?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+        pds_endpoint,
+        urlencoding::encode(author_did),
+        urlencoding::encode(cid),
+    );
+
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("blob fetch failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AppError::BadGateway(format!(
+            "PDS returned {status} for blob cid={cid}"
+        )));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("failed to read blob body: {e}")))?;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+    );
+
+    Ok((status, headers, bytes))
+}
+
 pub(crate) struct AppliedOp {
     pub action: OplogAction,
     pub collection: String,
@@ -214,6 +279,30 @@ pub(crate) async fn service_signing_key(
         )
     })?;
     load_signing_key(&state.db, state.db_backend, encryption_key).await
+}
+
+/// Begin a write to one space, holding the space for the whole transaction.
+///
+/// Every write reads its author's repo state and folds into it, so writes to
+/// a space have to land one at a time. SQLite's `BEGIN IMMEDIATE` already
+/// does that. Postgres runs them in parallel, so the space row is locked
+/// first: taken any later, after an insert's foreign key has share-locked the
+/// same row, two writers each wait on the other's share lock and deadlock.
+pub(crate) async fn begin_space_write(
+    state: &AppState,
+    space_id: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if state.db_backend == DatabaseBackend::Postgres {
+        crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR UPDATE")
+            .bind(space_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock space: {e}")))?;
+    }
+    Ok(tx)
 }
 
 pub(crate) async fn commit_write(
@@ -360,11 +449,16 @@ async fn forward_write_if_native(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
+    // Read only. Creating the row here, outside the write transaction and
+    // its lock on the space, would deadlock on Postgres against a write
+    // already holding that lock. A missing row is created as polyfill by the
+    // write itself.
+    let host_mode = db::read_repo_state(&mut conn, state.db_backend, &space.id, author_did)
+        .await?
+        .map_or(HostMode::Polyfill, |repo_state| repo_state.host_mode);
     drop(conn);
 
-    if repo_state.host_mode.is_authoritative_here() {
+    if host_mode.is_authoritative_here() {
         return Ok(None);
     }
 
@@ -487,11 +581,7 @@ pub(crate) async fn create_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
     let committed = commit_write(
         &mut tx,
@@ -581,11 +671,7 @@ pub(crate) async fn put_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = match swap_cid.as_deref() {
         Some(swap) => Some(swap.to_string()),
@@ -675,11 +761,7 @@ pub(crate) async fn delete_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = if let Some(swap) = swap_cid {
         db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
@@ -1060,8 +1142,19 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-    db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
+    match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
+        db::InviteClaim::Joined => {}
+        db::InviteClaim::Unavailable => {
+            return Err(AppError::BadRequest(
+                "This invite has been revoked or has reached its maximum uses".into(),
+            ));
+        }
+        db::InviteClaim::AlreadyMember => {
+            return Err(AppError::Conflict(
+                "You are already a member of this space".into(),
+            ));
+        }
+    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))
@@ -1116,6 +1209,8 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
@@ -1141,8 +1236,12 @@ mod tests {
                 )]),
             },
             keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(pool.clone(), backend),
+            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
+            session_store: crate::auth::oauth_store::DbSessionStore::new(
+                pool.clone(),
+                backend,
+                None,
+            ),
             resolver: atrium_oauth::OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -1170,10 +1269,15 @@ mod tests {
                     proxy_cost: 1,
                 },
             ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(std::sync::Arc::new(
-                oauth,
-            ))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(
+                std::sync::Arc::new(oauth),
+                None,
+            )),
+            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
+                pool.clone(),
+                backend,
+                None,
+            ),
             linked_repos_client: std::sync::Arc::new(
                 crate::linked_repos::client::build(
                     "https://plc.directory",
@@ -1184,9 +1288,10 @@ mod tests {
                     vec![atrium_oauth::Scope::Known(
                         atrium_oauth::KnownScope::Atproto,
                     )],
-                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
                     pool.clone(),
                     backend,
+                    None,
                     None,
                 )
                 .expect("Failed to create test linked-repo OAuth client"),
@@ -1422,7 +1527,7 @@ mod tests {
             super::create_invite(&state, &authority, &space_uri, None, None, None)
                 .await
                 .expect("authority creates invite");
-        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.id)
+        let revoked = db::revoke_invite(&state.db, state.db_backend, &invite.space_id, &invite.id)
             .await
             .expect("revoke should succeed");
         assert!(revoked);

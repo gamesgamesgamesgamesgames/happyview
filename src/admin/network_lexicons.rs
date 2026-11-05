@@ -83,9 +83,10 @@ pub(super) async fn add(
     let sql = adapt_sql(
         r#"
         INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
-        VALUES (?, ?, 0, ?, 'network', ?, ?, ?)
+        VALUES (?, ?, ?, ?, 'network', ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
+            backfill = EXCLUDED.backfill,
             target_collection = EXCLUDED.target_collection,
             source = 'network',
             authority_did = EXCLUDED.authority_did,
@@ -99,6 +100,7 @@ pub(super) async fn add(
     let row: (i32,) = crate::db::query_as(&sql)
         .bind(nsid)
         .bind(&lexicon_json_str)
+        .bind(if body.backfill { 1_i32 } else { 0_i32 })
         .bind(&body.target_collection)
         .bind(&authority_did)
         .bind(&now)
@@ -127,12 +129,36 @@ pub(super) async fn add(
         notify_collections(&state).await;
     }
 
+    let backfill_job_id: Option<String> =
+        if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
+            match crate::admin::backfill::start_backfill(
+                &state,
+                Some(nsid.clone()),
+                Vec::new(),
+                &auth.did,
+            )
+            .await
+            {
+                Ok(job_id) => Some(job_id),
+                Err(e) => {
+                    tracing::warn!(
+                        lexicon = nsid.as_str(),
+                        "failed to start backfill for network lexicon: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "nsid": nsid,
             "authority_did": authority_did,
             "revision": revision,
+            "backfill_job_id": backfill_job_id,
         })),
     ))
 }

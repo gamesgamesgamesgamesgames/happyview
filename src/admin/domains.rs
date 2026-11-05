@@ -8,8 +8,7 @@ use crate::domain::Domain;
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 
-use super::auth::UserAuth;
-use super::permissions::Permission;
+use super::auth::AllowPlatform;
 use super::types::{CreateDomainBody, DomainResponse};
 
 fn domain_to_response(d: &Domain) -> DomainResponse {
@@ -25,9 +24,9 @@ fn domain_to_response(d: &Domain) -> DomainResponse {
 /// GET /admin/domains
 pub(super) async fn list(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<Vec<DomainResponse>>, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains ORDER BY created_at",
@@ -57,10 +56,10 @@ pub(super) async fn list(
 /// POST /admin/domains
 pub(super) async fn create(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Json(body): Json<CreateDomainBody>,
 ) -> Result<(StatusCode, Json<DomainResponse>), AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let url = body.url.trim_end_matches('/').to_string();
 
@@ -229,10 +228,10 @@ pub(super) async fn create(
 /// DELETE /admin/domains/{id}
 pub(super) async fn delete(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
@@ -246,6 +245,16 @@ pub(super) async fn delete(
 
     let (_, url, is_primary, _, _) =
         row.ok_or_else(|| AppError::NotFound("domain not found".into()))?;
+
+    let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_domains")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count domains: {e}")))?;
+    if count <= 1 {
+        return Err(AppError::BadRequest(
+            "cannot delete the last domain — add another domain first".into(),
+        ));
+    }
 
     if is_primary != 0 {
         return Err(AppError::BadRequest(
@@ -295,10 +304,10 @@ pub(super) async fn delete(
 /// POST /admin/domains/{id}/primary
 pub(super) async fn set_primary(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
@@ -314,13 +323,19 @@ pub(super) async fn set_primary(
 
     let now = now_rfc3339();
 
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
     let unset_sql = adapt_sql(
         "UPDATE happyview_domains SET is_primary = 0, updated_at = ? WHERE is_primary = 1",
         state.db_backend,
     );
     crate::db::query(&unset_sql)
         .bind(&now)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to unset primary: {e}")))?;
 
@@ -328,12 +343,22 @@ pub(super) async fn set_primary(
         "UPDATE happyview_domains SET is_primary = 1, updated_at = ? WHERE id = ?",
         state.db_backend,
     );
-    crate::db::query(&set_sql)
+    let set_result = crate::db::query(&set_sql)
         .bind(&now)
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to set primary: {e}")))?;
+
+    // The domain can be deleted between the lookup and here; dropping `tx`
+    // rolls back the unset so the old primary survives.
+    if set_result.rows_affected() != 1 {
+        return Err(AppError::NotFound("domain not found".into()));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit primary change: {e}")))?;
 
     // Update cache
     let host = url

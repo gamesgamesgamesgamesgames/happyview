@@ -253,17 +253,9 @@ async fn host_http_request_impl(
     let url = request.url.clone();
     let method = request.method.clone();
 
-    let ctx = match build_host_context(caller.data()) {
-        Some(c) => c,
-        None => {
-            tracing::error!("host_http_request: failed to build host context (db missing?)");
-            return 0;
-        }
-    };
-
     let result = {
         let usage = &mut caller.data_mut().usage;
-        super::http_request(&ctx, usage, request).await
+        super::http_request(usage, request).await
     };
 
     let response_bytes = match result {

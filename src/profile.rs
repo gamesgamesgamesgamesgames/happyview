@@ -105,6 +105,23 @@ pub async fn resolve_profile(
     })
 }
 
+/// The display name and avatar URL from a DID's profile record, for showing an
+/// account in the dashboard. Every failure is `(None, None)`: a missing profile
+/// is not an error for display.
+pub async fn resolve_display_profile(
+    http: &reqwest::Client,
+    plc_url: &str,
+    did: &str,
+) -> (Option<String>, Option<String>) {
+    let Ok(pds_endpoint) = resolve_pds_endpoint(http, plc_url, did).await else {
+        return (None, None);
+    };
+    match fetch_profile_from_pds(http, &pds_endpoint, did).await {
+        Ok((display_name, _, avatar_url, _)) => (display_name, avatar_url),
+        Err(_) => (None, None),
+    }
+}
+
 /// Resolve the PDS endpoint for a DID by fetching its DID document.
 pub async fn resolve_pds_endpoint(
     http: &reqwest::Client,

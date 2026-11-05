@@ -554,6 +554,16 @@ mod tests {
         row.0
     }
 
+    async fn executed_event_count(state: &AppState) -> i64 {
+        let row: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'script.executed'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count script.executed events");
+        row.0
+    }
+
     async fn install_script(state: &AppState, trigger: &str, body: &str) {
         crate::db::query(
             "INSERT INTO happyview_scripts (id, body, script_type) VALUES (?, ?, 'lua')",
@@ -742,6 +752,51 @@ mod tests {
             skipped_event_count(&state).await,
             1,
             "record.skipped must still be logged when verbose event logging is on"
+        );
+    }
+
+    /// `script.executed` fires once per record that reaches a script, so it has
+    /// the same volume as `record.created` and sits behind the same gate.
+    #[tokio::test]
+    async fn script_executed_is_not_logged_while_verbose_logging_is_off() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return true end",
+        )
+        .await;
+
+        let _ = handle_record_event(&state, &create_event()).await;
+
+        assert!(
+            record_exists(&state).await,
+            "a create script returning true must index the record"
+        );
+        assert_eq!(
+            executed_event_count(&state).await,
+            0,
+            "script.executed must not be logged while verbose event logging is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_executed_is_logged_when_verbose_logging_is_on() {
+        let state = tracked_state().await;
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return true end",
+        )
+        .await;
+
+        let _ = handle_record_event(&state, &create_event()).await;
+
+        assert_eq!(
+            executed_event_count(&state).await,
+            1,
+            "script.executed must still be logged when verbose event logging is on"
         );
     }
 }

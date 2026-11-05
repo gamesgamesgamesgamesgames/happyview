@@ -223,6 +223,64 @@ async fn get_or_create_repo_state_is_idempotent() {
     assert_eq!(first.id, second.id);
 }
 
+// An author's first writes can arrive together, each on its own connection
+// and outside any transaction, so every one of them can miss the row and try
+// to create it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_first_writes_create_one_repo_state() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    const WRITERS: usize = 6;
+    let author_did = "did:plc:race-author";
+
+    for round in 0..10 {
+        let space_id = new_id();
+        let space = make_space(
+            &space_id,
+            "did:plc:race-owner",
+            "com.example.race",
+            &format!("race-skey-{round}"),
+        );
+        spaces_db::create_space(&pool, backend, &space)
+            .await
+            .expect("create_space failed");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                let space_id = space_id.clone();
+                tokio::spawn(async move {
+                    let mut conn = pool.acquire().await.expect("acquire failed");
+                    barrier.wait().await;
+                    spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
+                        .await
+                })
+            })
+            .collect();
+
+        let mut ids = Vec::new();
+        for writer in writers {
+            let state = writer
+                .await
+                .expect("writer task panicked")
+                .unwrap_or_else(|e| panic!("round {round}: a first write failed: {e:?}"));
+            ids.push(state.id);
+        }
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            1,
+            "round {round}: writers saw different rows: {ids:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn update_repo_state_persists_fields() {

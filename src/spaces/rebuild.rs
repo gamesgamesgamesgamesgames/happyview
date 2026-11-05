@@ -133,8 +133,7 @@ pub async fn run_commit_format_rebuild(
         return Ok(None);
     }
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool, backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 

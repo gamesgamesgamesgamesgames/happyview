@@ -6,16 +6,28 @@ use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::auth::middleware::Claims;
+use crate::constant_time::ct_eq_str;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 
 use super::permissions::Permission;
 
+/// The `did` recorded in event logs for actions taken by the managed-hosting
+/// platform principal. It is not a DID and never resolves; it marks the actor.
+pub const PLATFORM_ACTOR: &str = "platform";
+
+/// What the platform principal may do, beyond its dedicated checks
+/// (`require_domain_access`, `is_platform`). Deliberately tiny.
+const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
+
 pub struct UserAuth {
     pub did: String,
     pub user_id: String,
     pub is_super: bool,
+    /// The request was authenticated with the managed-hosting platform key
+    /// (`PLATFORM_API_KEY_HASH`). Never true for a user or a user's API key.
+    pub is_platform: bool,
     pub permissions: HashSet<Permission>,
     pub db: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
@@ -24,6 +36,17 @@ pub struct UserAuth {
 impl UserAuth {
     pub fn has(&self, permission: Permission) -> bool {
         self.is_super || self.permissions.contains(&permission)
+    }
+
+    /// Domain management: the platform principal, or anyone holding
+    /// `settings:manage`. Kept separate from `require` so the platform principal
+    /// can manage domains without receiving `settings:manage`, which covers far
+    /// more than domains.
+    pub async fn require_domain_access(&self) -> Result<(), AppError> {
+        if self.is_platform {
+            return Ok(());
+        }
+        self.require(Permission::SettingsManage).await
     }
 
     pub async fn require(&self, permission: Permission) -> Result<(), AppError> {
@@ -99,13 +122,11 @@ impl UserAuth {
     }
 }
 
-impl FromRequestParts<AppState> for UserAuth {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+impl UserAuth {
+    /// Authenticate the request, platform principal included. Callers decide
+    /// whether the platform principal is acceptable; see `UserAuth`'s extractor
+    /// and `AllowPlatform`.
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -208,10 +229,47 @@ impl FromRequestParts<AppState> for UserAuth {
             did,
             user_id,
             is_super,
+            is_platform: false,
             permissions,
             db: state.db.clone(),
             db_backend: backend,
         })
+    }
+}
+
+/// Deny by default: every handler that takes `UserAuth` refuses the managed-
+/// hosting platform principal, so a new route can never be reachable with the
+/// platform key by accident. Routes it may call opt in with `AllowPlatform`.
+impl FromRequestParts<AppState> for UserAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = Self::authenticate(parts, state).await?;
+        if auth.is_platform {
+            return Err(AppError::Forbidden(
+                "the platform key cannot use this endpoint".into(),
+            ));
+        }
+        Ok(auth)
+    }
+}
+
+/// Explicit opt-in for routes the managed-hosting platform may call. Behaves
+/// like `UserAuth` but also accepts the platform principal; the handler must
+/// still check what that principal is allowed to do.
+pub struct AllowPlatform(pub UserAuth);
+
+impl FromRequestParts<AppState> for AllowPlatform {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        UserAuth::authenticate(parts, state).await.map(Self)
     }
 }
 
@@ -236,6 +294,20 @@ impl UserAuth {
         };
 
         let hash = hex::encode(Sha256::digest(token.as_bytes()));
+
+        if let Some(platform_hash) = state.config.platform_api_key_hash.as_deref()
+            && ct_eq_str(&hash, platform_hash)
+        {
+            return Ok(Some(UserAuth {
+                did: PLATFORM_ACTOR.to_string(),
+                user_id: String::new(),
+                is_super: false,
+                is_platform: true,
+                permissions: PLATFORM_PERMISSIONS.iter().copied().collect(),
+                db: state.db.clone(),
+                db_backend: state.db_backend,
+            }));
+        }
         let backend = state.db_backend;
 
         let select_sql = adapt_sql(
@@ -290,6 +362,7 @@ impl UserAuth {
             // consult the key's permissions, and super-only operations (user
             // management, transfer_super) stay unavailable via API keys.
             is_super: false,
+            is_platform: false,
             permissions,
             db: state.db.clone(),
             db_backend: backend,

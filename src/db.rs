@@ -60,6 +60,22 @@ where
     sqlx_query_scalar(AssertSqlSafe(sql.to_owned()))
 }
 
+/// Begin a transaction that writes. On SQLite it opens with `BEGIN IMMEDIATE`,
+/// taking the write lock up front: a deferred transaction reads its snapshot
+/// at its first `SELECT`, and a write another connection commits before its
+/// own first write then fails that write with `SQLITE_BUSY_SNAPSHOT` at once,
+/// whatever `busy_timeout` is. Taken up front, the lock is waited for as any
+/// other is. Postgres gets a plain `BEGIN`.
+pub async fn begin_write(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
+    match backend {
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => pool.begin().await,
+    }
+}
+
 /// Escape the `LIKE` wildcard metacharacters (`%`, `_`) and the escape character
 /// (`\`) in a value that will be embedded as a *literal* inside a `LIKE` pattern.
 /// Must be paired with an explicit `ESCAPE '\'` clause — SQLite has no default
@@ -541,6 +557,59 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    /// `begin_write` takes SQLite's write lock as it begins, where a deferred
+    /// `BEGIN` takes none until its first write.
+    #[tokio::test]
+    async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.
+        let pool = || {
+            PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        query("PRAGMA busy_timeout = 0").execute(&mut *conn).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+        };
+        let first = pool().await.expect("connect first");
+        query("PRAGMA journal_mode = WAL")
+            .execute(&first)
+            .await
+            .expect("enable WAL");
+        let second = pool().await.expect("connect second");
+
+        let held = begin_write(&first, DatabaseBackend::Sqlite)
+            .await
+            .expect("begin the first write transaction");
+        let deferred = second
+            .begin()
+            .await
+            .expect("a deferred BEGIN takes no lock");
+        deferred.rollback().await.expect("roll back");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect_err("the write lock is already held");
+
+        held.commit().await.expect("release the write lock");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect("the lock is free again")
+            .commit()
+            .await
+            .expect("commit");
+
+        drop(first);
+        drop(second);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     const CAST_ON_READ: &[&str] = &[
         "service_identity.setup_complete",
@@ -1069,5 +1138,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -----------------------------------------------------------------------
+    // pool idle count
+    // -----------------------------------------------------------------------
+
+    // sqlx-core 0.9.0 made a released connection acquirable before counting it
+    // idle, so a concurrent acquire could take it first and wrap `num_idle` to
+    // `usize::MAX`. The pool's maintenance task loops over `0..num_idle()`
+    // without yielding, which pinned a worker thread at 100% CPU. On 0.9.0
+    // this sees the wrapped count within a millisecond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_pool_idle_count_never_wraps() {
+        const MAX: usize = 3;
+        sqlx::any::install_default_drivers();
+        let pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(MAX as u32)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let tasks: Vec<_> = (0..24)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let mut most = 0;
+                    while most <= MAX && std::time::Instant::now() < deadline {
+                        match pool.try_acquire() {
+                            Some(conn) => drop(conn),
+                            None => tokio::task::yield_now().await,
+                        }
+                        most = most.max(pool.num_idle());
+                    }
+                    most
+                })
+            })
+            .collect();
+        for task in tasks {
+            let most = task.await.expect("task");
+            assert!(
+                most <= MAX,
+                "num_idle reached {most} with {MAX} connections"
+            );
+        }
     }
 }

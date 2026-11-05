@@ -46,15 +46,63 @@ pub fn shared_client() -> &'static reqwest::Client {
     SHARED_CLIENT.get_or_init(|| build_http_client(&crate::version::user_agent()))
 }
 
+/// The shared client's settings with redirects disabled, for callers that
+/// vet a host before sending and must not let a redirect carry the request
+/// past that check.
+pub fn build_no_redirect_client(user_agent: &str) -> reqwest::Client {
+    client_builder_with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT, user_agent)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// The shared client's settings, screened by the policy installed for the
+/// requests plugins and scripts name themselves
+/// (`crate::outbound::Source::Plugins`), which may exempt hosts nothing else
+/// is allowed to reach. Redirects are followed, as the shared client does.
+pub fn build_plugin_client(user_agent: &str) -> reqwest::Client {
+    crate::outbound::screened(
+        base_builder(CONNECT_TIMEOUT, READ_TIMEOUT, user_agent),
+        crate::outbound::Source::Plugins,
+        Some(10),
+    )
+    .build()
+    .expect("failed to build HTTP client")
+}
+
+/// The client plugins' and scripts' own requests go through, built once.
+pub fn plugin_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_plugin_client(&crate::version::user_agent()))
+}
+
 fn client_with_timeouts(connect: Duration, read: Duration, user_agent: &str) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(connect)
-        .read_timeout(read)
-        .user_agent(user_agent)
+    client_builder_with_timeouts(connect, read, user_agent)
         .build()
         // Only fails if the TLS backend can't initialise, in which case no
         // outbound request would work anyway.
         .expect("failed to build HTTP client")
+}
+
+fn client_builder_with_timeouts(
+    connect: Duration,
+    read: Duration,
+    user_agent: &str,
+) -> reqwest::ClientBuilder {
+    // Every outbound client screens the addresses it connects to; see
+    // `crate::outbound`. Ten redirects is reqwest's own default.
+    crate::outbound::screened(
+        base_builder(connect, read, user_agent),
+        crate::outbound::Source::Installed,
+        Some(10),
+    )
+}
+
+fn base_builder(connect: Duration, read: Duration, user_agent: &str) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .user_agent(user_agent)
 }
 
 /// Wraps our shared, UA-and-timeout-configured `reqwest::Client` so it can
@@ -80,12 +128,24 @@ impl Default for HappyViewHttpClient {
 impl HttpClient for HappyViewHttpClient {
     async fn send_http(
         &self,
-        request: atrium_xrpc::http::Request<Vec<u8>>,
+        mut request: atrium_xrpc::http::Request<Vec<u8>>,
     ) -> core::result::Result<
         atrium_xrpc::http::Response<Vec<u8>>,
         Box<dyn std::error::Error + Send + Sync + 'static>,
     > {
+        let _ = HEADER_EXCHANGE.try_with(|exchange| {
+            request
+                .headers_mut()
+                .insert(exchange.send.0.clone(), exchange.send.1.clone());
+        });
         let response = self.0.execute(request.try_into()?).await?;
+        let _ = HEADER_EXCHANGE.try_with(|exchange| {
+            // Every response overwrites the last, so the value kept is the
+            // final response's: the request's own, after any token refresh or
+            // nonce retry the session made on the way.
+            *exchange.received.lock().expect("not poisoned") =
+                response.headers().get(&exchange.receive).cloned();
+        });
         let mut builder = atrium_xrpc::http::Response::builder().status(response.status());
         for (k, v) in response.headers() {
             builder = builder.header(k, v);
@@ -94,6 +154,45 @@ impl HttpClient for HappyViewHttpClient {
             .body(response.bytes().await?.to_vec())
             .map_err(Into::into)
     }
+}
+
+use atrium_xrpc::http::{HeaderName, HeaderValue};
+
+struct HeaderExchange {
+    send: (HeaderName, HeaderValue),
+    receive: HeaderName,
+    received: std::sync::Mutex<Option<HeaderValue>>,
+}
+
+tokio::task_local! {
+    static HEADER_EXCHANGE: HeaderExchange;
+}
+
+/// Run `fut` with a header added to every request it makes through
+/// [`HappyViewHttpClient`], returning the named header from the last response.
+///
+/// This is how a request sent through an OAuth session can carry a protocol
+/// header and read one back: atrium's `send_xrpc` takes neither. The header is
+/// added beneath the DPoP layer, which signs only the method and URL, so the
+/// proof is unaffected.
+pub async fn with_header_exchange<F: std::future::Future>(
+    send: (HeaderName, HeaderValue),
+    receive: HeaderName,
+    fut: F,
+) -> (F::Output, Option<HeaderValue>) {
+    let exchange = HeaderExchange {
+        send,
+        receive,
+        received: std::sync::Mutex::new(None),
+    };
+    HEADER_EXCHANGE
+        .scope(exchange, async {
+            let output = fut.await;
+            let received = HEADER_EXCHANGE
+                .with(|exchange| exchange.received.lock().expect("not poisoned").take());
+            (output, received)
+        })
+        .await
 }
 
 /// Parse rate-limit sleep duration from response headers.
@@ -128,6 +227,77 @@ mod tests {
     #[test]
     fn build_http_client_succeeds() {
         let _ = build_http_client("HappyView/test");
+    }
+
+    #[tokio::test]
+    async fn a_header_exchange_sends_one_header_and_reads_another_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *sink.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nx-answer: yes\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let client = HappyViewHttpClient::default();
+        let request = atrium_xrpc::http::Request::get(format!("http://{addr}/"))
+            .body(Vec::new())
+            .unwrap();
+        let (response, answer) = with_header_exchange(
+            (
+                HeaderName::from_static("x-question"),
+                HeaderValue::from_static("why"),
+            ),
+            HeaderName::from_static("x-answer"),
+            client.send_http(request),
+        )
+        .await;
+
+        assert!(response.is_ok());
+        assert_eq!(answer, Some(HeaderValue::from_static("yes")));
+        assert!(
+            received
+                .lock()
+                .await
+                .to_lowercase()
+                .contains("x-question: why")
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_outside_an_exchange_are_left_alone() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *sink.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let request = atrium_xrpc::http::Request::get(format!("http://{addr}/"))
+            .body(Vec::new())
+            .unwrap();
+        HappyViewHttpClient::default()
+            .send_http(request)
+            .await
+            .unwrap();
+        assert!(!received.lock().await.to_lowercase().contains("x-question"));
     }
 
     #[tokio::test]

@@ -4,7 +4,6 @@ use std::time::Duration;
 use mlua::LuaSerdeExt;
 
 use crate::AppState;
-use crate::db::adapt_sql;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::{sandbox, scripts};
 use crate::repo;
@@ -14,7 +13,7 @@ use super::db;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Start the background job worker. Polls for pending jobs and
-/// executes them one at a time.
+/// executes them one at a time per worker; see `spawn_workers`.
 pub async fn run_worker(state: AppState) {
     tracing::info!("job worker started");
 
@@ -33,6 +32,16 @@ pub async fn run_worker(state: AppState) {
             }
         }
     }
+}
+
+/// Start `count` job workers (at least one). Each claims jobs independently;
+/// `db::claim_next_job` guarantees a job is claimed by exactly one worker.
+pub fn spawn_workers(state: AppState, count: usize) -> Vec<tokio::task::JoinHandle<()>> {
+    let count = count.max(1);
+    tracing::info!(count, "starting job workers");
+    (0..count)
+        .map(|_| tokio::spawn(run_worker(state.clone())))
+        .collect()
 }
 
 /// Resume jobs that were interrupted by a server restart.
@@ -174,7 +183,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
     };
 
-    lua.remove_hook();
+    sandbox::lift_execution_limit(&lua);
 
     let state_arc = Arc::new(state.clone());
 
@@ -263,7 +272,12 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         return;
     }
 
-    let env_vars = load_env_vars(&state.db, backend).await;
+    let env_vars = crate::lua::variables::load(
+        &state.db,
+        backend,
+        state.config.token_encryption_key.as_ref(),
+    )
+    .await;
     if let Err(e) = crate::lua::context::set_env_context(&lua, &env_vars) {
         let _ = db::set_error(state, &job.id, &format!("env context: {e}")).await;
         return;
@@ -410,17 +424,4 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
         backend,
     )
     .await;
-}
-
-async fn load_env_vars(
-    db: &sqlx::AnyPool,
-    backend: crate::db::DatabaseBackend,
-) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
 }

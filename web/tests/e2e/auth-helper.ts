@@ -6,6 +6,7 @@ const SESSION_SECRET = "e2e-test-secret-that-is-at-least-32-bytes";
 const COOKIE_NAME = "happyview_session";
 const TEST_DID = "did:plc:e2e-test-admin";
 const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
+const PDS_DB_URL = "postgres://happyview:happyview@localhost:5434/pds";
 
 /**
  * HKDF-Expand (RFC 5869 section 2.3) — used by the cookie crate's
@@ -96,6 +97,27 @@ export async function setServiceIdentityMode(
   }
 }
 
+/**
+ * Marks a test PDS account's email as verified. Tranquil only sends secret
+ * codes, such as the one `requestPlcOperationSignature` issues, to a verified
+ * address, and the e2e stack has no mail to confirm one with.
+ */
+export async function markPdsEmailVerified(did: string): Promise<void> {
+  const client = new pg.Client(PDS_DB_URL);
+  await client.connect();
+  try {
+    const { rowCount } = await client.query(
+      "UPDATE users SET email_verified = TRUE WHERE did = $1",
+      [did],
+    );
+    if (rowCount !== 1) {
+      throw new Error(`no PDS account with DID ${did}`);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 export async function getOauthSessionSigningKid(
   did: string,
 ): Promise<string | null> {
@@ -112,20 +134,48 @@ export async function getOauthSessionSigningKid(
   }
 }
 
-export async function getOauthSessionTokenState(
-  did: string,
-): Promise<{ accessToken: string; expiresAt: string | null }> {
+/** `TOKEN_ENCRYPTION_KEY` in docker-compose.e2e.yml. */
+const E2E_ENCRYPTION_KEY = Buffer.alloc(32);
+
+/**
+ * Opens a value stored by `plugin::encryption::seal`: base64 of a 12-byte
+ * nonce, the AES-256-GCM ciphertext and its 16-byte tag.
+ */
+function openSealed(stored: string): string {
+  const bytes = Buffer.from(stored, "base64");
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    E2E_ENCRYPTION_KEY,
+    bytes.subarray(0, 12),
+  );
+  decipher.setAuthTag(bytes.subarray(-16));
+  return Buffer.concat([
+    decipher.update(bytes.subarray(12, -16)),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+export async function getOauthSessionTokenState(did: string): Promise<{
+  accessToken: string;
+  expiresAt: string | null;
+}> {
   const client = new pg.Client(DB_URL);
   await client.connect();
   try {
-    const { rows } = await client.query<{ session_data: string }>(
-      "SELECT session_data FROM happyview_oauth_sessions WHERE did = $1",
+    const { rows } = await client.query<{
+      session_data: string;
+      encrypted: number;
+    }>(
+      "SELECT session_data, encrypted FROM happyview_oauth_sessions WHERE did = $1",
       [did],
     );
     if (rows.length === 0) {
       throw new Error(`no happyview_oauth_sessions row for ${did}`);
     }
-    const session = JSON.parse(rows[0].session_data);
+    if (rows[0].encrypted !== 1) {
+      throw new Error(`the session for ${did} is stored unencrypted`);
+    }
+    const session = JSON.parse(openSealed(rows[0].session_data));
     return {
       accessToken: session.token_set.access_token,
       expiresAt: session.token_set.expires_at ?? null,

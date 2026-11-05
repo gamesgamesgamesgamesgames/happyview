@@ -37,6 +37,8 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
+    // Before the first outbound request: every shared client reads it.
+    happyview::outbound::install_for(&config);
     let db_backend = config.database_backend;
 
     // Connect to database and run migrations.
@@ -107,6 +109,23 @@ async fn main() {
             "space commit format rebuild failed; will retry on next startup"
         ),
     }
+
+    if let Some(key) = config.token_encryption_key.as_ref() {
+        match happyview::auth::oauth_store::seal_stored_sessions(&db_pool, db_backend, key).await {
+            Ok(0) => {}
+            Ok(count) => info!(count, "encrypted stored OAuth sessions"),
+            Err(e) => {
+                tracing::error!(error = %e, "OAuth session encryption failed; will retry on next startup")
+            }
+        }
+    }
+
+    happyview::lua::variables::encrypt_at_boot(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    )
+    .await;
 
     match happyview::maintenance::vacuum::run_if_requested(
         &db_pool,
@@ -281,6 +300,7 @@ async fn main() {
         &db_pool,
         db_backend,
         &config.public_url,
+        config.token_encryption_key.as_ref(),
     )
     .await
     {
@@ -384,29 +404,13 @@ async fn main() {
                     client_uri: client_uri.clone(),
                 },
             );
-            if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    happyview::rate_limit::RateLimitConfig {
-                        capacity: *cap as u32,
-                        refill_rate: *refill,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            } else {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    happyview::rate_limit::RateLimitConfig {
-                        capacity: config.default_rate_limit_capacity,
-                        refill_rate: config.default_rate_limit_refill_rate,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            }
+            rate_limiter.register_client_limit(
+                client_key.clone(),
+                *capacity,
+                *refill_rate,
+                config.default_rate_limit_capacity,
+                config.default_rate_limit_refill_rate,
+            );
         }
     }
 
@@ -533,7 +537,11 @@ async fn main() {
         protected_resource_metadata: Default::default(),
     };
 
-    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
+    let oauth_state_store = DbStateStore::new(
+        db_pool.clone(),
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    );
 
     let oauth_scopes = vec![
         Scope::Known(KnownScope::Atproto),
@@ -568,7 +576,11 @@ async fn main() {
             },
             keys: None,
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            ),
             resolver: resolver_config,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -587,8 +599,12 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
-                .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            )
+            .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -622,6 +638,7 @@ async fn main() {
             db_pool.clone(),
             db_backend,
             Some(client_jwks.clone()),
+            config.token_encryption_key.as_ref(),
         )
         .expect("Failed to create linked-repo OAuth client"),
     );
@@ -648,6 +665,7 @@ async fn main() {
     let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new_with_kid(
         Arc::clone(&oauth_client_arc),
         instance_signing_kid.clone(),
+        config.token_encryption_key.as_ref(),
     ));
     oauth_registry
         .load_from_db(
@@ -718,8 +736,12 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
-                .with_signing_kid(Some(instance_key.kid.clone())),
+            session_store: DbSessionStore::new(
+                db_pool.clone(),
+                db_backend,
+                config.token_encryption_key.as_ref(),
+            )
+            .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
@@ -768,6 +790,7 @@ async fn main() {
             db_pool.clone(),
             db_backend,
             key,
+            config.token_encryption_key.as_ref(),
         ) {
             Ok(client) => {
                 oauth_registry.register_for_kid(
@@ -803,6 +826,7 @@ async fn main() {
                 db_pool.clone(),
                 db_backend,
                 key,
+                config.token_encryption_key.as_ref(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
@@ -836,6 +860,7 @@ async fn main() {
                 db_pool.clone(),
                 db_backend,
                 Some(vec![jwk]),
+                config.token_encryption_key.as_ref(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));
@@ -960,12 +985,7 @@ async fn main() {
 
     // Resume interrupted jobs and start the job worker
     happyview::jobs::worker::resume_interrupted_jobs(&state).await;
-    {
-        let job_state = state.clone();
-        tokio::spawn(async move {
-            happyview::jobs::worker::run_worker(job_state).await;
-        });
-    }
+    happyview::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
 
     {
         let state = state.clone();

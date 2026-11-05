@@ -14,7 +14,7 @@ use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
-use crate::spaces::{db, members, notifications, oplog};
+use crate::spaces::{db, notifications, oplog};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -78,11 +78,14 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced, with its new `repoRev` and `hash`.
+    /// The repo that advanced, with its new `repoRev` and `data`.
     repo: Option<String>,
     repo_rev: Option<String>,
     /// The alpha lexicon's name for `repoRev`. Accepted until v3.
     rev: Option<String>,
+    data: Option<LexBytes>,
+    /// The name for `data` before proposal 0016. Accepted until every repo
+    /// host sends `data`.
     hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
     /// Accepted until v3.
@@ -104,7 +107,7 @@ impl LexBytes {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(self.bytes.trim_end_matches('='))
-            .map_err(|_| AppError::BadRequest("hash is not valid base64".into()))
+            .map_err(|_| AppError::BadRequest("data is not valid base64".into()))
     }
 }
 
@@ -170,6 +173,7 @@ struct DeleteRecordInput {
 #[serde(rename_all = "camelCase")]
 struct GetRecordQuery {
     space: String,
+    repo: Option<String>,
     collection: String,
     rkey: String,
 }
@@ -508,14 +512,24 @@ pub(crate) async fn get_space(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = service::resolve_space(&state, &query.space).await?;
 
-    // If the space's membership is not public, require auth + membership
-    if !space.config.membership_public {
-        let claims = require_auth(&xrpc_claims)?;
-        let did = claims.did();
-        if space.creator_did != did {
-            members::is_member(&state.db, state.db_backend, &space.id, did)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Space not found".into()))?;
+    // Only a space admin or a holder of a space credential may read the space.
+    let is_admin = match &xrpc_claims.identity {
+        Some(identity) => {
+            match service::require_space_admin(&state, &space, identity.did()).await {
+                Ok(()) => true,
+                Err(AppError::Forbidden(_)) => false,
+                Err(e) => return Err(e),
+            }
+        }
+        None => false,
+    };
+    if !is_admin {
+        if let Some(token) = &xrpc_claims.space_credential {
+            require_audience(&xrpc_claims, &space.authority_did)?;
+            service::verify_space_credential(&state, &space, token).await?;
+        } else {
+            require_auth(&xrpc_claims)?;
+            return Err(AppError::NotFound("Space not found".into()));
         }
     }
 
@@ -542,7 +556,15 @@ async fn list_spaces(
     Query(query): Query<ListSpacesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let did = query.did.unwrap_or_else(|| claims.did().to_string());
+    let caller = claims.did();
+    let did = query.did.unwrap_or_else(|| caller.to_string());
+    // Another account's memberships are its own business; only a super admin
+    // may ask for them, as with `getSpace`.
+    if did != caller && !service::is_super_admin(&state, caller).await? {
+        return Err(AppError::Forbidden(
+            "listSpaces lists only the caller's own spaces".into(),
+        ));
+    }
     let limit = query.limit.unwrap_or(50).min(100);
 
     let (views, cursor) = db::list_spaces_for_user(
@@ -754,11 +776,7 @@ async fn apply_writes(
     // transaction is open deadlocks on SQLite.
     let signing_key = service::service_signing_key(&state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = service::begin_space_write(&state, &space.id).await?;
 
     for op in input.writes {
         match op {
@@ -937,10 +955,19 @@ async fn get_record(
     )
     .await?;
 
+    // A credential is addressed to the repo it reads, and a read_self member
+    // can read only their own, so either names the repo when the query does not.
+    let repo = match (query.repo.as_deref(), xrpc_claims.space_audience.as_deref()) {
+        (Some(repo), _) => db::RecordRepo::Author(repo),
+        (None, Some(audience)) if has_credential => db::RecordRepo::Author(audience),
+        (None, _) if membership.restricted_to_own_records() => db::RecordRepo::Author(&did),
+        (None, _) => db::RecordRepo::Prefer(&did),
+    };
     let record = db::get_space_record_by_parts(
         &state.db,
         state.db_backend,
         &space.id,
+        repo,
         &query.collection,
         &query.rkey,
     )
@@ -997,6 +1024,16 @@ async fn list_records(
             Some(did.as_str())
         })
     };
+    authorize_space_read(
+        &state,
+        &xrpc_claims,
+        &did,
+        repo.unwrap_or(&space.authority_did),
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     let limit = query.limit.unwrap_or(50).min(100);
     let reverse = query.reverse.unwrap_or(false);
@@ -1092,7 +1129,8 @@ async fn revoke_invite(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, claims.did()).await?;
 
-    let revoked = db::revoke_invite(&state.db, state.db_backend, &input.invite_id).await?;
+    let revoked =
+        db::revoke_invite(&state.db, state.db_backend, &space.id, &input.invite_id).await?;
     if !revoked {
         return Err(AppError::NotFound("Invite not found".into()));
     }
@@ -1202,31 +1240,48 @@ async fn get_delegation_token(
 // Protocol endpoint implementations
 // ---------------------------------------------------------------------------
 
-fn repo_state_commit_json(repo_state: &RepoState) -> Result<Option<serde_json::Value>, AppError> {
+/// The commit to serve for a repo, in whichever model its state holds.
+///
+/// A repo synced from a 0016 host holds only its hash: the MAC that
+/// authenticated it was for that one request. Until HappyView can MAC a commit
+/// itself (HAP-192), it serves such a commit in the 0016 shape with no MAC,
+/// which 0016 permits under OAuth. `space` is echoed as the caller named it,
+/// as the reference does.
+fn repo_state_commit_json(
+    repo_state: &RepoState,
+    space: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
     let Some(h) = repo_state.hash.as_deref() else {
         return Ok(None);
     };
-    let ikm = repo_state.ikm.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but ikm missing".into())
-    })?;
-    let mac = repo_state.mac.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but mac missing".into())
-    })?;
-    let sig = repo_state.sig.as_deref().ok_or_else(|| {
-        AppError::Internal("corrupt repo state: hash present but sig missing".into())
-    })?;
     // The lexicon types these as `bytes`, which atproto renders as
     // `{"$bytes": "<standard base64>"}`. Other implementations cannot parse a
     // commit that carries bare base64url strings instead.
     use crate::spaces::commit::encode_lex_bytes;
-    Ok(Some(serde_json::json!({
-        "ver": 1,
-        "hash": encode_lex_bytes(h),
-        "ikm": encode_lex_bytes(ikm),
-        "sig": encode_lex_bytes(sig),
-        "mac": encode_lex_bytes(mac),
-        "rev": repo_state.rev,
-    })))
+    match (
+        repo_state.ikm.as_deref(),
+        repo_state.sig.as_deref(),
+        repo_state.mac.as_deref(),
+    ) {
+        (Some(ikm), Some(sig), Some(mac)) => Ok(Some(serde_json::json!({
+            "ver": 1,
+            "hash": encode_lex_bytes(h),
+            "ikm": encode_lex_bytes(ikm),
+            "sig": encode_lex_bytes(sig),
+            "mac": encode_lex_bytes(mac),
+            "rev": repo_state.rev,
+        }))),
+        (None, None, None) => Ok(Some(serde_json::json!({
+            "ver": 1,
+            "repo": repo_state.author_did,
+            "space": space,
+            "rev": repo_state.rev,
+            "data": encode_lex_bytes(h),
+        }))),
+        _ => Err(AppError::Internal(
+            "corrupt repo state: a signed commit is missing its ikm, sig or mac".into(),
+        )),
+    }
 }
 
 async fn get_latest_commit(
@@ -1265,7 +1320,7 @@ async fn get_latest_commit(
     let repo_state =
         db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
 
-    let commit = repo_state_commit_json(&repo_state)?;
+    let commit = repo_state_commit_json(&repo_state, &params.space)?;
 
     Ok(Json(serde_json::json!({
         "rev": repo_state.rev,
@@ -1319,34 +1374,41 @@ async fn get_repo(
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
-    let ikm: [u8; 32] = repo_state
-        .ikm
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing ikm".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("corrupt repo state: ikm is not 32 bytes".into()))?;
-    let mac: [u8; 32] = repo_state
-        .mac
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing mac".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("corrupt repo state: mac is not 32 bytes".into()))?;
     let rev = repo_state
         .rev
         .ok_or_else(|| AppError::Internal("corrupt repo state: missing rev".into()))?;
-    let sig = repo_state
-        .sig
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?;
-    let commit = crate::spaces::commit::SignedCommit {
-        ver: 1,
-        hash,
-        ikm,
-        sig,
-        mac,
-        rev,
-    };
 
-    let car_bytes = crate::spaces::car::serialize_repo(&commit, &records)?;
+    use crate::spaces::car::{CarCommit, serialize_repo};
+    let to_32 = |field: &str, value: Option<&[u8]>| -> Result<[u8; 32], AppError> {
+        value
+            .ok_or_else(|| AppError::Internal(format!("corrupt repo state: missing {field}")))?
+            .try_into()
+            .map_err(|_| AppError::Internal(format!("corrupt repo state: {field} is not 32 bytes")))
+    };
+    // See `repo_state_commit_json` for why a repo may hold only its hash.
+    let car_bytes =
+        if repo_state.ikm.is_none() && repo_state.sig.is_none() && repo_state.mac.is_none() {
+            let commit = crate::spaces::space_mac::Commit {
+                ver: 1,
+                repo: params.did.clone(),
+                space: params.space.clone(),
+                rev,
+                data: hash,
+            };
+            serialize_repo(CarCommit::Mac(&commit), &records)?
+        } else {
+            let commit = crate::spaces::commit::SignedCommit {
+                ver: 1,
+                hash,
+                ikm: to_32("ikm", repo_state.ikm.as_deref())?,
+                mac: to_32("mac", repo_state.mac.as_deref())?,
+                sig: repo_state
+                    .sig
+                    .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?,
+                rev,
+            };
+            serialize_repo(CarCommit::Signed(&commit), &records)?
+        };
 
     Ok((
         StatusCode::OK,
@@ -1416,7 +1478,7 @@ async fn list_repo_ops(
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
     let repo_state =
         db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-    let commit = repo_state_commit_json(&repo_state)?;
+    let commit = repo_state_commit_json(&repo_state, &params.space)?;
 
     Ok(Json(serde_json::json!({
         "ops": ops,
@@ -1433,17 +1495,27 @@ async fn list_repos(
     let space = service::resolve_space(&state, &params.space).await?;
     require_audience(&claims, &space.authority_did)?;
 
-    if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &claims).await?;
-        service::require_membership(
-            &state,
-            &space,
-            &did,
-            false,
-            claims.space_credential.as_deref(),
-        )
-        .await?;
-    }
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+    // Every writer's DID is a whole-space read, which read_self does not grant.
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let writers = crate::spaces::writers::list(
@@ -1467,6 +1539,9 @@ async fn list_repos(
                 "repoRev": w.rev,
                 // The alpha lexicon's name for `repoRev`. Sent until v3.
                 "rev": w.rev,
+                "data": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+                // The name for `data` before proposal 0016. Sent until every
+                // syncer reads `data`.
                 "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
                 "spaceRev": w.space_rev,
             })
@@ -1512,53 +1587,7 @@ async fn get_space_blob(
     )
     .await?;
 
-    let pds_endpoint =
-        crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &author_did)
-            .await?;
-
-    let url = format!(
-        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-        pds_endpoint,
-        urlencoding::encode(&author_did),
-        urlencoding::encode(&params.cid),
-    );
-
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AppError::BadGateway(format!("blob fetch failed: {e}")))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(AppError::BadGateway(format!(
-            "PDS returned {status} for blob cid={}",
-            params.cid
-        )));
-    }
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadGateway(format!("failed to read blob body: {e}")))?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        content_type
-            .parse()
-            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
-    );
-
-    Ok((status, headers, bytes))
+    service::fetch_space_blob(&state, &author_did, &params.cid).await
 }
 
 async fn register_notify(
@@ -1569,6 +1598,28 @@ async fn register_notify(
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
     require_audience(&claims, &space.authority_did)?;
+
+    // A registration is told every writer's DID and revision, so it needs the
+    // whole-space read that listing across repos does.
+    let has_credential = claims.space_credential.is_some();
+    let membership = service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+    authorize_space_read(
+        &state,
+        &claims,
+        &did,
+        &space.authority_did,
+        &space,
+        membership,
+        has_credential,
+    )
+    .await?;
 
     if let Some(service) = &input.service {
         let endpoint = crate::spaces::auth::resolve_service_identifier(
@@ -1771,13 +1822,12 @@ async fn notify_write(
         ),
     }
 
-    if let (Some(rev), Some(hash)) = (input.repo_rev.as_ref().or(input.rev.as_ref()), &input.hash) {
+    if let (Some(rev), Some(hash)) = (
+        input.repo_rev.as_ref().or(input.rev.as_ref()),
+        input.data.as_ref().or(input.hash.as_ref()),
+    ) {
         let hash = hash.decode()?;
-        let mut conn = state
-            .db
-            .begin()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+        let mut conn = service::begin_space_write(&state, &space.id).await?;
         let recorded = crate::spaces::writers::record(
             &mut conn,
             state.db_backend,

@@ -27,6 +27,7 @@ import {
   IconLink,
   IconShieldLock,
   IconChartBar,
+  IconLock,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -58,11 +59,20 @@ type NavItem = {
   url: string;
   icon: React.ComponentType;
   requiredPermissions?: string[];
+  /** Hidden unless this `/config` feature is on. */
+  requiredFeature?: "spaces" | "space_inspector";
 };
 
 const dataItems: NavItem[] = [
   { title: "Lexicons", url: "/dashboard/lexicons", icon: IconFileDescription },
   { title: "Records", url: "/dashboard/records", icon: IconTable },
+  {
+    title: "Spaces",
+    url: "/dashboard/spaces",
+    icon: IconLock,
+    requiredPermissions: ["spaces:read"],
+    requiredFeature: "space_inspector",
+  },
   { title: "Backfill", url: "/dashboard/backfill", icon: IconDatabase },
   {
     title: "Jobs",
@@ -186,7 +196,7 @@ const systemItems: NavItem[] = [
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const pathname = usePathname();
   const { logout } = useAuth();
-  const { app_name, logo_url } = useConfig();
+  const { app_name, logo_url, features, platform_managed } = useConfig();
   const { hasPermission } = useCurrentUser();
   const { hasUpdates } = usePluginUpdates();
   const { addReason, removeReason } = useRestart();
@@ -237,8 +247,9 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   function filterByPermission(items: NavItem[]) {
     return items.filter(
       (item) =>
-        !item.requiredPermissions ||
-        item.requiredPermissions.some((perm) => hasPermission(perm)),
+        (!item.requiredFeature || features[item.requiredFeature]) &&
+        (!item.requiredPermissions ||
+          item.requiredPermissions.some((perm) => hasPermission(perm))),
     );
   }
 
@@ -424,6 +435,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       </Scroller>
       <SidebarSeparator className="!mx-0" />
       <SidebarFooter>
+        {platform_managed && (
+          <p className="px-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+            Managed by HappyProto
+          </p>
+        )}
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton
