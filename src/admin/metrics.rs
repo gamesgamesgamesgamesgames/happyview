@@ -8,7 +8,7 @@ use crate::db::adapt_sql;
 use crate::error::AppError;
 use crate::metrics::{Step, Window, persist, unix_now};
 
-use super::auth::UserAuth;
+use super::auth::{AllowPlatform, UserAuth};
 use super::permissions::Permission;
 
 #[derive(Deserialize)]
@@ -77,7 +77,7 @@ async fn stored_fields(state: &AppState, window: Window, instances: Option<u64>,
 /// GET /admin/metrics/scripts — every script that ran inside the window.
 pub(super) async fn scripts(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Query(query): Query<WindowQuery>,
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
@@ -110,7 +110,7 @@ pub(super) async fn scripts(
 /// GET /admin/metrics/scripts/{trigger} — one script's series.
 pub(super) async fn script(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Path(trigger): Path<String>,
     Query(query): Query<WindowQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -157,7 +157,7 @@ pub(super) async fn script(
 /// GET /admin/metrics/ingest — the record pipeline, by collection and action.
 pub(super) async fn ingest(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Query(query): Query<WindowQuery>,
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;

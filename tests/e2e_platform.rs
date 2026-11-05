@@ -789,3 +789,139 @@ async fn only_the_platform_changes_domains_on_a_platform_managed_instance() {
         "a refused write changed the domains"
     );
 }
+
+const METRICS_TRIGGER: &str = "xrpc.query:games.gamesgamesgamesgames.listGames";
+
+/// The metrics routes a managed-hosting dashboard reads, the one-script route
+/// naming a script that has run.
+fn platform_metrics_routes() -> [String; 3] {
+    [
+        "/admin/metrics/scripts".to_string(),
+        format!(
+            "/admin/metrics/scripts/{}",
+            METRICS_TRIGGER.replace(':', "%3A")
+        ),
+        "/admin/metrics/ingest".to_string(),
+    ]
+}
+
+fn record_a_run(app: &TestApp) {
+    use happyview::metrics::run::RunTimings;
+    use happyview::metrics::{Layer, Outcome, RunSample};
+    use happyview::plugin::ScriptKind;
+
+    app.state.metrics.set_enabled(true);
+    app.state.metrics.record(
+        METRICS_TRIGGER,
+        ScriptKind::XrpcQuery,
+        Layer::Dashboard,
+        &RunSample {
+            outcome: Outcome::Ok,
+            wall: std::time::Duration::from_millis(4),
+            prepare: std::time::Duration::from_micros(200),
+            timings: RunTimings::default(),
+        },
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_script_and_ingest_metrics() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    record_a_run(&app);
+
+    for uri in platform_metrics_routes() {
+        for window in ["1h", "7d"] {
+            let uri = format!("{uri}?window={window}");
+            let resp = app
+                .router
+                .clone()
+                .oneshot(bearer(Method::GET, &uri, PLATFORM_KEY, None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        }
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::GET,
+            "/admin/metrics/scripts",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    let scripts = body["scripts"].as_array().unwrap();
+    assert!(
+        scripts
+            .iter()
+            .any(|s| s["trigger"].as_str() == Some(METRICS_TRIGGER)),
+        "{body}"
+    );
+}
+
+/// `metrics:read` opens only the routes that opt in with `AllowPlatform`: the
+/// live view of running work and the event log stay closed, as do writes.
+#[tokio::test]
+#[serial]
+async fn platform_key_cannot_read_live_metrics_or_the_event_log() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    for (method, uri) in [
+        (Method::GET, "/admin/metrics/live"),
+        (Method::GET, "/admin/events"),
+        (Method::GET, "/admin/events/count"),
+        (Method::POST, "/admin/events/purge"),
+    ] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(bearer(method.clone(), uri, PLATFORM_KEY, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn script_and_ingest_metrics_still_need_metrics_read() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    record_a_run(&app);
+    let (name, value) = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api-keys")
+                .header(name, value)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "no-metrics", "permissions": ["stats:read"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let key = json_body(resp).await["key"].as_str().unwrap().to_string();
+
+    for uri in platform_metrics_routes() {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(bearer(Method::GET, &uri, &key, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "GET {uri}");
+    }
+}
