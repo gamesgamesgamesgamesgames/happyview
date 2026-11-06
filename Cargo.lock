@@ -1981,6 +1981,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "data-encoding",
+ "k256",
  "multibase",
  "p256 0.14.0",
  "rand 0.10.2",
