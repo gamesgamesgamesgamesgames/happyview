@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   classifyConfigFailure,
   parseFeatures,
+  refreshFrom,
   retryDelayMs,
 } from "./config-load";
 
@@ -62,5 +63,45 @@ describe("parseFeatures", () => {
       spaces: false,
       space_inspector: false,
     });
+  });
+});
+
+describe("refreshFrom", () => {
+  it("keeps the loaded config when a refresh cannot reach the server", async () => {
+    const set = vi.fn();
+    await expect(
+      refreshFrom(
+        async () => ({
+          failure: { kind: "unreachable", detail: "The server answered 502." },
+        }),
+        set,
+      ),
+    ).rejects.toThrow("The server answered 502.");
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it("keeps the loaded config when the server does not serve the host", async () => {
+    const set = vi.fn();
+    await expect(
+      refreshFrom(
+        async () => ({
+          failure: {
+            kind: "unknown-host",
+            host: "app.example.com",
+            isLocalhost: false,
+          },
+        }),
+        set,
+      ),
+    ).rejects.toThrow("The server does not serve app.example.com.");
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it("hands a loaded config to set once", async () => {
+    const set = vi.fn();
+    const config = { public_url: "https://example.com" };
+    await refreshFrom(async () => ({ config }), set);
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(set).toHaveBeenCalledWith(config);
   });
 });
