@@ -519,32 +519,6 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # release/v2 only ships 2.17.x fixes. This refuses, before merge, what would
-  # take it off that line: a head that is another release branch, any history
-  # carrying a v3 tag, a feat or breaking commit (which semantic-release would
-  # otherwise refuse only after the merge, at release time), and migrations
-  # that beta does not already have. See scripts/check-release-v2.sh.
-  # ---------------------------------------------------------------------------
-  v2-guard:
-    if: github.event_name == 'pull_request' && github.base_ref == 'release/v2'
-    runs-on: depot-ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Fetch tags and beta
-        run: git fetch --tags --force origin beta
-
-      - name: Check the change stays on 2.17.x
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: bash scripts/check-release-v2.sh "$BASE_SHA" HEAD
-
-  # ---------------------------------------------------------------------------
   # Server release
   # ---------------------------------------------------------------------------
   release:

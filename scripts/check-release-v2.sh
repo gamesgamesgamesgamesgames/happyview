@@ -2,14 +2,16 @@
 # Refuses a change to release/v2 that would take it off the 2.17.x line:
 #   - a head branch that is main, beta or alpha
 #   - history that carries a v3 tag, which means it contains v3 commits
-#   - a feat or breaking commit, since release/v2 ships fixes only
+#   - a feat or breaking commit, since release/v2 ships fixes only, and the
+#     same in the pull request's title and body, which a squash merge makes
+#     the message of the commit that lands
 #   - a migration that shipped in v2.17.0 changing or disappearing
 #   - a new migration that is not listed in migrations/v2-backports.txt, or
 #     that beta does not hold byte for byte (migrations land on beta first)
 #
 # Usage: scripts/check-release-v2.sh <base> <head>
-# HEAD_REF, when set, is the pull request's head branch. Tags and origin/beta
-# must have been fetched.
+# HEAD_REF, PR_TITLE and PR_BODY, when set, are the pull request's head branch,
+# title and body. Tags and origin/beta must have been fetched.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -41,20 +43,39 @@ esac
 v3=$(git tag --merged "$head" --list 'v3.*' | head -n 1)
 [ -z "$v3" ] || fail "$head carries the tag $v3, so it contains v3 history."
 
+# What semantic-release would read from a commit message: "breaking", "feat"
+# or nothing.
+release_type() {
+  local message=$1
+  local subject=${message%%$'\n'*}
+  if [[ $subject =~ ^[a-z]+(\([^\)]*\))?!: ]] || grep -qE '^BREAKING[ -]CHANGE:' <<<"$message"; then
+    echo breaking
+  elif [[ $subject =~ ^feat(\([^\)]*\))?: ]]; then
+    echo feat
+  fi
+}
+
+refuse_release_type() {
+  local what=$1 message=$2
+  case $(release_type "$message") in
+    breaking) fail "$what is a breaking change." ;;
+    feat) fail "$what is a feat, and release/v2 ships fixes only." ;;
+  esac
+}
+
 while read -r sha; do
   [ -n "$sha" ] || continue
-  message=$(git log -1 --format=%B "$sha")
-  subject=${message%%$'\n'*}
-  line=$(git log -1 --format='%h %s' "$sha")
-  if [[ $subject =~ ^[a-z]+(\([^\)]*\))?!: ]] || grep -qE '^BREAKING[ -]CHANGE:' <<<"$message"; then
-    fail "$line is a breaking change."
-  elif [[ $subject =~ ^feat(\([^\)]*\))?: ]]; then
-    fail "$line is a feat, and release/v2 ships fixes only."
-  fi
+  refuse_release_type "$(git log -1 --format='%h %s' "$sha")" "$(git log -1 --format=%B "$sha")"
 done < <(git rev-list --no-merges "$base..$head")
 
+if [ -n "${PR_TITLE:-}" ]; then
+  refuse_release_type "The pull request title \"$PR_TITLE\"" "$PR_TITLE"$'\n\n'"${PR_BODY:-}"
+fi
+
+# The list is read from the head being checked, not from the working tree,
+# which need not be that head.
 listed() {
-  [ -f "$backports" ] && grep -vE '^[[:space:]]*(#|$)' "$backports" | grep -qxF "$1"
+  git show "$head:$backports" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | grep -qxF "$1"
 }
 
 for backend in sqlite postgres; do
