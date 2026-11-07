@@ -46,7 +46,7 @@ on:
       - "interop/**"
       - ".github/workflows/interop.yml"
   push:
-    branches: [main, beta, alpha]
+    branches: [main, beta, alpha, release/v2]
     paths: *interop-paths
 
 permissions:
