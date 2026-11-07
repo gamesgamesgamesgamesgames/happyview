@@ -75,10 +75,20 @@ pub async fn issue_credential(
         }),
     };
 
-    // A space this instance is authority for is verified against the
-    // `#atproto_space` key in the instance's DID document. Earlier spaces are
-    // anchored on their creator's DID and keep their per-space key.
-    let token = if is_instance_authority(pool, backend, public_url, space).await {
+    // A space on its own DID signs with that DID's `#atproto` key. A space
+    // this instance is authority for is verified against the `#atproto_space`
+    // key in the instance's DID document. Earlier spaces are anchored on their
+    // creator's DID and keep their per-space key.
+    let token = if let Some(signing_key) =
+        crate::spaces::authority::signing_key(pool, backend, encryption_key, &space.authority_did)
+            .await?
+    {
+        crate::spaces::credential::sign_credential_with_kid(
+            &claims,
+            &signing_key,
+            crate::spaces::authority::SIGNING_KID,
+        )?
+    } else if is_instance_authority(pool, backend, public_url, space).await {
         let signing_key =
             crate::spaces::service::load_signing_key(pool, backend, encryption_key).await?;
         crate::spaces::credential::sign_credential_with_key(&claims, &signing_key)?
@@ -298,31 +308,45 @@ async fn check_user_access_with_managing_app(
     // managing app verifies it and rejects anything without one. `aud` is the
     // managing app's service identifier and `lxm` pins the token to this single
     // method.
-    let token = crate::auth::service_auth::mint_service_auth(
+    let token = match crate::spaces::authority::mint_service_auth(
         auth_ctx.pool,
         auth_ctx.backend,
         auth_ctx.encryption_key,
-        auth_ctx.public_url,
+        authority_did,
         managing_app,
         CHECK_USER_ACCESS_LXM,
     )
-    .await?;
-
-    // The managing app expects the space authority as `iss`. When the authority
-    // is not this instance we cannot sign for it, so fail here rather than send
-    // a token the app will reject as the wrong issuer.
-    let instance_did = crate::auth::service_auth::instance_did(
-        auth_ctx.pool,
-        auth_ctx.backend,
-        auth_ctx.public_url,
-    )
-    .await?;
-    if instance_did != authority_did {
-        return Err(AppError::Internal(format!(
-            "cannot authenticate a managing-app check for authority {authority_did}: \
-             this instance signs as {instance_did}"
-        )));
-    }
+    .await?
+    {
+        Some(token) => token,
+        None => {
+            // The managing app expects the space authority as `iss`. A space
+            // created before space DIDs existed can be signed for only when its
+            // authority is this instance, so fail rather than send a token the
+            // app will reject as the wrong issuer.
+            let instance_did = crate::auth::service_auth::instance_did(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                auth_ctx.public_url,
+            )
+            .await?;
+            if instance_did != authority_did {
+                return Err(AppError::Internal(format!(
+                    "cannot authenticate a managing-app check for authority {authority_did}: \
+                     this instance signs as {instance_did}"
+                )));
+            }
+            crate::auth::service_auth::mint_service_auth(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                auth_ctx.encryption_key,
+                auth_ctx.public_url,
+                managing_app,
+                CHECK_USER_ACCESS_LXM,
+            )
+            .await?
+        }
+    };
 
     let resp = http
         .get(&url)
@@ -527,6 +551,14 @@ pub(crate) async fn space_verifying_key(
     public_url: &str,
     space: &Space,
 ) -> Result<crate::spaces::commit::SpaceVerifyingKey, AppError> {
+    if let Some(signing_key) =
+        crate::spaces::authority::signing_key(pool, backend, encryption_key, &space.authority_did)
+            .await?
+    {
+        return Ok(crate::spaces::commit::SpaceVerifyingKey::P256(
+            *signing_key.verifying_key(),
+        ));
+    }
     if is_instance_authority(pool, backend, public_url, space).await {
         let method =
             crate::verification_methods::get_method_by_fragment(pool, backend, "#atproto_space")

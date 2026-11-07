@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod authority;
 pub mod car;
 pub mod cid_backfill;
 pub mod client_attestation;
