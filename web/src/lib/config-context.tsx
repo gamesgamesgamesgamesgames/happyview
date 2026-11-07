@@ -19,6 +19,7 @@ import {
   type Features,
   classifyConfigFailure,
   parseFeatures,
+  refreshFrom,
   retryDelayMs,
 } from "@/lib/config-load";
 
@@ -117,20 +118,10 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
   const [retrying, setRetrying] = useState(false);
   const retryNow = useRef<() => void>(() => {});
 
-  // Throws on failure, so a caller such as the settings page can report it;
-  // the config already loaded stays in place.
-  const refreshConfig = useCallback(async () => {
-    const outcome = await loadConfig();
-    if ("failure" in outcome) {
-      const { failure } = outcome;
-      throw new Error(
-        failure.kind === "unreachable"
-          ? failure.detail
-          : `The server does not serve ${failure.host}.`,
-      );
-    }
-    setConfig(outcome.config);
-  }, []);
+  const refreshConfig = useCallback(
+    () => refreshFrom(loadConfig, setConfig),
+    [],
+  );
 
   // An unreachable server is retried with backoff until it answers. A host
   // the server does not serve is not: asking again gets the same answer.

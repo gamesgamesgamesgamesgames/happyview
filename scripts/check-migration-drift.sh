@@ -4,13 +4,13 @@
 # A file may sit at another version only when migrations/renumbered.tsv says
 # so; boot moves such a database's record to that version before migrating.
 #
-# Usage: scripts/check-migration-drift.sh [branch ...]   (default: beta main)
+# Usage: scripts/check-migration-drift.sh [branch ...]   (default: release/v2 main)
 # Compares against origin/<branch>, which must have been fetched.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 branches=("$@")
-[ ${#branches[@]} -gt 0 ] || branches=(beta main)
+[ ${#branches[@]} -gt 0 ] || branches=(release/v2 main)
 
 # The version this branch carries a stable version's file at, if renumbered.
 renumbered() {

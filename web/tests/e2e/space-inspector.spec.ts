@@ -141,6 +141,33 @@ test.describe("Space inspector", () => {
     ).toHaveCount(0);
   });
 
+  test("accounts show their handle, and a DID without one says so", async ({
+    page,
+  }) => {
+    await setSetting("feature.space_inspector_enabled", "true");
+    const { uri, id, creatorDid } = await createSpace(page);
+    spaceUri = uri;
+    const authorityDid = uri.replace(/^at:\/\//, "").split("/")[0];
+    // The local PDS's accounts have no handle that resolves inside the stack,
+    // so the resolver's answers are fixed here.
+    await page.route("**/admin/identity/resolve?**", (route) => {
+      const did = new URL(route.request().url()).searchParams.get("identifier");
+      return route.fulfill({
+        json: { did, handle: did === creatorDid ? "creator.test" : null },
+      });
+    });
+
+    await page.goto(`/dashboard/spaces/${encodeURIComponent(id)}/`);
+    const creator = page.getByText("Creator", { exact: true }).locator("..");
+    await expect(creator).toContainText("@creator.test");
+    await expect(creator).toContainText(creatorDid);
+    const authority = page
+      .getByText("Authority", { exact: true })
+      .locator("..");
+    await expect(authority).toContainText("Invalid Handle");
+    await expect(authority).toContainText(authorityDid);
+  });
+
   test("requesting access unlocks records and ending it locks them again", async ({
     page,
   }) => {

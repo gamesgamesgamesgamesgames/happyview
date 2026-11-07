@@ -59,3 +59,27 @@ const MAX_RETRY_MS = 30_000;
 export function retryDelayMs(attempt: number): number {
   return Math.min(FIRST_RETRY_MS * 2 ** Math.max(0, attempt), MAX_RETRY_MS);
 }
+
+/** What one `/config` load produced. */
+export type ConfigOutcome<C> = { config: C } | { failure: ConfigFailure };
+
+/**
+ * Loads the config again and hands it to `set`. A failure throws, so a caller
+ * such as the settings page can report it, and never reaches `set`, so the
+ * config already loaded stays in place.
+ */
+export async function refreshFrom<C>(
+  load: () => Promise<ConfigOutcome<C>>,
+  set: (config: C) => void,
+): Promise<void> {
+  const outcome = await load();
+  if ("failure" in outcome) {
+    const { failure } = outcome;
+    throw new Error(
+      failure.kind === "unreachable"
+        ? failure.detail
+        : `The server does not serve ${failure.host}.`,
+    );
+  }
+  set(outcome.config);
+}
