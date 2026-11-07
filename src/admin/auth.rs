@@ -20,8 +20,10 @@ pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
 /// (`require_domain_read`, `require_domain_write`, `require_rotation_read`,
-/// `is_platform`). Deliberately tiny.
-const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
+/// `is_platform`). Deliberately tiny: aggregate reads its managed-hosting
+/// dashboard shows, stats and script and ingest metrics. Routes still opt in
+/// with `AllowPlatform`, so `metrics:read` here does not open the live view.
+const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead, Permission::MetricsRead];
 
 #[derive(Clone)]
 pub struct UserAuth {
