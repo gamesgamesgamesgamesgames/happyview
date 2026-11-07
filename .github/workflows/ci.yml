@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, beta, alpha]
+    branches: [main, beta, alpha, release/v2]
   pull_request:
-    branches: [main, beta, alpha]
+    branches: [main, beta, alpha, release/v2]
   workflow_dispatch:
     inputs:
       server:
@@ -54,6 +54,7 @@ jobs:
       oauth-client-node: ${{ steps.filter.outputs.oauth-client-node }}
       lex-agent: ${{ steps.filter.outputs.lex-agent }}
       nsid: ${{ steps.filter.outputs.nsid }}
+      moved-docs: ${{ steps.filter.outputs.moved-docs }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -89,6 +90,39 @@ jobs:
             nsid:
               - 'crates/happyview-nsid/**'
               - 'packages/nsid/**'
+            # Read by `docs-moved`. Added and modified files only, so a change
+            # that deletes the old tree passes. A rename counts as a delete of
+            # the old path and an add of the new one, so moving a file in here
+            # is caught too.
+            moved-docs:
+              - added|modified: 'packages/docs/**'
+              - added|modified: 'docs/**'
+
+  # ---------------------------------------------------------------------------
+  # Docs guard — HappyView's docs live in their own repos (HAP-379). On this
+  # v2 line, doc changes go to happyproto/happyview-docs-legacy.
+  # ---------------------------------------------------------------------------
+  # Fails a change that adds or modifies a file under `packages/docs/` or a
+  # top-level `docs/`; deleting them passes. It runs on every pull request and
+  # push, since it costs seconds, and it fails rather than skips when `changes`
+  # did not succeed, because a skipped check satisfies a ruleset that requires
+  # it.
+  docs-moved:
+    needs: changes
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Path detection ran
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: test "$RESULT" = success
+
+      - name: Refuse changes to the moved docs
+        if: needs.changes.outputs.moved-docs == 'true'
+        run: |
+          echo "::error::HappyView's docs moved out of this repo. v3 docs: happyproto/happyview-docs. v2 docs: happyproto/happyview-docs-legacy. Open a companion PR there."
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
@@ -422,7 +456,7 @@ jobs:
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
-      && !contains(fromJSON('["beta", "alpha"]'), github.head_ref)
+      && !contains(fromJSON('["beta", "alpha", "release/v2"]'), github.head_ref)
       && needs.changes.outputs.server == 'true'
     runs-on: ${{ matrix.runs-on }}
     permissions:
@@ -519,12 +553,38 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # release/v2 only ships 2.17.x fixes. This refuses, before merge, what would
+  # take it off that line: a head that is another release branch, any history
+  # carrying a v3 tag, a feat or breaking commit (which semantic-release would
+  # otherwise refuse only after the merge, at release time), and migrations
+  # that beta does not already have. See scripts/check-release-v2.sh.
+  # ---------------------------------------------------------------------------
+  v2-guard:
+    if: github.event_name == 'pull_request' && github.base_ref == 'release/v2'
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch tags and beta
+        run: git fetch --tags --force origin beta
+
+      - name: Check the change stays on 2.17.x
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check-release-v2.sh "$BASE_SHA" HEAD
+
+  # ---------------------------------------------------------------------------
   # Server release
   # ---------------------------------------------------------------------------
   release:
     if: >-
       always()
-      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha", "refs/heads/release/v2"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
@@ -548,11 +608,26 @@ jobs:
         with:
           node-version: 22
 
+      # Which channel a tag was released on lives in a git note, which
+      # actions/checkout does not fetch, and semantic-release's own attempt
+      # fails quietly. Fetched here, a failure stops the release instead of
+      # silently costing every tag its channel.
+      - name: Fetch release channel notes
+        run: git fetch --no-tags origin '+refs/notes/*:refs/notes/*'
+
+      # Pinned, because this step decides the next version number. The exec
+      # plugin runs the `verifyReleaseCmd` in .releaserc.json that keeps this
+      # branch on 2.17.x.
       - name: Release
         id: semantic
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-        run: npx -p semantic-release -p semantic-release-gha-output semantic-release
+        run: >-
+          npx
+          -p semantic-release@25.0.9
+          -p @semantic-release/exec@7.1.0
+          -p semantic-release-gha-output@1.1.6
+          semantic-release
 
   # ---------------------------------------------------------------------------
   # Build + Docker — compile per-platform, upload to GitHub release, push image
