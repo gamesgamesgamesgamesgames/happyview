@@ -865,7 +865,8 @@ pub(crate) async fn create_space(
             "You already have a space with this type and key".into(),
         ));
     }
-    let authority = crate::spaces::authority::create(state, did, creator_rotation_key).await?;
+    let authority =
+        crate::spaces::authority::create(state, did, type_nsid, skey, creator_rotation_key).await?;
     let mut config = config.unwrap_or_default();
     if let Some(decl) = state.lexicons.get_space_declaration(type_nsid).await
         && let Some(collections) = decl.space_collections
@@ -2342,6 +2343,80 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// A DID the directory refused is submitted again, unchanged, when the
+    /// space is created again, instead of leaving a stranded key row.
+    #[tokio::test]
+    async fn a_refused_did_is_submitted_again_on_the_next_create() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let plc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&plc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap_err();
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the second create publishes the stored operation");
+
+        let ops = published(&plc).await;
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0], ops[1], "the same operation, for the same DID");
+        assert_eq!(ops[1].0, space.authority_did);
+    }
+
+    /// Two creates of one space that both pass the per-creator check share
+    /// its DID, so the second space row meets the address constraint, and is
+    /// a conflict rather than an internal error.
+    #[tokio::test]
+    async fn a_second_space_at_one_address_is_a_conflict() {
+        let (state, _plc) = memory_state_with_plc().await;
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let twin = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            ..space
+        };
+        let err = db::create_space(&state.db, state.db_backend, &twin)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+    }
+
+    /// A deleted space recreated with the same type and key gets its DID back,
+    /// so its address, which its members' records name, is unchanged.
+    #[tokio::test]
+    async fn a_recreated_space_keeps_its_did() {
+        let (state, plc) = memory_state_with_plc().await;
+        let first = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let uri = format!(
+            "at://{}/space/{}/{}",
+            first.did, first.type_nsid, first.skey
+        );
+        super::delete_space(&state, "did:plc:creator", &uri)
+            .await
+            .unwrap();
+        let again = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        assert_eq!(again.authority_did, first.authority_did);
+        assert_eq!(published(&plc).await.len(), 1, "published once");
     }
 
     #[tokio::test]

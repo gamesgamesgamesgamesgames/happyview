@@ -43,7 +43,14 @@ pub async fn create_space(
         .bind(&now)
         .execute(pool)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to create space: {e}")))?;
+        .map_err(
+            |e| match e.as_database_error().map(|d| d.is_unique_violation()) {
+                // Two creates of one space share its DID, so the second meets the
+                // address constraint.
+                Some(true) => AppError::Conflict("A space with this address already exists".into()),
+                _ => AppError::Internal(format!("failed to create space: {e}")),
+            },
+        )?;
 
     Ok(())
 }

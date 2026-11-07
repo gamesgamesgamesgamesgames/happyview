@@ -452,11 +452,13 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
     };
     assert_eq!(body["space"], json!(space));
     assert_eq!(body["credentials"], json!([jti]));
-    assert!(
-        received[0]
-            .headers
-            .get("authorization")
-            .is_some_and(|v| v.to_str().unwrap().starts_with("Bearer ")),
-        "revocations carry service auth from the authority"
-    );
+    // The space has a DID of its own, and revokes as it.
+    assert!(authority.starts_with("did:plc:"), "{authority}");
+    let authorization = received[0]
+        .headers
+        .get("authorization")
+        .expect("revocations carry service auth from the authority")
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, authority).await;
 }

@@ -559,6 +559,24 @@ async fn require_auth_or_credential(
 /// notify routes: a DPoP/cookie identity or a verified service-auth JWT. (Space
 /// credentials are not accepted here — their subject is a space, not the
 /// authority DID these routes gate on.)
+/// Refuse service auth addressed to another space's DID. A token addressed to
+/// the instance, as a space created before space DIDs existed is addressed,
+/// is not bound to one space.
+fn require_service_audience(claims: &XrpcClaims, space: &Space) -> Result<(), AppError> {
+    match claims
+        .service_auth
+        .as_ref()
+        .and_then(|sa| sa.space_audience.as_deref())
+    {
+        Some(audience) if audience != space.authority_did => Err(AppError::XrpcError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "BadServiceAudience",
+            message: format!("service auth is addressed to {audience}, not this space"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
     if let Some(identity) = &claims.identity {
         return Ok(identity.did().to_string());
@@ -1896,6 +1914,7 @@ async fn notify_write(
             },
             e => e,
         })?;
+    require_service_audience(&claims, &space)?;
     if caller != writer {
         service::require_space_admin(&state, &space, &caller).await?;
     }
@@ -2002,6 +2021,7 @@ async fn notify_space_deleted(
     // "space deleted" events (which may cause consumers to purge cached data).
     let did = require_notify_caller(&claims)?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_service_audience(&claims, &space)?;
     service::require_space_admin(&state, &space, &did).await?;
 
     let registrations =

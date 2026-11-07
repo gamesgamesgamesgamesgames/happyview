@@ -364,6 +364,9 @@ fn is_space_route(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct ServiceAuthClaims {
     pub did: String,
+    /// The space DID the token is addressed to, when it is addressed to one
+    /// this instance holds rather than to the instance itself.
+    pub space_audience: Option<String>,
     pub aud_fragment: String,
     /// The method the token is bound to, if it names one.
     pub lxm: Option<String>,
@@ -587,6 +590,7 @@ async fn try_parse_service_auth(
         }
         return Ok(ServiceAuthClaims {
             did: service_auth.did,
+            space_audience: Some(aud_did.to_string()),
             aud_fragment,
             lxm: payload.lxm,
         });
@@ -612,6 +616,7 @@ async fn try_parse_service_auth(
 
     Ok(ServiceAuthClaims {
         did: service_auth.did,
+        space_audience: None,
         aud_fragment: fragment,
         lxm: payload.lxm,
     })
