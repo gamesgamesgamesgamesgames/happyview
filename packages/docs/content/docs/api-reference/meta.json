@@ -1,9 +1,0 @@
-{
-  "title": "API Reference",
-  "pages": [
-    "xrpc-api",
-    "admin",
-    "oauth",
-    "lua"
-  ]
-}
