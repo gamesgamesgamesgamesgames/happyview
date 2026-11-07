@@ -14,17 +14,17 @@ const PROTECTED_TABLE_PREFIX: &str = "happyview_";
 const PROTECTED_EXACT_TABLES: &[&str] = &["_sqlx_migrations"];
 
 /// Internal tables `db.raw` is allowed to read and write despite the reserved
-/// prefix: public AppView data and space *data*. Everything else `happyview_*`
-/// stays blocked — secrets and tokens (`happyview_dpop_keys`/`_sessions`,
-/// `happyview_api_keys`, `happyview_oauth_*`, `happyview_script_variables`),
-/// auth/privilege state (`happyview_users`/`_user_permissions`, the delegation
-/// tables), trust config (`happyview_domains`, `happyview_instance_settings`),
-/// and cryptographic material (`happyview_space_credentials`, and
-/// `happyview_space_repo_state` which holds commit-signature key material).
+/// prefix: public AppView data and background jobs. Everything else
+/// `happyview_*` stays blocked — secrets and tokens (`happyview_dpop_keys`/
+/// `_sessions`, `happyview_api_keys`, `happyview_oauth_*`,
+/// `happyview_script_variables`), auth/privilege state
+/// (`happyview_users`/`_user_permissions`, the delegation tables), trust config
+/// (`happyview_domains`, `happyview_instance_settings`), cryptographic
+/// material, and every space table.
 ///
-/// Space membership/records are exposed because a space defines *access*, not
-/// confidentiality — whether to expose otherwise-private space data through the
-/// AppView is left to the admin.
+/// Space tables are reached only through `happyview.spaces`, which applies the
+/// space's access rules for its caller. Raw SQL reads and writes rows
+/// directly, outside those rules.
 const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     // Public AppView data.
     "happyview_records",
@@ -34,13 +34,6 @@ const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     crate::catalog::lexicon_rows::TABLE,
     // Background jobs.
     "happyview_jobs",
-    // Space data (not the credential/key-material tables).
-    "happyview_spaces",
-    "happyview_space_members",
-    "happyview_space_records",
-    "happyview_space_record_oplog",
-    "happyview_space_notify_registrations",
-    "happyview_space_dids",
 ];
 
 /// Reject a raw SQL string that references a protected internal table.
@@ -790,9 +783,6 @@ mod tests {
             .is_ok()
         );
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_jobs").is_ok());
-        // Space data (access, not confidentiality).
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_records").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_members").is_ok());
     }
 
     #[test]
@@ -805,12 +795,50 @@ mod tests {
         assert!(super::check_raw_sql_tables("UPDATE happyview_users SET is_super = true").is_err());
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_domains").is_err());
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_instance_settings").is_err());
-        // Space credential / key-material tables stay blocked even though other
-        // space tables are allowed.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_credentials").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_repo_state").is_err());
+        // Space tables, which `happyview.spaces` reaches with access checks.
+        for table in [
+            "happyview_spaces",
+            "happyview_space_members",
+            "happyview_space_records",
+            "happyview_space_record_oplog",
+            "happyview_space_notify_registrations",
+            "happyview_space_dids",
+            "happyview_space_credentials",
+            "happyview_space_repo_state",
+        ] {
+            assert!(
+                super::check_raw_sql_tables(&format!("SELECT * FROM {table}")).is_err(),
+                "{table} should be blocked"
+            );
+        }
+        assert!(
+            super::check_raw_sql_tables(
+                "INSERT INTO happyview_space_members (id, space_id, member_did) VALUES ($1, $2, $3)"
+            )
+            .is_err()
+        );
         // The migration bookkeeping table is off-limits too.
         assert!(super::check_raw_sql_tables("SELECT * FROM _sqlx_migrations").is_err());
+    }
+
+    /// Every space table the migrations create, including any added later, is
+    /// out of raw SQL's reach.
+    #[tokio::test]
+    async fn no_migrated_space_table_is_reachable() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let tables: Vec<(String,)> = crate::db::query_as(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name LIKE 'happyview\\_space%' ESCAPE '\\'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(tables.len() >= 6, "found {tables:?}");
+        for (table,) in tables {
+            assert!(
+                super::check_raw_sql_tables(&format!("SELECT * FROM {table}")).is_err(),
+                "{table} is reachable from raw SQL"
+            );
+        }
     }
 
     #[test]
