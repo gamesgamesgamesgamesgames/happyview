@@ -4,14 +4,15 @@ The contributor guide is on the documentation site:
 
 - [Develop](https://happyview.dev/docs/contributing/develop): choosing the base branch, setting up a checkout, the development stack, signing off commits, commit messages, and what a pull request needs to merge.
 - [Test](https://happyview.dev/docs/contributing/test): every CI check and the local commands that correspond to it.
-- [Release](https://happyview.dev/docs/contributing/release): how CI cuts releases from `main`, `beta` and `alpha`.
+- [Release](https://happyview.dev/docs/contributing/release): how CI cuts releases from `main`, `beta` and `release/v2`.
 
 In short:
 
-- Open pull requests against `beta`, or against `alpha` for a change that belongs to the next major line.
+- Open pull requests against `beta`, where v3 is developed. `alpha` is parked and takes no pull requests.
+- A fix that v2 needs too lands on `beta` first. It is then cherry-picked with `git cherry-pick -x` onto a `<topic>-v2` branch, in a pull request into `release/v2`, which ships 2.17.x fixes only. Its `v2-guard` check refuses a `feat` or breaking change, v3 history, and a migration that isn't on `beta` first.
 - Sign off every commit with `git commit -s`. The `DCO` check is required.
 - Write commit messages as [Conventional Commits](https://www.conventionalcommits.org/); releases are versioned from them.
-- Into `alpha`, open the pull request as a draft while you iterate, and mark it ready when it passes locally.
+- Into `beta`, open the pull request as a draft while you iterate, and mark it ready when it passes locally. The costly checks run only on a ready pull request.
 
 This file keeps what applies to maintainers and to the provider contract.
 
@@ -21,7 +22,7 @@ CI runs a fork's PR without the repository's secrets, and every required check i
 
 1. **Approve the workflow run** for a first-time contributor, from the banner on the PR's Checks tab. Read the diff first, especially anything under `.github/`: the run executes the PR's code on our runners.
 2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
-3. **Check the commit trailers before merging.** Pull requests into `alpha` and `beta` merge with a merge commit, so every commit lands as written, trailers included, and the merge dialog can't remove one. If a commit carries a trailer we don't carry, such as an AI co-author line, ask the contributor to amend it before merging, and keep their `Signed-off-by`.
+3. **Check the commit trailers before merging.** Pull requests into `beta` and `release/v2` merge with a merge commit, so every commit lands as written, trailers included, and the merge dialog can't remove one. If a commit carries a trailer we don't carry, such as an AI co-author line, ask the contributor to amend it before merging, and keep their `Signed-off-by`.
 
 ## The provider contract
 
