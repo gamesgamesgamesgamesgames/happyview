@@ -4,6 +4,8 @@ title: "Metrics"
 
 Admin API endpoints for script execution metrics: how often each script runs, how long it takes, how it ends, and where its time goes.
 
+On a managed instance, the [platform principal](./platform.md) may read [List scripts](#list-scripts), [Get one script](#get-one-script) and [Ingest](#ingest). It can't read [Live](#live).
+
 Metrics are kept in memory by the process that runs the scripts, for the last hour by the minute and the last day by the half hour. Nothing is written to the database per run. Instead, once a minute, each minute that has closed is written to the `happyview_script_metrics` table, one row for each script, and for each collection and action, that saw runs in it. Idle scripts write nothing. Test files run by `happyview test` are not recorded.
 
 The `1h` and `24h` windows are read from memory, and the `7d` and `30d` windows from the table. At startup the last day's rows are read back into memory, so a restart loses at most the minute that was open.

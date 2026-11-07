@@ -62,7 +62,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-const ALL = "__all__";
+import { ALL, stateForGrant } from "./records-state";
+
 const PAGE_SIZE = 20;
 
 const POLICY_LABELS: Record<string, string> = {
@@ -190,21 +191,14 @@ function SpaceDetailContent() {
 
   useEffect(() => {
     recordsRequest.current += 1;
-    // Records, pages and the open record belong to the previous grant's scope.
-    setRecords([]);
-    setNextCursor(undefined);
-    setCursorStack([]);
-    setViewRecord(null);
-    if (!access.grant) return;
-    // A new grant starts from its own scope: an account grant fixes the author,
-    // and a space grant starts from every author rather than a filter left
-    // over from a previous grant.
-    const filters =
-      access.grant.scope === "account"
-        ? { collection, repo: access.grant.target }
-        : { collection, repo: ALL };
-    setRepo(filters.repo);
-    fetchRecords(filters);
+    const next = stateForGrant(access.grant, collection);
+    setRecords(next.records);
+    setNextCursor(next.nextCursor);
+    setCursorStack(next.cursorStack);
+    setViewRecord(next.viewRecord);
+    if (!next.filters) return;
+    setRepo(next.filters.repo);
+    fetchRecords(next.filters);
     // Reload only when the grant or the space changes; filter changes go
     // through applyFilters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
