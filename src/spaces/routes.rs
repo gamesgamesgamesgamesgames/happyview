@@ -2080,6 +2080,7 @@ async fn notify_credential_revoked(
             },
             e => e,
         })?;
+    require_service_audience(&claims, &space)?;
     if caller != space.authority_did {
         return Err(AppError::Forbidden(
             "only the space's authority may revoke its credentials".into(),
