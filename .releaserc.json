@@ -1,13 +1,15 @@
 {
-  "branches": [
-    "main",
-    { "name": "beta", "prerelease": true },
-    { "name": "alpha", "prerelease": true }
-  ],
+  "branches": ["release/v2"],
   "tagFormat": "v${version}",
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/exec",
+      {
+        "verifyReleaseCmd": "case \"${nextRelease.version}\" in 2.17.*) ;; *) echo \"release/v2 releases only 2.17.x, not ${nextRelease.version}\" >&2; exit 1;; esac"
+      }
+    ],
     "@semantic-release/github",
     "semantic-release-gha-output"
   ]
