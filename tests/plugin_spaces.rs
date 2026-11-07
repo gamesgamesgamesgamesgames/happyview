@@ -162,7 +162,16 @@ async fn create_info_write_and_query_round_trip_the_record() {
     )
     .await
     .expect("info should succeed");
-    assert_eq!(info["did"], creator);
+    // The space has its own DID, which its uri names; the creator is recorded
+    // beside it.
+    let space_did = space_uri
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap();
+    assert_eq!(info["did"], space_did);
+    assert_ne!(info["did"], creator);
+    assert_eq!(info["creator_did"], creator);
 
     let written = call(
         &app,

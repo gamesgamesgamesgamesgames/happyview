@@ -1310,7 +1310,9 @@ async fn get_delegation_token(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let space_host = format!("{}#atproto_space_host", space.did);
+    // Proposal 0016 addresses a delegation token to the space host as the
+    // authority's `#atproto_pds`.
+    let space_host = format!("{}#atproto_pds", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
         sub: space_uri,

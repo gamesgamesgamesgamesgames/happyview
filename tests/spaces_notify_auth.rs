@@ -688,3 +688,190 @@ async fn notify_write_accepts_the_bare_authority_did_as_audience() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Create a space through `createSpace` as `creator`, returning its uri. It is
+/// created on a DID of its own.
+async fn create_space_on_its_own_did(app: &TestApp, creator: &str) -> String {
+    let (name, value) = common::auth::admin_cookie_header(creator, &app.state.cookie_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["uri"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// `notifyWrite` to a space on its own DID, with service auth addressed to
+/// `aud_fragment` of that DID, on an instance that exposes no identity of its
+/// own.
+async fn notify_space_did(aud_fragment: &str) -> StatusCode {
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let space_did = space.trim_start_matches("at://").split('/').next().unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            space_did,
+            aud_fragment,
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Proposal 0016 addresses a space host as its authority's `#atproto_pds`. A
+/// space DID this instance holds is an audience in its own right, whatever
+/// identity the instance itself exposes.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_service_auth_addressed_to_the_space_did() {
+    common::require_db!();
+    assert_eq!(notify_space_did("#atproto_pds").await, StatusCode::OK);
+    assert_eq!(notify_space_did("").await, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_another_service_of_the_space_did() {
+    common::require_db!();
+    assert_eq!(
+        notify_space_did("#atproto_labeler").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A space on its own DID forwards write notifications signed as that DID,
+/// with the key its genesis operation published as `#atproto`.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_forwards_notifications_signed_as_it() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &space_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let received = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1, "the syncer should be notified once");
+    let token = received[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("Bearer ")
+        .to_string();
+    let parts: Vec<&str> = token.split('.').collect();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+    assert_eq!(payload["iss"], json!(space_did));
+
+    let genesis = plc_store
+        .read()
+        .await
+        .get(&space_did)
+        .cloned()
+        .expect("the space's DID was published");
+    let published = genesis["verificationMethods"]["atproto"].as_str().unwrap();
+    let (_, multikey) = multibase::decode(published.trim_start_matches("did:key:")).unwrap();
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&multikey[2..]).unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&b64.decode(parts[2]).unwrap()).unwrap();
+    verifying
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .expect("signed with the space DID's #atproto key");
+}

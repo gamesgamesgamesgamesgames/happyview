@@ -598,6 +598,19 @@ async fn seed_everything_under_the_old_key(
     .execute(pool)
     .await
     .unwrap();
+    crate::db::query(&crate::db::adapt_sql(
+        "INSERT INTO happyview_space_authorities (did, signing_key_enc, kem_key_enc, rotation_key_enc, genesis_op, plc_state, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', 'published', 'did:plc:owner', ?, ?)",
+        backend,
+    ))
+    .bind(format!("did:plc:{}-authority", seeded.space_did_id))
+    .bind(encrypt(&OLD, b"authority-signing").unwrap())
+    .bind(encrypt(&OLD, b"authority-kem").unwrap())
+    .bind(encrypt(&OLD, b"authority-rotation").unwrap())
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
 
     for table in ["happyview_delegation_key", "happyview_attestation_key"] {
         crate::db::query(&format!("DELETE FROM {table}"))
@@ -677,6 +690,7 @@ async fn a_reseal_leaves_nothing_needing_the_previous_key() {
             "service_identity",
             "verification_methods",
             "space_dids",
+            "space_authorities",
             "attestation_key",
             "delegation_key",
             "script_variables",
@@ -786,6 +800,18 @@ async fn a_reseal_leaves_nothing_needing_the_previous_key() {
         .await
         .unwrap();
         assert_eq!(new.decrypt(&space_signing).unwrap(), b"space-signing");
+        let (signing, kem, rotation): (Vec<u8>, Vec<u8>, Vec<u8>) =
+            crate::db::query_as(&crate::db::adapt_sql(
+                "SELECT signing_key_enc, kem_key_enc, rotation_key_enc FROM happyview_space_authorities WHERE did = ?",
+                backend,
+            ))
+            .bind(format!("did:plc:{}-authority", seeded.space_did_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(new.decrypt(&signing).unwrap(), b"authority-signing");
+        assert_eq!(new.decrypt(&kem).unwrap(), b"authority-kem");
+        assert_eq!(new.decrypt(&rotation).unwrap(), b"authority-rotation");
         assert!(
             crate::spaces::delegation_key::load(&pool, backend, &new)
                 .await

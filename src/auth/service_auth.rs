@@ -351,7 +351,7 @@ pub async fn mint_service_auth(
     aud: &str,
     lxm: &str,
 ) -> Result<String, AppError> {
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use p256::ecdsa::SigningKey;
 
     let iss = instance_did(pool, backend, public_url).await?;
 
@@ -369,6 +369,18 @@ pub async fn mint_service_auth(
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
     let signing_key = SigningKey::from_slice(&private_bytes)
         .map_err(|e| AppError::Internal(format!("invalid service signing key: {e}")))?;
+
+    sign_service_auth(&signing_key, &iss, aud, lxm)
+}
+
+/// Sign a service auth token as `iss` with its `#atproto` key.
+pub fn sign_service_auth(
+    signing_key: &p256::ecdsa::SigningKey,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+) -> Result<String, AppError> {
+    use p256::ecdsa::{Signature, signature::Signer};
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

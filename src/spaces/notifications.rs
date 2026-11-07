@@ -50,6 +50,8 @@ pub struct WebhookSigner<'a> {
     pub encryption_key: &'a crate::plugin::encryption::Keyring,
     pub public_url: &'a str,
     pub plc_url: &'a str,
+    /// The space's authority, which deliveries are signed as.
+    pub authority_did: &'a str,
 }
 
 /// Whether the missing-key warning has been logged, so it is once a process.
@@ -125,11 +127,12 @@ async fn mint(
     lxm: &str,
 ) -> Option<String> {
     let signer = signer?;
-    match crate::auth::service_auth::mint_service_auth(
+    match crate::spaces::authority::mint_service_auth_or_instance(
         pool,
         backend,
         signer.encryption_key,
         signer.public_url,
+        signer.authority_did,
         &reg.service,
         lxm,
     )
@@ -315,10 +318,19 @@ async fn webhook_worker(
             }
         };
         let keyring = state.config.keyring();
+        // A space deleted while its batch waited has no authority to sign as;
+        // its deliveries are then signed as this instance.
+        let authority_did = db::get_space(&state.db, state.db_backend, &space_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|space| space.authority_did)
+            .unwrap_or_default();
         let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
             encryption_key,
             public_url: &state.config.public_url,
             plc_url: &state.config.plc_url,
+            authority_did: &authority_did,
         });
         if let Err(e) = dispatch_write_notifications(
             &state.db,
@@ -365,6 +377,7 @@ pub fn announce_space_deleted(
                         encryption_key,
                         public_url: &state.config.public_url,
                         plc_url: &state.config.plc_url,
+                        authority_did: &space.authority_did,
                     });
                     post_webhook(
                         &state.http,
@@ -382,11 +395,12 @@ pub fn announce_space_deleted(
                         tracing::warn!("TOKEN_ENCRYPTION_KEY is required to sign a space deletion");
                         continue;
                     };
-                    let token = match crate::auth::service_auth::mint_service_auth(
+                    let token = match crate::spaces::authority::mint_service_auth_or_instance(
                         &state.db,
                         state.db_backend,
                         key,
                         &state.config.public_url,
+                        &space.authority_did,
                         &reg.service,
                         NOTIFY_SPACE_DELETED_LXM,
                     )
@@ -499,13 +513,18 @@ async fn deliver_repo_update(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign write notifications".into())
     })?;
     let body = update.body();
+    let authority_did = db::get_space(&state.db, state.db_backend, space_id)
+        .await?
+        .map(|space| space.authority_did)
+        .ok_or_else(|| AppError::NotFound("space not found".into()))?;
 
     for reg in &registrations {
-        let token = match crate::auth::service_auth::mint_service_auth(
+        let token = match crate::spaces::authority::mint_service_auth_or_instance(
             &state.db,
             state.db_backend,
             encryption_key,
             &state.config.public_url,
+            &authority_did,
             &reg.service,
             NOTIFY_WRITE_LXM,
         )
@@ -581,7 +600,12 @@ async fn deliver_revocations(
         &state.config.public_url,
     )
     .await;
-    if instance.ok().as_deref() != Some(space.authority_did.as_str()) {
+    // A space on its own DID revokes as that DID. One created before space
+    // DIDs existed can sign only as this instance, so it revokes only when its
+    // authority is this instance.
+    let own_did =
+        crate::spaces::authority::holds(&state.db, state.db_backend, &space.authority_did).await?;
+    if !own_did && instance.ok().as_deref() != Some(space.authority_did.as_str()) {
         return Ok(());
     }
     let encryption_key = &state.config.keyring().ok_or_else(|| {
@@ -612,11 +636,12 @@ async fn deliver_revocations(
         );
         for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
             // Addressed to the repo, which is what its host accepts service auth for.
-            let token = crate::auth::service_auth::mint_service_auth(
+            let token = crate::spaces::authority::mint_service_auth_or_instance(
                 &state.db,
                 state.db_backend,
                 encryption_key,
                 &state.config.public_url,
+                &space.authority_did,
                 &repo,
                 NOTIFY_CREDENTIAL_REVOKED_LXM,
             )
@@ -759,6 +784,7 @@ mod tests {
             encryption_key: keyring,
             public_url: "https://hv.example",
             plc_url: plc,
+            authority_did: "did:plc:instance",
         }
     }
 

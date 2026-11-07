@@ -121,6 +121,7 @@ impl TestApp {
 
         let mock_server = MockServer::start().await;
         let mock_url = mock_server.uri();
+        accept_space_did_genesis(&mock_server).await;
 
         let admin_did = "did:plc:testadmin".to_string();
         let admin_token = "test-admin-token".to_string();
@@ -957,4 +958,20 @@ impl TestApp {
             serde_json::from_slice(&bytes).unwrap()
         }
     }
+}
+
+/// Accept every space DID's genesis operation at the mock PLC (`plc_url`), since
+/// creating a space publishes a did:plc. Mounted at the lowest priority, so a
+/// test that mounts its own PLC (`plc::setup_mock_plc`) still receives the
+/// operations it records.
+async fn accept_space_did_genesis(server: &MockServer) {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/did:plc:[a-z2-7]{24}$"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(u8::MAX)
+        .mount(server)
+        .await;
 }

@@ -331,3 +331,100 @@ async fn refuses_a_delegation_token_signed_with_the_encryption_key() {
         .unwrap();
     assert_eq!(retry.status(), StatusCode::OK);
 }
+
+/// A space created here has a DID of its own. A credential for it is signed
+/// with that DID's `#atproto` key, names `#atproto` as its `kid` and the space
+/// DID as its issuer, as Proposal 0016 requires, and verifies against the key
+/// the DID's genesis operation published. A delegation token for it is
+/// addressed to the space DID's `#atproto_pds`.
+#[tokio::test]
+#[serial]
+async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+
+    let (name, value) = cookie_for(&app, &creator);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .header(name.clone(), value.clone())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "spaceType": "com.example.mint", "skey": "own" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(space_did.starts_with("did:plc:"));
+
+    let genesis: Value = app
+        .mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path() == format!("/{space_did}"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the space's DID was published");
+    assert_eq!(happyview_plc::derive_did(&genesis).unwrap(), space_did);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencoding::encode(&space)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = json_of(resp).await["token"].as_str().unwrap().to_string();
+    assert_eq!(claims_of(&token)["aud"], format!("{space_did}#atproto_pds"));
+
+    let key = syncer_key();
+    let authorization = format!("Bearer {token}");
+    let signed = happyview::spaces::http_signature::sign(&key, &authorization, None);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .header("authorization", &authorization)
+        .header("signature-input", signed["signature-input"].clone())
+        .header("signature", signed["signature"].clone())
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let credential = json_of(resp).await["credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let parts: Vec<&str> = credential.split('.').collect();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header: Value = serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+    assert_eq!(header["kid"], "#atproto");
+    assert_eq!(claims_of(&credential)["iss"], space_did);
+
+    let published = genesis["verificationMethods"]["atproto"].as_str().unwrap();
+    let (_, multikey) = multibase::decode(published.trim_start_matches("did:key:")).unwrap();
+    assert_eq!(&multikey[..2], &[0x80, 0x24], "a P-256 key");
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&multikey[2..]).unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&b64.decode(parts[2]).unwrap()).unwrap();
+    verifying
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .expect("the credential verifies against the space DID's published #atproto key");
+}

@@ -513,53 +513,80 @@ async fn try_parse_service_auth(
     host: Option<&str>,
     path: &str,
 ) -> Result<ServiceAuthClaims, AppError> {
-    // 1. Check if service identity is configured and not "not_exposed"
+    // 1. The instance's own DID, when it exposes one. A space's own DID is an
+    // audience whatever the instance's identity mode, so a missing instance
+    // identity refuses only tokens that are not addressed to a space DID.
     let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
-    let identity =
-        identity.ok_or_else(|| AppError::Auth("no service identity configured".into()))?;
-
-    if identity.mode == crate::service_identity::IdentityMode::NotExposed {
-        return Err(AppError::Auth("service auth disabled".into()));
-    }
-
-    let instance_did = match &identity.mode {
-        crate::service_identity::IdentityMode::DidWeb => {
-            let h = host.ok_or_else(|| AppError::Auth("missing Host header for did:web".into()))?;
-            format!("did:web:{}", h.replace(':', "%3A"))
+    let instance_did = match identity {
+        None => Err(AppError::Auth("no service identity configured".into())),
+        Some(identity) if identity.mode == crate::service_identity::IdentityMode::NotExposed => {
+            Err(AppError::Auth("service auth disabled".into()))
         }
-        _ => identity
-            .did
-            .clone()
-            .ok_or_else(|| AppError::Auth("no DID configured".into()))?,
+        Some(identity) => match &identity.mode {
+            crate::service_identity::IdentityMode::DidWeb => host
+                .map(|h| format!("did:web:{}", h.replace(':', "%3A")))
+                .ok_or_else(|| AppError::Auth("missing Host header for did:web".into())),
+            _ => identity
+                .did
+                .clone()
+                .ok_or_else(|| AppError::Auth("no DID configured".into())),
+        },
     };
 
-    // 2. Verify the JWT (this resolves the issuer's DID doc and checks signature)
+    // 2. Decode the payload to read aud, and settle whether it names a space
+    // DID this instance holds before any network resolution.
+    let payload = crate::auth::service_auth::decode_jwt_payload(token)
+        .map_err(|_| AppError::Auth("failed to decode JWT".into()))?;
+    let aud = payload
+        .aud
+        .clone()
+        .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
+    let (aud_did, aud_fragment) = match aud.split_once('#') {
+        Some((did, fragment)) => (did, format!("#{fragment}")),
+        None => (aud.as_str(), String::new()),
+    };
+    let space_did_audience = is_space_route(path)
+        && crate::spaces::authority::holds(&state.db, state.db_backend, aud_did).await?;
+    let instance_did = if space_did_audience {
+        None
+    } else {
+        Some(instance_did?)
+    };
+
+    // 3. Verify the JWT (this resolves the issuer's DID doc and checks signature)
     let service_auth = crate::auth::service_auth::ServiceAuth::from_bearer(token, state)
         .await
         .map_err(|_| AppError::Auth("invalid service auth token".into()))?;
 
-    // 3. Decode payload to extract aud
-    let payload = crate::auth::service_auth::decode_jwt_payload(token)
-        .map_err(|_| AppError::Auth("failed to decode JWT".into()))?;
-
-    let aud = payload
-        .aud
-        .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
-
-    // 4. Verify aud starts with instance DID and extract fragment
-    if !aud.starts_with(&*instance_did) {
-        return Err(AppError::Auth(format!(
-            "JWT aud '{}' does not match instance DID '{}'",
-            aud, instance_did
-        )));
-    }
-
-    // 5. A token bound to one method must not authorize another.
+    // 4. A token bound to one method must not authorize another.
     if let (Some(lxm), Some(method)) = (payload.lxm.as_deref(), path.strip_prefix("/xrpc/"))
         && lxm != method
     {
         return Err(AppError::Auth(format!(
             "JWT lxm '{lxm}' does not match the called method '{method}'"
+        )));
+    }
+
+    // 5. A space's DID is addressed bare or as its `#atproto_pds`, the service
+    // Proposal 0016 names as the space host.
+    let Some(instance_did) = instance_did else {
+        if !aud_fragment.is_empty() && aud_fragment != "#atproto_pds" {
+            return Err(AppError::Auth(format!(
+                "JWT aud '{aud}' names a space DID's service other than #atproto_pds"
+            )));
+        }
+        return Ok(ServiceAuthClaims {
+            did: service_auth.did,
+            aud_fragment,
+            lxm: payload.lxm,
+        });
+    };
+
+    // 6. Verify aud starts with instance DID and extract fragment
+    if !aud.starts_with(&*instance_did) {
+        return Err(AppError::Auth(format!(
+            "JWT aud '{}' does not match instance DID '{}'",
+            aud, instance_did
         )));
     }
 
