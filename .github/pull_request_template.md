@@ -18,4 +18,4 @@ Thanks for contributing! Before opening this PR:
 - [ ] Every commit is signed off (`git commit -s`)
 - [ ] `cargo fmt` and `cargo clippy` pass locally (or the change doesn't touch Rust)
 - [ ] Tests are added or updated where it makes sense
-- [ ] Docs are updated if behavior changed
+- [ ] Docs: companion PR link, or n/a <!-- v3: happyproto/happyview-docs · v2: happyproto/happyview-docs-legacy -->
