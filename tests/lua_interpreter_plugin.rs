@@ -449,6 +449,51 @@ async fn a_spinning_script_is_interrupted_by_the_host_deadline() {
     );
 }
 
+/// The instruction budget is the bound a script hits first, and it has to hold
+/// on its own: the deadline the host arms ends a run only after the wall
+/// clock, which is seconds, not the budget's milliseconds. `pcall` and
+/// coroutines are how a script would try to swallow the limit, so each is
+/// driven into it. A run that ends well inside the wall clock was ended by the
+/// budget.
+#[tokio::test]
+async fn the_instruction_budget_ends_a_run_that_pcall_and_coroutines_cannot_save() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+
+    for source in [
+        "function handle() while true do end end",
+        "function handle() while true do pcall(function() while true do end end) end end",
+        "function handle() \
+           while true do \
+             coroutine.resume(coroutine.create(function() while true do end end)) \
+           end \
+         end",
+    ] {
+        let mut sent = input(source, ScriptKind::XrpcQuery);
+        sent.limits.instructions = Some(10_000);
+
+        let started = std::time::Instant::now();
+        let outcome = app.state.plugin_executor().execute_script(&id, &sent).await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Ok(output) => {
+                let (kind, message, _) = failure(output);
+                assert_eq!(kind, ScriptErrorKind::Timeout, "{source}: {message}");
+            }
+            Err(happyview::plugin::ExecutionError::Timeout) => {}
+            Err(other) => panic!("{source}: expected the budget to end the run, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{source}: ended after {elapsed:?}, so the wall clock ended it, not the budget"
+        );
+    }
+}
+
 /// The record-event runner's three-way branch reads `value_kind`, so the
 /// interpreter's half of it is what makes the host's half mean anything:
 /// `handle` returning nothing and returning `nil` are the same answer, and an
