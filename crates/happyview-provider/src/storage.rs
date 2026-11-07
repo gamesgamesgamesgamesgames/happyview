@@ -86,6 +86,12 @@ pub trait RecordStorage: Send + Sync + 'static {
     async fn count(&self, _collection: &str) -> Result<Option<i64>, sqlx::Error> {
         Ok(None)
     }
+    /// How many record deltas this storage can apply at once, when it has a
+    /// limit: HappyView hooks no more of a backfill's records concurrently
+    /// than this. `None` (the default): no limit of its own.
+    fn max_concurrent_deltas(&self) -> Option<usize> {
+        None
+    }
     /// A pool on which the compatibility views `happyview_records` and
     /// `happyview_record_refs` show this storage's records for every
     /// collection it claims, exactly as reads through `read_route` see them.

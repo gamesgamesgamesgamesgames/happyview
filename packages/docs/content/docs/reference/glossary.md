@@ -52,7 +52,7 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 
 **Permissioned Data** — atproto data that is gated by membership in a space, as opposed to public repo data. Defined by atproto Proposal 0016.
 
-**Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Operator** (viewer + backfill and API key management), **Manager** (operator + lexicon, record, spaces, and plugin management), and **Full Access** (all 44 permissions).
+**Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Maintainer** (viewer + backfill, API key and dead letter management), **Manager** (maintainer + lexicon, record, spaces, and plugin management), and **Full Access** (all 52 permissions).
 
 **Read Policy / Write Policy** — A space's two independent policies. The read policy decides who can obtain a space credential; the write policy decides whose writes the space tracks. Each is member-list, public, or managing-app.
 
@@ -61,5 +61,3 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 **Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 10-minute TTL) for cross-service read access to space data. Bound to the requester's P-256 key through `cnf.kid`, and used with HTTP Message Signatures by that key. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
 
 **Super user** — The bootstrapped user created on first login to a fresh HappyView instance. The super user has unrestricted access to all endpoints regardless of permissions, can transfer super status to another user, and cannot be deleted.
-
-**Target collection** — The record collection that a query or procedure lexicon operates on. Set via the `target_collection` field when uploading a lexicon.

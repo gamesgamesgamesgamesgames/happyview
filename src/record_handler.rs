@@ -104,7 +104,6 @@ mod tests {
     use crate::catalog::LexiconWrite;
     use crate::db::adapt_sql;
     use crate::lexicon::ParsedLexicon;
-    use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::project::{ProjectLexicon, ProjectSnapshot};
     use crate::test_support::test_state_with_pool;
@@ -222,8 +221,6 @@ mod tests {
                 "defs": {"main": {"type": "record", "key": "tid"}},
             }),
             1,
-            Some(NSID.to_string()),
-            ProcedureAction::Upsert,
             None,
         )
         .expect("parse test lexicon");
@@ -374,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn identical_redelivery_is_a_no_op_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -431,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_edit_is_restamped_by_the_identical_echo_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -927,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn an_older_rev_never_overwrites_a_newer_one_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -945,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_leaves_a_tombstone_that_blocks_resurrection_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1053,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_with_no_row_still_tombstones_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1127,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn an_unversioned_delete_tombstones_the_stored_rev_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1158,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_waits_for_a_concurrent_tombstone_on_postgres() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         register_tracked_lexicon(&state).await;
@@ -1257,8 +1254,6 @@ mod tests {
                 LexiconWrite {
                     lexicon_json: net_json("v1"),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some(AUTHORITY.to_string()),
                     indexed: true,
@@ -1339,14 +1334,7 @@ mod tests {
         snap.lexicons.insert(
             NET.to_string(),
             ProjectLexicon {
-                parsed: crate::lexicon::ParsedLexicon::parse(
-                    net_json("file"),
-                    0,
-                    None,
-                    ProcedureAction::Upsert,
-                    None,
-                )
-                .unwrap(),
+                parsed: crate::lexicon::ParsedLexicon::parse(net_json("file"), 0, None).unwrap(),
                 path: "src/lexicons/com/example/net.json".into(),
                 backfill: false,
                 indexed: true,
@@ -1388,8 +1376,6 @@ mod tests {
                 crate::catalog::LexiconWrite {
                     lexicon_json: schema_event("create").record.unwrap(),
                     backfill: false,
-                    target_collection: None,
-                    action: ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: Some("did:plc:abc".to_string()),
                     indexed: true,
@@ -1464,7 +1450,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_postgres_cannot_store_is_invalid() {
         let Some(state) = crate::test_support::test_state_from_env().await else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if state.db_backend != crate::db::DatabaseBackend::Postgres {

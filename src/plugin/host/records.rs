@@ -538,6 +538,31 @@ pub struct NetworkWrite<'a> {
 /// Which step of a mirror failed; see [`crate::record_store::LocalWriteError`].
 pub type MirrorError = crate::record_store::LocalWriteError;
 
+/// Whether a PDS's answer `uri` names the record a write was sent for: in
+/// `did`'s repo, in `collection`, at a valid record key, and at `rkey` when
+/// the caller chose one. A mirrored row is keyed by that `uri`, so an answer
+/// naming anything else must not be mirrored.
+pub(crate) fn reply_names_written(
+    uri: &str,
+    did: &str,
+    collection: &str,
+    rkey: Option<&str>,
+) -> bool {
+    let Some(path) = uri.strip_prefix("at://") else {
+        return false;
+    };
+    let mut parts = path.split('/');
+    let (Some(d), Some(c), Some(k), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    d == did
+        && c == collection
+        && atrium_api::types::string::RecordKey::new(k.to_string()).is_ok()
+        && rkey.is_none_or(|r| r == k)
+}
+
 /// Reflect a write the caller just made to their PDS into the local index, so
 /// a script that writes and then reads its own record sees it before Jetstream
 /// echoes it back.
@@ -595,6 +620,21 @@ pub async fn lexicon_get(lexicons: &crate::catalog::LexiconCatalog, nsid: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_names_only_the_record_written() {
+        let names = |uri, rkey| reply_names_written(uri, "did:plc:a", "app.test.rec", rkey);
+        assert!(names("at://did:plc:a/app.test.rec/1", Some("1")));
+        assert!(names("at://did:plc:a/app.test.rec/3kgen", None));
+        assert!(!names("at://did:plc:b/app.test.rec/1", Some("1")));
+        assert!(!names("at://did:plc:a/app.test.other/1", Some("1")));
+        assert!(!names("at://did:plc:a/app.test.rec/2", Some("1")));
+        assert!(!names("at://did:plc:a/app.test.rec/a/b", None));
+        assert!(!names("at://did:plc:a/app.test.rec/", None));
+        assert!(!names("at://did:plc:a/app.test.rec/..", None));
+        assert!(!names("at://did:plc:a/app.test.rec/sp ace", None));
+        assert!(!names("https://did:plc:a/app.test.rec/1", None));
+    }
     use crate::db::DatabaseBackend::{Postgres, Sqlite};
     use happyview_plugin_sdk::wire::{
         BacklinksQuery, Condition, Filter, RecordsCount, RecordsQuery, RecordsSearch, Sort,
@@ -1596,7 +1636,7 @@ mod tests {
                 let backend = DatabaseBackend::from_url(&url);
                 out.push((crate::db::connect(&url, backend).await, backend));
             }
-            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+            Err(_) => crate::test_support::unavailable(crate::test_support::NO_DATABASE),
         }
         out
     }

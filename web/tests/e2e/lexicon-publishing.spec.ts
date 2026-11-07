@@ -12,6 +12,7 @@ import {
   restoreServiceIdentity,
   setServiceIdentityMode,
   snapshotServiceIdentity,
+  DB_URL,
 } from "./auth-helper";
 
 /**
@@ -38,7 +39,6 @@ const NO_SESSION_REASON =
   "the attached account needs to sign in again from Service Identity";
 const SCHEMA_SCOPE =
   "atproto repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 
 /**
  * A session row for the attached account carrying the schema scope, which is

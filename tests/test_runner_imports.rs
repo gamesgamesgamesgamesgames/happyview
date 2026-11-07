@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use happyview::catalog::{LexiconWrite, ScriptWrite};
-use happyview::lexicon::ProcedureAction;
 use happyview::plugin::{
     ExecutionError, PluginRegistry, ScriptExecuteInput, ScriptExecuteOutput, TestStatus,
     WasmRuntime,
@@ -25,7 +24,7 @@ use common::echo_interpreter;
 
 async fn env() -> Option<TestEnv> {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return None;
     }
     let registry = Arc::new(PluginRegistry::new());
@@ -106,8 +105,6 @@ async fn a_query_served_on_a_test_state_cannot_reach_the_harness() {
             LexiconWrite {
                 lexicon_json: common::fixtures::list_games_query_lexicon(),
                 backfill: false,
-                target_collection: Some("games.gamesgamesgamesgames.game".into()),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,
@@ -180,7 +177,7 @@ async fn a_report_lands_on_the_files_harness() {
 #[tokio::test]
 async fn the_test_imports_refuse_an_interpreter_without_script_test() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let mut plugin = echo_interpreter::plugin("echo");
@@ -868,18 +865,16 @@ fn procedure_lexicon() -> LexiconWrite {
             "input": {"encoding": "application/json", "schema": {"type": "object", "properties": {}}},
         }}}),
         backfill: false,
-        target_collection: Some(COLLECTION.into()),
-        action: ProcedureAction::Create,
         token_cost: None,
         authority_did: None,
         indexed: true,
     }
 }
 
-/// A forged caller has no OAuth session, so a scriptless procedure fired as
-/// one writes only because a test run answers it from the in-process PDS.
+/// A procedure fired from a test file with no script to run answers the 501
+/// naming its trigger, and writes nothing to the in-process PDS.
 #[tokio::test]
-async fn a_scriptless_procedure_fired_as_a_caller_writes_through_the_test_pds() {
+async fn a_procedure_without_a_script_fired_as_a_caller_names_the_missing_script() {
     let Some(env) = env().await else { return };
     let file = file_with_handlers(&env).await;
     let state = &file.state;
@@ -901,22 +896,9 @@ async fn a_scriptless_procedure_fired_as_a_caller_writes_through_the_test_pds() 
     )
     .await;
     let result = &got[0]["ok"];
-    assert_eq!(result["status"], 200, "{got:?}");
-
-    let writes = file.harness.pds().writes();
-    assert_eq!(writes.len(), 1, "{writes:?}");
-    assert_eq!(writes[0].repo, "did:plc:alice");
-    assert_eq!(writes[0].collection, COLLECTION);
-    let uri = result["body"]["uri"]
-        .as_str()
-        .expect("the PDS's uri is answered");
-    let (cid,): (String,) =
-        happyview::db::query_as("SELECT cid FROM happyview_records WHERE uri = ?")
-            .bind(uri)
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-    assert_eq!(result["body"]["cid"], cid);
+    assert_eq!(result["status"], 501, "{got:?}");
+    assert_eq!(result["body"]["error"], "MethodNotImplemented", "{got:?}");
+    assert!(file.harness.pds().writes().is_empty());
     file.finish().await;
 }
 
@@ -960,7 +942,7 @@ async fn a_procedure_fired_with_delegate_did_is_refused_by_name() {
 
 async fn env_with_fixtures(fixtures: &[&str]) -> Option<TestEnv> {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return None;
     }
     let registry = Arc::new(PluginRegistry::new());

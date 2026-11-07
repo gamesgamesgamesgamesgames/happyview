@@ -1,19 +1,35 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
+import Link from "next/link";
 import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
 
+import { useAccessGrant } from "@/hooks/use-access-grant";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
+import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { AccountName } from "@/components/account-name";
+import { blobCids } from "@/lib/blob-refs";
 import { toastError } from "@/lib/format";
 import {
+  ApiError,
+  SPACE_ACCESS_GRANT_REQUIRED,
   adminSpaceBlobUrl,
   getAdminSpace,
   getAdminSpaceRecords,
+  getSpaceAccess,
+  getInspectorStatus,
 } from "@/lib/api";
-import type { AdminSpaceDetail, AdminSpaceRecord } from "@/types/spaces";
+import type {
+  AdminSpaceDetail,
+  AdminSpaceRecord,
+  InspectorStatus,
+} from "@/types/spaces";
 import { CodeBlock } from "@/components/code-block";
 import { SiteHeader } from "@/components/site-header";
+import { AccessGrantBanner } from "@/components/spaces/access-grant-banner";
+import { AccessGrantDialog } from "@/components/spaces/access-grant-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -46,7 +62,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-const ALL = "__all__";
+import { ALL, stateForGrant } from "./records-state";
+
 const PAGE_SIZE = 20;
 
 const POLICY_LABELS: Record<string, string> = {
@@ -60,21 +77,6 @@ const POLICY_LABELS: Record<string, string> = {
 function policyLabel(type: string): string {
   const name = type.split("#").pop() ?? type;
   return POLICY_LABELS[name] ?? name;
-}
-
-/** CIDs of the blob refs anywhere in a record. */
-function blobCids(value: unknown, found: string[] = []): string[] {
-  if (Array.isArray(value)) {
-    for (const item of value) blobCids(item, found);
-  } else if (value && typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const ref = obj.ref as Record<string, unknown> | undefined;
-    if (obj.$type === "blob" && typeof ref?.$link === "string") {
-      found.push(ref.$link);
-    }
-    for (const child of Object.values(obj)) blobCids(child, found);
-  }
-  return found;
 }
 
 function Field({
@@ -92,18 +94,19 @@ function Field({
   );
 }
 
-export default function SpaceDetail() {
+function SpaceDetailContent() {
   const pathname = usePathname();
   const id = decodeURIComponent(
     pathname.split("/").filter(Boolean).pop() ?? "",
   );
   const { hasPermission } = useCurrentUser();
-  const canReadRecords = hasPermission("spaces:manage-records");
+  const canInspect = hasPermission("spaces:inspect");
+  const canManageSettings = hasPermission("settings:manage");
 
   const [detail, setDetail] = useState<AdminSpaceDetail | null>(null);
+  const [inspector, setInspector] = useState<InspectorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const [showRecords, setShowRecords] = useState(false);
   const [collection, setCollection] = useState(ALL);
   const [repo, setRepo] = useState(ALL);
   const [records, setRecords] = useState<AdminSpaceRecord[]>([]);
@@ -111,15 +114,48 @@ export default function SpaceDetail() {
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [loading, setLoading] = useState(false);
   const [viewRecord, setViewRecord] = useState<AdminSpaceRecord | null>(null);
+  const [requestOpen, setRequestOpen] = useState(false);
 
   useEffect(() => {
     getAdminSpace(id)
       .then(setDetail)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    getInspectorStatus()
+      .then(setInspector)
+      .catch(() => setInspector(null));
   }, [id]);
+
+  const memberDids = useMemo(
+    () => detail?.members.map((m) => m.did) ?? [],
+    [detail],
+  );
+  // The server picks the covering grant: a space grant if there is one, or an
+  // account grant for a member or author of this space.
+  const access = useAccessGrant(
+    id,
+    () => getSpaceAccess(id).then((r) => r.grant),
+    Boolean(detail && inspector?.enabled && canInspect),
+  );
+  // The author filter lists members, plus the account an account grant covers
+  // when that account authored records here without being a member.
+  const accountTarget =
+    access.grant?.scope === "account" ? access.grant.target : null;
+  const authorOptions = useMemo(
+    () =>
+      accountTarget && !memberDids.includes(accountTarget)
+        ? [...memberDids, accountTarget]
+        : memberDids,
+    [memberDids, accountTarget],
+  );
+
+  // Bumped by each records request and each change of grant or space; a
+  // response for an older request is dropped, so records fetched under a
+  // broader grant can't replace what the current grant covers.
+  const recordsRequest = useRef(0);
 
   const fetchRecords = useCallback(
     async (filters: { collection: string; repo: string }, cursor?: string) => {
+      const request = ++recordsRequest.current;
       setLoading(true);
       try {
         const data = await getAdminSpaceRecords(id, {
@@ -129,9 +165,18 @@ export default function SpaceDetail() {
           limit: PAGE_SIZE,
           cursor,
         });
+        if (request !== recordsRequest.current) return;
         setRecords(data.records);
         setNextCursor(data.cursor);
       } catch (e: unknown) {
+        if (request !== recordsRequest.current) return;
+        if (
+          e instanceof ApiError &&
+          e.message === SPACE_ACCESS_GRANT_REQUIRED
+        ) {
+          access.drop();
+          return;
+        }
         toastError("Failed to load records", e);
         setRecords([]);
         setNextCursor(undefined);
@@ -139,19 +184,31 @@ export default function SpaceDetail() {
         setLoading(false);
       }
     },
-    [id],
+    // access.drop is stable; the rest of `access` isn't needed here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [id, access.drop],
   );
+
+  useEffect(() => {
+    recordsRequest.current += 1;
+    const next = stateForGrant(access.grant, collection);
+    setRecords(next.records);
+    setNextCursor(next.nextCursor);
+    setCursorStack(next.cursorStack);
+    setViewRecord(next.viewRecord);
+    if (!next.filters) return;
+    setRepo(next.filters.repo);
+    fetchRecords(next.filters);
+    // Reload only when the grant or the space changes; filter changes go
+    // through applyFilters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [access.grant?.id, id]);
 
   function applyFilters(filters: { collection: string; repo: string }) {
     setCollection(filters.collection);
     setRepo(filters.repo);
     setCursorStack([]);
     fetchRecords(filters);
-  }
-
-  function handleShowRecords() {
-    setShowRecords(true);
-    fetchRecords({ collection, repo });
   }
 
   function handleNext() {
@@ -206,14 +263,10 @@ export default function SpaceDetail() {
               <span className="font-mono text-xs">{space.type}</span>
             </Field>
             <Field label="Creator">
-              <span className="font-mono text-xs break-all">
-                {space.creator_did}
-              </span>
+              <AccountName did={space.creator_did} />
             </Field>
             <Field label="Authority">
-              <span className="font-mono text-xs break-all">
-                {space.authority_did}
-              </span>
+              <AccountName did={space.authority_did} />
             </Field>
             <Field label="Created">
               {new Date(space.created_at).toLocaleString()}
@@ -258,8 +311,13 @@ export default function SpaceDetail() {
                   <TableBody>
                     {members.map((member) => (
                       <TableRow key={member.did}>
-                        <TableCell className="font-mono text-xs break-all">
-                          {member.did}
+                        <TableCell>
+                          <Link
+                            href={`/dashboard/spaces/account/?did=${encodeURIComponent(member.did)}`}
+                            className="underline underline-offset-2"
+                          >
+                            <AccountName did={member.did} />
+                          </Link>
                         </TableCell>
                         <TableCell className="flex gap-1">
                           {member.read && <Badge variant="outline">read</Badge>}
@@ -308,25 +366,55 @@ export default function SpaceDetail() {
           </Card>
         </div>
 
-        {canReadRecords && (
+        {canInspect && (
           <Card>
             <CardHeader>
               <CardTitle>Records</CardTitle>
-              <CardDescription>
-                This space is private to its members. Each time you load its
-                records or open a blob, the read is recorded in the event log
-                under your account.
-              </CardDescription>
-              {!showRecords && (
-                <CardAction>
-                  <Button variant="outline" onClick={handleShowRecords}>
-                    Show records
-                  </Button>
-                </CardAction>
-              )}
+              {!inspector?.enabled ? (
+                <>
+                  <CardDescription>
+                    The space inspector is turned off on this instance.
+                  </CardDescription>
+                  {canManageSettings && (
+                    <CardAction>
+                      <Button variant="outline" asChild>
+                        <Link href="/dashboard/settings/general/">
+                          Open settings
+                        </Link>
+                      </Button>
+                    </CardAction>
+                  )}
+                </>
+              ) : !access.grant ? (
+                <>
+                  <CardDescription>
+                    This space is private to its members. To read its records,
+                    request access and give a reason. Access expires, and the
+                    reason and every read are logged.
+                  </CardDescription>
+                  <CardAction>
+                    <Button
+                      variant="outline"
+                      onClick={() => setRequestOpen(true)}
+                    >
+                      Request access
+                    </Button>
+                  </CardAction>
+                </>
+              ) : null}
             </CardHeader>
-            {showRecords && (
+            {inspector?.enabled && access.grant && (
               <CardContent className="flex flex-col gap-4">
+                <AccessGrantBanner
+                  grant={access.grant}
+                  remainingMs={access.remainingMs}
+                  onEnd={() =>
+                    access
+                      .end()
+                      .catch((e) => toastError("Couldn't end access", e))
+                  }
+                />
+
                 <div className="flex flex-wrap items-center gap-2">
                   <Select
                     value={collection}
@@ -351,6 +439,7 @@ export default function SpaceDetail() {
                   </Select>
                   <Select
                     value={repo}
+                    disabled={access.grant.scope === "account"}
                     onValueChange={(value) =>
                       applyFilters({ collection, repo: value })
                     }
@@ -363,9 +452,9 @@ export default function SpaceDetail() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL}>All authors</SelectItem>
-                      {members.map((member) => (
-                        <SelectItem key={member.did} value={member.did}>
-                          {member.did}
+                      {authorOptions.map((did) => (
+                        <SelectItem key={did} value={did}>
+                          <AccountName did={did} />
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -393,14 +482,23 @@ export default function SpaceDetail() {
                           className="cursor-pointer"
                           onClick={() => setViewRecord(record)}
                         >
-                          <TableCell className="font-mono text-xs whitespace-nowrap">
-                            {record.did}
+                          <TableCell className="whitespace-nowrap">
+                            <AccountName did={record.did} />
                           </TableCell>
                           <TableCell className="font-mono text-xs">
                             {record.collection}
                           </TableCell>
                           <TableCell className="font-mono text-xs">
-                            {record.rkey}
+                            <button
+                              type="button"
+                              className="underline-offset-2 hover:underline focus-visible:underline"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewRecord(record);
+                              }}
+                            >
+                              {record.rkey}
+                            </button>
                           </TableCell>
                           <TableCell className="text-xs whitespace-nowrap">
                             {new Date(record.indexed_at).toLocaleString()}
@@ -462,9 +560,7 @@ export default function SpaceDetail() {
                       </Field>
                     </div>
                     <Field label="Author">
-                      <span className="font-mono text-xs break-all">
-                        {viewRecord.did}
-                      </span>
+                      <AccountName did={viewRecord.did} />
                     </Field>
                     <Field label="Collection">
                       <span className="font-mono text-xs">
@@ -511,7 +607,39 @@ export default function SpaceDetail() {
             )}
           </SheetContent>
         </Sheet>
+
+        {inspector && detail && (
+          <AccessGrantDialog
+            open={requestOpen}
+            onOpenChange={setRequestOpen}
+            maxMinutes={inspector.max_grant_minutes}
+            defaultMinutes={inspector.default_grant_minutes}
+            scopeOptions={[
+              {
+                scope: "space",
+                target: id,
+                label: "This space: every record and blob, from every author",
+              },
+              ...memberDids.map((did) => ({
+                scope: "account" as const,
+                target: did,
+                label: (
+                  <>
+                    One account, in every space: <AccountName did={did} />
+                  </>
+                ),
+              })),
+            ]}
+            onGranted={(g) => access.setGrant(g)}
+          />
+        )}
       </div>
     </>
   );
+}
+
+export default function SpaceDetail() {
+  const { features } = useConfig();
+  if (!features.space_inspector) return <InspectorDisabled title="Space" />;
+  return <SpaceDetailContent />;
 }

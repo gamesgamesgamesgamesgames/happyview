@@ -798,6 +798,32 @@ pub struct CallerBlobUpload {
     pub mime_type: String,
 }
 
+/// The calling user's account as their PDS reports it, from
+/// `com.atproto.server.getSession`. Needs `caller:read`. The email address is
+/// not here: it needs its own capability, `caller:email`, and
+/// [`CallerEmail`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerAccount {
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
+/// The calling user's email address as their PDS reports it, from
+/// `com.atproto.server.getSession`. Needs `caller:email`.
+///
+/// Both fields are present only when the account has an address and the
+/// user's sign-in granted it: the reference PDS releases it under
+/// `transition:email` or the granular `account:email`. A PDS that withholds
+/// it is not an error; both fields are then absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallerEmail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_confirmed: Option<bool>,
+}
+
 /// An XRPC query issued as the calling script's user. Needs `caller:read`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallerXrpcQuery {
@@ -1804,6 +1830,41 @@ pub enum ExecuteOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chunk: Option<String>,
     },
+}
+
+/// An [`ExecuteOutput`] plus what the run cost, as `execute` sends it. The
+/// output's keys sit at the top level beside `instructions_used`, so a host
+/// that reads a bare [`ExecuteOutput`] ignores the extra key, and a report
+/// from an interpreter that never sets it reads as `None`. A handler may
+/// return either type: an `ExecuteOutput` becomes a report with nothing
+/// counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecuteReport {
+    #[serde(flatten)]
+    pub output: ExecuteOutput,
+    /// Instructions the interpreter executed, in its own unit. Omitted when it
+    /// did not count them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_used: Option<u64>,
+}
+
+impl From<ExecuteOutput> for ExecuteReport {
+    fn from(output: ExecuteOutput) -> Self {
+        ExecuteReport {
+            output,
+            instructions_used: None,
+        }
+    }
+}
+
+impl ExecuteOutput {
+    /// This output with the instructions the run used.
+    pub fn with_instructions(self, instructions_used: Option<u64>) -> ExecuteReport {
+        ExecuteReport {
+            output: self,
+            instructions_used,
+        }
+    }
 }
 
 /// What a chunk is for. A handler must define `handle`; a module and a test
@@ -4804,6 +4865,46 @@ mod interpreter_tests {
             .unwrap(),
             error
         );
+    }
+
+    #[test]
+    fn an_execute_report_reads_both_ways_across_the_instructions_field() {
+        let error = ExecuteOutput::Error {
+            kind: ScriptErrorKind::Timeout,
+            message: "script exceeded execution limit".to_string(),
+            line: Some(3),
+            raw: "instruction limit".to_string(),
+            chunk: Some("script".to_string()),
+        };
+        for output in [
+            ExecuteOutput::Returned {
+                value: json!({"rows": [1, 2.5, "three", null]}),
+                value_kind: ScriptValueKind::Object,
+            },
+            error,
+        ] {
+            let counted = output.clone().with_instructions(Some(1_234));
+            let value = serde_json::to_value(&counted).unwrap();
+            assert_eq!(value["instructions_used"], 1_234);
+            assert_eq!(
+                serde_json::from_value::<ExecuteReport>(value.clone()).unwrap(),
+                counted
+            );
+            // A host that predates the field reads the same output.
+            assert_eq!(
+                serde_json::from_value::<ExecuteOutput>(value).unwrap(),
+                output
+            );
+
+            // An interpreter that predates it sends the bare output.
+            let bare = serde_json::to_value(&output).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ExecuteReport>(bare).unwrap(),
+                ExecuteReport::from(output.clone())
+            );
+            let uncounted = serde_json::to_value(ExecuteReport::from(output)).unwrap();
+            assert!(uncounted.get("instructions_used").is_none(), "{uncounted}");
+        }
     }
 
     #[test]

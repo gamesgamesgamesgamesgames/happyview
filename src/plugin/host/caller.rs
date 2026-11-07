@@ -16,11 +16,12 @@ use crate::auth::Claims;
 use crate::error::AppError;
 
 use happyview_plugin_sdk::wire::{
-    CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, RecordRef,
+    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
+    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, RecordRef,
 };
 
 use crate::plugin::caller::{CallerSession, check_writable_repo};
+use crate::repo::PdsAuth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CallerError {
@@ -31,6 +32,9 @@ pub enum CallerError {
     Auth(String),
     #[error("{0}")]
     WritableRepo(String),
+    /// There is a session, but not one this call may act with.
+    #[error("{0}")]
+    NoSession(String),
     #[error("PDS returned {status}: {body}")]
     Pds { status: u16, body: String },
     #[error("XRPC returned {status}: {body}")]
@@ -49,6 +53,7 @@ impl CallerError {
         match self {
             Self::Auth(_) => "AUTH_REQUIRED",
             Self::WritableRepo(_) => "WRITABLE_REPO",
+            Self::NoSession(_) => "NO_SESSION",
             Self::Pds { .. } => "PDS_ERROR",
             Self::Xrpc { .. } => "XRPC_ERROR",
             Self::Validation(_) => "BAD_INPUT",
@@ -203,7 +208,12 @@ pub async fn create_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.createRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &spec.collection,
+        rkey: spec.rkey.as_deref(),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -229,7 +239,12 @@ pub async fn put_record(
     );
     let result = post(caller, &repo, "com.atproto.repo.putRecord", &body).await?;
     let reference = record_ref(&result)?;
-    mirror_write(caller, &reference, &record).await;
+    let written = Written {
+        repo: &repo,
+        collection: &collection,
+        rkey: Some(&rkey),
+    };
+    mirror_write(caller, written, &reference, &record).await;
     Ok(reference)
 }
 
@@ -249,12 +264,42 @@ pub async fn delete_record(
     Ok(())
 }
 
+/// Where a write was sent: the repo and collection, and the record key when
+/// the caller chose one.
+#[derive(Clone, Copy)]
+struct Written<'a> {
+    repo: &'a str,
+    collection: &'a str,
+    rkey: Option<&'a str>,
+}
+
 /// The PDS has accepted the write, so the index is told what it holds.
 /// A mirror that fails leaves the index stale until Jetstream echoes the
 /// record; it never turns an accepted write into an error the script would
 /// have to undo.
-async fn mirror_write(caller: &CallerSession, reference: &RecordRef, record: &Value) {
+async fn mirror_write(
+    caller: &CallerSession,
+    written: Written<'_>,
+    reference: &RecordRef,
+    record: &Value,
+) {
     let state = &caller.app_state;
+    // The row is keyed by what the PDS answered, which only the write itself
+    // vouches for. An answer naming any other record is not indexed.
+    if !super::records::reply_names_written(
+        &reference.uri,
+        written.repo,
+        written.collection,
+        written.rkey,
+    ) {
+        tracing::warn!(
+            uri = %reference.uri,
+            repo = written.repo,
+            collection = written.collection,
+            "the PDS answered a write with another record's uri; its index row is not written"
+        );
+        return;
+    }
     let (did, collection, rkey) = match parse_at_uri(&reference.uri) {
         Ok(parts) => parts,
         Err(e) => {
@@ -300,15 +345,120 @@ pub async fn upload_blob(
     caller: &CallerSession,
     spec: CallerBlobUpload,
 ) -> Result<Value, CallerError> {
+    // A blob goes to the repo a record write would default to, so a record
+    // a delegated script writes can reference it.
+    let repo = caller.default_repo();
     crate::repo::upload_blob_to_pds(
         &caller.app_state,
-        &caller.did,
-        &caller.pds_auth,
+        repo,
+        auth_for(caller, repo)?,
         &spec.mime_type,
         Bytes::from(spec.bytes),
     )
     .await
     .map_err(pds_failure)
+}
+
+/// The caller's account as their PDS reports it: the DID and handle, and
+/// nothing else `getSession` returns. The email address has its own import
+/// and capability, [`get_email`].
+pub async fn get_session(
+    caller: &CallerSession,
+    _spec: Value,
+) -> Result<CallerAccount, CallerError> {
+    let body = own_session(caller).await?;
+    Ok(CallerAccount {
+        did: caller.did.clone(),
+        handle: session_text(&body, "handle"),
+    })
+}
+
+/// The caller's email address and whether it is confirmed, as their PDS
+/// reports it. Behind `caller:email` rather than `caller:read`, so a plugin
+/// that starts reading it has a capability to declare and a new consent to
+/// ask for.
+pub async fn get_email(caller: &CallerSession, _spec: Value) -> Result<CallerEmail, CallerError> {
+    let body = own_session(caller).await?;
+    Ok(email_from_session(&body))
+}
+
+/// `com.atproto.server.getSession` as the caller, checked against the account
+/// the session belongs to.
+///
+/// A service-auth caller is refused. Its token proves who it is acting for,
+/// but it carries no credentials of its own, so the runner lends it the
+/// user's own sign-in to this instance. Writes have long worked that way, but
+/// the user never handed that sign-in to the calling service, and their
+/// account details aren't the service's to read through it.
+async fn own_session(caller: &CallerSession) -> Result<Value, CallerError> {
+    if caller.claims.service_auth_lxm().is_some() {
+        return Err(CallerError::NoSession(
+            "a service-auth caller's account can't be read: the session it runs with is \
+             the user's own sign-in to this instance, not one the calling service holds"
+                .into(),
+        ));
+    }
+    let response = caller
+        .pds_auth
+        .get_with_headers(
+            &caller.app_state,
+            &caller.did,
+            "com.atproto.server.getSession",
+            "",
+            &[],
+        )
+        .await
+        .map_err(pds_failure)?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|e| CallerError::Pds {
+        status: 0,
+        body: e.to_string(),
+    })?;
+    if !status.is_success() {
+        return Err(CallerError::Pds {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        });
+    }
+    let body: Value = serde_json::from_slice(&bytes).map_err(|e| CallerError::Pds {
+        status: status.as_u16(),
+        body: format!("getSession answered with something that isn't JSON: {e}"),
+    })?;
+    check_session_did(&caller.did, &body)?;
+    Ok(body)
+}
+
+/// A `getSession` body naming a different account, or none, is refused rather
+/// than believed.
+fn check_session_did(did: &str, body: &Value) -> Result<(), CallerError> {
+    match session_text(body, "did") {
+        Some(reported) if reported == did => Ok(()),
+        other => Err(CallerError::Pds {
+            status: 200,
+            body: format!(
+                "getSession named {} rather than the caller, {did}",
+                other.as_deref().unwrap_or("no account")
+            ),
+        }),
+    }
+}
+
+fn session_text(body: &Value, key: &str) -> Option<String> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The address, and its confirmation only alongside one.
+fn email_from_session(body: &Value) -> CallerEmail {
+    let email = session_text(body, "email");
+    CallerEmail {
+        email_confirmed: email
+            .as_ref()
+            .and_then(|_| body.get("emailConfirmed").and_then(Value::as_bool)),
+        email,
+    }
 }
 
 /// Unlike every other `host_caller_*` import, this one runs with no
@@ -374,14 +524,22 @@ async fn check_against_lexicon(
     validate_required_fields(record, &schema).map_err(CallerError::Validation)
 }
 
+fn auth_for<'a>(caller: &'a CallerSession, repo: &str) -> Result<&'a PdsAuth, CallerError> {
+    caller.auth_for(repo).map_err(|did| {
+        CallerError::NoSession(format!(
+            "{did} has no session with this app, so nothing can sign a write to its \
+             repo; the account has to sign in to the app again"
+        ))
+    })
+}
+
 async fn post(
     caller: &CallerSession,
     repo: &str,
     method: &str,
     body: &Value,
 ) -> Result<Value, CallerError> {
-    let response = caller
-        .pds_auth
+    let response = auth_for(caller, repo)?
         .post_json(&caller.app_state, repo, method, body)
         .await
         .map_err(pds_failure)?;
@@ -657,6 +815,281 @@ mod tests {
         assert_eq!(CallerError::Other("boom".into()).code(), "HOST_ERROR");
     }
 
+    /// The account and the address are read from the same body but handed
+    /// out separately, the confirmation only alongside an address, and a body
+    /// naming another account, or none, is refused.
+    #[test]
+    fn a_session_is_split_into_the_account_and_its_email() {
+        let full = json!({
+            "did": "did:plc:me", "handle": "me.test", "email": "me@example.com",
+            "emailConfirmed": true, "emailAuthFactor": false, "active": true,
+            "didDoc": {"id": "did:plc:me"},
+        });
+        check_session_did("did:plc:me", &full).unwrap();
+        assert_eq!(
+            serde_json::to_value(email_from_session(&full)).unwrap(),
+            json!({"email": "me@example.com", "email_confirmed": true})
+        );
+
+        // Neither transition:email nor account:email: the PDS leaves the
+        // address out.
+        let bare = json!({"did": "did:plc:me", "handle": "me.test"});
+        assert_eq!(
+            serde_json::to_value(email_from_session(&bare)).unwrap(),
+            json!({})
+        );
+        // A confirmation flag with no address means nothing.
+        let flag_only = json!({"did": "did:plc:me", "email": "", "emailConfirmed": true});
+        assert_eq!(email_from_session(&flag_only), CallerEmail::default());
+
+        for body in [
+            json!({"did": "did:plc:other"}),
+            json!({"handle": "me.test"}),
+        ] {
+            let err = check_session_did("did:plc:me", &body).unwrap_err();
+            assert_eq!(err.code(), "PDS_ERROR", "{body}");
+        }
+    }
+
+    /// A service-auth caller runs with the user's own sign-in to this
+    /// instance, lent by the runner, so neither its account nor its address is
+    /// read: both are refused before anything reaches a PDS. (The in-process
+    /// PDS would answer `not_served`, a `PDS_ERROR`, had the call got there.)
+    #[tokio::test]
+    async fn a_service_auth_caller_reads_no_account() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "a.test.lua",
+        )));
+        for lxm in [None, Some("app.test.doThing".to_string())] {
+            let caller = CallerSession {
+                did: "did:plc:alice".into(),
+                delegate_did: None,
+                claims: std::sync::Arc::new(Claims::service_auth_for_test(
+                    "did:plc:alice".into(),
+                    lxm,
+                )),
+                pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
+                app_state: state.clone(),
+                delegate_pds_auth: None,
+            };
+            let err = get_session(&caller, json!({})).await.unwrap_err();
+            assert_eq!(err.code(), "NO_SESSION", "{err}");
+            let err = get_email(&caller, json!({})).await.unwrap_err();
+            assert_eq!(err.code(), "NO_SESSION", "{err}");
+        }
+    }
+
+    /// A stub `atrium_oauth` session, as `plugin::host::jobs`'s tests build
+    /// one, whose PDS is the returned mock server: the dashboard's cookie
+    /// path, which acts with `PdsAuth::OAuth` rather than DPoP.
+    async fn cookie_caller(did: &str) -> (CallerSession, wiremock::MockServer) {
+        use atrium_common::store::Store;
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let pds = wiremock::MockServer::start().await;
+        let pds_url = pds.uri();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/oauth-authorization-server",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": pds_url,
+                "authorization_endpoint": format!("{pds_url}/authorize"),
+                "token_endpoint": format!("{pds_url}/token"),
+                "scopes_supported": ["atproto"],
+                "response_types_supported": ["code"],
+            })))
+            .mount(&pds)
+            .await;
+        let dpop_key = crate::oauth::client_keys::generate_client_key("test")
+            .unwrap()
+            .private_jwk;
+        let session: atrium_oauth::store::session::Session = serde_json::from_value(json!({
+            "dpop_key": dpop_key,
+            "token_set": {
+                "iss": pds_url, "sub": did, "aud": pds_url, "scope": null,
+                "refresh_token": null, "access_token": "cookie-access-token",
+                "token_type": "DPoP", "expires_at": null,
+            },
+        }))
+        .unwrap();
+        let store = crate::auth::oauth_store::DbSessionStore::new_with_table(
+            state.db.clone(),
+            state.db_backend,
+            crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+            state.config.keyring(),
+        );
+        let did_value = atrium_api::types::string::Did::new(did.to_string()).unwrap();
+        Store::set(&store, did_value.clone(), session)
+            .await
+            .unwrap();
+        let session = state.linked_repos_client.restore(&did_value).await.unwrap();
+        let caller = CallerSession {
+            did: did.to_string(),
+            delegate_did: None,
+            claims: std::sync::Arc::new(Claims::internal(did.to_string())),
+            pds_auth: std::sync::Arc::new(crate::repo::PdsAuth::OAuth(std::sync::Arc::new(
+                session,
+            ))),
+            app_state: state,
+            delegate_pds_auth: None,
+        };
+        (caller, pds)
+    }
+
+    fn write_reply(method: &str, uri: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/xrpc/{method}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({ "uri": uri, "cid": "bafyreply" })),
+            )
+            .up_to_n_times(1)
+    }
+
+    async fn indexed(caller: &CallerSession, uri: &str) -> bool {
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT uri FROM happyview_records WHERE uri = ?")
+                .bind(uri)
+                .fetch_optional(&caller.app_state.db)
+                .await
+                .unwrap();
+        row.is_some()
+    }
+
+    /// The index row is keyed by the PDS's answer, so an answer naming any
+    /// record but the one written must not be indexed: another account's, in
+    /// another collection, or at another key than the caller chose.
+    #[tokio::test]
+    async fn a_reply_naming_another_record_is_not_indexed() {
+        let (caller, pds) = cookie_caller("did:plc:alice").await;
+        let create = |rkey: &str| -> CallerRecordCreate {
+            serde_json::from_value(json!({
+                "collection": "app.test.rec", "rkey": rkey,
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap()
+        };
+
+        let elsewhere = [
+            "at://did:plc:victim/app.test.rec/1",
+            "at://did:plc:alice/app.test.other/1",
+            "at://did:plc:alice/app.test.rec/2",
+        ];
+        for uri in elsewhere {
+            write_reply("com.atproto.repo.createRecord", uri)
+                .mount(&pds)
+                .await;
+            create_record(&caller, create("1")).await.unwrap();
+            assert!(!indexed(&caller, uri).await, "{uri} was indexed");
+        }
+
+        // With no rkey chosen, the PDS picks one, but it must still be one.
+        let no_rkey: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.test.rec", "record": {"text": "hi"}, "validate": false,
+        }))
+        .unwrap();
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/a/b",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, no_rkey.clone()).await.unwrap();
+        let rows: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records WHERE uri LIKE 'at://did:plc:alice/app.test.rec/a%'",
+        )
+        .fetch_one(&caller.app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(rows.0, 0, "a malformed record key was indexed");
+
+        write_reply(
+            "com.atproto.repo.putRecord",
+            "at://did:plc:victim/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        put_record(
+            &caller,
+            serde_json::from_value(json!({
+                "uri": "at://did:plc:alice/app.test.rec/1",
+                "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!indexed(&caller, "at://did:plc:victim/app.test.rec/1").await);
+
+        // The answer for the record written is still indexed.
+        write_reply(
+            "com.atproto.repo.createRecord",
+            "at://did:plc:alice/app.test.rec/1",
+        )
+        .mount(&pds)
+        .await;
+        create_record(&caller, create("1")).await.unwrap();
+        assert!(indexed(&caller, "at://did:plc:alice/app.test.rec/1").await);
+    }
+
+    fn get_session_mock(body: Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/xrpc/com.atproto.server.getSession",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+    }
+
+    /// The cookie path reads the same account, and the address only through
+    /// its own call.
+    #[tokio::test]
+    async fn a_cookie_caller_reads_their_account_and_email_apart() {
+        let did = "did:plc:cookiecaller";
+        let (caller, pds) = cookie_caller(did).await;
+        get_session_mock(json!({
+            "did": did, "handle": "cookie.test", "email": "cookie@example.com",
+            "emailConfirmed": true,
+        }))
+        .expect(2)
+        .mount(&pds)
+        .await;
+
+        let account = get_session(&caller, json!({})).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&account).unwrap(),
+            json!({"did": did, "handle": "cookie.test"})
+        );
+        let email = get_email(&caller, json!({})).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&email).unwrap(),
+            json!({"email": "cookie@example.com", "email_confirmed": true})
+        );
+    }
+
+    /// Whatever path the session came by, a reply about someone else hands
+    /// out neither their account nor their address.
+    #[tokio::test]
+    async fn a_session_naming_another_account_is_refused_on_the_cookie_path() {
+        let did = "did:plc:cookiecaller2";
+        let (caller, pds) = cookie_caller(did).await;
+        get_session_mock(json!({
+            "did": "did:plc:someoneelse", "handle": "else.test", "email": "else@example.com",
+        }))
+        .mount(&pds)
+        .await;
+
+        let err = get_session(&caller, json!({})).await.unwrap_err();
+        assert_eq!(err.code(), "PDS_ERROR", "{err}");
+        let err = get_email(&caller, json!({})).await.unwrap_err();
+        assert_eq!(err.code(), "PDS_ERROR", "{err}");
+        assert!(!err.to_string().contains("else@example.com"), "{err}");
+    }
+
     /// The refusal message reaches the guest verbatim, so it has to survive
     /// the trip through `CallerError`.
     #[test]
@@ -683,6 +1116,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,
@@ -724,8 +1158,6 @@ mod tests {
             }),
             1,
             None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
         )
         .unwrap();
         state.lexicons.upsert_unindexed(parsed).await;
@@ -737,6 +1169,7 @@ mod tests {
             claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
             pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
             app_state: state.clone(),
+            delegate_pds_auth: None,
         };
         let reference = create_record(
             &caller,

@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use hex;
 use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -32,6 +32,12 @@ pub(super) async fn create_api_client(
 ) -> Result<(StatusCode, Json<CreateApiClientResponse>), AppError> {
     auth.require(Permission::ApiClientsCreate).await?;
 
+    if body.client_type != "confidential" && body.client_type != "public" {
+        return Err(AppError::BadRequest(
+            "client_type must be 'confidential' or 'public'".into(),
+        ));
+    }
+
     if state.oauth.is_domain_client_id(&body.client_id_url) {
         return Err(AppError::Conflict(format!(
             "client_id_url '{}' conflicts with a registered domain's OAuth client",
@@ -39,21 +45,18 @@ pub(super) async fn create_api_client(
         )));
     }
 
+    // The api_clients limit (HAP-226), after the request is known to be
+    // good, so a refusal says only what the limit allows.
+    let in_use = crate::limits::api_clients_in_use(&state.db, state.db_backend).await?;
+    state
+        .limits
+        .limits()
+        .check(happyview_provider::Limit::ApiClients, in_use)?;
+
     // Generate the client key: "hvc_" + 32 random hex chars.
     let mut random_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut random_bytes);
     let client_key = format!("hvc_{}", hex::encode(random_bytes));
-
-    // Generate the client secret for confidential clients only.
-    let (client_secret, client_secret_hash) = if body.client_type == "confidential" {
-        let mut secret_bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret_bytes);
-        let secret = format!("hvs_{}", hex::encode(secret_bytes));
-        let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        (Some(secret), hash)
-    } else {
-        (None, String::new())
-    };
 
     let id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
@@ -66,14 +69,13 @@ pub(super) async fn create_api_client(
         .map(|origins| serde_json::to_string(origins).unwrap_or_else(|_| "[]".to_string()));
 
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
         state.db_backend,
     );
 
     crate::db::query(&insert_sql)
         .bind(&id)
         .bind(&client_key)
-        .bind(&client_secret_hash)
         .bind(&body.name)
         .bind(&body.client_id_url)
         .bind(&body.client_uri)
@@ -89,6 +91,20 @@ pub(super) async fn create_api_client(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create api client: {e}")))?;
+
+    // A confidential client starts with one secret; a public one has none.
+    let client_secret = if body.client_type == "confidential" {
+        let (_, secret) = crate::oauth::client_secrets::create(
+            &state.db,
+            state.db_backend,
+            &id,
+            crate::oauth::client_secrets::ORIGINAL_LABEL,
+        )
+        .await?;
+        Some(secret)
+    } else {
+        None
+    };
 
     // Register the new client in the OAuth registry so it's usable immediately.
     let oauth_params = crate::auth::client_registry::ApiClientOAuthParams {
@@ -110,30 +126,23 @@ pub(super) async fn create_api_client(
     }
 
     // Register the client identity for request validation.
-    state.rate_limiter.register_client_identity(
-        client_key.clone(),
-        crate::rate_limit::ClientIdentity {
-            secret_hash: client_secret_hash.clone(),
-            client_uri: body.client_uri.clone(),
-        },
-    );
+    crate::oauth::client_secrets::register_identity(
+        &state.rate_limiter,
+        &state.db,
+        state.db_backend,
+        &id,
+        &client_key,
+        &body.client_uri,
+    )
+    .await?;
 
-    // Register per-client rate limit config if overrides are set.
-    if let (Some(capacity), Some(refill_rate)) =
-        (body.rate_limit_capacity, body.rate_limit_refill_rate)
-    {
-        let defaults = state.rate_limiter.defaults();
-        state.rate_limiter.register_client_config(
-            client_key.clone(),
-            crate::rate_limit::RateLimitConfig {
-                capacity: capacity as u32,
-                refill_rate,
-                default_query_cost: defaults.query_cost,
-                default_procedure_cost: defaults.procedure_cost,
-                default_proxy_cost: defaults.proxy_cost,
-            },
-        );
-    }
+    state.rate_limiter.register_client_limit(
+        client_key.clone(),
+        body.rate_limit_capacity,
+        body.rate_limit_refill_rate,
+        state.config.default_rate_limit_capacity,
+        state.config.default_rate_limit_refill_rate,
+    );
 
     log_event(
         &state.db,
@@ -302,12 +311,11 @@ pub(super) async fn update_api_client(
 
     // Read current values
     let select_sql = adapt_sql(
-        "SELECT client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM happyview_api_clients WHERE id = ?",
+        "SELECT client_key, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
 
     type UpdateRow = (
-        String,
         String,
         String,
         String,
@@ -327,7 +335,6 @@ pub(super) async fn update_api_client(
 
     let Some((
         client_key,
-        client_secret_hash,
         cur_name,
         client_id_url,
         cur_client_uri,
@@ -362,6 +369,25 @@ pub(super) async fn update_api_client(
         .is_active
         .map(|a| if a { 1i32 } else { 0i32 })
         .unwrap_or(cur_active);
+    // Turning a client back on takes a place under the api_clients limit
+    // again (HAP-226), unless it's one an app registered under its own.
+    if cur_active == 0 && is_active != 0 {
+        let (parent,): (Option<String>,) = crate::db::query_as(&adapt_sql(
+            "SELECT parent_client_id FROM happyview_api_clients WHERE id = ?",
+            state.db_backend,
+        ))
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get api client: {e}")))?;
+        if parent.is_none() {
+            let in_use = crate::limits::api_clients_in_use(&state.db, state.db_backend).await?;
+            state
+                .limits
+                .limits()
+                .check(happyview_provider::Limit::ApiClients, in_use)?;
+        }
+    }
     let now = now_rfc3339();
 
     let update_sql = adapt_sql(
@@ -413,29 +439,22 @@ pub(super) async fn update_api_client(
 
     // Update client identity and per-client rate limit config.
     if is_active != 0 {
-        state.rate_limiter.register_client_identity(
-            client_key.clone(),
-            crate::rate_limit::ClientIdentity {
-                secret_hash: client_secret_hash,
-                client_uri: client_uri.clone(),
-            },
+        crate::oauth::client_secrets::register_identity(
+            &state.rate_limiter,
+            &state.db,
+            state.db_backend,
+            &id,
+            &client_key,
+            &client_uri,
+        )
+        .await?;
+        state.rate_limiter.register_client_limit(
+            client_key,
+            capacity,
+            refill_rate,
+            state.config.default_rate_limit_capacity,
+            state.config.default_rate_limit_refill_rate,
         );
-        if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-            let defaults = state.rate_limiter.defaults();
-            state.rate_limiter.register_client_config(
-                client_key,
-                crate::rate_limit::RateLimitConfig {
-                    capacity: cap as u32,
-                    refill_rate: refill,
-                    default_query_cost: defaults.query_cost,
-                    default_procedure_cost: defaults.procedure_cost,
-                    default_proxy_cost: defaults.proxy_cost,
-                },
-            );
-        } else {
-            // Rate limit overrides were cleared — remove per-client config.
-            state.rate_limiter.remove_client_config(&client_key);
-        }
     } else {
         state.rate_limiter.remove_client_identity(&client_key);
         state.rate_limiter.remove_client_config(&client_key);
@@ -496,7 +515,7 @@ pub(super) async fn provision_auth_key(
     let existing = crate::oauth::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -511,7 +530,7 @@ pub(super) async fn provision_auth_key(
             crate::oauth::client_keys::insert_key(
                 &state.db,
                 state.db_backend,
-                state.config.token_encryption_key.as_ref(),
+                state.config.keyring().as_ref(),
                 &key,
             )
             .await?;
@@ -536,7 +555,7 @@ pub(super) async fn get_auth_key(
     let keys = crate::oauth::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         &id,
     )
     .await?;
@@ -574,6 +593,7 @@ pub(super) async fn list_auth_keys(
                 "kid": k.kid,
                 "status": k.status.as_str(),
                 "created_at": k.created_at,
+                "activates_at": k.activates_at,
                 "session_count": session_count,
             })
         })
@@ -703,25 +723,41 @@ pub(super) async fn revoke_all_auth_keys(
     })))
 }
 
+/// The body of a key rotation.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct RotateKeyBody {
+    /// Switch now instead of staging the new key. Authorization servers that
+    /// cached the old key set refuse the new one until their cache runs out,
+    /// so this is for a key that must stop signing at once.
+    #[serde(default)]
+    immediate: bool,
+}
+
 /// POST /admin/api-clients/:id/auth-key/rotate — rotate the client's
-/// authentication key, demoting the current one to `retiring` rather than
-/// revoking it, so already-established sessions keep resolving until they
-/// naturally cycle off it (see `client_keys::rotate_key`'s doc comment).
+/// authentication key. By default the new key is published as `pending` and
+/// takes over after `client_keys::ROTATION_OVERLAP`; `{"immediate": true}`
+/// switches now. Either way the old key is demoted to `retiring` rather than
+/// revoked, so already-established sessions keep resolving until they
+/// naturally cycle off it.
 pub(super) async fn rotate_auth_key(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(id): Path<String>,
+    body: Option<Json<RotateKeyBody>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::ApiClientsEdit).await?;
     crate::auth::cli_client::refuse_change(&id)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let key = crate::oauth::client_keys::rotate_key(
-        &state.db,
-        state.db_backend,
-        state.config.token_encryption_key.as_ref(),
-        &id,
-    )
-    .await?;
+    let keys = state.config.keyring();
+    let enc = keys.as_ref();
+    let (key, activates_at) = if body.immediate {
+        let key =
+            crate::oauth::client_keys::rotate_key(&state.db, state.db_backend, enc, &id).await?;
+        (key, None)
+    } else {
+        crate::oauth::client_keys::stage_key(&state.db, state.db_backend, enc, &id).await?
+    };
 
     let orphaned_sessions =
         crate::oauth::client_keys::count_unstamped_sessions(&state.db, state.db_backend, &id)
@@ -736,6 +772,8 @@ pub(super) async fn rotate_auth_key(
             subject: Some(id),
             detail: serde_json::json!({
                 "kid": key.kid,
+                "status": key.status.as_str(),
+                "activates_at": activates_at,
                 "orphaned_sessions": orphaned_sessions,
             }),
         },
@@ -745,21 +783,37 @@ pub(super) async fn rotate_auth_key(
 
     Ok(Json(serde_json::json!({
         "kid": key.kid,
+        "status": key.status.as_str(),
+        "activates_at": activates_at,
         "orphaned_sessions": orphaned_sessions,
     })))
 }
 
 /// POST /admin/oauth/instance-key/rotate — rotate the instance's own OAuth
-/// client-authentication key and immediately rebuild the OAuth clients
-/// pinned to it (primary + every domain), so the new key takes effect
-/// without a restart. See `oauth::rotation::rotate_instance_key`.
+/// client-authentication key. By default the new key is published as
+/// `pending` and the OAuth clients switch to it after
+/// `client_keys::ROTATION_OVERLAP` (`oauth::rotation::run_key_promotion`);
+/// `{"immediate": true}` switches and rebuilds them now, without a restart.
 pub(super) async fn rotate_instance_key(
     State(state): State<AppState>,
     auth: UserAuth,
+    body: Option<Json<RotateKeyBody>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let (key, orphaned_sessions) = crate::oauth::rotation::rotate_instance_key(&state).await?;
+    let (key, activates_at) = if body.immediate {
+        let (key, _) = crate::oauth::rotation::rotate_instance_key(&state).await?;
+        (key, None)
+    } else {
+        crate::oauth::rotation::stage_instance_key(&state).await?
+    };
+    let orphaned_sessions = crate::oauth::client_keys::count_unstamped_sessions(
+        &state.db,
+        state.db_backend,
+        crate::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await?;
 
     log_event(
         &state.db,
@@ -770,6 +824,8 @@ pub(super) async fn rotate_instance_key(
             subject: None,
             detail: serde_json::json!({
                 "kid": key.kid,
+                "status": key.status.as_str(),
+                "activates_at": activates_at,
                 "orphaned_sessions": orphaned_sessions,
             }),
         },
@@ -779,6 +835,8 @@ pub(super) async fn rotate_instance_key(
 
     Ok(Json(serde_json::json!({
         "kid": key.kid,
+        "status": key.status.as_str(),
+        "activates_at": activates_at,
         "orphaned_sessions": orphaned_sessions,
     })))
 }
@@ -810,6 +868,7 @@ pub(super) async fn list_instance_keys(
                 "kid": k.kid,
                 "status": k.status.as_str(),
                 "created_at": k.created_at,
+                "activates_at": k.activates_at,
                 "session_count": session_count,
             })
         })

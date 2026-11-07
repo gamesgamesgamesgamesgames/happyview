@@ -16,6 +16,7 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::dns::NativeDnsResolver;
 use crate::error::AppError;
 use crate::oauth::client_keys::ClientKey;
+use crate::plugin::encryption::Keyring;
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_instance_client(
@@ -29,6 +30,7 @@ pub fn build_instance_client(
     session_store_pool: sqlx::AnyPool,
     db_backend: DatabaseBackend,
     key: &ClientKey,
+    encryption_key: Option<Keyring>,
 ) -> Result<HappyViewOAuthClient, AppError> {
     let jwk = crate::oauth::client_keys::to_atrium_jwk(key)?;
 
@@ -55,8 +57,8 @@ pub fn build_instance_client(
     } else {
         Some(key.kid.clone())
     };
-    let session_store =
-        DbSessionStore::new(session_store_pool, db_backend).with_signing_kid(signing_kid);
+    let session_store = DbSessionStore::new(session_store_pool, db_backend, encryption_key)
+        .with_signing_kid(signing_kid);
 
     let client = if is_loopback {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
@@ -140,14 +142,20 @@ pub struct OAuthClientRegistry {
     by_kid: DashMap<(String, String), Arc<HappyViewOAuthClient>>,
     linked_repos_by_kid: DashMap<String, Arc<HappyViewOAuthClient>>,
     linked_repos_primary: ArcSwapOption<LinkedReposEntry>,
+    /// What clients this registry builds encrypt their sessions with.
+    encryption_key: Option<Keyring>,
 }
 
 impl OAuthClientRegistry {
-    pub fn new(primary_client: Arc<HappyViewOAuthClient>) -> Self {
-        Self::new_with_kid(primary_client, None)
+    pub fn new(primary_client: Arc<HappyViewOAuthClient>, key: Option<Keyring>) -> Self {
+        Self::new_with_kid(primary_client, None, key)
     }
 
-    pub fn new_with_kid(primary_client: Arc<HappyViewOAuthClient>, kid: Option<String>) -> Self {
+    pub fn new_with_kid(
+        primary_client: Arc<HappyViewOAuthClient>,
+        kid: Option<String>,
+        key: Option<Keyring>,
+    ) -> Self {
         Self {
             primary: ArcSwap::new(Arc::new(PrimaryEntry {
                 client: primary_client,
@@ -158,6 +166,7 @@ impl OAuthClientRegistry {
             by_kid: DashMap::new(),
             linked_repos_by_kid: DashMap::new(),
             linked_repos_primary: ArcSwapOption::empty(),
+            encryption_key: key,
         }
     }
 
@@ -423,7 +432,11 @@ impl OAuthClientRegistry {
                 },
                 keys: None,
                 state_store: state_store.clone(),
-                session_store: DbSessionStore::new(session_store_pool.clone(), *db_backend),
+                session_store: DbSessionStore::new(
+                    session_store_pool.clone(),
+                    *db_backend,
+                    self.encryption_key,
+                ),
                 resolver,
                 http_client: crate::http_retry::HappyViewHttpClient::new(
                     crate::http_retry::shared_client().clone(),
@@ -449,8 +462,12 @@ impl OAuthClientRegistry {
                 },
                 keys: client_keys.clone(),
                 state_store: state_store.clone(),
-                session_store: DbSessionStore::new(session_store_pool.clone(), *db_backend)
-                    .with_signing_kid(signing_kid.clone()),
+                session_store: DbSessionStore::new(
+                    session_store_pool.clone(),
+                    *db_backend,
+                    self.encryption_key,
+                )
+                .with_signing_kid(signing_kid.clone()),
                 resolver,
                 http_client: crate::http_retry::HappyViewHttpClient::new(
                     crate::http_retry::shared_client().clone(),
@@ -516,7 +533,7 @@ impl OAuthClientRegistry {
             let keys = crate::oauth::client_keys::load_keys(
                 &state.db,
                 state.db_backend,
-                state.config.token_encryption_key.as_ref(),
+                state.config.keyring().as_ref(),
                 api_client_id,
             )
             .await?;
@@ -631,7 +648,11 @@ impl OAuthClientRegistry {
                     },
                     keys: None,
                     state_store: state_store.clone(),
-                    session_store: DbSessionStore::new(session_store_pool.clone(), db_backend),
+                    session_store: DbSessionStore::new(
+                        session_store_pool.clone(),
+                        db_backend,
+                        self.encryption_key,
+                    ),
                     resolver,
                     http_client: crate::http_retry::HappyViewHttpClient::new(
                         crate::http_retry::shared_client().clone(),
@@ -651,7 +672,11 @@ impl OAuthClientRegistry {
                     },
                     keys: None,
                     state_store: state_store.clone(),
-                    session_store: DbSessionStore::new(session_store_pool.clone(), db_backend),
+                    session_store: DbSessionStore::new(
+                        session_store_pool.clone(),
+                        db_backend,
+                        self.encryption_key,
+                    ),
                     resolver,
                     http_client: crate::http_retry::HappyViewHttpClient::new(
                         crate::http_retry::shared_client().clone(),
@@ -808,8 +833,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -825,7 +850,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let key = crate::oauth::client_keys::generate_client_key("test-owner")
             .expect("generate client key");
@@ -840,7 +865,7 @@ mod tests {
                 "atproto",
                 &ApiClientOAuthParams {
                     plc_url: "https://plc.directory".into(),
-                    state_store: DbStateStore::new(pool.clone(), backend),
+                    state_store: DbStateStore::new(pool.clone(), backend, None),
                     session_store_pool: pool.clone(),
                     db_backend: backend,
                     client_keys: Some(vec![jwk]),
@@ -871,7 +896,7 @@ mod tests {
                 "atproto",
                 &ApiClientOAuthParams {
                     plc_url: "https://plc.directory".into(),
-                    state_store: DbStateStore::new(pool.clone(), backend),
+                    state_store: DbStateStore::new(pool.clone(), backend, None),
                     session_store_pool: pool.clone(),
                     db_backend: backend,
                     client_keys: None,
@@ -900,8 +925,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -917,7 +942,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let key_a = crate::oauth::client_keys::generate_client_key("test-owner")
             .expect("generate client key a");
@@ -945,8 +970,8 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
-                session_store: DbSessionStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
+                session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                         plc_directory_url: "https://plc.directory".into(),
@@ -994,8 +1019,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -1011,7 +1036,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let key = crate::oauth::client_keys::generate_client_key("instance")
             .expect("generate client key");
@@ -1034,8 +1059,8 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
-                session_store: DbSessionStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
+                session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                         plc_directory_url: "https://plc.directory".into(),
@@ -1084,8 +1109,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -1101,7 +1126,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let client_id_url = "https://example.com/oauth-client-metadata.json";
 
@@ -1120,8 +1145,8 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
-                session_store: DbSessionStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
+                session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                         plc_directory_url: "https://plc.directory".into(),
@@ -1183,8 +1208,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -1200,7 +1225,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let primary_client_id_url = "https://example.com/oauth-client-metadata.json";
         let domain_client_id_url = "https://domain.example.com/oauth-client-metadata.json";
@@ -1220,8 +1245,8 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
-                session_store: DbSessionStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
+                session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                         plc_directory_url: "https://plc.directory".into(),
@@ -1295,8 +1320,8 @@ mod tests {
                 scopes: None,
             },
             keys: None,
-            state_store: DbStateStore::new(pool.clone(), backend),
-            session_store: DbSessionStore::new(pool.clone(), backend),
+            state_store: DbStateStore::new(pool.clone(), backend, None),
+            session_store: DbSessionStore::new(pool.clone(), backend, None),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: "https://plc.directory".into(),
@@ -1312,7 +1337,7 @@ mod tests {
             http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("primary loopback client");
-        let registry = OAuthClientRegistry::new(Arc::new(primary));
+        let registry = OAuthClientRegistry::new(Arc::new(primary), None);
 
         let client_id_url = "https://example.com/oauth-client-metadata.json";
 
@@ -1331,8 +1356,8 @@ mod tests {
                     token_endpoint_auth_signing_alg: Some("ES256".to_string()),
                 },
                 keys: Some(vec![jwk]),
-                state_store: DbStateStore::new(pool.clone(), backend),
-                session_store: DbSessionStore::new(pool.clone(), backend),
+                state_store: DbStateStore::new(pool.clone(), backend, None),
+                session_store: DbSessionStore::new(pool.clone(), backend, None),
                 resolver: OAuthResolverConfig {
                     did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                         plc_directory_url: "https://plc.directory".into(),

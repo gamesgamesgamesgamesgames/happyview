@@ -124,10 +124,7 @@ pub async fn sync_repo(
 
     // Check the index against the host's commit. Incremental sync can miss ops
     // if a notification is lost, and the commit hash detects that.
-    let commit = native_client::get_latest_commit(state, &session, &uri, author_did).await?;
-    let key =
-        native_client::author_signing_key(&state.http, &state.config.plc_url, author_did).await?;
-    crate::spaces::commit::verify_commit(&commit, &uri, author_did, &key)?;
+    let commit = native_client::get_verified_commit(state, &session, &uri, author_did).await?;
 
     let records =
         db::list_all_space_records(&state.db, state.db_backend, &space.id, author_did).await?;
@@ -136,12 +133,12 @@ pub async fn sync_repo(
         fold.add(&lthash::record_element(&r.collection, &r.rkey, &r.cid));
     }
 
-    if commit.hash != fold.hash() {
+    if *commit.hash() != fold.hash() {
         // Do not advance the cursor. Leaving it where it is means the next sync
         // re-fetches the same window rather than skipping past a gap we have
         // already failed to close.
         return Ok(SyncOutcome::Diverged {
-            expected: hex(&commit.hash),
+            expected: hex(commit.hash()),
             ours: hex(&fold.hash()),
         });
     }
@@ -155,11 +152,22 @@ pub async fn sync_repo(
         db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
     repo_state.sync_cursor = Some(last_rev.clone());
     // The index now matches what the host signed, so adopt its commit too.
-    repo_state.rev = Some(commit.rev.clone());
-    repo_state.hash = Some(commit.hash.to_vec());
-    repo_state.ikm = Some(commit.ikm.to_vec());
-    repo_state.sig = Some(commit.sig.clone());
-    repo_state.mac = Some(commit.mac.to_vec());
+    repo_state.rev = Some(commit.rev().to_string());
+    repo_state.hash = Some(commit.hash().to_vec());
+    // A 0016 commit carries nothing that authenticates it at rest: its MAC was
+    // for this request only. Keeping the previous commit's would pair them with
+    // a hash they do not cover.
+    let (ikm, sig, mac) = match &commit {
+        native_client::VerifiedCommit::Signed(c) => (
+            Some(c.ikm.to_vec()),
+            Some(c.sig.clone()),
+            Some(c.mac.to_vec()),
+        ),
+        native_client::VerifiedCommit::Mac(_) => (None, None, None),
+    };
+    repo_state.ikm = ikm;
+    repo_state.sig = sig;
+    repo_state.mac = mac;
     repo_state.lthash_state = fold.as_bytes().to_vec();
     db::update_repo_state(&mut *conn, state.db_backend, &repo_state).await?;
 

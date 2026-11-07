@@ -32,7 +32,7 @@ On top of the client key, HappyView does best-effort validation that the caller 
 - If an `Origin` header is present (typical for browser apps), it must match the client's registered `client_uri`.
 - Otherwise, an `X-Client-Secret` header may be supplied and must match the stored secret (typical for server-to-server callers).
 
-Both checks currently log warnings on mismatch rather than rejecting the request, but the intent is clear: don't share client keys, and treat the secret like a password.
+A request that fails both checks, or names a key HappyView does not know, is not rejected: it is logged and handled as an anonymous request, so it is never charged to the named client's rate limit bucket. A DPoP request is identified by its session and needs neither check. Don't share client keys, and treat the secret like a password.
 
 ### Calling a query
 
@@ -237,7 +237,7 @@ As with the other methods, the resolved DID still has to exist in the HappyView 
 
 On a fresh deployment, the `happyview_users` table is empty. The first authenticated request to any admin endpoint auto-bootstraps that user as the **super user** with all permissions granted. This includes logging in to the dashboard — the dashboard makes admin API calls on your behalf, so the first person to log in becomes the super user.
 
-To add more users after that, use `POST /admin/users` or the [dashboard](dashboard.md). You can assign permissions individually or use a template (`viewer`, `operator`, `manager`, `full_access`). See [Admin API — Users](../api-reference/admin/users.md) for details.
+To add more users after that, use `POST /admin/users` or the [dashboard](dashboard.md). You can assign permissions individually or use a template (`viewer`, `maintainer`, `manager`, `full_access`). See [Admin API — Users](../api-reference/admin/users.md) for details.
 
 ## Proxying procedures to the user's PDS
 

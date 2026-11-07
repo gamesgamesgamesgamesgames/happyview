@@ -23,16 +23,16 @@ pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub fn fuel_for(plugin_type: PluginType) -> u64 {
     match plugin_type {
         PluginType::Library | PluginType::Auth => DEFAULT_FUEL,
-        // Fuel cannot bound an interpreter: wasmtime 49's Cranelift does not
-        // reload the fuel counter in a frame that catches a `throw`, so a
-        // guest that catches an error erases the fuel its body spent, and
-        // every Lua error on the wasi route is such a throw (reproduction:
-        // `.superpowers/spikes/lua-wasm/candidates/eh-probe/fuel_loss.wat`).
-        // Epoch interruption is the boundary that holds, which is why the
-        // engine keeps exceptions enabled: `executor::deadline`'s catching
-        // guest test shows the deadline stopping a `try_table` loop that
-        // fuel does not. Fuel stays enabled engine-wide because it is what
-        // bounds libraries. The whole range also covers the per-byte
+        // An interpreter is bounded by the operator's wall clock, an epoch
+        // deadline armed per run, rather than by fuel: nothing has calibrated
+        // a fuel budget against a script's instruction budget. That choice was
+        // first forced by wasmtime 49.0.0, which dropped the fuel a callee
+        // spent when it returned by a `throw` its caller caught, and every Lua
+        // error on the wasi route is such a throw (100 million iterations
+        // under a caught throw cost 1,101 fuel). Wasmtime 49.0.1 fixed that
+        // (GHSA-m63x-6p34-q65x; #14407 in 50), and HappyView requires 49.0.4,
+        // so fuel is now charged across a caught throw. Fuel stays enabled
+        // engine-wide because it is what bounds libraries. The whole range also covers the per-byte
         // instantiation charge a megabytes-sized interpreter image draws on
         // a host without copy-on-write memory.
         PluginType::Interpreter => u64::MAX,
@@ -90,10 +90,11 @@ pub const FUEL_PER_INSTRUCTION: u64 = 4_000;
 /// The fuel each call into a compiled module gets. `None` is a job, which
 /// has no budget and stops through `should_stop`.
 ///
-/// Fuel can bound a compiled module where it cannot bound an interpreter
-/// (see [`fuel_for`]) because nothing here catches a wasm `throw`: stable
-/// Rust on wasm32-wasip1 aborts on panic and emits no exception-handling
-/// instructions, and a module that defines a tag is refused before it runs.
+/// A compiled module is bounded by fuel, where an interpreter is bounded by
+/// the wall clock (see [`fuel_for`]). It never catches a wasm `throw`:
+/// stable Rust on wasm32-wasip1 aborts on panic and emits no
+/// exception-handling instructions, and a module that defines a tag is
+/// refused before it runs (see `project::script_module`).
 pub fn module_fuel(instructions: Option<u32>) -> u64 {
     instructions.map_or(u64::MAX, |n| {
         u64::from(n).saturating_mul(FUEL_PER_INSTRUCTION)
@@ -142,6 +143,16 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// the delta to the current epoch, and that sum must not overflow.
 pub const UNBOUNDED_TICKS: u64 = u64::MAX / 2;
 
+/// The ticks a guest runs before its store's epoch callback hands the worker
+/// back to the async executor: 50 ms at the 10 ms tick. A deadline is armed a
+/// slice at a time, so however long a budget is, a guest that spins in its
+/// own code yields its tokio worker at least this often, and the tasks queued
+/// behind it wait at most about one slice. Smaller would yield more often for
+/// no gain an operator could see; larger would let a spinning guest stall its
+/// neighbours for longer. The callback is a few atomic loads and a boxed
+/// future, so at twenty a second per running guest its cost is noise.
+pub const EPOCH_SLICE: u64 = 5;
+
 /// The native stack a guest's frames may take, which wasmtime's default holds
 /// to 512 KiB. A guest cannot see this stack at all: a C interpreter measures
 /// the shadow stack in its own linear memory, and each level of its recursion
@@ -169,6 +180,46 @@ pub struct WasmRuntime {
     epoch: Arc<AtomicU64>,
     ticker_stop: Arc<AtomicBool>,
     modules: Arc<ModuleCache>,
+    /// The linkers every instance on this engine is made with, built once.
+    /// They live here, beside the engine they are bound to, because an
+    /// executor is made per call and would rebuild them every time.
+    linkers: SharedLinkers,
+}
+
+/// One linker without WASI preview 1 and one with it, each built on first
+/// use. Building one registers every host function, which profiled at about
+/// a fifth of a record hook's CPU when it was done per instance. Host
+/// functions reach a run's state only through the store's data, so one
+/// linker serves every store.
+#[derive(Default)]
+pub(crate) struct SharedLinkers {
+    pub(crate) env: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
+    pub(crate) wasi: std::sync::OnceLock<Arc<Linker<crate::plugin::host::PluginState>>>,
+}
+
+/// The WebAssembly proposal HappyView turns off that `bytes` needs, if one
+/// is why the engine would refuse it: the component model, GC, or typed
+/// function references. `None` for a module that is valid without them, or
+/// one that is invalid anyway, whose own error says why.
+pub fn disabled_proposal(bytes: &[u8]) -> Option<&'static str> {
+    use wasmparser::{Parser, Validator, WasmFeatures};
+    if Parser::is_component(bytes) {
+        return Some("the WebAssembly component model");
+    }
+    let valid = |features: WasmFeatures| {
+        Validator::new_with_features(features)
+            .validate_all(bytes)
+            .is_ok()
+    };
+    let all = WasmFeatures::default();
+    let without_gc = all.difference(WasmFeatures::GC);
+    if valid(without_gc.difference(WasmFeatures::FUNCTION_REFERENCES)) || !valid(all) {
+        None
+    } else if !valid(without_gc) {
+        Some("WebAssembly GC")
+    } else {
+        Some("WebAssembly typed function references")
+    }
 }
 
 impl WasmRuntime {
@@ -221,6 +272,14 @@ impl WasmRuntime {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        // Off: no plugin HappyView runs uses them, and each is engine surface
+        // a guest could reach. The `gc` crate feature stays, because wasmtime
+        // enables exception handling only with it and the Lua interpreter
+        // throws. Reference types stay on: rustc and wasi-sdk's clang encode
+        // every `call_indirect` with them, so every plugin needs them.
+        config.wasm_gc(false);
+        config.wasm_function_references(false);
+        config.wasm_component_model(false);
         config.max_wasm_stack(MAX_WASM_STACK);
         config.async_stack_size(ASYNC_STACK_SIZE);
 
@@ -231,7 +290,13 @@ impl WasmRuntime {
             epoch: Arc::new(AtomicU64::new(0)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
             modules: Arc::default(),
+            linkers: SharedLinkers::default(),
         })
+    }
+
+    /// The linkers instances on this engine share.
+    pub(crate) fn linkers(&self) -> &SharedLinkers {
+        &self.linkers
     }
 
     /// This runtime, compiling every module it does not hold itself rather
@@ -279,22 +344,62 @@ impl WasmRuntime {
     /// ones above it. Everything past this runtime's memory runs on a
     /// blocking thread: a compile takes up to seconds.
     pub async fn module_for(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
+        self.module_lookup(plugin).await.map(|(module, _)| module)
+    }
+
+    /// As [`WasmRuntime::module_for`], saying whether this lookup was served
+    /// from this runtime's memory. Anything else (disk, the process's
+    /// compiled modules, a compile) is a miss.
+    pub async fn module_lookup(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Result<(Module, bool), anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
-            return Ok(module);
+            self.modules.count_lookup(true);
+            return Ok((module, true));
         }
         let engine = self.engine.clone();
         let modules = self.modules.clone();
         let plugin = plugin.clone();
-        tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await?
+        let (module, hit) =
+            tokio::task::spawn_blocking(move || resolve(&engine, &modules, &plugin)).await??;
+        self.modules.count_lookup(hit);
+        Ok((module, hit))
+    }
+
+    /// Start compiling `plugin`'s module on a blocking thread, so its first
+    /// call finds it ready rather than waiting out a compile that takes
+    /// seconds for an interpreter. A call arriving mid-compile waits for this
+    /// one instead of starting its own. A plugin removed before the thread
+    /// runs is not compiled, and a failure is only logged: the first call
+    /// reports it.
+    pub fn warm(&self, plugin: &Arc<LoadedPlugin>) -> tokio::task::JoinHandle<()> {
+        let engine = self.engine.clone();
+        let modules = self.modules.clone();
+        let plugin = Arc::downgrade(plugin);
+        tokio::task::spawn_blocking(move || {
+            let Some(plugin) = plugin.upgrade() else {
+                return;
+            };
+            if modules.get_by_identity(&plugin.info.id, &plugin).is_some() {
+                return;
+            }
+            if let Err(e) = resolve(&engine, &modules, &plugin) {
+                tracing::warn!(plugin_id = %plugin.info.id, error = %e, "plugin module could not be precompiled");
+            }
+        })
     }
 
     /// [`WasmRuntime::module_for`] on the calling thread, for a caller
     /// already off the async workers.
     pub fn module_for_blocking(&self, plugin: &Arc<LoadedPlugin>) -> Result<Module, anyhow::Error> {
         if let Some(module) = self.modules.get_by_identity(&plugin.info.id, plugin) {
+            self.modules.count_lookup(true);
             return Ok(module);
         }
-        resolve(&self.engine, &self.modules, plugin)
+        let (module, hit) = resolve(&self.engine, &self.modules, plugin)?;
+        self.modules.count_lookup(hit);
+        Ok(module)
     }
 
     /// Drop the in-memory module held for `plugin_id`.
@@ -305,6 +410,17 @@ impl WasmRuntime {
     /// Compiles performed by this runtime, cache hits excluded.
     pub fn compile_count(&self) -> u64 {
         self.modules.compiles.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups served from this runtime's memory.
+    pub fn cache_hits(&self) -> u64 {
+        self.modules.hits.load(Ordering::Relaxed)
+    }
+
+    /// Module lookups that had to go to disk, the process's compiled
+    /// modules, or the compiler.
+    pub fn cache_misses(&self) -> u64 {
+        self.modules.misses.load(Ordering::Relaxed)
     }
 
     /// The file stem a module's serialized form is kept under: the wasm
@@ -366,25 +482,39 @@ fn cache_key(engine: &Engine, wasm_sha256: &str) -> String {
 
 /// `plugin`'s module past the identity check: by hash in memory, from
 /// disk, or through [`compile`].
+/// The module for `plugin` and whether this runtime's memory held it. A
+/// caller that waited out another's compile finds it in memory, which counts
+/// as a hit: the wait was not this caller's compile.
 fn resolve(
     engine: &Engine,
     modules: &ModuleCache,
     plugin: &Arc<LoadedPlugin>,
-) -> Result<Module, anyhow::Error> {
+) -> Result<(Module, bool), anyhow::Error> {
     let id = plugin.info.id.as_str();
     let sha = hex::encode(Sha256::digest(&plugin.wasm_bytes));
     if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
-        return Ok(module);
+        return Ok((module, true));
     }
     let key = cache_key(engine, &sha);
-    if let Some(module) = modules.load_from_disk(engine, &key) {
+    // One compile per key at a time: whoever waited here finds the module
+    // the holder inserted.
+    let slot = modules.compiling(&key);
+    let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| -> Result<(Module, bool), anyhow::Error> {
+        if let Some(module) = modules.get_by_hash(id, plugin, &sha) {
+            return Ok((module, true));
+        }
+        if let Some(module) = modules.load_from_disk(engine, &key) {
+            modules.insert(id, plugin, &sha, module.clone());
+            return Ok((module, false));
+        }
+        let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
+        modules.write_to_disk(&key, &module, serialized.as_deref());
         modules.insert(id, plugin, &sha, module.clone());
-        return Ok(module);
-    }
-    let Compiled { module, serialized } = compile(engine, modules, &plugin.wasm_bytes, &key)?;
-    modules.write_to_disk(&key, &module, serialized.as_deref());
-    modules.insert(id, plugin, &sha, module.clone());
-    Ok(module)
+        Ok((module, false))
+    })();
+    modules.done_compiling(&key, &slot);
+    result
 }
 
 /// The total size of the compiled modules the process keeps for its
@@ -477,7 +607,13 @@ fn compile(
         }
     }
     modules.compiles.fetch_add(1, Ordering::Relaxed);
-    let module = Module::new(engine, wasm_bytes)?;
+    let module =
+        Module::new(engine, wasm_bytes).map_err(|e| match disabled_proposal(wasm_bytes) {
+            Some(proposal) => {
+                anyhow::anyhow!("this plugin uses {proposal}, which HappyView doesn't enable")
+            }
+            None => anyhow::Error::from(e),
+        })?;
     let Some(shared) = shared else {
         return Ok(Compiled {
             module,
@@ -569,12 +705,43 @@ struct ModuleCache {
     entries: Mutex<HashMap<String, CachedModule>>,
     dir: Option<PathBuf>,
     compiles: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
     warned: AtomicBool,
     /// Set by [`WasmRuntime::without_shared_modules`].
     unshared: bool,
+    /// One lock per cache key being resolved, so two callers wanting the
+    /// same module compile it once.
+    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ModuleCache {
+    fn count_lookup(&self, hit: bool) {
+        let counter = if hit { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn compiling(&self, key: &str) -> Arc<Mutex<()>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop `key`'s lock once nobody needs it. A waiter still holding a
+    /// clone finds the module by hash when it gets the lock.
+    fn done_compiling(&self, key: &str, slot: &Arc<Mutex<()>>) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(key)
+            .is_some_and(|held| Arc::ptr_eq(held, slot))
+        {
+            in_flight.remove(key);
+        }
+    }
+
     fn get_by_identity(&self, id: &str, plugin: &Arc<LoadedPlugin>) -> Option<Module> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.get(id)?;
@@ -827,6 +994,26 @@ impl ResourceLimiter for MemoryLimiter {
 /// is not charged for the host's latency. The methods keep the books; the
 /// caller applies the returned delta with `set_epoch_deadline`, since the
 /// store owns this value and cannot be borrowed through it.
+///
+/// The delta is never more than [`EPOCH_SLICE`]: the store's deadline is
+/// armed a slice at a time, and the callback [`slice_guest_deadline`]
+/// installs charges each slice here and either yields with the next one or,
+/// once the budget is spent, interrupts the guest. The time a yielded guest
+/// waits to be polled again is charged: the clock is running through it, as
+/// it was before there were yields, when the same wait fell on the tasks the
+/// guest held the worker from. A run therefore still ends within its wall
+/// clock however busy the runtime is, short of its host imports.
+///
+/// The cost is in the oversubscribed case. With N CPU-bound guests sharing
+/// M workers (N > M), each takes about N/M times its CPU in wall time and is
+/// charged all of it, so once that passes the budget they all time out
+/// together, where without yields the first ones would have finished and
+/// only the later ones would have waited. At the default instruction limit a
+/// run is tens of milliseconds of CPU, so this needs hundreds of guests per
+/// worker against a 10 s clock; it gets nearer as an operator raises
+/// `script_instruction_limit`. Charging only the slices a guest ran would
+/// avoid it, at the price of runs outlasting their wall clock on a saturated
+/// runtime.
 pub struct GuestDeadline {
     epoch: Arc<AtomicU64>,
     remaining: u64,
@@ -865,12 +1052,17 @@ impl GuestDeadline {
         self.armed_at = now;
     }
 
+    /// The delta for `set_epoch_deadline`: what is left, a slice at most.
+    fn slice(&self) -> u64 {
+        self.remaining.min(EPOCH_SLICE)
+    }
+
     /// Start a fresh budget. Returns the delta for `set_epoch_deadline`.
     pub fn arm(&mut self, ticks: u64) -> u64 {
         self.remaining = ticks;
         self.armed_at = self.now();
         self.running = true;
-        ticks
+        self.slice()
     }
 
     /// The guest has entered a host import: spend what it ran and stop
@@ -887,12 +1079,67 @@ impl GuestDeadline {
     pub fn resume(&mut self) -> u64 {
         self.settle();
         self.running = true;
-        self.remaining
+        self.slice()
+    }
+
+    /// Spend the whole budget, so the guest is interrupted at its next
+    /// epoch check. Used when the host decides a run must stop, as when a
+    /// job's worker loses its lease, and a lifted deadline is spent all the same.
+    pub fn exhaust(&mut self) {
+        self.settle();
+        self.remaining = 0;
+    }
+
+    /// The store's epoch deadline has been reached. Charges the slice the
+    /// guest ran and answers the next slice, or `None` once the budget is
+    /// spent.
+    fn on_deadline(&mut self) -> Option<u64> {
+        self.settle();
+        (self.remaining > 0).then(|| self.slice())
     }
 
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
+}
+
+/// What a guest's yield awaits: its tokio worker, given back.
+///
+/// Two of tokio's yields rather than one. A yield is deferred until the
+/// worker next polls its timers and I/O, and the tasks that poll wakes are
+/// queued behind the yielding one, which a tokio worker runs first as its
+/// most recently woken: with one yield, a timer task beside a spinning guest
+/// on a one-worker runtime ran every other slice (gaps of about 100 ms at a
+/// 50 ms slice). The second yield, taken at once, puts the guest behind
+/// everything the first one woke.
+async fn give_back_the_worker() {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+}
+
+/// Install the epoch callback every store that runs guest code needs. When a
+/// store reaches the deadline its [`GuestDeadline`] last armed, the slice is
+/// charged; a spent budget interrupts the guest with
+/// [`Trap::Interrupt`], the trap a deadline raised before there was a
+/// callback, so it still classifies as a timeout. Otherwise the guest yields
+/// its tokio worker and resumes with the next slice. A lifted or unbounded
+/// deadline therefore yields every slice and never traps.
+///
+/// A yield needs the guest to have been entered through an `*_async` call:
+/// from a synchronous one wasmtime raises a trap instead. Every store with
+/// this callback is only ever called through `call_async` and
+/// `instantiate_async`.
+pub fn slice_guest_deadline<T: 'static>(
+    store: &mut Store<T>,
+    deadline: fn(&mut T) -> &mut GuestDeadline,
+) {
+    store.epoch_deadline_callback(move |mut state| {
+        let deadline = deadline(state.data_mut());
+        Ok(match deadline.on_deadline() {
+            None => UpdateDeadline::Interrupt,
+            Some(delta) => UpdateDeadline::YieldCustom(delta, Box::pin(give_back_the_worker())),
+        })
+    });
 }
 
 #[cfg(test)]
@@ -907,6 +1154,93 @@ mod tests {
             module_fuel(Some(u32::MAX)),
             u64::from(u32::MAX) * FUEL_PER_INSTRUCTION
         );
+    }
+
+    #[test]
+    fn a_module_using_gc_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let gc = wat::parse_str(
+            r#"(module
+                (type $point (struct (field i32)))
+                (func (export "make") (result (ref null $point))
+                    i32.const 1
+                    struct.new $point))"#,
+        )
+        .unwrap();
+        let err = runtime.compile(&gc).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses WebAssembly GC, which HappyView doesn't enable"
+        );
+    }
+
+    #[test]
+    fn a_module_using_typed_function_references_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let typed = wat::parse_str(
+            r#"(module
+                (type $f (func))
+                (func $g)
+                (elem declare func $g)
+                (func (export "call") (call_ref $f (ref.func $g))))"#,
+        )
+        .unwrap();
+        let err = runtime.compile(&typed).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses WebAssembly typed function references, which HappyView doesn't enable"
+        );
+    }
+
+    #[test]
+    fn a_component_is_refused_naming_the_proposal() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let component = wat::parse_str("(component)").unwrap();
+        let err = runtime.compile(&component).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this plugin uses the WebAssembly component model, which HappyView doesn't enable"
+        );
+    }
+
+    /// Every plugin rustc or wasi-sdk builds needs reference types, and the
+    /// Lua interpreter throws, so turning the others off must leave both.
+    #[test]
+    fn reference_types_and_exceptions_still_compile() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (type $v (func))
+                (table $a 1 funcref)
+                (table $b 1 funcref)
+                (tag $oops (param i32))
+                (func $f)
+                (elem (table $b) (i32.const 0) func $f)
+                (func (export "run") (result i32)
+                    i32.const 0
+                    call_indirect $b (type $v)
+                    ref.null func
+                    drop
+                    block $caught (result i32)
+                        try_table (catch $oops $caught)
+                            i32.const 7
+                            throw $oops
+                        end
+                        i32.const 0
+                    end))"#,
+        )
+        .unwrap();
+        assert_eq!(disabled_proposal(&wasm), None);
+        runtime.compile(&wasm).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_module_keeps_its_own_error() {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let wasm = wat::parse_str(r#"(module (func (result i32) i64.const 1))"#).unwrap();
+        assert_eq!(disabled_proposal(&wasm), None);
+        let err = runtime.compile(&wasm).unwrap_err().to_string();
+        assert!(!err.contains("doesn't enable"), "{err}");
     }
 
     #[test]
@@ -1049,19 +1383,21 @@ mod tests {
     }
 
     /// Ticks that pass while suspended are not charged; ticks that pass
-    /// while running are, and the budget re-arms with what is left.
+    /// while running are, and the budget re-arms with what is left, a slice
+    /// at a time.
     #[test]
     fn a_suspended_deadline_does_not_spend_host_time() {
         let epoch = Arc::new(AtomicU64::new(0));
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
-        assert_eq!(deadline.arm(10), 10);
+        assert_eq!(deadline.arm(10), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), 10);
 
         epoch.fetch_add(3, Ordering::Relaxed);
         deadline.suspend();
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(100, Ordering::Relaxed);
-        assert_eq!(deadline.resume(), 7);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
         assert_eq!(deadline.remaining(), 7);
 
         epoch.fetch_add(2, Ordering::Relaxed);
@@ -1071,9 +1407,32 @@ mod tests {
 
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 5);
+        epoch.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(deadline.resume(), 2);
         epoch.fetch_add(9, Ordering::Relaxed);
         assert_eq!(deadline.resume(), 0);
         assert_eq!(deadline.resume(), 0);
+    }
+
+    /// Each slice the callback sees is charged and answered with the next,
+    /// the last one short; a spent budget answers nothing.
+    #[test]
+    fn the_deadline_is_charged_a_slice_at_a_time() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut deadline = GuestDeadline::unbounded(epoch.clone());
+        assert_eq!(deadline.arm(12), EPOCH_SLICE);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(EPOCH_SLICE));
+        assert_eq!(deadline.remaining(), 7);
+        epoch.fetch_add(EPOCH_SLICE, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), Some(2));
+        epoch.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(deadline.on_deadline(), None);
+
+        // An exhausted budget answers nothing even when lifted before.
+        deadline.arm(UNBOUNDED_TICKS);
+        deadline.exhaust();
+        assert_eq!(deadline.on_deadline(), None);
     }
 
     #[test]
@@ -1242,7 +1601,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_compile_leaves_the_async_runtime_free() {
         let Some(dir) = std::env::var_os("HAPPYVIEW_LUA_PLUGIN") else {
-            eprintln!("skipping: HAPPYVIEW_LUA_PLUGIN is unset");
+            crate::test_support::unavailable(
+                "HAPPYVIEW_LUA_PLUGIN is unset. Run scripts/fetch-lua-plugin.sh and point it at tests/fixtures/lua-plugin",
+            );
             return;
         };
         let mut plugin = crate::plugin::loader::load_from_file(Path::new(&dir))
@@ -1272,6 +1633,32 @@ mod tests {
         assert!(during > 0, "the ticker did not run during the compile");
     }
 
+    /// Callers wanting a module nobody holds yet compile it once: the rest
+    /// wait for the first and take what it compiled.
+    #[test]
+    fn concurrent_callers_compile_a_module_once() {
+        let runtime = Arc::new(
+            WasmRuntime::without_ticker()
+                .unwrap()
+                .without_shared_modules(),
+        );
+        let plugin = plugin("p", &answering(7));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (runtime, plugin, start) = (runtime.clone(), plugin.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.module_for_blocking(&plugin).unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(answer(&runtime, &thread.join().unwrap()), 7);
+        }
+        assert_eq!(runtime.compile_count(), 1);
+    }
+
     #[test]
     fn a_second_lookup_of_the_same_plugin_does_not_recompile() {
         let runtime = WasmRuntime::without_ticker()
@@ -1283,6 +1670,22 @@ mod tests {
         assert_eq!(runtime.compile_count(), 1);
         assert_eq!(answer(&runtime, &first), 7);
         assert_eq!(answer(&runtime, &second), 7);
+    }
+
+    /// Each lookup says whether memory served it, and the runtime keeps the
+    /// tally: a lookup that compiled or loaded is a miss.
+    #[tokio::test]
+    async fn a_lookup_reports_whether_memory_held_the_module() {
+        let runtime = WasmRuntime::without_ticker()
+            .unwrap()
+            .without_shared_modules();
+        let plugin = plugin("p", &answering(7));
+        let (_, first) = runtime.module_lookup(&plugin).await.unwrap();
+        let (_, second) = runtime.module_lookup(&plugin).await.unwrap();
+        assert!(!first);
+        assert!(second);
+        runtime.module_for_blocking(&plugin).unwrap();
+        assert_eq!((runtime.cache_hits(), runtime.cache_misses()), (2, 1));
     }
 
     /// The same bytes under a fresh registration hit by hash; different
@@ -1498,9 +1901,11 @@ mod tests {
         let mut deadline = GuestDeadline::unbounded(epoch.clone());
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert_eq!(deadline.resume(), UNBOUNDED_TICKS);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert_eq!(deadline.remaining(), UNBOUNDED_TICKS);
         epoch.fetch_add(1_000_000, Ordering::Relaxed);
         deadline.suspend();
-        assert!(deadline.resume() > UNBOUNDED_TICKS - 2_000_000);
+        assert_eq!(deadline.resume(), EPOCH_SLICE);
+        assert!(deadline.remaining() > UNBOUNDED_TICKS - 2_000_000);
     }
 }

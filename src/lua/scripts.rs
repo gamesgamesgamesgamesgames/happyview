@@ -258,11 +258,13 @@ pub async fn run_record_event_script(
     payload: RecordEventPayload<'_>,
 ) -> RecordHookOutcome {
     let project = state.project.load_full();
-    let resolved = match state
+    let started = std::time::Instant::now();
+    let resolved = state
         .scripts
         .resolve_record_event_in(&project, payload.nsid, payload.action)
-        .await
-    {
+        .await;
+    crate::metrics::ingest::note_resolve(started.elapsed(), resolved.is_some());
+    let resolved = match resolved {
         Some(s) => s,
         // No script for this trigger → index the event unchanged.
         None => return RecordHookOutcome::Proceed,
@@ -294,6 +296,7 @@ pub async fn run_record_event_script(
             payload.uri,
         )
         .await;
+        crate::metrics::ingest::note_dead_lettered();
         return RecordHookOutcome::Proceed;
     }
 
@@ -352,11 +355,44 @@ pub async fn run_record_event_script(
         payload.uri,
     )
     .await;
+    crate::metrics::ingest::note_dead_lettered();
 
     // Fail-open: index the event as if no script had run. For a delete this
     // means the delete still happens — the record body it lacks is not a
     // reason to keep a record its PDS no longer has.
     RecordHookOutcome::Proceed
+}
+
+/// [`run_record_event_script`] for a caller that must not act on a hook it
+/// could not hear from: a script that keeps failing, or has no interpreter,
+/// is an `Err` rather than a fail-open `Proceed`, and nothing is
+/// dead-lettered, since the caller decides what a failure means.
+pub async fn run_record_event_script_strict(
+    state: &AppState,
+    payload: RecordEventPayload<'_>,
+) -> Result<RecordHookOutcome, String> {
+    let project = state.project.load_full();
+    let Some(resolved) = state
+        .scripts
+        .resolve_record_event_in(&project, payload.nsid, payload.action)
+        .await
+    else {
+        return Ok(RecordHookOutcome::Proceed);
+    };
+    if no_interpreter_for(state, &resolved).await {
+        return Err(crate::script::no_interpreter_message(&resolved.script_type));
+    }
+    let mut last_error = String::new();
+    for attempt in 0..attempts(state) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+        }
+        match run_record_event_once(state, &resolved, payload).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
 }
 
 /// Single attempt at the record-event script. Used internally by the retry

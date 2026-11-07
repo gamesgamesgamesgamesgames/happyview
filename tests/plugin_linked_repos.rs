@@ -493,7 +493,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;

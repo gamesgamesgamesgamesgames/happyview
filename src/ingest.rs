@@ -8,10 +8,11 @@
 //! what it received, matched and skipped itself (ruling F1).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde_json::Value;
 
 pub use happyview_provider::{
@@ -24,6 +25,8 @@ use crate::db::now_rfc3339;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::LexiconType;
 use crate::lua::{RecordEventPayload, RecordHookOutcome, ResolvedScript};
+use crate::metrics::ingest::{RecordDecision, RecordTimer};
+use crate::metrics::stages;
 use crate::record_handler::LEXICON_SCHEMA_COLLECTION;
 use crate::record_store::PreparedRecord;
 
@@ -177,15 +180,127 @@ pub(crate) async fn apply_batch_in(
     state: &AppState,
     events: Vec<SourceEvent>,
 ) -> (BatchOutcome, Option<String>) {
+    crate::catalog::ScriptCatalog::for_one_batch(apply_events(state, events)).await
+}
+
+/// Hooks of one backfill batch run at once unless `BACKFILL_HOOK_CONCURRENCY`
+/// says otherwise.
+const DEFAULT_BACKFILL_HOOK_CONCURRENCY: usize = 4;
+/// The most `BACKFILL_HOOK_CONCURRENCY` may ask for.
+const MAX_BACKFILL_HOOK_CONCURRENCY: usize = 32;
+
+/// How many of a backfill batch's records are hooked at once, as configured.
+fn backfill_hook_concurrency() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        parse_hook_concurrency(crate::config::vars::var("BACKFILL_HOOK_CONCURRENCY").as_deref())
+    })
+}
+
+fn parse_hook_concurrency(value: Option<&str>) -> usize {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_BACKFILL_HOOK_CONCURRENCY;
+    };
+    match value.parse::<usize>() {
+        Ok(n) if (1..=MAX_BACKFILL_HOOK_CONCURRENCY).contains(&n) => n,
+        Ok(n) => {
+            let clamped = n.clamp(1, MAX_BACKFILL_HOOK_CONCURRENCY);
+            tracing::warn!(
+                value = n,
+                used = clamped,
+                "BACKFILL_HOOK_CONCURRENCY is outside 1 to {MAX_BACKFILL_HOOK_CONCURRENCY}"
+            );
+            clamped
+        }
+        Err(_) => {
+            tracing::warn!(
+                value,
+                used = DEFAULT_BACKFILL_HOOK_CONCURRENCY,
+                "BACKFILL_HOOK_CONCURRENCY is not a number"
+            );
+            DEFAULT_BACKFILL_HOOK_CONCURRENCY
+        }
+    }
+}
+
+/// How many of `events`' hooks may run at once. More than one only for a
+/// batch of backfill records with no key twice: their hooks are independent,
+/// while a live batch can carry several versions of one key, whose order
+/// matters. A storage that claims one of the collections can lower it to
+/// what it can apply at once.
+fn batch_concurrency(state: &AppState, events: &[SourceEvent]) -> usize {
+    let configured = backfill_hook_concurrency();
+    if configured == 1 {
+        return 1;
+    }
+    let mut uris = HashSet::with_capacity(events.len());
+    let mut limit = configured;
+    for event in events {
+        let SourceEvent::Record(ev) = event else {
+            return 1;
+        };
+        if !matches!(ev.origin, Origin::Backfill { .. }) || !uris.insert(ev.key.uri()) {
+            return 1;
+        }
+        if let Some(max) = state
+            .records
+            .external_route(&ev.key.collection)
+            .and_then(|ext| ext.max_concurrent_deltas())
+            && max < limit
+        {
+            limit = max.max(1);
+        }
+    }
+    if limit < configured {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            tracing::warn!(
+                configured,
+                used = limit,
+                "BACKFILL_HOOK_CONCURRENCY is more than the record storage can apply at once; \
+                 raise its connection limit to use it"
+            );
+        });
+    }
+    limit
+}
+
+/// [`apply_batch_in`], within its batch's lookups.
+async fn apply_events(
+    state: &AppState,
+    events: Vec<SourceEvent>,
+) -> (BatchOutcome, Option<String>) {
     let total = events.len();
     let mut out = BatchOutcome {
         outcomes: Vec::with_capacity(total),
         changed: Vec::with_capacity(total),
     };
-    let mut run: Vec<(usize, RecordEvent, PreparedRecord)> = Vec::new();
+    let concurrency = batch_concurrency(state, &events);
+    // A batch a storage claims whole is applied a record at a time, so it
+    // runs as many records at once as it may. Each has its own key, and the
+    // outcomes keep the batch's order.
+    if concurrency > 1
+        && events.iter().all(|event| match event {
+            SourceEvent::Record(ev) => state.records.external_route(&ev.key.collection).is_some(),
+            _ => false,
+        })
+    {
+        let applied: Vec<Applied> = futures_util::stream::iter(events)
+            .map(|event| apply_in(state, event))
+            .buffered(concurrency)
+            .collect()
+            .await;
+        for applied in applied {
+            out.outcomes.push(applied.outcome);
+            out.changed.push(applied.changed);
+        }
+        return (out, None);
+    }
+    let mut run: Vec<RunEntry> = Vec::new();
     let mut tracked: HashMap<String, bool> = HashMap::new();
+    let mut hooked_ahead = hook_ahead(state, &events, concurrency, &mut tracked).await;
 
-    for event in events {
+    for (index, event) in events.into_iter().enumerate() {
         // A claimed collection's events are written as deltas, one by one,
         // through `apply_in`.
         if let SourceEvent::Record(ev) = &event
@@ -203,7 +318,10 @@ pub(crate) async fn apply_batch_in(
                 }
             };
             if is_tracked {
-                let hooked = hook_body(state, ev, body).await;
+                let (hooked, timer) = match hooked_ahead.remove(&index) {
+                    Some(hooked) => hooked,
+                    None => hook_body(state, ev, body).await,
+                };
                 let SourceEvent::Record(ev) = event else {
                     unreachable!()
                 };
@@ -213,7 +331,7 @@ pub(crate) async fn apply_batch_in(
                         // change reason: a change of origin ends it.
                         if run
                             .last()
-                            .is_some_and(|(_, last, _)| last.origin != ev.origin)
+                            .is_some_and(|(_, last, _, _)| last.origin != ev.origin)
                             && let Err((outcome, error)) =
                                 write_run(state, &mut run, &mut out).await
                         {
@@ -221,12 +339,13 @@ pub(crate) async fn apply_batch_in(
                             return (out, Some(error));
                         }
                         let prepared = prepare(&ev, &body);
-                        run.push((out.outcomes.len(), ev, prepared));
+                        run.push((out.outcomes.len(), ev, prepared, timer));
                         // `changed` is settled when the run is written.
                         out.outcomes.push(IngestOutcome::Matched);
                         out.changed.push(false);
                     }
                     HookedBody::Skip | HookedBody::CidMismatch => {
+                        timer.finish(&state.metrics, None);
                         out.outcomes.push(IngestOutcome::Skipped);
                         out.changed.push(false);
                     }
@@ -249,11 +368,113 @@ pub(crate) async fn apply_batch_in(
     (out, None)
 }
 
+/// Runs the hooks of `events` this instance stores itself, `concurrency` at
+/// once, ahead of the batch's writes, which then go in order as before. Only
+/// for more than one at once; keyed by the event's place in the batch.
+async fn hook_ahead(
+    state: &AppState,
+    events: &[SourceEvent],
+    concurrency: usize,
+    tracked: &mut HashMap<String, bool>,
+) -> HashMap<usize, (HookedBody, RecordTimer)> {
+    if concurrency <= 1 {
+        return HashMap::new();
+    }
+    let mut hookable = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if let SourceEvent::Record(ev) = event
+            && matches!(ev.action, Action::Create | Action::Update)
+            && ev.key.collection != LEXICON_SCHEMA_COLLECTION
+            && state.records.external_route(&ev.key.collection).is_none()
+            && let Some(body) = &ev.body
+        {
+            let is_tracked = match tracked.get(&ev.key.collection) {
+                Some(known) => *known,
+                None => {
+                    let known = is_tracked(state, &ev.key.collection).await;
+                    tracked.insert(ev.key.collection.clone(), known);
+                    known
+                }
+            };
+            if is_tracked {
+                hookable.push((index, ev, body));
+            }
+        }
+    }
+    let mut hooked = HashMap::with_capacity(hookable.len());
+    let mut waiting = hookable.into_iter();
+    let mut running = futures_util::stream::FuturesUnordered::new();
+    for (index, ev, body) in waiting.by_ref().take(concurrency) {
+        running.push(hook_one(state, index, ev, body));
+    }
+    while let Some((index, outcome)) = running.next().await {
+        hooked.insert(index, outcome);
+        if let Some((index, ev, body)) = waiting.next() {
+            running.push(hook_one(state, index, ev, body));
+        }
+    }
+    hooked
+}
+
+/// One record's hook, with its place in the batch.
+async fn hook_one<'a>(
+    state: &'a AppState,
+    index: usize,
+    ev: &'a RecordEvent,
+    body: &'a Value,
+) -> (usize, (HookedBody, RecordTimer)) {
+    (index, hook_body(state, ev, body).await)
+}
+
+/// How many record hooks a test's task has running at once, and the most it
+/// has had.
+#[cfg(test)]
+pub(crate) mod hooks_in_flight {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct Count {
+        now: AtomicUsize,
+        pub(crate) most: AtomicUsize,
+    }
+
+    tokio::task_local! {
+        pub(crate) static COUNT: Arc<Count>;
+    }
+
+    /// One hook running, counted until dropped.
+    pub(crate) struct Running(Option<Arc<Count>>);
+
+    impl Running {
+        pub(crate) fn start() -> Self {
+            let count = COUNT.try_with(Arc::clone).ok();
+            if let Some(count) = &count {
+                let now = count.now.fetch_add(1, Ordering::SeqCst) + 1;
+                count.most.fetch_max(now, Ordering::SeqCst);
+            }
+            Self(count)
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if let Some(count) = &self.0 {
+                count.now.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 /// Give the not-yet-applied tail of a batch the failure's outcome.
 fn fill_failed(out: &mut BatchOutcome, total: usize, outcome: IngestOutcome) {
     out.outcomes.resize(total, outcome);
     out.changed.resize(total, false);
 }
+
+/// A hooked create or update waiting for its run's write: its slot in the
+/// batch's outcomes, and its timer, which the write finishes.
+type RunEntry = (usize, RecordEvent, PreparedRecord, RecordTimer);
 
 /// Write a run of hooked creates and updates in one transaction, settling
 /// their placeholder outcomes in `out` (each run entry carries its slot). On
@@ -261,13 +482,17 @@ fn fill_failed(out: &mut BatchOutcome, total: usize, outcome: IngestOutcome) {
 /// outcome and error are returned for the caller to fill the tail with.
 async fn write_run(
     state: &AppState,
-    run: &mut Vec<(usize, RecordEvent, PreparedRecord)>,
+    run: &mut Vec<RunEntry>,
     out: &mut BatchOutcome,
 ) -> Result<(), (IngestOutcome, String)> {
     if run.is_empty() {
         return Ok(());
     }
-    let run = std::mem::take(run);
+    let mut run = std::mem::take(run);
+    let timers: Vec<RecordTimer> = run
+        .iter_mut()
+        .map(|(_, _, _, timer)| std::mem::replace(timer, RecordTimer::off()))
+        .collect();
     // Every event of a run has one origin (`apply_batch_in` splits runs
     // where it changes).
     let backfill = matches!(run[0].1.origin, Origin::Backfill { .. });
@@ -276,12 +501,18 @@ async fn write_run(
     } else {
         &state.db
     };
-    let prepared: Vec<PreparedRecord> = run.iter().map(|(_, _, p)| p.clone()).collect();
+    let prepared: Vec<PreparedRecord> = run.iter().map(|(_, _, p, _)| p.clone()).collect();
+    let started = Instant::now();
     let written = crate::db::with_change_reason(
         backfill.then(|| "backfill".to_string()),
         crate::db::retry_on_busy(|| state.records.write_network(pool, &prepared)),
     )
     .await;
+    // One transaction for the run, so each record's share is an even one.
+    let share = started.elapsed() / u32::try_from(timers.len()).unwrap_or(u32::MAX);
+    for timer in timers {
+        timer.finish(&state.metrics, Some((stages::WRITE, share)));
+    }
     let changed = match written {
         Ok(changed) => changed,
         Err(e) => {
@@ -299,7 +530,7 @@ async fn write_run(
     // A URI written twice in the run counts as changed once, on its last
     // copy (the one stored).
     let mut fresh = Vec::new();
-    for (slot, ev, _) in run.iter().rev() {
+    for (slot, ev, _, _) in run.iter().rev() {
         let uri = ev.key.uri();
         if changed.remove(&uri) {
             out.changed[*slot] = true;
@@ -354,7 +585,14 @@ pub(crate) async fn is_tracked(state: &AppState, collection: &str) -> bool {
 /// Run the record hook for one create/update and say what to store. The CID
 /// check comes first: a body that does not hash to its claimed CID is never
 /// hooked or stored. An event without a CID skips the check.
-pub(crate) async fn hook_body(state: &AppState, ev: &RecordEvent, body: &Value) -> HookedBody {
+///
+/// The timer it answers has measured the record up to its decision; the
+/// caller finishes it once the record is written, or at once when it is not.
+pub(crate) async fn hook_body(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+) -> (HookedBody, RecordTimer) {
     hook_body_with(state, ev, body, Hook::Run).await
 }
 
@@ -363,16 +601,42 @@ async fn hook_body_with(
     ev: &RecordEvent,
     body: &Value,
     hook: Hook,
-) -> HookedBody {
-    match hook_decision(state, ev, body, hook).await {
+) -> (HookedBody, RecordTimer) {
+    let (decision, timer) = hook_decision(state, ev, body, hook).await;
+    let hooked = match decision {
         Decision::Proceed => HookedBody::Store(body.clone()),
         Decision::Replace(v) => HookedBody::Store(v),
         Decision::Skip => HookedBody::Skip,
         Decision::CidMismatch => HookedBody::CidMismatch,
-    }
+    };
+    (hooked, timer)
 }
 
-async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: Hook) -> Decision {
+/// [`decide`], timed.
+async fn hook_decision(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+    hook: Hook,
+) -> (Decision, RecordTimer) {
+    let mut timer = RecordTimer::start(&state.metrics, ev);
+    let decision = decide(state, ev, body, hook, &mut timer).await;
+    timer.decided(match &decision {
+        Decision::Proceed => RecordDecision::Proceed,
+        Decision::Replace(_) => RecordDecision::Replace,
+        Decision::Skip => RecordDecision::Skip,
+        Decision::CidMismatch => RecordDecision::CidMismatch,
+    });
+    (decision, timer)
+}
+
+async fn decide(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+    hook: Hook,
+    timer: &mut RecordTimer,
+) -> Decision {
     let uri = ev.key.uri();
     let cid = ev.cid.as_deref().unwrap_or_default();
 
@@ -381,7 +645,10 @@ async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: H
     // attacker-controllable through the DID document) could otherwise store
     // a record under a mismatched CID. `Skipped` (no/unencodable CID)
     // proceeds unchanged.
-    if crate::cid_verify::verify_record_cid(cid, body) == crate::cid_verify::CidCheck::Mismatch {
+    let checking = Instant::now();
+    let checked = crate::cid_verify::verify_record_cid(cid, body);
+    timer.stage(stages::CID_CHECK, checking.elapsed());
+    if checked == crate::cid_verify::CidCheck::Mismatch {
         if matches!(ev.origin, Origin::Backfill { .. }) {
             tracing::warn!(
                 collection = ev.key.collection,
@@ -421,18 +688,21 @@ async fn hook_decision(state: &AppState, ev: &RecordEvent, body: &Value, hook: H
     // `record.index:<nsid>`; failures are dead-lettered fail-open.
     let outcome = match hook {
         Hook::Run => {
-            crate::lua::run_record_event_script(
-                state,
-                RecordEventPayload {
-                    nsid: &ev.key.collection,
-                    action: ev.action.as_str(),
-                    uri: &uri,
-                    did: &ev.key.did,
-                    rkey: &ev.key.rkey,
-                    record: Some(body),
-                },
-            )
-            .await
+            #[cfg(test)]
+            let _running = hooks_in_flight::Running::start();
+            timer
+                .hooking(crate::lua::run_record_event_script(
+                    state,
+                    RecordEventPayload {
+                        nsid: &ev.key.collection,
+                        action: ev.action.as_str(),
+                        uri: &uri,
+                        did: &ev.key.did,
+                        rkey: &ev.key.rkey,
+                        record: Some(body),
+                    },
+                ))
+                .await
         }
         Hook::Given(outcome) => outcome,
     };
@@ -577,17 +847,23 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             let Some(rec) = &ev.body else {
                 return IngestOutcome::Invalid;
             };
-            let rec_to_store = match hook_body_with(state, ev, rec, hook).await {
+            let (hooked, timer) = hook_body_with(state, ev, rec, hook).await;
+            let rec_to_store = match hooked {
                 HookedBody::Store(v) => v,
                 // The delivery this retries failed open and stored the body
                 // as it arrived; the hook now says it should not be there.
                 HookedBody::Skip if ev.origin == Origin::Retry => {
+                    timer.finish(&state.metrics, None);
                     return remove_failed_open(state, ev, rec, &uri).await;
                 }
-                HookedBody::Skip | HookedBody::CidMismatch => return IngestOutcome::Skipped,
+                HookedBody::Skip | HookedBody::CidMismatch => {
+                    timer.finish(&state.metrics, None);
+                    return IngestOutcome::Skipped;
+                }
             };
 
             let prepared = prepare(ev, &rec_to_store);
+            let started = Instant::now();
             let written = crate::db::with_change_reason(
                 reason,
                 crate::db::retry_on_busy(|| {
@@ -598,6 +874,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             )
             .await
             .map(|changed| !changed.is_empty());
+            timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match written {
                 Ok(changed) => {
                     // An identical redelivery changed nothing, so there is
@@ -627,8 +904,9 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             // Run record-event script (if any) before deleting. Only a
             // script that actually ran and returned `nil` aborts the
             // delete — no script, or a dead-lettered one, proceeds.
-            let hook_result = delete_hook(state, ev, &uri, hook).await;
+            let (hook_result, timer) = delete_hook(state, ev, &uri, hook).await;
             if hook_result == RecordHookOutcome::Skip {
+                timer.finish(&state.metrics, None);
                 // Gated for the same reason as the create path.
                 log_skipped(state, ev, &uri).await;
                 return IngestOutcome::Skipped;
@@ -636,6 +914,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
 
             let now = now_rfc3339();
             let backfill_running = state.source.backfill_running(&ev.key.collection).await;
+            let started = Instant::now();
             let deleted = crate::db::with_change_reason(
                 reason,
                 crate::db::retry_on_busy(|| {
@@ -651,6 +930,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
                 }),
             )
             .await;
+            timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match deleted {
                 Ok(_) => {
                     if state.verbose_event_logging.load(Ordering::Relaxed) {
@@ -668,30 +948,104 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
     }
 }
 
-/// The delete hook's outcome for `ev`.
+/// The delete hook's outcome for `ev`, and the timer that measured it, for
+/// the caller to finish once the delete is applied.
 async fn delete_hook(
     state: &AppState,
     ev: &RecordEvent,
     uri: &str,
     hook: Hook,
-) -> RecordHookOutcome {
-    match hook {
+) -> (RecordHookOutcome, RecordTimer) {
+    let mut timer = RecordTimer::start(&state.metrics, ev);
+    let outcome = match hook {
         Hook::Run => {
-            crate::lua::run_record_event_script(
-                state,
-                RecordEventPayload {
-                    nsid: &ev.key.collection,
-                    action: "delete",
-                    uri,
-                    did: &ev.key.did,
-                    rkey: &ev.key.rkey,
-                    record: ev.body.as_ref(),
-                },
-            )
-            .await
+            timer
+                .hooking(crate::lua::run_record_event_script(
+                    state,
+                    RecordEventPayload {
+                        nsid: &ev.key.collection,
+                        action: "delete",
+                        uri,
+                        did: &ev.key.did,
+                        rkey: &ev.key.rkey,
+                        record: ev.body.as_ref(),
+                    },
+                ))
+                .await
         }
         Hook::Given(outcome) => outcome,
+    };
+    timer.decided(if outcome == RecordHookOutcome::Skip {
+        RecordDecision::Skip
+    } else {
+        RecordDecision::Proceed
+    });
+    (outcome, timer)
+}
+
+/// How often an ignored keep-on-delete is reported per collection, unless
+/// verbose event logging reports each one.
+const IGNORED_KEEP_EVERY: Duration = Duration::from_secs(3600);
+
+/// When each collection last reported an ignored keep-on-delete, and how many
+/// it has ignored since.
+#[derive(Default)]
+pub struct IgnoredKeeps(std::sync::Mutex<HashMap<String, (Instant, u64)>>);
+
+impl IgnoredKeeps {
+    /// Counts one ignored keep of `collection` at `now`. Answers how many to
+    /// report, this one included, when a report is due.
+    pub fn note(&self, collection: &str, now: Instant) -> Option<u64> {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((last, since)) = seen.get_mut(collection)
+            && now.duration_since(*last) < IGNORED_KEEP_EVERY
+        {
+            *since += 1;
+            return None;
+        }
+        let ignored = seen.get(collection).map_or(0, |(_, since)| *since) + 1;
+        seen.insert(collection.to_string(), (now, 0));
+        Some(ignored)
     }
+}
+
+/// A delete hook returned nil, asking to keep a record the storage that
+/// claims it has deleted. It can't be kept, and a script written to keep
+/// deleted records would otherwise lose them silently, so this warns: each
+/// time under verbose event logging, else once an hour per collection with
+/// how many were ignored.
+async fn report_ignored_keep(state: &AppState, ev: &RecordEvent, uri: &str) {
+    let ignored = if state.verbose_event_logging.load(Ordering::Relaxed) {
+        1
+    } else {
+        match state.ignored_keeps.note(&ev.key.collection, Instant::now()) {
+            Some(ignored) => ignored,
+            None => return,
+        }
+    };
+    tracing::warn!(
+        collection = %ev.key.collection,
+        ignored,
+        "a delete hook asked to keep a record its storage deleted; it is gone"
+    );
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "record.skip_ignored".to_string(),
+            severity: Severity::Warn,
+            actor_did: None,
+            subject: Some(uri.to_string()),
+            detail: serde_json::json!({
+                "collection": ev.key.collection,
+                "did": ev.key.did,
+                "rkey": ev.key.rkey,
+                "ignored": ignored,
+                "reason": "script returned nil for a record deleted from the store that holds it",
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
 }
 
 /// A record event for a collection an external storage claims. Its body is
@@ -728,12 +1082,13 @@ async fn apply_claimed(
         .await;
         return (IngestOutcome::Invalid, false);
     }
-    let (delta, outcome) = match ev.action {
+    let (delta, outcome, timer) = match ev.action {
         Action::Create | Action::Update => {
             let Some(body) = &ev.body else {
                 return (IngestOutcome::Invalid, false);
             };
-            match hook_decision(state, ev, body, hook).await {
+            let (decision, timer) = hook_decision(state, ev, body, hook).await;
+            let (delta, outcome) = match decision {
                 Decision::Proceed => (Delta::Proceed, IngestOutcome::Matched),
                 Decision::Replace(replaced) => (
                     Delta::Replace {
@@ -750,33 +1105,20 @@ async fn apply_claimed(
                     IngestOutcome::Matched,
                 ),
                 Decision::Skip | Decision::CidMismatch => (Delta::Hide, IngestOutcome::Skipped),
-            }
+            };
+            (delta, outcome, timer)
         }
         Action::Delete => {
-            if delete_hook(state, ev, &uri, hook).await == RecordHookOutcome::Skip
-                && state.verbose_event_logging.load(Ordering::Relaxed)
-            {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "record.skip_ignored".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(uri.clone()),
-                        detail: serde_json::json!({
-                            "collection": ev.key.collection,
-                            "did": ev.key.did,
-                            "rkey": ev.key.rkey,
-                            "reason": "script returned nil for a record deleted from the store that holds it",
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+            let (hooked, timer) = delete_hook(state, ev, &uri, hook).await;
+            if hooked == RecordHookOutcome::Skip {
+                report_ignored_keep(state, ev, &uri).await;
             }
-            (Delta::Proceed, IngestOutcome::Matched)
+            (Delta::Proceed, IngestOutcome::Matched, timer)
         }
     };
+    // The storage's own reads and writes for the delta, whatever they come
+    // to: a Hide is a write there as much as a Proceed is.
+    let writing = Instant::now();
     let event_type = match ev.action {
         Action::Delete => "record.deleted",
         Action::Create | Action::Update => "record.created",
@@ -803,10 +1145,12 @@ async fn apply_claimed(
                 for_rev = rev;
             }
             Ok(_) => {
+                timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
                 tracing::debug!(uri = %uri, "a retried delta's record changed since; dropped");
                 return (outcome, false);
             }
             Err(e) => {
+                timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
                 tracing::warn!(uri = %uri, "failed to read a retried record: {e}");
                 log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
                 return (
@@ -820,7 +1164,9 @@ async fn apply_claimed(
             }
         }
     }
-    match ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await {
+    let applied = ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await;
+    timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
+    match applied {
         Ok(()) => {
             let stored = outcome == IngestOutcome::Matched && ev.action != Action::Delete;
             if stored {
@@ -1318,5 +1664,44 @@ async fn repo_resynced(
             tracing::warn!(did, error = %e, "failed to purge a resynced repo");
             Applied::failed(&e)
         }
+    }
+}
+
+#[cfg(test)]
+mod ignored_keep_tests {
+    use std::time::{Duration, Instant};
+
+    use super::IgnoredKeeps;
+
+    #[test]
+    fn an_ignored_keep_is_reported_once_an_hour_per_collection_with_a_count() {
+        let keeps = IgnoredKeeps::default();
+        let start = Instant::now();
+        assert_eq!(keeps.note("app.a", start), Some(1));
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(60)), None);
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(3599)), None);
+        assert_eq!(keeps.note("app.b", start), Some(1), "each collection apart");
+        assert_eq!(
+            keeps.note("app.a", start + Duration::from_secs(3600)),
+            Some(3),
+            "the two held back, and this one"
+        );
+        assert_eq!(keeps.note("app.a", start + Duration::from_secs(3601)), None);
+    }
+}
+
+#[cfg(test)]
+mod hook_concurrency_tests {
+    use super::parse_hook_concurrency;
+
+    #[test]
+    fn backfill_hook_concurrency_is_read_and_bounded() {
+        assert_eq!(parse_hook_concurrency(None), 4);
+        assert_eq!(parse_hook_concurrency(Some("")), 4);
+        assert_eq!(parse_hook_concurrency(Some(" 8 ")), 8);
+        assert_eq!(parse_hook_concurrency(Some("1")), 1);
+        assert_eq!(parse_hook_concurrency(Some("0")), 1);
+        assert_eq!(parse_hook_concurrency(Some("500")), 32);
+        assert_eq!(parse_hook_concurrency(Some("many")), 4);
     }
 }

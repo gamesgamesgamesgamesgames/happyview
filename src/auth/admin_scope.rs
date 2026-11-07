@@ -8,8 +8,10 @@
 //! expanded permission is what [`grants_admin`] looks for. `/admin` is not
 //! XRPC, so the method is a name for the grant rather than a route.
 //!
-//! The same method gates a service-auth JWT, which a PDS mints for an OAuth app
-//! only when its session holds a matching `rpc` permission.
+//! A service-auth JWT bound to the same method is no substitute, and the admin
+//! API refuses every service-auth JWT: a PDS mints one for any `lxm` outside
+//! `chat.bsky.` to a session holding `transition:generic`, as most apps' do,
+//! and to an app password.
 
 /// The method the permission set grants. Published, with the set, under
 /// happyview.dev's lexicon authority.

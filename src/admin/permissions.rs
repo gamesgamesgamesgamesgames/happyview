@@ -65,6 +65,9 @@ pub enum Permission {
     #[serde(rename = "events:purge")]
     EventsPurge,
 
+    #[serde(rename = "metrics:read")]
+    MetricsRead,
+
     #[serde(rename = "labelers:create")]
     LabelersCreate,
     #[serde(rename = "labelers:read")]
@@ -112,6 +115,8 @@ pub enum Permission {
     SpacesManageRecords,
     #[serde(rename = "spaces:manage-credentials")]
     SpacesManageCredentials,
+    #[serde(rename = "spaces:inspect")]
+    SpacesInspect,
 
     #[serde(rename = "scripts:read")]
     ScriptsRead,
@@ -162,6 +167,7 @@ impl Permission {
             Self::StatsRead => "stats:read",
             Self::EventsRead => "events:read",
             Self::EventsPurge => "events:purge",
+            Self::MetricsRead => "metrics:read",
             Self::LabelersCreate => "labelers:create",
             Self::LabelersRead => "labelers:read",
             Self::LabelersDelete => "labelers:delete",
@@ -183,6 +189,7 @@ impl Permission {
             Self::SpacesManageInvites => "spaces:manage-invites",
             Self::SpacesManageRecords => "spaces:manage-records",
             Self::SpacesManageCredentials => "spaces:manage-credentials",
+            Self::SpacesInspect => "spaces:inspect",
             Self::ScriptsRead => "scripts:read",
             Self::ScriptsManage => "scripts:manage",
             Self::JobsRead => "jobs:read",
@@ -242,43 +249,43 @@ impl Permission {
             Self::ScriptVariablesCreate => PermissionInfo {
                 key: "script-variables:create",
                 name: "Create Script Variables",
-                description: "Add or update environment variables for Lua scripts",
+                description: "Add or update script variables",
                 category: "Script Variables",
             },
             Self::ScriptVariablesRead => PermissionInfo {
                 key: "script-variables:read",
                 name: "View Script Variables",
-                description: "View script environment variable keys and values",
+                description: "View script variable keys, with values masked",
                 category: "Script Variables",
             },
             Self::ScriptVariablesDelete => PermissionInfo {
                 key: "script-variables:delete",
                 name: "Delete Script Variables",
-                description: "Remove script environment variables",
+                description: "Remove script variables",
                 category: "Script Variables",
             },
             Self::UsersCreate => PermissionInfo {
                 key: "users:create",
                 name: "Create Users",
-                description: "Add new dashboard users",
+                description: "Add operators to the instance",
                 category: "Users",
             },
             Self::UsersRead => PermissionInfo {
                 key: "users:read",
                 name: "View Users",
-                description: "View the user list and their permissions",
+                description: "View operators and their permissions",
                 category: "Users",
             },
             Self::UsersUpdate => PermissionInfo {
                 key: "users:update",
                 name: "Update Users",
-                description: "Modify user permissions",
+                description: "Change an operator's permissions",
                 category: "Users",
             },
             Self::UsersDelete => PermissionInfo {
                 key: "users:delete",
                 name: "Delete Users",
-                description: "Remove dashboard users",
+                description: "Remove operators from the instance",
                 category: "Users",
             },
             Self::ApiKeysCreate => PermissionInfo {
@@ -327,6 +334,12 @@ impl Permission {
                 key: "events:purge",
                 name: "Purge Events",
                 description: "Bulk-delete event log entries matching a filter",
+                category: "System",
+            },
+            Self::MetricsRead => PermissionInfo {
+                key: "metrics:read",
+                name: "View Metrics",
+                description: "View script run counts, latency, errors and resource use",
                 category: "System",
             },
             Self::LabelersCreate => PermissionInfo {
@@ -446,13 +459,19 @@ impl Permission {
             Self::SpacesManageRecords => PermissionInfo {
                 key: "spaces:manage-records",
                 name: "Manage Records",
-                description: "Read and write records within spaces",
+                description: "Reserved; grants no access. Use `spaces:inspect` to read space contents.",
                 category: "Spaces",
             },
             Self::SpacesManageCredentials => PermissionInfo {
                 key: "spaces:manage-credentials",
                 name: "Manage Credentials",
                 description: "Issue and revoke space access credentials",
+                category: "Spaces",
+            },
+            Self::SpacesInspect => PermissionInfo {
+                key: "spaces:inspect",
+                name: "Inspect Space Contents",
+                description: "Request time-limited access to read records and blobs in private spaces",
                 category: "Spaces",
             },
             Self::ScriptsRead => PermissionInfo {
@@ -537,6 +556,7 @@ impl Permission {
             Self::StatsRead,
             Self::EventsRead,
             Self::EventsPurge,
+            Self::MetricsRead,
             Self::LabelersCreate,
             Self::LabelersRead,
             Self::LabelersDelete,
@@ -558,6 +578,7 @@ impl Permission {
             Self::SpacesManageInvites,
             Self::SpacesManageRecords,
             Self::SpacesManageCredentials,
+            Self::SpacesInspect,
             Self::ScriptsRead,
             Self::ScriptsManage,
             Self::JobsRead,
@@ -599,6 +620,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         StatsRead,
         EventsRead,
         EventsPurge,
+        MetricsRead,
         LabelersCreate,
         LabelersRead,
         LabelersDelete,
@@ -620,6 +642,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         SpacesManageInvites,
         SpacesManageRecords,
         SpacesManageCredentials,
+        SpacesInspect,
         JobsRead,
         JobsCreate,
         JobsManage,
@@ -644,7 +667,10 @@ pub fn is_valid(key: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum Template {
     Viewer,
-    Operator,
+    // Was called Operator, which the docs use for the person running the
+    // instance. The old name is still accepted wherever a template is sent.
+    #[serde(alias = "operator")]
+    Maintainer,
     Manager,
     FullAccess,
 }
@@ -659,7 +685,7 @@ pub struct TemplateInfo {
 impl Template {
     pub const ALL: &[Template] = &[
         Template::Viewer,
-        Template::Operator,
+        Template::Maintainer,
         Template::Manager,
         Template::FullAccess,
     ];
@@ -667,7 +693,7 @@ impl Template {
     pub fn key(&self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
-            Self::Operator => "operator",
+            Self::Maintainer => "maintainer",
             Self::Manager => "manager",
             Self::FullAccess => "full_access",
         }
@@ -676,7 +702,7 @@ impl Template {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Viewer => "Viewer",
-            Self::Operator => "Operator",
+            Self::Maintainer => "Maintainer",
             Self::Manager => "Manager",
             Self::FullAccess => "Full Access",
         }
@@ -702,9 +728,10 @@ impl Template {
                 Permission::BackfillRead,
                 Permission::StatsRead,
                 Permission::EventsRead,
+                Permission::MetricsRead,
                 Permission::DeadLettersRead,
             ]),
-            Self::Operator => {
+            Self::Maintainer => {
                 let mut perms = Self::Viewer.permissions();
                 perms.insert(Permission::BackfillCreate);
                 perms.insert(Permission::ApiKeysCreate);
@@ -713,7 +740,7 @@ impl Template {
                 perms
             }
             Self::Manager => {
-                let mut perms = Self::Operator.permissions();
+                let mut perms = Self::Maintainer.permissions();
                 perms.insert(Permission::LexiconsCreate);
                 perms.insert(Permission::LexiconsDelete);
                 perms.insert(Permission::LexiconsPublish);
@@ -816,17 +843,29 @@ mod tests {
     }
 
     #[test]
-    fn template_viewer_is_subset_of_operator() {
+    fn template_viewer_is_subset_of_maintainer() {
         let viewer = Template::Viewer.permissions();
-        let operator = Template::Operator.permissions();
-        assert!(viewer.is_subset(&operator));
+        let maintainer = Template::Maintainer.permissions();
+        assert!(viewer.is_subset(&maintainer));
     }
 
     #[test]
-    fn template_operator_is_subset_of_manager() {
-        let operator = Template::Operator.permissions();
+    fn template_maintainer_is_subset_of_manager() {
+        let maintainer = Template::Maintainer.permissions();
         let manager = Template::Manager.permissions();
-        assert!(operator.is_subset(&manager));
+        assert!(maintainer.is_subset(&manager));
+    }
+
+    #[test]
+    fn template_operator_is_still_read_as_maintainer() {
+        for key in ["maintainer", "operator"] {
+            let template: Template = serde_json::from_value(serde_json::json!(key)).unwrap();
+            assert_eq!(template.key(), "maintainer", "{key}");
+        }
+        assert_eq!(
+            serde_json::to_value(Template::Maintainer).unwrap(),
+            "maintainer"
+        );
     }
 
     #[test]
@@ -852,14 +891,41 @@ mod tests {
         }
     }
 
+    /// Whoever can read the event log can read the metrics beside it.
+    #[test]
+    fn every_template_with_events_read_has_metrics_read() {
+        for template in Template::ALL {
+            let permissions = template.permissions();
+            if permissions.contains(&Permission::EventsRead) {
+                assert!(
+                    permissions.contains(&Permission::MetricsRead),
+                    "{template:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn events_purge_is_registered_and_not_granted_by_default_templates() {
         assert_eq!(Permission::EventsPurge.as_str(), "events:purge");
         assert!(Permission::all().contains(&Permission::EventsPurge));
-        for template in [Template::Viewer, Template::Operator, Template::Manager] {
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
             assert!(
                 !template.permissions().contains(&Permission::EventsPurge),
                 "purging the audit log must not come with a built-in role template"
+            );
+        }
+    }
+
+    #[test]
+    fn spaces_inspect_is_opt_in() {
+        assert_eq!(Permission::SpacesInspect.as_str(), "spaces:inspect");
+        assert!(is_valid("spaces:inspect"));
+        assert!(Permission::all().contains(&Permission::SpacesInspect));
+        for template in [Template::Viewer, Template::Maintainer, Template::Manager] {
+            assert!(
+                !template.permissions().contains(&Permission::SpacesInspect),
+                "reading private space contents is granted deliberately, not by template"
             );
         }
     }

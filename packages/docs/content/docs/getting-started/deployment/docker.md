@@ -83,7 +83,7 @@ Compose refuses to start without these:
 
 - **`PUBLIC_URL`** — the public HTTPS URL users actually hit, scheme included. It's used to build OAuth redirect URIs, so a mismatch breaks login. Do **not** include `BASE_PATH` here.
 - **`SESSION_SECRET`** — signs the dashboard session cookie. An unset or too-short value doesn't stop the server booting; it silently disables cookie login, which is why the Compose files require it explicitly.
-- **`TOKEN_ENCRYPTION_KEY`** — the AES-256-GCM key protecting OAuth tokens, DPoP private keys, and plugin secrets at rest. Without it, DPoP sessions, [spaces](../../experimental/spaces/index.md), and service identity are disabled. Rotating it makes everything already encrypted unreadable.
+- **`TOKEN_ENCRYPTION_KEY`** — the AES-256-GCM key protecting OAuth tokens, DPoP private keys, and plugin secrets at rest. Without it, DPoP sessions, [spaces](../../experimental/spaces/index.md), and service identity are disabled. Changing it alone makes everything already encrypted unreadable: rotate it as in [Rotating the encryption key](../../guides/rotating-the-encryption-key.md).
 
 <Callout type="warn" title="Deploying from a clone of the repository instead">
 The steps above assume a directory containing nothing but the Compose file and your `.env`, which is why the plain filenames are safe. In a clone of the repository they are not: a development `.env` left beside the Compose files is auto-loaded just the same, and will quietly supply these values — including the `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` triplet that `.env.example` ships. If you deploy from a clone, keep production values in their own file and name both explicitly on every command:
@@ -196,7 +196,7 @@ Postgres stack only:
 The full environment variable reference is in [Configuration](../configuration.md). A few that aren't wired into the Compose files — `ATTESTATION_PRIVATE_KEY`, `APP_NAME`, `LOGO_URI`, `TOS_URI`, `POLICY_URI`, and the `BACKFILL_CONCURRENT_*` tuning knobs — are present as commented-out lines you can uncomment.
 
 <Callout type="warn" title="Postgres connection limits">
-HappyView opens two pools: the main one (`DATABASE_MAX_CONNECTIONS`) and a separate backfill pool sized `(BACKFILL_CONCURRENT_PDS × BACKFILL_CONCURRENT_DIDS_PER_PDS) + BACKFILL_CONCURRENT_RESOLUTION + 4`, which is 134 on the defaults. Both are lazy, so an idle instance holds almost nothing, but a running backfill peaks near 166, and Postgres's stock limit of 100 would fail it with `sorry, too many clients already`. Raise `POSTGRES_MAX_CONNECTIONS` further if you raise the backfill concurrency or add replicas.
+HappyView opens two pools: the main one (`DATABASE_MAX_CONNECTIONS`) and a separate backfill pool sized `(BACKFILL_CONCURRENT_PDS × BACKFILL_CONCURRENT_DIDS_PER_PDS) + BACKFILL_CONCURRENT_RESOLUTION + 4`, which is 134 on the defaults. A value saved in the dashboard's backfill settings takes the place of its variable, and the pool is sized when HappyView starts, so a raised setting needs a restart to get its connections. Both are lazy, so an idle instance holds almost nothing, but a running backfill peaks near 166, and Postgres's stock limit of 100 would fail it with `sorry, too many clients already`. Raise `POSTGRES_MAX_CONNECTIONS` further if you raise the backfill concurrency or add replicas.
 </Callout>
 
 <Callout type="error" title="Don't override the SQLite DATABASE_URL through the environment">

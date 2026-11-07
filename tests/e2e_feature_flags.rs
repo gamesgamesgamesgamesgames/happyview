@@ -188,6 +188,12 @@ async fn admin_feature_flags_lists_flags() {
     assert_eq!(spaces_flag["enabled"], false);
     assert!(spaces_flag["name"].as_str().is_some());
     assert!(spaces_flag["description"].as_str().is_some());
+
+    let migration_flag = flags
+        .iter()
+        .find(|f| f["key"] == "feature.spaces_pds_migration")
+        .expect("PDS migration flag not found");
+    assert_eq!(migration_flag["enabled"], false);
 }
 
 #[tokio::test]

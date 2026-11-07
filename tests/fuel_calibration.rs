@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use common::lua_plugin::{identify, plugin_dir};
 use happyview::config::project::ModuleDecl;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ParsedLexicon;
 use happyview::lua::limits::DEFAULT_INSTRUCTION_LIMIT;
 use happyview::plugin::capabilities::PluginCapability;
 use happyview::plugin::{
@@ -40,9 +40,9 @@ const MODULE: &str = "tests/fixtures/script_module/target/wasm32-wasip1/release/
 macro_rules! require_module {
     () => {
         if !std::path::Path::new(MODULE).exists() {
-            eprintln!(
-                "skipping: fixture not built. Run: cargo build --manifest-path \
-                 tests/fixtures/script_module/Cargo.toml --target wasm32-wasip1 --release"
+            happyview::test_support::unavailable(
+                "script_module fixture not built. Run: cargo build --manifest-path \
+                 tests/fixtures/script_module/Cargo.toml --target wasm32-wasip1 --release",
             );
             return;
         }
@@ -86,8 +86,6 @@ fn lexicon(id: &str, kind: &str) -> (String, ProjectLexicon) {
     let parsed = ParsedLexicon::parse(
         json!({"lexicon": 1, "id": id, "defs": {"main": main}}),
         1,
-        None,
-        ProcedureAction::Upsert,
         None,
     )
     .unwrap();

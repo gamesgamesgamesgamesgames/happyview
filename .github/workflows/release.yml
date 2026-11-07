@@ -53,6 +53,13 @@ on:
         default: dry-run
         type: string
 
+# Hand-added: `dist generate` does not write this, so keep it when
+# regenerating. A newer push to a pull request cancels its `plan` run; a
+# dispatched release is keyed by its tag and commit and never cancels.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}-{2}', github.event_name, github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
@@ -159,8 +166,6 @@ jobs:
         shell: "bash"
         env:
           "NEXT_PUBLIC_BASE_PATH": "/__HAPPYVIEW_BP__"
-          "MSYS2_ENV_CONV_EXCL": "NEXT_PUBLIC_BASE_PATH"
-          "MSYS_NO_PATHCONV": "1"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -11,7 +11,6 @@ use std::time::Duration;
 use happyview::db::DatabaseBackend;
 use happyview::db::adapt_sql;
 use happyview::host::AppHost;
-use happyview::lexicon::ProcedureAction;
 use happyview_source_jetstream::consumer::config::{
     DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
 };
@@ -56,7 +55,7 @@ impl Drop for Consumer {
 
 async fn app() -> Option<TestApp> {
     if std::env::var("TEST_DATABASE_URL").is_err() {
-        eprintln!("skipped (TEST_DATABASE_URL not set)");
+        happyview::test_support::unavailable(happyview::test_support::NO_DATABASE);
         return None;
     }
     let app = TestApp::new().await;
@@ -68,8 +67,6 @@ async fn app() -> Option<TestApp> {
             happyview::catalog::LexiconWrite {
                 lexicon_json: common::fixtures::game_record_lexicon(),
                 backfill: false,
-                target_collection: Some(GAME.to_string()),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

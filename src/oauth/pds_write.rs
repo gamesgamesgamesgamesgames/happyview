@@ -9,7 +9,6 @@ use std::sync::{Arc, LazyLock};
 use crate::auth::OAuthClientRegistry;
 use crate::db::DatabaseBackend;
 use crate::error::AppError;
-use crate::plugin::encryption::decrypt;
 
 use super::sessions::DpopSession;
 
@@ -24,7 +23,7 @@ struct DpopCredentials {
 async fn load_dpop_private_jwk(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     dpop_key_id: &str,
 ) -> Result<serde_json::Value, AppError> {
     let key_sql = crate::db::adapt_sql(
@@ -39,11 +38,41 @@ async fn load_dpop_private_jwk(
 
     let (encrypted_key,) = row.ok_or_else(|| AppError::Internal("DPoP key not found".into()))?;
 
-    let key_bytes = decrypt(encryption_key, &encrypted_key)
+    let key_bytes = encryption_key
+        .decrypt(&encrypted_key)
         .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
 
     serde_json::from_slice(&key_bytes)
         .map_err(|e| AppError::Internal(format!("failed to parse DPoP key: {e}")))
+}
+
+/// Check, once, a session stored before registration checked its PDS and
+/// issuer: its `pds_url` becomes the PDS the user's DID document names, and
+/// its issuer must be one that PDS lists, or the session is refused. Every
+/// path that sends a session's tokens reads it through here or checks it the
+/// same way, so none uses a PDS or issuer the app alone supplied.
+pub(crate) async fn ensure_verified(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    plc_url: &str,
+    session: &mut super::sessions::DpopSession,
+) -> Result<(), AppError> {
+    let (client, did, key) = (
+        session.api_client_id.as_str(),
+        session.user_did.as_str(),
+        session.dpop_key_id.as_str(),
+    );
+    if super::sessions::is_verified(pool, backend, client, did, key).await? {
+        return Ok(());
+    }
+    let pds = resolve_pds_from_did(http, plc_url, did).await?;
+    if let Some(issuer) = session.issuer.as_deref() {
+        verify_issuer_of(http, &pds, issuer).await?;
+    }
+    super::sessions::mark_verified(pool, backend, client, did, key, &pds).await?;
+    session.pds_url = Some(pds);
+    Ok(())
 }
 
 /// Resolve DPoP credentials: session, PDS URL, and decrypted private key.
@@ -52,7 +81,7 @@ async fn resolve_credentials(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     plc_url: &str,
     api_client_id: &str,
     user_did: &str,
@@ -68,6 +97,8 @@ async fn resolve_credentials(
     )
     .await?;
 
+    let mut session = session;
+    ensure_verified(http, pool, backend, plc_url, &mut session).await?;
     let pds_url = match session.pds_url {
         Some(ref url) => url.clone(),
         None => resolve_pds_from_did(http, plc_url, user_did).await?,
@@ -273,7 +304,7 @@ async fn dpop_request_with_retry(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
     http_method: &str,
@@ -340,7 +371,7 @@ async fn retry_after_refresh(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
     http_method: &str,
@@ -454,7 +485,7 @@ pub async fn dpop_pds_post(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -513,7 +544,7 @@ pub async fn dpop_pds_post_with_headers(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -577,7 +608,7 @@ pub async fn dpop_pds_get(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -645,7 +676,7 @@ pub async fn dpop_pds_post_blob(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -734,7 +765,7 @@ async fn refresh_access_token(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
 ) -> Result<Option<String>, AppError> {
@@ -827,7 +858,7 @@ async fn refresh_access_token(
     let body = String::from_utf8_lossy(&buffered.body).to_string();
 
     if status.is_success() {
-        return apply_refresh_response(pool, backend, encryption_key, creds, &body).await;
+        return apply_refresh_response(pool, backend, encryption_key.current(), creds, &body).await;
     }
 
     Err(AppError::Auth(format!(
@@ -853,7 +884,7 @@ pub async fn verified_granted_scope(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
     plc_url: &str,
     api_client_id: &str,
@@ -925,12 +956,24 @@ async fn verify_issuer(
     did: &str,
     issuer: Option<&str>,
 ) -> Result<(), AppError> {
-    let refused =
-        || AppError::Forbidden("the session's authorization server is not the account's".into());
-    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
-    let issuer = issuer.ok_or_else(refused)?;
-
+    let issuer = issuer.ok_or_else(issuer_refused)?;
     let pds = resolve_pds_from_did(http, plc_url, did).await?;
+    verify_issuer_of(http, &pds, issuer).await
+}
+
+fn issuer_refused() -> AppError {
+    AppError::Forbidden("the session's authorization server is not the account's".into())
+}
+
+/// [`verify_issuer`] for a PDS already resolved from the account's DID
+/// document: `issuer` must be listed by `pds` and name itself.
+pub(crate) async fn verify_issuer_of(
+    http: &reqwest::Client,
+    pds: &str,
+    issuer: &str,
+) -> Result<(), AppError> {
+    let refused = issuer_refused;
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
     let resource_url = format!(
         "{}/.well-known/oauth-protected-resource",
         pds.trim_end_matches('/')
@@ -1042,13 +1085,14 @@ pub async fn revoke_dpop_session_at_as(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     oauth_registry: &Arc<OAuthClientRegistry>,
+    plc_url: &str,
     api_client_id: &str,
     user_did: &str,
     dpop_key_id: &str,
 ) -> Result<(), AppError> {
-    let session = super::sessions::get_dpop_session(
+    let mut session = super::sessions::get_dpop_session(
         pool,
         backend,
         encryption_key,
@@ -1058,6 +1102,7 @@ pub async fn revoke_dpop_session_at_as(
     )
     .await?;
 
+    ensure_verified(http, pool, backend, plc_url, &mut session).await?;
     let Some(issuer) = session.issuer.clone() else {
         tracing::debug!(%user_did, "session has no issuer recorded; nothing to revoke");
         return Ok(());
@@ -1302,15 +1347,15 @@ fn generate_dpop_proof_inner(
 /// provisioned key the token is bound to. The PDS reports which DID the token
 /// actually belongs to; the caller compares it against the claimed `did`.
 ///
-/// Returns the DID the PDS reports for the token, or an auth error if the token
-/// is rejected.
+/// Returns the DID the PDS reports for the token and the PDS URL resolved for
+/// `did`, or an auth error if the token is rejected.
 pub async fn verify_access_token_did(
     http: &reqwest::Client,
     plc_url: &str,
     private_jwk: &serde_json::Value,
     did: &str,
     access_token: &str,
-) -> Result<String, AppError> {
+) -> Result<(String, String), AppError> {
     let pds_url = resolve_pds_from_did(http, plc_url, did).await?;
     let target_url = format!(
         "{}/xrpc/com.atproto.server.getSession",
@@ -1335,7 +1380,7 @@ pub async fn verify_access_token_did(
             .map_err(|e| AppError::Internal(format!("invalid getSession response: {e}")))?;
         return body["did"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(|s| (s.to_string(), pds_url.clone()))
             .ok_or_else(|| AppError::Auth("getSession response missing did".into()));
     }
 

@@ -1,6 +1,6 @@
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 
 /// Stored DPoP session data (decrypted).
 pub struct DpopSession {
@@ -170,7 +170,7 @@ pub async fn set_granted_scope(
 pub async fn get_dpop_session(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     api_client_id: &str,
     user_did: &str,
     dpop_key_id: &str,
@@ -202,14 +202,16 @@ pub async fn get_dpop_session(
         row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
 
     let access_token = String::from_utf8(
-        decrypt(encryption_key, &access_enc)
+        encryption_key
+            .decrypt(&access_enc)
             .map_err(|e| AppError::Internal(format!("failed to decrypt access token: {e}")))?,
     )
     .map_err(|e| AppError::Internal(format!("invalid access token bytes: {e}")))?;
 
     let refresh_token = refresh_enc
         .map(|enc| {
-            let bytes = decrypt(encryption_key, &enc)
+            let bytes = encryption_key
+                .decrypt(&enc)
                 .map_err(|e| AppError::Internal(format!("failed to decrypt refresh token: {e}")))?;
             String::from_utf8(bytes)
                 .map_err(|e| AppError::Internal(format!("invalid refresh token bytes: {e}")))
@@ -233,6 +235,55 @@ pub async fn get_dpop_session(
 
 /// Look up a DPoP session by api_client_id and dpop_key_id, decrypting tokens.
 /// Used by the auth middleware where the key ID is derived from the DPoP proof thumbprint.
+/// Whether a session's `pds_url` and issuer have been checked against the
+/// user's DID document, which registration does and an older row lacks.
+pub async fn is_verified(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Result<bool, AppError> {
+    let sql = adapt_sql(
+        "SELECT verified_at FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read a session's verification: {e}")))?;
+    Ok(row.and_then(|(at,)| at).is_some())
+}
+
+/// Record that a session's PDS is `pds_url`, resolved from the user's DID
+/// document, and that its issuer was checked against it.
+pub async fn mark_verified(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+    pds_url: &str,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_sessions SET pds_url = ?, verified_at = ? WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(pds_url)
+        .bind(now_rfc3339())
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to mark a session verified: {e}")))?;
+    Ok(())
+}
+
 /// Look up just the granted scopes for a session.
 ///
 /// Deliberately does not decrypt the tokens: a scope check has no business
@@ -261,7 +312,7 @@ pub async fn get_dpop_session_scopes(
 pub async fn get_dpop_session_by_key_id(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     api_client_id: &str,
     dpop_key_id: &str,
 ) -> Result<DpopSession, AppError> {
@@ -301,14 +352,16 @@ pub async fn get_dpop_session_by_key_id(
     ) = row.ok_or_else(|| AppError::Auth("no matching DPoP session".into()))?;
 
     let access_token = String::from_utf8(
-        decrypt(encryption_key, &access_enc)
+        encryption_key
+            .decrypt(&access_enc)
             .map_err(|e| AppError::Internal(format!("failed to decrypt access token: {e}")))?,
     )
     .map_err(|e| AppError::Internal(format!("invalid access token bytes: {e}")))?;
 
     let refresh_token = refresh_enc
         .map(|enc| {
-            let bytes = decrypt(encryption_key, &enc)
+            let bytes = encryption_key
+                .decrypt(&enc)
                 .map_err(|e| AppError::Internal(format!("failed to decrypt refresh token: {e}")))?;
             String::from_utf8(bytes)
                 .map_err(|e| AppError::Internal(format!("invalid refresh token bytes: {e}")))
@@ -477,16 +530,18 @@ pub async fn list_dpop_sessions(
 
 /// Look up a DPoP session by api_client_id and user_did only (without dpop_key_id).
 /// Used when the caller doesn't know the specific device key — delegation writes
-/// and confidential client session lookups. Returns the first matching session.
+/// and confidential client session lookups. Returns the most recently stored
+/// session, since a stale or revoked one is likelier among the older ones.
+/// `updated_at` is always `now_rfc3339()`, so text order is time order.
 pub async fn get_dpop_session_for_user(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     api_client_id: &str,
     user_did: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? LIMIT 1",
+        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
         backend,
     );
 
@@ -521,14 +576,16 @@ pub async fn get_dpop_session_for_user(
     ) = row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
 
     let access_token = String::from_utf8(
-        decrypt(encryption_key, &access_enc)
+        encryption_key
+            .decrypt(&access_enc)
             .map_err(|e| AppError::Internal(format!("failed to decrypt access token: {e}")))?,
     )
     .map_err(|e| AppError::Internal(format!("invalid access token bytes: {e}")))?;
 
     let refresh_token = refresh_enc
         .map(|enc| {
-            let bytes = decrypt(encryption_key, &enc)
+            let bytes = encryption_key
+                .decrypt(&enc)
                 .map_err(|e| AppError::Internal(format!("failed to decrypt refresh token: {e}")))?;
             String::from_utf8(bytes)
                 .map_err(|e| AppError::Internal(format!("invalid refresh token bytes: {e}")))

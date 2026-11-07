@@ -8,7 +8,7 @@ use happyview_provider::Host;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::ingest::REPO_STATUS_MAX_BYTES;
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 use happyview_source_jetstream::consumer::apply::*;
 use happyview_source_jetstream::consumer::event::{Commit, CursorPoint, Event, EventKind};
 use happyview_source_jetstream::consumer::workers::ApplyOutcome;
@@ -44,8 +44,6 @@ async fn register(state: &AppState) {
             "defs": {"main": {"type": "record", "key": "tid"}},
         }),
         1,
-        Some(NSID.to_string()),
-        ProcedureAction::Upsert,
         None,
     )
     .expect("parse lexicon");
@@ -221,8 +219,6 @@ async fn register_unindexed(state: &AppState) {
             "defs": {"main": {"type": "record", "key": "tid"}},
         }),
         1,
-        Some(NSID.to_string()),
-        ProcedureAction::Upsert,
         None,
     )
     .expect("parse lexicon");
@@ -1121,5 +1117,166 @@ async fn live_markers_still_purge_everything() {
         put(&state, &did, "newer", Some(30)).await;
         apply(&state, account(&did, 20, false, Some("takendown"))).await;
         assert!(rkeys(&state, &did).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_batch_looks_its_hook_up_once() {
+    for state in states().await {
+        let trigger = format!("record.create:{NSID}");
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                state.db_backend,
+                crate::catalog::ScriptWrite {
+                    id: trigger.clone(),
+                    script_type: "lua".into(),
+                    body: "function handle() return true end".into(),
+                    description: None,
+                },
+            )
+            .await
+            .expect("store the hook");
+        let did = unique_did();
+        let events = (0..10)
+            .map(|i| {
+                happyview_provider::SourceEvent::Record(happyview_provider::RecordEvent {
+                    key: happyview_provider::RecordKey {
+                        did: did.clone(),
+                        collection: NSID.into(),
+                        rkey: format!("r{i}"),
+                    },
+                    action: happyview_provider::Action::Create,
+                    cid: None,
+                    rev: None,
+                    body: Some(serde_json::json!({"text": i})),
+                    time_us: None,
+                    origin: happyview_provider::Origin::Live,
+                    stored: false,
+                })
+            })
+            .collect();
+        let before = state.scripts.table_reads();
+
+        host(&state).ingest_batch(events).await;
+
+        assert_eq!(
+            state.scripts.table_reads() - before,
+            1,
+            "ten creates in one batch read the hook's row once"
+        );
+        state
+            .scripts
+            .remove(&state.db, state.db_backend, &trigger)
+            .await
+            .expect("remove the hook");
+        clean_up(&state, &did).await;
+    }
+}
+
+/// Ten creates of `did` from `origin`, one key each.
+fn creates(did: &str, origin: happyview_provider::Origin) -> Vec<happyview_provider::SourceEvent> {
+    (0..10)
+        .map(|i| {
+            happyview_provider::SourceEvent::Record(happyview_provider::RecordEvent {
+                key: happyview_provider::RecordKey {
+                    did: did.into(),
+                    collection: NSID.into(),
+                    rkey: format!("r{i}"),
+                },
+                action: happyview_provider::Action::Create,
+                cid: None,
+                rev: None,
+                body: Some(serde_json::json!({"text": i})),
+                time_us: None,
+                origin: origin.clone(),
+                stored: false,
+            })
+        })
+        .collect()
+}
+
+/// Applies `events` with a hook in place, and answers the most hooks it had
+/// running at once and the batch's outcomes.
+async fn hooked_at_once(
+    state: &AppState,
+    events: Vec<happyview_provider::SourceEvent>,
+) -> (usize, Vec<happyview_provider::IngestOutcome>) {
+    use std::sync::atomic::Ordering;
+    let trigger = format!("record.create:{NSID}");
+    state
+        .scripts
+        .put_manual(
+            &state.db,
+            state.db_backend,
+            crate::catalog::ScriptWrite {
+                id: trigger.clone(),
+                script_type: "lua".into(),
+                body: "function handle() return true end".into(),
+                description: None,
+            },
+        )
+        .await
+        .expect("store the hook");
+    let count = Arc::new(crate::ingest::hooks_in_flight::Count::default());
+    let outcome = crate::ingest::hooks_in_flight::COUNT
+        .scope(count.clone(), host(state).ingest_batch(events))
+        .await;
+    state
+        .scripts
+        .remove(&state.db, state.db_backend, &trigger)
+        .await
+        .expect("remove the hook");
+    (count.most.load(Ordering::SeqCst), outcome.outcomes)
+}
+
+fn backfill() -> happyview_provider::Origin {
+    happyview_provider::Origin::Backfill {
+        job_id: "job".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_backfill_batch_hooks_its_records_at_once() {
+    for state in states().await {
+        let did = unique_did();
+        let (most, outcomes) = hooked_at_once(&state, creates(&did, backfill())).await;
+
+        assert_eq!(most, 4, "the default four hooks ran at once");
+        assert_eq!(
+            outcomes,
+            vec![happyview_provider::IngestOutcome::Matched; 10],
+            "every record applied, in order"
+        );
+        assert_eq!(rkeys(&state, &did).await.len(), 10);
+        clean_up(&state, &did).await;
+    }
+}
+
+#[tokio::test]
+async fn a_live_batch_hooks_one_record_at_a_time() {
+    for state in states().await {
+        let did = unique_did();
+        let (most, _) =
+            hooked_at_once(&state, creates(&did, happyview_provider::Origin::Live)).await;
+
+        assert_eq!(most, 1);
+        clean_up(&state, &did).await;
+    }
+}
+
+#[tokio::test]
+async fn a_backfill_batch_with_a_key_twice_hooks_one_record_at_a_time() {
+    for state in states().await {
+        let did = unique_did();
+        let mut events = creates(&did, backfill());
+        if let happyview_provider::SourceEvent::Record(ev) = &mut events[9] {
+            ev.key.rkey = "r0".into();
+        }
+        let (most, _) = hooked_at_once(&state, events).await;
+
+        assert_eq!(most, 1, "a key's versions keep their order");
+        clean_up(&state, &did).await;
     }
 }

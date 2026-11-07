@@ -1,10 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
 import pg from "pg";
-import { loginAsTestAdmin } from "./auth-helper";
+import { loginAsTestAdmin, DB_URL } from "./auth-helper";
 
 const TEST_TYPE_NSID = "com.example.testspace";
 const TEST_SKEY = "e2e-test-space";
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 
 async function enableSpacesFeature(): Promise<void> {
   const client = new pg.Client(DB_URL);
@@ -28,6 +27,11 @@ const MEMBER_LIST_POLICY = {
 const PUBLIC_POLICY = { $type: "com.atproto.simplespace.defs#publicPolicy" };
 
 test.describe("Spaces API", () => {
+  // `page.request` runs outside the browser and sends no fetch metadata, and
+  // the session cookie counts on XRPC only on a request from the instance's
+  // own pages. This spec drives the API only, as the dashboard would.
+  test.use({ extraHTTPHeaders: { "sec-fetch-site": "same-origin" } });
+
   let createdSpaceUri: string | null = null;
 
   test.beforeEach(async ({ page }) => {
@@ -271,6 +275,9 @@ async function disableSpacesFeature(): Promise<void> {
 }
 
 test.describe("Spaces Feature Flag", () => {
+  // As in "Spaces API": the API request is the dashboard's own.
+  test.use({ extraHTTPHeaders: { "sec-fetch-site": "same-origin" } });
+
   test.beforeEach(async ({ page }) => {
     await disableSpacesFeature();
     await loginAsTestAdmin(page);

@@ -26,7 +26,7 @@ function handle(input, ctx)
   end
 
   -- Create new
-  return record.create(ctx.collection, input)
+  return record.create("xyz.statusphere.status", input)
 end
 ```
 

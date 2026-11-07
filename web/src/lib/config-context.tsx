@@ -1,16 +1,42 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { TriangleAlert } from "lucide-react";
 
-interface ConfigContextType {
+import {
+  InstanceConnecting,
+  InstanceUnavailable,
+} from "@/components/instance-unavailable";
+import {
+  type ConfigFailure,
+  type Features,
+  classifyConfigFailure,
+  parseFeatures,
+  refreshFrom,
+  retryDelayMs,
+} from "@/lib/config-load";
+
+interface Config {
   public_url: string;
   default_rate_limit_capacity: number;
   default_rate_limit_refill_rate: number;
   app_name: string | null;
   logo_url: string | null;
+  features: Features;
   platform_managed: boolean;
   configErrors: string[];
+}
+
+interface ConfigContextType extends Config {
+  /** Re-fetch `/config`, e.g. after a setting that changes a feature flag. */
+  refreshConfig: () => Promise<void>;
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -19,8 +45,10 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  features: { spaces: false, space_inspector: false },
   platform_managed: false,
   configErrors: [],
+  refreshConfig: async () => {},
 });
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
@@ -48,44 +76,104 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
   );
 }
 
-export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<ConfigContextType | null>(null);
-  const [error, setError] = useState<string | null>(null);
+/** Fetch `/config`, answering a failure as what it means for the dashboard. */
+async function loadConfig(): Promise<
+  { config: Config } | { failure: ConfigFailure }
+> {
+  const host = window.location.host;
+  let res: Response;
+  try {
+    res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return { failure: classifyConfigFailure(null, host, detail) };
+  }
+  if (!res.ok) {
+    return {
+      failure: classifyConfigFailure(
+        res.status,
+        host,
+        `The server answered ${res.status}.`,
+      ),
+    };
+  }
+  const data = await res.json();
+  return {
+    config: {
+      public_url: data.public_url,
+      default_rate_limit_capacity: data.default_rate_limit_capacity,
+      default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
+      app_name: data.app_name ?? null,
+      logo_url: data.logo_url ?? null,
+      features: parseFeatures(data.features),
+      platform_managed: data.platform_managed === true,
+      configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
+    },
+  };
+}
 
+export function ConfigProvider({ children }: { children: React.ReactNode }) {
+  const [config, setConfig] = useState<Config | null>(null);
+  const [failure, setFailure] = useState<ConfigFailure | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const retryNow = useRef<() => void>(() => {});
+
+  const refreshConfig = useCallback(
+    () => refreshFrom(loadConfig, setConfig),
+    [],
+  );
+
+  // An unreachable server is retried with backoff until it answers. A host
+  // the server does not serve is not: asking again gets the same answer.
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
-        setConfig({
-          public_url: data.public_url,
-          default_rate_limit_capacity: data.default_rate_limit_capacity,
-          default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
-          app_name: data.app_name ?? null,
-          logo_url: data.logo_url ?? null,
-          platform_managed: data.platform_managed === true,
-          configErrors: Array.isArray(data.configErrors)
-            ? data.configErrors
-            : [],
-        });
-      })
-      .catch((e) => setError(e.message));
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
+    const run = async () => {
+      clearTimeout(timer);
+      const outcome = await loadConfig();
+      if (cancelled) return;
+      setRetrying(false);
+      if ("config" in outcome) {
+        setFailure(null);
+        setConfig(outcome.config);
+        return;
+      }
+      setFailure(outcome.failure);
+      if (outcome.failure.kind === "unreachable") {
+        timer = setTimeout(run, retryDelayMs(attempt));
+        attempt += 1;
+      }
+    };
+    retryNow.current = run;
+    run();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
-  if (error) {
+  if (failure && !config) {
     return (
-      <div style={{ padding: "2rem", color: "red" }}>
-        Failed to load config: {error}
-      </div>
+      <InstanceUnavailable
+        failure={failure}
+        retrying={retrying}
+        onRetry={
+          failure.kind === "unreachable"
+            ? () => {
+                setRetrying(true);
+                retryNow.current();
+              }
+            : undefined
+        }
+      />
     );
   }
 
-  if (!config) return null;
+  if (!config) return <InstanceConnecting />;
 
   return (
-    <ConfigContext.Provider value={config}>
+    <ConfigContext.Provider value={{ ...config, refreshConfig }}>
       {config.configErrors.length > 0 && (
         <ConfigErrorBanner errors={config.configErrors} />
       )}

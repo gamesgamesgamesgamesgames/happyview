@@ -76,7 +76,7 @@ A `PLUGIN_URLS` plugin is registered from its environment URL at every boot. It 
 
 ### Default Plugins
 
-Set `HAPPYVIEW_DEFAULT_PLUGINS` to give a new instance plugins it starts with, such as an interpreter:
+Set `HAPPYVIEW_DEFAULT_PLUGINS` to give a new instance plugins it starts with, such as an interpreter. It differs from `PLUGIN_URLS` in who owns the plugin afterwards: a default plugin is installed once and is then the owner's to update or remove, while a `PLUGIN_URLS` plugin is loaded from the environment again at every boot.
 
 ```
 HAPPYVIEW_DEFAULT_PLUGINS=https://example.com/plugins/lua/manifest.json

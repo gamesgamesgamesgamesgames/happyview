@@ -90,7 +90,7 @@ pub fn script_meta(
     // The admin API's limit, so a description reads the same wherever the
     // dashboard shows it.
     if let Some(description) = &description
-        && description.len() > MAX_DESCRIPTION_LEN
+        && crate::script::checks::description_too_long(description)
     {
         return Err(if from_config {
             Diagnostic::error(
@@ -200,6 +200,20 @@ mod tests {
         let source = format!("#!/usr/bin/env lua\n\n-- {long}\n");
         let err = script_meta("job.run:a", Path::new("src/jobs/a.lua"), &source, None).unwrap_err();
         assert_eq!(err.line, Some(3), "{err}");
+    }
+
+    /// The limit counts characters, so a description of 300 two-byte
+    /// characters fits and one more does not.
+    #[test]
+    fn the_description_limit_counts_characters() {
+        let fits = "é".repeat(MAX_DESCRIPTION_LEN);
+        let source = format!("-- {fits}\n");
+        let meta = script_meta("job.run:a", Path::new("src/jobs/a.lua"), &source, None).unwrap();
+        assert_eq!(meta.description.as_deref(), Some(fits.as_str()));
+
+        let over = "é".repeat(MAX_DESCRIPTION_LEN + 1);
+        let source = format!("-- {over}\n");
+        assert!(script_meta("job.run:a", Path::new("src/jobs/a.lua"), &source, None).is_err());
     }
 
     #[test]

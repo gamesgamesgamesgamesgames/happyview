@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Whether the real JavaScript and TypeScript interpreter plugins are available
-# to tests/quickjs_interpreter_plugins.rs, which skips without them.
+# to tests/quickjs_interpreter_plugins.rs, which fails without them unless
+# HAPPYVIEW_ALLOW_SKIPS=1.
 #
-# They are built artefacts of another repository, so nothing in this one can
-# produce them. libtest captures a passing test's skip line, so without this a
-# green run would not say that every test in that target made no assertion.
+# They are built artefacts of another repository, so nothing in this one
+# builds them; scripts/fetch-quickjs-plugins.sh downloads the pinned releases.
 #
 #   --require   exit non-zero when either plugin is absent, for a runner that
 #               is meant to have them

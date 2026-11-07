@@ -19,8 +19,11 @@ use super::permissions::Permission;
 pub const PLATFORM_ACTOR: &str = "platform";
 
 /// What the platform principal may do, beyond its dedicated checks
-/// (`require_domain_read`, `require_domain_write`, `is_platform`). Deliberately tiny.
-const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
+/// (`require_domain_read`, `require_domain_write`, `require_rotation_read`,
+/// `is_platform`). Deliberately tiny: aggregate reads its managed-hosting
+/// dashboard shows, stats and script and ingest metrics. Routes still opt in
+/// with `AllowPlatform`, so `metrics:read` here does not open the live view.
+const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead, Permission::MetricsRead];
 
 #[derive(Clone)]
 pub struct UserAuth {
@@ -45,6 +48,17 @@ impl UserAuth {
     /// can manage domains without receiving `settings:manage`, which covers far
     /// more than domains.
     pub async fn require_domain_read(&self) -> Result<(), AppError> {
+        if self.is_platform {
+            return Ok(());
+        }
+        self.require(Permission::SettingsManage).await
+    }
+
+    /// Reading what a key rotation still has to re-seal: the platform
+    /// principal, so its hosting platform can tell when the previous key can
+    /// go, or anyone holding `settings:manage`. It sees counts only, never a
+    /// value, and starting a re-seal still needs `settings:manage`.
+    pub async fn require_rotation_read(&self) -> Result<(), AppError> {
         if self.is_platform {
             return Ok(());
         }
@@ -269,27 +283,24 @@ impl UserAuth {
     }
 }
 
-/// An app's DPoP session, or a service-auth JWT, reaches the admin API only
-/// with the grant `auth::admin_scope` describes. A cookie is the dashboard's
-/// and needs none.
+/// An app's DPoP session reaches the admin API only with the grant
+/// `auth::admin_scope` describes, and a service-auth JWT never does. A cookie
+/// is the dashboard's and needs none.
 async fn require_admin_grant(state: &AppState, claims: &Claims) -> Result<(), AppError> {
-    if let Some(lxm) = claims.service_auth_lxm() {
-        if lxm != Some(admin_scope::ADMIN_LXM) {
-            return Err(AppError::Forbidden(format!(
-                "a service-auth token must be bound to {} to use the admin API",
-                admin_scope::ADMIN_LXM
-            )));
-        }
-        return Ok(());
+    if claims.service_auth_lxm().is_some() {
+        return Err(AppError::Forbidden(
+            "the admin API does not accept service-auth tokens; sign in with an app granted \
+             dev.happyview.adminFull, or use an API key"
+                .into(),
+        ));
     }
 
     let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {
         return Ok(());
     };
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
     let client =
         crate::oauth::client_auth::resolve_client_by_key(&state.db, state.db_backend, client_key)
@@ -522,7 +533,7 @@ pub(crate) async fn ensure_configured_superadmin(
     did: &str,
 ) -> Result<SuperadminSeed, sqlx::Error> {
     let now = now_rfc3339();
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db, backend).await?;
 
     let existing: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
         "SELECT id, is_super FROM happyview_users WHERE did = ?",
@@ -647,6 +658,54 @@ mod tests {
         assert_eq!(seed, SuperadminSeed::Promoted);
         assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
         assert_eq!(user(&db, "did:plc:other-super").await.unwrap().1, 1);
+    }
+
+    /// SQLite in WAL mode: another writer commits while the seed waits to
+    /// write. A deferred `BEGIN` read the user under the old snapshot, so its
+    /// write fails with `SQLITE_BUSY` at once; holding the write lock from
+    /// the start, the seed waits its turn and lands.
+    #[tokio::test]
+    async fn a_seed_waits_out_a_concurrent_writer() {
+        let path = std::env::temp_dir().join(format!("hv-seed-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = crate::db::connect_with(&url, DatabaseBackend::Sqlite, 2).await;
+        insert_user(&db, "did:plc:boss", 0).await;
+
+        let mut holder = db.acquire().await.expect("acquire the other writer");
+        crate::db::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .expect("take the write lock");
+        let seeding = tokio::spawn({
+            let db = db.clone();
+            async move {
+                ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss").await
+            }
+        });
+        // Long enough for the seed to have begun and be waiting on the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES ('t', 'v', 't')",
+        )
+        .execute(&mut *holder)
+        .await
+        .expect("the other writer writes");
+        crate::db::query("COMMIT")
+            .execute(&mut *holder)
+            .await
+            .expect("the other writer commits");
+        drop(holder);
+
+        let seed = seeding
+            .await
+            .expect("the seed task")
+            .expect("the seed lands");
+        assert_eq!(seed, SuperadminSeed::Promoted);
+        assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
+        db.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[tokio::test]

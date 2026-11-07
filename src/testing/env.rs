@@ -66,6 +66,9 @@ fn run_config(config: Config, fixture: &Config) -> Config {
         // Space writes sign with a key stored under the encryption key, so a
         // project that sets none still gets the fixture's.
         token_encryption_key: config.token_encryption_key.or(fixture.token_encryption_key),
+        token_encryption_key_previous: config
+            .token_encryption_key
+            .and(config.token_encryption_key_previous),
         // In-process requests name `/xrpc/...` at the root, and a test run
         // serves no dashboard.
         base_path: None,
@@ -206,7 +209,7 @@ impl TestEnv {
         );
         state.lexicons = lexicons;
         state.oauth_state_store =
-            crate::auth::oauth_store::DbStateStore::new(pool, DatabaseBackend::Sqlite);
+            crate::auth::oauth_store::DbStateStore::new(pool, DatabaseBackend::Sqlite, None);
         state.rate_limiter =
             crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
                 query_cost: 1,
@@ -392,8 +395,6 @@ mod tests {
                 "defs": { "main": { "type": "query" } },
             }),
             backfill: false,
-            target_collection: None,
-            action: crate::lexicon::ProcedureAction::Upsert,
             token_cost: None,
             authority_did: None,
             indexed: true,

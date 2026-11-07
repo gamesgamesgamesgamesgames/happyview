@@ -199,8 +199,13 @@ async fn a_plugin_the_owner_already_installed_is_only_marked_applied() {
     common::require_db!();
     let mut app = new_app().await;
     let own = serve(&app, "own", "lua", "1.0.0").await;
+    // As the dashboard installs it: the owner accepts what the manifest
+    // declares, which an install of a capability-declaring plugin requires.
     let (status, body) = app
-        .post_json_status("/admin/plugins", json!({ "url": own }))
+        .post_json_status(
+            "/admin/plugins",
+            json!({ "url": own, "accepted_capabilities": ["wasi:clock"] }),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
 

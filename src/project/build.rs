@@ -26,6 +26,9 @@ pub use super::diagnostic::{Diagnostic, Severity};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuildOptions {
     pub include_tests: bool,
+    /// Whether a lexicon's spec violations stop this build. Defaults to
+    /// `Strict`, so only the one caller that must not fail — boot — opts out.
+    pub lexicons: super::lexicons::Leniency,
 }
 
 pub struct BuildReport {
@@ -102,7 +105,7 @@ pub async fn build_snapshot_with(
     let mut index = LexiconIndex::default();
     for file in lexicon_paths {
         lexicon_files.insert(lexicons::expected_id(file));
-        match lexicons::load_lexicon(file, &config.lexicons) {
+        match lexicons::load_lexicon(file, &config.lexicons, opts.lexicons, &mut diagnostics) {
             Ok(lexicon) => {
                 index.insert(
                     file.dir(),
@@ -487,8 +490,6 @@ pub(crate) fn same_lexicon(a: &ProjectLexicon, b: &ProjectLexicon) -> bool {
     a.path == b.path
         && a.backfill == b.backfill
         && a.parsed.raw == b.parsed.raw
-        && a.parsed.target_collection == b.parsed.target_collection
-        && a.parsed.action == b.parsed.action
         && a.parsed.token_cost == b.parsed.token_cost
 }
 
@@ -586,7 +587,7 @@ mod tests {
         project(&[
             (
                 "happyview.toml",
-                "[lexicons.\"com.example.getThing\"]\ntarget_collection = \"com.example.thing\"\n",
+                "[lexicons.\"com.example.getThing\"]\ntoken_cost = 3\n",
             ),
             (
                 &format!("{LEX}/getThing.json"),
@@ -629,11 +630,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            snap.lexicons["com.example.getThing"]
-                .parsed
-                .target_collection
-                .as_deref(),
-            Some("com.example.thing")
+            snap.lexicons["com.example.getThing"].parsed.token_cost,
+            Some(3)
         );
         assert_eq!(
             snap.scripts.keys().collect::<Vec<_>>(),
@@ -680,6 +678,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await
@@ -893,6 +892,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await
@@ -1118,6 +1118,7 @@ mod tests {
             root.path(),
             BuildOptions {
                 include_tests: true,
+                ..BuildOptions::default()
             },
         )
         .await
@@ -1150,8 +1151,6 @@ mod tests {
                     ))
                     .unwrap(),
                     backfill: false,
-                    target_collection: None,
-                    action: crate::lexicon::ProcedureAction::Upsert,
                     token_cost: None,
                     authority_did: None,
                     indexed: true,
@@ -1238,10 +1237,7 @@ mod tests {
             .get("com.example.getThing")
             .await
             .expect("the project query");
-        assert_eq!(
-            query.target_collection.as_deref(),
-            Some("com.example.thing")
-        );
+        assert_eq!(query.token_cost, Some(3));
         assert!(
             state
                 .lexicons

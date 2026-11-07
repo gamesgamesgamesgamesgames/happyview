@@ -1,0 +1,38 @@
+{
+  "vectors": [
+    {
+      "author_kem_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "author_kem_did": "did:key:zDnaeQa8zprPhHA7Yuxcgc2Uh6XNQgaKjmFZE4EaA9fk5svmJ",
+      "ephemeral_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ephemeral_did": "did:key:zDnaex62me84JZnkEzmeYRa8FCLNe7y1asoSwBMK26GBYpL7c",
+      "shared_secret_hex": "76bccf1264f5f7f5b7df0b78b6c1037f2e22fb513288207ad2dede881710d4c3",
+      "commit": {
+        "ver": 1,
+        "repo": "did:plc:author",
+        "space": "ats://did:plc:auth/com.example.forum/main",
+        "rev": "3krevaaaaaaaa",
+        "data_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "commit_mac_hex": "9356849b73f4d66611aef56c4808a901a7d03e3c54aef2207930b52e70436f6f",
+      "want_mac_header": "type=\"atproto-space-repo\", ver=1, key_share=\"did:key:zDnaex62me84JZnkEzmeYRa8FCLNe7y1asoSwBMK26GBYpL7c\"",
+      "mac_header": "type=\"atproto-space-repo\", ver=1, mac=:k1aEm3P01mYRrvVsSAipAafQPjxUrvIgeTC1LnBDb28=:"
+    },
+    {
+      "author_kem_private_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "author_kem_did": "did:key:zDnaecEuXY81Zdx5AgzFZE4HWVSJiYVX1PqPuxcHvaPsbdcUx",
+      "ephemeral_private_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "ephemeral_did": "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF",
+      "shared_secret_hex": "d46c5d5a589670e3b4870cf0d4230dc24ea36721e44fad699a3391e1d04c9371",
+      "commit": {
+        "ver": 1,
+        "repo": "did:web:alice.example.com",
+        "space": "ats://did:web:space.example.com/com.example.chat/général",
+        "rev": "3lzq2b3k4c22a",
+        "data_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+      },
+      "commit_mac_hex": "636a82826623097fa0d618641dcf5d06fc0f7d051452835760a86cdb49a1372d",
+      "want_mac_header": "type=\"atproto-space-repo\", ver=1, key_share=\"did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF\"",
+      "mac_header": "type=\"atproto-space-repo\", ver=1, mac=:Y2qCgmYjCX+g1hhkHc9dBvwPfQUUUoNXYKhs20mhNy0=:"
+    }
+  ]
+}

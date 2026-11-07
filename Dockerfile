@@ -7,7 +7,7 @@ COPY web/ .
 ENV NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__
 RUN npm run build
 
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /app
 
@@ -24,8 +24,9 @@ COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
 COPY crates/happyview-script/Cargo.toml crates/happyview-script/
 COPY crates/happyview-script-macros/Cargo.toml crates/happyview-script-macros/
 COPY crates/happyview-source-jetstream/Cargo.toml crates/happyview-source-jetstream/
-RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-provider/src crates/happyview-scopes/src crates/happyview-script/src crates/happyview-script-macros/src crates/happyview-source-jetstream/src \
-    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-provider/src/lib.rs crates/happyview-scopes/src/lib.rs crates/happyview-script/src/lib.rs crates/happyview-script-macros/src/lib.rs crates/happyview-source-jetstream/src/lib.rs
+COPY crates/happyview-star/Cargo.toml crates/happyview-star/
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-provider/src crates/happyview-scopes/src crates/happyview-script/src crates/happyview-script-macros/src crates/happyview-source-jetstream/src crates/happyview-star/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-provider/src/lib.rs crates/happyview-scopes/src/lib.rs crates/happyview-script/src/lib.rs crates/happyview-script-macros/src/lib.rs crates/happyview-source-jetstream/src/lib.rs crates/happyview-star/src/lib.rs
 # Every target `Cargo.toml` declares needs a stub here, because cargo resolves
 # targets before it compiles anything: a declared `[[bin]]` with no file on disk
 # fails this layer with `can't find bin`, which surfaces as an image that never
@@ -57,6 +58,7 @@ RUN cargo build --release
 
 FROM scratch AS binary
 COPY --from=builder /app/target/release/happyview /target/release/happyview
+COPY --from=builder /app/target/release/happyview-codemod /target/release/happyview-codemod
 
 FROM debian:bookworm-slim
 
@@ -75,7 +77,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/happyview /usr/local/bin/happyview
-RUN chmod +x /usr/local/bin/happyview
+# The v2-to-v3 script rewrite, for `docker run <image> happyview-codemod ...` or
+# `docker exec` into a running container (see entrypoint.sh).
+COPY --from=builder /app/target/release/happyview-codemod /usr/local/bin/happyview-codemod
+# CI hands these in as downloaded artifacts, which keep no file modes.
+RUN chmod +x /usr/local/bin/happyview /usr/local/bin/happyview-codemod
 COPY --from=frontend /app/web/out /srv/static
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && touch /srv/static/.base-path-pending

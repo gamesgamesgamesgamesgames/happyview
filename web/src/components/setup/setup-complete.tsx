@@ -68,7 +68,7 @@ export function SetupComplete({ identityMode }: SetupCompleteProps) {
           <dd className="mt-1 text-sm font-medium">{modeLabel}</dd>
           <dd className="mt-1">
             <a
-              href={docsUrl("/getting-started/service-identity")}
+              href={docsUrl("/docs/guides/service-identity")}
               target="_blank"
               rel="noopener noreferrer"
               className="text-primary text-xs underline underline-offset-4 hover:text-primary/80"

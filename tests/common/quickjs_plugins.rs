@@ -7,15 +7,17 @@ use std::path::PathBuf;
 pub const JAVASCRIPT_DIR: &str = "HAPPYVIEW_JAVASCRIPT_PLUGIN";
 pub const TYPESCRIPT_DIR: &str = "HAPPYVIEW_TYPESCRIPT_PLUGIN";
 
-/// The directory `var` names, or `None` with a message saying so. A skip is
-/// not a pass: a run that means to cover these has to set the variable.
+/// The directory `var` names. Unset, the test fails, or skips with
+/// `HAPPYVIEW_ALLOW_SKIPS=1` (`happyview::test_support::unavailable`) and this
+/// is `None`.
 pub fn plugin_dir(var: &str) -> Option<PathBuf> {
     match std::env::var_os(var) {
         Some(dir) => Some(PathBuf::from(dir)),
         None => {
-            eprintln!(
-                "skipping: {var} is unset, so that built interpreter plugin is not available"
-            );
+            happyview::test_support::unavailable(&format!(
+                "{var} is unset, so that built interpreter plugin is not available. \
+                 Run scripts/fetch-quickjs-plugins.sh and point it at the plugin's directory"
+            ));
             None
         }
     }

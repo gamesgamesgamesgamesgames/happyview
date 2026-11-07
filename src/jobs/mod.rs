@@ -1,4 +1,8 @@
 pub(crate) mod db;
+/// Public for tests that run a job's script outside a worker, as a worker
+/// would: under the lease of the claim it holds.
+#[doc(hidden)]
+pub mod held;
 pub(crate) mod logs;
 pub mod native;
 pub mod worker;
@@ -23,6 +27,9 @@ pub struct Job {
     pub inherit_auth: bool,
     pub api_client_id: Option<String>,
     pub dpop_key_id: Option<String>,
+    /// How many runs of this job have started, one that lost its worker
+    /// included.
+    pub attempt: i64,
 }
 
 static JOB_TYPE_RE: LazyLock<Regex> =

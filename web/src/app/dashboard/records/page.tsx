@@ -19,6 +19,7 @@ import {
   getAdminRecords,
   deleteRecord,
   deleteCollectionRecords,
+  reconcileCollection,
 } from "@/lib/api";
 import type { AdminRecord } from "@/types/records";
 import {
@@ -113,6 +114,9 @@ export default function RecordsPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteUri, setDeleteUri] = useState<string | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [reconcileOpen, setReconcileOpen] = useState(false);
+  const [reconcileDryRun, setReconcileDryRun] = useState(true);
+  const [reconciling, setReconciling] = useState(false);
   const [bulkDeleteMode, setBulkDeleteMode] = useState<"selected" | "all">(
     "selected",
   );
@@ -228,6 +232,33 @@ export default function RecordsPage() {
       setDeletingAll(false);
     }
   }, [selectedCollection, router, vacuumNotDone]);
+
+  const handleReconcile = useCallback(async () => {
+    if (!selectedCollection) return;
+    setReconciling(true);
+    try {
+      const { job_id } = await reconcileCollection(
+        selectedCollection,
+        reconcileDryRun,
+      );
+      setReconcileOpen(false);
+      toast.success(
+        reconcileDryRun ? "Check started" : "Reconciliation started",
+        {
+          description:
+            "The job's result lists the records the PDSes no longer hold, and any it skipped.",
+          action: {
+            label: "View job",
+            onClick: () => router.push(`/dashboard/jobs?job=${job_id}`),
+          },
+        },
+      );
+    } catch (e: unknown) {
+      toastError("Failed to start the check", e);
+    } finally {
+      setReconciling(false);
+    }
+  }, [selectedCollection, reconcileDryRun, router]);
 
   const handleBulkDelete = useCallback(async () => {
     setDeleting(true);
@@ -433,6 +464,20 @@ export default function RecordsPage() {
               </SelectContent>
             </Select>
             <div className="flex items-center gap-2">
+              {hasPermission("records:read") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  disabled={!selectedCollection}
+                  onClick={() => {
+                    setReconcileDryRun(true);
+                    setReconcileOpen(true);
+                  }}
+                >
+                  Check against PDSes
+                </Button>
+              )}
               {hasPermission("records:delete") && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -586,6 +631,55 @@ export default function RecordsPage() {
             )}
           </SheetContent>
         </Sheet>
+
+        <AlertDialog open={reconcileOpen} onOpenChange={setReconcileOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Check against PDSes?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Compares each account&apos;s stored {selectedCollection} records
+                with its PDS, and finds the ones the PDS no longer holds. A
+                record is only counted once its PDS confirms it is gone, and an
+                account whose PDS can&apos;t be read, or lists far fewer records
+                than are stored, is skipped. Requests are paced at five a
+                second.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <label className="flex items-start gap-2 text-sm">
+              <Checkbox
+                checked={reconcileDryRun}
+                disabled={!hasPermission("records:delete")}
+                onCheckedChange={(checked) =>
+                  setReconcileDryRun(checked === true)
+                }
+              />
+              <span>
+                Report only. Untick to delete the missing records too: each
+                delete runs the collection&apos;s delete hook, which can keep
+                the record.
+              </span>
+            </label>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={reconciling}>
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant={reconcileDryRun ? "default" : "destructive"}
+                disabled={reconciling}
+                onClick={(e) => {
+                  e.preventDefault();
+                  handleReconcile();
+                }}
+              >
+                {reconciling
+                  ? "Starting..."
+                  : reconcileDryRun
+                    ? "Check"
+                    : "Check and delete"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         <AlertDialog
           open={!!deleteUri}

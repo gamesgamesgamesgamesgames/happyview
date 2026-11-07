@@ -239,6 +239,44 @@ pub(super) async fn languages(
     Ok(Json(languages))
 }
 
+/// One interpreter module of the deployed project: a file under `src/` that
+/// scripts import and that is not itself a handler. Only what the project's
+/// files hold; what an interpreter prepared from it stays on the instance.
+#[derive(Debug, Serialize)]
+pub(super) struct ModuleSourceResponse {
+    /// The module id: its project-relative path, the string an import
+    /// resolves to.
+    pub id: String,
+    /// Project-relative and `/`-separated (`src/lib/format.lua`).
+    pub path: String,
+    /// The language of the interpreter that claims the file's extension.
+    pub language: String,
+    pub source: String,
+}
+
+/// `GET /admin/scripts/modules` — the interpreter modules of the project the
+/// instance serves, sorted by id. Empty when no project is deployed. Compiled
+/// modules have no source here and are not listed. Like `languages`, the path
+/// can't shadow a script, because no trigger id lacks a colon.
+pub(super) async fn modules(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<Vec<ModuleSourceResponse>>, AppError> {
+    auth.require(Permission::ScriptsRead).await?;
+    let snapshot = state.project.load_full();
+    let modules = snapshot
+        .modules
+        .values()
+        .map(|m| ModuleSourceResponse {
+            id: m.id.clone(),
+            path: crate::catalog::path_string(&m.path),
+            language: m.language_id.clone(),
+            source: m.source.to_string(),
+        })
+        .collect();
+    Ok(Json(modules))
+}
+
 /// `GET /admin/scripts/{id}` — fetch one row.
 pub(super) async fn get(
     State(state): State<AppState>,
@@ -264,7 +302,7 @@ pub(super) async fn upsert(
     let _trigger = ParsedTrigger::parse(&body.id).map_err(AppError::BadRequest)?;
 
     if let Some(ref desc) = body.description
-        && desc.len() > MAX_DESCRIPTION_LEN
+        && checks::description_too_long(desc)
     {
         return Err(AppError::BadRequest(format!(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
@@ -355,7 +393,7 @@ pub(super) async fn patch(
     // Ahead of the body check, which keeps what it prepares: a patch refused
     // for its description should leave nothing behind for its body.
     if let Some(Some(ref desc)) = body.description
-        && desc.len() > MAX_DESCRIPTION_LEN
+        && checks::description_too_long(desc)
     {
         return Err(AppError::BadRequest(format!(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
@@ -482,6 +520,11 @@ pub(super) async fn codemod_apply(
         source: draft,
     } = body.map(|Json(b)| b).unwrap_or_default();
     let kind = ScriptKind::from_trigger_id(&id);
+    let collection = codemod::v2_collection(&state.db, state.db_backend, &id)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("could not read the script's v2 collection: {e}"))
+        })?;
 
     if let Some(draft) = draft {
         if apply {
@@ -489,7 +532,7 @@ pub(super) async fn codemod_apply(
                 "apply rewrites the stored script; a supplied source is preview-only".to_string(),
             ));
         }
-        let rewrite = rewrite_lua(&draft, kind)?;
+        let rewrite = rewrite_lua(&draft, kind, collection.as_deref())?;
         return Ok(Json(CodemodResponse {
             changed: rewrite.source != draft,
             source: rewrite.source,
@@ -511,7 +554,7 @@ pub(super) async fn codemod_apply(
         ));
     }
 
-    let rewrite = rewrite_lua(&existing.body, kind)?;
+    let rewrite = rewrite_lua(&existing.body, kind, collection.as_deref())?;
     let changed = rewrite.source != existing.body;
     let marker_count = rewrite.notes.len();
 
@@ -581,8 +624,12 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
     ))
 }
 
-fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppError> {
-    codemod::rewrite(source, kind)
+fn rewrite_lua(
+    source: &str,
+    kind: ScriptKind,
+    collection: Option<&str>,
+) -> Result<codemod::Rewrite, AppError> {
+    codemod::rewrite_for(source, kind, collection)
         .map_err(|e| AppError::BadRequest(format!("script did not parse as Lua: {e}")))
 }
 

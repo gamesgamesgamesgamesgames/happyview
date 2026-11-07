@@ -29,6 +29,7 @@ pub(crate) async fn execute_local_query(
             }
             if let Some(ref param_schema) = lex.parameters {
                 xrpc::coerce_params(params, param_schema);
+                xrpc::validate::params(params, param_schema)?;
             }
             xrpc::query::handle_query(state, method, params, &lex, claims).await
         }
@@ -73,6 +74,10 @@ pub(crate) async fn execute_local_procedure(
             }
             if let Some(ref param_schema) = lex.parameters {
                 xrpc::coerce_params(params, param_schema);
+                xrpc::validate::params(params, param_schema)?;
+            }
+            if !crate::script::encoding::of_input(&lex).is_bytes() {
+                xrpc::validate::input(state, &lex, input).await?;
             }
             xrpc::procedure::handle_procedure(state, method, claims, input, params, &lex, None)
                 .await
@@ -87,7 +92,7 @@ pub(crate) async fn execute_local_procedure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::{ParsedLexicon, ProcedureAction};
+    use crate::lexicon::ParsedLexicon;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::test_support::test_state_with_pool;
     use http_body_util::BodyExt;
@@ -154,8 +159,6 @@ mod tests {
             record_schema: None,
             raw: json!({}),
             revision: 1,
-            target_collection: None,
-            action: ProcedureAction::Create,
             token_cost: None,
             space_type: None,
             space_name: None,

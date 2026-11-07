@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use happyview::config::project::ModuleDecl;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ParsedLexicon;
 use happyview::plugin::capabilities::{PluginCapability, analyze_imports, minimal_set};
 use happyview::plugin::{
     ExecutionError, ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
@@ -27,7 +27,7 @@ const SOURCE: &str = "tests/fixtures/script_module/src/lib.rs";
 macro_rules! require_fixture {
     ($path:expr, $build:literal) => {
         if !std::path::Path::new($path).exists() {
-            eprintln!(concat!("skipping: fixture not built. Run: ", $build));
+            happyview::test_support::unavailable(concat!("fixture not built. Run: ", $build));
             return;
         }
     };
@@ -58,8 +58,6 @@ fn lexicon(id: &str, kind: &str) -> (String, ProjectLexicon) {
     let parsed = ParsedLexicon::parse(
         json!({"lexicon": 1, "id": id, "defs": {"main": main}}),
         1,
-        None,
-        ProcedureAction::Upsert,
         None,
     )
     .unwrap();
@@ -504,6 +502,7 @@ async fn a_query_reaches_the_module_through_the_xrpc_router() {
         root,
         happyview::project::build::BuildOptions {
             include_tests: false,
+            ..Default::default()
         },
     )
     .await

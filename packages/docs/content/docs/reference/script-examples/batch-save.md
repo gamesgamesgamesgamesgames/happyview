@@ -13,7 +13,7 @@ local record = require("happyview.record")
 function handle(input, ctx)
   local uris = {}
   for _, item in ipairs(input.items) do
-    local ref = record.create(ctx.collection, item)
+    local ref = record.create("com.example.post", item)
     uris[#uris + 1] = ref.uri
   end
   return { uris = json.to_array(uris) }

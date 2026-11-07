@@ -20,6 +20,10 @@ A backfill job starts with a discovery phase and then pipelines resolution and f
 
 Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_records`) and the current `stage` are updated in real time. The repo counters count work units, so a repo discovered under two collections counts twice. The dashboard's Backfill page shows live progress, and clicking a job opens a detail sheet with a stage-by-stage progress log.
 
+### Record hooks run concurrently
+
+A backfill runs the collection's record hook over several records at once: up to `BACKFILL_HOOK_CONCURRENCY` (4 by default) from each page of records it fetches, on top of the repos it fetches at once. Live records from the firehose are still hooked one at a time and in order. During a backfill, a hook can't rely on running alone or on the order of other records' hooks. A page never holds two versions of one record, and a page that did would be hooked one record at a time. The records themselves are written in the page's order, whichever hook finishes first. Set `BACKFILL_HOOK_CONCURRENCY=1` to hook a backfill's records one at a time.
+
 ## Replay and crawl
 
 A backfill job reads records from one of two sources:
@@ -109,6 +113,12 @@ Re-running a backfill for a collection that's already been backfilled is safe, w
 ## Restoring deleted records
 
 Deleting records from HappyView (via the dashboard or API) only removes them from the local database — the records still exist on the atproto network. To restore deleted records, create a backfill job for the affected collection. The backfill will re-discover the repos and re-fetch all records from each PDS, restoring any that were previously deleted.
+
+## Removing records deleted on the network
+
+A delete that happens while HappyView isn't tracking a collection never reaches the index, so the record is still served after its owner deleted it. A backfill doesn't remove it either: it adds and refreshes records, and never deletes. To find and remove them, open the collection on the **Records** page of HappyView's admin dashboard and choose **Check against PDSes**, or call [`POST /admin/records/collection/reconcile`](../api-reference/admin/records.md#reconcile-a-collection-with-its-pdses). It checks each account's records against its PDS and, unless you leave it as a report, deletes the ones the PDS confirms are gone. Each delete runs the collection's delete hook, which can keep the record. A hook that fails keeps it as well, because the job is inferring the delete rather than hearing it from the network. The collection has to be indexed, or nothing would apply the deletes.
+
+Run it as a report first. An account whose PDS can't be read, or lists far fewer records than are stored, is skipped rather than emptied. A delete can also race the record's own delete arriving from the firehose, so a delete hook can see the same delete twice: delete hooks run at least once, as record hooks do.
 
 ## Diagnostics
 

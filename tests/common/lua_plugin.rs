@@ -19,10 +19,10 @@ pub const PLUGIN_SRC: &str = "HAPPYVIEW_LUA_SRC";
 
 pub fn plugin_dir() -> Option<PathBuf> {
     let Some(dir) = std::env::var_os(PLUGIN_DIR) else {
-        eprintln!(
-            "skipping: {PLUGIN_DIR} is unset, so the built Lua plugin is not available. \
-             See this file's header for how to assemble the directory it names."
-        );
+        happyview::test_support::unavailable(&format!(
+            "{PLUGIN_DIR} is unset, so the built Lua plugin is not available. \
+             Run scripts/fetch-lua-plugin.sh and point it at tests/fixtures/lua-plugin"
+        ));
         return None;
     };
     let dir = PathBuf::from(dir);

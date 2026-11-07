@@ -5,8 +5,10 @@ import pg from "pg";
 const SESSION_SECRET = "e2e-test-secret-that-is-at-least-32-bytes";
 const COOKIE_NAME = "happyview_session";
 const TEST_DID = "did:plc:e2e-test-admin";
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
-const PDS_DB_URL = "postgres://happyview:happyview@localhost:5434/pds";
+// The e2e stack's Postgres, on the host port `docker-compose.e2e.yml` publishes.
+const DB_PORT = process.env.E2E_POSTGRES_PORT || "5434";
+export const DB_URL = `postgres://happyview:happyview@localhost:${DB_PORT}/happyview_test`;
+const PDS_DB_URL = `postgres://happyview:happyview@localhost:${DB_PORT}/pds`;
 
 /**
  * HKDF-Expand (RFC 5869 section 2.3) — used by the cookie crate's
@@ -170,6 +172,27 @@ export async function getOauthSessionSigningKid(
   }
 }
 
+/** `TOKEN_ENCRYPTION_KEY` in docker-compose.e2e.yml. */
+const E2E_ENCRYPTION_KEY = Buffer.alloc(32);
+
+/**
+ * Opens a value stored by `plugin::encryption::seal`: base64 of a 12-byte
+ * nonce, the AES-256-GCM ciphertext and its 16-byte tag.
+ */
+function openSealed(stored: string): string {
+  const bytes = Buffer.from(stored, "base64");
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    E2E_ENCRYPTION_KEY,
+    bytes.subarray(0, 12),
+  );
+  decipher.setAuthTag(bytes.subarray(-16));
+  return Buffer.concat([
+    decipher.update(bytes.subarray(12, -16)),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
 export async function getOauthSessionTokenState(did: string): Promise<{
   accessToken: string;
   expiresAt: string | null;
@@ -179,14 +202,20 @@ export async function getOauthSessionTokenState(did: string): Promise<{
   const client = new pg.Client(DB_URL);
   await client.connect();
   try {
-    const { rows } = await client.query<{ session_data: string }>(
-      "SELECT session_data FROM happyview_oauth_sessions WHERE did = $1",
+    const { rows } = await client.query<{
+      session_data: string;
+      encrypted: number;
+    }>(
+      "SELECT session_data, encrypted FROM happyview_oauth_sessions WHERE did = $1",
       [did],
     );
     if (rows.length === 0) {
       throw new Error(`no happyview_oauth_sessions row for ${did}`);
     }
-    const session = JSON.parse(rows[0].session_data);
+    if (rows[0].encrypted !== 1) {
+      throw new Error(`the session for ${did} is stored unencrypted`);
+    }
+    const session = JSON.parse(openSealed(rows[0].session_data));
     return {
       accessToken: session.token_set.access_token,
       expiresAt: session.token_set.expires_at ?? null,

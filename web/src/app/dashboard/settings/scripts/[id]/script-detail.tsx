@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import type { Script, TriggerFamily } from "@/types/scripts";
 import { TRIGGER_KIND_LABELS, familyOf, parseTriggerId } from "@/types/scripts";
+import { BackfillHint } from "@/components/backfill-hint";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -36,6 +37,7 @@ import {
   stateFromScript,
 } from "../script-form";
 import { MigrateScriptDialog } from "../migrate-dialog";
+import { ScriptMetricsSummary } from "../performance/script-metrics-summary";
 import { ScriptModulePanel } from "./script-module-panel";
 
 export default function ScriptDetail() {
@@ -164,6 +166,9 @@ export default function ScriptDetail() {
   }
 
   const canManage = hasPermission("scripts:manage");
+  const metrics = hasPermission("metrics:read") ? (
+    <ScriptMetricsSummary trigger={id} />
+  ) : null;
   // A project file owns this script: it changes by editing the file, so the
   // page offers nothing that would write.
   const projectPath = script?.layer === "project" ? script.path : null;
@@ -187,6 +192,7 @@ export default function ScriptDetail() {
               </Badge>
             </div>
           )}
+          {metrics}
           <ScriptModulePanel module={script.module} />
         </div>
       </>
@@ -221,6 +227,8 @@ export default function ScriptDetail() {
               )}
             </div>
           )}
+
+          <BackfillHint />
 
           {script?.runnable === false && (
             <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
@@ -268,6 +276,8 @@ export default function ScriptDetail() {
               )}
             </div>
           )}
+
+          {metrics}
 
           {projectPath && script?.shadows_stored && (
             <p className="text-muted-foreground text-xs">

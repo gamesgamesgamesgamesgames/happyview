@@ -209,8 +209,7 @@ async fn dev_mode_rebuilds_on_save() {
             "[instance]\nsuperadmin = \"{superadmin}\"\n\n[dev]\nport = {port}\n\n[lexicons.\"com.example.thing\"]\nbackfill = true\n{extra}"
         )
     };
-    let with_target =
-        "\n[lexicons.\"com.example.listThings\"]\ntarget_collection = \"com.example.thing\"\n";
+    let with_override = "\n[lexicons.\"com.example.listThings\"]\ntoken_cost = 2\n";
     save(&root.join("happyview.toml"), &toml("did:plc:devadmin", ""));
     // Script variables only: were dev to read these as server settings it
     // would connect to Postgres and listen on port 1, and never come up.
@@ -247,7 +246,7 @@ async fn dev_mode_rebuilds_on_save() {
         dev.lines()
     );
 
-    // Fixed: the query exists, but has no target collection yet.
+    // Fixed: the query exists, but has no script yet.
     let builds = dev.count(BUILT);
     save(&lexicons.join("listThings.json"), LIST);
     wait_for(
@@ -257,20 +256,23 @@ async fn dev_mode_rebuilds_on_save() {
         |d| d.count(BUILT) > builds,
     )
     .await;
-    let body = wait_for_status(&mut dev, &list_url, 400, Duration::from_secs(5)).await;
-    assert!(body.contains("target_collection"), "{body}");
+    let body = wait_for_status(&mut dev, &list_url, 501, Duration::from_secs(5)).await;
+    assert!(body.contains("xrpc.query:com.example.listThings"), "{body}");
 
-    // A happyview.toml edit: an override (applied by the build) and a new
+    // A happyview.toml edit: an override (applied by a rebuild) and a new
     // superadmin (applied by the reload) take effect without a restart.
+    let builds = dev.count(BUILT);
     save(
         &root.join("happyview.toml"),
-        &toml("did:plc:second", with_target),
+        &toml("did:plc:second", with_override),
     );
-    let body = wait_for_status(&mut dev, &list_url, 200, Duration::from_secs(30)).await;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["records"],
-        serde_json::json!([])
-    );
+    wait_for(
+        &mut dev,
+        "a build after the override",
+        Duration::from_secs(30),
+        |d| d.count(BUILT) > builds,
+    )
+    .await;
     let pool = db(&root).await;
     let started = Instant::now();
     while is_super(&pool, "did:plc:second").await != Some(1) {
@@ -292,7 +294,7 @@ async fn dev_mode_rebuilds_on_save() {
     let other_port = free_port();
     save(
         &root.join("happyview.toml"),
-        &toml("did:plc:second", with_target)
+        &toml("did:plc:second", with_override)
             .replace(&format!("port = {port}"), &format!("port = {other_port}")),
     );
     wait_for(
@@ -308,7 +310,7 @@ async fn dev_mode_rebuilds_on_save() {
     .await;
     assert_eq!(
         get(&list_url).await.0,
-        200,
+        501,
         "still listening on the old port"
     );
 
@@ -379,7 +381,9 @@ async fn dev_mode_rebuilds_on_save() {
         d.count(STILL_SERVING) > failures
     })
     .await;
-    assert_eq!(get(&list_url).await.0, 200);
+    // Still the previous build's query, which knows the method; a dropped one
+    // would fall through to the proxy.
+    assert_eq!(get(&list_url).await.0, 501);
 
     // The state the instance made for itself.
     let state = root.join(".happyview");

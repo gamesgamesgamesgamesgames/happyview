@@ -96,7 +96,7 @@ mod tests {
                 let backend = DatabaseBackend::from_url(&url);
                 out.push(context_on(crate::db::connect(&url, backend).await, backend));
             }
-            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+            Err(_) => crate::test_support::unavailable(crate::test_support::NO_DATABASE),
         }
         out
     }

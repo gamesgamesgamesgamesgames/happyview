@@ -34,5 +34,5 @@ local __codemod_flat, __codemod_flat_page, __codemod_flat_rows = (function()
 end)()
 
 function handle(input, ctx)
-  return __codemod_flat_page(db.records(ctx.collection):run())
+  return __codemod_flat_page(db.records("games.gamesgamesgamesgames.game"):run())
 end

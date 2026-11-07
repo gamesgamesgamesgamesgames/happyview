@@ -147,6 +147,10 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             }
         },
     };
+    // Before the first outbound request: every shared client reads it. Here
+    // rather than in `boot`, which tests also run against local mocks.
+    crate::outbound::install_for(&config, dev.is_some());
+
     let Booted {
         state,
         labeler_subscriptions_rx,
@@ -180,6 +184,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
             crate::config::vars::var("DEAD_LETTER_RETENTION_DAYS").as_deref(),
         ),
         crate::tombstones::retention_hours(),
+        state.limits.clone(),
     ));
 
     {
@@ -217,8 +222,9 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
     }
 
     // Resume interrupted jobs and start the job worker
-    crate::jobs::worker::resume_interrupted_jobs(&state).await;
+    crate::jobs::worker::spawn_recovery(state.clone());
     crate::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
+    crate::reseal::spawn_boot_check(state.clone());
 
     {
         let keepalive_state = state.clone();
@@ -293,6 +299,25 @@ struct Booted {
 /// starting the record source: everything a served instance has before its
 /// background tasks start and it listens. An `Err` is the exit code to stop
 /// with.
+/// Logs every configuration problem first, before anything slow can push it
+/// out of view. A bad `SESSION_SECRET` does not stop boot, because API-key,
+/// DPoP and service-auth callers need no cookie, but it leaves the dashboard
+/// with no way to sign in, so the error says that and names the fix.
+fn report_config_errors(config: &Config) {
+    let errors = config.config_errors();
+    for err in &errors {
+        tracing::error!("INSECURE CONFIGURATION: {err}");
+    }
+    if !config.session_secret_secure() {
+        tracing::error!(
+            "Dashboard sign-in is DISABLED: nobody can sign in with a cookie until \
+             SESSION_SECRET is set to a random value of at least 32 bytes \
+             (`openssl rand -base64 48`) and the server is restarted. API keys, \
+             DPoP and service auth keep working."
+        );
+    }
+}
+
 async fn boot(
     config: Config,
     dev_mode: bool,
@@ -300,9 +325,12 @@ async fn boot(
 ) -> Result<Booted, std::process::ExitCode> {
     let db_backend = config.database_backend;
 
+    report_config_errors(&config);
+
     // Connect to database and run migrations.
     let db_pool = db::connect(&config.database_url, db_backend).await;
-    let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
+    let backfill_db_pool =
+        db::connect_backfill_pool(&config.database_url, db_backend, &db_pool).await;
 
     // The source's own schema, after HappyView's own migrations and before
     // the source starts.
@@ -327,7 +355,7 @@ async fn boot(
     );
 
     // The backfill re-mints commits, so it needs the space signing key.
-    let space_signing_key = match config.token_encryption_key.as_ref() {
+    let space_signing_key = match config.keyring().as_ref() {
         Some(key) => crate::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
             .await
             .ok(),
@@ -384,6 +412,19 @@ async fn boot(
         ),
     }
 
+    if let Some(key) = config.token_encryption_key.as_ref() {
+        match crate::auth::oauth_store::seal_stored_sessions(&db_pool, db_backend, key).await {
+            Ok(0) => {}
+            Ok(count) => info!(count, "encrypted stored OAuth sessions"),
+            Err(e) => {
+                tracing::error!(error = %e, "OAuth session encryption failed; will retry on next startup")
+            }
+        }
+    }
+
+    crate::script::variables::encrypt_at_boot(&db_pool, db_backend, config.keyring().as_ref())
+        .await;
+
     match crate::maintenance::vacuum::run_if_requested(&db_pool, db_backend, &config.database_url)
         .await
     {
@@ -404,6 +445,12 @@ async fn boot(
     }
 
     crate::telemetry::collect::health::note_restart(&db_pool, db_backend).await;
+    crate::telemetry::collect::health::note_version(
+        &db_pool,
+        db_backend,
+        crate::version::version(),
+    )
+    .await;
     crate::maintenance::nsid_audit::run(&db_pool, db_backend).await;
     crate::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
@@ -482,6 +529,7 @@ async fn boot(
         &db_pool,
         db_backend,
         &config.public_url,
+        config.keyring().as_ref(),
     )
     .await
     {
@@ -590,43 +638,39 @@ async fn boot(
             Option<String>,
         );
         let client_rows: Vec<ClientRow> = crate::db::query_as(
-            "SELECT client_key, client_secret_hash, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
+            "SELECT id, client_key, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
         )
         .fetch_all(&db_pool)
         .await
         .unwrap_or_default();
 
-        for (client_key, secret_hash, client_uri, capacity, refill_rate, _) in &client_rows {
-            rate_limiter.register_client_identity(
-                client_key.clone(),
-                crate::rate_limit::ClientIdentity {
-                    secret_hash: secret_hash.clone(),
-                    client_uri: client_uri.clone(),
-                },
-            );
-            if let (Some(cap), Some(refill)) = (capacity, refill_rate) {
-                rate_limiter.register_client_config(
+        for (client_id, client_key, client_uri, capacity, refill_rate, _) in &client_rows {
+            if let Err(e) = crate::oauth::client_secrets::register_identity(
+                &rate_limiter,
+                &db_pool,
+                db_backend,
+                client_id,
+                client_key,
+                client_uri,
+            )
+            .await
+            {
+                tracing::error!(client_key, error = %e, "could not load an API client's secrets; it is registered with none");
+                rate_limiter.register_client_identity(
                     client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: *cap as u32,
-                        refill_rate: *refill,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
-                    },
-                );
-            } else {
-                rate_limiter.register_client_config(
-                    client_key.clone(),
-                    crate::rate_limit::RateLimitConfig {
-                        capacity: config.default_rate_limit_capacity,
-                        refill_rate: config.default_rate_limit_refill_rate,
-                        default_query_cost: defaults.query_cost,
-                        default_procedure_cost: defaults.procedure_cost,
-                        default_proxy_cost: defaults.proxy_cost,
+                    crate::rate_limit::ClientIdentity {
+                        secrets: Vec::new(),
+                        client_uri: client_uri.clone(),
                     },
                 );
             }
+            rate_limiter.register_client_limit(
+                client_key.clone(),
+                *capacity,
+                *refill_rate,
+                config.default_rate_limit_capacity,
+                config.default_rate_limit_refill_rate,
+            );
         }
     }
 
@@ -700,17 +744,23 @@ async fn boot(
         protected_resource_metadata: Default::default(),
     };
 
-    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
+    let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend, config.keyring());
 
     let oauth_scopes = crate::oauth::rotation::instance_scopes();
 
     let linked_repos_scopes = oauth_scopes.clone();
     let oauth_scopes_for_by_kid = oauth_scopes.clone();
 
+    // A staged key that came due while the instance was down takes over
+    // before the clients are built around the current one.
+    if let Err(e) = crate::oauth::client_keys::promote_due_keys(&db_pool, db_backend).await {
+        warn!(error = %e, "failed to promote staged OAuth client keys");
+    }
+
     let instance_key = crate::oauth::client_keys::ensure_instance_key(
         &db_pool,
         db_backend,
-        config.token_encryption_key.as_ref(),
+        config.keyring().as_ref(),
     )
     .await
     .expect("Failed to load OAuth client authentication key");
@@ -732,7 +782,7 @@ async fn boot(
             },
             keys: None,
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring()),
             resolver: resolver_config,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
         })
@@ -751,7 +801,7 @@ async fn boot(
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring())
                 .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
@@ -786,6 +836,7 @@ async fn boot(
             db_pool.clone(),
             db_backend,
             Some(client_jwks.clone()),
+            config.keyring(),
         )
         .expect("Failed to create linked-repo OAuth client"),
     );
@@ -793,13 +844,6 @@ async fn boot(
     let cookie_key = if config.session_secret_secure() {
         axum_extra::extract::cookie::Key::derive_from(config.session_secret.as_bytes())
     } else {
-        for err in config.config_errors() {
-            tracing::error!("INSECURE CONFIGURATION: {err}");
-        }
-        tracing::error!(
-            "Cookie-based login is DISABLED until SESSION_SECRET is set securely. \
-             Other auth (DPoP, service auth, API keys) continues to work."
-        );
         axum_extra::extract::cookie::Key::generate()
     };
 
@@ -812,6 +856,7 @@ async fn boot(
     let oauth_registry = Arc::new(crate::auth::OAuthClientRegistry::new_with_kid(
         Arc::clone(&oauth_client_arc),
         instance_signing_kid.clone(),
+        config.keyring(),
     ));
     oauth_registry
         .load_from_db(
@@ -880,7 +925,7 @@ async fn boot(
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend, config.keyring())
                 .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
             http_client: crate::http_retry::HappyViewHttpClient::new(http.clone()),
@@ -913,7 +958,7 @@ async fn boot(
     let instance_keys = crate::oauth::client_keys::load_keys(
         &db_pool,
         db_backend,
-        config.token_encryption_key.as_ref(),
+        config.keyring().as_ref(),
         crate::oauth::client_keys::INSTANCE_OWNER,
     )
     .await
@@ -930,6 +975,7 @@ async fn boot(
             db_pool.clone(),
             db_backend,
             key,
+            config.keyring(),
         ) {
             Ok(client) => {
                 oauth_registry.register_for_kid(
@@ -965,6 +1011,7 @@ async fn boot(
                 db_pool.clone(),
                 db_backend,
                 key,
+                config.keyring(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
@@ -998,6 +1045,7 @@ async fn boot(
                 db_pool.clone(),
                 db_backend,
                 Some(vec![jwk]),
+                config.keyring(),
             ) {
                 Ok(client) => {
                     oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));
@@ -1049,6 +1097,23 @@ async fn boot(
 
     let script_limits =
         std::sync::Arc::new(crate::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
+    let limits = match crate::limits::load() {
+        Ok(limits) => limits,
+        Err(e) => {
+            tracing::error!("{e}");
+            return Err(std::process::ExitCode::FAILURE);
+        }
+    };
+    if let Some(file) = limits.file.clone() {
+        tracing::info!(file = %file.path().display(), "limits are read from this file");
+        tokio::spawn(file.watch());
+    }
+    let metrics = std::sync::Arc::new(crate::metrics::ScriptMetrics::new());
+    tracing::info!(
+        instance = metrics.instance(),
+        "script metrics are stored under this instance id"
+    );
+    metrics.refresh(&db_pool, db_backend).await;
 
     let mut records = crate::record_store::RecordStore::shared(db_pool.clone(), db_backend)
         .await
@@ -1085,9 +1150,12 @@ async fn boot(
         official_registry_config,
         proxy_config,
         verbose_event_logging,
+        ignored_keeps: Arc::default(),
         client_jwks,
         telemetry_counters,
         script_limits,
+        limits: limits.provider,
+        metrics,
         test: None,
     };
 
@@ -1179,6 +1247,34 @@ async fn boot(
         state.db.clone(),
         state.db_backend,
     ));
+    tokio::spawn(crate::metrics::run_refresh_loop(
+        state.metrics.clone(),
+        state.db.clone(),
+        state.db_backend,
+    ));
+    // The last day back into the rings before ingest starts, so a
+    // restart does not blank the live windows.
+    match crate::metrics::persist::reload(
+        &state.metrics,
+        &state.db,
+        state.db_backend,
+        crate::metrics::unix_now(),
+    )
+    .await
+    {
+        Ok(n) => tracing::debug!(rows = n, "read script metrics back"),
+        Err(e) => tracing::warn!(error = %e, "failed to read script metrics back"),
+    }
+    tokio::spawn(crate::metrics::persist::run(
+        state.metrics.clone(),
+        state.db.clone(),
+        state.db_backend,
+        state.limits.clone(),
+    ));
+
+    // Staged OAuth client keys take over when they come due. In the boot,
+    // rather than in `run`, so `boot_for_test` exercises it too.
+    tokio::spawn(crate::oauth::rotation::run_key_promotion(state.clone()));
 
     // Where `jetstream::spawn` stood: live ingest starts after the project
     // is installed and before anything else is spawned.

@@ -1112,6 +1112,7 @@ async fn take_pending_grant_returns_the_grant_and_is_single_use() {
         PendingGrant::Grant {
             grant_id: grant.id.clone(),
             origin: flow::AuthOrigin::Admin,
+            kid: None,
         }
     );
     // The DELETE is the claim, so a replay finds nothing at all.
@@ -1402,6 +1403,7 @@ async fn client_for_grant_stamps_the_key_it_actually_signs_with_across_a_rotatio
             state.db.clone(),
             state.db_backend,
             Some(vec![jwk_a]),
+            state.config.keyring(),
         )
         .expect("failed to build non-loopback linked-repo OAuth client"),
     );

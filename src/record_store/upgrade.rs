@@ -1417,6 +1417,10 @@ pub async fn run_on(
         let mut tx = begin_write_on(conn, backend).await?;
         if !legacy_tables_present(&mut *tx, backend).await? {
             tx.rollback().await?;
+            // Upgraded under an older build: gain the views added since.
+            for sql in compat::ensure_statements(backend, compat::LIVE) {
+                crate::db::query(&sql).execute(&mut *conn).await?;
+            }
             return Ok(UpgradeOutcome::AlreadyDone);
         }
         // Before anything is copied: a full copy that the swap's DROP TABLE

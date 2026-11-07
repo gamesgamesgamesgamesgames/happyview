@@ -103,7 +103,8 @@ export default function LexiconPublishingPage() {
                   Publishing rules
                 </h2>
                 <p className="text-muted-foreground text-sm">
-                  Each lexicon is published by the first rule that matches it.
+                  Each lexicon is published by the most specific rule that
+                  matches it.
                 </p>
               </div>
               {canPublish && overview && !noTargets && (

@@ -1,7 +1,7 @@
 //! External account token storage with encryption.
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
-use crate::plugin::encryption::{EncryptionError, decrypt, encrypt};
+use crate::plugin::encryption::{EncryptionError, encrypt};
 
 /// Row type for token query results
 type TokenRow = (
@@ -91,7 +91,7 @@ pub async fn store_tokens(
 pub async fn get_tokens(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&crate::plugin::encryption::Keyring>,
     did: &str,
     plugin_id: &str,
 ) -> Result<StoredTokens, TokenError> {
@@ -111,12 +111,12 @@ pub async fn get_tokens(
     let (account_id, encrypted_access, encrypted_refresh, token_type, scope, expires_at) =
         row.ok_or(TokenError::NotFound)?;
 
-    let access_token = String::from_utf8(decrypt(key, &encrypted_access)?)
+    let access_token = String::from_utf8(key.decrypt(&encrypted_access)?)
         .map_err(|_| EncryptionError::DecryptionFailed)?;
 
     let refresh_token = encrypted_refresh
         .map(|enc| {
-            decrypt(key, &enc).and_then(|dec| {
+            key.decrypt(&enc).and_then(|dec| {
                 String::from_utf8(dec).map_err(|_| EncryptionError::DecryptionFailed)
             })
         })

@@ -13,32 +13,34 @@ pub struct ResolvedClient {
 }
 
 /// Authenticate a confidential client using client_key + client_secret.
+/// The secret may be any of the client's that has not been revoked; they are
+/// read from the database on every call, so a revocation holds at once on
+/// every instance.
 pub async fn authenticate_confidential(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     client_key: &str,
     client_secret: &str,
 ) -> Result<ResolvedClient, AppError> {
-    let secret_hash = hex::encode(Sha256::digest(client_secret.as_bytes()));
-
     let sql = adapt_sql(
-        "SELECT id, client_key, client_type, scopes, allowed_origins, client_secret_hash FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
+        "SELECT id, client_key, client_type, scopes, allowed_origins FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
         backend,
     );
 
-    let row: Option<(String, String, String, String, Option<String>, String)> =
-        crate::db::query_as(&sql)
-            .bind(client_key)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("client lookup failed: {e}")))?;
+    let row: Option<(String, String, String, String, Option<String>)> = crate::db::query_as(&sql)
+        .bind(client_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("client lookup failed: {e}")))?;
 
-    let (id, key, client_type, scopes, origins_json, stored_hash) =
+    let (id, key, client_type, scopes, origins_json) =
         row.ok_or_else(|| AppError::Auth("invalid client credentials".into()))?;
 
-    if !crate::constant_time::ct_eq_str(&stored_hash, &secret_hash) {
+    let secrets = super::client_secrets::active_hashes(pool, backend, &id).await?;
+    let Some(secret_id) = super::client_secrets::matching(&secrets, client_secret) else {
         return Err(AppError::Auth("invalid client credentials".into()));
-    }
+    };
+    super::client_secrets::record_use(pool, backend, &secret_id).await;
 
     if client_type != "confidential" {
         return Err(AppError::Auth(
@@ -418,14 +420,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -474,14 +469,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         // Its own authority: granted.
@@ -529,14 +517,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         for scope in [
@@ -575,14 +556,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         assert!(
@@ -655,14 +629,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -705,14 +672,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
@@ -743,14 +703,7 @@ mod tests {
                 }
             }
         });
-        let parsed = crate::lexicon::ParsedLexicon::parse(
-            raw,
-            1,
-            None,
-            crate::lexicon::ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap();
         reg.upsert(parsed).await;
 
         let result = validate_scopes(

@@ -49,6 +49,11 @@ pub struct ScriptRun {
     /// Set for a job run, whose log lines also land in the job's own log and
     /// whose progress, stop flag and waits the three controls act on.
     pub job_id: Option<String>,
+    /// Set once the worker running this job lost its lease to another claim:
+    /// the run is interrupted at its next host import (see
+    /// `bindings::HostImports::define`), so it repeats no more of the job's
+    /// side effects alongside the run that took it over.
+    pub lease_lost: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this run is a test file. The five test imports answer only
     /// when it is, whatever the plugin declared.
     pub test: bool,
@@ -64,6 +69,10 @@ pub struct ScriptRun {
     /// caps in total: a wait is host time, so a job that waits in a loop
     /// would otherwise never reach its deadline.
     pub waited_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Where this run's host imports are timed, when the run is measured.
+    /// The run's own rather than the task's, because a library call runs on
+    /// the caller's task and its imports are already inside the caller's.
+    pub metrics: Option<Arc<crate::metrics::run::RunCollector>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -494,16 +503,30 @@ mod tests {
         .await
         .unwrap();
         let run = run(Some(&job));
-
-        progress(
-            &state,
-            &run,
-            JobProgressRequest {
-                data: serde_json::json!({"done": 3}),
+        // As a worker runs it: claimed, and under the claim's lease.
+        let claimed = crate::jobs::db::hold_job(&state, &job, "me")
+            .await
+            .unwrap()
+            .unwrap();
+        let held = crate::jobs::held::Held::new(
+            &job,
+            crate::jobs::db::Lease {
+                owner: "me".into(),
+                attempt: claimed.attempt,
             },
-        )
-        .await
-        .unwrap();
+        );
+        crate::jobs::held::run_under(held.clone(), async {
+            progress(
+                &state,
+                &run,
+                JobProgressRequest {
+                    data: serde_json::json!({"done": 3}),
+                },
+            )
+            .await
+            .unwrap();
+        })
+        .await;
         let (stored,): (String,) =
             crate::db::query_as("SELECT progress FROM happyview_jobs WHERE id = ?")
                 .bind(&job)
@@ -515,7 +538,8 @@ mod tests {
             serde_json::json!({"done": 3})
         );
 
-        assert!(!should_stop(&state, &run).await.unwrap());
+        let asked = crate::jobs::held::run_under(held.clone(), should_stop(&state, &run)).await;
+        assert!(!asked.unwrap());
         for status in ["cancelling", "pausing"] {
             crate::db::query("UPDATE happyview_jobs SET status = ? WHERE id = ?")
                 .bind(status)
@@ -523,7 +547,8 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .unwrap();
-            assert!(should_stop(&state, &run).await.unwrap(), "{status}");
+            let asked = crate::jobs::held::run_under(held.clone(), should_stop(&state, &run)).await;
+            assert!(asked.unwrap(), "{status}");
         }
     }
 }

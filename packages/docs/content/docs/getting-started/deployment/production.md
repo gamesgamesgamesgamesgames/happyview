@@ -92,6 +92,8 @@ SQLite is fine for small to medium instances and is the default. Switch to Postg
 
 See the [database setup guide](../../guides/database/database-setup.md) for configuration details and [Postgres → SQLite migration](../../guides/database/postgres-to-sqlite-migration.md) if you're moving the other direction. Migrations run automatically on startup regardless of backend. Upgrades that build an index over a large records table make that boot slow on either backend. With several replicas, upgrade one first. See [migrations at startup](../../guides/database/database-setup.md#migrations-at-startup). The upgrade to the [compact record format](../../guides/database/database-setup.md#the-compact-record-format) copies every record once and can't be rolled back without a backup; read its notes first.
 
+When several replicas share a database, give each one a stable, distinct `HAPPYVIEW_INSTANCE_ID`. Its stored [script metrics](../../api-reference/admin/metrics.md#several-instances-on-one-database) are kept under that id, so a replica that restarts reads its own history back.
+
 ## Rate limits
 
 HappyView has a per-client token-bucket rate limiter for XRPC endpoints. The defaults (set via `DEFAULT_RATE_LIMIT_CAPACITY` and `DEFAULT_RATE_LIMIT_REFILL_RATE`) apply to any [API client](../../guides/api-keys.md) that doesn't have per-client overrides. Raise the defaults cautiously — they exist so one misbehaving integrator can't saturate the server.
@@ -110,7 +112,9 @@ Structured logs go to stdout, so any platform that captures container stdout (Ra
 
 ## Event log retention
 
-The admin [event log](../../guides/event-logs.md) is stored in the same database as records. `EVENT_LOG_RETENTION_DAYS` (default `30`) controls automatic cleanup. Set to `0` to keep events indefinitely — useful for compliance-sensitive deployments, but plan for database growth.
+The admin [event log](../../guides/event-logs.md) is stored in the same database as records. `EVENT_LOG_RETENTION_DAYS` (default `30`) controls automatic cleanup, of the event log and of each background job's own log. Set to `0` to keep them indefinitely — useful for compliance-sensitive deployments, but plan for database growth.
+
+[Stored script metrics](../../api-reference/admin/metrics.md#retention) (`happyview_script_metrics`) are kept for the same number of days.
 
 ## Health checks
 

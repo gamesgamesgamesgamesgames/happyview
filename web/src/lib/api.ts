@@ -1,3 +1,5 @@
+import type { LimitReached } from "@/types/limits";
+import { parseLimitReached } from "@/lib/limits";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
@@ -13,12 +15,21 @@ import type {
 } from "@/types/lexicon-publishing";
 import type { ResolvedIdentity } from "@/types/identity";
 import type {
+  BackfillCollection,
   BackfillJob,
   BackfillReposResponse,
   PdsSummaryResponse,
   BackfillErrorsResponse,
 } from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
+import type {
+  IngestMetricsResponse,
+  LiveMetricsResponse,
+  MetricsStep,
+  MetricsWindow,
+  ScriptMetricsListResponse,
+  ScriptSeriesResponse,
+} from "@/types/metrics";
 import type {
   CreateLinkedRepoBody,
   LinkedRepo,
@@ -31,8 +42,13 @@ import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
   AdminSpaceDetail,
+  AccessGrant,
+  GrantScope,
+  InspectorStatus,
+  AdminAccountSpace,
+  AdminAccountRecord,
 } from "@/types/spaces";
-import type { EventsListResponse } from "@/types/events";
+import type { EventLogEntry, EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
   Script,
@@ -52,6 +68,9 @@ import type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
@@ -70,6 +89,7 @@ import type {
   DeadLetterDetail,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
@@ -119,6 +139,9 @@ export type {
   ApiClientAuthKeysResponse,
   RevokeApiClientAuthKeyResult,
   RevokeAllApiClientAuthKeysResult,
+  ApiClientSecret,
+  CreatedApiClientSecret,
+  RevokeApiClientSecretResult,
   KeyRotationResult,
   InstanceOauthKey,
   InstanceOauthKeysResponse,
@@ -151,9 +174,18 @@ export type {
   DeadLettersListResponse,
   DeadLetterCountResponse,
   BulkActionResponse,
+  BulkItemsResponse,
 } from "@/types/dead-letters";
 
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
+
+/** One thing wrong with an uploaded lexicon, and where in the document. */
+export type LexiconIssue = {
+  /** A dotted path, e.g. `defs.main.record.properties.title`. */
+  path: string;
+  message: string;
+  severity: "error" | "warning";
+};
 
 export class ApiError extends Error {
   status: number;
@@ -162,10 +194,28 @@ export class ApiError extends Error {
    * `removed_globals`. Absent on every other error.
    */
   removedGlobals?: string[];
-  constructor(status: number, message: string, removedGlobals?: string[]) {
+  /**
+   * Per-field problems a refused lexicon upload named, from the response's
+   * `issues`. Absent on every other error.
+   */
+  lexiconIssues?: LexiconIssue[];
+  /**
+   * The limit a `LimitReached` refusal hit, with the host's wording. Absent
+   * on every other error.
+   */
+  limitReached?: LimitReached;
+  constructor(
+    status: number,
+    message: string,
+    removedGlobals?: string[],
+    lexiconIssues?: LexiconIssue[],
+    limitReached?: LimitReached,
+  ) {
     super(message);
     this.status = status;
     this.removedGlobals = removedGlobals;
+    this.lexiconIssues = lexiconIssues;
+    this.limitReached = limitReached;
   }
 }
 
@@ -192,16 +242,29 @@ async function apiFetch<T = unknown>(
     const text = await res.text().catch(() => res.statusText);
     let message = text;
     let removedGlobals: string[] | undefined;
+    let lexiconIssues: LexiconIssue[] | undefined;
+    let limitReached: LimitReached | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
       if (Array.isArray(parsed.removed_globals)) {
         removedGlobals = parsed.removed_globals;
       }
+      if (Array.isArray(parsed.issues)) {
+        lexiconIssues = parsed.issues;
+      }
+      limitReached = parseLimitReached(parsed);
+      if (limitReached) message = limitReached.message;
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message, removedGlobals);
+    throw new ApiError(
+      res.status,
+      message,
+      removedGlobals,
+      lexiconIssues,
+      limitReached,
+    );
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
@@ -231,20 +294,41 @@ export function uploadLexicon(body: {
   lexicon_json: unknown;
   backfill?: boolean;
   indexed?: boolean;
-  target_collection?: string;
-  action?: string;
   token_cost?: number | null;
 }) {
-  return apiFetch<{ id: string; revision: number }>("/admin/lexicons", {
+  return apiFetch<{
+    id: string;
+    revision: number;
+    /**
+     * Warnings about a lexicon that was accepted anyway — a `subscription`,
+     * which stores and generates no endpoint, is the one that matters.
+     * Errors never reach here; they are an `ApiError`.
+     */
+    issues?: LexiconIssue[];
+  }>("/admin/lexicons", {
     method: "POST",
     body: JSON.stringify(body),
   });
 }
 
-export function deleteLexicon(id: string) {
-  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}`, {
+export function deleteLexicon(id: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(`/admin/lexicons/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
+}
+
+// How many records are indexed under a record lexicon's collection. Asked
+// for only when the delete confirm opens, because it is a COUNT(*).
+export function getLexiconRecordCount(id: string) {
+  return apiFetch<{
+    collection: string;
+    /** Null when the count could not be read; the delete does not need it. */
+    count: number | null;
+    /** False when a shared record store serves this collection. */
+    deletable: boolean;
+    not_deletable_reason: string | null;
+  }>(`/admin/lexicons/${encodeURIComponent(id)}/record-count`);
 }
 
 // Lexicon publishing
@@ -314,7 +398,6 @@ export function addNetworkLexicon(body: {
   nsid: string;
   backfill?: boolean;
   indexed?: boolean;
-  target_collection?: string;
 }) {
   return apiFetch<{
     nsid: string;
@@ -324,15 +407,23 @@ export function addNetworkLexicon(body: {
   }>("/admin/network-lexicons", { method: "POST", body: JSON.stringify(body) });
 }
 
-export function deleteNetworkLexicon(nsid: string) {
-  return apiFetch(`/admin/network-lexicons/${encodeURIComponent(nsid)}`, {
-    method: "DELETE",
-  });
+export function deleteNetworkLexicon(nsid: string, deleteRecords = false) {
+  const query = deleteRecords ? "?delete_records=true" : "";
+  return apiFetch(
+    `/admin/network-lexicons/${encodeURIComponent(nsid)}${query}`,
+    { method: "DELETE" },
+  );
 }
 
 // Backfill
 export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
+}
+
+export function getBackfillCollection(nsid: string) {
+  return apiFetch<BackfillCollection>(
+    `/admin/backfill/collections/${encodeURIComponent(nsid)}`,
+  );
 }
 
 export function createBackfillJob(body: {
@@ -412,6 +503,35 @@ export function retryFailedBackfill(jobId: string, kinds?: string[]) {
     method: "POST",
     body: JSON.stringify(kinds ? { kinds } : {}),
   });
+}
+
+// Metrics
+export function getScriptMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<ScriptMetricsListResponse>(
+    `/admin/metrics/scripts?window=${window}`,
+  );
+}
+
+export function getScriptSeries(
+  trigger: string,
+  window: MetricsWindow = "1h",
+  step?: MetricsStep,
+) {
+  const qs = new URLSearchParams({ window });
+  if (step) qs.set("step", step);
+  return apiFetch<ScriptSeriesResponse>(
+    `/admin/metrics/scripts/${encodeURIComponent(trigger)}?${qs}`,
+  );
+}
+
+export function getIngestMetrics(window: MetricsWindow = "1h") {
+  return apiFetch<IngestMetricsResponse>(
+    `/admin/metrics/ingest?window=${window}`,
+  );
+}
+
+export function getLiveMetrics() {
+  return apiFetch<LiveMetricsResponse>("/admin/metrics/live");
 }
 
 // Jobs
@@ -555,8 +675,13 @@ export function addUser(body: {
   });
 }
 
-export function resolveIdentity(identifier: string) {
-  const qs = new URLSearchParams({ identifier }).toString();
+export function resolveIdentity(
+  identifier: string,
+  options: { profile?: boolean } = {},
+) {
+  const params = new URLSearchParams({ identifier });
+  if (options.profile) params.set("profile", "true");
+  const qs = params.toString();
   return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 
@@ -699,6 +824,98 @@ export function getAdminSpaceRecords(
 /** Opening this URL is written to the event log. */
 export function adminSpaceBlobUrl(id: string, cid: string) {
   return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
+}
+
+export const SPACE_ACCESS_GRANT_REQUIRED = "SpaceAccessGrantRequired";
+export const SPACE_INSPECTOR_DISABLED = "SpaceInspectorDisabled";
+
+export function getInspectorStatus() {
+  return apiFetch<InspectorStatus>("/admin/spaces/inspector");
+}
+
+/** The caller's active grant covering an account's records, if any. */
+export function getAccountAccess(did: string) {
+  return apiFetch<{ grant: AccessGrant | null }>(
+    `/admin/accounts/${encodeURIComponent(did)}/access`,
+  );
+}
+
+/** The caller's active grant covering a space's page, if any. */
+export function getSpaceAccess(id: string) {
+  return apiFetch<{ grant: AccessGrant | null }>(
+    `/admin/spaces/${encodeURIComponent(id)}/access`,
+  );
+}
+
+export function listAccessGrants(active = true) {
+  return apiFetch<{ grants: AccessGrant[] }>(
+    `/admin/spaces/access-grants?active=${active}`,
+  );
+}
+
+export function createAccessGrant(body: {
+  scope: GrantScope;
+  target: string;
+  reason: string;
+  duration_minutes: number;
+}) {
+  return apiFetch<AccessGrant>("/admin/spaces/access-grants", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function revokeAccessGrant(id: string) {
+  return apiFetch<AccessGrant>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One page of the reads made under a grant, oldest first. */
+export function getGrantReads(id: string, cursor?: string) {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const qs = params.toString();
+  return apiFetch<{ events: EventLogEntry[]; cursor?: string }>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}/reads${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function getAccountSpaces(did: string) {
+  return apiFetch<{ spaces: AdminAccountSpace[] }>(
+    `/admin/accounts/${encodeURIComponent(did)}/spaces`,
+  );
+}
+
+/** Reading an account's records is written to the event log. */
+export function getAccountSpaceRecords(
+  did: string,
+  options: {
+    space?: string;
+    collection?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.space) params.set("space", options.space);
+  if (options.collection) params.set("collection", options.collection);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  return apiFetch<{ records: AdminAccountRecord[]; cursor?: string }>(
+    `/admin/accounts/${encodeURIComponent(did)}/space-records?${params}`,
+  );
+}
+
+// Checks a collection's stored records against its accounts' PDSes. A dry
+// run only reports; otherwise the records the PDSes no longer hold are
+// deleted, through the delete hook.
+export function reconcileCollection(collection: string, dryRun: boolean) {
+  return apiFetch<{ job_id: string }>("/admin/records/collection/reconcile", {
+    method: "POST",
+    body: JSON.stringify({ collection, dry_run: dryRun }),
+  });
 }
 
 export function deleteCollectionRecords(collection: string) {
@@ -1118,10 +1335,10 @@ export function recheckApiClientAuthKey(id: string) {
   );
 }
 
-export function rotateApiClientAuthKey(id: string) {
+export function rotateApiClientAuthKey(id: string, immediate = false) {
   return apiFetch<KeyRotationResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
-    { method: "POST" },
+    { method: "POST", body: JSON.stringify({ immediate }) },
   );
 }
 
@@ -1145,9 +1362,30 @@ export function revokeAllApiClientAuthKeys(id: string) {
   );
 }
 
-export function rotateInstanceOauthKey() {
+export function listApiClientSecrets(id: string) {
+  return apiFetch<{ secrets: ApiClientSecret[] }>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+  );
+}
+
+export function createApiClientSecret(id: string, label: string) {
+  return apiFetch<CreatedApiClientSecret>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets`,
+    { method: "POST", body: JSON.stringify({ label }) },
+  );
+}
+
+export function revokeApiClientSecret(id: string, secretId: string) {
+  return apiFetch<RevokeApiClientSecretResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/secrets/${encodeURIComponent(secretId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function rotateInstanceOauthKey(immediate = false) {
   return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
     method: "POST",
+    body: JSON.stringify({ immediate }),
   });
 }
 
@@ -1474,7 +1712,7 @@ export function bulkRetryDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/retry", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/retry", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -1485,7 +1723,7 @@ export function bulkReindexDeadLetters(body: {
   all?: boolean;
   collection?: string;
 }) {
-  return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/reindex", {
+  return apiFetch<BulkItemsResponse>("/admin/dead-letters/bulk/reindex", {
     method: "POST",
     body: JSON.stringify(body),
   });

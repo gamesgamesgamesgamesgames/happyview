@@ -44,8 +44,7 @@ macro_rules! require_fixture {
         ))
         .exists()
         {
-            eprintln!(concat!(
-                "skipping: ",
+            happyview::test_support::unavailable(concat!(
                 $name,
                 " fixture not built. Run: cargo build --manifest-path tests/fixtures/",
                 $name,
@@ -170,8 +169,8 @@ fn returned(output: ScriptExecuteOutput) -> (Value, ScriptValueKind) {
 async fn seeded_job(app: &TestApp) -> String {
     let id = Uuid::new_v4().to_string();
     happyview::db::query(&happyview::db::adapt_sql(
-        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth)
-         VALUES (?, 'test.interpreter', 'running', '{}', '{}', ?, ?, ?)",
+        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth, claimed_by, attempt)
+         VALUES (?, 'test.interpreter', 'running', '{}', '{}', ?, ?, ?, 'runner', 1)",
         app.state.db_backend,
     ))
     .bind(&id)
@@ -355,7 +354,7 @@ async fn a_spinning_script_is_interrupted_at_the_wall_clock_and_classifies_as_ti
 /// The burn is sized to this machine, since no one count outlasts the budget
 /// on every machine without costing seconds on some. The non-job arms prove
 /// it outlasted the budget whatever it was sized to — a burn too short comes
-/// back from them returned rather than timed out — and the floor below is
+/// back from them returned rather than timed out — and the budget check below is
 /// checked first only so a burn the guest never spent is reported as that
 /// rather than as a deadline that stopped working.
 #[tokio::test]
@@ -382,7 +381,7 @@ async fn only_a_job_run_outlives_the_wall_clock() {
     );
     let burned = started.elapsed();
     assert_eq!(value["source"], source);
-    burn.assert_outlasted(burned);
+    burn.assert_outlasted(burned, std::time::Duration::from_secs(1));
 
     for kind in [ScriptKind::XrpcQuery, ScriptKind::RecordEvent] {
         let err = app
@@ -527,7 +526,15 @@ async fn job_progress_updates_the_row_and_should_stop_reads_both_stop_states() {
     let mut sent = input("host:job_progress", ScriptKind::Job);
     sent.context.job = Some(ScriptJob { id: job.clone() });
     sent.input = json!({"processed": 42});
-    let (value, _) = returned(executor.execute_script(id, &sent).await.unwrap());
+    // Progress is written under the lease of the claim the run holds, as a
+    // worker runs it.
+    let lease = happyview::jobs::held::Lease {
+        owner: "runner".into(),
+        attempt: 1,
+    };
+    let run = happyview::jobs::held::Held::new(&job, lease);
+    let ran = happyview::jobs::held::run_under(run, executor.execute_script(id, &sent)).await;
+    let (value, _) = returned(ran.unwrap());
     assert!(value.get("error").is_none(), "{value}");
 
     let (stored,): (String,) = happyview::db::query_as(&happyview::db::adapt_sql(

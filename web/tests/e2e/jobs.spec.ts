@@ -1,9 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "crypto";
 import pg from "pg";
-import { loginAsTestAdmin } from "./auth-helper";
+import { loginAsTestAdmin, DB_URL } from "./auth-helper";
 
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 const TEST_DID = "did:plc:e2e-test-admin";
 
 async function seedJob(

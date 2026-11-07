@@ -18,7 +18,31 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 use wiremock::MockServer;
 
-use crate::common::db;
+/// See [`TestApp::build_router`].
+async fn as_dashboard(mut req: Request<Body>) -> Request<Body> {
+    let headers = req.headers();
+    let cookie = format!("{}=", happyview::auth::COOKIE_NAME);
+    let carries_session = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(';')
+                .any(|pair| pair.trim_start().starts_with(&cookie))
+        });
+    if carries_session
+        && !headers.contains_key("sec-fetch-site")
+        && !headers.contains_key(axum::http::header::ORIGIN)
+    {
+        req.headers_mut().insert(
+            "sec-fetch-site",
+            axum::http::HeaderValue::from_static("same-origin"),
+        );
+    }
+    req
+}
+
+use crate::common::{db, watchdog};
 
 pub struct TestApp {
     pub router: Router,
@@ -32,6 +56,8 @@ pub struct TestApp {
     /// The state's Jetstream source.
     pub jetstream: std::sync::Arc<happyview_source_jetstream::JetstreamSource>,
     _db_lock: Option<db::TestLock>,
+    /// Last, so it drops after everything else the app holds.
+    _alive: watchdog::Alive,
 }
 
 impl TestApp {
@@ -45,7 +71,22 @@ impl TestApp {
     pub async fn new_with_registry_config(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
-        Self::build(registry_config, false).await
+        Self::build(registry_config, false, None).await
+    }
+
+    /// A [`TestApp`] whose record store delegates the collections `external`
+    /// claims to it, as a managed instance's does to the shared network
+    /// store. It has to be given before the router is built, because the
+    /// router holds its own clone of the state.
+    pub async fn new_with_external_storage(
+        external: std::sync::Arc<dyn happyview_provider::RecordStorage>,
+    ) -> Self {
+        Self::build(
+            happyview::plugin::official_registry::RegistryConfig::production(),
+            false,
+            Some(external),
+        )
+        .await
     }
 
     /// A [`TestApp`] whose plugin registry writes `happyview_plugins` rows, as
@@ -54,13 +95,16 @@ impl TestApp {
     pub async fn new_with_persisted_plugins(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
-        Self::build(registry_config, true).await
+        Self::build(registry_config, true, None).await
     }
 
     async fn build(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
         persist_plugins: bool,
+        external: Option<std::sync::Arc<dyn happyview_provider::RecordStorage>>,
     ) -> Self {
+        // Before the lock, which can wait on another test binary.
+        let _alive = watchdog::Alive::new();
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
@@ -101,13 +145,11 @@ impl TestApp {
             plc_url: mock_url.clone(),
             static_dir: Some("./web/out".into()),
             base_path: None,
-            event_log_retention_days: 30,
             app_name: None,
             logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
             // Space writes need this to decrypt the `#atproto_space` signing key.
             token_encryption_key: Some(db::TEST_ENCRYPTION_KEY),
+            token_encryption_key_previous: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -172,8 +214,13 @@ impl TestApp {
             state_store: happyview::auth::oauth_store::DbStateStore::new(
                 oauth_pool.clone(),
                 backend,
+                Some(db::TEST_ENCRYPTION_KEY.into()),
             ),
-            session_store: happyview::auth::oauth_store::DbSessionStore::new(oauth_pool, backend),
+            session_store: happyview::auth::oauth_store::DbSessionStore::new(
+                oauth_pool,
+                backend,
+                Some(db::TEST_ENCRYPTION_KEY.into()),
+            ),
             resolver: OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -198,11 +245,15 @@ impl TestApp {
         state.records = happyview::record_store::RecordStore::shared(pool.clone(), backend)
             .await
             .expect("load record dictionaries");
+        if let Some(external) = external {
+            state.records = state.records.clone().with_external(external);
+        }
         state.domain_cache = domain_cache;
         state.lexicons = lexicons;
         state.collections_tx = collections_tx;
         state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            Some(db::TEST_ENCRYPTION_KEY.into()),
         ));
         state.linked_repos_client = std::sync::Arc::new(
             happyview::linked_repos::client::build(
@@ -212,10 +263,15 @@ impl TestApp {
                 "http://127.0.0.1:0/auth/callback".into(),
                 true,
                 oauth_scopes,
-                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                happyview::auth::oauth_store::DbStateStore::new(
+                    pool.clone(),
+                    backend,
+                    Some(db::TEST_ENCRYPTION_KEY.into()),
+                ),
                 pool.clone(),
                 backend,
                 None,
+                Some(db::TEST_ENCRYPTION_KEY.into()),
             )
             .expect("Failed to create test linked-repo OAuth client"),
         );
@@ -241,11 +297,23 @@ impl TestApp {
             admin_token,
             archive,
             jetstream,
+            _alive,
         }
     }
 
+    /// The instance's router, as the dashboard's own browser reaches it: a
+    /// request carrying the session cookie and no fetch metadata is sent as
+    /// `Sec-Fetch-Site: same-origin`, because outside `/admin` the cookie
+    /// counts only on a same-origin request and a test request has no
+    /// browser to say so. A test about fetch metadata sends its own headers,
+    /// or uses [`TestApp::unmarked_router`] to send none.
     fn build_router(state: &AppState) -> axum::Router {
-        happyview::testkit::app::router(state)
+        happyview::testkit::app::router(state).layer(axum::middleware::map_request(as_dashboard))
+    }
+
+    /// The instance's router with nothing added to a request.
+    pub fn unmarked_router(&self) -> axum::Router {
+        happyview::testkit::app::router(&self.state)
     }
 
     pub fn rebuild_router(&mut self) {
@@ -270,8 +338,11 @@ impl TestApp {
         let http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         // One store, shared: `/auth/login` reads back the state key the client
         // just stored through `oauth_state_store`.
-        let state_store =
-            happyview::auth::oauth_store::DbStateStore::new(self.state.db.clone(), backend);
+        let state_store = happyview::auth::oauth_store::DbStateStore::new(
+            self.state.db.clone(),
+            backend,
+            Some(db::TEST_ENCRYPTION_KEY.into()),
+        );
         let scopes: Vec<Scope> = scopes
             .iter()
             .map(|s| match *s {
@@ -290,6 +361,7 @@ impl TestApp {
             session_store: happyview::auth::oauth_store::DbSessionStore::new(
                 self.state.db.clone(),
                 backend,
+                Some(db::TEST_ENCRYPTION_KEY.into()),
             ),
             resolver: OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
@@ -310,6 +382,7 @@ impl TestApp {
         self.state.config.plc_url = plc_url.to_string();
         self.state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
             std::sync::Arc::new(oauth),
+            Some(db::TEST_ENCRYPTION_KEY.into()),
         ));
         self.state.oauth_state_store = state_store;
         self.rebuild_router();
@@ -377,6 +450,19 @@ impl TestApp {
             .execute(&self.state.db)
             .await
             .expect("failed to create test API client");
+
+        let secret_sql = adapt_sql(
+            "INSERT INTO happyview_api_client_secrets (id, client_id, label, secret_hash, created_at) VALUES (?, ?, 'Original', ?, ?)",
+            self.state.db_backend,
+        );
+        happyview::db::query(&secret_sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(&secret_hash)
+            .bind(&now)
+            .execute(&self.state.db)
+            .await
+            .expect("failed to create test API client secret");
 
         (client_key, client_secret, id)
     }
@@ -747,6 +833,25 @@ impl TestApp {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "did": resolved_did })),
+            )
+            .mount(&self.mock_server)
+            .await;
+    }
+
+    /// Make the PDS [`Self::mock_session_verification`] resolves for `did`
+    /// name `issuer` as its authorization server, which a session
+    /// registration naming `issuer` checks.
+    pub async fn mock_pds_names_issuer(&self, did: &str, issuer: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/pds/{did}/.well-known/oauth-protected-resource"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "authorization_servers": [issuer] })),
             )
             .mount(&self.mock_server)
             .await;

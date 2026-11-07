@@ -163,7 +163,7 @@ pub const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
 /// Idempotent, and safe to race: every test uses [`TEST_ENCRYPTION_KEY`], so an
 /// existing row is always one this state can decrypt.
 pub async fn provision_space_signing_key(state: &AppState) {
-    let Some(key) = state.config.token_encryption_key.as_ref() else {
+    let Some(key) = &state.config.keyring() else {
         return;
     };
 
@@ -192,9 +192,13 @@ pub async fn provision_space_signing_key(state: &AppState) {
             .await;
     }
 
-    crate::verification_methods::ensure_atproto_space_method(&state.db, state.db_backend, key)
-        .await
-        .expect("provision #atproto_space key");
+    crate::verification_methods::ensure_atproto_space_method(
+        &state.db,
+        state.db_backend,
+        key.current(),
+    )
+    .await
+    .expect("provision #atproto_space key");
 }
 
 /// A state on the database `TEST_DATABASE_URL` names, or `None` when it names
@@ -210,7 +214,10 @@ pub async fn test_state_from_env() -> Option<AppState> {
     // takes the same path so the order is the same on both.
     static CONNECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    let url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        unavailable(NO_DATABASE);
+        return None;
+    };
     let backend = crate::db::DatabaseBackend::from_url(&url);
     let pool = {
         let _connecting = CONNECTING.lock().await;
@@ -241,14 +248,12 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         plc_url: String::new(),
         static_dir: None,
         base_path: None,
-        event_log_retention_days: 30,
         app_name: None,
         logo_uri: None,
-        tos_uri: None,
-        policy_uri: None,
         // Spaces sign every commit with the `#atproto_space` key, which is
         // stored encrypted, so space writes need this set.
         token_encryption_key: Some(TEST_ENCRYPTION_KEY),
+        token_encryption_key_previous: None,
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
         telemetry_collector_url: String::new(),
@@ -392,6 +397,36 @@ pub fn assert_index_without_sort(
     };
     assert!(!sorts, "{backend:?} plan sorts: {plan:#?}");
 }
+
+/// Set to `1` to let a test skip when something it needs is not here: a
+/// database, a built plugin fixture, an interpreter plugin.
+pub const ALLOW_SKIPS: &str = "HAPPYVIEW_ALLOW_SKIPS";
+
+/// What a test that cannot have `what` does about it. A skipped test reports
+/// `ok`, so a run with nothing built and no database reports a wall of
+/// passes having tested little; that let a real bug through once. So it
+/// fails, naming what is missing and how to get it, unless
+/// [`ALLOW_SKIPS`] is `1`, in which case it notes the skip and the caller
+/// returns.
+///
+/// For a prerequisite that is absent. A test that runs only on the other
+/// database backend is not missing anything and skips without this.
+#[track_caller]
+pub fn unavailable(what: &str) {
+    if std::env::var(ALLOW_SKIPS).as_deref() == Ok("1") {
+        eprintln!("skipped: {what}");
+        return;
+    }
+    panic!(
+        "{what}\n\nThis test needs it and cannot run without it. Build every plugin fixture with \
+         `bash scripts/build-plugin-fixtures.sh` and point TEST_DATABASE_URL at a test database, \
+         or set {ALLOW_SKIPS}=1 to skip the tests whose prerequisites are missing."
+    );
+}
+
+/// The message for a test that needs `TEST_DATABASE_URL`.
+pub const NO_DATABASE: &str =
+    "TEST_DATABASE_URL is not set (e.g. sqlite:///tmp/happyview-test.db?mode=rwc)";
 
 #[cfg(test)]
 mod tests {

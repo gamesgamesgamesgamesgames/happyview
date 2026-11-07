@@ -22,7 +22,7 @@ Every script defines a `handle(input, ctx)` function. HappyView calls it when th
 local db = require("happyview.db")
 
 function handle(input, ctx)
-  return db.records(ctx.collection):limit(20):run()
+  return db.records("xyz.statusphere.status"):limit(20):run()
 end
 ```
 
@@ -50,7 +50,7 @@ See the [Standard Libraries](../api-reference/lua/standard-libraries.md) referen
 local db = require("happyview.db")
 
 function handle(input, ctx)
-  local page = db.records(ctx.collection)
+  local page = db.records("xyz.statusphere.status")
     :where("status", "=", input.status)
     :did(input.did)
     :limit(tonumber(input.limit))
@@ -76,7 +76,7 @@ local time = require("internal.time")
 local record = require("happyview.record")
 
 function handle(input, ctx)
-  return record.create(ctx.collection, {
+  return record.create("com.example.post", {
     text = input.text,
     createdAt = time.to_iso8601(time.now()),
   })
@@ -113,7 +113,7 @@ Anything too slow for a request goes to a job. `happyview.jobs` enqueues one fro
 local jobs = require("happyview.jobs")
 
 function handle(input, ctx)
-  local job_id = jobs.create("export", { collection = ctx.collection })
+  local job_id = jobs.create("export", { collection = "xyz.statusphere.status" })
   return { job_id = job_id }
 end
 ```
@@ -132,7 +132,7 @@ local db = require("happyview.db")
 
 function handle(input, ctx)
   log.debug("handle called", { limit = input.limit })
-  local page = db.records(ctx.collection):limit(tonumber(input.limit)):run()
+  local page = db.records("xyz.statusphere.status"):limit(tonumber(input.limit)):run()
   log.info("query returned records", { count = #page.records })
   return page
 end
@@ -143,6 +143,10 @@ To see debug output in stdout, make sure your `RUST_LOG` environment variable in
 ### Error messages
 
 When a script fails, the client receives the Lua error message, its type and the line it came from, as described under [Errors](../api-reference/lua/script-contract.md#errors) in the Script Contract. The same message is logged server-side at error level with its stack trace.
+
+### Performance
+
+The dashboard's **Script performance** page shows how often each script runs, how long it takes and where that time goes, split into the script's own code and the platform's work around it. See [Dashboard](../getting-started/dashboard.md#script-performance).
 
 ### Common mistakes
 

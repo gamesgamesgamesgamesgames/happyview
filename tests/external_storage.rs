@@ -12,7 +12,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use happyview::AppState;
 use happyview::db::DatabaseBackend;
-use happyview::lexicon::ProcedureAction;
 use happyview::plugin::library::LibraryCallContext;
 use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
 use happyview::record_store::{PreparedRecord, RecordStore};
@@ -107,7 +106,7 @@ fn query_lexicon(id: &str) -> Value {
     })
 }
 
-async fn put_lexicon(state: &AppState, lexicon: Value, target: Option<&str>) {
+async fn put_lexicon(state: &AppState, lexicon: Value) {
     state
         .lexicons
         .put_manual(
@@ -116,8 +115,6 @@ async fn put_lexicon(state: &AppState, lexicon: Value, target: Option<&str>) {
             happyview::catalog::LexiconWrite {
                 lexicon_json: lexicon,
                 backfill: false,
-                target_collection: target.map(str::to_string),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,
@@ -146,12 +143,9 @@ async fn instance(storage: Option<Arc<FakeStorage>>) -> AppState {
             updated_at: happyview::db::now_rfc3339(),
         })
         .await;
-    for (record, query, collection) in [
-        (CLAIMED, CLAIMED_QUERY, CLAIMED),
-        (LOCAL, LOCAL_QUERY, LOCAL),
-    ] {
-        put_lexicon(&state, record_lexicon(record), Some(collection)).await;
-        put_lexicon(&state, query_lexicon(query), Some(collection)).await;
+    for (record, query) in [(CLAIMED, CLAIMED_QUERY), (LOCAL, LOCAL_QUERY)] {
+        put_lexicon(&state, record_lexicon(record)).await;
+        put_lexicon(&state, query_lexicon(query)).await;
     }
     happyview::db::query(
         "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, 1, ?)",
@@ -243,42 +237,35 @@ async fn a_claimed_collection_is_read_from_the_external_storage() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["record"]["text"], "elsewhere");
 
-    let (status, body) = get(&state, &format!("/xrpc/{CLAIMED_QUERY}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
-    assert_eq!(body["records"][0]["uri"], uri(CLAIMED, "g1"));
+    let listed = state
+        .records
+        .list_recent(CLAIMED, None, 20, 0)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].uri, uri(CLAIMED, "g1"));
 
     assert_eq!(state.records.count_collection(CLAIMED).await.unwrap(), 1);
     assert_eq!(local_rows(&state).await, 0);
 }
 
 #[tokio::test]
-async fn a_procedure_write_to_a_claimed_collection_is_a_pending_delta() {
+async fn a_script_write_to_a_claimed_collection_is_a_pending_delta() {
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
-    let mut state = instance(Some(storage.clone())).await;
-    put_lexicon(
-        &state,
-        common::fixtures::create_game_procedure_lexicon(),
-        Some(CLAIMED),
-    )
-    .await;
-    // The `happyview test` harness: the caller is forged and the write goes
-    // to its in-process PDS, through the same procedure handler a session's
-    // write takes.
-    state.test = Some(Arc::new(happyview::testing::TestHarness::new("procedure")));
-    let mut request = Request::post("/xrpc/games.gamesgamesgamesgames.createGame")
-        .header("host", "127.0.0.1")
-        .header("x-client-key", happyview::testing::TEST_CLIENT_KEY)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"title": "Pending", "createdAt": "2026-01-02T03:04:05.000Z"}).to_string(),
-        ))
+    let state = instance(Some(storage.clone())).await;
+    // A script's PDS write lands in the index the way the PDS echo would.
+    let mut written = prepared(
+        CLAIMED,
+        "w1",
+        json!({"$type": CLAIMED, "title": "Pending", "createdAt": "2026-01-02T03:04:05.000Z"}),
+    );
+    written.cid = "bafy-pending".to_string();
+    state
+        .records
+        .write_local(happyview::record_store::WriteKind::Echoed, &written)
+        .await
         .unwrap();
-    request
-        .extensions_mut()
-        .insert(happyview::testing::ForgedCaller::new(DID));
-    let (status, body) = send(&state, request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = json!({"uri": uri(CLAIMED, "w1"), "cid": written.cid});
 
     let deltas = storage.deltas();
     assert_eq!(deltas.len(), 1, "{deltas:?}");
@@ -394,10 +381,64 @@ async fn a_claimed_delete_clears_the_delta_so_a_recreate_is_served_fresh() {
     assert_eq!(local_rows(&state).await, 0);
 }
 
+/// A delete hook that returns nil asks to keep a record its storage has
+/// deleted, which can't be done. That warns in the event log: once per
+/// collection per hour with a count, or every time under verbose logging.
+#[tokio::test]
+async fn an_ignored_keep_on_delete_warns() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    install_script(&state, &format!("record.delete:{CLAIMED}"), "value:none").await;
+    let warned = |state: AppState| async move {
+        let rows: Vec<(String, String)> = happyview::db::query_as(
+            "SELECT severity, detail FROM happyview_event_logs \
+              WHERE event_type = 'record.skip_ignored' ORDER BY created_at, id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(severity, detail)| {
+                let detail: Value = serde_json::from_str(&detail).unwrap();
+                (severity, detail["rkey"].clone(), detail["ignored"].clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let delete = |rkey: &str| record_event(CLAIMED, rkey, Action::Delete, None, Some(tid(2)), true);
+
+    for rkey in ["d1", "d2", "d3"] {
+        let outcome = happyview::ingest::apply(&state, delete(rkey)).await;
+        assert_eq!(outcome, IngestOutcome::Matched, "the delete still applies");
+    }
+    assert_eq!(
+        warned(state.clone()).await,
+        [("warn".to_string(), json!("d1"), json!(1))],
+        "one report for the collection, not one per delete"
+    );
+
+    state.verbose_event_logging.store(true, Ordering::Relaxed);
+    for rkey in ["d4", "d5"] {
+        let outcome = happyview::ingest::apply(&state, delete(rkey)).await;
+        assert_eq!(outcome, IngestOutcome::Matched);
+    }
+    let rows = warned(state.clone()).await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[1], ("warn".to_string(), json!("d4"), json!(1)));
+    assert_eq!(rows[2], ("warn".to_string(), json!("d5"), json!(1)));
+}
+
 #[tokio::test]
 async fn a_stored_event_writes_only_the_hook_delta() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -604,17 +645,20 @@ async fn external_storage_down_is_503_and_local_reads_work() {
         .unwrap();
     storage.down.store(true, Ordering::SeqCst);
 
-    for path in [
-        format!("/xrpc/{CLAIMED_QUERY}?uri={}", uri(CLAIMED, "g1")),
-        format!("/xrpc/{CLAIMED_QUERY}"),
-    ] {
-        let (status, body) = get(&state, &path).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
-        assert_eq!(
-            body,
-            json!({"error": "ServiceUnavailable", "message": "the record store is unavailable"})
-        );
-    }
+    let path = format!("/xrpc/{CLAIMED_QUERY}?uri={}", uri(CLAIMED, "g1"));
+    let (status, body) = get(&state, &path).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+    assert_eq!(
+        body,
+        json!({"error": "ServiceUnavailable", "message": "the record store is unavailable"})
+    );
+    assert!(
+        state
+            .records
+            .list_recent(CLAIMED, None, 20, 0)
+            .await
+            .is_err()
+    );
 
     let (status, body) = get(
         &state,
@@ -623,9 +667,8 @@ async fn external_storage_down_is_503_and_local_reads_work() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["record"]["text"], "here");
-    let (status, body) = get(&state, &format!("/xrpc/{LOCAL_QUERY}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+    let listed = state.records.list_recent(LOCAL, None, 20, 0).await.unwrap();
+    assert_eq!(listed.len(), 1);
 }
 
 /// The real Lua interpreter plugin, registered on `state` with the
@@ -933,7 +976,13 @@ fn sql_library() -> LoadedPlugin {
         wasm_bytes: std::fs::read(
             "tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm",
         )
-        .expect("test_library fixture not built"),
+        .expect(
+            "test_library fixture not built. Run: bash scripts/build-plugin-fixtures.sh \
+             (or cargo build --manifest-path tests/fixtures/test_library/Cargo.toml \
+             --target wasm32-unknown-unknown --release). This target panics rather than \
+             skipping, so a missing fixture fails several tests at once and reads like a \
+             regression.",
+        ),
         manifest: Some(manifest),
     }
 }
@@ -970,7 +1019,7 @@ async fn raw_sql_writes_to_a_claimed_collection_are_refused() {
     assert!(err.contains(CLAIMED), "{err}");
     assert!(
         err.contains(
-            "writes to records of a collection stored outside this instance must go through records.indexPut"
+            "writes to records of a collection stored outside this instance must go through save_local in happyview.record"
         ),
         "{err}"
     );
@@ -1328,13 +1377,12 @@ async fn local_cycle(state: &AppState) -> Vec<Value> {
     )
     .await;
     out.push(json!(format!("{outcome:?}")));
-    for path in [
-        format!("/xrpc/{LOCAL_QUERY}?uri={}", uri(LOCAL, "c1")),
-        format!("/xrpc/{LOCAL_QUERY}"),
-    ] {
-        let (status, body) = get(state, &path).await;
-        out.push(json!([status.as_u16(), body]));
-    }
+    let (status, body) = get(
+        state,
+        &format!("/xrpc/{LOCAL_QUERY}?uri={}", uri(LOCAL, "c1")),
+    )
+    .await;
+    out.push(json!([status.as_u16(), body]));
     out.push(json!(state.records.count_collection(LOCAL).await.unwrap()));
     out.push(json!(state.records.count_all().await.unwrap()));
     out.push(json!(state.records.count_by_collection().await.unwrap()));
@@ -1355,7 +1403,6 @@ async fn no_external_storage_means_no_behaviour_change() {
     let expected = vec![
         json!("Matched"),
         json!([200, {"record": {"$type": LOCAL, "text": "hello", "uri": uri(LOCAL, "c1")}}]),
-        json!([200, {"records": [{"$type": LOCAL, "text": "hello", "uri": uri(LOCAL, "c1")}]}]),
         json!(1),
         json!(1),
         json!([[LOCAL, 1]]),
@@ -1449,7 +1496,7 @@ async fn open_dead_letters(state: &AppState) -> i64 {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1473,7 +1520,7 @@ async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from
 #[tokio::test]
 async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1495,7 +1542,7 @@ async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
 #[tokio::test]
 async fn a_claimed_retry_whose_hook_now_replaces_names_the_replaced_body() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
@@ -1585,4 +1632,27 @@ async fn a_batch_reports_a_claimed_delta_that_applied_as_a_change() {
         ]
     );
     assert_eq!(local_rows(&state).await, 0);
+}
+
+/// HAP-270: a collection external storage claims isn't this instance's to
+/// reconcile; a stale record there is the store's.
+#[tokio::test]
+async fn a_claimed_collection_is_not_reconciled_here() {
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let options = happyview::jobs::native::reconcile_collection::Options {
+        collection: CLAIMED.into(),
+        dry_run: false,
+        dids: None,
+        pds_requests_per_second: None,
+        allow_suspicious: vec![],
+    };
+    let refused = happyview::jobs::native::reconcile_collection::reconcile(&state, &options, None)
+        .await
+        .expect_err("a claimed collection is refused");
+    assert!(refused.contains("shared record store"), "{refused}");
+    assert!(
+        happyview::jobs::native::reconcile_collection::refusal(&state, LOCAL).is_none(),
+        "a local collection is reconciled here"
+    );
 }

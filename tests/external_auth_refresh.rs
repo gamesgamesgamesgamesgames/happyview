@@ -67,7 +67,7 @@ async fn stored(app: &TestApp) -> happyview::external_auth::tokens::StoredTokens
     get_tokens(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
         &app.admin_did,
         "sdk_auth",
     )

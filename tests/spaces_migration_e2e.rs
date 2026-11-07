@@ -38,6 +38,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::app::TestApp;
+use common::workers::Workers;
 
 const PDS: &str = "http://localhost:2588";
 const PLC: &str = "http://localhost:2585";
@@ -331,9 +332,9 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
 
     // --- The migration job moves the repo ---------------------------------
 
-    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let workers = Workers::one(&app.state);
     let (status, result) = wait_for_migration(&app).await;
-    worker.abort();
+    workers.stop().await;
     assert_eq!(status, "completed", "migration job failed: {result}");
     assert_eq!(
         result["status"], "migrated",

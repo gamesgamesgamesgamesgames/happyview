@@ -449,6 +449,51 @@ async fn a_spinning_script_is_interrupted_by_the_host_deadline() {
     );
 }
 
+/// The instruction budget is the bound a script hits first, and it has to hold
+/// on its own: the deadline the host arms ends a run only after the wall
+/// clock, which is seconds, not the budget's milliseconds. `pcall` and
+/// coroutines are how a script would try to swallow the limit, so each is
+/// driven into it. A run that ends well inside the wall clock was ended by the
+/// budget.
+#[tokio::test]
+async fn the_instruction_budget_ends_a_run_that_pcall_and_coroutines_cannot_save() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+
+    for source in [
+        "function handle() while true do end end",
+        "function handle() while true do pcall(function() while true do end end) end end",
+        "function handle() \
+           while true do \
+             coroutine.resume(coroutine.create(function() while true do end end)) \
+           end \
+         end",
+    ] {
+        let mut sent = input(source, ScriptKind::XrpcQuery);
+        sent.limits.instructions = Some(10_000);
+
+        let started = std::time::Instant::now();
+        let outcome = app.state.plugin_executor().execute_script(&id, &sent).await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Ok(output) => {
+                let (kind, message, _) = failure(output);
+                assert_eq!(kind, ScriptErrorKind::Timeout, "{source}: {message}");
+            }
+            Err(happyview::plugin::ExecutionError::Timeout) => {}
+            Err(other) => panic!("{source}: expected the budget to end the run, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{source}: ended after {elapsed:?}, so the wall clock ended it, not the budget"
+        );
+    }
+}
+
 /// The record-event runner's three-way branch reads `value_kind`, so the
 /// interpreter's half of it is what makes the host's half mean anything:
 /// `handle` returning nothing and returning `nil` are the same answer, and an
@@ -553,7 +598,7 @@ async fn os_time_on_a_table_is_read_as_utc_whatever_zone_the_host_is_in() {
 async fn a_library_call_from_inside_a_coroutine_answers_its_value() {
     common::require_db!();
     if !library_fixture_built() {
-        eprintln!("skipping: {LIBRARY_BUILD}");
+        happyview::test_support::unavailable(LIBRARY_BUILD);
         return;
     }
     let app = TestApp::new().await;
@@ -768,4 +813,81 @@ async fn a_module_runs_from_its_artifact_rather_than_its_source() {
             }
         );
     }
+}
+
+/// A Lua run counts its instructions, and the count reaches the metrics an
+/// operator reads. The loop is about two instructions an iteration, so its
+/// mean sits far from both zero and the budget; the interpreter counts in
+/// steps of a thousand, so the bounds are loose rather than exact.
+#[tokio::test]
+async fn a_run_reports_the_instructions_it_used_to_the_metrics() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    if registered(&app).await.is_none() {
+        return;
+    }
+    let query = "games.gamesgamesgamesgames.listGames";
+    let trigger = format!("xrpc.query:{query}");
+
+    let cookie = app.admin_cookie();
+    let upload = Request::post("/admin/lexicons")
+        .header(cookie.0, cookie.1)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "lexicon_json": common::fixtures::list_games_query_lexicon(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(upload).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let now = happyview::db::now_rfc3339();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&trigger)
+    .bind(
+        "function handle() local s = 0 for i = 1, 50000 do s = s + i end \
+         return { games = {}, sum = s } end",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&app.state.db)
+    .await
+    .expect("seed a script row");
+
+    let call = Request::get(format!("/xrpc/{query}"))
+        .header("x-client-key", "hvc_test")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(call).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cookie = app.admin_cookie();
+    let listing = Request::get("/admin/metrics/scripts")
+        .header(cookie.0, cookie.1)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(listing).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let listing: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let script = listing["scripts"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["trigger"] == trigger.as_str()))
+        .unwrap_or_else(|| panic!("no metrics row for {trigger}: {listing:#}"));
+    let used = script["instructions_mean"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the plugin reported no instructions: {script:#}"));
+    println!("instructions_mean: {used}");
+    assert!((50_000.0..1_000_000.0).contains(&used), "{script:#}");
 }

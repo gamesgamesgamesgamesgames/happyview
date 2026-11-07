@@ -65,7 +65,6 @@ test.describe("Linked Repos — real OAuth authorization", () => {
       data: {
         lexicon_json: TEST_LEXICON,
         backfill: false,
-        target_collection: TEST_NSID,
       },
     });
     if (!lex.ok() && !(await lex.text()).includes("already exists")) {

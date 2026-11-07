@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::config::project::{LexiconOverride, PROJECT_FILE};
-use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use crate::lexicon::ParsedLexicon;
 
 use super::diagnostic::Diagnostic;
 use super::snapshot::ProjectLexicon;
@@ -19,16 +19,61 @@ pub fn expected_id(file: &SrcFile) -> String {
     parts.join(".")
 }
 
+/// The three things a lexicon had to get right before the spec checks
+/// landed: its version and its id. A project that booted before them must
+/// keep booting, so everything *else* the validator finds can be a warning
+/// at boot (see [`Leniency`]) — but not these, because the build cannot key
+/// a lexicon it has no id for, and refusing an unsupported version is not
+/// new behaviour.
+const ALWAYS_FATAL_PATHS: &[&str] = &["lexicon", "id"];
+
+/// Whether a lexicon's spec violations stop the build.
+///
+/// `Strict` everywhere a human asked for the build — `happyview check`, a
+/// project deploy, `happyview test`. `Lenient` at boot only, so that
+/// upgrading HappyView can never turn a serving instance into one that exits
+/// 1 over a file it accepted yesterday. The next check or deploy still
+/// refuses it, which is where someone is watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Leniency {
+    #[default]
+    Strict,
+    Lenient,
+}
+
 pub fn load_lexicon(
     file: &SrcFile,
     overrides: &BTreeMap<String, LexiconOverride>,
+    leniency: Leniency,
+    warnings: &mut Vec<Diagnostic>,
 ) -> Result<ProjectLexicon, Diagnostic> {
     let path = file.rel_path();
     let text = file.read_text()?;
     let raw: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         Diagnostic::error(&path, format!("invalid JSON: {e}")).at_line(u32::try_from(e.line()).ok())
     })?;
-    let id = crate::lexicon::check_document(&raw).map_err(|e| Diagnostic::error(&path, e))?;
+
+    let issues = crate::lexicon::validate::validate(&raw);
+    let mut fatal: Vec<String> = Vec::new();
+    for issue in &issues {
+        let is_error = issue.severity == crate::lexicon::validate::Severity::Error;
+        let always = ALWAYS_FATAL_PATHS.contains(&issue.path.as_str());
+        if is_error && (always || leniency == Leniency::Strict) {
+            fatal.push(issue.render());
+        } else {
+            warnings.push(Diagnostic::warning(&path, issue.render()));
+        }
+    }
+    if !fatal.is_empty() {
+        return Err(Diagnostic::error(&path, fatal.join("; ")));
+    }
+    // Valid enough to key on: an id that is a string and an NSID is fatal
+    // above whatever the leniency.
+    let id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     // The id is what clients call and what the catalog keys on, so it wins;
     // the path is only a convention, but it is the one a reader trusts.
@@ -44,18 +89,8 @@ pub fn load_lexicon(
     }
 
     let overrides = overrides.get(&id);
-    let action = overrides
-        .and_then(|o| o.action)
-        .map(ProcedureAction::from)
-        .unwrap_or(ProcedureAction::Upsert);
-    let parsed = ParsedLexicon::parse(
-        raw,
-        1,
-        overrides.and_then(|o| o.target_collection.clone()),
-        action,
-        overrides.and_then(|o| o.token_cost),
-    )
-    .map_err(|e| Diagnostic::error(&path, format!("failed to parse lexicon: {e}")))?;
+    let parsed = ParsedLexicon::parse(raw, 1, overrides.and_then(|o| o.token_cost))
+        .map_err(|e| Diagnostic::error(&path, format!("failed to parse lexicon: {e}")))?;
     Ok(project_lexicon(
         parsed,
         path,
@@ -138,9 +173,18 @@ pub fn duplicate_ids(files: &[&SrcFile]) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    /// The old two-argument shape, strict, with the warnings discarded.
+    fn load_lexicon(
+        file: &SrcFile,
+        overrides: &BTreeMap<String, LexiconOverride>,
+    ) -> Result<ProjectLexicon, Diagnostic> {
+        let mut warnings = Vec::new();
+        super::load_lexicon(file, overrides, Leniency::Strict, &mut warnings)
+    }
+
     use super::*;
-    use crate::config::project::{LexiconOverride, OverrideAction};
-    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::config::project::LexiconOverride;
+    use crate::lexicon::LexiconType;
     use serde_json::json;
 
     fn write(dir: &tempfile::TempDir, rel: &str, contents: &str) -> SrcFile {
@@ -168,7 +212,6 @@ mod tests {
         let overrides = BTreeMap::from([(
             "com.example.getThing".to_string(),
             LexiconOverride {
-                target_collection: Some("com.example.thing".into()),
                 token_cost: Some(5),
                 backfill: Some(true),
                 ..Default::default()
@@ -177,10 +220,6 @@ mod tests {
         let lexicon = load_lexicon(&file, &overrides).unwrap();
         assert_eq!(lexicon.parsed.id, "com.example.getThing");
         assert_eq!(lexicon.parsed.lexicon_type, LexiconType::Query);
-        assert_eq!(
-            lexicon.parsed.target_collection.as_deref(),
-            Some("com.example.thing")
-        );
         assert_eq!(lexicon.parsed.token_cost, Some(5));
         assert!(lexicon.backfill);
         assert_eq!(
@@ -190,7 +229,7 @@ mod tests {
 
         let plain = load_lexicon(&file, &BTreeMap::new()).unwrap();
         assert!(!plain.backfill);
-        assert!(plain.parsed.target_collection.is_none());
+        assert_eq!(plain.parsed.token_cost, None);
     }
 
     #[test]
@@ -309,31 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn an_action_override_reaches_the_parsed_lexicon() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = write(
-            &dir,
-            "lexicons/com/example/putThing.json",
-            &json!({"lexicon": 1, "id": "com.example.putThing", "defs": {"main": {"type": "procedure"}}}).to_string(),
-        );
-        let overrides = BTreeMap::from([(
-            "com.example.putThing".to_string(),
-            LexiconOverride {
-                action: Some(OverrideAction::Create),
-                ..Default::default()
-            },
-        )]);
-        assert_eq!(
-            load_lexicon(&file, &overrides).unwrap().parsed.action,
-            ProcedureAction::Create
-        );
-        assert_eq!(
-            load_lexicon(&file, &BTreeMap::new()).unwrap().parsed.action,
-            ProcedureAction::Upsert
-        );
-    }
-
-    #[test]
     fn an_override_naming_no_lexicon_file_is_an_error() {
         let overrides = BTreeMap::from([
             (
@@ -379,5 +393,79 @@ mod tests {
             found[0]
         );
         assert!(duplicate_ids(&[&a]).is_empty());
+    }
+
+    /// A spec violation refuses a deliberate build and only warns at boot,
+    /// so upgrading cannot stop an instance that served yesterday.
+    #[test]
+    fn leniency_decides_whether_a_spec_violation_stops_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write(
+            &dir,
+            "lexicons/com/example/thing.json",
+            &serde_json::json!({
+                "lexicon": 1,
+                "id": "com.example.thing",
+                "defs": { "main": {
+                    "type": "object",
+                    "properties": { "a": { "type": "ref", "ref": "#missing" } }
+                } }
+            })
+            .to_string(),
+        );
+
+        let mut strict_warnings = Vec::new();
+        let refused = super::load_lexicon(
+            &file,
+            &BTreeMap::new(),
+            Leniency::Strict,
+            &mut strict_warnings,
+        )
+        .unwrap_err();
+        assert!(
+            refused.message.contains("names no def in this lexicon"),
+            "{refused}"
+        );
+
+        let mut warnings = Vec::new();
+        let loaded = super::load_lexicon(&file, &BTreeMap::new(), Leniency::Lenient, &mut warnings)
+            .expect("boot must load it");
+        assert_eq!(loaded.parsed.id, "com.example.thing");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!warnings[0].is_error(), "{:?}", warnings[0]);
+        assert!(
+            warnings[0].message.contains("names no def in this lexicon"),
+            "{:?}",
+            warnings[0]
+        );
+    }
+
+    /// Leniency does not extend to the id: the build keys every lexicon on
+    /// it, and refusing an unsupported version is not new behaviour either.
+    #[test]
+    fn an_unusable_id_or_version_is_fatal_however_lenient_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            (
+                "bad-id",
+                serde_json::json!({ "lexicon": 1, "id": "not an nsid", "defs": { "main": { "type": "object" } } }),
+            ),
+            (
+                "bad-version",
+                serde_json::json!({ "lexicon": 2, "id": "com.example.thing", "defs": { "main": { "type": "object" } } }),
+            ),
+        ] {
+            let file = write(
+                &dir,
+                &format!("lexicons/com/example/{name}.json"),
+                &body.to_string(),
+            );
+            let mut warnings = Vec::new();
+            assert!(
+                super::load_lexicon(&file, &BTreeMap::new(), Leniency::Lenient, &mut warnings)
+                    .is_err(),
+                "{name} must be fatal even when lenient"
+            );
+        }
     }
 }

@@ -44,20 +44,32 @@ pub async fn note_restart(pool: &AnyPool, backend: DatabaseBackend) -> i64 {
     next
 }
 
-/// When this instance first booted the version it is running now.
+/// Record the version this instance is running, if it has changed. Called at
+/// boot, beside [`note_restart`].
+///
+/// Separate from [`time_on_version`] because assembling a telemetry snapshot
+/// must not write: `GET /admin/settings/telemetry/preview` assembles one, and
+/// a preview that advanced this marker both wrote from a `GET` the CSRF guard
+/// exempts and consumed the signal it was previewing — the next real report
+/// would then date this version from whenever someone happened to look.
+pub async fn note_version(pool: &AnyPool, backend: DatabaseBackend, version: &str) {
+    if read(pool, backend, KEY_VERSION).await.as_deref() == Some(version) {
+        return;
+    }
+    write(pool, backend, KEY_VERSION, version).await;
+    write(pool, backend, KEY_VERSION_SINCE, &now_rfc3339()).await;
+}
+
+/// When this instance first booted the version it is running now, or `None`
+/// while no boot has recorded this version yet. Reads only.
 pub async fn time_on_version(
     pool: &AnyPool,
     backend: DatabaseBackend,
     version: &str,
 ) -> Option<String> {
-    let seen = read(pool, backend, KEY_VERSION).await;
-
-    if seen.as_deref() != Some(version) {
-        write(pool, backend, KEY_VERSION, version).await;
-        write(pool, backend, KEY_VERSION_SINCE, &now_rfc3339()).await;
+    if read(pool, backend, KEY_VERSION).await.as_deref() != Some(version) {
         return None;
     }
-
     read(pool, backend, KEY_VERSION_SINCE).await
 }
 
@@ -213,14 +225,23 @@ mod tests {
         assert!(keys.contains(&"app_name".to_string()));
     }
 
+    async fn settings_count(pool: &AnyPool) -> i64 {
+        let (n,): (i64,) = crate::db::query_as("SELECT count(*) FROM happyview_instance_settings")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        n
+    }
+
     #[tokio::test]
-    async fn time_on_version_is_none_on_first_boot_of_a_version() {
+    async fn time_on_version_is_none_until_a_boot_records_the_version() {
         let pool = pool_for_health().await;
         assert!(
             time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0")
                 .await
                 .is_none()
         );
+        note_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
         assert!(
             time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0")
                 .await
@@ -228,19 +249,57 @@ mod tests {
         );
     }
 
+    /// Asking how long this version has been running records nothing.
+    ///
+    /// `GET /admin/settings/telemetry/preview` assembles a snapshot, and this
+    /// is what it reaches. A write here is a write from a `GET` the CSRF guard
+    /// exempts, and it also consumes the signal the preview is showing.
+    #[tokio::test]
+    async fn reading_the_version_stamp_writes_nothing() {
+        let pool = pool_for_health().await;
+        let before = settings_count(&pool).await;
+        for _ in 0..3 {
+            let _ = time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
+        }
+        assert_eq!(settings_count(&pool).await, before);
+    }
+
     #[tokio::test]
     async fn upgrading_resets_the_version_stamp() {
         let pool = pool_for_health().await;
-        time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
+        note_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
         assert!(
             time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0")
                 .await
                 .is_some()
         );
+        // The new version has no stamp until its own boot records one.
         assert!(
             time_on_version(&pool, DatabaseBackend::Sqlite, "0.2.0")
                 .await
                 .is_none()
+        );
+        note_version(&pool, DatabaseBackend::Sqlite, "0.2.0").await;
+        assert!(
+            time_on_version(&pool, DatabaseBackend::Sqlite, "0.2.0")
+                .await
+                .is_some()
+        );
+    }
+
+    /// A second boot of the same version keeps the first one's stamp, or
+    /// "time on this version" would reset at every restart.
+    #[tokio::test]
+    async fn noting_the_same_version_twice_keeps_the_first_stamp() {
+        let pool = pool_for_health().await;
+        note_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
+        let first = time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0")
+            .await
+            .expect("the first boot should stamp it");
+        note_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await;
+        assert_eq!(
+            time_on_version(&pool, DatabaseBackend::Sqlite, "0.1.0").await,
+            Some(first)
         );
     }
 

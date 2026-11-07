@@ -26,6 +26,6 @@ pub mod source;
 
 pub use archive::pacer::{BytePacer, Quota};
 pub use archive::{ArchiveConfig, SourceChoice};
-pub use compose::{BackfillExecutor, JobHandle, JobTotals};
+pub use compose::{BackfillExecutor, CollectionSummary, JobHandle, JobTotals, SummaryState};
 pub use consumer::config::{Endpoint, ProtocolChoice, Settings};
 pub use source::{JetstreamSource, JetstreamSourceBuilder};

@@ -8,7 +8,10 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::plugin::attestation::AttestationSigner;
 use crate::profile;
 
-use super::{MAX_HTTP_RESPONSE_SIZE, no_redirect_client};
+use super::{
+    BoundedError, MAX_HTTP_REQUEST_DURATION, MAX_HTTP_RESPONSE_SIZE, no_redirect_client,
+    send_bounded,
+};
 
 use happyview_plugin_sdk::wire::{AtprotoBlobDownload, AttestVerify, BlobData, Label};
 
@@ -56,9 +59,10 @@ pub async fn resolve_service(
 /// nothing stops one from advertising `http://169.254.169.254/...` or a
 /// private-network address, and unlike `host_http_request` there is no
 /// `allowed_hosts` list checking it, since the plugin never chose this URL
-/// itself. This checks the URL's literal host, not a DNS lookup: an IP
-/// literal is checked against the loopback/link-local/private ranges
-/// directly, and a hostname is refused only if it is literally `localhost`.
+/// itself. This judges the URL as written, refusing plain http, `localhost`
+/// and private IP literals before anything is sent; what a hostname resolves
+/// to, and the address actually connected to, is judged by the client itself
+/// (`crate::outbound`).
 fn refuse_unsafe_endpoint(endpoint: &str) -> Result<(), AtprotoError> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| AtprotoError::Resolve(format!("invalid service endpoint {endpoint}: {e}")))?;
@@ -178,50 +182,40 @@ async fn blob_download_capped(
     // `refuse_unsafe_endpoint` never saw.
     let client = no_redirect_client()
         .map_err(|e| AtprotoError::Other(format!("failed to build client: {e}")))?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AtprotoError::Other(format!("request failed: {e}")))?;
+    // Bounded as `host_http_request` is: an oversized blob is refused on its
+    // advertised size before any of it is read, or once the bytes read pass
+    // the cap, never after buffering all of it.
+    let (status, headers, bytes) =
+        match send_bounded(client.get(&url), cap, MAX_HTTP_REQUEST_DURATION).await {
+            Ok(response) => response,
+            Err(BoundedError::Over(size)) => return Err(too_large(size, cap)),
+            Err(BoundedError::TimedOut(after)) => {
+                return Err(AtprotoError::Other(format!(
+                    "request timed out after {}s",
+                    after.as_secs()
+                )));
+            }
+            Err(BoundedError::Failed(e)) => {
+                return Err(AtprotoError::Other(format!("request failed: {e}")));
+            }
+        };
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
         return Err(AtprotoError::Blob {
-            status: status.as_u16(),
-            body,
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
         });
     }
 
-    // Refuse on the advertised size before buffering the body, so an
-    // oversized blob is rejected without paying for the transfer.
-    if let Some(len) = response.content_length()
-        && len > cap
-    {
-        return Err(too_large(len, cap));
-    }
-
-    let mime_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AtprotoError::Other(format!("failed to read body: {e}")))?;
-
-    // A dishonest or absent `content-length` doesn't get a pass: check the
-    // body actually read too.
-    if bytes.len() as u64 > cap {
-        return Err(too_large(bytes.len() as u64, cap));
-    }
+    let mime_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
     Ok(BlobData {
         size: bytes.len() as u64,
-        bytes: bytes.to_vec(),
+        bytes,
         mime_type,
     })
 }

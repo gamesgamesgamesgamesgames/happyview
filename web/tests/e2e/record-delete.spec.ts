@@ -1,8 +1,7 @@
 import { test, expect } from "@playwright/test";
-import { loginAsTestAdmin } from "./auth-helper";
+import { loginAsTestAdmin, DB_URL } from "./auth-helper";
 import pg from "pg";
 
-const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 const COLLECTION = "test.e2e.recorddelete.item";
 
 const TEST_LEXICON = {

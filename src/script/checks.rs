@@ -10,8 +10,14 @@ use crate::plugin::{
 };
 use crate::project::modules::is_relative;
 
-/// The longest description a script may carry, from either source.
+/// The longest description a script may carry, from either source, in
+/// characters. The database's own constraint counts characters too.
 pub const MAX_DESCRIPTION_LEN: usize = 300;
+
+/// Whether `description` is over [`MAX_DESCRIPTION_LEN`] characters.
+pub fn description_too_long(description: &str) -> bool {
+    description.chars().count() > MAX_DESCRIPTION_LEN
+}
 
 /// The removed v2 globals a Lua body still reaches, in `needs_migration`'s
 /// order. Empty when it reaches none, when the body is not Lua, and when the

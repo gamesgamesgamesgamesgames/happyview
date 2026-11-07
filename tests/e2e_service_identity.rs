@@ -53,11 +53,34 @@ async fn seed_query_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
         .unwrap();
+
+    // A query answers a list only through its script. The echo fixture
+    // answers any run, and the access check in front of it is the subject.
+    install_lua_interpreter(app).await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/scripts",
+            app.admin_cookie(),
+            &json!({
+                "id": "xrpc.query:games.gamesgamesgamesgames.listGames",
+                "script_type": "lua",
+                "body": "function handle() return {} end",
+                "description": "test query"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "seeding the query script failed with status {}",
+        resp.status(),
+    );
 }
 
 async fn seed_procedure_lexicon(app: &TestApp) {
@@ -81,7 +104,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
@@ -1077,7 +1099,6 @@ async fn static_analysis_persistence() {
             app.admin_cookie(),
             &json!({
                 "lexicon_json": fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
             }),
         ))
         .await
@@ -2343,11 +2364,12 @@ async fn seed_super_user(app: &TestApp, did: &str) {
         .expect("seed super user");
 }
 
-/// A service-auth JWT addressed to THIS instance and bound to the admin method
-/// authenticates on an admin route.
+/// A service-auth JWT addressed to THIS instance, bound to the admin method and
+/// signed by a super user, is still refused on an admin route: the admin API
+/// accepts no service-auth JWT, whatever it names.
 #[tokio::test]
 #[serial]
-async fn service_auth_correct_aud_accepted_on_admin_route() {
+async fn service_auth_correct_aud_refused_on_admin_route() {
     common::require_db!();
     let mut app = TestApp::new().await;
     let plc_store = plc::setup_mock_plc(&app.mock_server).await;
@@ -2383,7 +2405,7 @@ async fn service_auth_correct_aud_accepted_on_admin_route() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// A service-auth JWT the user minted for a DIFFERENT audience must NOT
@@ -2396,8 +2418,9 @@ async fn service_auth_wrong_aud_rejected_on_admin_route() {
     let plc_store = plc::setup_mock_plc(&app.mock_server).await;
     let _instance_did = app.setup_did_plc().await;
 
-    // The issuer is even a super user — so if the token authenticated, it would
-    // return 200. The point is that the wrong audience blocks it entirely.
+    // The issuer is even a super user. An authenticated service-auth token is
+    // refused on admin routes with 403; the wrong audience stops it earlier,
+    // at authentication.
     let issuer = "did:plc:h6-bad-issuer";
     seed_super_user(&app, issuer).await;
 

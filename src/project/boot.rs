@@ -61,7 +61,19 @@ pub async fn build_and_install(
     root: &Path,
 ) -> Result<Installed, Vec<Diagnostic>> {
     let turn = INSTALL.lock().await;
-    let report = build_snapshot(state, root, BuildOptions::default()).await?;
+    // Lenient: upgrading HappyView must never turn an instance that served
+    // yesterday into one that exits 1 over a lexicon file it already
+    // accepted. The spec violations are printed as warnings here and refused
+    // by the next `happyview check` or deploy.
+    let report = build_snapshot(
+        state,
+        root,
+        BuildOptions {
+            lexicons: crate::project::lexicons::Leniency::Lenient,
+            ..BuildOptions::default()
+        },
+    )
+    .await?;
     let mut warnings = report.warnings;
     tracing::info!(
         root = %root.display(),

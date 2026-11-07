@@ -54,10 +54,19 @@ struct TokenBucket {
     last_access: Instant,
 }
 
+/// One of a client's live secrets, by its SHA-256.
+#[derive(Debug, Clone)]
+pub struct SecretHash {
+    pub id: String,
+    pub hash: String,
+}
+
 /// Metadata about a registered API client, used for request validation.
 pub struct ClientIdentity {
-    /// SHA-256 hash of the client secret
-    pub secret_hash: String,
+    /// The client's secrets that have not been revoked. Revoking one removes
+    /// it here at once (`revoke_client_secret`), so this copy never accepts a
+    /// secret the database no longer does.
+    pub secrets: Vec<SecretHash>,
     /// The client's registered URI (for Origin header validation)
     pub client_uri: String,
 }
@@ -71,6 +80,9 @@ pub struct RateLimiter {
     client_configs: DashMap<String, RateLimitConfig>,
     /// Registered client identities, keyed by client_key
     client_identities: DashMap<String, ClientIdentity>,
+    /// When each secret's use was last handed to the database, so a client
+    /// sending its secret on every request costs one write a minute.
+    secret_uses: DashMap<String, Instant>,
 }
 
 fn now_unix() -> u64 {
@@ -87,6 +99,7 @@ impl RateLimiter {
             buckets: DashMap::new(),
             client_configs: DashMap::new(),
             client_identities: DashMap::new(),
+            secret_uses: DashMap::new(),
         })
     }
 
@@ -170,6 +183,33 @@ impl RateLimiter {
         self.client_configs.insert(client_key, config);
     }
 
+    /// Give `client_key` its bucket: the client's own capacity and refill rate
+    /// when it sets both, and the instance's (`instance_capacity`,
+    /// `instance_refill_rate`) otherwise.
+    pub fn register_client_limit(
+        &self,
+        client_key: String,
+        capacity: Option<i32>,
+        refill_rate: Option<f64>,
+        instance_capacity: u32,
+        instance_refill_rate: f64,
+    ) {
+        let (capacity, refill_rate) = match (capacity, refill_rate) {
+            (Some(capacity), Some(refill_rate)) => (capacity as u32, refill_rate),
+            _ => (instance_capacity, instance_refill_rate),
+        };
+        self.register_client_config(
+            client_key,
+            RateLimitConfig {
+                capacity,
+                refill_rate,
+                default_query_cost: self.defaults.query_cost,
+                default_procedure_cost: self.defaults.procedure_cost,
+                default_proxy_cost: self.defaults.proxy_cost,
+            },
+        );
+    }
+
     pub fn get_client_config(&self, client_key: &str) -> Option<RateLimitConfig> {
         self.client_configs
             .get(client_key)
@@ -194,13 +234,43 @@ impl RateLimiter {
         self.client_identities.remove(client_key);
     }
 
-    pub fn validate_client_secret(&self, client_key: &str, secret: &str) -> bool {
-        use sha2::{Digest, Sha256};
-        if let Some(identity) = self.client_identities.get(client_key) {
-            let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-            crate::constant_time::ct_eq_str(&hash, &identity.secret_hash)
-        } else {
-            false
+    /// The id of the client's live secret that `secret` is, if it is one.
+    pub fn match_client_secret(&self, client_key: &str, secret: &str) -> Option<String> {
+        let identity = self.client_identities.get(client_key)?;
+        crate::oauth::client_secrets::matching(&identity.secrets, secret)
+    }
+
+    /// Stop accepting secret `secret_id` for `client_key` from now on.
+    pub fn revoke_client_secret(&self, client_key: &str, secret_id: &str) {
+        if let Some(mut identity) = self.client_identities.get_mut(client_key) {
+            identity.secrets.retain(|s| s.id != secret_id);
+        }
+    }
+
+    /// Whether a use of `secret_id` now is worth recording: true at most once
+    /// per [`USE_RECORD_INTERVAL`](crate::oauth::client_secrets::USE_RECORD_INTERVAL).
+    pub fn note_secret_use(&self, secret_id: &str) -> bool {
+        let now = Instant::now();
+        let mut due = false;
+        self.secret_uses
+            .entry(secret_id.to_string())
+            .and_modify(|last| {
+                if now.duration_since(*last) >= crate::oauth::client_secrets::USE_RECORD_INTERVAL {
+                    *last = now;
+                    due = true;
+                }
+            })
+            .or_insert_with(|| {
+                due = true;
+                now
+            });
+        due
+    }
+
+    /// Start accepting `secret` for `client_key`.
+    pub fn add_client_secret(&self, client_key: &str, secret: SecretHash) {
+        if let Some(mut identity) = self.client_identities.get_mut(client_key) {
+            identity.secrets.push(secret);
         }
     }
 
@@ -300,6 +370,21 @@ mod tests {
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Allowed { .. }));
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Allowed { .. }));
         assert!(matches!(rl.check("hvc_b", 1), CheckResult::Limited { .. }));
+    }
+
+    #[test]
+    fn a_client_limit_uses_its_overrides_only_when_both_are_set() {
+        let rl = RateLimiter::new(defaults());
+        for (key, capacity, refill, expected) in [
+            ("hvc_both", Some(7), Some(0.5), (7, 0.5)),
+            ("hvc_neither", None, None, (100, 2.0)),
+            ("hvc_capacity", Some(7), None, (100, 2.0)),
+            ("hvc_refill", None, Some(0.5), (100, 2.0)),
+        ] {
+            rl.register_client_limit(key.into(), capacity, refill, 100, 2.0);
+            let cfg = rl.get_client_config(key).expect(key);
+            assert_eq!((cfg.capacity, cfg.refill_rate), expected, "{key}");
+        }
     }
 
     #[test]

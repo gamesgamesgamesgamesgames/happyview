@@ -38,7 +38,7 @@ async fn states() -> Vec<(happyview::AppState, &'static str)> {
             };
             out.push((ready(state).await, name));
         }
-        None => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+        None => happyview::test_support::unavailable(happyview::test_support::NO_DATABASE),
     }
     out
 }

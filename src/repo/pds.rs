@@ -20,7 +20,7 @@ pub(crate) enum PdsAuth {
     Dpop {
         api_client_id: String,
         dpop_key_id: String,
-        encryption_key: [u8; 32],
+        encryption_key: crate::plugin::encryption::Keyring,
     },
     /// The in-process PDS of a test run. Only `test_pds_auth` builds one.
     Fake(Arc<crate::testing::FakePds>),
@@ -334,10 +334,9 @@ pub(crate) async fn pds_auth_for_claims(
         )));
     };
 
-    let encryption_key = state
+    let encryption_key = &state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     let api_client_id = super::session::get_dpop_client_id(state, client_key).await?;
@@ -453,6 +452,25 @@ pub(crate) async fn pds_post_json_raw(
     }
 }
 
+/// Ask the account's PDS to email a PLC operation signature token.
+///
+/// The lexicon declares no output, so atrium's typed call reads the body as
+/// `()` and fails on the `{}` a PDS answers. The body carries nothing, so it is
+/// read as whatever it is and dropped.
+pub(crate) async fn request_plc_operation_signature(
+    client: &(impl XrpcClient + Sync),
+) -> Result<(), atrium_xrpc::Error<Value>> {
+    let request = XrpcRequest {
+        method: Method::POST,
+        nsid: "com.atproto.identity.requestPlcOperationSignature".to_string(),
+        parameters: None::<()>,
+        input: None::<InputDataOrBytes<()>>,
+        encoding: None,
+    };
+    let _: OutputDataOrBytes<Value> = client.send_xrpc(&request).await?;
+    Ok(())
+}
+
 /// POST a binary blob to the PDS with OAuth session auth.
 pub(super) async fn pds_post_blob(
     _state: &AppState,
@@ -495,6 +513,75 @@ pub(super) async fn pds_post_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockPds(String);
+
+    impl atrium_xrpc::HttpClient for MockPds {
+        async fn send_http(
+            &self,
+            request: atrium_xrpc::http::Request<Vec<u8>>,
+        ) -> Result<
+            atrium_xrpc::http::Response<Vec<u8>>,
+            Box<dyn std::error::Error + Send + Sync + 'static>,
+        > {
+            crate::http_retry::HappyViewHttpClient::new(reqwest::Client::new())
+                .send_http(request)
+                .await
+        }
+    }
+
+    impl XrpcClient for MockPds {
+        fn base_uri(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    async fn pds_answering(response: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(
+                "/xrpc/com.atproto.identity.requestPlcOperationSignature",
+            ))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_plc_signature_request_answered_with_an_empty_object_succeeds() {
+        let server = pds_answering(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+        )
+        .await;
+        request_plc_operation_signature(&MockPds(server.uri()))
+            .await
+            .expect("an empty object is the PDS saying yes");
+    }
+
+    #[tokio::test]
+    async fn a_plc_signature_request_answered_with_no_body_succeeds() {
+        let server = pds_answering(wiremock::ResponseTemplate::new(200)).await;
+        request_plc_operation_signature(&MockPds(server.uri()))
+            .await
+            .expect("an empty body is the PDS saying yes");
+    }
+
+    #[tokio::test]
+    async fn a_refused_plc_signature_request_is_an_error() {
+        let server =
+            pds_answering(wiremock::ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"error": "InvalidRequest", "message": "no email"}),
+            ))
+            .await;
+        assert!(
+            request_plc_operation_signature(&MockPds(server.uri()))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn proxy_header_splits_did_and_service_type() {

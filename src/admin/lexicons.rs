@@ -1,12 +1,14 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lexicon::{LexiconType, ProcedureAction};
+use crate::lexicon::LexiconType;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -38,11 +40,22 @@ pub(super) async fn upload_lexicon(
     // Before any other validation, so a project-owned id is always a 409.
     state.lexicons.check_writable(&id)?;
 
-    crate::lexicon::check_document(&body.lexicon_json).map_err(AppError::BadRequest)?;
-
-    // Validate action
-    let action =
-        ProcedureAction::from_optional_str(body.action.as_deref()).map_err(AppError::BadRequest)?;
+    // Per field rather than one sentence: an editor can point at each place
+    // the document is wrong, and warnings ride along with the errors so one
+    // answer says everything. Same rule set the project build uses.
+    let issues = crate::lexicon::validate::validate(&body.lexicon_json);
+    if issues
+        .iter()
+        .any(|i| i.severity == crate::lexicon::validate::Severity::Error)
+    {
+        return Err(AppError::InvalidLexicon(issues));
+    }
+    // A warning does not refuse the upload, but it still has to reach the
+    // caller: a `subscription` lexicon is valid, stores, and generates
+    // nothing, and succeeding in silence is what makes that read as support.
+    // Carried on the success response, since there is no error to attach it
+    // to.
+    let warnings = issues;
 
     let indexed = match body.indexed {
         Some(v) => v,
@@ -61,8 +74,6 @@ pub(super) async fn upload_lexicon(
             crate::catalog::LexiconWrite {
                 lexicon_json: body.lexicon_json,
                 backfill: body.backfill,
-                target_collection: body.target_collection,
-                action,
                 token_cost: body.token_cost,
                 authority_did: None,
                 indexed,
@@ -134,6 +145,7 @@ pub(super) async fn upload_lexicon(
             "id": id,
             "revision": revision,
             "backfill_job_id": backfill_job_id,
+            "issues": warnings,
         })),
     ))
 }
@@ -188,12 +200,110 @@ pub(super) async fn get_lexicon(
     Ok(Json(out))
 }
 
-/// DELETE /admin/lexicons/:id — remove a lexicon.
+/// `?delete_records=true` on a lexicon delete.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DeleteLexiconParams {
+    /// Also delete every record indexed under this collection. Opt-in: a
+    /// lexicon delete alone has never touched the records and must not start
+    /// doing so for a caller that did not ask.
+    #[serde(default)]
+    delete_records: bool,
+}
+
+/// GET /admin/lexicons/:id/record-count — how many records are indexed under
+/// a record lexicon's collection.
+///
+/// Its own route rather than a field on the lexicon, because this is a
+/// `COUNT(*)` over the collection and the lexicon list and detail pages are
+/// loaded far more often than anyone deletes a lexicon. The delete confirm
+/// asks for it once, when it opens.
+pub(super) async fn lexicon_record_count(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    auth.require(Permission::LexiconsRead).await?;
+    auth.require(Permission::RecordsRead).await?;
+    let lexicon = state
+        .lexicons
+        .get(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("lexicon '{id}' not found")))?;
+    if lexicon.lexicon_type != LexiconType::Record {
+        return Err(AppError::BadRequest(not_a_record_lexicon(&id, &lexicon)));
+    }
+    // The count only informs the confirm. One that fails leaves `count` null
+    // and the delete still offered, since deleting does not depend on it.
+    let count = match state.records.count_collection(&id).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(collection = %id, "could not count the collection for the delete confirm: {e}");
+            None
+        }
+    };
+    // So the confirm can offer the option only where it would be honoured,
+    // rather than showing a control the delete would refuse.
+    let refusal = records_not_locally_deletable(&state, &id);
+    Ok(Json(serde_json::json!({
+        "collection": id,
+        "count": count,
+        "deletable": refusal.is_none(),
+        "not_deletable_reason": refusal,
+    })))
+}
+
+/// Why this instance may not delete a collection's indexed records, or
+/// `None` when it may.
+///
+/// A collection an external `RecordStorage` claims — the shared network store
+/// on a managed instance — is not this instance's to empty. The delete would
+/// reach only the tenant's own overlay rows while the shared records those
+/// union with stay exactly where they are, so the job would report success
+/// having removed a fraction of what the operator was looking at. Refusing
+/// says the true thing. The shared rows are safe either way: a tenant holds
+/// `SELECT` on them and nothing more.
+pub(crate) fn records_not_locally_deletable(state: &AppState, collection: &str) -> Option<String> {
+    state.records.external_route(collection).is_some().then(|| {
+        format!(
+            "'{collection}' is served from a shared record store, so this instance cannot delete its records: they belong to every instance reading that store, not to this one. Delete the lexicon on its own, or ask whoever runs the store."
+        )
+    })
+}
+
+/// Why a lexicon has no records of its own to delete. A query or procedure
+/// is an endpoint, and the records its script reads or writes belong to a
+/// record lexicon nobody asked about.
+pub(super) fn not_a_record_lexicon(id: &str, lexicon: &crate::lexicon::ParsedLexicon) -> String {
+    let kind = match lexicon.lexicon_type {
+        LexiconType::Record => "record",
+        LexiconType::Query => "query",
+        LexiconType::Procedure => "procedure",
+        LexiconType::Space => "space",
+        LexiconType::Definitions => "definitions",
+    };
+    format!("'{id}' is a {kind} lexicon, so it stores no records of its own")
+}
+
+/// DELETE /admin/lexicons/:id — remove a lexicon, and with
+/// `?delete_records=true` also enqueue deletion of its indexed records.
+///
+/// Answers `204` as it always has, or `202` with the job id when records are
+/// being deleted: the delete runs as `happyview.delete-collection`, in batches
+/// with progress, pause and cancel, because a large collection takes far
+/// longer than a request may.
+///
+/// **The records are deleted whatever a record script would have done with an
+/// upstream delete.** A script that keeps a row when the record is deleted at
+/// the source (HAP-268) is describing what the network did; this is an
+/// operator deleting the collection on purpose, which is a different act and
+/// wins. The count the confirm shows therefore includes rows kept that way,
+/// and the event log records how many there were.
 pub(super) async fn delete_lexicon(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(id): Path<String>,
-) -> Result<StatusCode, AppError> {
+    Query(params): Query<DeleteLexiconParams>,
+) -> Result<Response, AppError> {
     auth.require(Permission::LexiconsDelete).await?;
     let backend = state.db_backend;
     // The same message as the network-lexicon route: the file is the source of
@@ -203,11 +313,66 @@ pub(super) async fn delete_lexicon(
             "'{id}' is declared in happyview.toml; remove it from the file instead"
         )));
     }
+
+    // Everything the records half needs has to be decided while the lexicon
+    // still exists: its type, and whether this caller may delete records at
+    // all. Removing it first and then refusing would leave the lexicon gone
+    // and the records orphaned, which is the state this route exists to stop.
+    let mut counted: Option<i64> = None;
+    if params.delete_records {
+        // The same pair `DELETE /admin/records/collection` requires. Deleting
+        // a collection through a different door must not be a weaker gate.
+        auth.require(Permission::RecordsDeleteCollection).await?;
+        auth.require(Permission::RecordsDelete).await?;
+        let lexicon = state
+            .lexicons
+            .get(&id)
+            .await
+            .ok_or_else(|| AppError::NotFound(format!("lexicon '{id}' not found")))?;
+        if lexicon.lexicon_type != LexiconType::Record {
+            return Err(AppError::BadRequest(not_a_record_lexicon(&id, &lexicon)));
+        }
+        if let Some(reason) = records_not_locally_deletable(&state, &id) {
+            return Err(AppError::BadRequest(reason));
+        }
+        // Recorded for the event log, not to gate anything: a collection that
+        // counts zero now may still have rows the job finds, and a count that
+        // cannot be read must not stop a delete the caller asked for.
+        counted = state.records.count_collection(&id).await.ok();
+    }
+
     if !state.lexicons.remove(&state.db, backend, &id).await? {
         return Err(AppError::NotFound(format!("lexicon '{id}' not found")));
     }
+    // Before the job: this stops live indexing, so the delete is not racing
+    // Jetstream putting the same collection's records back as it runs.
     notify_collections(&state).await;
 
+    let job_id = if params.delete_records {
+        Some(
+            crate::jobs::db::create_job(
+                &state,
+                "happyview.delete-collection",
+                &serde_json::json!({ "collection": id }),
+                &auth.did,
+                false,
+                None,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut detail = serde_json::json!({});
+    if let Some(job_id) = &job_id {
+        detail["delete_records_job"] = serde_json::json!(job_id);
+        detail["records_at_delete"] = match counted {
+            Some(n) => serde_json::json!(n),
+            None => Value::Null,
+        };
+    }
     log_event(
         &state.db,
         EventLog {
@@ -215,11 +380,18 @@ pub(super) async fn delete_lexicon(
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
             subject: Some(id.clone()),
-            detail: serde_json::json!({}),
+            detail,
         },
         backend,
     )
     .await;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(match job_id {
+        Some(job_id) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "job_id": job_id, "collection": id })),
+        )
+            .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }

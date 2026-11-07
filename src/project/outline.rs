@@ -99,7 +99,15 @@ pub async fn outline(registry: &PluginRegistry, root: &Path) -> Outline {
     let mut lexicon_entries = Vec::new();
     let mut project_ids = BTreeSet::new();
     for file in files.iter().filter(|f| layout::is_lexicon(f)) {
-        if let Ok(lexicon) = lexicons::load_lexicon(file, &no_overrides) {
+        // The outline describes what is there; a lexicon's spec problems are
+        // the build's to report, not this one's.
+        let mut ignored = Vec::new();
+        if let Ok(lexicon) = lexicons::load_lexicon(
+            file,
+            &no_overrides,
+            lexicons::Leniency::Lenient,
+            &mut ignored,
+        ) {
             let parsed = &lexicon.parsed;
             index.insert(
                 file.dir(),

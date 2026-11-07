@@ -16,11 +16,16 @@ use happyview::db::DatabaseBackend;
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  happyview-codemod --file PATH --kind KIND");
-    eprintln!("  happyview-codemod --stdin --kind KIND");
+    eprintln!("  happyview-codemod --file PATH --kind KIND [--collection NSID]");
+    eprintln!("  happyview-codemod --stdin --kind KIND [--collection NSID]");
     eprintln!("  happyview-codemod --database-url URL [--script ID] [--apply] [--allow-markers]");
     eprintln!();
     eprintln!("KIND is one of: procedure, query, record, label, job");
+    eprintln!();
+    eprintln!("v3 gives a query or procedure no collection, so its reads of `collection`");
+    eprintln!("and `ctx.collection` are written as the NSID its v2 lexicon named:");
+    eprintln!("--collection in file and stdin mode, the stored value in database mode.");
+    eprintln!("Without one they are marked.");
     eprintln!();
     eprintln!("Rewrites a v2 Lua script onto the v3 handle(input, ctx) contract. A construct");
     eprintln!("with no mechanical rewrite is left in place under a `-- codemod:` comment and");
@@ -40,6 +45,7 @@ struct Args {
     file: Option<PathBuf>,
     stdin: bool,
     kind: Option<String>,
+    collection: Option<String>,
     database_url: Option<String>,
     script: Option<String>,
     apply: bool,
@@ -59,6 +65,10 @@ fn parse_args() -> Result<Args, String> {
             "--kind" => {
                 let value = raw.next().ok_or("--kind requires a value")?;
                 args.kind = Some(value);
+            }
+            "--collection" => {
+                let value = raw.next().ok_or("--collection requires an NSID")?;
+                args.collection = Some(value);
             }
             "--database-url" => {
                 let value = raw.next().ok_or("--database-url requires a value")?;
@@ -92,8 +102,10 @@ async fn main() -> ExitCode {
     };
 
     if args.database_url.is_some() {
-        if args.file.is_some() || args.stdin || args.kind.is_some() {
-            eprintln!("error: --database-url cannot be combined with --file, --stdin, or --kind");
+        if args.file.is_some() || args.stdin || args.kind.is_some() || args.collection.is_some() {
+            eprintln!(
+                "error: --database-url cannot be combined with --file, --stdin, --kind, or --collection"
+            );
             return ExitCode::from(1);
         }
         return run_database_mode(&args).await;
@@ -152,7 +164,7 @@ fn run_source_mode(args: &Args) -> ExitCode {
         }
     };
 
-    match codemod::rewrite(&source, kind) {
+    match codemod::rewrite_for(&source, kind, args.collection.as_deref()) {
         Ok(result) => {
             print!("{}", result.source);
             for note in &result.notes {
@@ -240,7 +252,15 @@ async fn run_database_mode(args: &Args) -> ExitCode {
         }
 
         let kind = ScriptKind::from_trigger_id(&id);
-        match codemod::rewrite(&body, kind) {
+        let collection = match codemod::v2_collection(&pool, backend, &id).await {
+            Ok(collection) => collection,
+            Err(e) => {
+                eprintln!("{id}: could not read its v2 collection: {e}");
+                had_error = true;
+                continue;
+            }
+        };
+        match codemod::rewrite_for(&body, kind, collection.as_deref()) {
             Ok(result) => {
                 let marker_count = result.notes.len();
                 if marker_count > 0 {

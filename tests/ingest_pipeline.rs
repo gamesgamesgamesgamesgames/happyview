@@ -8,7 +8,6 @@ use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use happyview::lexicon::ProcedureAction;
 use happyview_provider::{Action, IngestOutcome, Origin, RecordEvent, RecordKey, SourceEvent};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -24,7 +23,7 @@ const DID: &str = "did:plc:ingest";
 macro_rules! require_fixture {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };
@@ -40,8 +39,6 @@ async fn app() -> TestApp {
             happyview::catalog::LexiconWrite {
                 lexicon_json: common::fixtures::game_record_lexicon(),
                 backfill: false,
-                target_collection: Some(GAME.to_string()),
-                action: ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,

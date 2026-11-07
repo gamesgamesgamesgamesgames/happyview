@@ -614,7 +614,6 @@ async fn query_lexicon_with_backfill_starts_no_job() {
     let body = json!({
         "lexicon_json": fixtures::list_games_query_lexicon(),
         "backfill": true,
-        "target_collection": "games.gamesgamesgamesgames.game"
     });
 
     let resp = app
@@ -865,8 +864,6 @@ async fn stats_with_seeded_records() {
             happyview::catalog::LexiconWrite {
                 lexicon_json: lexicon_json_val,
                 backfill: false,
-                target_collection: None,
-                action: happyview::lexicon::ProcedureAction::Upsert,
                 token_cost: None,
                 authority_did: None,
                 indexed: true,
@@ -1419,6 +1416,48 @@ async fn admin_created_did_authenticates() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// The Maintainer template was called Operator. A client still sending the old
+/// name gets the same permissions as one sending the new name.
+#[tokio::test]
+#[serial]
+async fn admin_create_accepts_the_operator_template_as_maintainer() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let mut granted = Vec::new();
+    for (did, template) in [
+        ("did:plc:maintainer", "maintainer"),
+        ("did:plc:oldoperator", "operator"),
+    ] {
+        let body = json!({ "did": did, "template": template });
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "{template}");
+        let id = json_body(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_get(&format!("/admin/users/{id}"), app.admin_cookie()))
+            .await
+            .unwrap();
+        let mut perms: Vec<String> =
+            serde_json::from_value(json_body(resp).await["permissions"].clone()).unwrap();
+        perms.sort();
+        granted.push(perms);
+    }
+
+    assert!(
+        granted[0].contains(&"dead-letters:manage".to_string()),
+        "{granted:?}"
+    );
+    assert_eq!(granted[0], granted[1]);
+}
+
 #[tokio::test]
 #[serial]
 async fn admin_list_returns_dids() {
@@ -1638,4 +1677,133 @@ async fn admin_create_duplicate_did_conflicts() {
         .await
         .unwrap();
     assert_eq!(second.status(), StatusCode::CONFLICT);
+}
+
+/// HAP-225: with a seats limit, adding an admin past it is refused with the
+/// host's words, and nothing is added; an existing admin still works.
+#[tokio::test]
+#[serial]
+async fn adding_an_admin_past_the_seats_limit_is_refused() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    // The test admin is one seat; a second fits a limit of 2, a third doesn't.
+    app.state.limits = std::sync::Arc::new(happyview_provider::FixedLimits::new(
+        happyview_provider::Limits {
+            seats: Some(happyview_provider::Cap {
+                max: 2,
+                wording: happyview_provider::Wording {
+                    message: Some("Your plan includes 2 seats.".into()),
+                    action_url: Some("https://host.example/plan".into()),
+                    action_label: Some("Change plan".into()),
+                },
+            }),
+            ..Default::default()
+        },
+    ));
+    app.rebuild_router();
+
+    let add = |did: &str| admin_post("/admin/users", app.admin_cookie(), &json!({ "did": did }));
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:second"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:third"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(resp).await,
+        json!({
+            "error": "LimitReached",
+            "limit": "seats",
+            "max": 2,
+            "current": 2,
+            "message": "Your plan includes 2 seats.",
+            "actionUrl": "https://host.example/plan",
+            "actionLabel": "Change plan",
+        })
+    );
+
+    let (count,): (i64,) = happyview::db::query_as("SELECT COUNT(*) FROM happyview_users")
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "the refused admin was not added");
+
+    // Re-adding someone already there is still a conflict, not a limit.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(add("did:plc:second"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// HAP-225: a limit lowered under the admins already there takes none away.
+#[tokio::test]
+#[serial]
+async fn a_lowered_seats_limit_keeps_every_admin() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/users",
+            app.admin_cookie(),
+            &json!({ "did": "did:plc:kept" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    app.state.limits = std::sync::Arc::new(happyview_provider::FixedLimits::new(
+        happyview_provider::Limits {
+            seats: Some(happyview_provider::Cap {
+                max: 1,
+                wording: Default::default(),
+            }),
+            ..Default::default()
+        },
+    ));
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/lexicons",
+            common::auth::admin_cookie_header("did:plc:kept", &app.state.cookie_key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an admin over the limit keeps working"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/users",
+            app.admin_cookie(),
+            &json!({ "did": "did:plc:more" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(resp).await["message"],
+        "This instance allows 1 admin."
+    );
 }

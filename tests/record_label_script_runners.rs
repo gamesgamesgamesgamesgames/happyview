@@ -33,7 +33,7 @@ const LABELER: &str = "did:plc:labeler";
 macro_rules! require_fixture {
     () => {
         if !echo_interpreter::is_built() {
-            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            happyview::test_support::unavailable(echo_interpreter::BUILD);
             return;
         }
     };

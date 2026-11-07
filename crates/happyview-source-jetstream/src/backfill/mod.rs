@@ -201,6 +201,27 @@ pub(crate) async fn set_stage(state: &JobState, job_id: &str, stage: &str) {
     );
 }
 
+pub(crate) async fn set_note(state: &JobState, job_id: &str, note: &str) {
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET note = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "note", || {
+        happyview_provider::db::query(&sql)
+            .bind(note)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        types::BackfillEvent::JobNote {
+            job_id: job_id.to_string(),
+            note: note.to_string(),
+        },
+    );
+}
+
 pub(crate) async fn update_job_counter(state: &JobState, job_id: &str, column: &str, value: i32) {
     let query = match column {
         "total_repos" => "UPDATE happyview_backfill_jobs SET total_repos = ? WHERE id = ?",
@@ -257,6 +278,74 @@ pub fn saturating_fetch_add(counter: &AtomicI32, n: i32) -> i32 {
 
 pub(crate) fn publish_event(state: &JobState, event: types::BackfillEvent) {
     let _ = state.backfill_events_tx.send(event);
+}
+
+/// How often a running job asks its host whether new hook stats are due. The
+/// host decides how often they are, so this only bounds how late they go out.
+const HOOK_STATS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Publishes a running job's hook stats as its host makes them due, until
+/// dropped.
+struct HookStatsPublisher(tokio::task::JoinHandle<()>);
+
+impl HookStatsPublisher {
+    fn spawn(state: &JobState, job_id: &str) -> Self {
+        let state = state.clone();
+        let job_id = job_id.to_string();
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HOOK_STATS_POLL).await;
+                if let Some(stats) = state.host.job_hook_stats_due(&job_id) {
+                    publish_event(
+                        &state,
+                        types::BackfillEvent::HookStats {
+                            job_id: job_id.clone(),
+                            stats,
+                        },
+                    );
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for HookStatsPublisher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keep a job's final hook stats with it as it ends, and publish them ahead
+/// of its completion. A job none of whose records reached a hook keeps none.
+async fn keep_hook_stats(state: &JobState, job_id: &str) {
+    let Some(stats) = state.host.finish_job_hook_stats(job_id) else {
+        return;
+    };
+    let json = match serde_json::to_string(&stats) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "could not encode a job's hook stats");
+            return;
+        }
+    };
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET hook_stats = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "hook_stats", || {
+        happyview_provider::db::query(&sql)
+            .bind(&json)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        types::BackfillEvent::HookStats {
+            job_id: job_id.to_string(),
+            stats,
+        },
+    );
 }
 
 /// Run one bookkeeping write for a job, retrying while the database is busy.
@@ -400,6 +489,7 @@ pub(crate) async fn load_max_attempts(state: &JobState) -> u32 {
 }
 
 pub(crate) async fn fail_job(state: &JobState, job_id: &str, error: &str) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
@@ -460,9 +550,10 @@ pub(crate) async fn request_cancel(state: &JobState, job_id: &str) {
 }
 
 pub(crate) async fn finalise_cancel(state: &JobState, job_id: &str) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'Cancelled by an operator' WHERE id = ?",
         state.db_backend,
     );
     job_write(state, job_id, "cancel", || {
@@ -523,6 +614,7 @@ pub(crate) async fn complete_job(
     total_records: i32,
     error: Option<&str>,
 ) {
+    keep_hook_stats(state, job_id).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         "UPDATE happyview_backfill_jobs SET status = 'completed', stage = 'completed', completed_at = ?, processed_repos = ?, total_records = ?, error = ? WHERE id = ?",
@@ -564,6 +656,17 @@ pub(crate) fn spawn_job(state: &JobState, job_id: &str, collection: Option<Strin
         run_backfill_job(spawn_state, spawn_job_id).await;
         drop(running);
     });
+}
+
+/// What a job notes when every collection it covers was left to an
+/// executor: a backfill of every collection (whose executor collections each
+/// get their own job), or an account backfill of a collection with one
+/// (which an executor backfills whole).
+pub(crate) fn executor_owned_note(collection: Option<&str>) -> String {
+    match collection {
+        Some(col) => format!("{col} is backfilled as a whole, not per account."),
+        None => "Each collection is backfilled by its own job.".to_string(),
+    }
 }
 
 pub(crate) async fn run_backfill_job(state: JobState, job_id: String) {
@@ -613,6 +716,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         return;
     };
     let _running = state.running.enter(&job_id, collection.clone());
+    let _hook_stats = HookStatsPublisher::spawn(&state, &job_id);
 
     // Determine target collections. A collection with an executor belongs
     // to the provider that composes this source: a crawl or replay of every
@@ -657,14 +761,21 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
     }
 
     if collections.is_empty() {
-        complete_job(
-            &state,
-            &job_id,
-            0,
-            0,
-            Some("no backfill-eligible collections"),
-        )
-        .await;
+        if left_out.is_empty() {
+            complete_job(
+                &state,
+                &job_id,
+                0,
+                0,
+                Some("no backfill-eligible collections"),
+            )
+            .await;
+        } else {
+            // Nothing went wrong: every collection the job covers has an
+            // executor, which backfills it in its own job.
+            set_note(&state, &job_id, &executor_owned_note(collection.as_deref())).await;
+            complete_job(&state, &job_id, 0, 0, None).await;
+        }
         return;
     }
 

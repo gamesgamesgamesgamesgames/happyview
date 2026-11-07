@@ -105,7 +105,7 @@ pub(super) async fn create(
     let instance_keys = crate::oauth::client_keys::load_keys(
         &state.db,
         state.db_backend,
-        state.config.token_encryption_key.as_ref(),
+        state.config.keyring().as_ref(),
         crate::oauth::client_keys::INSTANCE_OWNER,
     )
     .await?;

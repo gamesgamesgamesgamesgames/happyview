@@ -119,31 +119,8 @@ impl JetstreamProtocol {
 #[serde(default, deny_unknown_fields)]
 pub struct LexiconOverride {
     pub backfill: Option<bool>,
-    #[serde(deserialize_with = "de_some::<_, NsidRule>")]
-    pub target_collection: Option<String>,
-    pub action: Option<OverrideAction>,
     pub token_cost: Option<u32>,
     pub indexed: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OverrideAction {
-    Create,
-    Update,
-    Delete,
-    Upsert,
-}
-
-impl From<OverrideAction> for crate::lexicon::ProcedureAction {
-    fn from(action: OverrideAction) -> Self {
-        match action {
-            OverrideAction::Create => Self::Create,
-            OverrideAction::Update => Self::Update,
-            OverrideAction::Delete => Self::Delete,
-            OverrideAction::Upsert => Self::Upsert,
-        }
-    }
 }
 
 impl ProjectConfig {
@@ -688,14 +665,13 @@ protocol = "v1"
 compression = false
 
 [lexicons."at.happyproto.registry.getArtifact"]
-target_collection = "software.release.manifest"
+token_cost = 2
 
 [lexicons."software.release.manifest"]
 backfill = true
 indexed = false
 
 [lexicons."at.happyproto.registry.putArtifact"]
-action = "create"
 token_cost = 5
 
 [scripts."xrpc.query:at.happyproto.registry.getArtifact"]
@@ -759,10 +735,7 @@ capabilities = ["library:call"]
         assert_eq!(config.jetstream.compression, Some(false));
 
         let get = &config.lexicons["at.happyproto.registry.getArtifact"];
-        assert_eq!(
-            get.target_collection.as_deref(),
-            Some("software.release.manifest")
-        );
+        assert_eq!(get.token_cost, Some(2));
         assert_eq!(get.backfill, None, "an unset override stays unset");
         assert_eq!(
             config.lexicons["software.release.manifest"].backfill,
@@ -774,7 +747,6 @@ capabilities = ["library:call"]
         );
         assert_eq!(get.indexed, None, "an unset override stays unset");
         let put = &config.lexicons["at.happyproto.registry.putArtifact"];
-        assert_eq!(put.action, Some(OverrideAction::Create));
         assert_eq!(put.token_cost, Some(5));
 
         let script = &config.scripts["xrpc.query:at.happyproto.registry.getArtifact"];
@@ -827,15 +799,20 @@ capabilities = ["library:call"]
         assert!(err.to_string().contains("target"), "{err}");
     }
 
+    /// Scripts name their collection and their write, so a file still
+    /// setting either is refused at its line rather than read differently.
     #[test]
-    fn an_unknown_action_names_the_valid_ones() {
-        let err = parse_err("[lexicons.\"at.example.thing\"]\naction = \"replace\"\n");
-        let text = err.to_string();
-        assert!(text.starts_with("happyview.toml:2:"), "{text}");
-        assert!(
-            text.contains("replace") && text.contains("upsert"),
-            "{text}"
-        );
+    fn a_lexicon_override_naming_a_target_collection_or_action_is_refused() {
+        for key in [
+            "target_collection = \"at.example.thing\"",
+            "action = \"create\"",
+        ] {
+            let err = parse_err(&format!("[lexicons.\"at.example.get\"]\n{key}\n"));
+            let text = err.to_string();
+            assert!(text.starts_with("happyview.toml:2:"), "{text}");
+            let name = key.split(' ').next().unwrap();
+            assert!(text.contains(&format!("unknown field `{name}`")), "{text}");
+        }
     }
 
     #[test]
@@ -850,27 +827,6 @@ capabilities = ["library:call"]
     fn a_module_without_a_path_is_refused() {
         let err = parse_err("[modules.registry]\nlanguage = \"rust\"\n");
         assert!(err.to_string().contains("path"), "{err}");
-    }
-
-    #[test]
-    fn the_action_override_maps_onto_the_procedure_action() {
-        use crate::lexicon::ProcedureAction;
-        assert_eq!(
-            ProcedureAction::from(OverrideAction::Create),
-            ProcedureAction::Create
-        );
-        assert_eq!(
-            ProcedureAction::from(OverrideAction::Update),
-            ProcedureAction::Update
-        );
-        assert_eq!(
-            ProcedureAction::from(OverrideAction::Delete),
-            ProcedureAction::Delete
-        );
-        assert_eq!(
-            ProcedureAction::from(OverrideAction::Upsert),
-            ProcedureAction::Upsert
-        );
     }
 
     #[test]
@@ -951,15 +907,6 @@ capabilities = ["library:call"]
             "[lexicons.\"getArtifact\"]\nbackfill = true\n",
             1,
             "getArtifact",
-        );
-    }
-
-    #[test]
-    fn a_target_collection_that_is_not_an_nsid_is_refused() {
-        assert_refused_at(
-            "[lexicons.\"at.example.get\"]\ntarget_collection = \"artifact\"\n",
-            2,
-            "artifact",
         );
     }
 

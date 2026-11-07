@@ -34,8 +34,7 @@ macro_rules! require_fixture {
         ))
         .exists()
         {
-            eprintln!(concat!(
-                "skipping: ",
+            happyview::test_support::unavailable(concat!(
                 $name,
                 " fixture not built. Run: cargo build --manifest-path tests/fixtures/",
                 $name,

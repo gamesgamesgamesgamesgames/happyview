@@ -332,6 +332,7 @@ async fn refresh(app: &TestApp) {
         &app.state.official_registry,
         &app.state.db,
         app.state.db_backend,
+        happyview::plugin::registry_source::RefreshMode::Full,
     )
     .await
     .unwrap();
@@ -1346,6 +1347,7 @@ async fn put_in_catalogue(app: &TestApp, id: &str, versions: &[&str]) {
         .collect(),
         latest_version: Some(versions[0].into()),
         lifecycle_state: "active".into(),
+        fingerprint: String::new(),
         releases: versions
             .iter()
             .map(|v| ReleaseEntry {

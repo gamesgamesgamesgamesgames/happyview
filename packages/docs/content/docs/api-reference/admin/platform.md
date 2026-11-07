@@ -21,6 +21,8 @@ The platform principal can:
 
 - list, add, remove and promote [domains](./domains.md); while it's set, it is the only caller that can add, remove or promote one
 - read [stats](./stats.md)
+- read script and ingest [metrics](./metrics.md), but not the live view
+- read the status of a `TOKEN_ENCRYPTION_KEY` rotation ([`GET /admin/encryption/rotation`](./encryption.md#rotation-status)): how many stored values each store still has sealed under the previous key, and whether the previous key can be removed. It sees counts, never a value, and can't start a re-seal
 - call the endpoints on this page
 
 Every other admin endpoint refuses it with `403`.

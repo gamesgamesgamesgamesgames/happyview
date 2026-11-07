@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use happyview_provider::Host;
 use happyview_provider::db::adapt_sql;
@@ -29,6 +30,37 @@ pub trait BackfillExecutor: Send + Sync + 'static {
     /// Backfill `collection`. Return early once [`JobHandle::should_stop`]
     /// says so; the job is then paused or cancelled, whatever this returns.
     async fn run(&self, job: JobHandle, collection: &str) -> Result<JobTotals, String>;
+    /// What this executor can say about `collection` now, apart from any
+    /// job: shown beside its backfills, since what it backfills from can
+    /// keep changing after a job ends. `None` says nothing.
+    async fn describe(&self, _collection: &str) -> Option<CollectionSummary> {
+        None
+    }
+}
+
+/// An executor's account of a collection it backfills
+/// ([`BackfillExecutor::describe`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CollectionSummary {
+    /// A sentence for the operator, in the executor's words.
+    pub message: String,
+    /// Records the executor holds for the collection, when it knows.
+    pub records: Option<i64>,
+    /// Whether what it backfills from is still being filled.
+    pub state: Option<SummaryState>,
+    /// When it next tries to fill it, after a try that found nothing: RFC
+    /// 3339 with a `+00:00` offset. `None` while no retry is due.
+    pub retry_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryState {
+    /// Due to be filled, and not started yet.
+    Queued,
+    Running,
+    Complete,
+    Failed,
 }
 
 /// What an executor's run did.
@@ -79,6 +111,7 @@ impl JobHandle {
     /// and `total_repos`, sent to the job's event stream.
     pub async fn progress(&self, processed: i64, total: Option<i64>) {
         self.processed.store(processed, Ordering::Relaxed);
+        self.jobs.host.note_job_progress(&self.id, processed, total);
         let processed = clamp(processed);
         let total = total.map(clamp);
         backfill::update_job_counter(&self.jobs, &self.id, "processed_repos", processed).await;
@@ -95,6 +128,29 @@ impl JobHandle {
                 total_records: None,
             },
         );
+    }
+
+    /// Add `n` records' worth of `elapsed` to this job's stage `stage`, which
+    /// its hook stats report beside the stages HappyView measures: the time
+    /// an executor spends where HappyView cannot see it, such as reading a
+    /// page or writing to its own store. Any name will do.
+    ///
+    /// A stage whose name ends in `_skipped` is a count, and `elapsed` is
+    /// ignored: report work that was skipped as `write_skipped` with
+    /// [`Duration::ZERO`] rather than as a `write` that took no time, so the
+    /// `write` mean stays the mean of real round trips. Neither counts
+    /// towards a record's time or its script share, which are HappyView's
+    /// own measurements.
+    pub fn observe(&self, stage: &'static str, elapsed: Duration, n: u64) {
+        self.jobs
+            .host
+            .observe_job_stage(&self.id, stage, elapsed, n);
+    }
+
+    /// A sentence for the operator about what this job did or found, shown
+    /// with the job. A later note replaces an earlier one.
+    pub async fn note(&self, note: &str) {
+        backfill::set_note(&self.jobs, &self.id, note).await;
     }
 
     /// The job's stage, shown as it is.

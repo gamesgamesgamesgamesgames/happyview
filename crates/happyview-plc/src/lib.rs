@@ -5,6 +5,8 @@
 //! operation and reading a DID's audit log are HTTP concerns and stay with the
 //! service that owns the HTTP client.
 
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
@@ -18,14 +20,21 @@ pub enum PlcError {
     InvalidKey(String),
     #[error("no CID in PLC log entry")]
     MissingCid,
+    #[error("invalid PLC operation: {0}")]
+    InvalidOperation(String),
 }
 
 /// Parameters for building a PLC genesis operation.
 pub struct PlcGenesisParams {
-    /// The rotation key in did:key multibase format (e.g. "did:key:z...")
-    pub rotation_key_did_key: String,
-    /// The signing key in did:key multibase format (e.g. "did:key:z...")
-    pub signing_key_did_key: String,
+    /// Rotation keys as did:key strings, highest authority first. Within 72
+    /// hours of an operation, a key listed before the one that signed it can
+    /// nullify it.
+    pub rotation_keys: Vec<String>,
+    /// Verification methods by id, without the `#` (e.g. `atproto`,
+    /// `atproto_kem`), each a did:key.
+    pub verification_methods: BTreeMap<String, String>,
+    /// `at://` handles. Empty is valid: an identity needs no handle.
+    pub also_known_as: Vec<String>,
     /// Service entries: (key, type, endpoint) — e.g. ("atproto_labeler", "AtprotoLabeler", "https://...")
     pub service_entries: Vec<(String, String, String)>,
 }
@@ -45,21 +54,176 @@ pub fn build_unsigned_genesis(params: &PlcGenesisParams) -> serde_json::Value {
 
     serde_json::json!({
         "type": "plc_operation",
-        "rotationKeys": [&params.rotation_key_did_key],
-        "verificationMethods": {
-            "atproto": &params.signing_key_did_key,
-        },
-        "alsoKnownAs": [],
+        "rotationKeys": &params.rotation_keys,
+        "verificationMethods": &params.verification_methods,
+        "alsoKnownAs": &params.also_known_as,
         "services": services,
         "prev": null,
     })
+}
+
+// The limits are the stricter of the did:plc spec (v0.2) and the directory
+// server (`packages/server/src/constraints.ts`), which is what plc.directory
+// enforces. The server allows 10 rotation keys where the spec allows 5, and
+// the spec allows 7500 bytes where the server allows 4000.
+const MAX_OP_BYTES: usize = 4000;
+const MAX_ROTATION_KEYS: usize = 5;
+const MAX_VERIFICATION_METHODS: usize = 10;
+const MAX_SERVICES: usize = 10;
+const MAX_ALSO_KNOWN_AS: usize = 10;
+const MAX_ALSO_KNOWN_AS_LENGTH: usize = 258;
+const MAX_ID_LENGTH: usize = 32;
+const MAX_DID_KEY_LENGTH: usize = 256;
+const MAX_SERVICE_TYPE_LENGTH: usize = 256;
+const MAX_SERVICE_ENDPOINT_LENGTH: usize = 512;
+
+/// Multicodec prefixes of the two key types a rotation key may be.
+const P256_MULTICODEC: [u8; 2] = [0x80, 0x24];
+const SECP256K1_MULTICODEC: [u8; 2] = [0xe7, 0x01];
+
+/// Check a signed operation against the directory's limits, so a violation
+/// fails here with its reason rather than as a 400 from the directory.
+pub fn check_operation(signed_op: &serde_json::Value) -> Result<(), PlcError> {
+    let invalid = |msg: String| Err(PlcError::InvalidOperation(msg));
+
+    let size = serde_ipld_dagcbor::to_vec(signed_op)
+        .map_err(|e| PlcError::Encoding(e.to_string()))?
+        .len();
+    if size > MAX_OP_BYTES {
+        return invalid(format!(
+            "operation is {size} bytes of DAG-CBOR, over the {MAX_OP_BYTES}-byte limit"
+        ));
+    }
+
+    let rotation_keys = string_array(signed_op, "rotationKeys")?;
+    if rotation_keys.is_empty() || rotation_keys.len() > MAX_ROTATION_KEYS {
+        return invalid(format!(
+            "an operation needs 1 to {MAX_ROTATION_KEYS} rotation keys, not {}",
+            rotation_keys.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for key in &rotation_keys {
+        if !seen.insert(key) {
+            return invalid(format!("rotation key listed twice: {key}"));
+        }
+        match did_key_multicodec(key) {
+            Some(prefix) if prefix == P256_MULTICODEC || prefix == SECP256K1_MULTICODEC => {}
+            _ => {
+                return invalid(format!(
+                    "rotation key is not a P-256 or secp256k1 did:key: {key}"
+                ));
+            }
+        }
+    }
+
+    let methods = object(signed_op, "verificationMethods")?;
+    if methods.len() > MAX_VERIFICATION_METHODS {
+        return invalid(format!(
+            "{} verification methods, over the limit of {MAX_VERIFICATION_METHODS}",
+            methods.len()
+        ));
+    }
+    for (id, key) in methods {
+        check_id(id, "verification method")?;
+        let key = key.as_str().unwrap_or_default();
+        if key.len() > MAX_DID_KEY_LENGTH || did_key_multicodec(key).is_none() {
+            return invalid(format!("verification method {id} is not a did:key: {key}"));
+        }
+    }
+
+    let services = object(signed_op, "services")?;
+    if services.len() > MAX_SERVICES {
+        return invalid(format!(
+            "{} services, over the limit of {MAX_SERVICES}",
+            services.len()
+        ));
+    }
+    for (id, service) in services {
+        check_id(id, "service")?;
+        let service_type = service["type"].as_str().unwrap_or_default();
+        let endpoint = service["endpoint"].as_str().unwrap_or_default();
+        if service_type.len() > MAX_SERVICE_TYPE_LENGTH {
+            return invalid(format!(
+                "service {id}'s type is over {MAX_SERVICE_TYPE_LENGTH} characters"
+            ));
+        }
+        if endpoint.len() > MAX_SERVICE_ENDPOINT_LENGTH {
+            return invalid(format!(
+                "service {id}'s endpoint is over {MAX_SERVICE_ENDPOINT_LENGTH} characters"
+            ));
+        }
+    }
+
+    let aliases = string_array(signed_op, "alsoKnownAs")?;
+    if aliases.len() > MAX_ALSO_KNOWN_AS {
+        return invalid(format!(
+            "{} alsoKnownAs entries, over the limit of {MAX_ALSO_KNOWN_AS}",
+            aliases.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for alias in &aliases {
+        if alias.len() > MAX_ALSO_KNOWN_AS_LENGTH {
+            return invalid(format!(
+                "alsoKnownAs entry is over {MAX_ALSO_KNOWN_AS_LENGTH} characters: {alias}"
+            ));
+        }
+        if !seen.insert(alias) {
+            return invalid(format!("alsoKnownAs entry listed twice: {alias}"));
+        }
+    }
+
+    Ok(())
+}
+
+fn string_array<'a>(op: &'a serde_json::Value, field: &str) -> Result<Vec<&'a str>, PlcError> {
+    op[field]
+        .as_array()
+        .ok_or_else(|| PlcError::InvalidOperation(format!("{field} must be an array")))?
+        .iter()
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                PlcError::InvalidOperation(format!("every {field} entry must be a string"))
+            })
+        })
+        .collect()
+}
+
+fn object<'a>(
+    op: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, PlcError> {
+    op[field]
+        .as_object()
+        .ok_or_else(|| PlcError::InvalidOperation(format!("{field} must be an object")))
+}
+
+fn check_id(id: &str, kind: &str) -> Result<(), PlcError> {
+    if id.is_empty() || id.len() > MAX_ID_LENGTH || id.contains('#') {
+        return Err(PlcError::InvalidOperation(format!(
+            "{kind} id must be 1 to {MAX_ID_LENGTH} characters with no '#': {id:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The multicodec prefix of a base58btc `did:key`, or `None` when it isn't one.
+fn did_key_multicodec(did_key: &str) -> Option<[u8; 2]> {
+    let multibase = did_key.strip_prefix("did:key:")?;
+    if !multibase.starts_with('z') {
+        return None;
+    }
+    let (_, bytes) = multibase::decode(multibase).ok()?;
+    Some([*bytes.first()?, *bytes.get(1)?])
 }
 
 /// Sign an unsigned PLC operation with the rotation key.
 ///
 /// The signature covers the DAG-CBOR encoding of the unsigned operation
 /// (all fields except `sig`). ECDSA P-256 internally SHA-256 hashes the
-/// message before signing.
+/// message before signing. The signed operation is checked with
+/// [`check_operation`] before it is returned.
 pub fn sign_operation(
     unsigned_op: &serde_json::Value,
     rotation_key: &SigningKey,
@@ -85,6 +249,7 @@ pub fn sign_operation(
         .as_object_mut()
         .ok_or_else(|| PlcError::Encoding("operation must be a JSON object".into()))?
         .insert("sig".to_string(), serde_json::json!(sig_b64));
+    check_operation(&signed)?;
     Ok(signed)
 }
 
@@ -164,19 +329,41 @@ mod tests {
         SigningKey::from_slice(&bytes[..]).unwrap()
     }
 
+    fn test_did_key() -> String {
+        private_key_to_did_key(&test_signing_key().to_bytes()).unwrap()
+    }
+
     fn test_params() -> PlcGenesisParams {
         PlcGenesisParams {
-            rotation_key_did_key: "did:key:zTest".into(),
-            signing_key_did_key: "did:key:zTest".into(),
+            rotation_keys: vec![test_did_key()],
+            verification_methods: BTreeMap::from([("atproto".into(), test_did_key())]),
+            also_known_as: vec![],
             service_entries: vec![],
+        }
+    }
+
+    fn signed(params: &PlcGenesisParams) -> Result<serde_json::Value, PlcError> {
+        sign_operation(&build_unsigned_genesis(params), &test_signing_key())
+    }
+
+    fn assert_invalid(result: Result<serde_json::Value, PlcError>, expected: &str) {
+        match result {
+            Err(PlcError::InvalidOperation(msg)) => {
+                assert!(
+                    msg.contains(expected),
+                    "{msg:?} should mention {expected:?}"
+                )
+            }
+            other => panic!("expected InvalidOperation mentioning {expected:?}, got {other:?}"),
         }
     }
 
     #[test]
     fn build_unsigned_genesis_structure() {
         let params = PlcGenesisParams {
-            rotation_key_did_key: "did:key:zRotation".into(),
-            signing_key_did_key: "did:key:zSigning".into(),
+            rotation_keys: vec!["did:key:zRotation".into()],
+            verification_methods: BTreeMap::from([("atproto".into(), "did:key:zSigning".into())]),
+            also_known_as: vec![],
             service_entries: vec![(
                 "atproto_labeler".into(),
                 "AtprotoLabeler".into(),
@@ -318,5 +505,124 @@ mod tests {
         assert_eq!(op["prev"], "bafyprev");
         assert_eq!(op["rotationKeys"][0], "did:key:zRotation");
         assert_eq!(op["alsoKnownAs"][0], "at://example.test");
+    }
+
+    #[test]
+    fn genesis_carries_every_rotation_key_method_and_alias_in_order() {
+        let creator = test_did_key();
+        let instance = test_did_key();
+        let params = PlcGenesisParams {
+            rotation_keys: vec![creator.clone(), instance.clone()],
+            verification_methods: BTreeMap::from([
+                ("atproto".into(), test_did_key()),
+                ("atproto_kem".into(), test_did_key()),
+            ]),
+            also_known_as: vec!["at://space.example.com".into()],
+            service_entries: vec![(
+                "atproto_pds".into(),
+                "AtprotoPersonalDataServer".into(),
+                "https://happyview.example.com".into(),
+            )],
+        };
+
+        let op = signed(&params).unwrap();
+        assert_eq!(op["rotationKeys"], serde_json::json!([creator, instance]));
+        assert!(op["verificationMethods"]["atproto_kem"].is_string());
+        assert_eq!(op["alsoKnownAs"][0], "at://space.example.com");
+        derive_did(&op).unwrap();
+    }
+
+    #[test]
+    fn a_secp256k1_rotation_key_is_accepted() {
+        let k256 = k256_did_key();
+        let mut params = test_params();
+        params.rotation_keys.insert(0, k256);
+        signed(&params).unwrap();
+    }
+
+    #[test]
+    fn more_than_five_rotation_keys_are_refused() {
+        let mut params = test_params();
+        params.rotation_keys = (0..6).map(|_| test_did_key()).collect();
+        assert_invalid(signed(&params), "1 to 5 rotation keys");
+    }
+
+    #[test]
+    fn no_rotation_key_is_refused() {
+        let mut params = test_params();
+        params.rotation_keys.clear();
+        assert_invalid(signed(&params), "1 to 5 rotation keys");
+    }
+
+    #[test]
+    fn a_duplicate_rotation_key_is_refused() {
+        let mut params = test_params();
+        params.rotation_keys.push(params.rotation_keys[0].clone());
+        assert_invalid(signed(&params), "listed twice");
+    }
+
+    #[test]
+    fn an_ed25519_rotation_key_is_refused() {
+        let mut bytes = vec![0xed, 0x01];
+        bytes.extend_from_slice(&[7u8; 32]);
+        let ed25519 = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &bytes)
+        );
+        let mut params = test_params();
+        params.rotation_keys = vec![ed25519];
+        assert_invalid(signed(&params), "not a P-256 or secp256k1");
+    }
+
+    #[test]
+    fn a_verification_method_id_with_a_hash_is_refused() {
+        let mut params = test_params();
+        params
+            .verification_methods
+            .insert("#atproto_kem".into(), test_did_key());
+        assert_invalid(signed(&params), "no '#'");
+    }
+
+    #[test]
+    fn a_verification_method_that_is_not_a_did_key_is_refused() {
+        let mut params = test_params();
+        params
+            .verification_methods
+            .insert("atproto_kem".into(), "did:web:example.com".into());
+        assert_invalid(signed(&params), "not a did:key");
+    }
+
+    #[test]
+    fn an_operation_over_4000_bytes_is_refused() {
+        let mut params = test_params();
+        params.service_entries = (0..9)
+            .map(|i| {
+                (
+                    format!("svc{i}"),
+                    "Example".into(),
+                    format!("https://{}.example.com", "a".repeat(480)),
+                )
+            })
+            .collect();
+        assert_invalid(signed(&params), "4000-byte limit");
+    }
+
+    #[test]
+    fn a_duplicate_alias_is_refused() {
+        let mut params = test_params();
+        params.also_known_as = vec!["at://a.example.com".into(), "at://a.example.com".into()];
+        assert_invalid(signed(&params), "listed twice");
+    }
+
+    fn k256_did_key() -> String {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let key = k256::ecdsa::SigningKey::from_slice(&bytes).unwrap();
+        let mut multikey = vec![0xe7, 0x01];
+        multikey.extend_from_slice(key.verifying_key().to_sec1_point(true).as_bytes());
+        format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &multikey)
+        )
     }
 }

@@ -7,7 +7,7 @@
 //! copy (`getArtifact?cid=`), never from a URL a publisher gave, so whatever
 //! is fetched can be checked against the CID that named it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -334,6 +334,55 @@ pub struct ProjectView {
     pub indexed_at: Option<String>,
 }
 
+impl ProjectView {
+    /// Everything a catalogue entry takes from the project listing, as one
+    /// string. Two reads with the same fingerprint describe the same project
+    /// at the same channel heads, so the versions behind them need not be
+    /// read again.
+    ///
+    /// What it cannot see is inside the version records: a version's
+    /// `suspect` flag, a lifecycle change on a version no channel points at,
+    /// and a version published but not yet pointed to. Those are why
+    /// [`RefreshMode::Full`] exists. Nothing here is a security boundary --
+    /// an install re-reads the version from the registry and refuses a
+    /// suspect one then -- so a stale flag costs display accuracy, not
+    /// safety.
+    pub fn fingerprint(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.name);
+        out.push('\u{1f}');
+        out.push_str(&self.plugin_type);
+        out.push('\u{1f}');
+        out.push_str(&self.lifecycle.state);
+        out.push('\u{1f}');
+        out.push_str(self.indexed_at.as_deref().unwrap_or(""));
+        out.push('\u{1f}');
+        out.push_str(self.publication.name.as_deref().unwrap_or(""));
+        out.push('\u{1f}');
+        out.push_str(self.publication.description.as_deref().unwrap_or(""));
+        out.push('\u{1f}');
+        out.push_str(self.publication.icon.as_deref().unwrap_or(""));
+        out.push('\u{1f}');
+        out.push_str(self.banner.as_ref().map(|b| b.cid.as_str()).unwrap_or(""));
+        // BTreeMap, so the order is the same on every read.
+        for (channel, c) in &self.channels {
+            out.push('\u{1e}');
+            out.push_str(channel);
+            out.push('\u{1f}');
+            out.push_str(&c.version);
+            out.push('\u{1f}');
+            out.push_str(&c.uri);
+            out.push('\u{1f}');
+            out.push_str(&c.cid);
+            out.push('\u{1f}');
+            out.push_str(&c.state);
+            out.push('\u{1f}');
+            out.push_str(&c.availability);
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Publication {
@@ -600,7 +649,22 @@ pub async fn fetch_catalogue(
     client: &reqwest::Client,
     source: &RegistrySource,
 ) -> Result<Vec<CatalogueEntry>, SourceError> {
-    Ok(one_per_name(fetch_listing(client, source).await?.entries))
+    let listing = fetch_listing(client, source, RefreshMode::Full, &HashMap::new()).await?;
+    Ok(one_per_name(listing.entries))
+}
+
+/// Whether a refresh may reuse what the cache already holds.
+///
+/// A refresh reads `searchProjects` either way; the choice is whether it then
+/// reads each project's versions. [`Self::Incremental`] reads them only for a
+/// project whose [`ProjectView::fingerprint`] has changed, which in a steady
+/// state is none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshMode {
+    /// Reuse a cached entry whose project fingerprint is unchanged.
+    Incremental,
+    /// Read every listed project's versions, whatever the fingerprint says.
+    Full,
 }
 
 /// What a listing read: an entry for each project whose versions could be
@@ -609,6 +673,8 @@ pub async fn fetch_catalogue(
 pub struct Listing {
     pub entries: Vec<CatalogueEntry>,
     pub unreadable: Vec<(String, String)>,
+    /// How many entries came from the cache without reading any versions.
+    pub reused: usize,
 }
 
 /// Every project the registry lists, each publisher's own, including those
@@ -617,11 +683,25 @@ pub struct Listing {
 pub async fn fetch_listing(
     client: &reqwest::Client,
     source: &RegistrySource,
+    mode: RefreshMode,
+    cached: &HashMap<(String, String), CatalogueEntry>,
 ) -> Result<Listing, SourceError> {
     let projects = source.search_projects(client).await?;
     let mut listing = Listing::default();
     for project in projects {
         let key = (project.did.clone(), project.name.clone());
+        // The whole point of the fingerprint: a project that has not moved
+        // costs no `listVersions` call at all, which in a steady state is
+        // every project.
+        if mode == RefreshMode::Incremental
+            && let Some(hit) = cached.get(&key)
+            && !hit.fingerprint.is_empty()
+            && hit.fingerprint == project.fingerprint()
+        {
+            listing.reused += 1;
+            listing.entries.push(hit.clone());
+            continue;
+        }
         match entry_for(client, source, project).await {
             Some(entry) => listing.entries.push(entry),
             None => listing.unreadable.push(key),
@@ -730,6 +810,7 @@ fn build_entry(
     versions: Vec<VersionView>,
     latest: Option<VersionView>,
 ) -> CatalogueEntry {
+    let fingerprint = project.fingerprint();
     // A channel carries its version's state and availability, not whether
     // the registry flagged it suspect; the version itself says that.
     let suspect = |c: &ChannelView| {
@@ -803,6 +884,7 @@ fn build_entry(
         releases,
         sections,
         lifecycle_state: project.lifecycle.state.clone(),
+        fingerprint,
         id: project.name,
     }
 }
@@ -1529,5 +1611,170 @@ mod tests {
         assert_eq!(next_cursor(Some("a"), Some("a".into())), None);
         assert_eq!(next_cursor(Some("a"), Some(String::new())), None);
         assert_eq!(next_cursor(Some("a"), None), None);
+    }
+
+    /// How many times the listing asked a project for its versions. The
+    /// whole point of the fingerprint is that this stops growing.
+    async fn list_versions_calls(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/xrpc/at.happyproto.registry.listVersions")
+            .count()
+    }
+
+    /// The cache a refresh would hold after `listing`, keyed as
+    /// [`fetch_listing`] reads it.
+    fn cache_of(listing: &Listing) -> HashMap<(String, String), CatalogueEntry> {
+        listing
+            .entries
+            .iter()
+            .filter_map(|e| {
+                e.publisher_did
+                    .clone()
+                    .map(|did| ((did, e.id.clone()), e.clone()))
+            })
+            .collect()
+    }
+
+    async fn mount_lua(server: &MockServer, version_number: &str) {
+        mount_projects(
+            server,
+            serde_json::json!([project(
+                HP,
+                "lua",
+                serde_json::json!({ "latest": channel(HP, "lua", version_number, "active", "available") })
+            )]),
+        )
+        .await;
+        mount_versions(
+            server,
+            HP,
+            "lua",
+            serde_json::json!([version(
+                HP,
+                "lua",
+                version_number,
+                "active",
+                true,
+                "available"
+            )]),
+        )
+        .await;
+    }
+
+    /// An incremental pass over a project that has not moved reads no
+    /// versions at all, and keeps the entry it already had.
+    #[tokio::test]
+    async fn an_unchanged_project_reads_no_versions_on_the_next_pass() {
+        let server = MockServer::start().await;
+        mount_lua(&server, "1.2.0").await;
+        let src = source(&server);
+        let client = reqwest::Client::new();
+
+        let first = fetch_listing(&client, &src, RefreshMode::Full, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.reused, 0, "nothing to reuse on a cold cache");
+        let reads = list_versions_calls(&server).await;
+        assert!(reads >= 1, "the first pass has to read the versions");
+
+        let second = fetch_listing(&client, &src, RefreshMode::Incremental, &cache_of(&first))
+            .await
+            .unwrap();
+        assert_eq!(second.reused, 1);
+        assert_eq!(
+            list_versions_calls(&server).await,
+            reads,
+            "an unchanged project must not be read again"
+        );
+        assert_eq!(second.entries[0].latest_version.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            second.entries[0].releases.len(),
+            first.entries[0].releases.len(),
+            "the reused entry keeps its release list"
+        );
+    }
+
+    /// A channel pointed somewhere new changes the fingerprint, so that
+    /// project is read again and the entry follows it.
+    #[tokio::test]
+    async fn a_moved_channel_is_read_again() {
+        let server = MockServer::start().await;
+        mount_lua(&server, "1.2.0").await;
+        let src = source(&server);
+        let client = reqwest::Client::new();
+
+        let first = fetch_listing(&client, &src, RefreshMode::Full, &HashMap::new())
+            .await
+            .unwrap();
+        let cached = cache_of(&first);
+
+        server.reset().await;
+        mount_lua(&server, "1.3.0").await;
+
+        let second = fetch_listing(&client, &src, RefreshMode::Incremental, &cached)
+            .await
+            .unwrap();
+        assert_eq!(second.reused, 0, "a moved channel is not a cache hit");
+        assert_eq!(
+            list_versions_calls(&server).await,
+            1,
+            "the moved project is read once"
+        );
+        assert_eq!(second.entries[0].latest_version.as_deref(), Some("1.3.0"));
+    }
+
+    /// The periodic full pass exists to see what a project listing cannot
+    /// show, so it reads versions even when nothing in the listing moved.
+    #[tokio::test]
+    async fn a_full_pass_reads_versions_even_when_nothing_moved() {
+        let server = MockServer::start().await;
+        mount_lua(&server, "1.2.0").await;
+        let src = source(&server);
+        let client = reqwest::Client::new();
+
+        let first = fetch_listing(&client, &src, RefreshMode::Full, &HashMap::new())
+            .await
+            .unwrap();
+        let reads = list_versions_calls(&server).await;
+
+        let second = fetch_listing(&client, &src, RefreshMode::Full, &cache_of(&first))
+            .await
+            .unwrap();
+        assert_eq!(second.reused, 0);
+        assert!(
+            list_versions_calls(&server).await > reads,
+            "a full pass reads the versions whatever the cache holds"
+        );
+    }
+
+    /// The fingerprint is the cache's own bookkeeping and must not reach the
+    /// catalogue's wire shape.
+    #[tokio::test]
+    async fn the_fingerprint_is_not_serialised() {
+        let server = MockServer::start().await;
+        mount_lua(&server, "1.2.0").await;
+        let listing = fetch_listing(
+            &reqwest::Client::new(),
+            &source(&server),
+            RefreshMode::Full,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let entry = &listing.entries[0];
+        assert!(
+            !entry.fingerprint.is_empty(),
+            "the entry should carry a fingerprint internally"
+        );
+        let json = serde_json::to_value(entry).unwrap();
+        assert!(
+            json.get("fingerprint").is_none(),
+            "fingerprint leaked into the catalogue response"
+        );
     }
 }

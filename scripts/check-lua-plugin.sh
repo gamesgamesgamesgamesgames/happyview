@@ -4,11 +4,11 @@
 # load it.
 #
 # It is a built artefact of another repository and needs a C toolchain, so
-# nothing in this repository can produce it and the targets needing it skip
-# wherever it was not supplied. libtest captures a passing test's skip line,
-# so without this a green run would not say which assertions it did not make
-# — and among them are the three refusal messages an operator reads when a
-# script will not save.
+# nothing in this repository builds it; scripts/fetch-lua-plugin.sh downloads
+# the pinned release. The targets needing it fail without it unless
+# HAPPYVIEW_ALLOW_SKIPS=1, and this names the absence up front — among what
+# they cover are the three refusal messages an operator reads when a script
+# will not save.
 #
 #   --require   exit non-zero when the plugin is absent, for a runner that is
 #               meant to have it

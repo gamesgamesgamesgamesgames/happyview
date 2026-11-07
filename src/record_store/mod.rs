@@ -210,6 +210,10 @@ pub struct RecordStore {
     interner: Arc<Interner>,
     bodies: Arc<compression::BodyCodec>,
     external: Option<Arc<dyn RecordStorage>>,
+    /// Makes [`Self::count_collection`] fail, so a test can see what its
+    /// callers do without the count.
+    #[cfg(test)]
+    pub(crate) fail_counts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A row an upsert inserted or changed: its id, its collection's id, and
@@ -310,6 +314,8 @@ impl RecordStore {
             interner: Arc::new(Interner::new(DID_CACHE_CAPACITY)),
             bodies: Arc::new(bodies),
             external: None,
+            #[cfg(test)]
+            fail_counts: Arc::default(),
         }
     }
 
@@ -1107,6 +1113,110 @@ impl RecordStore {
             .collect())
     }
 
+    /// The `(rkey, cid, rev)` of every network row `did` holds in
+    /// `collection` in this instance's own tables, by rkey. Rows a local write
+    /// stored and the network has not echoed (`indexed_at` unset) are left
+    /// out. Not routed: a collection external storage claims has none here.
+    pub async fn network_keys_of(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, sqlx::Error> {
+        let sql = adapt_sql(
+            &format!(
+                "SELECT r.rkey, hv_cid_text(r.cid), r.rev FROM happyview_records_v2 r \
+                 WHERE r.did_id = {DID_ID} AND r.collection_id = {COLLECTION_ID} \
+                   AND r.indexed_at IS NOT NULL ORDER BY r.rkey"
+            ),
+            self.backend,
+        );
+        crate::db::query_as::<(String, Option<String>, Option<String>)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .fetch_all(&self.db)
+            .await
+    }
+
+    /// The CID, rev and body of `did`'s network row at `rkey` in
+    /// `collection` in this instance's own tables, as
+    /// [`Self::network_keys_of`] reads them; `None` when there is none.
+    pub async fn network_row(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<(Option<String>, Option<String>, String)>, sqlx::Error> {
+        let body = match self.backend {
+            DatabaseBackend::Sqlite => "hv_record(r.body, r.body_dict)",
+            DatabaseBackend::Postgres => "r.record",
+        };
+        let sql = adapt_sql(
+            &format!(
+                "SELECT hv_cid_text(r.cid), r.rev, {body} FROM happyview_records_v2 r \
+                 WHERE r.did_id = {DID_ID} AND r.collection_id = {COLLECTION_ID} \
+                   AND r.rkey = ? AND r.indexed_at IS NOT NULL"
+            ),
+            self.backend,
+        );
+        crate::db::query_as::<(Option<String>, Option<String>, String)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&self.db)
+            .await
+    }
+
+    /// [`Self::delete_network`] without a rev, but only while the stored row
+    /// still has the CID and rev it had when `expected_cid` and
+    /// `expected_rev` were read: a record recreated at the same key since
+    /// then is left alone. The check and the delete run in one transaction
+    /// under the record's locks. Returns whether a row was removed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_network_if_unchanged(
+        &self,
+        pool: &AnyPool,
+        uri: &str,
+        did: &str,
+        collection: &str,
+        expected_cid: Option<&str>,
+        expected_rev: Option<&str>,
+        now: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let backend = self.backend;
+        let Some((_, _, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(false);
+        };
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
+        crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
+        let sql = adapt_sql(
+            &format!(
+                "SELECT id, hv_cid_text(cid), rev FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ? \
+                   AND indexed_at IS NOT NULL"
+            ),
+            backend,
+        );
+        let found = crate::db::query_as::<(i64, Option<String>, Option<String>)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((id, cid, rev)) = found else {
+            return Ok(false);
+        };
+        if cid.as_deref() != expected_cid || rev.as_deref() != expected_rev {
+            return Ok(false);
+        }
+        self.delete_ids(&mut tx, &[id]).await?;
+        if let Some(rev) = rev {
+            crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &rev, now).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// [`Self::holds_local_network_records`], counting only rows older than
     /// `before_rev` (or with no rev).
     pub async fn holds_network_records_before(
@@ -1149,25 +1259,40 @@ impl RecordStore {
             return ext.delete_collection_batch(collection, limit).await;
         }
         let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
-        let ids: Vec<i64> = crate::db::query_as::<(i64,)>(&adapt_sql(
-            &format!(
-                "SELECT id FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID} LIMIT ?"
-            ),
-            self.backend,
-        ))
-        .bind(collection)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|(id,)| id)
-        .collect();
+        let ids: Vec<i64> =
+            crate::db::query_as::<(i64,)>(&Self::collection_batch_sql(self.backend))
+                .bind(collection)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect();
         let deleted = self.delete_ids(&mut tx, &ids).await?;
         tx.commit().await?;
         Ok(deleted)
     }
 
+    /// The SQL picking a collection's next batch to delete. Ordered as
+    /// `idx_records_v2_collection_created_at_id` is, so the batch is read from
+    /// that index (pinned by a test): unordered, Postgres can't estimate a
+    /// collection named through a subquery, assumes it is most of the table
+    /// and scans every record to find a small collection's few.
+    pub(crate) fn collection_batch_sql(backend: DatabaseBackend) -> String {
+        adapt_sql(
+            &format!(
+                "SELECT id FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID} \
+                 ORDER BY created_at DESC, id DESC LIMIT ?"
+            ),
+            backend,
+        )
+    }
+
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
+        #[cfg(test)]
+        if self.fail_counts.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
         match self.external_route(collection) {
             Some(ext) => Self::count_claimed(ext, collection).await,
             None => Self::count_collection_on(&self.local_route(), collection).await,
@@ -2428,6 +2553,27 @@ mod tests {
                     backend,
                 );
             }
+        }
+    }
+
+    /// The ordered batch is read from the collection index with no sort. A
+    /// test table is too small to show the plan the order exists to avoid,
+    /// which only a large table's estimate produces; this pins that adding it
+    /// costs no sort.
+    #[tokio::test]
+    async fn a_collection_delete_batch_reads_the_collection_index() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let sql = crate::test_support::inline_binds_on(
+                &RecordStore::collection_batch_sql(backend),
+                backend,
+                &["'app.test.post'", "5000"],
+            );
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_v2_collection_created_at_id",
+                backend,
+            );
         }
     }
 

@@ -47,7 +47,7 @@ const response = await fetch("http://127.0.0.1:3000/admin/users", {
   },
   body: JSON.stringify({
     did: "did:plc:newuser",
-    template: "operator",
+    template: "maintainer",
   }),
 });
 const data: User = await response.json();
@@ -61,7 +61,7 @@ const response = await fetch("http://127.0.0.1:3000/admin/users", {
   },
   body: JSON.stringify({
     did: "did:plc:newuser",
-    template: "operator",
+    template: "maintainer",
   }),
 });
 const data = await response.json();
@@ -72,7 +72,7 @@ let response = client
     .bearer_auth(token)
     .json(&serde_json::json!({
         "did": "did:plc:newuser",
-        "template": "operator"
+        "template": "maintainer"
     }))
     .send()
     .await?;
@@ -81,7 +81,7 @@ let data: serde_json::Value = response.json().await?;
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
   "did": "did:plc:newuser",
-  "template": "operator"
+  "template": "maintainer"
 }`)
 req, _ := http.NewRequest("POST", "http://127.0.0.1:3000/admin/users", body)
 req.Header.Set("Authorization", "Bearer "+token)
@@ -94,14 +94,14 @@ curl -X POST http://127.0.0.1:3000/admin/users \
   -H "Content-Type: application/json" \
   -d '{
     "did": "did:plc:newuser",
-    "template": "operator"
+    "template": "maintainer"
   }'
 ```
 
 | Field         | Type     | Required | Description                                                                        |
 | ------------- | -------- | -------- | ---------------------------------------------------------------------------------- |
 | `did`         | string   | yes      | The atproto DID of the user to add                                             |
-| `template`    | string   | no       | Permission template: `viewer`, `operator`, `manager`, or `full_access`             |
+| `template`    | string   | no       | Permission template: `viewer`, `maintainer`, `manager`, or `full_access`. `operator`, the old name for `maintainer`, is still accepted |
 | `permissions` | string[] | no       | Explicit list of permissions to grant (used instead of or in addition to `template`) |
 
 If neither `template` nor `permissions` is provided, the user is created with no permissions.

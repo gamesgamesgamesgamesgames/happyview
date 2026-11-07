@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -238,7 +237,10 @@ async fn run_subscription_once(
         .to_string();
     let port = request.uri().port_u16().unwrap_or(443);
 
-    let tcp = TcpStream::connect((&*host, port)).await?;
+    // The endpoint comes from the labeler's DID document, so it is screened
+    // like any reqwest request; see `crate::outbound`.
+    let tcp =
+        crate::outbound::connect_tcp(&crate::outbound::Source::Installed, &host, port).await?;
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let root_store =
@@ -955,7 +957,7 @@ mod tests {
     #[serial]
     async fn the_sweep_deletes_only_orderable_expiries_on_postgres() {
         if std::env::var("TEST_DATABASE_URL").is_err() {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         }
         let url = std::env::var("TEST_DATABASE_URL").expect("the caller checks it first");

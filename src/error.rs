@@ -131,6 +131,13 @@ pub enum AppError {
     /// The names travel as a field of their own so a client can offer the
     /// codemod without depending on the message's wording.
     UnmigratedScript(Vec<String>),
+    /// An uploaded lexicon that does not pass [`crate::lexicon::validate`].
+    ///
+    /// Carries one entry per field rather than one sentence, because a
+    /// lexicon has many places to be wrong at once and the editor can point
+    /// at each of them. Warnings travel with the errors so the caller sees
+    /// everything in one answer.
+    InvalidLexicon(Vec<crate::lexicon::validate::Issue>),
     /// An XRPC error carrying a lexicon-defined code, e.g. `UnsupportedPolicy`.
     ///
     /// Clients switch on `error`, so a generic BadRequest is not
@@ -141,6 +148,10 @@ pub enum AppError {
         code: &'static str,
         message: String,
     },
+    /// The instance's limits don't allow what was asked. The limit and the
+    /// host's wording travel as fields, so a client can show the message and
+    /// its action without parsing anything.
+    LimitReached(happyview_provider::LimitReached),
     RateLimited {
         retry_after: u64,
         limit: u32,
@@ -188,6 +199,24 @@ pub(crate) fn file_of(chunk: Option<String>) -> Option<String> {
     chunk.filter(|chunk| chunk != crate::plugin::DEFAULT_CHUNK_NAME)
 }
 
+/// One sentence for a log line or a client that reads only `error`; the
+/// per-field detail is in `issues`.
+fn invalid_lexicon_message(issues: &[crate::lexicon::validate::Issue]) -> String {
+    let errors: Vec<&crate::lexicon::validate::Issue> = issues
+        .iter()
+        .filter(|i| i.severity == crate::lexicon::validate::Severity::Error)
+        .collect();
+    match errors.split_first() {
+        None => "the lexicon is not valid".to_string(),
+        Some((first, [])) => format!("the lexicon is not valid: {}", first.render()),
+        Some((first, rest)) => format!(
+            "the lexicon is not valid: {} (and {} more)",
+            first.render(),
+            rest.len()
+        ),
+    }
+}
+
 fn unmigrated_script_message(globals: &[String]) -> String {
     crate::script::checks::unmigrated_message(globals)
 }
@@ -202,6 +231,7 @@ impl std::fmt::Display for AppError {
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             AppError::Conflict(msg) => write!(f, "conflict: {msg}"),
             AppError::FeatureDisabled(msg) => write!(f, "feature disabled: {msg}"),
+            AppError::LimitReached(reached) => write!(f, "limit reached: {reached}"),
             AppError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             AppError::InsufficientPermissions(perm) => write!(f, "Missing permission: {perm}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
@@ -210,6 +240,9 @@ impl std::fmt::Display for AppError {
             AppError::ServerMisconfigured(msg) => write!(f, "server misconfigured: {msg}"),
             AppError::UnmigratedScript(globals) => {
                 write!(f, "bad request: {}", unmigrated_script_message(globals))
+            }
+            AppError::InvalidLexicon(issues) => {
+                write!(f, "bad request: {}", invalid_lexicon_message(issues))
             }
             AppError::RateLimited { retry_after, .. } => {
                 write!(f, "rate limited: retry after {retry_after}s")
@@ -236,6 +269,12 @@ impl std::fmt::Display for AppError {
                 (None, None) => write!(f, "script {error_type} error in {method}: {message}"),
             },
         }
+    }
+}
+
+impl From<happyview_provider::LimitReached> for AppError {
+    fn from(reached: happyview_provider::LimitReached) -> Self {
+        AppError::LimitReached(reached)
     }
 }
 
@@ -278,6 +317,17 @@ impl IntoResponse for AppError {
                 });
                 (status, axum::Json(body)).into_response()
             }
+            // 403: nothing about the request is malformed, and asking again
+            // won't help until the limit changes.
+            AppError::LimitReached(reached) => {
+                let mut body = serde_json::json!({ "error": "LimitReached" });
+                if let (Some(map), Ok(serde_json::Value::Object(fields))) =
+                    (body.as_object_mut(), serde_json::to_value(&reached))
+                {
+                    map.extend(fields);
+                }
+                (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+            }
             AppError::FeatureDisabled(msg) => {
                 let body = serde_json::json!({
                     "error": "FeatureDisabled",
@@ -303,6 +353,13 @@ impl IntoResponse for AppError {
                 let body = serde_json::json!({
                     "error": unmigrated_script_message(&globals),
                     "removed_globals": globals,
+                });
+                (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+            }
+            AppError::InvalidLexicon(issues) => {
+                let body = serde_json::json!({
+                    "error": invalid_lexicon_message(&issues),
+                    "issues": issues,
                 });
                 (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
             }
@@ -359,10 +416,12 @@ impl IntoResponse for AppError {
                     AppError::PdsError(..)
                     | AppError::AuthDpopNonce(..)
                     | AppError::FeatureDisabled(..)
+                    | AppError::LimitReached(..)
                     | AppError::InsufficientPermissions(..)
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
                     | AppError::UnmigratedScript(..)
+                    | AppError::InvalidLexicon(..)
                     | AppError::RateLimited { .. }
                     | AppError::XrpcError { .. }
                     | AppError::ScriptError { .. } => unreachable!(),
@@ -371,6 +430,22 @@ impl IntoResponse for AppError {
                 let body = serde_json::json!({ "error": message });
                 (status, axum::Json(body)).into_response()
             }
+        }
+    }
+}
+
+impl AppError {
+    /// This error as text a client may see, for a response that carries several
+    /// outcomes. An internal error's detail goes to the log under a correlation
+    /// id, as it does when one is the whole response.
+    pub fn client_message(&self) -> String {
+        match self {
+            AppError::Internal(msg) => {
+                let correlation_id = format!("{:016x}", rand::random::<u64>());
+                tracing::error!(correlation_id, "internal error: {msg}");
+                format!("Internal server error ({correlation_id})")
+            }
+            other => other.to_string(),
         }
     }
 }
@@ -429,6 +504,17 @@ mod tests {
         let (status, body) = response_parts(AppError::BadRequest("missing field".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "missing field");
+    }
+
+    #[test]
+    fn a_client_message_keeps_internal_detail_out() {
+        let message = AppError::Internal("secret SQL driver details".into()).client_message();
+        assert!(message.starts_with("Internal server error"));
+        assert!(!message.contains("secret"));
+        assert_eq!(
+            AppError::NotFound("no such letter".into()).client_message(),
+            AppError::NotFound("no such letter".into()).to_string()
+        );
     }
 
     #[tokio::test]
@@ -517,6 +603,60 @@ mod tests {
         assert_eq!(body["error"], "script_error");
         assert_eq!(body["errorType"], "syntax");
         assert_eq!(body["line"], 5);
+    }
+
+    #[tokio::test]
+    async fn a_reached_limit_is_a_403_with_the_limit_and_the_hosts_wording() {
+        let limits = happyview_provider::Limits {
+            seats: Some(happyview_provider::Cap {
+                max: 5,
+                wording: happyview_provider::Wording {
+                    message: Some("Your plan includes 5 seats.".into()),
+                    action_url: Some("https://host.example/plan".into()),
+                    action_label: Some("Add a seat".into()),
+                },
+            }),
+            ..Default::default()
+        };
+        let reached = limits
+            .check(happyview_provider::Limit::Seats, 5)
+            .unwrap_err();
+        let (status, body) = response_parts(reached.into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "LimitReached",
+                "limit": "seats",
+                "max": 5,
+                "current": 5,
+                "message": "Your plan includes 5 seats.",
+                "actionUrl": "https://host.example/plan",
+                "actionLabel": "Add a seat",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_gate_has_no_counts_and_says_the_generic_sentence() {
+        let limits = happyview_provider::Limits {
+            anonymous_xrpc: Some(happyview_provider::Gate {
+                allowed: false,
+                wording: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let (status, body) =
+            response_parts(limits.allows_anonymous_xrpc().unwrap_err().into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "LimitReached",
+                "limit": "anonymous_xrpc",
+                "message": "This instance only answers XRPC calls made with an API client.",
+            })
+        );
     }
 
     #[tokio::test]

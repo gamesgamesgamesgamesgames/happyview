@@ -50,17 +50,17 @@ fn parse_input(input: &serde_json::Value) -> Option<Input> {
 /// login: the two differ whenever a user declines part of a consent screen, and
 /// acting on the request would enqueue migrations that cannot run.
 pub async fn granted_scope(state: &AppState, did: &str) -> Result<Option<String>, AppError> {
-    let sql = crate::db::adapt_sql(
-        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+    let data = crate::auth::oauth_store::stored_session_json(
+        &state.db,
         state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
+        crate::auth::oauth_store::SESSIONS_TABLE,
+        did,
+        state.config.keyring().as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read oauth session: {e}")))?;
 
-    let Some((data,)) = row else {
+    let Some(data) = data else {
         return Ok(None);
     };
     let parsed: serde_json::Value = serde_json::from_str(&data)
@@ -156,20 +156,27 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
 
     match migrate(state, job, &input).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            // Any failure returns the repo to polyfill. Migration never modifies
-            // the local copy, so the user's repo keeps working as it did.
-            if let Err(revert) = set_mode(state, &input, HostMode::Polyfill).await {
-                tracing::error!(
-                    space_id = %input.space_id,
-                    author_did = %input.author_did,
-                    error = %revert,
-                    "failed to return repo to polyfill after a failed migration"
-                );
-            }
-            NativeOutcome::Failed(format!("{e}"))
-        }
+        Err(e) => failed(state, job, &input, e).await,
     }
+}
+
+/// The outcome of a run that failed. A failure returns the repo to
+/// polyfill: migration never modifies the local copy, so the user's repo
+/// keeps working as it did. Unless the run's job was taken over while it
+/// failed (a run stuck in a call to the PDS across the takeover): the run
+/// that took it may have moved the repo on already, and the mode is its.
+async fn failed(state: &AppState, job: &Job, input: &Input, e: AppError) -> NativeOutcome {
+    if jobs_db::should_stop(state, &job.id).await != Some("lost")
+        && let Err(revert) = set_mode(state, input, HostMode::Polyfill).await
+    {
+        tracing::error!(
+            space_id = %input.space_id,
+            author_did = %input.author_did,
+            error = %revert,
+            "failed to return repo to polyfill after a failed migration"
+        );
+    }
+    NativeOutcome::Failed(format!("{e}"))
 }
 
 async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOutcome, AppError> {
@@ -249,55 +256,72 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     // `list_all_space_records` returns, so a resumed run repeats the same
     // sequence.
     let total = records.len();
-    let mut written = 0usize;
-    for (body, chunk) in replay_batches(&space_uri, &input.author_did, &records)
-        .iter()
-        .zip(records.chunks(BATCH_SIZE))
-    {
-        let resp = crate::repo::pds::pds_post_json_raw(
-            state,
-            &session,
-            "com.atproto.space.applyWrites",
-            body,
-        )
-        .await?;
-        if !resp.status().is_success() {
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "applyWrites rejected a batch: {detail}"
-            )));
+    let batches = replay_batches(&space_uri, &input.author_did, &records)
+        .into_iter()
+        .zip(records.chunks(BATCH_SIZE).map(<[SpaceRecord]>::len));
+    let replayed = replay(state, job, batches, total, |body| {
+        let session = &session;
+        async move {
+            let resp = crate::repo::pds::pds_post_json_raw(
+                state,
+                session,
+                "com.atproto.space.applyWrites",
+                &body,
+            )
+            .await?;
+            if !resp.status().is_success() {
+                let detail = resp.text().await.unwrap_or_default();
+                return Err(AppError::Internal(format!(
+                    "applyWrites rejected a batch: {detail}"
+                )));
+            }
+            Ok(())
         }
-
-        written += chunk.len();
-        let _ = jobs_db::update_progress(
-            state,
-            &job.id,
-            &serde_json::json!({ "records_written": written, "records_total": total }),
-        )
-        .await;
+    })
+    .await?;
+    if let Replayed::Stopped { reason, written } = replayed {
+        return Ok(stopped(state, input, reason, written, total).await);
     }
 
     // Verify with two independent checks. Both must pass.
+    // Authenticity: the commit is signed by, or MACed under, the author's key.
     let commit =
-        native_client::get_latest_commit(state, &session, &space_uri, &input.author_did).await?;
+        native_client::get_verified_commit(state, &session, &space_uri, &input.author_did).await?;
 
-    // Authenticity: the commit carries a valid signature from the author's key.
-    let key =
-        native_client::author_signing_key(&state.http, &state.config.plc_url, &input.author_did)
-            .await?;
-    crate::spaces::commit::verify_commit(&commit, &space_uri, &input.author_did, &key)?;
-
-    // Agreement: the signed hash describes the records we sent. An authentic
-    // commit can still summarise a different record set.
-    if commit.hash != expected_commit_hash(&records) {
+    // Agreement: the authenticated hash describes the records we sent. An
+    // authentic commit can still summarise a different record set.
+    if *commit.hash() != expected_commit_hash(&records) {
         return Err(AppError::Internal(format!(
             "the PDS's commit does not describe the {total} records we replayed; \
              leaving this repo on HappyView"
         )));
     }
 
-    // Handoff confirmed. Record where to resume syncing from before flipping,
-    // so a native repo is never left without a cursor.
+    // Handoff confirmed.
+    if let Some(reason) = hand_off(state, job, input, commit.rev()).await? {
+        return Ok(stopped(state, input, reason, total, total).await);
+    }
+
+    Ok(NativeOutcome::Completed(serde_json::json!({
+        "status": "migrated",
+        "records": total,
+        "rev": commit.rev(),
+    })))
+}
+
+/// Record where to resume syncing from, then make the PDS the repo's source
+/// of truth. The cursor goes first, so a native repo is never left without
+/// one. A run asked to stop, or whose job was taken over, while the handoff
+/// was being checked writes neither, and answers why.
+async fn hand_off(
+    state: &AppState,
+    job: &Job,
+    input: &Input,
+    rev: &str,
+) -> Result<Option<&'static str>, AppError> {
+    if let Some(reason) = jobs_db::should_stop(state, &job.id).await {
+        return Ok(Some(reason));
+    }
     {
         let mut conn = state
             .db
@@ -311,17 +335,83 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
             &input.author_did,
         )
         .await?;
-        repo_state.sync_cursor = Some(commit.rev.clone());
+        repo_state.sync_cursor = Some(rev.to_string());
         db::update_repo_state(&mut *conn, state.db_backend, &repo_state).await?;
     }
 
     set_mode(state, input, HostMode::Native).await?;
+    Ok(None)
+}
 
-    Ok(NativeOutcome::Completed(serde_json::json!({
-        "status": "migrated",
-        "records": total,
-        "rev": commit.rev,
-    })))
+/// How far a replay got.
+#[derive(Debug, PartialEq)]
+enum Replayed {
+    All,
+    /// The run was asked to stop, or lost its job, after `written` records.
+    Stopped {
+        reason: &'static str,
+        written: usize,
+    },
+}
+
+/// Send each `(body, records in it)` batch in order with `send`, recording
+/// progress after each, and asking before each whether the run is to stop: a
+/// paused or cancelled job, or a run whose job was taken over, sends no more.
+async fn replay<F, Fut>(
+    state: &AppState,
+    job: &Job,
+    batches: impl IntoIterator<Item = (serde_json::Value, usize)>,
+    total: usize,
+    mut send: F,
+) -> Result<Replayed, AppError>
+where
+    F: FnMut(serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    let mut written = 0usize;
+    for (body, records) in batches {
+        if let Some(reason) = jobs_db::should_stop(state, &job.id).await {
+            return Ok(Replayed::Stopped { reason, written });
+        }
+        send(body).await?;
+        written += records;
+        let _ = jobs_db::update_progress(
+            state,
+            &job.id,
+            &serde_json::json!({ "records_written": written, "records_total": total }),
+        )
+        .await;
+    }
+    Ok(Replayed::All)
+}
+
+/// The outcome of a run that stopped before the handoff. Paused or
+/// cancelled, the repo goes back to `polyfill`, as after a failure, since the
+/// PDS holds only part of it; a resumed job replays from the start. A run
+/// whose job was taken over leaves the mode to the run that took it.
+async fn stopped(
+    state: &AppState,
+    input: &Input,
+    reason: &'static str,
+    written: usize,
+    total: usize,
+) -> NativeOutcome {
+    if reason != "lost"
+        && let Err(e) = set_mode(state, input, HostMode::Polyfill).await
+    {
+        tracing::error!(
+            space_id = %input.space_id,
+            author_did = %input.author_did,
+            error = %e,
+            "failed to return repo to polyfill after a stopped migration"
+        );
+    }
+    NativeOutcome::Completed(serde_json::json!({
+        "status": "stopped",
+        "stopped": reason,
+        "records_written": written,
+        "records_total": total,
+    }))
 }
 
 /// The `applyWrites` bodies that replay a repo's records onto its new host.
@@ -482,5 +572,175 @@ mod tests {
             &a_space(),
             &collections
         ));
+    }
+
+    /// A job to migrate `USER`'s repo in space `sp1`, and the state it runs
+    /// on, with the repo mid-migration.
+    async fn migrating() -> (AppState, Job, Input) {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let id = jobs_db::create_job(
+            &state,
+            JOB_TYPE,
+            &serde_json::json!({ "space_id": "sp1", "author_did": USER }),
+            USER,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let job = jobs_db::get_job(&state, &id).await.unwrap().unwrap();
+        db::create_space(&state.db, state.db_backend, &a_space())
+            .await
+            .unwrap();
+        let input = Input {
+            space_id: "sp1".into(),
+            author_did: USER.into(),
+        };
+        set_mode(&state, &input, HostMode::Migrating).await.unwrap();
+        (state, job, input)
+    }
+
+    async fn ask(state: &AppState, job: &Job, status: &str) {
+        crate::db::query("UPDATE happyview_jobs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&job.id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+
+    async fn repo(state: &AppState, input: &Input) -> crate::spaces::types::RepoState {
+        let mut conn = state.db.acquire().await.unwrap();
+        db::get_or_create_repo_state(
+            &mut conn,
+            state.db_backend,
+            &input.space_id,
+            &input.author_did,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A pause or cancel asked mid-replay sends no batch after it.
+    #[tokio::test]
+    async fn a_replay_asked_to_stop_sends_no_more_batches() {
+        for asked in ["cancelling", "pausing"] {
+            let (state, job, _) = migrating().await;
+            let sent = std::cell::Cell::new(0);
+            let batches = (0..4).map(|i| (serde_json::json!({ "batch": i }), 50));
+            let replayed = replay(&state, &job, batches, 200, |_| {
+                sent.set(sent.get() + 1);
+                let now = sent.get();
+                let (state, job) = (&state, &job);
+                async move {
+                    if now == 2 {
+                        ask(state, job, asked).await;
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(sent.get(), 2, "{asked}");
+            assert_eq!(
+                replayed,
+                Replayed::Stopped {
+                    reason: asked,
+                    written: 100,
+                }
+            );
+        }
+    }
+
+    /// A run asked to stop after the handoff was checked neither records a
+    /// cursor nor makes the PDS the source of truth.
+    #[tokio::test]
+    async fn a_handoff_asked_to_stop_does_not_flip_the_repo() {
+        let (state, job, input) = migrating().await;
+        ask(&state, &job, "cancelling").await;
+
+        let stopped_for = hand_off(&state, &job, &input, "rev1").await.unwrap();
+
+        assert_eq!(stopped_for, Some("cancelling"));
+        let repo = repo(&state, &input).await;
+        assert_eq!(repo.host_mode, HostMode::Migrating);
+        assert_eq!(repo.sync_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn a_handoff_not_asked_to_stop_flips_the_repo() {
+        let (state, job, input) = migrating().await;
+
+        assert_eq!(hand_off(&state, &job, &input, "rev1").await.unwrap(), None);
+        let repo = repo(&state, &input).await;
+        assert_eq!(repo.host_mode, HostMode::Native);
+        assert_eq!(repo.sync_cursor.as_deref(), Some("rev1"));
+    }
+
+    /// Paused or cancelled, the repo goes back to polyfill; a run whose job
+    /// was taken over leaves it to the run that took it.
+    #[tokio::test]
+    async fn a_stopped_migration_returns_the_repo_unless_its_job_was_taken_over() {
+        for (reason, mode) in [
+            ("cancelling", HostMode::Polyfill),
+            ("pausing", HostMode::Polyfill),
+            ("lost", HostMode::Migrating),
+        ] {
+            let (state, _, input) = migrating().await;
+            let out = stopped(&state, &input, reason, 50, 200).await;
+            assert!(
+                matches!(&out, NativeOutcome::Completed(v) if v["stopped"] == reason),
+                "{reason}"
+            );
+            assert_eq!(repo(&state, &input).await.host_mode, mode, "{reason}");
+        }
+    }
+
+    /// A failed run returns the repo to polyfill, unless its job was taken
+    /// over: the run that took it may have finished the move, and a stale
+    /// run failing late must not undo it.
+    #[tokio::test]
+    async fn a_failed_run_returns_the_repo_unless_its_job_was_taken_over() {
+        use super::super::super::held::{Held, Lease, run_under};
+
+        for (case, taken_over, mode) in [
+            ("its own", false, HostMode::Polyfill),
+            ("taken over", true, HostMode::Native),
+        ] {
+            let (state, job, input) = migrating().await;
+            let claimed = jobs_db::hold_job(&state, &job.id, "here")
+                .await
+                .unwrap()
+                .unwrap();
+            // The repo as the run that took the job over left it.
+            if taken_over {
+                set_mode(&state, &input, HostMode::Native).await.unwrap();
+            }
+            let attempt = claimed.attempt + i64::from(taken_over);
+            let run = Held::new(
+                &job.id,
+                Lease {
+                    owner: "here".into(),
+                    attempt,
+                },
+            );
+            let out = run_under(
+                run,
+                failed(
+                    &state,
+                    &job,
+                    &input,
+                    AppError::Internal("the PDS went away".into()),
+                ),
+            )
+            .await;
+
+            assert!(matches!(out, NativeOutcome::Failed(_)), "{case}");
+            assert_eq!(repo(&state, &input).await.host_mode, mode, "{case}");
+        }
     }
 }

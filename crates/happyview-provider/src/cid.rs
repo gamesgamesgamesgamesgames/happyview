@@ -55,10 +55,8 @@ fn atproto_json_to_ipld(value: &Value) -> Option<Ipld> {
                 Ipld::Integer(i as i128)
             } else if let Some(u) = n.as_u64() {
                 Ipld::Integer(u as i128)
-            } else if let Some(f) = n.as_f64() {
-                Ipld::Float(f)
             } else {
-                return None;
+                Ipld::Float(n.as_f64()?)
             }
         }
         Value::String(s) => Ipld::String(s.clone()),

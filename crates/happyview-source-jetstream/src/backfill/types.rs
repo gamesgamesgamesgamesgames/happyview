@@ -1,5 +1,6 @@
 //! What the backfill admin routes and the job event stream send and take.
 
+use happyview_provider::JobHookStats;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -41,8 +42,15 @@ pub struct BackfillJob {
     /// `auto` until an `auto` job has probed the archive, then `replay` or
     /// `crawl`.
     pub source: String,
+    /// What an executor's job said about itself ([`crate::JobHandle::note`]).
+    pub note: Option<String>,
     /// Replay progress; `None` for a crawl.
     pub replay: Option<ReplayProgress>,
+    /// The job's hook stats while this process holds them: from its first
+    /// record until an hour after its last.
+    pub hooks: Option<JobHookStats>,
+    /// The hook stats kept with the job when it ended.
+    pub hook_stats: Option<serde_json::Value>,
 }
 
 /// Where a replay job's running sweep is, and what it has cost.
@@ -96,12 +104,23 @@ pub enum BackfillEvent {
         status: String,
         error: Option<String>,
     },
+    JobNote {
+        job_id: String,
+        note: String,
+    },
     ReplayProgress {
         job_id: String,
         through_seq: i64,
         tip_seq: i64,
         bytes: i64,
         blocks_failed: i32,
+    },
+    /// What the job's records cost in hooks so far: at most once a second
+    /// while records arrive, and once more as the job ends.
+    HookStats {
+        job_id: String,
+        #[serde(flatten)]
+        stats: JobHookStats,
     },
     /// Current job state, straight from the database.
     ///

@@ -43,6 +43,17 @@ fn post_json_with_headers(uri: &str, body: &Value, headers: Vec<(&str, &str)>) -
 
 /// Set up a full DPoP session and return `(client_key, dpop_key, access_token)`.
 async fn setup_dpop_session(app: &TestApp, user_did: &str) -> (String, Value, String) {
+    let (client_key, _secret, dpop_key, access_token) =
+        setup_dpop_session_with_secret(app, user_did).await;
+    (client_key, dpop_key, access_token)
+}
+
+/// [`setup_dpop_session`], also returning the API client's secret, which
+/// registering a second account's session under the same client needs.
+async fn setup_dpop_session_with_secret(
+    app: &TestApp,
+    user_did: &str,
+) -> (String, String, Value, String) {
     let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
 
     let key_req = post_json_with_headers(
@@ -78,7 +89,7 @@ async fn setup_dpop_session(app: &TestApp, user_did: &str) -> (String, Value, St
     let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
     assert_eq!(session_resp.status(), StatusCode::CREATED);
 
-    (client_key, dpop_key, access_token)
+    (client_key, client_secret, dpop_key, access_token)
 }
 
 /// Build DPoP auth headers for a request.
@@ -135,7 +146,6 @@ async fn seed_procedure_lexicon(app: &TestApp) {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::create_game_procedure_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -358,6 +368,375 @@ async fn blob_upload_errors_carry_the_pds_status() {
     assert!(message.contains("413"), "{message}");
 }
 
+/// Answer `getSession` at `did`'s mocked PDS, only for the session holding
+/// `access_token`. Mounted ahead of the mock `setup_dpop_session` mounts for
+/// session verification, which answers with the DID alone.
+async fn mount_get_session(
+    app: &TestApp,
+    did: &str,
+    access_token: &str,
+    response: ResponseTemplate,
+    times: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/pds/{did}/xrpc/com.atproto.server.getSession"
+        )))
+        .and(header(
+            "authorization",
+            format!("DPoP {access_token}").as_str(),
+        ))
+        .respond_with(response)
+        .with_priority(1)
+        .expect(times)
+        .mount(&app.mock_server)
+        .await;
+}
+
+/// A DPoP caller with a procedure script that calls the fixture, whose PDS
+/// is mocked at `/pds/{did}`.
+async fn session_caller(app: &TestApp, did: &str) -> (String, Value, String) {
+    install_caller_fixture(app).await;
+    seed_procedure_lexicon(app).await;
+    seed_script(app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    let session = setup_dpop_session(app, did).await;
+    update_session_pds_url(app, did, &format!("{}/pds/{did}", app.mock_server.uri())).await;
+    session
+}
+
+async fn call_as(
+    app: &TestApp,
+    (client_key, dpop_key, access_token): &(String, Value, String),
+    function: &str,
+) -> (StatusCode, Value) {
+    let resp = dpop_post(
+        app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &call(function, json!({})),
+        client_key,
+        dpop_key,
+        access_token,
+    )
+    .await;
+    let status = resp.status();
+    (status, response_json(resp).await)
+}
+
+fn full_session(did: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "did": did,
+        "handle": "session.test",
+        "email": "session@example.com",
+        "emailConfirmed": false,
+        "active": true,
+    }))
+}
+
+/// The caller's account comes from their own PDS's getSession, as them, and
+/// only the DID and handle reach a plugin through `caller:read`, even when the
+/// PDS reports the address too.
+#[tokio::test]
+#[serial]
+async fn get_session_reads_the_callers_pds_account() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallersession";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(&app, DID, &session.2, full_session(DID), 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"did": DID, "handle": "session.test"}));
+}
+
+/// The address comes only through `host_caller_get_email`, behind
+/// `caller:email`.
+#[tokio::test]
+#[serial]
+async fn get_email_reads_the_callers_address() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcalleremail";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(&app, DID, &session.2, full_session(DID), 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"email": "session@example.com", "email_confirmed": false})
+    );
+}
+
+/// A sign-in granted neither `transition:email` nor `account:email` gets no
+/// address from the PDS, and that is an empty answer, not an error.
+#[tokio::test]
+#[serial]
+async fn get_email_is_empty_when_the_pds_withholds_it() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallernoemail";
+    let session = session_caller(&app, DID).await;
+    let withheld = ResponseTemplate::new(200)
+        .set_body_json(json!({"did": DID, "handle": "session.test", "active": true}));
+    mount_get_session(&app, DID, &session.2, withheld, 1).await;
+
+    let (status, body) = call_as(&app, &session, "get_email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({}));
+}
+
+/// A PDS answering about another account is refused by both calls, and
+/// nothing it said reaches the guest.
+#[tokio::test]
+#[serial]
+async fn a_session_naming_another_account_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallerimpostor";
+    let session = session_caller(&app, DID).await;
+    let other = ResponseTemplate::new(200).set_body_json(json!({
+        "did": "did:plc:someoneelse", "handle": "else.test", "email": "else@example.com",
+    }));
+    mount_get_session(&app, DID, &session.2, other, 2).await;
+
+    for function in ["get_session", "get_email"] {
+        let (status, body) = call_as(&app, &session, function).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{function}: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("PDS_ERROR"), "{function}: {message}");
+        assert!(
+            !message.contains("else@example.com"),
+            "{function}: {message}"
+        );
+        assert!(!message.contains("else.test"), "{function}: {message}");
+    }
+}
+
+/// A PDS's refusal reaches the guest with its status.
+#[tokio::test]
+#[serial]
+async fn get_session_errors_carry_the_pds_status() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const DID: &str = "did:plc:sdkcallerpdsdown";
+    let session = session_caller(&app, DID).await;
+    mount_get_session(
+        &app,
+        DID,
+        &session.2,
+        ResponseTemplate::new(503).set_body_string("Unavailable"),
+        2,
+    )
+    .await;
+
+    for function in ["get_session", "get_email"] {
+        let (status, body) = call_as(&app, &session, function).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{function}: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("PDS_ERROR"), "{function}: {message}");
+        assert!(message.contains("503"), "{function}: {message}");
+    }
+}
+
+/// No caller, as for a query, record-event or label script or a job without
+/// `auth`: nothing to read the account with.
+#[tokio::test]
+#[serial]
+async fn account_calls_with_no_session_are_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+
+    for function in ["get_session", "get_email"] {
+        let err = app
+            .state
+            .plugin_executor()
+            .call_library(
+                "sdk_caller",
+                function,
+                &[json!({})],
+                &LibraryCallContext::default(),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("NO_SESSION"), "{function}: {err}");
+    }
+}
+
+/// A plugin that imports the email call without declaring `caller:email`
+/// is refused at load, so an update can't start reading addresses under the
+/// consent an operator gave to `caller:read`.
+#[tokio::test]
+async fn the_email_call_needs_caller_email_declared() {
+    let fixture = std::path::Path::new("tests/fixtures/sdk_caller");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.join("manifest.json")).unwrap())
+            .unwrap();
+    let wasm = std::fs::canonicalize(fixture.join(manifest["wasm_file"].as_str().unwrap())).expect(
+        "sdk_caller fixture not built. Run: cargo build --manifest-path \
+             tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release",
+    );
+    manifest["wasm_file"] = json!(wasm.to_str().unwrap());
+    manifest["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c != "caller:email");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = loader::load_from_file(dir.path())
+        .await
+        .err()
+        .expect("loading an undeclared email import must fail")
+        .to_string();
+    assert!(err.contains("host_caller_get_email"), "{err}");
+    assert!(err.contains("caller:email"), "{err}");
+}
+
+/// A delegated request acts for another account, but the session it reads is
+/// still the actor's own: the account and address handed out are theirs, and
+/// the delegated account's PDS is never asked.
+#[tokio::test]
+#[serial]
+async fn a_delegated_request_reads_the_actors_account() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    const OWNER: &str = "did:plc:sdkcallerowner";
+    const STUDIO: &str = "did:plc:sdkcallerstudio";
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    let (client_key, client_secret, dpop_key, access_token) =
+        setup_dpop_session_with_secret(&app, OWNER).await;
+    update_session_pds_url(
+        &app,
+        OWNER,
+        &format!("{}/pds/{OWNER}", app.mock_server.uri()),
+    )
+    .await;
+    let (client_key, dpop_key, access_token) = (&client_key, &dpop_key, &access_token);
+    link_account(
+        &app,
+        client_key,
+        &client_secret,
+        dpop_key,
+        access_token,
+        STUDIO,
+    )
+    .await;
+    update_session_pds_url(
+        &app,
+        STUDIO,
+        &format!("{}/pds/{STUDIO}", app.mock_server.uri()),
+    )
+    .await;
+    mount_get_session(&app, OWNER, access_token, full_session(OWNER), 2).await;
+    Mock::given(path(format!(
+        "/pds/{STUDIO}/xrpc/com.atproto.server.getSession"
+    )))
+    .respond_with(full_session(STUDIO))
+    .with_priority(1)
+    .expect(0)
+    .mount(&app.mock_server)
+    .await;
+
+    for (function, expected) in [
+        (
+            "get_session",
+            json!({"did": OWNER, "handle": "session.test"}),
+        ),
+        (
+            "get_email",
+            json!({"email": "session@example.com", "email_confirmed": false}),
+        ),
+    ] {
+        let mut body = call(function, json!({}));
+        body["delegateDid"] = json!(STUDIO);
+        let resp = dpop_post(
+            &app,
+            &format!("/xrpc/{CREATE_GAME}"),
+            &body,
+            client_key,
+            dpop_key,
+            access_token,
+        )
+        .await;
+        let status = resp.status();
+        let body = response_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "{function}: {body}");
+        assert_eq!(body, expected, "{function}");
+    }
+}
+
+/// Register a session for `target_did` under the caller's API client and link
+/// it to the caller, as `tests/e2e_delegation.rs`'s `setup_linked_account`
+/// does.
+async fn link_account(
+    app: &TestApp,
+    client_key: &str,
+    client_secret: &str,
+    dpop_key: &Value,
+    access_token: &str,
+    target_did: &str,
+) {
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", client_key),
+            ("x-client-secret", client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let provision_id = response_json(key_resp).await["provision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.mock_session_verification(target_did, target_did).await;
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": target_did,
+            "access_token": format!("test-target-access-{}", uuid::Uuid::new_v4()),
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![
+            ("x-client-key", client_key),
+            ("x-client-secret", client_secret),
+        ],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    let resp = dpop_post(
+        app,
+        "/xrpc/dev.happyview.delegation.linkAccount",
+        &json!({ "did": target_did }),
+        client_key,
+        dpop_key,
+        access_token,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "linkAccount failed");
+}
+
 #[tokio::test]
 #[serial]
 async fn xrpc_query_reaches_a_local_handler() {
@@ -372,7 +751,6 @@ async fn xrpc_query_reaches_a_local_handler() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -419,7 +797,6 @@ async fn xrpc_query_reaches_a_local_handler_with_no_session() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -454,7 +831,6 @@ async fn index_put_and_lexicon_get_round_trip() {
             "/admin/lexicons",
             json!({
                 "lexicon_json": lexicon,
-                "target_collection": "games.gamesgamesgamesgames.game",
             }),
         )
         .await;
@@ -883,11 +1259,12 @@ async fn a_test_runs_procedure_script_writes_through_the_in_process_pds() {
     assert_eq!(row["cid"], body["cid"]);
 }
 
-/// A procedure with a lexicon and no script writes through the in-process
-/// PDS and mirrors what it answered, as the OAuth path does.
+/// A procedure with a lexicon and no script has nothing to run: an
+/// authenticated caller gets the 501 naming the trigger, and nothing reaches
+/// the PDS.
 #[tokio::test]
 #[serial]
-async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
+async fn a_procedure_without_a_script_names_the_missing_script() {
     common::require_db!();
     let mut app = TestApp::new_with_encryption().await;
     seed_procedure_lexicon(&app).await;
@@ -908,15 +1285,203 @@ async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
     .await;
     let status = resp.status();
     let body = response_json(resp).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"], "MethodNotImplemented", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("xrpc.procedure:{CREATE_GAME}")),
+        "{message}"
+    );
+    assert!(harness.pds().writes().is_empty());
+}
 
-    let writes = harness.pds().writes();
-    assert_eq!(writes.len(), 1, "{writes:?}");
-    assert_eq!(writes[0].action, "create");
-    assert_eq!(writes[0].repo, DID);
-    assert_eq!(writes[0].collection, "games.gamesgamesgamesgames.game");
-    let uri = body["uri"].as_str().expect("the PDS's uri is answered");
-    let row = indexed(&app, uri).await.expect("the write is in the index");
-    assert_eq!(row["cid"], body["cid"]);
-    assert_eq!(row["record"]["name"], "Tetris");
+// ---------------------------------------------------------------------------
+// Lexicon validation of a script's own XRPC calls
+// ---------------------------------------------------------------------------
+
+const VALIDATED_QUERY: &str = "com.example.validate.localProbe";
+const VALIDATED_PROCEDURE: &str = "com.example.validate.localSubmit";
+
+/// A query and a procedure with constraints to break, each bound to the echo
+/// fixture so a call that gets through answers with what reached the script.
+/// The routes' checks are pinned constraint by constraint in
+/// `xrpc_validation.rs`; these pin that a script calling them meets the same.
+async fn seed_validated_methods(app: &TestApp) {
+    for lexicon in [
+        json!({
+            "lexicon": 1,
+            "id": VALIDATED_QUERY,
+            "defs": { "main": {
+                "type": "query",
+                "parameters": {
+                    "type": "params",
+                    "required": ["q"],
+                    "properties": {
+                        "q": { "type": "string", "maxLength": 5 },
+                        "tags": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "output": { "encoding": "application/json" }
+            } }
+        }),
+        json!({
+            "lexicon": 1,
+            "id": VALIDATED_PROCEDURE,
+            "defs": { "main": {
+                "type": "procedure",
+                "parameters": {
+                    "type": "params",
+                    "properties": { "limit": { "type": "integer", "maximum": 10 } }
+                },
+                "input": {
+                    "encoding": "application/json",
+                    "schema": {
+                        "type": "object",
+                        "required": ["text"],
+                        "properties": { "text": { "type": "string", "maxLength": 5 } }
+                    }
+                },
+                "output": { "encoding": "application/json" }
+            } }
+        }),
+    ] {
+        let (status, body) = app
+            .post_json_status("/admin/lexicons", json!({ "lexicon_json": lexicon }))
+            .await;
+        assert!(status < 300, "failed to seed a lexicon: {status} {body}");
+    }
+    seed_script(app, &format!("xrpc.query:{VALIDATED_QUERY}"), "echo").await;
+    seed_script(
+        app,
+        &format!("xrpc.procedure:{VALIDATED_PROCEDURE}"),
+        "echo",
+    )
+    .await;
+}
+
+async fn local_query(app: &TestApp, params: Value) -> Result<Value, String> {
+    app.state
+        .plugin_executor()
+        .call_library(
+            "sdk_caller",
+            "xrpc_query",
+            &[json!({ "method": VALIDATED_QUERY, "params": params })],
+            &LibraryCallContext::default(),
+            0,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_query_breaking_its_lexicon_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_validated_methods(&app).await;
+
+    let err = local_query(&app, json!({ "tags": ["a"] }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("InvalidRequest: Params must have the property \"q\""),
+        "{err}"
+    );
+    let err = local_query(&app, json!({ "q": "toolong" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("InvalidRequest: Params/q must not be longer than 5 characters"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_query_keeping_to_its_lexicon_reaches_the_script() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_validated_methods(&app).await;
+
+    let echoed = local_query(&app, json!({ "q": "hi", "tags": "solo" }))
+        .await
+        .unwrap();
+    assert_eq!(echoed["input"]["q"], "hi");
+    assert_eq!(echoed["input"]["tags"], json!(["solo"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_procedure_breaking_its_lexicon_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    seed_validated_methods(&app).await;
+
+    const DID: &str = "did:plc:sdkcallervalidator";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+
+    for (spec, expected) in [
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "note": "no text" } }),
+            "InvalidRequest: Input must have the property",
+        ),
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "toolong" } }),
+            "InvalidRequest: Input/text must not be longer than 5 characters",
+        ),
+        (
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "hi" }, "params": { "limit": 11 } }),
+            "InvalidRequest: Params/limit can not be greater than 10",
+        ),
+    ] {
+        let resp = dpop_post(
+            &app,
+            &format!("/xrpc/{CREATE_GAME}"),
+            &call("xrpc_procedure", spec),
+            &client_key,
+            &dpop_key,
+            &access_token,
+        )
+        .await;
+        let body = response_json(resp).await;
+        let message = body["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("XRPC_ERROR"), "{message}");
+        assert!(message.contains(expected), "{expected} in {message}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_local_procedure_keeping_to_its_lexicon_reaches_the_script() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+    seed_validated_methods(&app).await;
+
+    const DID: &str = "did:plc:sdkcallervalidated";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &call(
+            "xrpc_procedure",
+            json!({ "method": VALIDATED_PROCEDURE, "input": { "text": "hi" }, "params": { "limit": 3 } }),
+        ),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["input"]["text"], "hi");
 }

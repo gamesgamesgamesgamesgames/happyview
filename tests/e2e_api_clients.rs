@@ -644,6 +644,80 @@ async fn create_api_client_with_rate_limit_overrides() {
     assert_eq!(json["rate_limit_refill_rate"], 1.5);
 }
 
+/// The bucket the limiter holds for `client_key`, as (capacity, refill rate).
+fn bucket(app: &TestApp, client_key: &str) -> Option<(u32, f64)> {
+    app.state
+        .rate_limiter
+        .get_client_config(client_key)
+        .map(|c| (c.capacity, c.refill_rate))
+}
+
+fn instance_bucket(app: &TestApp) -> Option<(u32, f64)> {
+    Some((
+        app.state.config.default_rate_limit_capacity,
+        app.state.config.default_rate_limit_refill_rate,
+    ))
+}
+
+#[tokio::test]
+#[serial]
+async fn a_client_created_without_overrides_gets_the_instance_rate_limit() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/api-clients",
+            app.admin_cookie(),
+            &sample_api_client_body(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = json_body(resp).await;
+
+    let client_key = created["client_key"].as_str().unwrap();
+    assert_eq!(bucket(&app, client_key), instance_bucket(&app));
+}
+
+#[tokio::test]
+#[serial]
+async fn clearing_a_clients_overrides_returns_it_to_the_instance_rate_limit() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut body = sample_api_client_body();
+    body["rate_limit_capacity"] = json!(7);
+    body["rate_limit_refill_rate"] = json!(0.5);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/api-clients", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = json_body(resp).await;
+    let id = created["id"].as_str().unwrap();
+    let client_key = created["client_key"].as_str().unwrap();
+    assert_eq!(bucket(&app, client_key), Some((7, 0.5)));
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            &format!("/admin/api-clients/{id}"),
+            app.admin_cookie(),
+            &json!({ "rate_limit_capacity": null, "rate_limit_refill_rate": null }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(bucket(&app, client_key), instance_bucket(&app));
+}
+
 // Self-service client creation tests removed — the /oauth/api-clients route
 // no longer exists. The XRPC equivalent (dev.happyview.createApiClient) is
 // tested in tests/dev_happyview.rs.

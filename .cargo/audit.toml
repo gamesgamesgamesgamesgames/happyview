@@ -8,12 +8,6 @@ ignore = [
     # fxhash: unmaintained (warning, not a vulnerability). Transitive dependency
     # of wasmtime (via fxprof-processed-profile); not removable independently.
     "RUSTSEC-2025-0057",
-    # webpki-roots: distrusted emSign root, patched only in 1.0.10. The lockfile
-    # has 1.0.10, but tokio-tungstenite (0.29 and 0.30 alike) depends on 0.26,
-    # whose last release is a shim that re-exports 1.x and so carries 1.0.10's
-    # roots. The advisory matches the shim by version number alone. Remove this
-    # once tokio-tungstenite depends on webpki-roots 1.
-    "RUSTSEC-2026-0381",
     # crypto-bigint 0.5.5: timing variability in operations meant to be
     # constant-time, fixed only in 0.7.6. The 0.7 copy is updated; 0.5.5 comes
     # from elliptic-curve 0.13 under p256 0.13, which atrium-oauth 0.1.7 and

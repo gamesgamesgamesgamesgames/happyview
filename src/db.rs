@@ -228,6 +228,91 @@ fn with_sqlite_pragmas(
 pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
 pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
 
+/// Migrations a stable branch applied under a version alpha had already given
+/// to another migration, as `(stable version, alpha version, description)`.
+/// See `migrations/renumbered.tsv`.
+pub(crate) fn renumbered_migrations() -> Vec<(i64, i64, &'static str)> {
+    include_str!("../migrations/renumbered.tsv")
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let mut version = || {
+                fields
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("migrations/renumbered.tsv: a version")
+            };
+            let (from, to) = (version(), version());
+            let description = fields
+                .next()
+                .expect("migrations/renumbered.tsv: a description");
+            (from, to, description)
+        })
+        .collect()
+}
+
+/// Move a database's record of each renumbered migration to the version alpha
+/// carries it under, so the migrator finds the file it ran and runs the one
+/// alpha keeps at the old version.
+///
+/// A row is moved only when its description and checksum are those of the file
+/// alpha carries at the new version, which is byte for byte the one the stable
+/// branch ran, and nothing holds the new version yet. Anything else is left for
+/// the migrator to report. The move is one statement, so a boot that stops
+/// after it, or any later boot, finds nothing left to move. On Postgres it runs
+/// under the migration lock, so two instances booting together can't both act.
+async fn renumber_stable_migrations(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    migrator: &Migrator,
+) -> Result<(), sqlx::Error> {
+    let exists = match backend {
+        DatabaseBackend::Sqlite => {
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations'"
+        }
+    };
+    let found: Option<(i32,)> = crate::db::query_as(exists)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if found.is_none() {
+        return Ok(());
+    }
+    for (from, to, description) in renumbered_migrations() {
+        let Some(carried) = migrator.iter().find(|m| m.version == to) else {
+            continue;
+        };
+        let sql = adapt_sql(
+            "UPDATE _sqlx_migrations SET version = ? \
+             WHERE version = ? AND description = ? AND checksum = ? \
+             AND NOT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = ?)",
+            backend,
+        );
+        let moved = crate::db::query(&sql)
+            .bind(to)
+            .bind(from)
+            .bind(description)
+            .bind(carried.checksum.to_vec())
+            .bind(to)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        if moved > 0 {
+            tracing::info!(
+                from,
+                to,
+                description,
+                "moved a stable migration to its alpha version"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Install sqlx's `Any` drivers and register the record store's SQLite
 /// functions (`record_store::sqlite_functions`), which must happen before
 /// the first SQLite connection opens. Call this, not
@@ -347,6 +432,7 @@ pub async fn migrate(pool: &AnyPool, backend: DatabaseBackend) {
     let migrated: Result<(), MigrateFailure> = match backend {
         DatabaseBackend::Sqlite => {
             async {
+                renumber_stable_migrations(&mut *pool.acquire().await?, backend, migrator).await?;
                 migrator.run(pool).await?;
                 crate::record_store::upgrade::run(pool, backend).await?;
                 Ok(())
@@ -447,6 +533,7 @@ async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), Mig
         // `run` would do, but its `Acquire` bound is not general enough for
         // the compiler to prove `connect`'s future `Send`. `run_direct` is
         // what `run` calls once it has the connection.
+        renumber_stable_migrations(&mut conn, DatabaseBackend::Postgres, migrator).await?;
         migrator.run_direct(None, &mut *conn, false).await?;
         // On the lock's own connection: it stays busy (no idle session the
         // server could drop mid-copy), and a one-connection pool suffices.
@@ -508,18 +595,18 @@ pub fn compute_backfill_pool_size(
         .max(1)
 }
 
-pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
+/// The backfill pool, sized for the crawl concurrency a job will run with:
+/// [`crate::admin::settings::backfill_concurrency`] read from `settings`, the
+/// migrated main pool, so a setting saved from the dashboard counts.
+pub async fn connect_backfill_pool(
+    url: &str,
+    backend: DatabaseBackend,
+    settings: &AnyPool,
+) -> AnyPool {
     install_drivers();
 
-    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
-    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+    let (pds, dids, resolution) =
+        crate::admin::settings::backfill_concurrency(settings, backend).await;
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);
 
     tracing::info!(max_connections, "backfill pool sized");
@@ -867,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_serialization_and_deadlock_codes_are_retryable() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
@@ -931,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_connection_and_shutdown_codes_are_unavailable() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
@@ -1041,6 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_connection_postgres_boot_upgrades_the_record_store() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
             return;
         };
         if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
@@ -1348,6 +1436,42 @@ mod tests {
         );
     }
 
+    /// The pool is sized for the concurrency a crawl will read, which is the
+    /// instance setting when there is one: an operator who raised it from
+    /// the dashboard gets a pool to match at the next start.
+    #[tokio::test]
+    #[serial]
+    async fn the_backfill_pool_is_sized_from_the_instance_settings() {
+        let path = std::env::temp_dir().join(format!("hv-bf-size-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let main = connect(&url, DatabaseBackend::Sqlite).await;
+        let size = |pool: &AnyPool| pool.options().get_max_connections();
+
+        let defaults = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &main).await;
+        assert_eq!(
+            size(&defaults),
+            16,
+            "10 × 3 + 100 + 4, held to SQLite's ceiling"
+        );
+
+        for (key, value) in [
+            ("backfill_concurrent_pds", "2"),
+            ("backfill_concurrent_dids_per_pds", "2"),
+            ("backfill_concurrent_resolution", "3"),
+        ] {
+            crate::admin::settings::put_setting(&main, key, value, DatabaseBackend::Sqlite)
+                .await
+                .unwrap();
+        }
+        let sized = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &main).await;
+        assert_eq!(size(&sized), 11, "2 × 2 + 3 + 4, from the stored settings");
+
+        defaults.close().await;
+        sized.close().await;
+        main.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     #[serial]
     async fn synchronous_normal_reaches_backfill_pool_connections() {
@@ -1359,7 +1483,8 @@ mod tests {
         unsafe {
             std::env::remove_var("SQLITE_SYNCHRONOUS");
         }
-        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite).await;
+        let settings = crate::test_support::migrated_memory_pool().await;
+        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite, &settings).await;
 
         let mut conns = Vec::new();
         for _ in 0..4 {
@@ -1414,5 +1539,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -----------------------------------------------------------------------
+    // pool idle count
+    // -----------------------------------------------------------------------
+
+    // sqlx-core 0.9.0 made a released connection acquirable before counting it
+    // idle, so a concurrent acquire could take it first and wrap `num_idle` to
+    // `usize::MAX`. The pool's maintenance task loops over `0..num_idle()`
+    // without yielding, which pinned a worker thread at 100% CPU. On 0.9.0
+    // this sees the wrapped count within a millisecond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_pool_idle_count_never_wraps() {
+        const MAX: usize = 3;
+        install_drivers();
+        let pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(MAX as u32)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let tasks: Vec<_> = (0..24)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let mut most = 0;
+                    while most <= MAX && std::time::Instant::now() < deadline {
+                        match pool.try_acquire() {
+                            Some(conn) => drop(conn),
+                            None => tokio::task::yield_now().await,
+                        }
+                        most = most.max(pool.num_idle());
+                    }
+                    most
+                })
+            })
+            .collect();
+        for task in tasks {
+            let most = task.await.expect("task");
+            assert!(
+                most <= MAX,
+                "num_idle reached {most} with {MAX} connections"
+            );
+        }
     }
 }

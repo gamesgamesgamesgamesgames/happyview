@@ -67,6 +67,51 @@ export function MonacoEditor({
   const monacoRef = useRef<Monaco | null>(null);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const disposablesRef = useRef<IDisposable[]>([]);
+  // Values the editor has reported through `onChange` that the parent has not
+  // yet rendered back, oldest first. `syncingRef` marks an edit made here,
+  // which is not reported.
+  const pendingRef = useRef<string[]>([]);
+  const syncingRef = useRef(false);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  // `value` reaches the editor only when the parent changed it. A render that
+  // carries back something the editor already reported is behind it: the
+  // keys typed since are in the editor and not yet in `value`, and writing
+  // `value` in would delete them. @monaco-editor/react's own `value` prop does
+  // exactly that whenever a render lands between two keystrokes, so the
+  // editor is given `defaultValue` and kept in step here instead.
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    const echoed = pendingRef.current.indexOf(value);
+    if (echoed >= 0) {
+      pendingRef.current.splice(0, echoed + 1);
+      return;
+    }
+    pendingRef.current = [];
+    if (value !== ed.getValue()) replaceContent(ed, value);
+  }, [value]);
+
+  function replaceContent(ed: editor.IStandaloneCodeEditor, next: string) {
+    syncingRef.current = true;
+    try {
+      if (ed.getOption(monacoRef.current!.editor.EditorOption.readOnly)) {
+        ed.setValue(next);
+      } else {
+        ed.executeEdits("", [
+          {
+            range: ed.getModel()!.getFullModelRange(),
+            text: next,
+            forceMoveMarkers: true,
+          },
+        ]);
+        ed.pushUndoStop();
+      }
+    } finally {
+      syncingRef.current = false;
+    }
+  }
 
   // Providers read the latest declarations and trigger through the ref, so
   // they are registered once per mount.
@@ -108,9 +153,15 @@ export function MonacoEditor({
         <Editor
           height="100%"
           language={language}
-          value={value}
+          defaultValue={value}
           theme={resolvedTheme === "dark" ? "happyview-dark" : "vs"}
-          onChange={(v) => onChange?.(v ?? "")}
+          onChange={(v) => {
+            if (syncingRef.current || !onChange) return;
+            const next = v ?? "";
+            // A parent that never renders a change back must not grow this.
+            if (pendingRef.current.push(next) > 256) pendingRef.current.shift();
+            onChange(next);
+          }}
           loading="Loading editor..."
           path={language === "json" ? "lexicon.json" : undefined}
           beforeMount={(monaco) => {
@@ -135,6 +186,9 @@ export function MonacoEditor({
           onMount={(mounted, monaco) => {
             monacoRef.current = monaco;
             editorRef.current = mounted;
+            // `value` may have moved on while the editor loaded.
+            if (mounted.getValue() !== valueRef.current)
+              replaceContent(mounted, valueRef.current);
             if (language !== "lua") return;
 
             // What HappyView's libraries, lexicons and ctx offer.

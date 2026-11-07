@@ -52,7 +52,7 @@ To see what is installed:
 curl "http://127.0.0.1:3000/admin/plugins?type=interpreter" -H "$AUTH"
 ```
 
-The scripts list also flags each row: `runnable` is `false` when no installed interpreter claims its `script_type`, and the dashboard marks those rows at **Settings → Scripts**.
+The scripts list also flags each row: `runnable` is `false` when no installed interpreter claims its `script_type`, and the dashboard marks those rows at **Integrations → Scripts**.
 
 ### Which interpreter
 
@@ -68,7 +68,7 @@ An upgrade needs `happyview-lua`: every script a v2 instance stored is Lua. The 
 
 ### Installing it
 
-Go to **Settings → Plugins**, click **Add plugin**, pick the project from the catalogue, choose a channel, review the capabilities it asks for, and install. [Installing plugins](plugins.md#from-the-registry) is the reference; three things about it matter here.
+Go to **Integrations → Plugins**, click **Add plugin**, pick the project from the catalogue, choose a channel, review the capabilities it asks for, and install. [Installing plugins](plugins.md#from-the-registry) is the reference; three things about it matter here.
 
 **It is the `alpha` channel.** A project publishes up to three — `latest`, `beta` and `alpha` — and these have published only `alpha` so far. The dashboard picks it for you, because it is the only one the project has; `POST /admin/plugins` does not, and a `registry` install naming no channel asks for `latest` and resolves to nothing. **Switch channel** moves an install later, once there is somewhere to move it to — see [Channels](plugins.md#channels).
 
@@ -89,7 +89,7 @@ A script stored before the upgrade stays in the table untouched and fails the fi
 Two things that matter for the order you do this in:
 
 - **The codemod does not need an interpreter.** It is a source rewrite, so you can migrate every stored script before installing one. Editing a script by hand afterwards does need an interpreter, because the save is validated through it.
-- **`happyview-codemod` is not in the published Docker image.** From a container, use `POST /admin/scripts/{id}/codemod` with `{"apply": true}`, or run the CLI from a source checkout against the same `DATABASE_URL`.
+- **`happyview-codemod` ships in the Docker image.** Run it inside a running container with `docker exec <container> happyview-codemod --database-url "$DATABASE_URL"`, or start one for it with `docker run --rm <image> happyview-codemod ...`. See [Running the codemod](migrating-scripts.md#from-the-cli).
 
 Saving is stricter than running: `POST` / `PATCH /admin/scripts` refuse a Lua body that still references a removed global, with the names in `removed_globals`. The codemod's own apply is the one exception, so a script with markers can be stored once you confirm.
 
@@ -143,7 +143,7 @@ v2 set a one-million-instruction limit and then never enforced it: the hook was 
 
 Jobs are exempt from the first two — running long is what a job is for, and `ctx.job.should_stop()` is its stop.
 
-Both settings resolve database → environment → default, so the **Instruction limit** and **Request wall clock** fields in **Settings → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
+Both settings resolve database → environment → default, so the **Instruction limit** and **Script wall clock** fields in **System → General** take precedence over the environment. A value outside the range is refused on save; an environment value outside it is warned about and the default stands. A change lands in-process and reaches a second instance on the same database within ten seconds.
 
 The wall clock counts only time the script itself runs. Waiting on the host — an HTTP request, a database read — is not charged to it.
 
@@ -167,11 +167,41 @@ The HTTP surface is unaffected. `createSpace` and `listSpaces` accept `spaceType
 
 A record read through a library — `require("happyview.db")`'s `get`, `search` and `records(…)` chains, and `require("happyview.backlinks")` — answers `{uri, did, collection, rkey, cid, indexed_at, record}`, with the stored body verbatim under `record`. v2 answered the body with `uri` written onto it. `cid` is null while the row holds a local write's placeholder, and `indexed_at` is null until Jetstream has echoed the record.
 
-The public XRPC query routes keep their flat body-plus-`uri` shape. That is a client contract, and it did not change — a scriptless lexicon query still answers what it answered in v2.
+The public XRPC query routes keep their flat body-plus-`uri` shape. That is a client contract, and it did not change: a query's script decides what it returns, and a query with no script still answers a `uri` lookup as it did in v2. Anything else a query with no script answered in v2 is gone; see [Queries and procedures need a script](#9-queries-and-procedures-need-a-script).
 
 A script the codemod migrated keeps v2's flat rows, through a shim the codemod inlines; [Migrating Scripts to v3](migrating-scripts.md#polyfills) describes it and how to retire it.
 
-## 9. Building from source
+## 9. Queries and procedures need a script
+
+A query or procedure lexicon no longer names a collection. `target_collection` and the procedure `action` setting (`create`, `update`, `delete`, `upsert`) are removed from the admin API's lexicon and network-lexicon bodies and responses, from the `happyview_lexicons` table and from the dashboard. A script names the collection it reads or writes as a literal, `db.records("xyz.statusphere.status")`, and `ctx.collection` is set only for record events.
+
+With nothing to say which collection to use, HappyView no longer answers a query or procedure on its own:
+
+| Call | v2 with no script | v3 with no script |
+|------|-------------------|-------------------|
+| Query with `?uri=<at-uri>` | That record, as `{"record": {...}}` | Unchanged |
+| Any other query | A page of the target collection | `501 MethodNotImplemented` |
+| Procedure | A create, put or delete on the caller's PDS | `501 MethodNotImplemented` |
+
+The `501` body names the trigger to add a script for:
+
+```json
+{ "error": "MethodNotImplemented", "message": "xyz.statusphere.setStatus has no script. Add one for the trigger xrpc.procedure:xyz.statusphere.setStatus" }
+```
+
+Before you upgrade, list the query and procedure lexicons your clients call that have no script, and write one for each. A script for a v2 default list query is a `db.records(...)` chain; a default procedure is a `record.create` or `record.put` from `happyview.record`. The [script examples](../reference/script-examples/paginated-list.md) cover both.
+
+**The codemod writes the collection in.** A v2 query or procedure that read its `collection` global, or `ctx.collection`, gets the NSID its lexicon's `target_collection` named, as a literal. The migration that drops the column first copies each lexicon's value into a table the codemod reads, so this works on an upgraded instance. In `--file` or `--stdin` mode, pass the NSID with `--collection`. Where the codemod doesn't know it, it leaves a `-- codemod:` marker; see [The collection a query or procedure names](migrating-scripts.md#the-collection-a-query-or-procedure-names).
+
+**Remove `target_collection` and `action` from `happyview.toml`.** A `[lexicons."<nsid>"]` table that still sets either is refused when the file is loaded, with toml's own error naming the line:
+
+```
+happyview.toml:2: unknown field `target_collection`
+```
+
+`happyview check`, boot and a project deploy all fail on it.
+
+## 10. Building from source
 
 A default build compiles no Lua interpreter at all — `mlua` sits behind a non-default `lua-reference` feature. The resulting binary cannot run a script without an interpreter plugin, which is the point.
 
@@ -184,9 +214,9 @@ Two new environment variables, both optional and additive:
 | `PLUGIN_CACHE_DIR` | `plugin-cache` beside the SQLite database, else none | Where compiled plugin modules are kept between restarts. A Postgres instance has no such directory of its own and keeps the cache in memory unless you set this |
 | `HAPPYVIEW_DEFAULT_PLUGINS` | _(none)_ | Comma-separated plugin sources to install once, on the first boot that lists them. Listing a source consents to every capability its manifest declares. Installs run in the background and never delay boot |
 
-## 10. Rolling back
+## 11. Rolling back
 
-v3's own schema change is one irreversible migration: it drops `happyview_plugin_dedup_keys`, a table nothing read or wrote. Nothing else it adds is destructive.
+v3's own schema changes include two irreversible migrations. One drops `happyview_plugin_dedup_keys`, a table nothing read or wrote. The other drops the `target_collection` and `action` columns from `happyview_lexicons`; it copies each lexicon's `target_collection` into `happyview_codemod_collections` first, and keeps no copy of `action`. Nothing else v3 adds is destructive.
 
 That is not the same as a return path. A script the codemod rewrote will not run on v2, since the globals it now reaches through `require` were never there. And if you are skipping v2 releases to get here, their migrations come along too — the spaces work in the 2.x line drops columns outright. Take a database backup before the upgrade.
 
@@ -194,6 +224,7 @@ That is not the same as a return path. A script the codemod rewrote will not run
 
 - [ ] Install an interpreter plugin from the catalogue on the `alpha` channel, and confirm boot no longer warns
 - [ ] Run the codemod over every stored script, and finish any `-- codemod:` markers by hand
+- [ ] Add a script to every query or procedure that had none, and remove `target_collection` and `action` from `happyview.toml`
 - [ ] Install a library plugin for every `happyview.*` module the rewritten scripts require
 - [ ] Confirm `needs_migration` is empty and `runnable` is true for every script
 - [ ] Replace any plugin whose manifest is `api_version` `"1"`, and check the boot log for refusals

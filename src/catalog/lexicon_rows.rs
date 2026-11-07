@@ -14,8 +14,6 @@ pub(crate) struct LoadedRow {
     pub id: String,
     pub lexicon_json: String,
     pub revision: i32,
-    pub target_collection: Option<String>,
-    pub action: Option<String>,
     pub token_cost: Option<i32>,
     pub source: String,
     pub authority_did: Option<String>,
@@ -28,42 +26,26 @@ pub(crate) async fn load_all(db: &AnyPool) -> Result<Vec<LoadedRow>, sqlx::Error
         String,
         String,
         i32,
-        Option<String>,
-        Option<String>,
         Option<i32>,
         String,
         Option<String>,
         i32,
     )> = crate::db::query_as(
-        "SELECT id, lexicon_json, revision, target_collection, action, token_cost, source, authority_did, indexed FROM happyview_lexicons",
+        "SELECT id, lexicon_json, revision, token_cost, source, authority_did, indexed FROM happyview_lexicons",
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(
+            |(id, lexicon_json, revision, token_cost, source, authority_did, indexed)| LoadedRow {
                 id,
                 lexicon_json,
                 revision,
-                target_collection,
-                action,
                 token_cost,
                 source,
                 authority_did,
-                indexed,
-            )| {
-                LoadedRow {
-                    id,
-                    lexicon_json,
-                    revision,
-                    target_collection,
-                    action,
-                    token_cost,
-                    source,
-                    authority_did,
-                    indexed: indexed != 0,
-                }
+                indexed: indexed != 0,
             },
         )
         .collect())
@@ -79,8 +61,6 @@ pub(crate) struct FullRow {
     pub revision: i32,
     pub lexicon_json: String,
     pub backfill: bool,
-    pub action: Option<String>,
-    pub target_collection: Option<String>,
     pub source: String,
     pub authority_did: Option<String>,
     pub last_fetched_at: Option<String>,
@@ -90,15 +70,13 @@ pub(crate) struct FullRow {
     pub indexed: bool,
 }
 
-const FULL_COLUMNS: &str = "id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost, indexed";
+const FULL_COLUMNS: &str = "id, revision, lexicon_json, backfill, source, authority_did, last_fetched_at, created_at, updated_at, token_cost, indexed";
 
 type FullColumns = (
     String,
     i32,
     String,
     i32,
-    Option<String>,
-    Option<String>,
     String,
     Option<String>,
     Option<String>,
@@ -114,15 +92,13 @@ fn full(c: FullColumns) -> FullRow {
         revision: c.1,
         lexicon_json: c.2,
         backfill: c.3 != 0,
-        action: c.4,
-        target_collection: c.5,
-        source: c.6,
-        authority_did: c.7,
-        last_fetched_at: c.8,
-        created_at: c.9,
-        updated_at: c.10,
-        token_cost: c.11,
-        indexed: c.12 != 0,
+        source: c.4,
+        authority_did: c.5,
+        last_fetched_at: c.6,
+        created_at: c.7,
+        updated_at: c.8,
+        token_cost: c.9,
+        indexed: c.10 != 0,
     }
 }
 
@@ -162,13 +138,11 @@ pub(crate) async fn upsert_manual(
 ) -> Result<i32, sqlx::Error> {
     let sql = adapt_sql(
         r#"
-        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, action, token_cost, indexed, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, token_cost, indexed, source, created_at)
+        VALUES (?, ?, ?, ?, ?, 'manual', ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
             backfill = EXCLUDED.backfill,
-            target_collection = EXCLUDED.target_collection,
-            action = EXCLUDED.action,
             token_cost = EXCLUDED.token_cost,
             indexed = EXCLUDED.indexed,
             source = 'manual',
@@ -185,8 +159,6 @@ pub(crate) async fn upsert_manual(
         .bind(id)
         .bind(serde_json::to_string(&lexicon.lexicon_json).unwrap_or_default())
         .bind(if lexicon.backfill { 1_i32 } else { 0_i32 })
-        .bind(&lexicon.target_collection)
-        .bind(lexicon.action.to_optional_str())
         .bind(lexicon.token_cost)
         .bind(if lexicon.indexed { 1_i32 } else { 0_i32 })
         .bind(&now)
@@ -205,12 +177,11 @@ pub(crate) async fn upsert_network(
 ) -> Result<i32, sqlx::Error> {
     let sql = adapt_sql(
         r#"
-        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, indexed, source, authority_did, last_fetched_at, created_at)
-        VALUES (?, ?, ?, ?, ?, 'network', ?, ?, ?)
+        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, indexed, source, authority_did, last_fetched_at, created_at)
+        VALUES (?, ?, ?, ?, 'network', ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
             backfill = EXCLUDED.backfill,
-            target_collection = EXCLUDED.target_collection,
             indexed = EXCLUDED.indexed,
             source = 'network',
             authority_did = EXCLUDED.authority_did,
@@ -226,7 +197,6 @@ pub(crate) async fn upsert_network(
         .bind(id)
         .bind(serde_json::to_string(&lexicon.lexicon_json).unwrap_or_default())
         .bind(if lexicon.backfill { 1_i32 } else { 0_i32 })
-        .bind(&lexicon.target_collection)
         .bind(if lexicon.indexed { 1_i32 } else { 0_i32 })
         .bind(authority_did)
         .bind(&now)

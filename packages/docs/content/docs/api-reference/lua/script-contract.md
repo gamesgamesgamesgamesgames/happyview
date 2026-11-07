@@ -10,7 +10,7 @@ local db = require("happyview.db")
 
 function handle(input, ctx)
   log.info("listing", { trigger = ctx.trigger, limit = input.limit })
-  return db.records(ctx.collection):limit(tonumber(input.limit)):run()
+  return db.records("xyz.statusphere.status"):limit(tonumber(input.limit)):run()
 end
 ```
 
@@ -49,7 +49,7 @@ A script requires only what it uses. The codemod writes its requires in this ord
 
 | Trigger | `input` |
 | --- | --- |
-| `xrpc.query:<nsid>` | The query-string parameters. A parameter the lexicon declares as `integer`, `number` or `boolean` arrives as that Lua type; any other value is a string, and a repeated key is an array of strings |
+| `xrpc.query:<nsid>` | The query-string parameters, already checked against the lexicon. A parameter the lexicon declares as `integer`, `number` or `boolean` arrives as that Lua type, one declared as an `array` arrives as an array even when it was sent once, and a missing parameter with a `default` arrives as its default. Any other value is a string, and a repeated key is an array of strings |
 | `xrpc.procedure:<nsid>` | The request body |
 | `record.index:<nsid>`, `record.create:<nsid>`, `record.update:<nsid>`, `record.delete:<nsid>` | `{ action, uri, did, collection, rkey, record }`. `action` is `"create"`, `"update"` or `"delete"`; `record` is `nil` on delete |
 | `labeler.apply:<nsid>`, `labeler.apply:_actor` | `{ src, uri, val, neg, cts, exp }`. `exp` is absent when the label does not expire |
@@ -66,7 +66,7 @@ Every invocation gets the same keys. A key that does not apply to the trigger is
 | `has_pds_auth` | boolean | `true` when the script can act on a PDS as `caller_did`: a procedure whose caller holds a session, or a job created with `{ auth = true }`. `false` for queries, record events and labels |
 | `env` | table | [Script variables](../admin/script-variables.md), keyed by name. Present for every kind |
 | `method` | string? | Query and procedure: the XRPC method NSID |
-| `collection` | string? | Query and procedure: the lexicon's `target_collection`. Record event: the record's collection |
+| `collection` | string? | Record event: the record's collection. A query or procedure names the collection it reads or writes in the script itself |
 | `params` | table? | Procedure: the query-string parameters. The body is `input` |
 | `delegate_did` | string? | Procedure: the account the caller is delegated to write for |
 | `space` | table? | Query and procedure on a space-scoped request: `{ uri, id, did, authority_did, spaceType, skey }` |

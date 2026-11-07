@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod validate;
+
 /// The type of a lexicon's `main` definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,44 +14,6 @@ pub enum LexiconType {
     Space,
     /// Lexicons with no `main` def or a non-endpoint main type (token, object, string, etc.).
     Definitions,
-}
-
-/// The action a procedure lexicon performs on its target collection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProcedureAction {
-    Create,
-    Update,
-    Delete,
-    /// Backwards-compatible default: sniff for `uri` in input to decide create vs put.
-    Upsert,
-}
-
-impl ProcedureAction {
-    /// Parse an optional action string into a `ProcedureAction`.
-    /// Returns `Upsert` for `None`, or an error for unrecognized values.
-    pub fn from_optional_str(s: Option<&str>) -> Result<Self, String> {
-        match s {
-            None => Ok(Self::Upsert),
-            Some("create") => Ok(Self::Create),
-            Some("update") => Ok(Self::Update),
-            Some("delete") => Ok(Self::Delete),
-            Some("upsert") => Ok(Self::Upsert),
-            Some(other) => Err(format!(
-                "invalid action '{other}': must be create, update, delete, or upsert"
-            )),
-        }
-    }
-
-    /// Convert to an optional string for database storage.
-    /// `Upsert` maps to `None` (the default).
-    pub fn to_optional_str(&self) -> Option<&'static str> {
-        match self {
-            Self::Create => Some("create"),
-            Self::Update => Some("update"),
-            Self::Delete => Some("delete"),
-            Self::Upsert => None,
-        }
-    }
 }
 
 /// Metadata extracted from a raw lexicon JSON document.
@@ -73,10 +37,6 @@ pub struct ParsedLexicon {
     pub raw: Value,
     /// Database revision number.
     pub revision: i32,
-    /// For queries/procedures: the backing record collection NSID.
-    pub target_collection: Option<String>,
-    /// For procedures: the action this procedure performs (create, update, delete, upsert).
-    pub action: ProcedureAction,
     /// Optional per-NSID token cost for rate limiting.
     pub token_cost: Option<u32>,
     /// Optional space type NSID indicating this lexicon is designed for use within spaces of that type.
@@ -89,13 +49,7 @@ pub struct ParsedLexicon {
 
 impl ParsedLexicon {
     /// Parse a lexicon JSON document into a `ParsedLexicon`.
-    pub fn parse(
-        raw: Value,
-        revision: i32,
-        target_collection: Option<String>,
-        action: ProcedureAction,
-        token_cost: Option<u32>,
-    ) -> Result<Self, String> {
+    pub fn parse(raw: Value, revision: i32, token_cost: Option<u32>) -> Result<Self, String> {
         let id = raw
             .get("id")
             .and_then(|v| v.as_str())
@@ -176,8 +130,6 @@ impl ParsedLexicon {
             record_schema,
             raw,
             revision,
-            target_collection,
-            action,
             token_cost,
             space_type,
             space_name,
@@ -186,24 +138,30 @@ impl ParsedLexicon {
     }
 }
 
-/// The structural checks every lexicon passes before it is stored or served:
-/// lexicon version 1 and a string `id` that is a valid NSID. Returns the id.
-/// The admin upload and the project build both call this, so a file cannot
-/// carry a lexicon the upload would refuse.
+/// The checks every lexicon passes before it is stored or served, as one
+/// message per line. Returns the id.
+///
+/// The admin upload and the project build share [`validate::validate`], so a
+/// file cannot carry a lexicon the upload would refuse. They differ only in
+/// how they render it: this joins the errors for a build diagnostic, while the
+/// upload answers one entry per field. Warnings are not refusals and are left
+/// out here.
 pub fn check_document(raw: &Value) -> Result<String, String> {
-    let version = raw
-        .get("lexicon")
-        .and_then(|v| v.as_i64())
-        .ok_or("lexicon JSON must have a numeric 'lexicon' field")?;
-    if version != 1 {
-        return Err(format!("unsupported lexicon version: {version}"));
+    let issues = validate::validate(raw);
+    let errors: Vec<String> = issues
+        .iter()
+        .filter(|i| i.severity == validate::Severity::Error)
+        .map(validate::Issue::render)
+        .collect();
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
-    let id = raw
+    // Valid, so the id is a string and an NSID; validate() proved both.
+    Ok(raw
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or("lexicon JSON must have a string 'id' field")?;
-    happyview_nsid::validate_nsid(id).map_err(|e| e.to_string())?;
-    Ok(id.to_string())
+        .unwrap_or_default()
+        .to_string())
 }
 
 #[cfg(test)]
@@ -313,14 +271,7 @@ mod tests {
 
     #[test]
     fn parse_record_lexicon() {
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(record_lexicon_json(), 1, None).unwrap();
         assert_eq!(parsed.id, "games.gamesgamesgamesgames.game");
         assert_eq!(parsed.lexicon_type, LexiconType::Record);
         assert_eq!(parsed.record_key, Some("tid".into()));
@@ -331,69 +282,31 @@ mod tests {
 
     #[test]
     fn parse_query_lexicon() {
-        let parsed = ParsedLexicon::parse(
-            query_lexicon_json(),
-            2,
-            Some("games.gamesgamesgamesgames.game".into()),
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(query_lexicon_json(), 2, None).unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Query);
         assert!(parsed.parameters.is_some());
         assert!(parsed.output.is_some());
-        assert_eq!(
-            parsed.target_collection,
-            Some("games.gamesgamesgamesgames.game".into())
-        );
         assert_eq!(parsed.revision, 2);
     }
 
     #[test]
     fn parse_procedure_lexicon() {
-        let parsed = ParsedLexicon::parse(
-            procedure_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(procedure_lexicon_json(), 1, None).unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Procedure);
         assert!(parsed.input.is_some());
         assert!(parsed.output.is_some());
     }
 
     #[test]
-    fn parse_procedure_with_action() {
-        let parsed = ParsedLexicon::parse(
-            procedure_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Delete,
-            None,
-        )
-        .unwrap();
-        assert_eq!(parsed.action, ProcedureAction::Delete);
-    }
-
-    #[test]
     fn parse_definitions_lexicon() {
-        let parsed = ParsedLexicon::parse(
-            definitions_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(definitions_lexicon_json(), 1, None).unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Definitions);
     }
 
     #[test]
     fn parse_missing_id_returns_error() {
         let raw = json!({"lexicon": 1, "defs": {}});
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        let result = ParsedLexicon::parse(raw, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("id"));
     }
@@ -401,69 +314,8 @@ mod tests {
     #[test]
     fn parse_preserves_raw_json() {
         let raw = record_lexicon_json();
-        let parsed =
-            ParsedLexicon::parse(raw.clone(), 1, None, ProcedureAction::Upsert, None).unwrap();
+        let parsed = ParsedLexicon::parse(raw.clone(), 1, None).unwrap();
         assert_eq!(parsed.raw, raw);
-    }
-
-    #[test]
-    fn parse_target_collection_passthrough() {
-        let parsed = ParsedLexicon::parse(
-            query_lexicon_json(),
-            1,
-            Some("custom.collection".into()),
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
-        assert_eq!(parsed.target_collection, Some("custom.collection".into()));
-    }
-
-    // -----------------------------------------------------------------------
-    // ProcedureAction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn procedure_action_from_none_is_upsert() {
-        assert_eq!(
-            ProcedureAction::from_optional_str(None).unwrap(),
-            ProcedureAction::Upsert
-        );
-    }
-
-    #[test]
-    fn procedure_action_from_known_values() {
-        assert_eq!(
-            ProcedureAction::from_optional_str(Some("create")).unwrap(),
-            ProcedureAction::Create
-        );
-        assert_eq!(
-            ProcedureAction::from_optional_str(Some("update")).unwrap(),
-            ProcedureAction::Update
-        );
-        assert_eq!(
-            ProcedureAction::from_optional_str(Some("delete")).unwrap(),
-            ProcedureAction::Delete
-        );
-        assert_eq!(
-            ProcedureAction::from_optional_str(Some("upsert")).unwrap(),
-            ProcedureAction::Upsert
-        );
-    }
-
-    #[test]
-    fn procedure_action_from_invalid_returns_error() {
-        let result = ProcedureAction::from_optional_str(Some("invalid"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid"));
-    }
-
-    #[test]
-    fn procedure_action_to_optional_str_roundtrip() {
-        assert_eq!(ProcedureAction::Create.to_optional_str(), Some("create"));
-        assert_eq!(ProcedureAction::Update.to_optional_str(), Some("update"));
-        assert_eq!(ProcedureAction::Delete.to_optional_str(), Some("delete"));
-        assert_eq!(ProcedureAction::Upsert.to_optional_str(), None);
     }
 
     fn space_declaration_lexicon_json() -> Value {
@@ -486,14 +338,7 @@ mod tests {
 
     #[test]
     fn parse_space_declaration_lexicon() {
-        let parsed = ParsedLexicon::parse(
-            space_declaration_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(space_declaration_lexicon_json(), 1, None).unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Space);
         assert_eq!(parsed.space_name.as_deref(), Some("Forum"));
         assert_eq!(
@@ -518,7 +363,7 @@ mod tests {
                 }
             }
         });
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        let result = ParsedLexicon::parse(raw, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("key"));
     }
@@ -536,7 +381,7 @@ mod tests {
                 }
             }
         });
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        let result = ParsedLexicon::parse(raw, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("name"));
     }
@@ -555,7 +400,7 @@ mod tests {
                 }
             }
         });
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        let result = ParsedLexicon::parse(raw, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("1-64"));
     }
@@ -573,7 +418,7 @@ mod tests {
                 }
             }
         });
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        let result = ParsedLexicon::parse(raw, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("collections"));
     }
@@ -597,20 +442,13 @@ mod tests {
                 }
             }
         });
-        let parsed = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None).unwrap();
+        let parsed = ParsedLexicon::parse(raw, 1, None).unwrap();
         assert_eq!(parsed.space_type.as_deref(), Some("com.example.forum"));
     }
 
     #[test]
     fn parse_space_type_none_by_default() {
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-        )
-        .unwrap();
+        let parsed = ParsedLexicon::parse(record_lexicon_json(), 1, None).unwrap();
         assert!(parsed.space_type.is_none());
     }
 }

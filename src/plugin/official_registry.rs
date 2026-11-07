@@ -85,6 +85,12 @@ pub struct CatalogueEntry {
     pub sections: PluginSections,
     /// The project's own lifecycle state.
     pub lifecycle_state: String,
+    /// What the project looked like in `searchProjects` when this entry was
+    /// built, so a later refresh can tell an unchanged project from one that
+    /// has moved without reading its versions again. Internal to the cache:
+    /// never serialised, so the catalogue's wire shape does not carry it.
+    #[serde(skip)]
+    pub fingerprint: String,
 }
 
 /// The four long-form fields a plugin version's artifact carries. CommonMark
@@ -128,6 +134,13 @@ impl OfficialRegistryState {
 }
 
 pub type SharedRegistry = Arc<RwLock<OfficialRegistryState>>;
+
+/// How often the catalogue is re-read.
+pub const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// One pass in four reads every project's versions, so with
+/// [`REFRESH_INTERVAL`] at 15 minutes a full read happens hourly.
+pub const FULL_REFRESH_EVERY: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct RegistryConfig {
@@ -232,6 +245,7 @@ pub async fn refresh_full(
     config: &RegistryConfig,
     state: &SharedRegistry,
     installed: &[(String, String)],
+    mode: super::registry_source::RefreshMode,
 ) -> Result<(), RegistryError> {
     if config.disabled {
         return Ok(());
@@ -240,11 +254,30 @@ pub async fn refresh_full(
         return Ok(());
     };
 
-    let listing = super::registry_source::fetch_listing(client, source).await?;
+    // Keyed the way the listing is read, by publisher and name, so a project
+    // that has not moved since the last refresh is answered from here rather
+    // than by reading its versions again.
+    let cached: HashMap<(String, String), CatalogueEntry> = {
+        let previous = state.read().await;
+        previous
+            .plugins
+            .values()
+            .chain(previous.installed.values())
+            .filter_map(|e| {
+                e.publisher_did
+                    .clone()
+                    .map(|did| ((did, e.id.clone()), e.clone()))
+            })
+            .collect()
+    };
+
+    let listing = super::registry_source::fetch_listing(client, source, mode, &cached).await?;
     let mut listed = listing.entries;
     tracing::info!(
         count = listed.len(),
         unreadable = listing.unreadable.len(),
+        reused = listing.reused,
+        mode = ?mode,
         "official_registry: catalogue read from the registry"
     );
     // A project listed but unreadable this time keeps the entry the cache
@@ -312,6 +345,7 @@ pub async fn refresh_for_installs(
     state: &SharedRegistry,
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
+    mode: super::registry_source::RefreshMode,
 ) -> Result<(), RegistryError> {
     // Without the list, the catalogue still refreshes; installed projects
     // shadowed by another publisher's name just go stale until next time.
@@ -319,7 +353,7 @@ pub async fn refresh_for_installs(
         tracing::warn!(error = %e, "official_registry: installed projects unreadable");
         Vec::new()
     });
-    refresh_full(client, config, state, &installed).await?;
+    refresh_full(client, config, state, &installed, mode).await?;
     if let Err(e) = attach_url_installs(client, config, state, db, backend).await {
         tracing::warn!(error = %e, "official_registry: url installs not matched to registry projects");
     }
@@ -530,6 +564,13 @@ pub async fn refresh_project(
 
 /// Background task: run `refresh_full` on startup, then every 15 minutes.
 /// Spawns nothing, and answers `None`, when the catalogue is off.
+///
+/// Every [`FULL_REFRESH_EVERY`]th pass reads every project's versions; the
+/// rest read versions only for the projects `searchProjects` shows as having
+/// moved. The periodic full pass is what eventually picks up the things a
+/// project listing cannot show -- a version flagged suspect, a lifecycle
+/// change on a version no channel points at -- none of which gate an
+/// install, since installing re-reads the version from the registry.
 pub fn spawn_refresh_task(
     client: reqwest::Client,
     config: RegistryConfig,
@@ -544,12 +585,22 @@ pub fn spawn_refresh_task(
         return None;
     }
     Some(tokio::spawn(async move {
+        // Counts passes, so the first is full: a fresh cache has nothing to
+        // reuse, and starting full means an instance never serves a
+        // part-built catalogue.
+        let mut pass: u64 = 0;
         loop {
-            match refresh_for_installs(&client, &config, &state, &db, backend).await {
-                Ok(()) => tracing::info!("official_registry: cache refreshed"),
+            let mode = if pass.is_multiple_of(FULL_REFRESH_EVERY) {
+                super::registry_source::RefreshMode::Full
+            } else {
+                super::registry_source::RefreshMode::Incremental
+            };
+            match refresh_for_installs(&client, &config, &state, &db, backend, mode).await {
+                Ok(()) => tracing::info!(mode = ?mode, "official_registry: cache refreshed"),
                 Err(e) => tracing::warn!(error = %e, "official_registry: refresh failed"),
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+            pass = pass.wrapping_add(1);
+            tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     }))
 }
@@ -585,6 +636,7 @@ mod tests {
             channels: Default::default(),
             latest_version: Some("1.0.0".into()),
             lifecycle_state: "active".into(),
+            fingerprint: String::new(),
             releases: vec![],
             sections: Default::default(),
             banner_url: None,
@@ -665,9 +717,15 @@ mod tests {
     async fn an_off_catalogue_refreshes_nothing_and_checks_refuse() {
         let (server, off) = unreachable_sources(true).await;
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
-        refresh_full(&reqwest::Client::new(), &off, &state, &[])
-            .await
-            .unwrap();
+        refresh_full(
+            &reqwest::Client::new(),
+            &off,
+            &state,
+            &[],
+            crate::plugin::registry_source::RefreshMode::Full,
+        )
+        .await
+        .unwrap();
         assert!(state.read().await.last_refreshed_at.is_none());
         assert!(matches!(
             refresh_plugin(&reqwest::Client::new(), &off, &state, "lua").await,
@@ -760,9 +818,15 @@ mod tests {
             .await;
 
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
-        refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[])
-            .await
-            .unwrap();
+        refresh_full(
+            &reqwest::Client::new(),
+            &registry_at(&server),
+            &state,
+            &[],
+            crate::plugin::registry_source::RefreshMode::Full,
+        )
+        .await
+        .unwrap();
         let guard = state.read().await;
         assert_eq!(guard.plugins.len(), 2);
         assert!(
@@ -786,8 +850,14 @@ mod tests {
             .await;
 
         let state = cached_official_lua();
-        let result =
-            refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[]).await;
+        let result = refresh_full(
+            &reqwest::Client::new(),
+            &registry_at(&server),
+            &state,
+            &[],
+            crate::plugin::registry_source::RefreshMode::Full,
+        )
+        .await;
         assert!(
             matches!(result, Err(RegistryError::Registry(_))),
             "{result:?}"
@@ -831,8 +901,14 @@ mod tests {
             .await;
 
         let state = cached_official_lua();
-        let result =
-            refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[]).await;
+        let result = refresh_full(
+            &reqwest::Client::new(),
+            &registry_at(&server),
+            &state,
+            &[],
+            crate::plugin::registry_source::RefreshMode::Full,
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -878,9 +954,15 @@ mod tests {
         list_versions_answers(&server, STRANGER, "extra", "0.1.0").await;
 
         let state = cached_official_lua();
-        refresh_full(&reqwest::Client::new(), &registry_at(&server), &state, &[])
-            .await
-            .unwrap();
+        refresh_full(
+            &reqwest::Client::new(),
+            &registry_at(&server),
+            &state,
+            &[],
+            crate::plugin::registry_source::RefreshMode::Full,
+        )
+        .await
+        .unwrap();
         let guard = state.read().await;
         assert_eq!(guard.plugins.len(), 2);
         assert_eq!(

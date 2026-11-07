@@ -32,16 +32,16 @@ fn types(args: &[&str]) -> (i32, String, String) {
 /// The fixtures this file needs, or why it is skipping.
 fn built() -> bool {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return false;
     }
     if !Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(HTTP_WASM)
         .exists()
     {
-        eprintln!(
-            "skipping: sdk_http fixture not built. Run: cargo build --manifest-path \
-             tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release"
+        happyview::test_support::unavailable(
+            "sdk_http fixture not built. Run: cargo build --manifest-path \
+             tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release",
         );
         return false;
     }

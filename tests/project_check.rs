@@ -27,7 +27,7 @@ const ECHO: &str = "tests/fixtures/interpreter_echo";
 #[test]
 fn a_project_that_builds_passes() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let (code, stdout, stderr) = check(&["tests/fixtures/projects/basic", "--plugin", ECHO]);
@@ -45,7 +45,7 @@ fn a_project_that_builds_passes() {
 #[test]
 fn a_project_that_does_not_build_prints_every_error_and_fails() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let (code, stdout, _) = check(&["tests/fixtures/projects/broken", "--plugin", ECHO]);
@@ -131,7 +131,7 @@ fn file<'a>(report: &'a serde_json::Value, path: &str) -> &'a serde_json::Value 
 #[test]
 fn json_outlines_a_project_that_builds() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let (code, report) = check_json(&["tests/fixtures/projects/basic", "--plugin", ECHO]);
@@ -190,7 +190,7 @@ fn json_outlines_a_project_that_builds() {
 #[test]
 fn json_still_outlines_a_project_that_does_not_build() {
     if !echo_interpreter::is_built() {
-        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        happyview::test_support::unavailable(echo_interpreter::BUILD);
         return;
     }
     let (code, report) = check_json(&["tests/fixtures/projects/broken", "--plugin", ECHO]);
