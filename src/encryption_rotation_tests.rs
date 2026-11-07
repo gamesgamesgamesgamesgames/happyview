@@ -599,13 +599,14 @@ async fn seed_everything_under_the_old_key(
     .await
     .unwrap();
     crate::db::query(&crate::db::adapt_sql(
-        "INSERT INTO happyview_space_authorities (did, signing_key_enc, kem_key_enc, rotation_key_enc, genesis_op, plc_state, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', 'published', 'did:plc:owner', ?, ?)",
+        "INSERT INTO happyview_space_authorities (did, signing_key_enc, kem_key_enc, rotation_key_enc, genesis_op, plc_state, created_by, space_type, skey, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', 'published', 'did:plc:owner', 'com.example.rotation', ?, ?, ?)",
         backend,
     ))
     .bind(format!("did:plc:{}-authority", seeded.space_did_id))
     .bind(encrypt(&OLD, b"authority-signing").unwrap())
     .bind(encrypt(&OLD, b"authority-kem").unwrap())
     .bind(encrypt(&OLD, b"authority-rotation").unwrap())
+    .bind(&seeded.space_did_id)
     .bind(now_rfc3339())
     .bind(now_rfc3339())
     .execute(pool)
