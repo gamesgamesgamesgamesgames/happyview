@@ -692,15 +692,26 @@ async fn notify_write_accepts_the_bare_authority_did_as_audience() {
 /// Create a space through `createSpace` as `creator`, returning its uri. It is
 /// created on a DID of its own.
 async fn create_space_on_its_own_did(app: &TestApp, creator: &str) -> String {
+    create_space_on_its_own_did_with(app, creator, json!({})).await
+}
+
+/// `create_space_on_its_own_did`, with `extra` merged into the request.
+async fn create_space_on_its_own_did_with(
+    app: &TestApp,
+    creator: &str,
+    extra: serde_json::Value,
+) -> String {
     let (name, value) = common::auth::admin_cookie_header(creator, &app.state.cookie_key);
+    let mut body = json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
     let req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.simplespace.createSpace")
         .header(name, value)
         .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY }).to_string(),
-        ))
+        .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -874,4 +885,214 @@ async fn a_space_on_its_own_did_forwards_notifications_signed_as_it() {
     verifying
         .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
         .expect("signed with the space DID's #atproto key");
+}
+
+fn space_did_of(space: &str) -> String {
+    space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A space on its own DID asks its managing app with service auth signed as
+/// that DID.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    let managing_app = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
+        .mount(&managing_app)
+        .await;
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "writePolicy": {
+            "$type": "com.atproto.simplespace.defs#managingAppPolicy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+
+    let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &newcomer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": newcomer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let asked = managing_app.received_requests().await.unwrap();
+    assert_eq!(asked.len(), 1, "the managing app is asked once");
+    let authorization = asked[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, &space_did).await;
+}
+
+/// A space on its own DID tells its registered syncers it was deleted with
+/// service auth signed as that DID.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_announces_its_deletion_as_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &creator).await;
+    let space_did = space_did_of(&space);
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &space_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.notifySpaceDeleted"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&syncer)
+        .await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let (name, value) = common::auth::admin_cookie_header(&creator, &app.state.cookie_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.deleteSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    assert!(
+        app.router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let mut received = Vec::new();
+    for _ in 0..50 {
+        received = syncer.received_requests().await.unwrap_or_default();
+        if !received.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(received.len(), 1, "the syncer is told once");
+    let authorization = received[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, &space_did).await;
+}
+
+/// Service auth addressed to one space's DID is refused on another space's
+/// routes, though this instance holds both DIDs.
+#[tokio::test]
+#[serial]
+async fn service_auth_for_one_space_is_refused_on_another() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let other = create_space_on_its_own_did_with(&app, &writer, json!({ "skey": "other" })).await;
+    let other_did = space_did_of(&other);
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &other_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

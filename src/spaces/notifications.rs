@@ -318,14 +318,20 @@ async fn webhook_worker(
             }
         };
         let keyring = state.config.keyring();
-        // A space deleted while its batch waited has no authority to sign as;
-        // its deliveries are then signed as this instance.
-        let authority_did = db::get_space(&state.db, state.db_backend, &space_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|space| space.authority_did)
-            .unwrap_or_default();
+        // Deliveries are signed as the space's authority. A batch whose space
+        // cannot be read, or was deleted while it waited, is dropped rather
+        // than signed as someone else.
+        let authority_did = match db::get_space(&state.db, state.db_backend, &space_id).await {
+            Ok(Some(space)) => space.authority_did,
+            Ok(None) => {
+                tracing::debug!(space_id, "dropping webhook batch for a deleted space");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(space_id, error = %e, "dropping webhook batch: its space could not be read");
+                continue;
+            }
+        };
         let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
             encryption_key,
             public_url: &state.config.public_url,
@@ -1058,6 +1064,59 @@ mod tests {
         verifying
             .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
             .expect("the receiver can verify it against the instance's DID document key");
+    }
+
+    /// A space on its own DID signs its webhook deliveries as that DID, with
+    /// its `#atproto` key, not as this instance.
+    #[tokio::test]
+    async fn a_space_on_its_own_did_signs_its_webhooks_as_it() {
+        const SPACE_KEY: [u8; 32] = [0x44; 32];
+        const SPACE_DID: &str = "did:plc:spaceofitsown";
+        let (pool, backend) = pool(true).await;
+        let sealed = crate::plugin::encryption::encrypt(
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            &SPACE_KEY,
+        )
+        .unwrap();
+        crate::db::query(
+            "INSERT INTO happyview_space_authorities (did, signing_key_enc, kem_key_enc, rotation_key_enc, genesis_op, plc_state, created_by, space_type, skey, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', 'published', 'did:plc:creator', 'com.example.forum', 'main', '', '')",
+        )
+        .bind(SPACE_DID)
+        .bind(sealed.clone())
+        .bind(sealed.clone())
+        .bind(sealed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let delivery = Delivery::new().await;
+        let plc = plc_listing(&delivery.receiver.uri()).await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(WebhookSigner {
+                    authority_did: SPACE_DID,
+                    ..signer(&keyring, &plc.uri())
+                }),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
+
+        let (claims, parts) = claims(&request);
+        assert_eq!(claims["iss"], SPACE_DID);
+        assert_eq!(claims["aud"], SERVICE);
+        let verifying = *p256::ecdsa::SigningKey::from_slice(&SPACE_KEY)
+            .unwrap()
+            .verifying_key();
+        let signature =
+            p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(&parts[2]).unwrap())
+                .unwrap();
+        verifying
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("signed with the space DID's key");
     }
 
     #[tokio::test]
