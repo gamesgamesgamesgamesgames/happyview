@@ -23,9 +23,8 @@ const PROTECTED_EXACT_TABLES: &[&str] = &["_sqlx_migrations"];
 /// material, and every space table.
 ///
 /// Space tables are reached only through `happyview.spaces`, which applies the
-/// space's access rules for its caller. Raw SQL would see every space's
-/// members and records whatever those rules say, and could change who is a
-/// member.
+/// space's access rules for its caller. Raw SQL reads and writes rows
+/// directly, outside those rules.
 const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     // Public AppView data.
     "happyview_records",
