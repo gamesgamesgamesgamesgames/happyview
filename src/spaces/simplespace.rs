@@ -39,6 +39,9 @@ pub(crate) struct CreateSpaceInput {
     /// The legacy policy's managing app, sent beside it rather than inside.
     pub managing_app: Option<String>,
     pub managing_app_did: Option<String>,
+    /// A did:key the creator holds, listed as a rotation key of the space's
+    /// DID ahead of this instance's, so the creator can move the space.
+    pub rotation_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +297,7 @@ async fn create_space(
         parse_policy(input.write_policy, "writePolicy")?.or(legacy),
         parse_app_access(input.app_access)?,
         input.config,
+        input.rotation_key.as_deref(),
     )
     .await?;
     let space_uri = format!(

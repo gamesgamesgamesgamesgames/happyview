@@ -249,10 +249,20 @@ pub fn sign_credential_with_key(
     claims: &SpaceCredentialClaims,
     signing_key: &SigningKey,
 ) -> Result<String, AppError> {
+    sign_credential_with_kid(claims, signing_key, "#atproto_space")
+}
+
+/// Sign a credential with a P-256 key, naming it `kid` in the header. A space
+/// on its own DID names `#atproto`, as Proposal 0016 requires.
+pub fn sign_credential_with_kid(
+    claims: &SpaceCredentialClaims,
+    signing_key: &SigningKey,
+    kid: &str,
+) -> Result<String, AppError> {
     let header = serde_json::json!({
         "alg": "ES256",
         "typ": SPACE_CREDENTIAL_TYP,
-        "kid": "#atproto_space",
+        "kid": kid,
     });
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());

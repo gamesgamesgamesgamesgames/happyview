@@ -306,6 +306,7 @@ pub async fn create(
         write_policy,
         app_access,
         config,
+        None,
     )
     .await?;
     Ok(space_info(&space))
@@ -693,7 +694,14 @@ mod tests {
     #[serial(spaces_feature_flag)]
     async fn create_then_info_round_trips_every_field() {
         require_test_db!();
-        let state = db_test_state().await;
+        let mut state = db_test_state().await;
+        // Creating a space publishes its own did:plc.
+        let plc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
         enable_spaces_feature(&state).await;
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let did = format!("did:plc:creator{unique}");
@@ -716,8 +724,9 @@ mod tests {
         .expect("create should succeed");
         assert_eq!(created.display_name.as_deref(), Some("Main forum"));
         assert_eq!(created.description.as_deref(), Some("The default forum"));
-        assert_eq!(created.did, did);
-        assert_eq!(created.authority_did, did);
+        assert!(created.did.starts_with("did:plc:"));
+        assert_ne!(created.did, did);
+        assert_eq!(created.authority_did, created.did);
         assert_eq!(created.creator_did, did);
 
         let fetched = info(

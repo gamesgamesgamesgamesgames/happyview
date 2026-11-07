@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
@@ -215,6 +215,11 @@ struct RevokeInviteInput {
 #[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
     space: String,
+    /// The P-256 did:key the credential is bound to. Every request using the
+    /// credential is signed by it.
+    credential_kid: String,
+    /// Establishes the user being acted for, for spaces that gate on users.
+    delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
     client_attestation: Option<String>,
 }
@@ -392,6 +397,10 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         (
             format!("{PROTO_NS}.space.notifySpaceDeleted"),
             post(notify_space_deleted),
+        ),
+        (
+            format!("{PROTO_NS}.space.notifyCredentialRevoked"),
+            post(notify_credential_revoked),
         ),
         (format!("{PROTO_NS}.space.getBlob"), get(get_space_blob)),
     ]
@@ -1310,7 +1319,9 @@ async fn get_delegation_token(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let space_host = format!("{}#atproto_space_host", space.did);
+    // Proposal 0016 addresses a delegation token to the space host as the
+    // authority's `#atproto_pds`.
+    let space_host = format!("{}#atproto_pds", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
         sub: space_uri,
@@ -2000,114 +2011,161 @@ async fn notify_space_deleted(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// Exchange a delegation token for a space credential bound to the caller's key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyCredentialRevokedInput {
+    space: String,
+    credentials: Vec<String>,
+}
+
+/// The most `jti`s one `notifyCredentialRevoked` call may name.
+const MAX_REVOKED_PER_NOTIFICATION: usize = 100;
+
+/// A space authority revoking credentials before they expire.
 ///
-/// The delegation token is the request's authorization token, and an
-/// `atproto-space` HTTP Message Signature over it proves possession of the key
-/// the credential is bound to. No account session is involved: the delegation
-/// token is the account's consent, and the credential goes to whoever holds the
-/// key.
+/// This instance accepts only credentials it issued, so a revocation marks its
+/// own records, which every credential check reads. Service auth from the
+/// space's authority is required. Repeating a revocation changes nothing.
+async fn notify_credential_revoked(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Json(input): Json<NotifyCredentialRevokedInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let caller = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.did.clone())
+        .ok_or_else(|| {
+            AppError::Auth("service auth from the space authority is required".into())
+        })?;
+    if input.credentials.is_empty()
+        || input.credentials.len() > MAX_REVOKED_PER_NOTIFICATION
+        || input.credentials.iter().any(|jti| jti.is_empty())
+    {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: format!(
+                "credentials must name 1 to {MAX_REVOKED_PER_NOTIFICATION} non-empty jtis"
+            ),
+        });
+    }
+    let space = service::resolve_space(&state, &input.space)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "SpaceNotFound",
+                message: "space not found".into(),
+            },
+            e => e,
+        })?;
+    if caller != space.authority_did {
+        return Err(AppError::Forbidden(
+            "only the space's authority may revoke its credentials".into(),
+        ));
+    }
+    db::revoke_space_credentials_by_jti(&state.db, state.db_backend, &space.id, &input.credentials)
+        .await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Issue a space credential bound to the key the request names.
+///
+/// The request carries whichever assertions the space requires: a delegation
+/// token from the user's PDS for a space that gates on users, and a client
+/// attestation for one that gates on apps. Neither is an authorization header,
+/// and an assertion the space does not require is still verified, never held
+/// against the request.
 async fn get_space_credential(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(input): Json<GetSpaceCredentialInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::Auth("a delegation token is required".into()))?
-        .to_string();
-    let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
+    let refused = |code: &'static str, message: String| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        message,
+    };
+    if !crate::spaces::http_signature::is_p256_did_key(&input.credential_kid) {
+        return Err(refused(
+            "InvalidRequest",
+            "credentialKid must be a P-256 did:key".into(),
+        ));
+    }
 
     let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let space = service::resolve_space(&state, &input.space).await?;
-    // An authority that publishes no #atproto_space_host is reached at its
-    // #atproto_pds endpoint, so a token may name either.
-    let space_host_aud = format!("{}#atproto_space_host", space.did);
-    let pds_aud = format!("{}#atproto_pds", space.did);
-    let accepted_aud = [space_host_aud.as_str(), pds_aud.as_str()];
-
-    // A PDS that serves spaces mints delegation tokens with the account's own
-    // key. For accounts on one that does not, HappyView mints them with its own
-    // delegation key.
-    // A key that cannot be read leaves only the account's own key to try, as
-    // a token this instance signed cannot be verified without it anyway.
-    let local_key =
-        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "delegation key unreadable");
-                None
-            });
-    let local_claims = local_key.as_ref().map(|key| {
-        crate::spaces::credential::verify_delegation_token(
-            &token,
-            key.verifying_key(),
-            &accepted_aud,
-        )
-    });
-    let delegation_claims = match local_claims {
-        Some(Ok(claims)) => claims,
-        _ => crate::spaces::credential::verify_account_delegation_token(
-            &token,
-            &state.http,
-            &state.config.plc_url,
-            &accepted_aud,
-        )
+    let space = service::resolve_space(&state, &input.space)
         .await
-        .map_err(|e| AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: e.to_string(),
-        })?,
-    };
+        .map_err(|e| match e {
+            AppError::NotFound(_) => refused("SpaceNotFound", "space not found".into()),
+            e => e,
+        })?;
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    if delegation_claims.sub != space_uri {
-        return Err(AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: "delegation token is for a different space".into(),
-        });
-    }
-    if !db::consume_delegation_token(
-        &state.db,
-        state.db_backend,
-        &delegation_claims.iss,
-        &delegation_claims.jti,
-        delegation_claims.exp,
-    )
-    .await?
-    {
-        return Err(AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: "delegation token has already been used".into(),
-        });
-    }
+    // Proposal 0016 addresses both assertions to the space host, the
+    // authority's `#atproto_pds`.
+    let host_aud = format!("{}#atproto_pds", space.did);
+
+    let subject = match &input.delegation_token {
+        Some(token) => {
+            Some(verify_delegation(&state, encryption_key, token, &space_uri, &host_aud).await?)
+        }
+        None => None,
+    };
 
     let client_id = match &input.client_attestation {
-        Some(attestation) => Some(
-            crate::spaces::client_attestation::verify_client_attestation(
+        Some(attestation) => {
+            let verified = crate::spaces::client_attestation::verify_client_attestation(
                 attestation,
-                &space.authority_did,
+                &host_aud,
                 &state.http,
             )
             .await
-            .map_err(|e| AppError::XrpcError {
-                status: StatusCode::BAD_REQUEST,
-                code: "InvalidClientAttestation",
-                message: e.to_string(),
-            })?
-            .client_id,
-        ),
+            .map_err(|e| refused("InvalidClientAttestation", e.to_string()))?;
+            if !db::consume_delegation_token(
+                &state.db,
+                state.db_backend,
+                &verified.client_id,
+                &verified.jti,
+                verified.exp,
+            )
+            .await?
+            {
+                return Err(refused(
+                    "InvalidClientAttestation",
+                    "client attestation has already been used".into(),
+                ));
+            }
+            Some(verified.client_id)
+        }
         None => None,
+    };
+
+    crate::spaces::auth::check_app_access(&space, client_id.as_deref()).map_err(|e| {
+        AppError::XrpcError {
+            status: StatusCode::FORBIDDEN,
+            code: "AppNotAuthorized",
+            message: e.to_string(),
+        }
+    })?;
+
+    // A space that anyone may read needs no user; any other has to know who
+    // it is issuing to.
+    let subject = match subject {
+        Some(subject) => subject,
+        None if space.read_policy == crate::spaces::types::Policy::Public => String::new(),
+        None => {
+            return Err(AppError::XrpcError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "UserNotAuthorized",
+                message: "this space requires a delegation token".into(),
+            });
+        }
     };
 
     let issued = crate::spaces::auth::issue_credential(
@@ -2118,17 +2176,88 @@ async fn get_space_credential(
         &state.config.public_url,
         &state.config.plc_url,
         &space,
-        &delegation_claims.iss,
+        &subject,
         client_id.as_deref(),
         &space.authority_did,
-        Some(&bound_key),
+        Some(&input.credential_kid),
     )
-    .await?;
+    .await
+    .map_err(|e| match e {
+        AppError::Forbidden(message) => AppError::XrpcError {
+            status: StatusCode::FORBIDDEN,
+            code: "UserNotAuthorized",
+            message,
+        },
+        e => e,
+    })?;
 
     Ok(Json(serde_json::json!({
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
+}
+
+/// Verify a delegation token for `space_uri` and record it as used, returning
+/// the user it was issued by.
+async fn verify_delegation(
+    state: &AppState,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    token: &str,
+    space_uri: &str,
+    host_aud: &str,
+) -> Result<String, AppError> {
+    let invalid = |message: String| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "InvalidDelegationToken",
+        message,
+    };
+    let accepted_aud = [host_aud];
+
+    // A PDS that serves spaces mints delegation tokens with the account's own
+    // key. For accounts on one that does not, HappyView mints them with its own
+    // delegation key. A key that cannot be read leaves only the account's own
+    // key to try, as a token this instance signed cannot be verified without it
+    // anyway.
+    let local_key =
+        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "delegation key unreadable");
+                None
+            });
+    let local_claims = local_key.as_ref().map(|key| {
+        crate::spaces::credential::verify_delegation_token(
+            token,
+            key.verifying_key(),
+            &accepted_aud,
+        )
+    });
+    let claims = match local_claims {
+        Some(Ok(claims)) => claims,
+        _ => crate::spaces::credential::verify_account_delegation_token(
+            token,
+            &state.http,
+            &state.config.plc_url,
+            &accepted_aud,
+        )
+        .await
+        .map_err(|e| invalid(e.to_string()))?,
+    };
+    if claims.sub != space_uri {
+        return Err(invalid("delegation token is for a different space".into()));
+    }
+    if !db::consume_delegation_token(
+        &state.db,
+        state.db_backend,
+        &claims.iss,
+        &claims.jti,
+        claims.exp,
+    )
+    .await?
+    {
+        return Err(invalid("delegation token has already been used".into()));
+    }
+    Ok(claims.iss)
 }
 
 #[cfg(test)]

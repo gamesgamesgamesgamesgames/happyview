@@ -508,6 +508,52 @@ pub async fn list_native_repo_authors(
     Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
+/// Mark this space's credentials with any of `jtis` revoked, as an authority's
+/// `notifyCredentialRevoked` asks. Idempotent: a credential already revoked
+/// keeps its first revocation time. Returns how many were newly revoked.
+pub async fn revoke_space_credentials_by_jti(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    jtis: &[String],
+) -> Result<u64, AppError> {
+    let now = now_rfc3339();
+    let mut revoked = 0;
+    for jti in jtis {
+        let result = crate::db::query(&adapt_sql(
+            "UPDATE happyview_space_credentials SET revoked_at = ? WHERE space_id = ? AND jti = ? AND revoked_at IS NULL",
+            backend,
+        ))
+        .bind(&now)
+        .bind(space_id)
+        .bind(jti)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
+        revoked += result.rows_affected();
+    }
+    Ok(revoked)
+}
+
+/// Delete credential records that expired before `cutoff`. A credential is
+/// refused once it expires, so its record, and any revocation on it, matters
+/// only until then.
+pub async fn purge_expired_credentials(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    cutoff: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_credentials WHERE expires_at < ?",
+        backend,
+    ))
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to purge expired space credentials: {e}")))
+}
+
 /// Revoke all active space credentials issued to `did` within `space_id`.
 /// Returns the number of credentials revoked.
 pub async fn revoke_space_credentials_for_member(
@@ -1380,7 +1426,9 @@ pub async fn find_blob_authors(
 // Delegation token uses
 // ---------------------------------------------------------------------------
 
-/// Record a delegation token as used, returning `false` if it already was.
+/// Record a single-use token as used, returning `false` if it already was.
+/// Delegation tokens are keyed by the issuing DID and client attestations by
+/// the `client_id`, so the two cannot collide.
 pub async fn consume_delegation_token(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

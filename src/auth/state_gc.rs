@@ -75,6 +75,18 @@ pub async fn run_expired_state_gc(pool: AnyPool, backend: DatabaseBackend) {
             tracing::info!(removed, "purged expired OAuth state rows");
         }
 
+        // Kept an hour past expiry, so a revocation is held for at least the
+        // 60 minutes Proposal 0016 asks of a repo host.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        match crate::spaces::db::purge_expired_credentials(&pool, backend, &cutoff).await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "purged expired space credentials");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to purge expired space credentials"),
+        }
+
         match crate::oauth::client_keys::retire_unused_keys(&pool, backend).await {
             Ok(revoked) if revoked > 0 => {
                 tracing::info!(revoked, "retired unused OAuth client keys");
