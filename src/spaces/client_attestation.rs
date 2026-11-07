@@ -4,6 +4,9 @@ pub const CLIENT_ATTESTATION_TYP: &str = "atproto-client-attestation+jwt";
 
 pub struct VerifiedAttestation {
     pub client_id: String,
+    /// The attestation's nonce, recorded so it cannot be presented twice.
+    pub jti: String,
+    pub exp: u64,
 }
 
 pub async fn verify_client_attestation(
@@ -45,6 +48,8 @@ pub async fn verify_client_attestation(
         sub: String,
         aud: String,
         exp: u64,
+        #[serde(default)]
+        jti: String,
     }
 
     let claims: AttestationClaims = serde_json::from_slice(&payload_bytes)
@@ -56,6 +61,10 @@ pub async fn verify_client_attestation(
 
     if claims.aud != expected_aud {
         return Err(AppError::Auth("attestation aud mismatch".into()));
+    }
+    // Single use: the nonce is what makes a replay detectable.
+    if claims.jti.is_empty() {
+        return Err(AppError::Auth("client attestation has no jti".into()));
     }
 
     let now = std::time::SystemTime::now()
@@ -127,5 +136,7 @@ pub async fn verify_client_attestation(
 
     Ok(VerifiedAttestation {
         client_id: claims.iss,
+        jti: claims.jti,
+        exp: claims.exp,
     })
 }

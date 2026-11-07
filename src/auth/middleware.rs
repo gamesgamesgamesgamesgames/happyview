@@ -326,7 +326,7 @@ pub async fn resolve_dpop_claims(
 /// XRPC-specific claims extractor.
 ///
 /// Accepts DPoP auth (`Authorization: DPoP <token>`), space credentials
-/// (`Authorization: Atproto-Space <credential>` with an HTTP Message Signature
+/// (`Authorization: Atproto-Space-Credential <credential>` with an HTTP Message Signature
 /// by the credential's bound key), or Bearer service auth JWTs
 /// (`Authorization: Bearer <service_jwt>`). Bearer API keys are rejected on
 /// XRPC routes. With no `Authorization` header, the session cookie is the
@@ -429,7 +429,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 match crate::spaces::credential::peek_jwt_typ(token) {
                     Some(typ) if typ == crate::spaces::credential::SPACE_CREDENTIAL_TYP => {
                         Err(AppError::Auth(
-                            "space credentials use the Atproto-Space authorization scheme".into(),
+                            "space credentials use the Atproto-Space-Credential authorization scheme".into(),
                         ))
                     }
                     _ => Err(AppError::Auth(
@@ -437,8 +437,8 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     )),
                 }
             }
-            Some(h) if h.starts_with("Atproto-Space ") => {
-                let token = &h["Atproto-Space ".len()..];
+            Some(h) if space_credential_token(h).is_some() => {
+                let token = space_credential_token(h).unwrap_or_default();
                 if !is_space_route(parts.uri.path()) {
                     return Err(AppError::Auth(
                         "space credentials are only accepted on space routes".into(),
@@ -448,7 +448,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     crate::spaces::credential::peek_bound_key(token).ok_or_else(|| {
                         AppError::Auth("space credential is not bound to a key".into())
                     })?;
-                crate::spaces::http_signature::verify(&parts.headers, Some(&bound_key))?;
+                crate::spaces::http_signature::verify(&parts.headers, &bound_key)?;
                 let audience = parts
                     .headers
                     .get(crate::spaces::http_signature::AUDIENCE_HEADER)
@@ -505,6 +505,16 @@ impl FromRequestParts<AppState> for XrpcClaims {
             }
         }
     }
+}
+
+/// The space credential in an `Authorization` value using the
+/// `Atproto-Space-Credential` scheme. Like any HTTP authentication scheme it
+/// is recognised regardless of case; the signature covers the value as
+/// received.
+fn space_credential_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start();
+    (scheme.eq_ignore_ascii_case("Atproto-Space-Credential") && !token.is_empty()).then_some(token)
 }
 
 async fn try_parse_service_auth(
@@ -620,6 +630,27 @@ mod tests {
             "/xrpc/com.atproto.space.notARealMethod",
         ] {
             assert!(is_space_route(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_credential_scheme_is_recognised_regardless_of_case() {
+        use super::space_credential_token;
+        for value in [
+            "Atproto-Space-Credential tok",
+            "atproto-space-credential tok",
+            "ATPROTO-SPACE-CREDENTIAL tok",
+        ] {
+            assert_eq!(space_credential_token(value), Some("tok"), "{value}");
+        }
+        for value in [
+            "Atproto-Space tok",
+            "Bearer tok",
+            "Atproto-Space-Credential",
+            "Atproto-Space-Credential ",
+            "Atproto-Space-Credentials tok",
+        ] {
+            assert_eq!(space_credential_token(value), None, "{value}");
         }
     }
 
