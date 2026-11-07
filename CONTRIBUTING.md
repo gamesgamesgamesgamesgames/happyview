@@ -6,6 +6,8 @@ The contributor guide is on the documentation site:
 - [Test](https://happyview.dev/docs/contributing/test): every CI check and the local commands that correspond to it.
 - [Release](https://happyview.dev/docs/contributing/release): how CI cuts releases from `main`, `beta` and `alpha`.
 
+The docs aren't in this repo. v3 docs live in [happyproto/happyview-docs](https://github.com/happyproto/happyview-docs), and v2 docs in [happyproto/happyview-docs-legacy](https://github.com/happyproto/happyview-docs-legacy). A change to documented behaviour needs a companion PR there; link it from the Docs checkbox in the pull request's description.
+
 In short:
 
 - Open pull requests against `beta`, or against `alpha` for a change that belongs to the next major line.
@@ -20,8 +22,7 @@ This file keeps what applies to maintainers and to the provider contract.
 CI runs a fork's PR without the repository's secrets, and every required check is built to pass without them. PR images are pushed by a separate workflow that runs from the default branch and never executes the PR's code. What a maintainer does on a fork's PR:
 
 1. **Approve the workflow run** for a first-time contributor, from the banner on the PR's Checks tab. Read the diff first, especially anything under `.github/`: the run executes the PR's code on our runners.
-2. **Authorize the docs preview**, if it's useful for the PR, from the link in Vercel's comment. That runs the docs build from the PR's branch on Vercel. A preview never publishes to the docs' atproto account; only the production deploy does. It also builds without fresh changelogs if GitHub's API can't be reached, and uses the committed ones.
-3. **Check the commit trailers before merging.** Pull requests into `alpha` and `beta` merge with a merge commit, so every commit lands as written, trailers included, and the merge dialog can't remove one. If a commit carries a trailer we don't carry, such as an AI co-author line, ask the contributor to amend it before merging, and keep their `Signed-off-by`.
+2. **Check the commit trailers before merging.** Pull requests into `alpha` and `beta` merge with a merge commit, so every commit lands as written, trailers included, and the merge dialog can't remove one. If a commit carries a trailer we don't carry, such as an AI co-author line, ask the contributor to amend it before merging, and keep their `Signed-off-by`.
 
 ## The provider contract
 
