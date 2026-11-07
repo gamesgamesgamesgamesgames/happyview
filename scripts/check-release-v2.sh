@@ -43,12 +43,17 @@ esac
 v3=$(git tag --merged "$head" --list 'v3.*' | head -n 1)
 [ -z "$v3" ] || fail "$head carries the tag $v3, so it contains v3 history."
 
-# What semantic-release would read from a commit message: "breaking", "feat"
-# or nothing.
+# What a commit message asks semantic-release for: "breaking", "feat" or
+# nothing. The footer rule follows the commit analyzer's own parser, which
+# reads a breaking note in any case, indented or not, with or without a space
+# before the colon. It errs strict where semantic-release would not release a
+# major at all: `type!:` and `BREAKING-CHANGE:` are refused too, because each
+# says the change breaks something.
 release_type() {
   local message=$1
   local subject=${message%%$'\n'*}
-  if [[ $subject =~ ^[a-z]+(\([^\)]*\))?!: ]] || grep -qE '^BREAKING[ -]CHANGE:' <<<"$message"; then
+  if [[ $subject =~ ^[a-z]+(\([^\)]*\))?!: ]] ||
+    grep -qiE '^[[:space:]]*BREAKING[ -]CHANGE[[:space:]]*:' <<<"$message"; then
     echo breaking
   elif [[ $subject =~ ^feat(\([^\)]*\))?: ]]; then
     echo feat

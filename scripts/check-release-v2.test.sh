@@ -76,12 +76,20 @@ expect refuse "a hyphenated breaking change in the body" "$fix" PR_TITLE="fix: c
   PR_BODY="BREAKING-CHANGE: the response shape moved"
 expect pass "a body that only mentions a breaking change" "$fix" PR_TITLE="fix: change a thing" \
   PR_BODY="This is not a BREAKING CHANGE: it only says so mid-line."
+expect refuse "a breaking footer with a space before the colon" "$fix" PR_TITLE="fix: change a thing" \
+  PR_BODY="BREAKING CHANGE : the response shape moved"
+expect refuse "an indented breaking footer" "$fix" PR_TITLE="fix: change a thing" \
+  PR_BODY="  BREAKING CHANGE: the response shape moved"
+expect refuse "a lowercase breaking footer" "$fix" PR_TITLE="fix: change a thing" \
+  PR_BODY="breaking change: the response shape moved"
 
 feat=$(commit feat "feat: add a thing")
 expect refuse "a feat commit under a fix title" "$feat" PR_TITLE="fix: add a thing"
 
 breaking=$(commit breaking "fix: change a thing" "BREAKING CHANGE: the response shape moved")
 expect refuse "a breaking commit" "$breaking"
+spaced=$(commit spaced "fix: change a thing" "BREAKING CHANGE : the response shape moved")
+expect refuse "a breaking commit footer with a space before the colon" "$spaced"
 
 expect refuse "beta as the head branch" "$fix" HEAD_REF=beta
 
