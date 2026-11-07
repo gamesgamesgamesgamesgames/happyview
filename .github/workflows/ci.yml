@@ -54,6 +54,7 @@ jobs:
       oauth-client-node: ${{ steps.filter.outputs.oauth-client-node }}
       lex-agent: ${{ steps.filter.outputs.lex-agent }}
       nsid: ${{ steps.filter.outputs.nsid }}
+      moved-docs: ${{ steps.filter.outputs.moved-docs }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -89,6 +90,39 @@ jobs:
             nsid:
               - 'crates/happyview-nsid/**'
               - 'packages/nsid/**'
+            # Read by `docs-moved`. Added and modified files only, so a change
+            # that deletes the old tree passes. A rename counts as a delete of
+            # the old path and an add of the new one, so moving a file in here
+            # is caught too.
+            moved-docs:
+              - added|modified: 'packages/docs/**'
+              - added|modified: 'docs/**'
+
+  # ---------------------------------------------------------------------------
+  # Docs guard — HappyView's docs live in their own repos (HAP-379). On this
+  # v2 line, doc changes go to happyproto/happyview-docs-legacy.
+  # ---------------------------------------------------------------------------
+  # Fails a change that adds or modifies a file under `packages/docs/` or a
+  # top-level `docs/`; deleting them passes. It runs on every pull request and
+  # push, since it costs seconds, and it fails rather than skips when `changes`
+  # did not succeed, because a skipped check satisfies a ruleset that requires
+  # it.
+  docs-moved:
+    needs: changes
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Path detection ran
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: test "$RESULT" = success
+
+      - name: Refuse changes to the moved docs
+        if: needs.changes.outputs.moved-docs == 'true'
+        run: |
+          echo "::error::HappyView's docs moved out of this repo. v3 docs: happyproto/happyview-docs. v2 docs: happyproto/happyview-docs-legacy. Open a companion PR there."
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
