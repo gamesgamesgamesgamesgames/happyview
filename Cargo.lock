@@ -1981,6 +1981,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "data-encoding",
+ "k256",
  "multibase",
  "p256 0.14.0",
  "rand 0.10.2",
@@ -2081,6 +2082,16 @@ dependencies = [
  "webpki-roots",
  "wiremock",
  "zstd",
+]
+
+[[package]]
+name = "happyview-star"
+version = "0.1.0"
+dependencies = [
+ "ipld-core",
+ "serde_ipld_dagcbor",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
