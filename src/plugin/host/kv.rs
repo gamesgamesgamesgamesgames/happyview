@@ -130,7 +130,7 @@ mod tests {
     macro_rules! require_test_db {
         () => {
             if std::env::var("TEST_DATABASE_URL").is_err() {
-                eprintln!("skipped (TEST_DATABASE_URL not set)");
+                crate::test_support::unavailable(crate::test_support::NO_DATABASE);
                 return;
             }
         };
@@ -164,10 +164,11 @@ mod tests {
             scope: "did:plc:test".to_string(),
             secrets: Default::default(),
             config: serde_json::Value::Null,
+            records: crate::record_store::RecordStore::new(db.clone(), backend),
             db,
             db_backend: backend,
             http_client: reqwest::Client::new(),
-            lexicons: std::sync::Arc::new(crate::lexicon::LexiconRegistry::new()),
+            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),
         }
     }
 

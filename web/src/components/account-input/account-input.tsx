@@ -1,10 +1,10 @@
-"use client"
+"use client";
 
-import { useEffect, useLayoutEffect, useState, type RefObject } from "react"
-import type { Combobox as ComboboxPrimitive } from "@base-ui/react"
-import { Loader2 } from "lucide-react"
+import { useEffect, useLayoutEffect, useState, type RefObject } from "react";
+import type { Combobox as ComboboxPrimitive } from "@base-ui/react";
+import { Loader2 } from "lucide-react";
 
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   Combobox,
   ComboboxChip,
@@ -14,36 +14,36 @@ import {
   ComboboxItem,
   ComboboxList,
   useComboboxAnchor,
-} from "@/components/ui/combobox"
+} from "@/components/ui/combobox";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-} from "@/components/ui/tooltip"
-import { searchActors, type TypeaheadActor } from "@/lib/typeahead"
-import { cn } from "@/lib/utils"
+} from "@/components/ui/tooltip";
+import { searchActors, type TypeaheadActor } from "@/lib/typeahead";
+import { cn } from "@/lib/utils";
 
 import {
   splitEntries,
   useAccountTags,
   type AccountTag,
-} from "./use-account-tags"
+} from "./use-account-tags";
 
 type Option =
-  | { kind: "tag"; tag: AccountTag }
-  | { kind: "actor"; actor: TypeaheadActor }
+  { kind: "tag"; tag: AccountTag } | { kind: "actor"; actor: TypeaheadActor };
 
 // Suggestions never equal tags. If they did, Base UI would treat choosing a
 // suggestion for an existing account as deselecting it and remove the tag;
 // instead the choice reaches `add`, which ignores accounts already present.
 function sameOption(a: Option, b: Option) {
-  if (a.kind === "tag" && b.kind === "tag") return a.tag.key === b.tag.key
-  if (a.kind === "actor" && b.kind === "actor") return a.actor.did === b.actor.did
-  return false
+  if (a.kind === "tag" && b.kind === "tag") return a.tag.key === b.tag.key;
+  if (a.kind === "actor" && b.kind === "actor")
+    return a.actor.did === b.actor.did;
+  return false;
 }
 
 function optionLabel(option: Option) {
-  return option.kind === "tag" ? option.tag.input : option.actor.handle
+  return option.kind === "tag" ? option.tag.input : option.actor.handle;
 }
 
 function AccountChip({ tag }: { tag: AccountTag }) {
@@ -80,21 +80,21 @@ function AccountChip({ tag }: { tag: AccountTag }) {
         )}
       </span>
     </ComboboxChip>
-  )
+  );
 
-  if (tag.status !== "error") return chip
+  if (tag.status !== "error") return chip;
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>{chip}</TooltipTrigger>
       <TooltipContent>{tag.error}</TooltipContent>
     </Tooltip>
-  )
+  );
 }
 
 // Below this much room, the suggestion list opens upward if there is more
 // room there.
-const MIN_ROOM_BELOW = 288
+const MIN_ROOM_BELOW = 288;
 
 /**
  * Pick the side of `anchor` with room for the suggestion list.
@@ -108,34 +108,34 @@ function usePopupSide(
   anchor: RefObject<HTMLElement | null>,
   layoutKey: unknown,
 ): "top" | "bottom" {
-  const [side, setSide] = useState<"top" | "bottom">("bottom")
+  const [side, setSide] = useState<"top" | "bottom">("bottom");
 
   useLayoutEffect(() => {
     function measure() {
-      const el = anchor.current
-      if (!el) return
-      const rect = el.getBoundingClientRect()
-      const viewport = window.visualViewport
-      const top = viewport?.offsetTop ?? 0
-      const bottom = top + (viewport?.height ?? window.innerHeight)
-      const above = rect.top - top
-      const below = bottom - rect.bottom
-      setSide(below < MIN_ROOM_BELOW && above > below ? "top" : "bottom")
+      const el = anchor.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const top = viewport?.offsetTop ?? 0;
+      const bottom = top + (viewport?.height ?? window.innerHeight);
+      const above = rect.top - top;
+      const below = bottom - rect.bottom;
+      setSide(below < MIN_ROOM_BELOW && above > below ? "top" : "bottom");
     }
 
-    measure()
-    const viewport = window.visualViewport
-    window.addEventListener("resize", measure)
-    viewport?.addEventListener("resize", measure)
-    viewport?.addEventListener("scroll", measure)
+    measure();
+    const viewport = window.visualViewport;
+    window.addEventListener("resize", measure);
+    viewport?.addEventListener("resize", measure);
+    viewport?.addEventListener("scroll", measure);
     return () => {
-      window.removeEventListener("resize", measure)
-      viewport?.removeEventListener("resize", measure)
-      viewport?.removeEventListener("scroll", measure)
-    }
-  }, [anchor, layoutKey])
+      window.removeEventListener("resize", measure);
+      viewport?.removeEventListener("resize", measure);
+      viewport?.removeEventListener("scroll", measure);
+    };
+  }, [anchor, layoutKey]);
 
-  return side
+  return side;
 }
 
 export function AccountInput({
@@ -145,42 +145,46 @@ export function AccountInput({
   onChange,
   onBlockedChange,
 }: {
-  id: string
-  placeholder?: string
-  max?: number
-  onChange: (dids: string[]) => void
-  onBlockedChange: (blocked: boolean) => void
+  id: string;
+  placeholder?: string;
+  max?: number;
+  onChange: (dids: string[]) => void;
+  onBlockedChange: (blocked: boolean) => void;
 }) {
-  const { tags, add, remove } = useAccountTags({ max, onChange, onBlockedChange })
-  const anchor = useComboboxAnchor()
-  const [query, setQuery] = useState("")
-  const [suggestions, setSuggestions] = useState<TypeaheadActor[]>([])
-  const [highlighted, setHighlighted] = useState(false)
+  const { tags, add, remove } = useAccountTags({
+    max,
+    onChange,
+    onBlockedChange,
+  });
+  const anchor = useComboboxAnchor();
+  const [query, setQuery] = useState("");
+  const [suggestions, setSuggestions] = useState<TypeaheadActor[]>([]);
+  const [highlighted, setHighlighted] = useState(false);
 
-  const term = query.trim().replace(/^@/, "")
-  const searchable = term.length >= 2 && !term.startsWith("did:")
-  const full = max !== undefined && tags.length >= max
+  const term = query.trim().replace(/^@/, "");
+  const searchable = term.length >= 2 && !term.startsWith("did:");
+  const full = max !== undefined && tags.length >= max;
 
   useEffect(() => {
-    if (!searchable) return
-    const controller = new AbortController()
+    if (!searchable) return;
+    const controller = new AbortController();
     const timer = setTimeout(() => {
       searchActors(term, controller.signal).then((actors) => {
-        if (!controller.signal.aborted) setSuggestions(actors)
-      })
-    }, 250)
+        if (!controller.signal.aborted) setSuggestions(actors);
+      });
+    }, 250);
     return () => {
-      clearTimeout(timer)
-      controller.abort()
-    }
-  }, [term, searchable])
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [term, searchable]);
 
   const items: Option[] = searchable
     ? suggestions.map((actor) => ({ kind: "actor", actor }))
-    : []
-  const value: Option[] = tags.map((tag) => ({ kind: "tag", tag }))
+    : [];
+  const value: Option[] = tags.map((tag) => ({ kind: "tag", tag }));
   // Re-measured when the list fills or the chips wrap onto a new line.
-  const side = usePopupSide(anchor, `${items.length}:${tags.length}`)
+  const side = usePopupSide(anchor, `${items.length}:${tags.length}`);
 
   function handleValueChange(
     next: Option[],
@@ -189,23 +193,23 @@ export function AccountInput({
     // Base UI clears the selection (and, in ComboboxChipsInput below, the
     // typed text) on Escape; ignoring escape-key changes here and keeping
     // `value`/`inputValue` controlled restores both on the next render.
-    if (eventDetails.reason === "escape-key") return
+    if (eventDetails.reason === "escape-key") return;
     const kept = new Set(
       next.flatMap((o) => (o.kind === "tag" ? [o.tag.key] : [])),
-    )
-    remove(tags.filter((t) => !kept.has(t.key)).map((t) => t.key))
+    );
+    remove(tags.filter((t) => !kept.has(t.key)).map((t) => t.key));
     for (const option of next) {
-      if (option.kind === "actor") add([option.actor.handle], option.actor)
+      if (option.kind === "actor") add([option.actor.handle], option.actor);
     }
-    setQuery("")
+    setQuery("");
   }
 
   function commitTyped() {
-    const entries = splitEntries(query)
-    if (entries.length === 0) return false
-    add(entries)
-    setQuery("")
-    return true
+    const entries = splitEntries(query);
+    if (entries.length === 0) return false;
+    add(entries);
+    setQuery("");
+    return true;
   }
 
   return (
@@ -217,8 +221,8 @@ export function AccountInput({
       inputValue={query}
       onInputValueChange={(next, eventDetails) => {
         // See the `escape-key` check in `handleValueChange` above.
-        if (eventDetails.reason === "escape-key") return
-        setQuery(next)
+        if (eventDetails.reason === "escape-key") return;
+        setQuery(next);
       }}
       filter={null}
       itemToStringLabel={optionLabel}
@@ -227,7 +231,7 @@ export function AccountInput({
       // Base UI stops syncing the highlight while closed, so a stale highlight
       // would otherwise swallow Enter after Escape.
       onOpenChange={(open) => {
-        if (!open) setHighlighted(false)
+        if (!open) setHighlighted(false);
       }}
     >
       <ComboboxChips ref={anchor}>
@@ -241,31 +245,31 @@ export function AccountInput({
           onKeyDown={(e) => {
             if (e.key === ",") {
               // A comma is a separator, never part of an entry.
-              e.preventDefault()
-              commitTyped()
+              e.preventDefault();
+              commitTyped();
             } else if (e.key === "Enter" && !highlighted) {
-              if (commitTyped()) e.preventDefault()
+              if (commitTyped()) e.preventDefault();
             }
           }}
           onPaste={(e) => {
-            const text = e.clipboardData.getData("text")
+            const text = e.clipboardData.getData("text");
             if (/[\s,]/.test(text.trim())) {
-              e.preventDefault()
-              add(splitEntries(text))
+              e.preventDefault();
+              add(splitEntries(text));
             }
           }}
           onBlur={(e) => {
             // Clicking a suggestion moves focus into the popup before the
             // click lands; committing the partial text here would replace the
             // suggestion list out from under that click.
-            const next = e.relatedTarget
+            const next = e.relatedTarget;
             if (
               next instanceof Element &&
               next.closest('[data-slot="combobox-content"]')
             ) {
-              return
+              return;
             }
-            commitTyped()
+            commitTyped();
           }}
         />
       </ComboboxChips>
@@ -298,5 +302,5 @@ export function AccountInput({
         </ComboboxList>
       </ComboboxContent>
     </Combobox>
-  )
+  );
 }

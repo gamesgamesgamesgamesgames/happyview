@@ -2,7 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, HelpCircle, KeyRound, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  HelpCircle,
+  KeyRound,
+  Plus,
+  RefreshCw,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -66,29 +74,46 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { ATTACHED_ACCOUNT_SCOPE } from "@/lib/attached-account-scope";
 
 const SYNC_STORAGE_KEY = "happyview:service-identity:last-synced-at";
 const REAUTH_STORAGE_KEY = "happyview:service-identity:reauth";
 const REAUTH_MAX_AGE_MS = 10 * 60 * 1000;
-const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone/.test(navigator.userAgent);
+const IS_MAC =
+  typeof navigator !== "undefined" && /Mac|iPhone/.test(navigator.userAgent);
 const MOD_KEY = IS_MAC ? "⌘" : "Ctrl+";
 const FRAGMENT_ID_RE = /^#?[a-zA-Z][a-zA-Z0-9_-]*$/;
 
 function formatMode(mode: string): string {
   switch (mode) {
-    case "did_web": return "did:web (domain-based)";
-    case "did_plc": return "did:plc (PLC directory)";
-    case "attach_account": return "Attached account";
-    case "not_exposed": return "Not exposed";
-    default: return mode;
+    case "did_web":
+      return "did:web (domain-based)";
+    case "did_plc":
+      return "did:plc (PLC directory)";
+    case "attach_account":
+      return "Attached account";
+    case "not_exposed":
+      return "Not exposed";
+    default:
+      return mode;
   }
 }
 
-function HelpTip({ label, children }: { label: string; children: React.ReactNode }) {
+function HelpTip({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button type="button" className="inline-flex text-muted-foreground hover:text-foreground" aria-label={`Help for ${label}`}>
+        <button
+          type="button"
+          className="inline-flex text-muted-foreground hover:text-foreground"
+          aria-label={`Help for ${label}`}
+        >
           <HelpCircle className="size-3.5" />
         </button>
       </TooltipTrigger>
@@ -122,7 +147,9 @@ export default function ServiceIdentityPage() {
   const [changingMode, setChangingMode] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  const [identity, setIdentity] = useState<ServiceIdentityResponse | null>(null);
+  const [identity, setIdentity] = useState<ServiceIdentityResponse | null>(
+    null,
+  );
   const [entries, setEntries] = useState<ServiceEntry[]>([]);
 
   const [fragmentId, setFragmentId] = useState("");
@@ -149,9 +176,10 @@ export default function ServiceIdentityPage() {
 
   const fragmentIdRef = useRef<HTMLInputElement>(null);
 
-  const fragmentIdError = fragmentId.trim() && !FRAGMENT_ID_RE.test(fragmentId.trim())
-    ? "Must start with a letter and contain only letters, numbers, hyphens, and underscores."
-    : null;
+  const fragmentIdError =
+    fragmentId.trim() && !FRAGMENT_ID_RE.test(fragmentId.trim())
+      ? "Must start with a letter and contain only letters, numbers, hyphens, and underscores."
+      : null;
 
   const filteredEntries = useMemo(() => {
     if (!filterQuery) return entries;
@@ -203,7 +231,11 @@ export default function ServiceIdentityPage() {
   useEffect(() => {
     if (!canManage) return;
     function onKeyDown(e: KeyboardEvent) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      )
+        return;
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
 
@@ -228,7 +260,10 @@ export default function ServiceIdentityPage() {
       return;
     }
 
-    if (payload.timestamp && Date.now() - payload.timestamp > REAUTH_MAX_AGE_MS) {
+    if (
+      payload.timestamp &&
+      Date.now() - payload.timestamp > REAUTH_MAX_AGE_MS
+    ) {
       localStorage.removeItem(REAUTH_STORAGE_KEY);
       return;
     }
@@ -272,9 +307,13 @@ export default function ServiceIdentityPage() {
       }),
       did.startsWith("did:plc:")
         ? fetch(`https://plc.directory/${did}`)
-            .then((r) => (r.ok ? (r.json() as Promise<{ alsoKnownAs?: string[] }>) : null))
+            .then((r) =>
+              r.ok ? (r.json() as Promise<{ alsoKnownAs?: string[] }>) : null,
+            )
             .then((doc) => {
-              const aka = doc?.alsoKnownAs?.find((a: string) => a.startsWith("at://"));
+              const aka = doc?.alsoKnownAs?.find((a: string) =>
+                a.startsWith("at://"),
+              );
               return aka ? aka.replace("at://", "") : null;
             })
             .catch(() => null)
@@ -287,7 +326,7 @@ export default function ServiceIdentityPage() {
         );
         const identifier = handle ?? did;
         return fetch(
-          `/auth/login?handle=${encodeURIComponent(identifier)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
+          `/auth/login?handle=${encodeURIComponent(identifier)}&scope=${encodeURIComponent(ATTACHED_ACCOUNT_SCOPE)}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
           { credentials: "same-origin" },
         );
       })
@@ -304,7 +343,9 @@ export default function ServiceIdentityPage() {
       });
   }
 
-  const showSyncButton = canManage && identity &&
+  const showSyncButton =
+    canManage &&
+    identity &&
     (identity.mode === "did_plc" || identity.mode === "attach_account");
 
   async function handleAdd() {
@@ -376,7 +417,9 @@ export default function ServiceIdentityPage() {
   async function handleBulkDelete() {
     setBulkDeleting(true);
     const ids = Array.from(selected);
-    const results = await Promise.allSettled(ids.map((id) => deleteServiceEntry(id)));
+    const results = await Promise.allSettled(
+      ids.map((id) => deleteServiceEntry(id)),
+    );
     const succeeded = ids.filter((_, i) => results[i].status === "fulfilled");
     const failed = ids.length - succeeded.length;
 
@@ -390,9 +433,12 @@ export default function ServiceIdentityPage() {
     }
 
     if (failed === 0) {
-      toast.success(`Deleted ${succeeded.length} service ${succeeded.length === 1 ? "entry" : "entries"}`, {
-        description: "Sync to the PLC directory to publish this change.",
-      });
+      toast.success(
+        `Deleted ${succeeded.length} service ${succeeded.length === 1 ? "entry" : "entries"}`,
+        {
+          description: "Sync to the PLC directory to publish this change.",
+        },
+      );
     } else if (succeeded.length === 0) {
       toast.error("Failed to delete service entries");
     } else {
@@ -405,8 +451,10 @@ export default function ServiceIdentityPage() {
     setBulkDeleting(false);
   }
 
-  const allSelected = filteredEntries.length > 0 && selected.size === filteredEntries.length;
-  const someSelected = selected.size > 0 && selected.size < filteredEntries.length;
+  const allSelected =
+    filteredEntries.length > 0 && selected.size === filteredEntries.length;
+  const someSelected =
+    selected.size > 0 && selected.size < filteredEntries.length;
 
   async function handleSyncPlc() {
     setSyncing(true);
@@ -416,7 +464,8 @@ export default function ServiceIdentityPage() {
       setLastSyncedAt();
       setSyncPopoverOpen(false);
       toast.success("DID document synced", {
-        description: "Your service entries are now published to the PLC directory.",
+        description:
+          "Your service entries are now published to the PLC directory.",
       });
     } catch (e: unknown) {
       toastError("Failed to sync to PLC directory", e);
@@ -450,7 +499,8 @@ export default function ServiceIdentityPage() {
       setCodeRequested(false);
       setPlcToken("");
       toast.success("DID document synced", {
-        description: "Your service entries are now published to the PLC directory.",
+        description:
+          "Your service entries are now published to the PLC directory.",
       });
     } catch (e: unknown) {
       toastError("Failed to submit confirmation code", e);
@@ -471,7 +521,13 @@ export default function ServiceIdentityPage() {
   }
 
   function handleAddKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Enter" && fragmentId.trim() && serviceType.trim() && !adding && !fragmentIdError) {
+    if (
+      e.key === "Enter" &&
+      fragmentId.trim() &&
+      serviceType.trim() &&
+      !adding &&
+      !fragmentIdError
+    ) {
       handleAdd();
     }
   }
@@ -480,7 +536,6 @@ export default function ServiceIdentityPage() {
     <>
       <SiteHeader title="Service Identity" />
       <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">
-
         {/* Identity metadata grid */}
         {loading ? (
           <div className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-3 lg:grid-cols-4">
@@ -519,7 +574,12 @@ export default function ServiceIdentityPage() {
                 </span>
               </Label>
               <p className="mt-1 font-mono text-sm break-all">
-                {identity.did ?? (identity.mode === "did_web" ? `did:web:${typeof window !== "undefined" ? window.location.host : "…"}` : <em className="text-muted-foreground">not set</em>)}
+                {identity.did ??
+                  (identity.mode === "did_web" ? (
+                    `did:web:${typeof window !== "undefined" ? window.location.host : "…"}`
+                  ) : (
+                    <em className="text-muted-foreground">not set</em>
+                  ))}
               </p>
             </div>
             <div>
@@ -534,7 +594,9 @@ export default function ServiceIdentityPage() {
                 </span>
               </Label>
               <div className="mt-1">
-                <Badge variant={identity.setup_complete ? "secondary" : "outline"}>
+                <Badge
+                  variant={identity.setup_complete ? "secondary" : "outline"}
+                >
                   {identity.setup_complete ? "Complete" : "Incomplete"}
                 </Badge>
               </div>
@@ -542,8 +604,15 @@ export default function ServiceIdentityPage() {
           </div>
         ) : (
           <div className="flex flex-col gap-2">
-            <p className="text-muted-foreground text-sm">No identity configured.</p>
-            <Button variant="outline" size="sm" className="w-fit" onClick={() => router.push("/setup")}>
+            <p className="text-muted-foreground text-sm">
+              No identity configured.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-fit"
+              onClick={() => router.push("/setup")}
+            >
               Run Setup Wizard
             </Button>
           </div>
@@ -601,21 +670,26 @@ export default function ServiceIdentityPage() {
                 </AlertDialogContent>
               </AlertDialog>
             )}
-            {canManage && identity?.mode === "attach_account" && identity.attached_account_did && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleReauthenticate}
-                disabled={reauthing}
-              >
-                <KeyRound className="size-3.5" />
-                {reauthing ? "Redirecting…" : "Re-authenticate"}
-              </Button>
-            )}
-            {showSyncButton && (
-              identity?.mode === "did_plc" ? (
+            {canManage &&
+              identity?.mode === "attach_account" &&
+              identity.attached_account_did && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleReauthenticate}
+                  disabled={reauthing}
+                >
+                  <KeyRound className="size-3.5" />
+                  {reauthing ? "Redirecting…" : "Re-authenticate"}
+                </Button>
+              )}
+            {showSyncButton &&
+              (identity?.mode === "did_plc" ? (
                 needsSync ? (
-                  <Popover open={syncPopoverOpen} onOpenChange={setSyncPopoverOpen}>
+                  <Popover
+                    open={syncPopoverOpen}
+                    onOpenChange={setSyncPopoverOpen}
+                  >
                     <PopoverTrigger asChild>
                       <Button variant="outline" size="sm">
                         <AlertTriangle className="size-3.5 text-amber-500" />
@@ -625,7 +699,9 @@ export default function ServiceIdentityPage() {
                     </PopoverTrigger>
                     <PopoverContent className="w-80">
                       <div className="flex flex-col gap-3">
-                        <p className="text-sm font-medium">Sync to PLC Directory</p>
+                        <p className="text-sm font-medium">
+                          Sync to PLC Directory
+                        </p>
                         <p className="text-sm text-muted-foreground">
                           Publish your current service entries. This signs and
                           submits a PLC update operation. Changes take effect
@@ -689,8 +765,7 @@ export default function ServiceIdentityPage() {
                     Your DID document is up to date.
                   </TooltipContent>
                 </Tooltip>
-              )
-            )}
+              ))}
             {canManage && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -709,7 +784,8 @@ export default function ServiceIdentityPage() {
         {selected.size > 0 && (
           <div className="flex items-center gap-3 rounded-lg border bg-muted/50 px-4 py-2">
             <span className="text-sm font-medium">
-              {selected.size} {filterQuery ? `of ${entries.length} ` : ""}{selected.size === 1 ? "entry" : "entries"} selected
+              {selected.size} {filterQuery ? `of ${entries.length} ` : ""}
+              {selected.size === 1 ? "entry" : "entries"} selected
             </span>
             <AlertDialog>
               <AlertDialogTrigger asChild>
@@ -721,12 +797,13 @@ export default function ServiceIdentityPage() {
               <AlertDialogContent>
                 <AlertDialogHeader>
                   <AlertDialogTitle>
-                    Delete {selected.size} service {selected.size === 1 ? "entry" : "entries"}?
+                    Delete {selected.size} service{" "}
+                    {selected.size === 1 ? "entry" : "entries"}?
                   </AlertDialogTitle>
                   <AlertDialogDescription>
                     This will remove the selected service entries from your
-                    configuration. Changes take effect in the DID document
-                    after your next PLC sync.
+                    configuration. Changes take effect in the DID document after
+                    your next PLC sync.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -781,11 +858,25 @@ export default function ServiceIdentityPage() {
               <TableBody>
                 {[1, 2].map((i) => (
                   <TableRow key={i}>
-                    {canManage && <TableCell><Skeleton className="size-4" /></TableCell>}
-                    <TableCell><Skeleton className="h-4 w-28" /></TableCell>
-                    <TableCell><Skeleton className="h-4 w-40" /></TableCell>
-                    <TableCell><Skeleton className="h-5 w-20 rounded-full" /></TableCell>
-                    {canManage && <TableCell><Skeleton className="size-8" /></TableCell>}
+                    {canManage && (
+                      <TableCell>
+                        <Skeleton className="size-4" />
+                      </TableCell>
+                    )}
+                    <TableCell>
+                      <Skeleton className="h-4 w-28" />
+                    </TableCell>
+                    <TableCell>
+                      <Skeleton className="h-4 w-40" />
+                    </TableCell>
+                    <TableCell>
+                      <Skeleton className="h-5 w-20 rounded-full" />
+                    </TableCell>
+                    {canManage && (
+                      <TableCell>
+                        <Skeleton className="size-8" />
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>
@@ -821,7 +912,9 @@ export default function ServiceIdentityPage() {
                   {canManage && (
                     <TableHead className="w-10">
                       <Checkbox
-                        checked={allSelected || (someSelected && "indeterminate")}
+                        checked={
+                          allSelected || (someSelected && "indeterminate")
+                        }
                         onCheckedChange={toggleSelectAll}
                         aria-label="Select all"
                       />
@@ -831,9 +924,9 @@ export default function ServiceIdentityPage() {
                     <span className="inline-flex items-center gap-1.5">
                       Fragment ID
                       <HelpTip label="Fragment ID">
-                        A unique identifier within the DID document
-                        (e.g. <code className="text-xs">#atproto_pds</code>).
-                        Used by clients to locate this service endpoint.
+                        A unique identifier within the DID document (e.g.{" "}
+                        <code className="text-xs">#atproto_pds</code>). Used by
+                        clients to locate this service endpoint.
                       </HelpTip>
                     </span>
                   </TableHead>
@@ -841,8 +934,8 @@ export default function ServiceIdentityPage() {
                     <span className="inline-flex items-center gap-1.5">
                       Type
                       <HelpTip label="Service Type">
-                        The AT Protocol service type this entry represents
-                        (e.g. AtprotoPersonalDataServer, BskyAppView).
+                        The AT Protocol service type this entry represents (e.g.
+                        AtprotoPersonalDataServer, BskyAppView).
                       </HelpTip>
                     </span>
                   </TableHead>
@@ -851,8 +944,8 @@ export default function ServiceIdentityPage() {
                       XRPC Access
                       <HelpTip label="XRPC Access">
                         Controls which XRPC methods this service can handle.
-                        &quot;All&quot; allows every method; &quot;Specific&quot; restricts
-                        to an allowlist.
+                        &quot;All&quot; allows every method;
+                        &quot;Specific&quot; restricts to an allowlist.
                       </HelpTip>
                     </span>
                   </TableHead>
@@ -881,7 +974,10 @@ export default function ServiceIdentityPage() {
                   </TableRow>
                 )}
                 {filteredEntries.map((entry) => (
-                  <TableRow key={entry.id} data-state={selected.has(entry.id) ? "selected" : undefined}>
+                  <TableRow
+                    key={entry.id}
+                    data-state={selected.has(entry.id) ? "selected" : undefined}
+                  >
                     {canManage && (
                       <TableCell className="w-10">
                         <Checkbox
@@ -900,7 +996,9 @@ export default function ServiceIdentityPage() {
                         {entry.fragment_id}
                       </button>
                     </TableCell>
-                    <TableCell className="text-sm">{entry.service_type}</TableCell>
+                    <TableCell className="text-sm">
+                      {entry.service_type}
+                    </TableCell>
                     <TableCell>
                       <Badge variant="secondary">
                         {entry.access_mode === "all" ? "All XRPCs" : "Specific"}
@@ -925,8 +1023,8 @@ export default function ServiceIdentityPage() {
                               </AlertDialogTitle>
                               <AlertDialogDescription>
                                 This will remove the service entry from your
-                                configuration. The change will take effect in the
-                                DID document after your next PLC sync.
+                                configuration. The change will take effect in
+                                the DID document after your next PLC sync.
                               </AlertDialogDescription>
                             </AlertDialogHeader>
                             <AlertDialogFooter>
@@ -961,15 +1059,18 @@ export default function ServiceIdentityPage() {
       )}
 
       {/* Add service entry sheet */}
-      <Sheet open={addSheetOpen} onOpenChange={(open) => {
-        setAddSheetOpen(open);
-        if (!open) {
-          setFragmentId("");
-          setServiceType("");
-        } else {
-          requestAnimationFrame(() => fragmentIdRef.current?.focus());
-        }
-      }}>
+      <Sheet
+        open={addSheetOpen}
+        onOpenChange={(open) => {
+          setAddSheetOpen(open);
+          if (!open) {
+            setFragmentId("");
+            setServiceType("");
+          } else {
+            requestAnimationFrame(() => fragmentIdRef.current?.focus());
+          }
+        }}
+      >
         <SheetContent className="flex flex-col gap-0">
           <SheetHeader className="border-b pb-4">
             <SheetTitle>Add Service Entry</SheetTitle>
@@ -1032,7 +1133,12 @@ export default function ServiceIdentityPage() {
           <SheetFooter className="border-t pt-4">
             <Button
               onClick={handleAdd}
-              disabled={adding || !fragmentId.trim() || !serviceType.trim() || !!fragmentIdError}
+              disabled={
+                adding ||
+                !fragmentId.trim() ||
+                !serviceType.trim() ||
+                !!fragmentIdError
+              }
             >
               {adding ? "Adding…" : "Add Entry"}
             </Button>
@@ -1041,13 +1147,16 @@ export default function ServiceIdentityPage() {
       </Sheet>
 
       {/* Sync PLC sheet — attach_account mode only (did_plc uses popover) */}
-      <Sheet open={syncSheetOpen} onOpenChange={(open) => {
-        setSyncSheetOpen(open);
-        if (!open) {
-          setCodeRequested(false);
-          setPlcToken("");
-        }
-      }}>
+      <Sheet
+        open={syncSheetOpen}
+        onOpenChange={(open) => {
+          setSyncSheetOpen(open);
+          if (!open) {
+            setCodeRequested(false);
+            setPlcToken("");
+          }
+        }}
+      >
         <SheetContent className="flex flex-col gap-0">
           <SheetHeader className="border-b pb-4">
             <SheetTitle>Sync to PLC Directory</SheetTitle>
@@ -1087,8 +1196,8 @@ export default function ServiceIdentityPage() {
             {codeRequested && (
               <div className="flex flex-col gap-3">
                 <p className="text-sm text-muted-foreground">
-                  Check the inbox for the attached account&apos;s email.
-                  The code expires after a few minutes.
+                  Check the inbox for the attached account&apos;s email. The
+                  code expires after a few minutes.
                 </p>
                 <div className="flex flex-col gap-2">
                   <Label htmlFor="plc_token">Confirmation Code</Label>
@@ -1097,7 +1206,11 @@ export default function ServiceIdentityPage() {
                     value={plcToken}
                     onChange={(e) => setPlcToken(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && plcToken.trim() && !submittingToken) {
+                      if (
+                        e.key === "Enter" &&
+                        plcToken.trim() &&
+                        !submittingToken
+                      ) {
                         handleSyncPlcSubmit();
                       }
                     }}

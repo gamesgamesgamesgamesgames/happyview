@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 
 use crate::AppState;
-use crate::admin::settings::get_setting;
+use crate::admin::settings::{env_var_for, get_setting, stored_setting};
+use crate::config::vars;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, write_event};
-use crate::feature_flags::{self, FeatureFlag};
+use crate::feature_flags::FeatureFlag;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -42,9 +43,30 @@ pub fn parse_max_minutes(raw: Option<&str>) -> i64 {
         .clamp(MIN_GRANT_MINUTES, MAX_GRANT_MINUTES)
 }
 
+fn is_true(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
+}
+
+/// Whether the inspector is on: its stored row, else the value the
+/// environment or `happyview.toml` configures.
+pub fn switch_is_on(stored: Option<&str>, configured: Option<&str>) -> bool {
+    stored.or(configured).is_some_and(is_true)
+}
+
+/// The inspector switch as [`switch_is_on`] reads it. A database that cannot
+/// be read counts as holding no row, which leaves the inspector off.
+pub async fn inspector_enabled(pool: &AnyPool, backend: DatabaseBackend) -> bool {
+    let stored = stored_setting(pool, FeatureFlag::SPACE_INSPECTOR, backend)
+        .await
+        .ok()
+        .flatten();
+    let configured = env_var_for(FeatureFlag::SPACE_INSPECTOR).and_then(vars::var);
+    switch_is_on(stored.as_deref(), configured.as_deref())
+}
+
 pub async fn load_config(pool: &AnyPool, backend: DatabaseBackend) -> InspectorConfig {
     InspectorConfig {
-        enabled: feature_flags::is_enabled(pool, FeatureFlag::SPACE_INSPECTOR, backend).await,
+        enabled: inspector_enabled(pool, backend).await,
         max_grant_minutes: parse_max_minutes(
             get_setting(pool, MAX_GRANT_SETTING, backend)
                 .await
@@ -669,6 +691,15 @@ pub(super) async fn grant_reads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_reads_stored_then_configured() {
+        assert!(switch_is_on(Some("true"), None));
+        assert!(switch_is_on(Some(" TRUE "), Some("false")));
+        assert!(!switch_is_on(Some("false"), Some("true")));
+        assert!(switch_is_on(None, Some("true")));
+        assert!(!switch_is_on(None, None));
+    }
 
     #[test]
     fn max_minutes_parsing() {

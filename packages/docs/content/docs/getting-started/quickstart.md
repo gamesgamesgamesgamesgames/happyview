@@ -12,6 +12,7 @@ Pick whichever option fits your situation:
 | ------------------------------------------ | ------------------------------------------------------------------------------------ |
 | [**Railway**](deployment/railway.md)       | Fastest path — one-click deploy of HappyView + Postgres |
 | [**Docker**](deployment/docker.md) | Self-hosting on your own server, from the images published to ghcr.io |
+| [**Native binary**](deployment/binary.md) | Running a released binary with no container or toolchain |
 | [**Local development**](deployment/local-development.md) | Running the whole stack locally with hot reloading |
 | [**From source**](deployment/other.md)     | Running HappyView with `cargo run` and managing dependencies yourself                |
 
@@ -40,20 +41,28 @@ The dashboard home shows a live record count and a per-collection breakdown. For
 
 ## 5. Query your data
 
-Once you have a record lexicon indexed, add a query lexicon to expose a read endpoint. Go to **Lexicons > Add Lexicon > Local** and create a query lexicon with `target_collection` set to your record collection's NSID. (`target_collection` is a HappyView-specific field that tells a query or procedure which record collection it operates on.)
+Once you have a record lexicon indexed, add a query lexicon to expose a read endpoint. Go to **Lexicons > Add Lexicon > Local** and create a query lexicon, for example `xyz.statusphere.listStatuses`. The editor fills in a Lua script for it; make the script name your record collection's NSID:
 
-Without a Lua script, HappyView generates a default query endpoint that supports `limit`, `cursor`, `did`, and `uri` parameters:
+```lua
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  return db.records("xyz.statusphere.status"):limit(tonumber(input.limit)):run()
+end
+```
+
+The query now serves the records:
 
 ```
 GET /xrpc/xyz.statusphere.listStatuses?limit=5
 ```
 
-For custom query logic, attach a [Lua script](../guides/lua-scripting.md).
+A query needs a script. Without one it answers only a single-record lookup by `uri` and returns `501` for anything else. See [Lua Scripting](../guides/lua-scripting.md) for what a script can do.
 
 ## Next steps
 
 - [**Statusphere tutorial**](../tutorials/statusphere.md): full walkthrough building a complete AppView with record, query, and procedure lexicons
-- [**Lexicons guide**](../guides/lexicons.md): target collections, backfill flag, network lexicons
+- [**Lexicons guide**](../guides/lexicons.md): lexicon types, backfill flag, network lexicons
 - [**Lua Scripting**](../guides/lua-scripting.md): custom query and procedure logic
 - [**Configuration**](configuration.md): environment variables and tuning
 - [**Authentication**](authentication.md): how OAuth works and how to get API tokens

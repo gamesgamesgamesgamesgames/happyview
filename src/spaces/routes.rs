@@ -3,18 +3,17 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
-use k256;
 use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::now_rfc3339;
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
 use crate::spaces::{db, notifications, oplog};
+use crate::tid::generate_tid;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -264,6 +263,71 @@ enum WriteOp {
         #[serde(rename = "swapRecord")]
         swap_record: Option<String>,
     },
+}
+
+/// The PDS's `applyWrites` body for a batch: each write tagged by `$type`, as
+/// `com.atproto.space.applyWrites` takes it, where this route takes `action`.
+/// Optional fields are sent only when the caller gave them.
+fn pds_apply_writes_body(
+    space_uri: &str,
+    repo: &str,
+    swap_commit: Option<&str>,
+    writes: &[WriteOp],
+) -> serde_json::Value {
+    let writes: Vec<serde_json::Value> = writes
+        .iter()
+        .map(|write| {
+            let (kind, collection, rkey, value, swap_record) = match write {
+                WriteOp::Create {
+                    collection,
+                    rkey,
+                    value,
+                } => ("create", collection, rkey.as_deref(), Some(value), None),
+                WriteOp::Update {
+                    collection,
+                    rkey,
+                    value,
+                    swap_record,
+                } => (
+                    "update",
+                    collection,
+                    Some(rkey.as_str()),
+                    Some(value),
+                    swap_record.as_deref(),
+                ),
+                WriteOp::Delete {
+                    collection,
+                    rkey,
+                    swap_record,
+                } => (
+                    "delete",
+                    collection,
+                    Some(rkey.as_str()),
+                    None,
+                    swap_record.as_deref(),
+                ),
+            };
+            let mut op = serde_json::json!({
+                "$type": format!("com.atproto.space.applyWrites#{kind}"),
+                "collection": collection,
+            });
+            if let Some(rkey) = rkey {
+                op["rkey"] = rkey.into();
+            }
+            if let Some(value) = value {
+                op["value"] = value.clone();
+            }
+            if let Some(swap) = swap_record {
+                op["swapRecord"] = swap.into();
+            }
+            op
+        })
+        .collect();
+    let mut body = serde_json::json!({ "space": space_uri, "repo": repo, "writes": writes });
+    if let Some(swap) = swap_commit {
+        body["swapCommit"] = swap.into();
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +819,39 @@ async fn apply_writes(
         }
     }
 
+    // The single writes check the collection before they forward; a batch
+    // checks every op before it does, so it cannot carry a collection the
+    // space does not allow.
+    for write in &input.writes {
+        if let WriteOp::Create { collection, .. } | WriteOp::Update { collection, .. } = write {
+            service::check_collection_allowed(&space, collection)?;
+        }
+    }
+
+    // A repo hosted on its author's PDS takes the batch there, as the single
+    // writes do; writing only HappyView's copy would fork the two, and the
+    // next sync would drop what was written here.
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = service::forward_write_if_native(
+        &state,
+        &space,
+        &did,
+        "com.atproto.space.applyWrites",
+        pds_apply_writes_body(
+            &space_uri,
+            &did,
+            input.swap_commit.as_deref(),
+            &input.writes,
+        ),
+    )
+    .await?
+    {
+        return Ok(Json(forwarded));
+    }
+
     if let Some(ref expected_rev) = input.swap_commit {
         match &space.revision {
             Some(current_rev) if current_rev != expected_rev => {
@@ -1195,12 +1292,13 @@ async fn get_delegation_token(
     )
     .await?;
 
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+    let signing_key =
+        crate::spaces::delegation_key::load_or_create(&state.db, state.db_backend, encryption_key)
+            .await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1317,13 +1415,17 @@ async fn get_latest_commit(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    // An author who has never written here has no state, so no rev and no
+    // commit: what an unwritten state would hold.
     let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-
-    let commit = repo_state_commit_json(&repo_state, &params.space)?;
+        db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    let commit = match &repo_state {
+        Some(repo_state) => repo_state_commit_json(repo_state, &params.space)?,
+        None => None,
+    };
 
     Ok(Json(serde_json::json!({
-        "rev": repo_state.rev,
+        "rev": repo_state.and_then(|s| s.rev),
         "commit": commit,
     })))
 }
@@ -1361,16 +1463,15 @@ async fn get_repo(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    let no_commit = || AppError::NotFound("no commit exists for this repo".into());
+    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did)
+        .await?
+        .ok_or_else(no_commit)?;
     drop(conn);
     let records =
         db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
 
-    let hash = repo_state
-        .hash
-        .as_deref()
-        .ok_or_else(|| AppError::NotFound("no commit exists for this repo".into()))?;
+    let hash = repo_state.hash.as_deref().ok_or_else(no_commit)?;
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
@@ -1476,9 +1577,11 @@ async fn list_repo_ops(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let repo_state =
-        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
-    let commit = repo_state_commit_json(&repo_state, &params.space)?;
+    let commit =
+        match db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await? {
+            Some(repo_state) => repo_state_commit_json(&repo_state, &params.space)?,
+            None => None,
+        };
 
     Ok(Json(serde_json::json!({
         "ops": ops,
@@ -1864,17 +1967,16 @@ async fn notify_write(
     }
 
     if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
-        notifications::dispatch_write_notification(
-            &state.db,
-            state.db_backend,
-            &state.http,
+        notifications::announce_writes(
+            &state,
             &space.id,
             &writer,
-            collection,
-            rkey,
-            input.cid.as_deref(),
-        )
-        .await?;
+            vec![notifications::WebhookWrite {
+                collection: collection.clone(),
+                rkey: rkey.clone(),
+                cid: input.cid.clone(),
+            }],
+        );
     }
 
     Ok(Json(serde_json::json!({ "success": true })))
@@ -1918,7 +2020,7 @@ async fn get_space_credential(
         .to_string();
     let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
 
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
@@ -1932,22 +2034,37 @@ async fn get_space_credential(
     // A PDS that serves spaces mints delegation tokens with the account's own
     // key. For accounts on one that does not, HappyView mints them with its own
     // delegation key.
-    let delegation_claims =
-        match verify_local_delegation_token(encryption_key, &token, &accepted_aud) {
-            Ok(claims) => claims,
-            Err(_) => crate::spaces::credential::verify_account_delegation_token(
-                &token,
-                &state.http,
-                &state.config.plc_url,
-                &accepted_aud,
-            )
+    // A key that cannot be read leaves only the account's own key to try, as
+    // a token this instance signed cannot be verified without it anyway.
+    let local_key =
+        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
             .await
-            .map_err(|e| AppError::XrpcError {
-                status: StatusCode::BAD_REQUEST,
-                code: "InvalidDelegationToken",
-                message: e.to_string(),
-            })?,
-        };
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "delegation key unreadable");
+                None
+            });
+    let local_claims = local_key.as_ref().map(|key| {
+        crate::spaces::credential::verify_delegation_token(
+            &token,
+            key.verifying_key(),
+            &accepted_aud,
+        )
+    });
+    let delegation_claims = match local_claims {
+        Some(Ok(claims)) => claims,
+        _ => crate::spaces::credential::verify_account_delegation_token(
+            &token,
+            &state.http,
+            &state.config.plc_url,
+            &accepted_aud,
+        )
+        .await
+        .map_err(|e| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: e.to_string(),
+        })?,
+    };
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
@@ -2014,25 +2131,41 @@ async fn get_space_credential(
     })))
 }
 
-/// Verify a delegation token HappyView minted with its own delegation key.
-fn verify_local_delegation_token(
-    encryption_key: &[u8; 32],
-    token: &str,
-    accepted_aud: &[&str],
-) -> Result<crate::spaces::credential::DelegationTokenClaims, AppError> {
-    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
-        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
-    crate::spaces::credential::verify_delegation_token(
-        token,
-        &k256::ecdsa::VerifyingKey::from(&signing_key),
-        accepted_aud,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_forwarded_batch_tags_each_write_by_type_and_sends_only_what_was_given() {
+        let writes: Vec<WriteOp> = serde_json::from_value(json!([
+            { "action": "create", "collection": "com.example.a", "value": { "n": 1 } },
+            { "action": "update", "collection": "com.example.a", "rkey": "r1",
+              "value": { "n": 2 }, "swapRecord": "bafyold" },
+            { "action": "delete", "collection": "com.example.b", "rkey": "r2" },
+        ]))
+        .unwrap();
+        let body = pds_apply_writes_body("at://did:web:s/space/t/k", "did:plc:me", None, &writes);
+        assert_eq!(
+            body,
+            json!({
+                "space": "at://did:web:s/space/t/k",
+                "repo": "did:plc:me",
+                "writes": [
+                    { "$type": "com.atproto.space.applyWrites#create",
+                      "collection": "com.example.a", "value": { "n": 1 } },
+                    { "$type": "com.atproto.space.applyWrites#update",
+                      "collection": "com.example.a", "rkey": "r1", "value": { "n": 2 },
+                      "swapRecord": "bafyold" },
+                    { "$type": "com.atproto.space.applyWrites#delete",
+                      "collection": "com.example.b", "rkey": "r2" },
+                ],
+            })
+        );
+        let with_swap =
+            pds_apply_writes_body("at://did:web:s/space/t/k", "did:plc:me", Some("3krev"), &[]);
+        assert_eq!(with_swap["swapCommit"], "3krev");
+    }
 
     #[test]
     fn content_cid_deterministic() {

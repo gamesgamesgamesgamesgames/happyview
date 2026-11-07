@@ -17,6 +17,10 @@ pub struct LexiconReport {
     pub structures: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documents: Option<Vec<serde_json::Value>>,
+    /// Documents left out of `documents` to keep the report under the
+    /// collector's size limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents_omitted: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -30,6 +34,10 @@ pub struct Snapshot {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<String>,
+    /// The hosting platform that made reporting mandatory; absent when the
+    /// operator chose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<String>,
 
     #[serde(default)]
     pub totals: Counters,
@@ -62,6 +70,7 @@ mod tests {
             happyview_version: "0.1.0".into(),
             process_started_at: "2026-08-18T00:00:00+00:00".into(),
             contact: None,
+            managed: None,
             totals: Default::default(),
             since_start: Default::default(),
             features: Default::default(),
@@ -85,6 +94,17 @@ mod tests {
         s.contact = Some("tre@trezy.com".into());
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(json["contact"], "tre@trezy.com");
+    }
+
+    #[test]
+    fn omits_managed_unless_a_platform_set_it() {
+        let json = serde_json::to_value(sample()).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("managed"));
+
+        let mut s = sample();
+        s.managed = Some("acme".into());
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(json["managed"], "acme");
     }
 
     #[test]

@@ -1,0 +1,5 @@
+[lexicons."com.example.project.getThing"]
+token_cost = 2
+
+[scripts."job.run:thing.reindex"]
+description = "Reindexes every thing."

@@ -1,11 +1,11 @@
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
+use crate::tid::generate_tid;
 use sha2::{Digest, Sha256};
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {
@@ -82,7 +82,7 @@ pub(crate) async fn verify_space_credential(
     space: &Space,
     token: &str,
 ) -> Result<crate::spaces::credential::SpaceCredentialClaims, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
     let key = crate::spaces::auth::space_verifying_key(
@@ -147,7 +147,11 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
-pub(crate) async fn fetch_space_blob(
+///
+/// Public only so `tests/test_runner_identity.rs` can show it refuses a
+/// forged PDS before any request; the routes are its real callers.
+#[doc(hidden)]
+pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
     cid: &str,
@@ -162,6 +166,13 @@ pub(crate) async fn fetch_space_blob(
     let pds_endpoint =
         crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
             .await?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "fetching a space blob").map_err(
+        |message| AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message,
+        },
+    )?;
 
     let url = format!(
         "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
@@ -230,9 +241,14 @@ pub(crate) struct AppliedOp {
 pub async fn signing_key_from_pool(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    crate::verification_methods::ensure_atproto_space_method(pool, backend, encryption_key).await?;
+    crate::verification_methods::ensure_atproto_space_method(
+        pool,
+        backend,
+        encryption_key.current(),
+    )
+    .await?;
     load_signing_key(pool, backend, encryption_key).await
 }
 
@@ -240,7 +256,7 @@ pub async fn signing_key_from_pool(
 pub async fn load_signing_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
     let key_bytes = crate::verification_methods::get_private_key_bytes(
         pool,
@@ -272,7 +288,7 @@ pub async fn load_signing_key(
 pub(crate) async fn service_signing_key(
     state: &AppState,
 ) -> Result<p256::ecdsa::SigningKey, AppError> {
-    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+    let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal(
             "spaces require a token encryption key to sign commits; set TOKEN_ENCRYPTION_KEY"
                 .into(),
@@ -413,19 +429,18 @@ pub(crate) async fn notify_ops(
         );
     }
 
-    for op in ops {
-        let _ = notifications::dispatch_write_notification(
-            &state.db,
-            state.db_backend,
-            &state.http,
-            &space.id,
-            author_did,
-            &op.collection,
-            &op.rkey,
-            op.new_cid.as_deref(),
-        )
-        .await;
-    }
+    notifications::announce_writes(
+        state,
+        &space.id,
+        author_did,
+        ops.iter()
+            .map(|op| notifications::WebhookWrite {
+                collection: op.collection.clone(),
+                rkey: op.rkey.clone(),
+                cid: op.new_cid.clone(),
+            })
+            .collect(),
+    );
 }
 
 /// Whether this repo's writes still belong to HappyView, and if not, forward them.
@@ -437,7 +452,7 @@ pub(crate) async fn notify_ops(
 ///
 /// This bridge is deprecated. It keeps existing clients working once their
 /// repos migrate. Remove it once clients write to PDSes directly.
-async fn forward_write_if_native(
+pub(crate) async fn forward_write_if_native(
     state: &AppState,
     space: &Space,
     author_did: &str,
@@ -460,6 +475,19 @@ async fn forward_write_if_native(
 
     if host_mode.is_authoritative_here() {
         return Ok(None);
+    }
+
+    // The in-process PDS answers repo writes only, so re-authenticating, which
+    // is the advice below, could never help here.
+    if state.test.is_some() {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message: format!(
+                "this space lives on {author_did}'s PDS, and a test run serves no \
+                 PDS-backed spaces; {method} reaches only spaces HappyView hosts"
+            ),
+        });
     }
 
     tracing::warn!(
@@ -938,18 +966,27 @@ async fn revoke_member_credentials(
     Ok(())
 }
 
+/// Upsert a member. `access` of `None` leaves an existing member's read and
+/// write untouched, and gives a new one read — so a caller who names only a
+/// DID, or only `is_delegation`, neither grants nor withdraws access.
+///
+/// `read_self` is carried forward on the same principle: it is HappyView-local,
+/// and replacing read and write is not a request to lift an own-records-only
+/// restriction.
 pub(crate) async fn put_member(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
     member_did: &str,
-    access: MemberAccess,
+    access: Option<MemberAccess>,
     is_delegation: Option<bool>,
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
 
     let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    let current = existing.as_ref().map(|m| m.access);
+    let access = access.unwrap_or_else(|| current.unwrap_or(MemberAccess::READ));
     let member = SpaceMember {
         id: existing
             .as_ref()
@@ -958,7 +995,7 @@ pub(crate) async fn put_member(
         space_id: space.id.clone(),
         did: member_did.to_string(),
         access: MemberAccess {
-            read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
+            read_self: current.map(|a| a.read_self).unwrap_or(false),
             ..access
         },
         is_delegation: is_delegation.unwrap_or(false),
@@ -1071,6 +1108,37 @@ pub(crate) async fn remove_member(
     Ok(())
 }
 
+/// An invite's `expiresAt` as given at creation, as the UTC timestamp it is
+/// stored as: the form [`now_rfc3339`] writes, so every stored expiry reads the
+/// same way. A value that isn't a lexicon `datetime` is refused, naming the
+/// field the way lexicon validation does.
+///
+/// An expiry already in the past is kept, not refused: creation takes the
+/// other limits as given too (`maxUses: 0` is stored), and such an invite is
+/// simply one redemption refuses.
+fn normalize_invite_expiry(raw: &str) -> Result<String, AppError> {
+    crate::xrpc::validate::parse_datetime(raw)
+        .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
+        .ok_or_else(|| AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "Input/expiresAt must be a valid datetime (ISO 8601 with a timezone)".into(),
+        })
+}
+
+/// Whether a stored invite expiry has passed at `now`, compared as times. A
+/// stored value that doesn't parse as a timestamp (one written before creation
+/// parsed it) counts as passed, so an invite is never open-ended by accident.
+fn invite_expired(stored: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(stored) {
+        Ok(at) => now > at.with_timezone(&chrono::Utc),
+        Err(err) => {
+            tracing::warn!(expires_at = stored, "unparseable invite expiry: {err}");
+            true
+        }
+    }
+}
+
 pub(crate) async fn create_invite(
     state: &AppState,
     actor_did: &str,
@@ -1079,6 +1147,10 @@ pub(crate) async fn create_invite(
     max_uses: Option<i64>,
     expires_at: Option<String>,
 ) -> Result<(SpaceInvite, String), AppError> {
+    let expires_at = expires_at
+        .as_deref()
+        .map(normalize_invite_expiry)
+        .transpose()?;
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
     let mut token_bytes = [0u8; 24];
@@ -1121,7 +1193,7 @@ pub(crate) async fn accept_invite(
         ));
     }
     if let Some(ref expires) = invite.expires_at
-        && now_rfc3339() > *expires
+        && invite_expired(expires, chrono::Utc::now())
     {
         return Err(AppError::BadRequest("This invite has expired".into()));
     }
@@ -1165,15 +1237,12 @@ pub(crate) async fn accept_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use crate::lexicon::LexiconRegistry;
-    use tokio::sync::watch;
 
     macro_rules! require_test_db {
         () => {
             if std::env::var("TEST_DATABASE_URL").is_err() {
-                eprintln!("skipped (TEST_DATABASE_URL not set)");
+                crate::test_support::unavailable(crate::test_support::NO_DATABASE);
                 return;
             }
         };
@@ -1185,139 +1254,10 @@ mod tests {
         let backend = DatabaseBackend::from_url(&url);
         let pool = crate::db::connect(&url, backend).await;
 
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            database_url: String::new(),
-            database_backend: backend,
-            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
-            public_url: String::new(),
-            user_agent: String::new(),
-            session_secret: "test-secret".into(),
-            jetstream_url: String::new(),
-            relay_url: String::new(),
-            plc_url: String::new(),
-            static_dir: String::new(),
-            base_path: None,
-            event_log_retention_days: 30,
-            app_name: None,
-            logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
-            // Space writes need this to decrypt the `#atproto_space` signing key.
-            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
-            default_rate_limit_capacity: 100,
-            default_rate_limit_refill_rate: 2.0,
-            telemetry_collector_url: String::new(),
-            platform_api_key_hash: None,
-            job_worker_concurrency: 1,
-        };
-        let (collections_tx, _) = watch::channel(vec![]);
-        let (labeler_subscriptions_tx, _) = watch::channel(());
-
-        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
-        let did_resolver = atrium_identity::did::CommonDidResolver::new(
-            atrium_identity::did::CommonDidResolverConfig {
-                plc_directory_url: "https://plc.directory".into(),
-                http_client: std::sync::Arc::clone(&atrium_http),
-            },
-        );
-        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
-            atrium_identity::handle::AtprotoHandleResolverConfig {
-                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
-                http_client: atrium_http,
-            },
-        );
-        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
-            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![atrium_oauth::Scope::Known(
-                    atrium_oauth::KnownScope::Atproto,
-                )]),
-            },
-            keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(
-                pool.clone(),
-                backend,
-                None,
-            ),
-            resolver: atrium_oauth::OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-            http_client: crate::http_retry::HappyViewHttpClient::default(),
-        })
-        .expect("Failed to create test OAuth client");
-
-        let state = AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: pool.clone(),
-            backfill_db: pool.clone(),
-            db_backend: backend,
-            domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
-            collections_tx,
-            labeler_subscriptions_tx,
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: std::sync::Arc::new(crate::auth::OAuthClientRegistry::new(
-                std::sync::Arc::new(oauth),
-                None,
-            )),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
-                pool.clone(),
-                backend,
-                None,
-            ),
-            linked_repos_client: std::sync::Arc::new(
-                crate::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    vec![atrium_oauth::Scope::Known(
-                        atrium_oauth::KnownScope::Atproto,
-                    )],
-                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend, None),
-                    pool.clone(),
-                    backend,
-                    None,
-                    None,
-                )
-                .expect("Failed to create test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-for-tests-only-not-production",
-            ),
-            plugin_registry: std::sync::Arc::new(crate::plugin::PluginRegistry::new()),
-            wasm_runtime: std::sync::Arc::new(
-                crate::plugin::WasmRuntime::new().expect("wasm runtime"),
-            ),
-            attestation_signer: None,
-            official_registry: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
-            ),
-            proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
-                crate::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-        };
+        // Port 0: the one field the shared fixture's configuration sets
+        // differently.
+        let mut state = crate::test_support::test_state_with_pool_on(pool, backend);
+        state.config.port = 0;
 
         crate::test_support::provision_space_signing_key(&state).await;
 
@@ -1573,6 +1513,204 @@ mod tests {
             }
             other => panic!("expected BadRequest, got: {other:?}"),
         }
+    }
+
+    /// An invite created with `expires_at` exactly as given, the way one was
+    /// stored before creation parsed it.
+    async fn seed_raw_invite(state: &AppState, space_uri: &str, expires_at: &str) -> String {
+        let space = super::resolve_space(state, space_uri)
+            .await
+            .expect("space resolves");
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let invite = SpaceInvite {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space.id,
+            token_hash: hex::encode(Sha256::digest(token.as_bytes())),
+            created_by: space.authority_did,
+            access: MemberAccess::READ,
+            max_uses: None,
+            uses: 0,
+            expires_at: Some(expires_at.to_string()),
+            revoked: false,
+            created_at: now_rfc3339(),
+        };
+        db::create_invite(&state.db, state.db_backend, &invite)
+            .await
+            .expect("failed to seed invite");
+        token
+    }
+
+    fn assert_expired(err: crate::error::AppError) {
+        match err {
+            crate::error::AppError::BadRequest(msg) => assert!(
+                msg.to_lowercase().contains("expired"),
+                "expected 'expired' in message, got: {msg}"
+            ),
+            other => panic!("expected BadRequest, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offset_expiry_in_the_past_is_refused_at_redeem() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        // One hour ago, written in +02:00: its local clock reads an hour
+        // later than UTC now, so as text it sorts after the current time.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let (_invite, token) =
+            super::create_invite(&state, &authority, &space_uri, None, None, Some(past))
+                .await
+                .expect("authority creates invite");
+
+        let err = super::accept_invite(&state, "did:plc:joiner-offset-past", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[tokio::test]
+    async fn an_offset_expiry_in_the_future_is_accepted_at_redeem() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+        let future = at
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let (invite, token) =
+            super::create_invite(&state, &authority, &space_uri, None, None, Some(future))
+                .await
+                .expect("authority creates invite");
+        assert_eq!(
+            invite.expires_at.as_deref(),
+            Some(at.to_rfc3339().as_str()),
+            "the expiry is stored in UTC, in the form now_rfc3339 writes"
+        );
+
+        super::accept_invite(&state, "did:plc:joiner-offset-future", &token)
+            .await
+            .expect("an unexpired invite is redeemed");
+    }
+
+    #[tokio::test]
+    async fn a_utc_expiry_still_works() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        let (invite, token) = super::create_invite(
+            &state,
+            &authority,
+            &space_uri,
+            None,
+            None,
+            Some("2999-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .expect("authority creates invite");
+        assert_eq!(
+            invite.expires_at.as_deref(),
+            Some("2999-01-01T00:00:00+00:00")
+        );
+        let stored = db::get_invite_by_token_hash(
+            &state.db,
+            state.db_backend,
+            &hex::encode(Sha256::digest(token.as_bytes())),
+        )
+        .await
+        .unwrap()
+        .expect("invite stored");
+        assert_eq!(stored.expires_at, invite.expires_at);
+
+        super::accept_invite(&state, "did:plc:joiner-utc-future", &token)
+            .await
+            .expect("an unexpired invite is redeemed");
+    }
+
+    #[tokio::test]
+    async fn a_non_timestamp_expiry_is_refused_at_creation() {
+        require_test_db!();
+        let (state, space_uri, authority) = service_test_db().await;
+        for bad in ["next tuesday", "2026-06-01", "2026-06-01 00:00:00Z", ""] {
+            let err = super::create_invite(
+                &state,
+                &authority,
+                &space_uri,
+                None,
+                None,
+                Some(bad.to_string()),
+            )
+            .await
+            .unwrap_err();
+            match err {
+                crate::error::AppError::XrpcError {
+                    status,
+                    code,
+                    message,
+                } => {
+                    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{bad:?}");
+                    assert_eq!(code, "InvalidRequest", "{bad:?}");
+                    assert!(message.contains("expiresAt"), "{bad:?}: {message}");
+                }
+                other => panic!("{bad:?}: expected InvalidRequest, got: {other:?}"),
+            }
+        }
+        let space = super::resolve_space(&state, &space_uri).await.unwrap();
+        let invites = db::list_invites(&state.db, state.db_backend, &space.id)
+            .await
+            .unwrap();
+        assert!(invites.is_empty(), "a refused invite is not stored");
+    }
+
+    #[tokio::test]
+    async fn a_stored_expiry_that_does_not_parse_counts_as_expired() {
+        require_test_db!();
+        let (state, space_uri, _authority) = service_test_db().await;
+        let token = seed_raw_invite(&state, &space_uri, "never").await;
+
+        let err = super::accept_invite(&state, "did:plc:joiner-legacy", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[tokio::test]
+    async fn a_stored_offset_expiry_is_compared_as_a_time() {
+        require_test_db!();
+        let (state, space_uri, _authority) = service_test_db().await;
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let token = seed_raw_invite(&state, &space_uri, &past).await;
+
+        let err = super::accept_invite(&state, "did:plc:joiner-legacy-offset", &token)
+            .await
+            .unwrap_err();
+        assert_expired(err);
+    }
+
+    #[test]
+    fn invite_expiry_is_normalized_to_utc() {
+        assert_eq!(
+            super::normalize_invite_expiry("2026-06-01T02:00:00+02:00").unwrap(),
+            "2026-06-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            super::normalize_invite_expiry("2026-06-01T00:00:00.5Z").unwrap(),
+            "2026-06-01T00:00:00.500+00:00"
+        );
+        assert!(super::normalize_invite_expiry("2026-06-01T00:00:00-00:00").is_err());
+    }
+
+    #[test]
+    fn invite_expiry_compares_times_not_text() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 2026-06-01T00:00:00Z: passed, though it sorts after `now` as text.
+        assert!(super::invite_expired("2026-06-01T02:00:00+02:00", now));
+        // 2026-06-01T01:00:00Z: not passed, though it sorts before `now`.
+        assert!(!super::invite_expired("2026-05-31T20:00:00-05:00", now));
+        assert!(super::invite_expired("not a date", now));
     }
 
     #[tokio::test]
@@ -2063,7 +2201,7 @@ mod tests {
             "did:plc:creator",
             &uri,
             "did:plc:friend",
-            MemberAccess::READ,
+            Some(MemberAccess::READ),
             None,
         )
         .await
@@ -2073,7 +2211,7 @@ mod tests {
             "did:plc:friend",
             &uri,
             "did:plc:other",
-            MemberAccess::READ,
+            Some(MemberAccess::READ),
             None,
         )
         .await
@@ -2285,6 +2423,33 @@ mod native_write_bridge_tests {
             "the error should tell the user what to do: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn a_native_write_in_a_test_run_says_the_run_serves_no_pds_spaces() {
+        let (mut state, space) = state_with_space(HostMode::Native).await;
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "src/a.test.lua",
+        )));
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a test run cannot forward a write to a PDS");
+
+        let AppError::XrpcError {
+            status, message, ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(message.contains("test run"), "{message}");
+        assert!(!message.contains("re-authenticate"), "{message}");
+    }
 }
 
 #[cfg(test)]
@@ -2436,6 +2601,82 @@ mod invite_access_tests {
                 .expect("read the invite back")
                 .expect("the invite exists");
             assert_eq!(fetched.access, access, "round-trip of {access:?}");
+        }
+    }
+
+    /// The migration's backfill, against rows that actually predate it.
+    ///
+    /// A fresh database and a migrated one both cross this migration with
+    /// nothing to convert, so the four mappings are exercised by no ordinary
+    /// run. They matter: each has to be exactly what `parse_wire` made of that
+    /// word, or an outstanding invite changes meaning as it crosses.
+    ///
+    /// The SQL is read from the migration rather than restated, so the test
+    /// cannot drift from the thing it checks. The two backends' files are
+    /// asserted byte-identical, which is what lets one execution speak for
+    /// both — reversing the migration on the shared Postgres database would
+    /// break it for every other test.
+    #[tokio::test]
+    async fn the_migration_backfills_each_access_word() {
+        let (state, space) = state_with_space().await;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let name = "20260930000005_space_invite_booleans.sql";
+        let sqlite_sql = std::fs::read_to_string(dir.join("sqlite").join(name)).expect("read it");
+        let postgres_sql =
+            std::fs::read_to_string(dir.join("postgres").join(name)).expect("read it");
+        assert_eq!(
+            sqlite_sql, postgres_sql,
+            "the two backends' migrations have diverged, so this covers only one"
+        );
+
+        // Back to the shape the migration expects to find.
+        for stmt in [
+            "ALTER TABLE happyview_space_invites ADD COLUMN access TEXT NOT NULL DEFAULT 'read'",
+            "ALTER TABLE happyview_space_invites DROP COLUMN can_read",
+            "ALTER TABLE happyview_space_invites DROP COLUMN can_write",
+            "ALTER TABLE happyview_space_invites DROP COLUMN read_self",
+        ] {
+            crate::db::query(stmt)
+                .execute(&state.db)
+                .await
+                .expect("undo the migration");
+        }
+
+        let words = ["read", "write", "read_self", "none"];
+        for word in words {
+            crate::db::query(
+                "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, access, uses, revoked, created_at) \
+                 VALUES (?, ?, ?, ?, ?, 0, 0, ?)",
+            )
+            .bind(word)
+            .bind(&space.id)
+            .bind(format!("hash-{word}"))
+            .bind(ADMIN)
+            .bind(word)
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .expect("seed a pre-migration invite");
+        }
+
+        // The string comes off disk from this repo, not from a caller.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sqlite_sql.clone()))
+            .execute(&state.db)
+            .await
+            .expect("run the migration");
+
+        for word in words {
+            let row =
+                db::get_invite_by_token_hash(&state.db, state.db_backend, &format!("hash-{word}"))
+                    .await
+                    .expect("read the invite back")
+                    .expect("the invite survived");
+            assert_eq!(
+                row.access,
+                MemberAccess::parse_wire(word).unwrap(),
+                "'{word}' crossed the migration as something else"
+            );
         }
     }
 }

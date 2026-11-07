@@ -71,10 +71,10 @@ async fn a_saved_value_is_stored_encrypted_and_listed_masked() {
     let (value, encrypted) = stored(&app, "API_TOKEN").await;
     assert_eq!(encrypted, 1);
     assert!(!value.contains("secret"));
-    let env = happyview::lua::variables::load(
+    let env = happyview::script::variables::load(
         &app.state.db,
         app.state.db_backend,
-        app.state.config.token_encryption_key.as_ref(),
+        app.state.config.keyring().as_ref(),
     )
     .await;
     assert_eq!(env["API_TOKEN"], "ijklmnop-secret");

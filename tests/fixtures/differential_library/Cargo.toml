@@ -1,0 +1,19 @@
+# The library the differential harness runs both interpreters against. It
+# answers every call the corpus and the bridge cases make, and logs each one
+# through `host_log` so both paths leave a transcript the harness can compare.
+[package]
+name = "differential-library"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "differential_library"
+crate-type = ["cdylib"]
+
+[dependencies]
+happyview-plugin-sdk = { path = "../../../crates/happyview-plugin-sdk" }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

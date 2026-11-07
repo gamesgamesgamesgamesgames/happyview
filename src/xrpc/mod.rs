@@ -1,8 +1,9 @@
+pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
+pub(crate) mod validate;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -15,8 +16,25 @@ use crate::AppState;
 use crate::auth::{Claims, XrpcClaims};
 use crate::error::AppError;
 use crate::lexicon::LexiconType;
-use crate::rate_limit::CheckResult;
+use crate::rate_limit::{CheckResult, RateLimiter};
 use crate::resolve::resolve_nsid_authority;
+
+/// Decode one query-string component.
+///
+/// A query string is form-urlencoded, which the URL standard requires of the
+/// query and which `URLSearchParams`, a browser `fetch` and most HTTP clients
+/// all produce -- so a space arrives as `+`, not `%20`. Percent-decoding alone
+/// left it as a literal plus, and a search for `Integration Demo` therefore
+/// looked for `Integration+Demo` and matched nothing.
+///
+/// The replacement runs first and a real plus survives it: `a+b` is read as
+/// `a b`, while an encoded one is `a%2Bb`, carries no plus to replace, and
+/// percent-decodes to `a+b` afterwards.
+fn decode_component(raw: &str) -> String {
+    urlencoding::decode(&raw.replace('+', " "))
+        .unwrap_or_default()
+        .into_owned()
+}
 
 /// Parse a raw query string into a map where repeated keys become JSON arrays.
 /// Single-value keys remain as JSON strings for backward compatibility.
@@ -27,14 +45,8 @@ pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
             continue;
         }
         let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (
-                urlencoding::decode(k).unwrap_or_default().into_owned(),
-                urlencoding::decode(v).unwrap_or_default().into_owned(),
-            ),
-            None => (
-                urlencoding::decode(pair).unwrap_or_default().into_owned(),
-                String::new(),
-            ),
+            Some((k, v)) => (decode_component(k), decode_component(v)),
+            None => (decode_component(pair), String::new()),
         };
         multi.entry(key).or_default().push(value);
     }
@@ -315,15 +327,18 @@ pub(crate) async fn proxy_to_authority(
         .unwrap())
 }
 
+/// The rate key of a request that names no client.
+const ANONYMOUS_CLIENT_KEY: &str = "anonymous";
+
 /// Find the client key from claims, headers, or query params.
 ///
 /// Authenticated requests (claims present) must provide one — returns Err
-/// if missing.  Anonymous requests fall back to `"anonymous"`.
+/// if missing. An anonymous request that names none is `None`.
 fn extract_client_key(
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     let found = claims
         .and_then(|c| c.client_key().map(|k| k.to_string()))
         .or_else(|| {
@@ -341,27 +356,37 @@ fn extract_client_key(
         });
 
     match found {
-        Some(k) => Ok(k),
+        Some(k) => Ok(Some(k)),
         None if claims.is_some() => Err(AppError::Auth(
             "Missing client identification. Provide an X-Client-Key header or client_key query parameter.".into(),
         )),
-        None => Ok("anonymous".to_string()),
+        None => Ok(None),
     }
 }
 
-/// Resolve the client key and run origin/secret validation.
+/// The rate key of a request: the client it names, once that client is
+/// proven, and `anonymous` otherwise.
+///
+/// A client is proven by the session it signed in through, by its registered
+/// Origin, or by one of its live secrets. A key that is unknown, or arrives
+/// with the wrong Origin, a wrong secret or neither, is warned about and
+/// limited as `anonymous`: the key is public, so taking it on its word would
+/// let any caller spend that client's bucket. A request that names no client
+/// is the ordinary case for a public query and logs nothing.
 fn resolve_client_key(
-    state: &AppState,
+    rate_limiter: &RateLimiter,
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
+    secret_used: impl FnOnce(String),
 ) -> Result<String, AppError> {
-    let client_key = extract_client_key(claims, parts, query_params)?;
+    let Some(client_key) = extract_client_key(claims, parts, query_params)? else {
+        return Ok(ANONYMOUS_CLIENT_KEY.to_string());
+    };
 
-    // Log validation warnings but always return the key for rate limiting.
-    if !state.rate_limiter.is_valid_client_key(&client_key) {
+    if !rate_limiter.is_valid_client_key(&client_key) {
         tracing::warn!("Unknown client key: {client_key}");
-        return Ok(client_key);
+        return Ok(ANONYMOUS_CLIENT_KEY.to_string());
     }
 
     // If the key came from a session cookie, it was already validated at login time.
@@ -374,11 +399,9 @@ fn resolve_client_key(
         let origin = parts.headers.get("origin").and_then(|v| v.to_str().ok());
 
         if let Some(origin) = origin {
-            if !state
-                .rate_limiter
-                .validate_client_origin(&client_key, origin)
-            {
+            if !rate_limiter.validate_client_origin(&client_key, origin) {
                 tracing::warn!("Origin mismatch for client {client_key}: got {origin}");
+                return Ok(ANONYMOUS_CLIENT_KEY.to_string());
             }
         } else {
             let secret = parts
@@ -386,19 +409,50 @@ fn resolve_client_key(
                 .get("x-client-secret")
                 .and_then(|v| v.to_str().ok());
 
-            match secret {
-                Some(s) if state.rate_limiter.validate_client_secret(&client_key, s) => {}
-                Some(_) => {
+            match secret.map(|s| rate_limiter.match_client_secret(&client_key, s)) {
+                Some(Some(secret_id)) => {
+                    if rate_limiter.note_secret_use(&secret_id) {
+                        secret_used(secret_id);
+                    }
+                }
+                Some(None) => {
                     tracing::warn!("Invalid client secret for {client_key}");
+                    return Ok(ANONYMOUS_CLIENT_KEY.to_string());
                 }
                 None => {
                     tracing::warn!("No Origin or X-Client-Secret for client {client_key}");
+                    return Ok(ANONYMOUS_CLIENT_KEY.to_string());
                 }
             }
         }
     }
 
     Ok(client_key)
+}
+
+/// The `anonymous_xrpc` limit (HAP-226): a call from nobody is refused when
+/// the instance's limits say so. `identified` is whether the caller is someone
+/// (a signed-in session or another service), which is what decides this.
+/// A space credential doesn't count here: the space routes verify their own
+/// credentials, and a credential grants reads of one space through them, not
+/// a caller for every other method. `rate_key` doesn't decide it either: that
+/// says only whether a client key checked out, and a signed-in caller's can
+/// fail to, say on an instance that hasn't loaded the client yet. A key alone
+/// identifies nobody either, so a call with no caller needs one that checked
+/// out. Reads the limits in memory, on every request.
+fn refuse_anonymous(state: &AppState, identified: bool, rate_key: &str) -> Result<(), AppError> {
+    if !identified && rate_key == ANONYMOUS_CLIENT_KEY {
+        state.limits.limits().allows_anonymous_xrpc()?;
+    }
+    Ok(())
+}
+
+/// Record, off the request path, that a client secret authenticated a request.
+fn record_secret_use(state: &AppState, secret_id: String) {
+    let (db, backend) = (state.db.clone(), state.db_backend);
+    tokio::spawn(async move {
+        crate::oauth::client_secrets::record_use(&db, backend, &secret_id).await;
+    });
 }
 
 /// Apply rate limit headers to a response.
@@ -465,8 +519,16 @@ pub async fn xrpc_get(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
+    let identified = claims.is_some() || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     let lexicon = state.lexicons.get(&method).await;
 
@@ -549,6 +611,7 @@ pub async fn xrpc_get(
 
     if let Some(ref param_schema) = lexicon.parameters {
         coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
     }
 
     let mut response =
@@ -565,13 +628,72 @@ pub async fn xrpc_get(
 }
 
 /// Catch-all POST handler for XRPC procedures.
+/// A JSON body, read as strictly as the `Json` extractor did: the media type
+/// has to say JSON, and the bytes have to parse.
+fn json_body(parts: &Parts, raw: &axum::body::Bytes) -> Result<serde_json::Value, AppError> {
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mime = declared.split(';').next().unwrap_or("").trim();
+    if !(mime.eq_ignore_ascii_case("application/json")
+        || mime.to_ascii_lowercase().ends_with("+json"))
+    {
+        return Err(AppError::BadRequest(
+            "this method expects a JSON body; set content-type: application/json".into(),
+        ));
+    }
+
+    serde_json::from_slice(raw)
+        .map_err(|e| AppError::BadRequest(format!("request body is not valid JSON: {e}")))
+}
+
+/// Store a byte body and describe it to the script as a blob ref.
+///
+/// The media type recorded is the caller's, since `*/*` means the caller
+/// decides; a lexicon that pins one supplies it when the caller does not.
+async fn ingest_body(
+    state: &AppState,
+    parts: &Parts,
+    lexicon: &crate::lexicon::ParsedLexicon,
+    raw: &axum::body::Bytes,
+) -> Result<serde_json::Value, AppError> {
+    if raw.is_empty() {
+        return Err(AppError::BadRequest(
+            "this method expects a body of bytes, and none was sent".into(),
+        ));
+    }
+
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mime = match (declared, crate::script::encoding::of_input(lexicon)) {
+        (Some(sent), _) => sent,
+        (None, crate::script::Encoding::Fixed(pinned)) => pinned,
+        (None, _) => "application/octet-stream".to_string(),
+    };
+
+    let cid = crate::blobs::put(&state.db, state.db_backend, raw, &mime).await?;
+    serde_json::to_value(crate::blobs::BlobRef::new(cid, mime, raw.len() as i64))
+        .map_err(|e| AppError::Internal(format!("failed to describe a stored blob: {e}")))
+}
+
 pub async fn xrpc_post(
     State(state): State<AppState>,
     Path(method): Path<String>,
     RawQuery(raw_query): RawQuery,
     xrpc_claims: XrpcClaims,
     parts: Parts,
-    Json(body): Json<serde_json::Value>,
+    // Bytes rather than `Json`, because whether this body is JSON at all is
+    // the lexicon's to declare: `uploadBlob` takes `*/*`, and an extractor
+    // chosen before the method is known cannot honour that. A method whose
+    // lexicon says JSON is parsed exactly as strictly as before.
+    raw_body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let raw_query = raw_query.unwrap_or_default();
     let mut params = parse_query_params(&raw_query);
@@ -580,8 +702,16 @@ pub async fn xrpc_post(
     let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
         format!("service:{}", sa.did)
     } else {
-        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+        resolve_client_key(
+            &state.rate_limiter,
+            claims.as_ref(),
+            &parts,
+            &params,
+            |id| record_secret_use(&state, id),
+        )?
     };
+    let identified = claims.is_some() || xrpc_claims.service_auth.is_some();
+    refuse_anonymous(&state, identified, &rate_key)?;
 
     if claims.is_none()
         && xrpc_claims.space_credential.is_none()
@@ -641,10 +771,23 @@ pub async fn xrpc_post(
                     let claims = claims.as_ref().ok_or_else(|| {
                         AppError::Auth("XRPC procedures require DPoP authentication".into())
                     })?;
-                    forward_to_caller_pds(&state, claims, &method, &body, &parts).await?
+                    forward_to_caller_pds(
+                        &state,
+                        claims,
+                        &method,
+                        &json_body(&parts, &raw_body)?,
+                        &parts,
+                    )
+                    .await?
                 }
                 crate::proxy_config::ProxyRouting::Authority => {
-                    proxy_to_authority(&state, &method, &raw_query, Some(&body)).await?
+                    proxy_to_authority(
+                        &state,
+                        &method,
+                        &raw_query,
+                        Some(&json_body(&parts, &raw_body)?),
+                    )
+                    .await?
                 }
             };
 
@@ -666,10 +809,6 @@ pub async fn xrpc_post(
         )));
     }
 
-    if let Some(ref param_schema) = lexicon.parameters {
-        coerce_params(&mut params, param_schema);
-    }
-
     // For service auth, synthesise Claims from the caller's DID so the
     // procedure handler has an identity to work with.
     let service_auth_claims_owned;
@@ -682,6 +821,25 @@ pub async fn xrpc_post(
         // Re-bind to a reference with matching lifetime
         service_auth_claims_owned = c;
         (&service_auth_claims_owned, None)
+    };
+
+    // After auth, so a caller who may not call the procedure learns nothing
+    // about its lexicon from a validation error.
+    if let Some(ref param_schema) = lexicon.parameters {
+        coerce_params(&mut params, param_schema);
+        validate::params(&mut params, param_schema)?;
+    }
+
+    // `input.encoding` decides what the script receives. Bytes are stored
+    // before the script runs and reach it as an ordinary blob ref, so a script
+    // authorizes and records a body without ever carrying it — which is the
+    // same two-step `uploadBlob` and `createRecord` already describe.
+    let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
+        ingest_body(&state, &parts, &lexicon, &raw_body).await?
+    } else {
+        let body = json_body(&parts, &raw_body)?;
+        validate::input(&state, &lexicon, &body).await?;
+        body
     };
 
     let mut response =
@@ -722,6 +880,26 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert_eq!(arr[1], "b");
         assert_eq!(arr[2], "c");
+    }
+
+    /// A space reaches us as `+`, because that is what form-urlencoding --
+    /// and therefore `URLSearchParams` and every browser `fetch` -- sends. A
+    /// plus that was meant literally arrives as `%2B` and must survive.
+    #[test]
+    fn parse_query_params_reads_plus_as_a_space() {
+        let params = parse_query_params("q=Integration+Demo&tag=c%2B%2B&both=a+b%2Bc");
+
+        assert_eq!(params["q"], json!("Integration Demo"));
+        assert_eq!(params["tag"], json!("c++"));
+        assert_eq!(params["both"], json!("a b+c"));
+    }
+
+    /// Keys are form-urlencoded too.
+    #[test]
+    fn parse_query_params_reads_plus_in_a_key() {
+        let params = parse_query_params("a+key=value");
+
+        assert_eq!(params["a key"], json!("value"));
     }
 
     #[test]
@@ -852,11 +1030,11 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_request_gets_anonymous_rate_key() {
+    fn anonymous_request_names_no_client_key() {
         let parts = empty_parts();
         let params = HashMap::new();
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "anonymous");
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
@@ -874,7 +1052,7 @@ mod tests {
         let params = HashMap::new();
         let claims = crate::auth::Claims::with_client_key("did:plc:test".into(), "hvc_abc".into());
         let result = extract_client_key(Some(&claims), &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_abc");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_abc"));
     }
 
     #[test]
@@ -887,7 +1065,7 @@ mod tests {
             .into_parts();
         let params = HashMap::new();
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_from_header");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_from_header"));
     }
 
     #[test]
@@ -896,7 +1074,187 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("client_key".into(), json!("hvc_from_query"));
         let result = extract_client_key(None, &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_from_query");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_from_query"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_client_key
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn rate_limiter() -> std::sync::Arc<crate::rate_limit::RateLimiter> {
+        crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
+            query_cost: 1,
+            procedure_cost: 1,
+            proxy_cost: 1,
+        })
+    }
+
+    /// What `resolve_client_key` answers for `parts`, and what it logged at
+    /// warn level or above.
+    fn resolve_logging_warnings(parts: &Parts) -> (String, String) {
+        resolve_against(&rate_limiter(), parts)
+    }
+
+    fn resolve_against(
+        rate_limiter: &crate::rate_limit::RateLimiter,
+        parts: &Parts,
+    ) -> (String, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let key = tracing::subscriber::with_default(subscriber, || {
+            resolve_client_key(rate_limiter, None, parts, &HashMap::new(), |_| {}).unwrap()
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        (key, log)
+    }
+
+    #[test]
+    fn an_anonymous_request_is_rate_limited_as_anonymous_and_warns_about_nothing() {
+        let (key, log) = resolve_logging_warnings(&empty_parts());
+        assert_eq!(key, "anonymous");
+        assert_eq!(log, "", "an anonymous request logged at warn level");
+    }
+
+    #[test]
+    fn a_client_key_nobody_registered_is_warned_about_and_limited_as_anonymous() {
+        for named in ["hvc_nobody", "anonymous"] {
+            let (parts, _) = axum::http::Request::builder()
+                .uri("/xrpc/test")
+                .header("x-client-key", named)
+                .body(())
+                .unwrap()
+                .into_parts();
+            let (key, log) = resolve_logging_warnings(&parts);
+            assert_eq!(key, "anonymous");
+            assert!(
+                log.contains(&format!("Unknown client key: {named}")),
+                "got: {log}"
+            );
+        }
+    }
+
+    const VICTIM: &str = "hvc_victim";
+    const VICTIM_URI: &str = "https://victim.example";
+    const VICTIM_SECRET: &str = "hvs_victim_secret";
+
+    /// A limiter knowing one client, with a bucket of `capacity` that does
+    /// not refill within a test.
+    fn limiter_with_victim(capacity: u32) -> std::sync::Arc<crate::rate_limit::RateLimiter> {
+        let rate_limiter = rate_limiter();
+        rate_limiter.register_client_identity(
+            VICTIM.into(),
+            crate::rate_limit::ClientIdentity {
+                secrets: vec![crate::rate_limit::SecretHash {
+                    id: "secret-1".into(),
+                    hash: crate::oauth::client_secrets::hash(VICTIM_SECRET),
+                }],
+                client_uri: VICTIM_URI.into(),
+            },
+        );
+        rate_limiter.register_client_config(
+            VICTIM.into(),
+            crate::rate_limit::RateLimitConfig {
+                capacity,
+                refill_rate: 0.000_001,
+                default_query_cost: 1,
+                default_procedure_cost: 1,
+                default_proxy_cost: 1,
+            },
+        );
+        rate_limiter
+    }
+
+    #[test]
+    fn a_registered_key_without_proof_is_limited_as_anonymous() {
+        let rate_limiter = limiter_with_victim(10);
+        for (case, headers, warning) in [
+            (
+                "the wrong Origin",
+                vec![
+                    ("x-client-key", VICTIM),
+                    ("origin", "https://attacker.example"),
+                ],
+                "Origin mismatch",
+            ),
+            (
+                "a wrong secret",
+                vec![("x-client-key", VICTIM), ("x-client-secret", "hvs_guess")],
+                "Invalid client secret",
+            ),
+            (
+                "neither",
+                vec![("x-client-key", VICTIM)],
+                "No Origin or X-Client-Secret",
+            ),
+        ] {
+            let (key, log) = resolve_against(&rate_limiter, &parts_with(&headers));
+            assert_eq!(key, "anonymous", "{case}");
+            assert!(log.contains(warning), "{case}: got {log}");
+        }
+    }
+
+    #[test]
+    fn a_registered_key_with_proof_is_limited_as_itself() {
+        let rate_limiter = limiter_with_victim(10);
+        for (case, headers) in [
+            (
+                "its Origin",
+                vec![("x-client-key", VICTIM), ("origin", VICTIM_URI)],
+            ),
+            (
+                "its secret",
+                vec![("x-client-key", VICTIM), ("x-client-secret", VICTIM_SECRET)],
+            ),
+        ] {
+            let (key, log) = resolve_against(&rate_limiter, &parts_with(&headers));
+            assert_eq!(key, VICTIM, "{case}");
+            assert_eq!(log, "", "{case}");
+        }
+
+        let claims = crate::auth::Claims::with_client_key("did:plc:test".into(), VICTIM.into());
+        let key = resolve_client_key(
+            &rate_limiter,
+            Some(&claims),
+            &parts_with(&[]),
+            &HashMap::new(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(key, VICTIM, "its session");
+    }
+
+    /// The end of the chain: requests naming a client they cannot prove
+    /// leave that client's bucket untouched.
+    #[test]
+    fn naming_another_client_does_not_spend_its_bucket() {
+        let rate_limiter = limiter_with_victim(1);
+        let forged = parts_with(&[("x-client-key", VICTIM), ("x-client-secret", "hvs_guess")]);
+        for _ in 0..5 {
+            let (key, _) = resolve_against(&rate_limiter, &forged);
+            rate_limiter.check(&key, 1);
+        }
+        assert!(matches!(
+            rate_limiter.check(VICTIM, 1),
+            crate::rate_limit::CheckResult::Allowed { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -983,6 +1341,6 @@ mod tests {
         let params = HashMap::new();
         let claims = crate::auth::Claims::new_for_test("did:plc:test".into());
         let result = extract_client_key(Some(&claims), &parts, &params);
-        assert_eq!(result.unwrap(), "hvc_fallback");
+        assert_eq!(result.unwrap().as_deref(), Some("hvc_fallback"));
     }
 }

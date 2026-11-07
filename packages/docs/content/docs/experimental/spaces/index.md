@@ -169,22 +169,15 @@ HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/p
 
 ## Moderating spaces
 
-Spaces decide who can ask for data. They don't encrypt it. Anyone who can read
-HappyView's database can read every space it hosts, and that will hold for any
-server that hosts or indexes a space.
+The space inspector lets moderators read space contents while handling a report. It is off by default. An operator with `settings:manage` turns it on with **Enable Space Inspector** under **Settings > General**, or with `SPACE_INSPECTOR_ENABLED` (see [Configuration](../../getting-started/configuration.md)). The same page sets the longest access a moderator can request, and how long the access log is kept.
 
-HappyView's space inspector lets moderators read space contents from the
-dashboard while handling a report. It's off until an operator turns it on in
-**Settings → General**. With it on, a user with the `spaces:inspect`
-permission picks one space or one account, writes down why, and gets access
-for a limited time (an hour by default). The grant, the reason, and every
-record and blob opened under it go to the event log, where they can't be
-purged by hand.
+With it on, a user with the `spaces:inspect` permission requests access from the dashboard:
 
-If you build an app on spaces, tell your users what "private" means in your
-app. If moderators can read private data, say so. If you promise they can't,
-you need end-to-end encryption on top of spaces; the inspector would then show
-only ciphertext.
+1. Open **Spaces**, then a space, and choose **Request access** on its Records card. To look at one account across every space it writes to, enter its DID and choose **Open account** instead.
+2. Choose what to read: the whole space, or one of its members in every space.
+3. State why, and choose how long. Access lasts an hour by default, and never longer than the instance allows.
+
+The records appear under a banner that shows the reason and the time remaining. **End access** ends the grant early; otherwise it expires on its own. The grant, the reason, and every record and blob opened under it go to the event log as [protected events](../../guides/event-logs.md#protected-events), which can't be purged by hand. The event for a grant lists the reads made under it. See the [admin spaces API](../../api-reference/admin/spaces.md#access-grants) to do the same without the dashboard.
 
 ## Next steps
 

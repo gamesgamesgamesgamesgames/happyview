@@ -346,7 +346,7 @@ pub async fn instance_did(
 pub async fn mint_service_auth(
     pool: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     public_url: &str,
     aud: &str,
     lxm: &str,
@@ -364,7 +364,8 @@ pub async fn mint_service_auth(
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(&enc_b64)
         .map_err(|e| AppError::Internal(format!("invalid signing key encoding: {e}")))?;
-    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let private_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
     let signing_key = SigningKey::from_slice(&private_bytes)
         .map_err(|e| AppError::Internal(format!("invalid service signing key: {e}")))?;
@@ -604,7 +605,7 @@ mod outbound_tests {
         let token = mint_service_auth(
             &pool,
             backend,
-            &key,
+            &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app.example.com#forum",
             "com.atproto.simplespace.checkUserAccess",
@@ -636,7 +637,7 @@ mod outbound_tests {
             let token = mint_service_auth(
                 &pool,
                 backend,
-                &key,
+                &crate::plugin::encryption::Keyring::from(key),
                 "https://hv.example",
                 "did:web:app.example.com#forum",
                 "com.atproto.space.notifyWrite",
@@ -662,7 +663,7 @@ mod outbound_tests {
         let token = mint_service_auth(
             &pool,
             backend,
-            &key,
+            &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app#f",
             "com.atproto.simplespace.checkUserAccess",

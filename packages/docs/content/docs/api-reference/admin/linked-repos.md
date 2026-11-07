@@ -4,7 +4,7 @@ title: "Linked Repos"
 
 Admin API endpoints for managing linked repos and their invites. The whole lifecycle is available here, so the feature can be driven headlessly without the dashboard. For a conceptual overview, see [Linked Repos](../../guides/linked-repos.md).
 
-The repo write operations themselves are not part of this API. The admin API manages grants; [Lua scripts](../lua/linked-repos-api.md) use them.
+The repo write operations themselves are not part of this API. The admin API manages grants; Lua scripts use them through the [`happyview.linked_repos` library](../lua/libraries.md).
 
 ## List grants
 
@@ -209,5 +209,5 @@ curl -s https://appview.example.com/admin/linked-repos \
 ## See also
 
 - [Linked Repos guide](../../guides/linked-repos.md): Concepts, scopes, and the invite flow
-- [Linked Repos Lua API](../lua/linked-repos-api.md): Writing to a linked repo from a script
+- [Linked Repos guide](../../guides/linked-repos.md#using-a-linked-repo-from-a-script): Writing to a linked repo from a script
 - [Permissions](../../guides/permissions.md): The full permission list

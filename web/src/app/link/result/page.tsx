@@ -14,12 +14,7 @@ import {
 } from "@/components/ui/empty";
 
 type ResultStatus =
-  | "success"
-  | "expired"
-  | "mismatch"
-  | "already_linked"
-  | "failed"
-  | "gone";
+  "success" | "expired" | "mismatch" | "already_linked" | "failed" | "gone";
 
 interface ResultCopy {
   icon: React.ComponentType<{ className?: string }>;
@@ -42,8 +37,8 @@ const RESULT_COPY: Record<ResultStatus, ResultCopy> = {
         ) : (
           "Your repo is now linked."
         )}{" "}
-        You can review or revoke this access at any time from your own
-        account or PDS settings.
+        You can review or revoke this access at any time from your own account
+        or PDS settings.
       </>
     ),
   },
@@ -93,7 +88,9 @@ function LinkResultInner() {
   const statusParam = searchParams.get("status");
   const handle = searchParams.get("handle");
 
-  const status: ResultStatus = isResultStatus(statusParam) ? statusParam : "failed";
+  const status: ResultStatus = isResultStatus(statusParam)
+    ? statusParam
+    : "failed";
   const copy = RESULT_COPY[status];
   const Icon = copy.icon;
 
@@ -114,8 +111,8 @@ function LinkResultInner() {
       {status === "mismatch" && (
         <EmptyContent>
           <p className="text-muted-foreground text-sm">
-            No action was taken on the account you meant to link — it&apos;s safe
-            to try again.
+            No action was taken on the account you meant to link — it&apos;s
+            safe to try again.
           </p>
         </EmptyContent>
       )}

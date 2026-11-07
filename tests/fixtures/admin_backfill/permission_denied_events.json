@@ -1,0 +1,137 @@
+[
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-admin\"}",
+    "call": "warn did:plc:pinnedadmin backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody backfill:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"stats:read\",\"user_id\":\"user-nobody\"}",
+    "call": "warn did:plc:pinnednobody stats:read",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  },
+  {
+    "body": "{\"required_permission\":\"backfill:create\",\"user_id\":\"user-reader\"}",
+    "call": "warn did:plc:pinnedreader backfill:create",
+    "status": 0
+  }
+]

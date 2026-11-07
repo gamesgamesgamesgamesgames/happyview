@@ -1,0 +1,5 @@
+error[E0425]: cannot find value `happyview_handler_plain` in this scope
+ --> tests/ui/listed_without_attribute.rs:5:9
+  |
+5 | export!(plain);
+  |         ^^^^^ not found in this scope

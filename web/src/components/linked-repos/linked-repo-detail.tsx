@@ -110,11 +110,14 @@ export function LinkedRepoDetail({
       await navigator.clipboard.writeText(inviteUrl);
       toast.success("Invite link copied. Send it to the repo's owner.");
     } catch {
-      toast.warning("Invite link created, but copying to the clipboard failed", {
-        description: inviteUrl,
-        duration: Infinity,
-        closeButton: true,
-      });
+      toast.warning(
+        "Invite link created, but copying to the clipboard failed",
+        {
+          description: inviteUrl,
+          duration: Infinity,
+          closeButton: true,
+        },
+      );
     }
     setBusy(false);
     loadInvites();
@@ -185,7 +188,11 @@ export function LinkedRepoDetail({
               .split(/\s+/)
               .filter(Boolean)
               .map((scope) => (
-                <Badge key={scope} variant="outline" className="font-mono text-xs">
+                <Badge
+                  key={scope}
+                  variant="outline"
+                  className="font-mono text-xs"
+                >
                   {scope}
                 </Badge>
               ))}
@@ -280,7 +287,11 @@ export function LinkedRepoDetail({
           </p>
         )}
         {canDelete && (
-          <Button variant="ghost" className="text-destructive" onClick={onRequestDelete}>
+          <Button
+            variant="ghost"
+            className="text-destructive"
+            onClick={onRequestDelete}
+          >
             Remove this linked repo
           </Button>
         )}

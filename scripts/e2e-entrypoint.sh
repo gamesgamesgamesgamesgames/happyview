@@ -2,8 +2,9 @@
 set -e
 
 # Wait for Caddy's internal CA certificate to appear in the shared volume,
-# then install it so reqwest (native-tls / OpenSSL) trusts TLS connections
-# proxied through Caddy (e.g. the PDS OAuth endpoints).
+# then install it into the system store, which reqwest (rustls with native
+# roots) reads, so it trusts TLS connections proxied through Caddy (e.g. the
+# PDS OAuth endpoints).
 #
 # Reading Caddy's CA (its pki/ tree is root-owned, mode 0700 to protect the CA
 # key) and installing it into the system trust store both require root, so the

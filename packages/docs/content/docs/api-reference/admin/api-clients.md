@@ -6,7 +6,7 @@ API clients identify third-party applications that call HappyView's XRPC endpoin
 
 A single API client represents your application, not individual users. Create one client for your app and use the same client key across all instances. Users authenticate separately via OAuth — the client key identifies _your app_, not _who is using it_.
 
-Each client has an `hvc_`-prefixed client key and an `hvs_`-prefixed client secret. The secret is only returned at creation and is sha256-hashed in the database. Server-to-server callers pass the secret as `X-Client-Secret`. Browser callers use the `Origin` header, which is matched against the client's `client_uri`. Mismatches currently log warnings rather than rejecting the request, but rate limiting applies either way. See [Authentication — XRPC](../../getting-started/authentication.md#xrpc-api-client-identification) for the client-side view, and the [API Keys guide](../../guides/api-keys.md) for how admin API keys differ from API clients.
+Each client has an `hvc_`-prefixed client key. A confidential client also has one or more `hvs_`-prefixed client secrets, any of which authenticates it ([Client secrets](#client-secrets)). A secret is only returned when it is created, and only its sha256 hash is stored. Server-to-server callers pass the secret as `X-Client-Secret`. Browser callers use the `Origin` header, which is matched against the client's `client_uri`. A request that matches neither is logged and handled as anonymous rather than rejected, and is not charged to the client's rate limit bucket. See [Authentication — XRPC](../../getting-started/authentication.md#xrpc-api-client-identification) for the client-side view, and the [API Keys guide](../../guides/api-keys.md) for how admin API keys differ from API clients.
 
 <Callout type="idea" title="Third-Party API Clients">
 Third-party apps can also create, list, and delete their own API clients programmatically via the [XRPC API](../oauth/api-clients.md), without needing admin access.
@@ -38,6 +38,8 @@ GET /admin/api-clients
 ```
 
 Requires `api-clients:view`. Returns clients ordered by `created_at` descending. Secrets are never returned.
+
+The list includes `builtin-hpy`, the public client hpy signs in with (`client_key` `hvc_hpy`). HappyView writes it at every boot, and updating it, deleting it, or provisioning or rotating an authentication key for it answers `409 Conflict`.
 
 ```ts tab="TypeScript" tab-group="language"
 interface ApiClient {
@@ -115,7 +117,7 @@ curl http://127.0.0.1:3000/admin/api-clients -H "$AUTH"
 POST /admin/api-clients
 ```
 
-Requires `api-clients:create`. Generates a `client_key` and `client_secret`. Store the secret — it won't be shown again.
+Requires `api-clients:create`. Generates a `client_key` and, for a confidential client, a first `client_secret`, labelled `Original`. Store the secret — it won't be shown again. A public client gets no secret, and `client_secret` is `null`.
 
 ```ts tab="TypeScript" tab-group="language"
 interface ApiClient {
@@ -219,6 +221,8 @@ curl -X POST http://127.0.0.1:3000/admin/api-clients \
 | `scopes`                 | string   | no       | Space-separated OAuth scopes (default `"atproto"`)                                     |
 | `rate_limit_capacity`    | integer  | no       | Per-client token bucket capacity. Falls back to `DEFAULT_RATE_LIMIT_CAPACITY` if unset |
 | `rate_limit_refill_rate` | number   | no       | Tokens added per second. Falls back to `DEFAULT_RATE_LIMIT_REFILL_RATE` if unset       |
+| `client_type`            | string   | no       | `"confidential"` (default) or `"public"`. Any other value is refused with `400`        |
+| `allowed_origins`        | string[] | no       | Origins a public client's requests may come from                                       |
 
 **Response**: `201 Created`
 
@@ -315,7 +319,10 @@ curl -X PUT http://127.0.0.1:3000/admin/api-clients/01J9... \
 | `scopes`                 | string   | Replace the OAuth scopes                                               |
 | `rate_limit_capacity`    | integer  | New bucket capacity. Pass `null` to clear the override                 |
 | `rate_limit_refill_rate` | number   | New refill rate. Pass `null` to clear the override                     |
+| `allowed_origins`        | string[] | Replace the allowed origins. Pass `null` to clear them                 |
 | `is_active`              | boolean  | Disable (`false`) or re-enable (`true`) the client without deleting it |
+
+A field left out is unchanged; `null` clears it.
 
 **Response**: `204 No Content`
 
@@ -359,6 +366,92 @@ curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9... -H "$AUTH"
 
 **Response**: `204 No Content`
 
+## Client secrets
+
+A confidential client can hold several secrets at once, each with a label and each revocable on its own. Give each place the client runs (localhost, staging, production) its own secret. To rotate one, add a new secret, move to it, then revoke the old one. The client, its key and its sessions are untouched throughout.
+
+Revoking a secret takes effect on the next request that presents it. The client's other secrets keep working. A public client has no secrets: it is identified by its key and its `Origin`.
+
+### List secrets
+
+```
+GET /admin/api-clients/{id}/secrets
+```
+
+Requires `api-clients:view`. Lists every secret the client has held, oldest first, including revoked ones. The secrets themselves are never returned.
+
+```ts tab="TypeScript" tab-group="language"
+interface ApiClientSecret {
+  id: string;
+  label: string;
+  created_at: string;
+  last_used_at: string | null; // to the minute; null if never used
+  revoked_at: string | null;
+}
+
+const res = await fetch("http://127.0.0.1:3000/admin/api-clients/01J9.../secrets", { headers });
+const { secrets }: { secrets: ApiClientSecret[] } = await res.json();
+```
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/api-clients/01J9.../secrets -H "$AUTH"
+```
+
+```json
+{
+  "secrets": [
+    {
+      "id": "original-01J9...",
+      "label": "Original",
+      "created_at": "2026-05-01T00:00:00+00:00",
+      "last_used_at": "2026-10-30T09:12:00+00:00",
+      "revoked_at": null
+    }
+  ]
+}
+```
+
+### Add a secret
+
+```
+POST /admin/api-clients/{id}/secrets
+```
+
+Requires `api-clients:edit`. The body is `{ "label": string }`. A label is trimmed and must be 1–100 characters. The new secret works at once, alongside the others.
+
+```ts tab="TypeScript" tab-group="language"
+const res = await fetch("http://127.0.0.1:3000/admin/api-clients/01J9.../secrets", {
+  method: "POST",
+  headers: { ...headers, "Content-Type": "application/json" },
+  body: JSON.stringify({ label: "staging" }),
+});
+const secret = await res.json(); // { id, label, created_at, last_used_at, revoked_at, client_secret }
+```
+```sh tab="cURL" tab-group="language"
+curl -X POST http://127.0.0.1:3000/admin/api-clients/01J9.../secrets \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"label": "staging"}'
+```
+
+**Response**: `201 Created` with the secret's fields plus `client_secret`, the plaintext. This response is the only place it appears. `400` for a public client or an empty label.
+
+### Revoke a secret
+
+```
+DELETE /admin/api-clients/{id}/secrets/{secret_id}
+```
+
+Requires `api-clients:edit`. Revoking an already-revoked secret changes nothing and answers `revoked: false`.
+
+```sh tab="cURL" tab-group="language"
+curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../secrets/original-01J9... -H "$AUTH"
+```
+
+```json
+{ "revoked": true, "active_secrets": 1 }
+```
+
+`active_secrets` is how many still work. At `0` the client can't authenticate with a secret until you add one.
+
 ## AT Protocol client authentication keys
 
 A client can delegate its AT Protocol OAuth signing key to HappyView, so HappyView authenticates to users' PDSes as a **confidential** client on its behalf. Confidential clients get far longer session lifetimes than public ones (the authorization server's policy — 2 years rather than 2 weeks on a conforming PDS).
@@ -387,7 +480,7 @@ curl -X POST http://127.0.0.1:3000/admin/api-clients/01J9.../auth-key -H "$AUTH"
 GET /admin/api-clients/{id}/auth-keys
 ```
 
-Requires `api-clients:view`. Every key the client holds, ordered `current`, then `retiring`, then `revoked`, each with a live `session_count`.
+Requires `api-clients:view`. Every key the client holds, ordered `pending`, then `current`, then `retiring`, then `revoked`, each with a live `session_count`. A `pending` key carries `activates_at`, when it takes over.
 
 Distinct from `GET .../auth-key`, which reports only the current key. An operator revoking a leaked key needs to see the **retiring** one and how many sessions revoking it will destroy. Revoked keys are listed so a revoke is visibly done.
 
@@ -419,7 +512,9 @@ Requires `api-clients:edit`. Re-fetches the client's published metadata and repo
 POST /admin/api-clients/{id}/auth-key/rotate
 ```
 
-Requires `api-clients:edit`. Mints a new `current` key and demotes the previous one to `retiring`. **Nothing is logged out**: a retiring key stays in the published JWKS and keeps signing refreshes for the sessions established with it.
+Requires `api-clients:edit`. Publishes a new key as `pending` in the client's JWKS. At `activates_at`, about 75 minutes later, once authorization servers' cached copies of the key set have had time to include it, the new key becomes `current` and the previous one is demoted to `retiring`. **Nothing is logged out**: a retiring key stays in the published JWKS and keeps signing refreshes for the sessions established with it. Send `{"immediate": true}` to switch now instead; sign-ins through a server that cached the old key set can fail for up to an hour, so keep that for a leaked key.
+
+**Response**: `200 OK` with `kid`, `status` (`pending`, or `current` after an immediate switch), `activates_at` and `orphaned_sessions`.
 
 ### Revoke a key
 
@@ -433,7 +528,7 @@ This is the response to a **leaked or compromised key**, not routine cleanup. Ro
 
 | Status | Meaning |
 | ------ | ------- |
-| `400`  | The target is the `current` key. Rotate first, then revoke the retiring key. |
+| `400`  | The target is the `current` key. Rotate with `"immediate": true` first, then revoke the retiring key. |
 | `404`  | No key with that `kid` belongs to this client. |
 
 ```sh tab="cURL" tab-group="language"
@@ -468,7 +563,7 @@ curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../auth-keys -H "$AU
 
 ### Responding to a leaked client key
 
-1. `POST .../auth-key/rotate` — the leaked key becomes `retiring`, a fresh key takes over, and the client keeps working.
+1. `POST .../auth-key/rotate` with `{"immediate": true}` — the leaked key becomes `retiring`, a fresh key takes over, and the client keeps working.
 2. `GET .../auth-keys` — confirm it is now `retiring` and note its `session_count`, which is how many users step 3 signs out.
 3. `DELETE .../auth-key/{kid}` on the leaked key.
 

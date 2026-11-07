@@ -18,7 +18,7 @@ pub async fn delete_api_client(
     // 1. Require DPoP auth
     let claims = xrpc_claims
         .identity
-        .ok_or_else(|| AppError::Auth("deleteApiClient requires DPoP authentication".into()))?;
+        .ok_or_else(|| AppError::Auth("deleteApiClient requires DPoP authentication, or the session cookie on a request from this instance".into()))?;
 
     // 2. Rate-limit the request (procedure type)
     let check = if let Some(client_key) = claims.client_key() {

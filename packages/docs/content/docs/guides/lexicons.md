@@ -10,24 +10,26 @@ You don't write route handlers or database queries; you upload a lexicon and Hap
 
 | Type          | Effect                                                                                                                                   |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](record-scripts) |
-| `query`       | Registers a `GET /xrpc/{nsid}` endpoint that queries indexed records                                                                     |
-| `procedure`   | Registers a `POST /xrpc/{nsid}` endpoint that proxies writes to the user's PDS                                                           |
+| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](record-scripts.md) |
+| `query`       | Registers a `GET /xrpc/{nsid}` endpoint, served by its script                                                                            |
+| `procedure`   | Registers a `POST /xrpc/{nsid}` endpoint, served by its script                                                                           |
 | `definitions` | Stored but does not generate routes or subscriptions                                                                                     |
 
 A typical setup has three lexicons working together: a **record** lexicon that defines the data and triggers indexing, a **query** lexicon that exposes a read endpoint, and a **procedure** lexicon that exposes a write endpoint. The [Statusphere tutorial](../tutorials/statusphere.md) walks through this pattern end-to-end.
 
-## Target collection
+## Queries and procedures need a script
 
-Query and procedure lexicons don't store data themselves. They operate on records stored by a record-type lexicon. The `target_collection` field tells HappyView which record collection to read from or write to. Without it, default queries and procedures won't know which DB records to operate on.
+Query and procedure lexicons don't store data themselves, and they don't name a collection. A [Lua script](lua-scripting.md) attached to the method does the work, and it names the collection it reads or writes:
 
-For example, a query lexicon `xyz.statusphere.listStatuses` would set `target_collection` to `xyz.statusphere.status` to read from that record collection.
+```lua
+local db = require("happyview.db")
 
-See the [admin API](../api-reference/admin/lexicons.md#upload--upsert-a-lexicon) for how to set `target_collection` when uploading.
+function handle(input, ctx)
+  return db.records("xyz.statusphere.status"):limit(20):run()
+end
+```
 
-<Callout type="info">
-The `target_collection` is available in Lua scripts as the `collection` global, but it is not required if your endpoint uses a Lua script.
-</Callout>
+A query with no script answers only `?uri=<at-uri>`, with that one indexed record. Any other call to it, and every call to a procedure with no script, answers `501` with a `MethodNotImplemented` body naming the trigger to add a script for, such as `xrpc.query:xyz.statusphere.listStatuses`.
 
 ## Backfill flag
 
@@ -35,11 +37,19 @@ When a record-type lexicon is uploaded for the first time, HappyView automatical
 
 Only the *first* upload starts one. Editing a lexicon afterwards re-saves it without re-crawling the network — if you want to backfill again, start one from the Backfill page. If you only want to index new records going forward, set `backfill` to `false`.
 
+## Indexed flag
+
+A record lexicon can be installed without HappyView collecting its records from the network: set `indexed` to `false`. No backfill starts for it. On a lexicon's page in the dashboard, the **Indexed** switch changes the setting for a dashboard or network lexicon, including one declared in `happyview.toml`. A lexicon defined by a project file takes the setting from its `[lexicons."<nsid>"]` table instead.
+
+Turning indexing on collects new records from then on. It doesn't fetch older ones, so start a backfill from the Backfill page if you want them. Turning it off stops collecting and keeps the records already stored. Changing the switch on a network lexicon fetches its current version from the network, as adding it again does.
+
 ## Jetstream collection filters
 
 When record-type lexicons change (uploaded or deleted), HappyView reconnects to Jetstream with an updated collection filter. HappyView always includes `com.atproto.lexicon.schema` in the filter to track network lexicon updates.
 
-Deleting a lexicon stops live indexing for that collection but does **not** remove previously indexed records from the database. If you want to start fresh, you'll need to delete the records separately (e.g. via the admin API or directly in the database) before re-adding the lexicon and running a [backfill](backfill.md).
+Deleting a lexicon stops live indexing for that collection. By default it does **not** remove previously indexed records: they stay in the database and remain queryable.
+
+The dashboard's delete confirmation offers to delete them as well, and shows how many there are. Over the admin API that is `DELETE /admin/lexicons/{id}?delete_records=true`, which answers `202` with the id of the job doing the deleting; see [the admin API reference](../api-reference/admin/lexicons.md#also-deleting-the-collections-records). Either way, to start fresh delete the records before re-adding the lexicon and running a [backfill](backfill.md).
 
 ## Network lexicons
 
@@ -82,7 +92,7 @@ On every startup, HappyView re-fetches all network lexicons from their respectiv
 
 ## XRPC routing for unknown methods
 
-When a client calls `/xrpc/{method}` and HappyView has a local lexicon for that NSID, the request is handled by the lexicon's Lua script (or HappyView's default behavior if no script is attached). Otherwise, HappyView attempts to proxy the request to the method's **home authority** using the same DNS-based authority resolution described above:
+When a client calls `/xrpc/{method}` and HappyView has a local lexicon for that NSID, the request is handled by the lexicon's Lua script (or answers `501` if no script is attached; see [Queries and procedures need a script](#queries-and-procedures-need-a-script)). Otherwise, HappyView attempts to proxy the request to the method's **home authority** using the same DNS-based authority resolution described above:
 
 1. Extract the authority from the NSID (all segments except the last). `com.example.foo.getBar` → authority `com.example.foo`.
 2. Reverse it to form a domain: `foo.example.com`.
@@ -95,14 +105,14 @@ A few things to note:
 - HappyView does **not** proxy to the reversed hostname directly. `foo.example.com` is only the DNS host for the TXT record — the actual XRPC request goes to whatever PDS endpoint the authority DID resolves to.
 - Proxying applies equally to queries and procedures. For procedures, HappyView uses the caller's OAuth session to attach a DPoP-bound access token (see [Authentication](../getting-started/authentication.md#proxying-procedures-to-the-users-pds)).
 - If authority resolution fails — no TXT record, unresolvable DID, or the target PDS doesn't support the method — the client gets an error back. HappyView does not fall back to any other routing strategy.
-- Tracking a network lexicon does **not** make HappyView handle requests for that NSID locally. Network lexicons are only about indexing record collections and keeping the schema up to date. If a client calls a query NSID that you've tracked as a network lexicon but haven't uploaded a local query lexicon for, HappyView still proxies the request out — it won't query your local record table. To serve a method locally, upload a local query or procedure lexicon with a matching `target_collection`.
+- Tracking a network lexicon does **not** make HappyView handle requests for that NSID locally. Network lexicons are only about indexing record collections and keeping the schema up to date. If a client calls a query NSID that you've tracked as a network lexicon but haven't uploaded a local query lexicon for, HappyView still proxies the request out — it won't query your local record table. To serve a method locally, upload a local query or procedure lexicon and attach a script to it.
 
 In short: if you want to serve an XRPC method on your instance, you need a local lexicon for it. Otherwise HappyView attempts to proxy to the method's home authority.
 
 ## Next steps
 
 - [Lua Scripting](./lua-scripting.md): Add custom query and procedure logic to your endpoints
-- [Record & Label Scripts](record-scripts): Run Lua scripts when records are indexed or labels arrive
+- [Record & Label Scripts](record-scripts.md): Run Lua scripts when records are indexed or labels arrive
 - [XRPC API](../api-reference/xrpc-api.md): Understand how the generated endpoints behave
 - [Backfill](backfill.md): Learn how historical records are indexed
 - [Admin API](../api-reference/admin/admin-api.md): Full reference for lexicon management endpoints

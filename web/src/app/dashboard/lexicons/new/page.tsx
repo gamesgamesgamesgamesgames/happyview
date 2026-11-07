@@ -2,12 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import {
   addNetworkLexicon,
   resolveNetworkLexicon,
   uploadLexicon,
+  ApiError,
+  type LexiconIssue,
 } from "@/lib/api";
 import { isValidNsid } from "@happyview/nsid";
 import { LEXICON_TEMPLATE } from "@/lib/lua-templates";
@@ -28,7 +31,6 @@ import {
   ComboboxItem,
   ComboboxList,
 } from "@/components/ui/combobox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -37,6 +39,7 @@ export default function AddLexiconPage() {
   const { hasPermission, loading } = useCurrentUser();
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
+  const [issues, setIssues] = useState<LexiconIssue[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // Redirect if the user cannot create lexicons (only after loading completes)
@@ -48,12 +51,16 @@ export default function AddLexiconPage() {
 
   // Local state
   const [json, setJson] = useState(LEXICON_TEMPLATE);
-  const [localTargetCollection, setLocalTargetCollection] = useState("");
   const [backfill, setBackfill] = useState(true);
+  const [indexed, setIndexed] = useState(true);
+
+  function handleIndexedChange(value: boolean) {
+    setIndexed(value);
+    if (!value) setBackfill(false);
+  }
 
   // Network state
   const [nsid, setNsid] = useState("");
-  const [networkTargetCollection, setNetworkTargetCollection] = useState("");
   const [resolved, setResolved] = useState<{
     nsid: string;
     type: string | undefined;
@@ -110,8 +117,6 @@ export default function AddLexiconPage() {
     return null;
   }, [json]);
 
-  const showLocalTargetCollection =
-    localMainType === "query" || localMainType === "procedure";
   const prevType = useRef(localMainType);
   useEffect(() => {
     if (prevType.current !== localMainType) {
@@ -175,21 +180,29 @@ export default function AddLexiconPage() {
     };
   }, [nsid, canSuggest]);
 
-  const showNetworkTargetCollection =
-    mainType === "query" || mainType === "procedure";
-
   async function handleUploadLocal() {
     setError(null);
+    setIssues(null);
     setSubmitting(true);
     try {
       const lexiconJson = JSON.parse(json);
-      const { id } = await uploadLexicon({
+      const { id, issues: warnings } = await uploadLexicon({
         lexicon_json: lexiconJson,
-        backfill: localMainType === "record" && backfill,
+        backfill: localMainType === "record" && indexed && backfill,
+        indexed: localMainType === "record" ? indexed : undefined,
       });
+      // The page navigates away on success, so a warning that only rendered
+      // here would never be read. A toast survives the navigation.
+      for (const warning of warnings ?? []) {
+        toast.warning("Lexicon uploaded with a warning", {
+          description: warning.message,
+          duration: 10000,
+        });
+      }
       router.push(`/dashboard/lexicons/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setIssues(e instanceof ApiError ? (e.lexiconIssues ?? null) : null);
       setSubmitting(false);
     }
   }
@@ -200,10 +213,8 @@ export default function AddLexiconPage() {
     try {
       const added = await addNetworkLexicon({
         nsid,
-        backfill: mainType === "record" && backfill,
-        target_collection: showNetworkTargetCollection
-          ? networkTargetCollection || undefined
-          : undefined,
+        backfill: mainType === "record" && indexed && backfill,
+        indexed: mainType === "record" ? indexed : undefined,
       });
       router.push(`/dashboard/lexicons/${encodeURIComponent(added.nsid)}`);
     } catch (e: unknown) {
@@ -235,23 +246,25 @@ export default function AddLexiconPage() {
           <TabsContent value="local" className="flex flex-col flex-1 min-h-0">
             <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 pt-0 md:p-6 md:pt-0">
               {error && <p className="text-destructive text-sm">{error}</p>}
-
-              {/* Metadata fields */}
-              {/* <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {showLocalTargetCollection && (
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="target-collection">
-                      Record Collection (optional)
-                    </Label>
-                    <Input
-                      id="target-collection"
-                      value={localTargetCollection}
-                      onChange={(e) => setLocalTargetCollection(e.target.value)}
-                      placeholder="com.example.record"
-                    />
-                  </div>
-                )}
-              </div> */}
+              {issues && issues.length > 0 && (
+                <ul className="space-y-1 text-sm">
+                  {issues.map((issue, i) => (
+                    <li
+                      key={`${issue.path}-${i}`}
+                      className={
+                        issue.severity === "error"
+                          ? "text-destructive"
+                          : "text-muted-foreground"
+                      }
+                    >
+                      <code className="text-xs">
+                        {issue.path || "(document)"}
+                      </code>{" "}
+                      {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
 
               {/* Code panels */}
               <CodePanels
@@ -263,14 +276,29 @@ export default function AddLexiconPage() {
 
             <footer className="bg-sidebar-accent flex justify-end gap-6 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
               {localMainType === "record" && (
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="backfill">Enable backfill for lexicon</Label>
-                  <Switch
-                    id="backfill"
-                    checked={backfill}
-                    onCheckedChange={setBackfill}
-                  />
-                </div>
+                <>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="indexed">
+                      Index records from the network
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      checked={indexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="backfill">
+                      Enable backfill for lexicon
+                    </Label>
+                    <Switch
+                      id="backfill"
+                      checked={indexed && backfill}
+                      disabled={!indexed}
+                      onCheckedChange={setBackfill}
+                    />
+                  </div>
+                </>
               )}
 
               {localIdError && (
@@ -300,7 +328,7 @@ export default function AddLexiconPage() {
                     items={suggestions}
                     filter={null}
                     inputValue={nsid}
-                    onInputValueChange={setNsid}                  
+                    onInputValueChange={setNsid}
                     onValueChange={(suggestion: LexiconSuggestion | null) => {
                       if (suggestion) setNsid(suggestion.nsid);
                     }}
@@ -332,22 +360,6 @@ export default function AddLexiconPage() {
                     </ComboboxContent>
                   </Combobox>
                 </div>
-
-                {showNetworkTargetCollection && (
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="nl-target-collection">
-                      Target Collection (optional)
-                    </Label>
-                    <Input
-                      id="nl-target-collection"
-                      value={networkTargetCollection}
-                      onChange={(e) =>
-                        setNetworkTargetCollection(e.target.value)
-                      }
-                      placeholder="com.example.record"
-                    />
-                  </div>
-                )}
               </div>
 
               {resolving && (
@@ -379,14 +391,29 @@ export default function AddLexiconPage() {
 
             <footer className="bg-sidebar-accent flex justify-end gap-6 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
               {mainType === "record" && (
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="backfill">Enable backfill for lexicon</Label>
-                  <Switch
-                    id="backfill"
-                    checked={backfill}
-                    onCheckedChange={setBackfill}
-                  />
-                </div>
+                <>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="indexed">
+                      Index records from the network
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      checked={indexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="backfill">
+                      Enable backfill for lexicon
+                    </Label>
+                    <Switch
+                      id="backfill"
+                      checked={indexed && backfill}
+                      disabled={!indexed}
+                      onCheckedChange={setBackfill}
+                    />
+                  </div>
+                </>
               )}
               <Button
                 onClick={handleAddNetwork}

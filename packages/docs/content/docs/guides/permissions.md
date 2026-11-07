@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 51 permissions organized by category:
+HappyView defines 54 permissions organized by category:
 
 ### Lexicons
 
@@ -15,6 +15,7 @@ HappyView defines 51 permissions organized by category:
 | `lexicons:create` | Upload and register new lexicon schemas |
 | `lexicons:read`   | View registered lexicon schemas      |
 | `lexicons:delete` | Remove lexicon schemas               |
+| `lexicons:publish` | Publish lexicons to the network and manage publishing rules |
 
 ### Records
 
@@ -35,7 +36,7 @@ HappyView defines 51 permissions organized by category:
 
 | Permission                | Description                                        |
 | ------------------------- | -------------------------------------------------- |
-| `script-variables:create` | Add or update environment variables for Lua scripts |
+| `script-variables:create` | Add or update environment variables for scripts |
 | `script-variables:read`   | View script environment variable keys and values   |
 | `script-variables:delete` | Remove script environment variables                |
 
@@ -115,7 +116,7 @@ HappyView defines 51 permissions organized by category:
 | `spaces:manage-credentials` | Issue and revoke space access credentials  |
 | `spaces:inspect`            | Request time-limited access to read records and blobs in private spaces |
 
-No template grants `spaces:inspect` except Full Access — it's assigned individually to the moderators who should be able to request access to a space or account's contents. See [Spaces — Moderating spaces](../experimental/spaces/index.md#moderating-spaces).
+No template grants `spaces:inspect` except Full Access. It is assigned individually to the users who should be able to request access to a space's or an account's contents. See [Spaces: Moderating spaces](../experimental/spaces/index.md#moderating-spaces).
 
 ### Jobs
 
@@ -135,12 +136,22 @@ No template grants `spaces:inspect` except Full Access — it's assigned individ
 
 Revoking an invite uses `linked-repos:create` rather than `linked-repos:delete`, because minting and revoking are one lifecycle. `linked-repos:delete` is reserved for destroying a grant and the OAuth session behind it. See [Linked Repos](./linked-repos.md).
 
+### Project
+
+| Permission       | Description                                                                                     |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| `project:deploy` | Replace the instance's project with a deployed bundle and start the backfills it declares       |
+
+It also covers reading what is deployed. A deploy can add, change and remove every lexicon and script the project owns, so it is as strong as `lexicons:create`, `lexicons:delete` and `scripts:manage` together, plus `backfill:create` for the backfills a project declares. See [Project](../api-reference/admin/project.md).
+
 ### System
 
 | Permission   | Description                              |
 | ------------ | ---------------------------------------- |
 | `stats:read` | View collection statistics and record counts |
 | `events:read` | View the event log                      |
+| `events:purge` | Bulk-delete event log entries matching a filter |
+| `metrics:read` | View script run counts, latency, errors and resource use |
 
 ## Permission templates
 
@@ -148,25 +159,27 @@ Templates are predefined sets of permissions that simplify user creation. Pass a
 
 ### Viewer
 
-Read-only access. Can browse lexicons, records, scripts, stats, events, dead letters, and user lists but cannot modify anything.
+Read-only access. Can browse lexicons, records, scripts, stats, events, metrics, dead letters, and user lists but cannot modify anything.
 
-Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `dead-letters:read`
+Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `metrics:read`, `dead-letters:read`
 
-### Operator
+### Maintainer
 
 Everything in Viewer, plus the ability to run backfill jobs, manage API keys, and manage dead letters.
+
+This template used to be called Operator. `POST /admin/users` still accepts `"template": "operator"` and grants the same permissions.
 
 Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`, `dead-letters:manage`
 
 ### Manager
 
-Everything in Operator, plus the ability to manage lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces.
+Everything in Maintainer, plus the ability to manage and publish lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces, and to deploy the project.
 
-Adds: `lexicons:create`, `lexicons:delete`, `scripts:manage`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
+Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`, `project:deploy`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
 
 ### Full Access
 
-All 49 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 52 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 

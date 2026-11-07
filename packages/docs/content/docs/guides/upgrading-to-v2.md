@@ -105,8 +105,8 @@ Clients should pass the `cursor` value from the response as a query parameter to
 
 v2 adds several new Lua APIs that you can optionally adopt:
 
-- [`atproto.resolve_service_endpoint`](../api-reference/lua/atproto-api.md) — resolve a DID to its PDS endpoint
-- [`atproto.get_labels`](../api-reference/lua/atproto-api.md) / [`atproto.get_labels_batch`](../api-reference/lua/atproto-api.md) — fetch content labels from subscribed labelers
+- [`atproto.resolve_service_endpoint`](../api-reference/lua/libraries.md) — resolve a DID to its PDS endpoint
+- [`atproto.get_labels`](../api-reference/lua/libraries.md) / [`atproto.get_labels_batch`](../api-reference/lua/libraries.md) — fetch content labels from subscribed labelers
 - [`os.time`](../api-reference/lua/standard-libraries.md), `os.date`, `os.difftime`, `os.clock` — safe `os` subset
 
 ## 5. Update API key prefixes
@@ -134,7 +134,7 @@ v2 introduces granular user permissions. After upgrading:
 
 1. The first user to authenticate becomes the **super user** (full access).
 2. Additional users are created with no permissions by default.
-3. Assign permissions or use a template (Viewer, Operator, Manager, Full Access).
+3. Assign permissions or use a template (Viewer, Maintainer, Manager, Full Access).
 
 See the [Permissions guide](permissions.md) for details.
 

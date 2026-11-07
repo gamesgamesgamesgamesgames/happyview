@@ -4,11 +4,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use bytes::Bytes;
-use http_body_util::Full;
-use std::convert::Infallible;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::AppState;
@@ -22,46 +18,6 @@ use crate::repo;
 use crate::xrpc;
 
 pub fn router(state: AppState) -> Router {
-    let static_dir = state.config.static_dir.clone();
-
-    // SPA fallback: when ServeDir can't find a static file, check if the
-    // parent path contains a _/index.html (Next.js dynamic route shell)
-    // before falling back to the root index.html.
-    let fallback_dir = static_dir.clone();
-    let spa_fallback = tower::service_fn(move |req: axum::http::Request<_>| {
-        let dir = fallback_dir.clone();
-        async move {
-            let path = req.uri().path();
-            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-
-            // Try _/index.html in the parent directory (matches Next.js dynamic routes)
-            if segments.len() >= 2 {
-                let parent = segments[..segments.len() - 1].join("/");
-                let dynamic_path = format!("{}/{}/_/index.html", dir, parent);
-                if let Ok(body) = tokio::fs::read(&dynamic_path).await {
-                    return Ok::<_, Infallible>(
-                        axum::http::Response::builder()
-                            .header("content-type", "text/html; charset=utf-8")
-                            .body(Full::new(Bytes::from(body)))
-                            .unwrap(),
-                    );
-                }
-            }
-
-            // Default: serve root index.html
-            let index = format!("{}/index.html", dir);
-            let body = tokio::fs::read(&index).await.unwrap_or_default();
-            Ok::<_, Infallible>(
-                axum::http::Response::builder()
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Full::new(Bytes::from(body)))
-                    .unwrap(),
-            )
-        }
-    });
-
-    let serve_dir = ServeDir::new(&static_dir).not_found_service(spa_fallback);
-
     let domain_routes = Router::new()
         .merge(
             crate::spaces::routes::space_routes().layer(axum::middleware::from_fn_with_state(
@@ -152,11 +108,13 @@ pub fn router(state: AppState) -> Router {
             resolve_domain,
         ));
 
-    let app_routes = Router::new()
-        .nest("/admin", admin::admin_routes(state.clone()))
-        .merge(domain_routes)
-        .route("/", get(|| async { Redirect::to("/dashboard/") }))
-        .fallback_service(serve_dir);
+    let app_routes = crate::dashboard::attach(
+        Router::new()
+            .nest("/admin", admin::admin_routes(state.clone()))
+            .merge(domain_routes)
+            .route("/", get(|| async { Redirect::to("/dashboard/") })),
+        &state.config,
+    );
 
     let outer = if let Some(ref base_path) = state.config.base_path {
         let bp = base_path.clone();
@@ -189,6 +147,10 @@ pub fn router(state: AppState) -> Router {
     };
 
     outer
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::csrf::guard,
+        ))
         .layer(CatchPanicLayer::custom(panic_response))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
@@ -359,12 +321,8 @@ async fn config_endpoint(
         backend,
     )
     .await;
-    let space_inspector_enabled = crate::feature_flags::is_enabled(
-        pool,
-        crate::feature_flags::FeatureFlag::SPACE_INSPECTOR,
-        backend,
-    )
-    .await;
+    let space_inspector_enabled =
+        crate::admin::space_access::inspector_enabled(pool, backend).await;
 
     Json(serde_json::json!({
         "public_url": domain_url,
@@ -378,8 +336,10 @@ async fn config_endpoint(
         "app_name": app_name,
         // Whether a managed-hosting platform administers this instance, so the
         // dashboard can say so.
-        "platform_managed": state.config.platform_api_key_hash.is_some(),
+        "platform_managed": state.config.platform_managed(),
         "logo_url": logo_url,
+        // The key hpy signs in with; see `auth::cli_client`.
+        "cli_client_key": crate::auth::cli_client::CLIENT_KEY,
         "features": {
             "spaces": spaces_enabled,
             "space_inspector": space_inspector_enabled,
@@ -458,47 +418,33 @@ async fn client_metadata(
         }
     }
 
-    if metadata.get("jwks").is_some() {
-        match crate::oauth::client_keys::load_keys(
-            pool,
-            backend,
-            state.config.token_encryption_key.as_ref(),
-            crate::oauth::client_keys::INSTANCE_OWNER,
-        )
-        .await
-        {
-            Ok(keys) => apply_jwks_override(&mut metadata, &keys),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to load instance client keys for jwks");
-            }
-        }
-    }
+    // Point at the key set rather than inlining it. Authorization servers
+    // cache this document; one that meets a signature by a key it has not
+    // seen can refetch a `jwks_uri` (Tranquil does, at most once a minute)
+    // but cannot refresh an inline set until the whole document expires.
+    apply_jwks_uri(&mut metadata, &domain_url);
 
     Json(metadata)
 }
 
-fn published_jwks(keys: &[crate::oauth::client_keys::ClientKey]) -> Option<serde_json::Value> {
-    let publishable: Vec<_> = keys
-        .iter()
-        .filter(|k| k.status != crate::oauth::client_keys::KeyStatus::Revoked)
-        .cloned()
-        .collect();
-    if publishable.is_empty() {
-        return None;
-    }
-    Some(crate::oauth::client_keys::render_jwks(&publishable))
-}
-
-fn apply_jwks_override(
-    metadata: &mut serde_json::Value,
-    keys: &[crate::oauth::client_keys::ClientKey],
-) {
-    if metadata.get("jwks").is_none() {
+/// Swap a confidential client's inline `jwks` for the `jwks_uri` that
+/// serves the instance's published keys (`oauth::routes::client_jwks`):
+/// `current`, `pending` and `retiring`. A public client has neither.
+fn apply_jwks_uri(metadata: &mut serde_json::Value, domain_url: &str) {
+    let Some(fields) = metadata.as_object_mut() else {
+        return;
+    };
+    if fields.remove("jwks").is_none() {
         return;
     }
-    if let Some(jwks) = published_jwks(keys) {
-        metadata["jwks"] = jwks;
-    }
+    fields.insert(
+        "jwks_uri".into(),
+        serde_json::Value::String(format!(
+            "{}/oauth/clients/{}/jwks.json",
+            domain_url.trim_end_matches('/'),
+            crate::oauth::client_keys::INSTANCE_OWNER
+        )),
+    );
 }
 
 fn extract_public_key_multibase(
@@ -516,11 +462,11 @@ fn extract_public_key_multibase(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let private_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
 
     let signing_key = p256::ecdsa::SigningKey::from_slice(private_bytes.as_slice())
@@ -633,119 +579,36 @@ async fn get_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_jwks_override, published_jwks};
-    use crate::oauth::client_keys::{KeyStatus, generate_client_key};
-
-    const PRIVATE_JWK_PARAMS: &[&str] = &["d", "p", "q", "dp", "dq", "qi"];
-
-    fn key_with_status(status: KeyStatus) -> crate::oauth::client_keys::ClientKey {
-        let mut key = generate_client_key(crate::oauth::client_keys::INSTANCE_OWNER).unwrap();
-        key.status = status;
-        key
-    }
-
-    /// Regression test for the defect: after a rotation there are two
-    /// non-revoked keys (current + retiring), and both must be published —
-    /// the retiring one is what live sessions' refreshes are pinned to.
-    #[test]
-    fn both_current_and_retiring_keys_are_published() {
-        let current = key_with_status(KeyStatus::Current);
-        let retiring = key_with_status(KeyStatus::Retiring);
-
-        let jwks = published_jwks(&[current.clone(), retiring.clone()]).unwrap();
-        let kids: Vec<&str> = jwks["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|k| k["kid"].as_str().unwrap())
-            .collect();
-
-        assert!(kids.contains(&current.kid.as_str()));
-        assert!(kids.contains(&retiring.kid.as_str()));
-        assert_eq!(kids.len(), 2);
-    }
+    use super::apply_jwks_uri;
 
     #[test]
-    fn a_revoked_key_is_not_published_alongside_a_current_one() {
-        let current = key_with_status(KeyStatus::Current);
-        let revoked = key_with_status(KeyStatus::Revoked);
-
-        let jwks = published_jwks(&[current.clone(), revoked.clone()]).unwrap();
-        let kids: Vec<&str> = jwks["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|k| k["kid"].as_str().unwrap())
-            .collect();
-
-        assert_eq!(kids, vec![current.kid.as_str()]);
-    }
-
-    #[test]
-    fn published_jwks_contains_no_private_key_material() {
-        let current = key_with_status(KeyStatus::Current);
-        let retiring = key_with_status(KeyStatus::Retiring);
-
-        // Sanity check the fixture actually has private material to omit,
-        // so this test cannot pass vacuously.
-        assert!(current.private_jwk["d"].is_string());
-
-        let jwks = published_jwks(&[current, retiring]).unwrap();
-        for key in jwks["keys"].as_array().unwrap() {
-            for param in PRIVATE_JWK_PARAMS {
-                assert!(
-                    key.get(*param).is_none(),
-                    "published JWK unexpectedly contains private parameter `{param}`"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn only_revoked_keys_publish_nothing() {
-        let revoked = key_with_status(KeyStatus::Revoked);
-        assert!(published_jwks(&[revoked]).is_none());
-    }
-
-    #[test]
-    fn no_keys_publishes_nothing() {
-        assert!(published_jwks(&[]).is_none());
-    }
-
-    #[test]
-    fn a_public_clients_metadata_gets_no_jwks_field() {
+    fn a_public_clients_metadata_gets_no_key_set() {
         let mut metadata = serde_json::json!({
             "client_id": "https://example.com/oauth-client-metadata.json",
             "client_name": "Example",
         });
-        let keys = vec![key_with_status(KeyStatus::Current)];
 
-        apply_jwks_override(&mut metadata, &keys);
+        apply_jwks_uri(&mut metadata, "https://example.com");
 
         assert!(metadata.get("jwks").is_none());
+        assert!(metadata.get("jwks_uri").is_none());
     }
 
     #[test]
-    fn a_confidential_clients_jwks_field_is_replaced_with_the_full_key_set() {
+    fn a_confidential_clients_inline_key_set_becomes_a_jwks_uri() {
         let mut metadata = serde_json::json!({
-            "client_id": "https://example.com/oauth-client-metadata.json",
-            // Stand-in for atrium's single-key projection, which is exactly
-            // what this override must widen.
+            "client_id": "https://example.com/base/oauth-client-metadata.json",
+            // atrium's single-key projection.
             "jwks": {"keys": []},
         });
-        let current = key_with_status(KeyStatus::Current);
-        let retiring = key_with_status(KeyStatus::Retiring);
 
-        apply_jwks_override(&mut metadata, &[current.clone(), retiring.clone()]);
+        apply_jwks_uri(&mut metadata, "https://example.com/base/");
 
-        let kids: Vec<&str> = metadata["jwks"]["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|k| k["kid"].as_str().unwrap())
-            .collect();
-        assert!(kids.contains(&current.kid.as_str()));
-        assert!(kids.contains(&retiring.kid.as_str()));
+        assert!(metadata.get("jwks").is_none(), "{metadata}");
+        assert_eq!(
+            metadata["jwks_uri"],
+            "https://example.com/base/oauth/clients/instance/jwks.json"
+        );
     }
 }
 

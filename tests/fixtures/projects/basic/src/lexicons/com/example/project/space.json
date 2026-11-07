@@ -1,0 +1,7 @@
+{
+  "lexicon": 1,
+  "id": "com.example.project.space",
+  "defs": {
+    "main": { "type": "space", "key": "any", "name": "Project room", "collections": ["com.example.project.thing"] }
+  }
+}

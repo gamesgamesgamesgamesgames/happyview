@@ -1,7 +1,7 @@
 //! External account token storage with encryption.
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
-use crate::plugin::encryption::{EncryptionError, decrypt, encrypt};
+use crate::plugin::encryption::{EncryptionError, encrypt};
 
 /// Row type for token query results
 type TokenRow = (
@@ -91,7 +91,7 @@ pub async fn store_tokens(
 pub async fn get_tokens(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&crate::plugin::encryption::Keyring>,
     did: &str,
     plugin_id: &str,
 ) -> Result<StoredTokens, TokenError> {
@@ -111,12 +111,12 @@ pub async fn get_tokens(
     let (account_id, encrypted_access, encrypted_refresh, token_type, scope, expires_at) =
         row.ok_or(TokenError::NotFound)?;
 
-    let access_token = String::from_utf8(decrypt(key, &encrypted_access)?)
+    let access_token = String::from_utf8(key.decrypt(&encrypted_access)?)
         .map_err(|_| EncryptionError::DecryptionFailed)?;
 
     let refresh_token = encrypted_refresh
         .map(|enc| {
-            decrypt(key, &enc).and_then(|dec| {
+            key.decrypt(&enc).and_then(|dec| {
                 String::from_utf8(dec).map_err(|_| EncryptionError::DecryptionFailed)
             })
         })
@@ -202,6 +202,7 @@ pub struct LinkedAccountSummary {
     pub account_id: String,
     pub created_at: String,
     pub updated_at: String,
+    pub expires_at: Option<String>,
 }
 
 /// List all linked external accounts for a user
@@ -211,24 +212,23 @@ pub async fn list_linked_accounts(
     did: &str,
 ) -> Result<Vec<LinkedAccountSummary>, TokenError> {
     let sql = adapt_sql(
-        "SELECT plugin_id, account_id, created_at, updated_at FROM happyview_external_account_tokens WHERE did = ? ORDER BY created_at DESC",
+        "SELECT plugin_id, account_id, created_at, updated_at, expires_at FROM happyview_external_account_tokens WHERE did = ? ORDER BY created_at DESC",
         backend,
     );
 
-    let rows: Vec<(String, String, String, String)> =
+    let rows: Vec<(String, String, String, String, Option<String>)> =
         crate::db::query_as(&sql).bind(did).fetch_all(db).await?;
 
     Ok(rows
         .into_iter()
         .map(
-            |(plugin_id, account_id, created_at, updated_at)| LinkedAccountSummary {
+            |(plugin_id, account_id, created_at, updated_at, expires_at)| LinkedAccountSummary {
                 plugin_id,
                 account_id,
                 created_at,
                 updated_at,
+                expires_at,
             },
         )
         .collect())
 }
-
-// Integration tests for token storage are in tests/e2e_external_auth.rs

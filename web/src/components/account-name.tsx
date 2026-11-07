@@ -2,62 +2,9 @@
 
 import { type RefObject, useEffect, useRef, useState } from "react";
 
-import { ApiError, resolveIdentity } from "@/lib/api";
+import { type Lookup, lookupIdentity } from "@/lib/identity-lookup";
 import { cn } from "@/lib/utils";
-import type { ResolvedIdentity } from "@/types/identity";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-
-// Each lookup resolves a DID document and fetches a profile from the account's
-// PDS, so lookups run a few at a time instead of all at once for a long list.
-const MAX_IN_FLIGHT = 4;
-let inFlight = 0;
-const waiting: Array<() => void> = [];
-
-function whenSlotFree(): Promise<void> {
-  if (inFlight < MAX_IN_FLIGHT) {
-    inFlight += 1;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    waiting.push(() => {
-      inFlight += 1;
-      resolve();
-    });
-  });
-}
-
-function releaseSlot() {
-  inFlight -= 1;
-  waiting.shift()?.();
-}
-
-// A lookup that failed for a reason other than the DID being unresolvable.
-type Unavailable = "unavailable";
-type Lookup = ResolvedIdentity | null | Unavailable;
-
-// One lookup per DID for the life of the page. The resolver answers 400 only
-// for a DID that is malformed or has no usable document, which is cached as
-// null. Timeouts, rate limits and unreachable hosts (502) and network errors
-// are dropped from the cache, so the next component to show that DID retries.
-const identities = new Map<string, Promise<Lookup>>();
-
-function lookupIdentity(did: string): Promise<Lookup> {
-  let pending = identities.get(did);
-  if (!pending) {
-    pending = whenSlotFree().then(() =>
-      resolveIdentity(did, { profile: true })
-        .then((identity): Lookup => identity)
-        .catch((e: unknown): Lookup => {
-          if (e instanceof ApiError && e.status === 400) return null;
-          identities.delete(did);
-          return "unavailable";
-        })
-        .finally(releaseSlot),
-    );
-    identities.set(did, pending);
-  }
-  return pending;
-}
 
 /**
  * A DID's identity: `undefined` while loading, `null` when the DID can't be
@@ -133,7 +80,10 @@ export function AccountName({
   return (
     <span
       ref={ref}
-      className={cn("inline-flex min-w-0 items-center gap-2 align-middle", className)}
+      className={cn(
+        "inline-flex min-w-0 items-center gap-2 align-middle",
+        className,
+      )}
       title={identity?.display_name ?? undefined}
     >
       <Avatar className="size-6">

@@ -1490,52 +1490,46 @@ pub async fn claim_invite(
     invite_id: &str,
     member: &SpaceMember,
 ) -> Result<InviteClaim, AppError> {
-    let err = |e: sqlx::Error| AppError::Internal(format!("failed to accept invite: {e}"));
-    let mut tx = match backend {
-        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
-        DatabaseBackend::Postgres => pool.begin().await,
-    }
-    .map_err(err)?;
-
     let take_use = adapt_sql(
         "UPDATE happyview_space_invites SET uses = uses + 1 \
          WHERE id = ? AND revoked = 0 AND (max_uses IS NULL OR uses < max_uses)",
         backend,
     );
-    let taken = crate::db::query(&take_use)
-        .bind(invite_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(err)?;
-    if taken.rows_affected() == 0 {
-        return Ok(InviteClaim::Unavailable);
-    }
-
     let insert_member = adapt_sql(
         "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (space_id, member_did) DO NOTHING",
         backend,
     );
-    let inserted = crate::db::query(&insert_member)
-        .bind(&member.id)
-        .bind(&member.space_id)
-        .bind(&member.did)
-        .bind(member.access.read as i32)
-        .bind(member.access.write as i32)
-        .bind(member.access.read_self as i32)
-        .bind(member.is_delegation as i32)
-        .bind(&member.granted_by)
-        .bind(&member.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(err)?;
-    if inserted.rows_affected() == 0 {
-        return Ok(InviteClaim::AlreadyMember);
-    }
-
-    tx.commit().await.map_err(err)?;
-    Ok(InviteClaim::Joined)
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        let taken = crate::db::query(&take_use)
+            .bind(invite_id)
+            .execute(&mut *tx)
+            .await?;
+        if taken.rows_affected() == 0 {
+            return Ok(InviteClaim::Unavailable);
+        }
+        let inserted = crate::db::query(&insert_member)
+            .bind(&member.id)
+            .bind(&member.space_id)
+            .bind(&member.did)
+            .bind(member.access.read as i32)
+            .bind(member.access.write as i32)
+            .bind(member.access.read_self as i32)
+            .bind(member.is_delegation as i32)
+            .bind(&member.granted_by)
+            .bind(&member.created_at)
+            .execute(&mut *tx)
+            .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(InviteClaim::AlreadyMember);
+        }
+        tx.commit().await?;
+        Ok(InviteClaim::Joined)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to accept invite: {e}")))
 }
 
 /// Revoke one of `space_id`'s invites. An id belonging to another space

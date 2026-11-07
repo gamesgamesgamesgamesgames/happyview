@@ -16,6 +16,7 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::dns::NativeDnsResolver;
 use crate::error::AppError;
 use crate::oauth::client_keys::ClientKey;
+use crate::plugin::encryption::Keyring;
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_instance_client(
@@ -29,7 +30,7 @@ pub fn build_instance_client(
     session_store_pool: sqlx::AnyPool,
     db_backend: DatabaseBackend,
     key: &ClientKey,
-    encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<Keyring>,
 ) -> Result<HappyViewOAuthClient, AppError> {
     let jwk = crate::oauth::client_keys::to_atrium_jwk(key)?;
 
@@ -142,18 +143,18 @@ pub struct OAuthClientRegistry {
     linked_repos_by_kid: DashMap<String, Arc<HappyViewOAuthClient>>,
     linked_repos_primary: ArcSwapOption<LinkedReposEntry>,
     /// What clients this registry builds encrypt their sessions with.
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<Keyring>,
 }
 
 impl OAuthClientRegistry {
-    pub fn new(primary_client: Arc<HappyViewOAuthClient>, key: Option<&[u8; 32]>) -> Self {
+    pub fn new(primary_client: Arc<HappyViewOAuthClient>, key: Option<Keyring>) -> Self {
         Self::new_with_kid(primary_client, None, key)
     }
 
     pub fn new_with_kid(
         primary_client: Arc<HappyViewOAuthClient>,
         kid: Option<String>,
-        key: Option<&[u8; 32]>,
+        key: Option<Keyring>,
     ) -> Self {
         Self {
             primary: ArcSwap::new(Arc::new(PrimaryEntry {
@@ -165,7 +166,7 @@ impl OAuthClientRegistry {
             by_kid: DashMap::new(),
             linked_repos_by_kid: DashMap::new(),
             linked_repos_primary: ArcSwapOption::empty(),
-            encryption_key: key.copied(),
+            encryption_key: key,
         }
     }
 
@@ -434,7 +435,7 @@ impl OAuthClientRegistry {
                 session_store: DbSessionStore::new(
                     session_store_pool.clone(),
                     *db_backend,
-                    self.encryption_key.as_ref(),
+                    self.encryption_key,
                 ),
                 resolver,
                 http_client: crate::http_retry::HappyViewHttpClient::new(
@@ -464,7 +465,7 @@ impl OAuthClientRegistry {
                 session_store: DbSessionStore::new(
                     session_store_pool.clone(),
                     *db_backend,
-                    self.encryption_key.as_ref(),
+                    self.encryption_key,
                 )
                 .with_signing_kid(signing_kid.clone()),
                 resolver,
@@ -532,7 +533,7 @@ impl OAuthClientRegistry {
             let keys = crate::oauth::client_keys::load_keys(
                 &state.db,
                 state.db_backend,
-                state.config.token_encryption_key.as_ref(),
+                state.config.keyring().as_ref(),
                 api_client_id,
             )
             .await?;
@@ -650,7 +651,7 @@ impl OAuthClientRegistry {
                     session_store: DbSessionStore::new(
                         session_store_pool.clone(),
                         db_backend,
-                        self.encryption_key.as_ref(),
+                        self.encryption_key,
                     ),
                     resolver,
                     http_client: crate::http_retry::HappyViewHttpClient::new(
@@ -674,7 +675,7 @@ impl OAuthClientRegistry {
                     session_store: DbSessionStore::new(
                         session_store_pool.clone(),
                         db_backend,
-                        self.encryption_key.as_ref(),
+                        self.encryption_key,
                     ),
                     resolver,
                     http_client: crate::http_retry::HappyViewHttpClient::new(

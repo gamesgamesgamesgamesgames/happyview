@@ -890,3 +890,125 @@ async fn inspect_alone_can_read_the_inspector_status() {
     let resp = get(&app, "/admin/spaces/inspector", Some(&key)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// A cookie-authenticated content read with exactly the fetch metadata given,
+/// through the router that adds none of its own.
+async fn cookie_read(
+    app: &TestApp,
+    uri: &str,
+    sec_fetch_site: Option<&str>,
+    origin: Option<&str>,
+) -> StatusCode {
+    let (name, value) = app.admin_cookie();
+    let mut req = Request::builder().uri(uri).header(name, value);
+    if let Some(site) = sec_fetch_site {
+        req = req.header("sec-fetch-site", site);
+    }
+    if let Some(origin) = origin {
+        req = req.header("origin", origin);
+    }
+    app.unmarked_router()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Every route that records the read it serves.
+fn audited_reads(space_id: &str) -> [String; 3] {
+    [
+        format!("/admin/spaces/{space_id}/records"),
+        format!("/admin/spaces/{space_id}/blob?cid=bafkcsrf"),
+        format!("/admin/accounts/{MEMBER}/space-records"),
+    ]
+}
+
+async fn grant_everything(app: &TestApp) -> String {
+    let id = seed_space(app).await;
+    seed_blob_record(app, &id, "main", MEMBER, "b1", "bafkcsrf").await;
+    enable_inspector(app).await;
+    grant(app, "space", &id).await;
+    grant(app, "account", MEMBER).await;
+    id
+}
+
+/// The CSRF guard lets every `GET` through, so a link on another site could
+/// make an operator holding a grant record a read they never made. A content
+/// read refuses the session cookie from anywhere but the dashboard, and
+/// records nothing when it does.
+#[tokio::test]
+#[serial]
+async fn a_content_read_refuses_the_cookie_from_another_site() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = grant_everything(&app).await;
+
+    for uri in audited_reads(&id) {
+        for (site, origin) in [
+            (Some("cross-site"), None),
+            (Some("same-site"), None),
+            (Some("none"), None),
+            (None, Some("https://evil.example")),
+            // Neither header: not from the dashboard, which is the only
+            // place the cookie belongs.
+            (None, None),
+        ] {
+            let before = moderator_reads(&app).await.len();
+            assert_eq!(
+                cookie_read(&app, &uri, site, origin).await,
+                StatusCode::FORBIDDEN,
+                "{uri} with sec-fetch-site {site:?}, origin {origin:?}"
+            );
+            assert_eq!(
+                moderator_reads(&app).await.len(),
+                before,
+                "{uri}: a refused read is not recorded"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_content_read_from_the_dashboard_is_served_and_recorded() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = grant_everything(&app).await;
+    let origin = app.state.config.public_url.clone();
+
+    for uri in audited_reads(&id) {
+        for (site, origin) in [(Some("same-origin"), None), (None, Some(origin.as_str()))] {
+            let before = moderator_reads(&app).await.len();
+            let status = cookie_read(&app, &uri, site, origin).await;
+            // The blob's PDS cannot be resolved for a test DID, so a covered
+            // blob read ends in 404 after it has been recorded.
+            assert!(
+                status == StatusCode::OK
+                    || (uri.contains("/blob") && status == StatusCode::NOT_FOUND),
+                "{uri} with sec-fetch-site {site:?}, origin {origin:?}: {status}"
+            );
+            assert_eq!(moderator_reads(&app).await.len(), before + 1, "{uri}");
+        }
+    }
+}
+
+/// An API key is not a credential a browser attaches by itself, so the rule
+/// does not apply to it.
+#[tokio::test]
+#[serial]
+async fn a_content_read_with_an_api_key_needs_no_origin() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = grant_everything(&app).await;
+    let key = common::api_key(&app, &["spaces:inspect"]).await;
+
+    for uri in audited_reads(&id) {
+        let before = moderator_reads(&app).await.len();
+        let status = get(&app, &uri, Some(&key)).await.status();
+        assert!(
+            status == StatusCode::OK || (uri.contains("/blob") && status == StatusCode::NOT_FOUND),
+            "{uri}: {status}"
+        );
+        assert_eq!(moderator_reads(&app).await.len(), before + 1, "{uri}");
+    }
+}

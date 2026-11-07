@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: two handlers in export! answer xrpc.query:app.test.same
+  --> tests/ui/duplicate_trigger.rs:13:1
+   |
+13 | export!(first, other::second);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed here

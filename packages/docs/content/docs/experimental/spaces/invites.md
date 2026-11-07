@@ -111,7 +111,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 | `space` | string | Yes | | The space this invite is for |
 | `access` | object | No | `{ "read": true, "write": false }` | Access granted on acceptance: `read` and `write` booleans, both required when `access` is given |
 | `maxUses` | integer | No | unlimited | Maximum number of times the invite can be redeemed |
-| `expiresAt` | string (datetime) | No | never | When the invite expires |
+| `expiresAt` | string (datetime) | No | never | When the invite expires, as an RFC 3339 datetime with a timezone. Stored and returned in UTC. Any other value fails with `400 InvalidRequest` |
 
 **Response (201):**
 
@@ -121,7 +121,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
   "token": "a1b2c3d4e5f6...",
   "access": { "read": true, "write": true },
   "maxUses": 10,
-  "expiresAt": "2026-06-01T00:00:00Z"
+  "expiresAt": "2026-06-01T00:00:00+00:00"
 }
 ```
 
@@ -373,7 +373,7 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=a
       "access": { "read": true, "write": true },
       "maxUses": 10,
       "uses": 3,
-      "expiresAt": "2026-06-01T00:00:00Z",
+      "expiresAt": "2026-06-01T00:00:00+00:00",
       "revoked": false,
       "createdBy": "did:plc:abc123",
       "createdAt": "2026-05-09T12:00:00Z"

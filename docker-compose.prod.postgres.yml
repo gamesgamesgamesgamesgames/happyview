@@ -149,6 +149,12 @@ services:
 
       # --- Upstream services --------------------------------------------
       JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream1.us-east.bsky.network}
+      # auto tries v2 and falls back to v1; v2 or v1 forces one.
+      JETSTREAM_PROTOCOL: ${JETSTREAM_PROTOCOL:-auto}
+      JETSTREAM_COMPRESSION: ${JETSTREAM_COMPRESSION:-true}
+      JETSTREAM_WORKERS: ${JETSTREAM_WORKERS:-8}
+      JETSTREAM_API_KEY: ${JETSTREAM_API_KEY:-}
+      BACKFILL_SOURCE: ${BACKFILL_SOURCE:-crawl}
       RELAY_URL: ${RELAY_URL:-https://bsky.network}
       PLC_URL: ${PLC_URL:-https://plc.directory}
 
@@ -167,6 +173,13 @@ services:
       # The dev default (`happyview=debug`) is very noisy in production.
       RUST_LOG: ${RUST_LOG:-happyview=info,tower_http=info,sqlx=warn}
       EVENT_LOG_RETENTION_DAYS: ${EVENT_LOG_RETENTION_DAYS:-30}
+      # Days to keep script dead letters once resolved. 0 keeps them.
+      DEAD_LETTER_RETENTION_DAYS: ${DEAD_LETTER_RETENTION_DAYS:-30}
+      # Hours to remember deleted records and accounts. 0 keeps them.
+      RECORD_TOMBSTONE_RETENTION_HOURS: ${RECORD_TOMBSTONE_RETENTION_HOURS:-72}
+      # Most work units a backfill keeps queued at once. Lower it on a small
+      # disk.
+      BACKFILL_DISCOVERY_WINDOW: ${BACKFILL_DISCOVERY_WINDOW:-50000}
       DEFAULT_RATE_LIMIT_CAPACITY: ${DEFAULT_RATE_LIMIT_CAPACITY:-100}
       DEFAULT_RATE_LIMIT_REFILL_RATE: ${DEFAULT_RATE_LIMIT_REFILL_RATE:-2.0}
       # Backfill concurrency. Each of these feeds the backfill pool size — see

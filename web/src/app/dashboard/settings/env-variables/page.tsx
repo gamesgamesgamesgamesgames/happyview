@@ -79,8 +79,8 @@ export default function EnvVariablesPage() {
           <div>
             <h2 className="text-lg font-semibold">Script Variables</h2>
             <p className="text-muted-foreground text-sm">
-              Define variables that Lua scripts can access via the{" "}
-              <code className="text-xs">env</code> global table.
+              Define variables that scripts can read from{" "}
+              <code className="text-xs">ctx.env</code>.
             </p>
           </div>
           {hasPermission("script-variables:create") && (
@@ -95,7 +95,7 @@ export default function EnvVariablesPage() {
                 <TableHead>Key</TableHead>
                 <TableHead>Preview</TableHead>
                 <TableHead>Updated</TableHead>
-                <TableHead className="w-20 sticky right-0 bg-inherit z-[1]" />
+                <TableHead className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -105,15 +105,14 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet. Variables defined here are accessible to Lua scripts via the env global table.
+                    No script variables yet. Variables defined here are readable
+                    by scripts as ctx.env.
                   </TableCell>
                 </TableRow>
               )}
               {vars.map((v) => (
                 <TableRow key={v.key}>
-                  <TableCell className="font-mono text-sm">
-                    {v.key}
-                  </TableCell>
+                  <TableCell className="font-mono text-sm">{v.key}</TableCell>
                   <TableCell className="font-mono text-sm text-muted-foreground">
                     {v.unreadable
                       ? "Can't be read with this instance's key. Set it again."
@@ -122,12 +121,9 @@ export default function EnvVariablesPage() {
                   <TableCell>
                     {new Date(v.updated_at).toLocaleString()}
                   </TableCell>
-                  <TableCell className="w-20 sticky right-0 bg-inherit z-[1]">
+                  <TableCell className="w-20 sticky right-0 z-[1] bg-background group-hover/row:bg-muted">
                     <div className="flex gap-1">
-                      <UpsertVariableDialog
-                        onSuccess={load}
-                        editKey={v.key}
-                      />
+                      <UpsertVariableDialog onSuccess={load} editKey={v.key} />
                       {hasPermission("script-variables:delete") && (
                         <AlertDialog>
                           <AlertDialogTrigger asChild>
@@ -143,10 +139,13 @@ export default function EnvVariablesPage() {
                           </AlertDialogTrigger>
                           <AlertDialogContent>
                             <AlertDialogHeader>
-                              <AlertDialogTitle>Delete variable?</AlertDialogTitle>
+                              <AlertDialogTitle>
+                                Delete variable?
+                              </AlertDialogTitle>
                               <AlertDialogDescription>
-                                This will permanently remove the variable. Scripts
-                                using this variable will fail on next execution.
+                                This will permanently remove the variable.
+                                Scripts using this variable will fail on next
+                                execution.
                               </AlertDialogDescription>
                             </AlertDialogHeader>
                             <AlertDialogFooter>

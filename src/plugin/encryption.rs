@@ -61,6 +61,91 @@ pub fn decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionE
         .map_err(|_| EncryptionError::DecryptionFailed)
 }
 
+/// The keys stored values open with: `TOKEN_ENCRYPTION_KEY`, which also seals
+/// every new value, then `TOKEN_ENCRYPTION_KEY_PREVIOUS` while a rotation is
+/// under way. There are no key ids: AES-GCM authenticates each value, so one
+/// sealed under the other key fails cleanly and the next key is tried.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Keyring {
+    current: [u8; 32],
+    previous: Option<[u8; 32]>,
+}
+
+impl Keyring {
+    /// A previous key equal to the current one adds nothing and is dropped.
+    pub fn new(current: [u8; 32], previous: Option<[u8; 32]>) -> Self {
+        Self {
+            current,
+            previous: previous.filter(|p| *p != current),
+        }
+    }
+
+    /// The key that seals.
+    pub fn current(&self) -> &[u8; 32] {
+        &self.current
+    }
+
+    pub fn has_previous(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    /// Decrypt with the current key, then the previous one.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        match decrypt(&self.current, ciphertext) {
+            Err(EncryptionError::DecryptionFailed) => match &self.previous {
+                Some(previous) => decrypt(previous, ciphertext),
+                None => Err(EncryptionError::DecryptionFailed),
+            },
+            result => result,
+        }
+    }
+}
+
+/// Which of a keyring's keys opened a value, and what it held.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Opened {
+    Current(Vec<u8>),
+    Previous(Vec<u8>),
+    /// Neither key opens it, or it isn't ciphertext at all.
+    Neither,
+}
+
+impl Keyring {
+    /// Like [`Keyring::decrypt`], but says which key opened the value, so a
+    /// rotation can tell what still needs re-sealing.
+    pub fn which_opens(&self, ciphertext: &[u8]) -> Opened {
+        if let Ok(plain) = decrypt(&self.current, ciphertext) {
+            return Opened::Current(plain);
+        }
+        match self.previous.as_ref().map(|key| decrypt(key, ciphertext)) {
+            Some(Ok(plain)) => Opened::Previous(plain),
+            _ => Opened::Neither,
+        }
+    }
+
+    /// One key and no rotation under way.
+    pub const fn single(current: [u8; 32]) -> Self {
+        Self {
+            current,
+            previous: None,
+        }
+    }
+}
+
+impl From<[u8; 32]> for Keyring {
+    fn from(current: [u8; 32]) -> Self {
+        Self::single(current)
+    }
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("previous", &self.previous.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Text as it goes in a column beside an `encrypted` flag.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sealed {
@@ -70,10 +155,10 @@ pub struct Sealed {
 
 /// Encrypt `value` when the instance has a key, or keep it as plaintext: the
 /// key is optional, and a store shouldn't refuse a write that worked without it.
-pub fn seal(key: Option<&[u8; 32]>, value: &str) -> Result<Sealed, EncryptionError> {
-    Ok(match key {
-        Some(key) => Sealed {
-            value: BASE64.encode(encrypt(key, value.as_bytes())?),
+pub fn seal(keys: Option<&Keyring>, value: &str) -> Result<Sealed, EncryptionError> {
+    Ok(match keys {
+        Some(keys) => Sealed {
+            value: BASE64.encode(encrypt(keys.current(), value.as_bytes())?),
             encrypted: 1,
         },
         None => Sealed {
@@ -85,17 +170,95 @@ pub fn seal(key: Option<&[u8; 32]>, value: &str) -> Result<Sealed, EncryptionErr
 
 /// The text of a stored value, or `None` if it's ciphertext this instance can't
 /// open.
-pub fn open(key: Option<&[u8; 32]>, stored: &str, encrypted: bool) -> Option<String> {
+pub fn open(keys: Option<&Keyring>, stored: &str, encrypted: bool) -> Option<String> {
     if !encrypted {
         return Some(stored.to_string());
     }
     let bytes = BASE64.decode(stored).ok()?;
-    String::from_utf8(decrypt(key?, &bytes).ok()?).ok()
+    String::from_utf8(keys?.decrypt(&bytes).ok()?).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OLD: [u8; 32] = [0x11; 32];
+    const NEW: [u8; 32] = [0x22; 32];
+
+    #[test]
+    fn a_keyring_opens_with_the_current_key_then_the_previous_one() {
+        let keys = Keyring::new(NEW, Some(OLD));
+        let under_old = encrypt(&OLD, b"old").unwrap();
+        let under_new = encrypt(&NEW, b"new").unwrap();
+        assert_eq!(keys.decrypt(&under_old).unwrap(), b"old");
+        assert_eq!(keys.decrypt(&under_new).unwrap(), b"new");
+
+        let other = encrypt(&[0x33; 32], b"other").unwrap();
+        assert!(matches!(
+            keys.decrypt(&other),
+            Err(EncryptionError::DecryptionFailed)
+        ));
+        assert!(Keyring::single(NEW).decrypt(&under_old).is_err());
+    }
+
+    #[test]
+    fn a_keyring_seals_with_the_current_key_only() {
+        let keys = Keyring::new(NEW, Some(OLD));
+        let sealed = seal(Some(&keys), "value").unwrap();
+        assert_eq!(
+            open(Some(&Keyring::single(NEW)), &sealed.value, true).as_deref(),
+            Some("value")
+        );
+        assert_eq!(open(Some(&Keyring::single(OLD)), &sealed.value, true), None);
+    }
+
+    /// A malformed value is not a wrong key, so the previous key isn't tried.
+    #[test]
+    fn a_keyring_reports_a_malformed_value_as_such() {
+        let keys = Keyring::new(NEW, Some(OLD));
+        assert!(matches!(
+            keys.decrypt(&[0u8; 10]),
+            Err(EncryptionError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn a_keyring_says_which_key_opened_a_value() {
+        let keys = Keyring::new(NEW, Some(OLD));
+        assert_eq!(
+            keys.which_opens(&encrypt(&NEW, b"n").unwrap()),
+            Opened::Current(b"n".to_vec())
+        );
+        assert_eq!(
+            keys.which_opens(&encrypt(&OLD, b"o").unwrap()),
+            Opened::Previous(b"o".to_vec())
+        );
+        assert_eq!(
+            keys.which_opens(&encrypt(&[0x33; 32], b"x").unwrap()),
+            Opened::Neither
+        );
+        assert_eq!(keys.which_opens(b"short"), Opened::Neither);
+        assert_eq!(
+            Keyring::single(NEW).which_opens(&encrypt(&OLD, b"o").unwrap()),
+            Opened::Neither
+        );
+    }
+
+    #[test]
+    fn a_previous_key_equal_to_the_current_one_is_dropped() {
+        assert!(!Keyring::new(NEW, Some(NEW)).has_previous());
+        assert!(Keyring::new(NEW, Some(OLD)).has_previous());
+    }
+
+    #[test]
+    fn a_keyring_never_prints_its_keys() {
+        let printed = format!("{:?}", Keyring::new(NEW, Some(OLD)));
+        assert!(
+            !printed.contains("34") && !printed.contains("17"),
+            "{printed}"
+        );
+        assert!(printed.contains("previous: true"), "{printed}");
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

@@ -7,52 +7,43 @@ Delete a record and all related records across collections.
 **Lexicon type:** procedure
 
 ```lua
-function handle()
+local db = require("happyview.db")
+local record = require("happyview.record")
+
+function handle(input, ctx)
   if not input.uri then
     return { error = "uri is required" }
   end
 
-  -- Load the primary record
-  local primary = Record.load(input.uri)
-  if not primary then
+  if not db.get(input.uri) then
     return { error = "not found" }
   end
 
-  -- Find related records that reference this URI
-  local comments = db.query({
-    collection = "xyz.statusphere.comment",
-    did = caller_did,
-    limit = 100,
-  })
+  -- Find the caller's comments that reference this URI
+  local comments = db.records("xyz.statusphere.comment")
+    :where("postUri", "=", input.uri)
+    :did(ctx.caller_did)
+    :limit(100)
+    :run()
 
-  -- Collect records to delete
-  local to_delete = { primary }
+  local to_delete = { input.uri }
   for _, comment in ipairs(comments.records) do
-    if comment.postUri == input.uri then
-      local r = Record.load(comment.uri)
-      if r then
-        to_delete[#to_delete + 1] = r
-      end
-    end
+    to_delete[#to_delete + 1] = comment.uri
   end
 
-  -- Delete all matched records
-  for _, r in ipairs(to_delete) do
-    r:delete()
+  for _, uri in ipairs(to_delete) do
+    record.delete(uri)
   end
 
-  return {
-    deleted = #to_delete,
-  }
+  return { deleted = #to_delete }
 end
 ```
 
 ## How it works
 
-1. Load the primary record by URI. Return early if it doesn't exist.
-2. Query for related records, in this example comments by the same user that reference the primary record's URI.
-3. Load each related record with [`Record.load`](../../api-reference/lua/record-api.md#static-methods) to get a deletable `Record` instance.
-4. Delete everything. Each `r:delete()` removes the record from the user's PDS and the local index.
+1. Check the primary record exists with `db.get`. Return early if it doesn't.
+2. Query for related records: comments by the same user whose `postUri` field is the primary record's URI. `where` filters on a field of the stored body, so the match happens in the database rather than in Lua.
+3. Delete everything with `record.delete`. Each call removes the record from the user's PDS and the local index.
 
 ## Usage
 
@@ -121,4 +112,4 @@ curl -X POST http://127.0.0.1:3000/xrpc/xyz.statusphere.deletePost \
 
 Cascading deletes are useful when your data model has parent-child relationships across collections. For example, deleting a post should also clean up its comments, reactions, or metadata records. This keeps the user's repo and the local index consistent.
 
-Note that this only deletes records owned by `caller_did`. atproto records can only be deleted by their owner. If the related records could have more than 100 matches, paginate through all of them before deleting.
+Note that this only deletes records owned by `ctx.caller_did`. atproto records can only be deleted by their owner. If the related records could have more than 100 matches, paginate through all of them before deleting.

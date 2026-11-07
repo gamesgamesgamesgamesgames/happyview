@@ -3,6 +3,7 @@
   "pages": [
     "railway",
     "docker",
+    "binary",
     "other",
     "local-development",
     "production"

@@ -1,38 +1,11 @@
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use serde_json::{Value, json};
+use axum::response::Response;
+use serde_json::Value;
 
 use crate::AppState;
 use crate::auth::Claims;
 use crate::auth::ServiceAuthClaims;
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lexicon::ProcedureAction;
-use crate::record_refs::sync_refs;
 use crate::repo;
-
-/// Resolve where a put/delete writes in the local index.
-///
-/// The client supplies a full AT URI, but only the record key (last segment) is
-/// trusted — the URI's DID is **ignored**. The returned index URI is always
-/// scoped to the caller's own repo (`did`), so a caller cannot overwrite or
-/// delete another user's indexed record by naming their URI. `collection` comes
-/// from the server-side lexicon, not the client.
-///
-/// Returns `(rkey, index_uri)`.
-fn resolve_write_target(
-    did: &str,
-    collection: &str,
-    client_uri: &str,
-) -> Result<(String, String), AppError> {
-    let rkey = client_uri
-        .split('/')
-        .next_back()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::BadRequest("invalid AT URI".into()))?;
-    let index_uri = format!("at://{did}/{collection}/{rkey}");
-    Ok((rkey.to_string(), index_uri))
-}
 
 pub(crate) async fn handle_procedure(
     state: &AppState,
@@ -43,9 +16,14 @@ pub(crate) async fn handle_procedure(
     lexicon: &crate::lexicon::ParsedLexicon,
     service_auth: Option<&ServiceAuthClaims>,
 ) -> Result<Response, AppError> {
-    // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
-    // overrides the default PDS-write flow.
-    let trigger = format!("xrpc.procedure:{}", lexicon.id);
+    // A procedure is its script, bound at `xrpc.procedure:<id>`; one with no
+    // script has nothing to run.
+    let trigger =
+        crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcProcedure, &lexicon.id);
+    // One lookup for the whole call: the scope check below and the run after
+    // it must describe the same script, whatever the snapshot does meanwhile.
+    let project = state.project.load_full();
+    let resolved = state.scripts.resolve_in(&project, &trigger).await;
 
     // Service auth access and scope checks
     if let Some(sa) = &service_auth {
@@ -81,18 +59,10 @@ pub(crate) async fn handle_procedure(
         }
 
         // Check token scope against outbound XRPCs declared by the script
-        let outbound_sql = adapt_sql(
-            "SELECT outbound_xrpcs FROM happyview_scripts WHERE id = ?",
-            state.db_backend,
-        );
-        if let Ok(Some((Some(json_str),))) = crate::db::query_as::<(Option<String>,)>(&outbound_sql)
-            .bind(&trigger)
-            .fetch_optional(&state.db)
-            .await
-            && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
-        {
+        if let Some(script) = &resolved {
             let token_scope: Vec<&str> = vec![&method];
-            let missing: Vec<&String> = outbound_list
+            let missing: Vec<&String> = script
+                .outbound_xrpcs
                 .iter()
                 .filter(|x| !token_scope.contains(&x.as_str()))
                 .collect();
@@ -106,7 +76,18 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
-    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
+    // A forged caller holds no DPoP session, so the delegation guard below
+    // would refuse it for missing authentication. A test acts as an account
+    // by naming it.
+    if state.test.is_some() && input.get("delegateDid").is_some() {
+        return Err(AppError::BadRequest(
+            "a test run does not support delegateDid; fire the trigger `as` the \
+             delegated account instead"
+                .into(),
+        ));
+    }
+
+    if let Some(resolved) = resolved {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
         // active write-capable delegate of that account, scoped to the
@@ -163,504 +144,12 @@ pub(crate) async fn handle_procedure(
             &script_input,
             params,
             lexicon,
-            &resolved.body,
+            &resolved,
             None,
             delegate_did.as_deref(),
         )
         .await;
     }
 
-    let collection = lexicon.target_collection.as_deref().ok_or_else(|| {
-        AppError::BadRequest(format!("{method} has no target_collection configured"))
-    })?;
-
-    // If the user authenticated via a DPoP session (has a client_key from DPoP auth),
-    // use the DPoP PDS write path. Otherwise, fall back to the atrium OAuth session.
-    if let Some(client_key) = claims.client_key() {
-        let encryption_key = state
-            .config
-            .token_encryption_key
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
-
-        let api_client_id = repo::get_dpop_client_id(state, client_key).await?;
-
-        let delegate_did = input
-            .get("delegateDid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        return handle_dpop_procedure(
-            state,
-            claims,
-            input,
-            collection,
-            &lexicon.action,
-            &api_client_id,
-            encryption_key,
-            delegate_did.as_deref(),
-        )
-        .await;
-    }
-
-    let session = repo::get_oauth_session(state, claims.did()).await?;
-
-    match &lexicon.action {
-        ProcedureAction::Create => {
-            handle_create_record(state, claims, input, collection, &session).await
-        }
-        ProcedureAction::Update => {
-            handle_put_record(state, claims, input, collection, &session).await
-        }
-        ProcedureAction::Delete => {
-            handle_delete_record(state, claims, input, collection, &session).await
-        }
-        ProcedureAction::Upsert => {
-            // Backwards-compatible: sniff for `uri` field to decide create vs put.
-            let has_uri = input.get("uri").and_then(|v| v.as_str()).is_some();
-            if has_uri {
-                handle_put_record(state, claims, input, collection, &session).await
-            } else {
-                handle_create_record(state, claims, input, collection, &session).await
-            }
-        }
-    }
-}
-
-async fn handle_create_record(
-    state: &AppState,
-    claims: &Claims,
-    input: &Value,
-    collection: &str,
-    session: &crate::HappyViewOAuthSession,
-) -> Result<Response, AppError> {
-    // Build record from input, adding $type
-    let mut record = input.clone();
-    if let Some(obj) = record.as_object_mut() {
-        obj.insert("$type".to_string(), json!(collection));
-        // Remove fields that are procedure params, not record fields
-        obj.remove("shouldPublish");
-    }
-
-    let pds_body = json!({
-        "repo": claims.did(),
-        "collection": collection,
-        "record": record,
-    });
-
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.createRecord", &pds_body).await?;
-
-    if resp.status().is_success() {
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
-
-        let pds_result: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Internal(format!("invalid PDS JSON: {e}")))?;
-
-        if let (Some(uri), Some(cid)) = (
-            pds_result.get("uri").and_then(|v| v.as_str()),
-            pds_result.get("cid").and_then(|v| v.as_str()),
-        ) {
-            let backend = state.db_backend;
-            let rkey = uri.split('/').next_back().unwrap_or_default();
-            let record_str = serde_json::to_string(&record).unwrap_or_default();
-            let sql = adapt_sql(
-                r#"
-                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (uri) DO UPDATE
-                    SET record = EXCLUDED.record,
-                        cid = EXCLUDED.cid
-                "#,
-                backend,
-            );
-            let now = now_rfc3339();
-            let _ = crate::db::query(&sql)
-                .bind(uri)
-                .bind(claims.did())
-                .bind(collection)
-                .bind(rkey)
-                .bind(&record_str)
-                .bind(cid)
-                .bind(crate::db::NO_INDEXED_AT)
-                .bind(&now)
-                .execute(&state.db)
-                .await;
-
-            let _ = sync_refs(&state.db, uri, collection, &record, backend).await;
-        }
-
-        Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response())
-    } else {
-        repo::forward_pds_response(resp).await
-    }
-}
-
-async fn handle_put_record(
-    state: &AppState,
-    claims: &Claims,
-    input: &Value,
-    collection: &str,
-    session: &crate::HappyViewOAuthSession,
-) -> Result<Response, AppError> {
-    let client_uri = input
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("missing uri field".into()))?;
-
-    // Trust only the record key from the client URI; scope the index write to
-    // the caller's own repo so it can't overwrite another user's indexed record.
-    let (rkey, uri) = resolve_write_target(claims.did(), collection, client_uri)?;
-
-    // Build record from input, adding $type
-    let mut record = input.clone();
-    if let Some(obj) = record.as_object_mut() {
-        obj.insert("$type".to_string(), json!(collection));
-        obj.remove("uri");
-        obj.remove("shouldPublish");
-    }
-
-    let pds_body = json!({
-        "repo": claims.did(),
-        "collection": collection,
-        "rkey": rkey,
-        "record": record,
-    });
-
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.putRecord", &pds_body).await?;
-
-    if resp.status().is_success() {
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
-
-        let pds_result: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Internal(format!("invalid PDS JSON: {e}")))?;
-
-        let cid = pds_result
-            .get("cid")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        let backend = state.db_backend;
-        let record_str = serde_json::to_string(&record).unwrap_or_default();
-        let now = now_rfc3339();
-        let sql = adapt_sql(
-            r#"
-            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (uri) DO UPDATE
-                SET record = EXCLUDED.record,
-                    cid = EXCLUDED.cid
-            "#,
-            backend,
-        );
-        let _ = crate::db::query(&sql)
-            .bind(&uri)
-            .bind(claims.did())
-            .bind(collection)
-            .bind(&rkey)
-            .bind(&record_str)
-            .bind(cid)
-            .bind(crate::db::NO_INDEXED_AT)
-            .bind(&now)
-            .execute(&state.db)
-            .await;
-
-        let _ = sync_refs(&state.db, &uri, collection, &record, backend).await;
-
-        Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response())
-    } else {
-        repo::forward_pds_response(resp).await
-    }
-}
-
-async fn handle_delete_record(
-    state: &AppState,
-    claims: &Claims,
-    input: &Value,
-    collection: &str,
-    session: &crate::HappyViewOAuthSession,
-) -> Result<Response, AppError> {
-    let client_uri = input
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("missing uri field".into()))?;
-
-    // Trust only the record key from the client URI; scope the index delete to
-    // the caller's own repo so it can't delete another user's indexed record.
-    let (rkey, uri) = resolve_write_target(claims.did(), collection, client_uri)?;
-
-    let pds_body = json!({
-        "repo": claims.did(),
-        "collection": collection,
-        "rkey": rkey,
-    });
-
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.deleteRecord", &pds_body).await?;
-
-    if resp.status().is_success() {
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
-
-        let backend = state.db_backend;
-        let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-        let _ = crate::db::query(&sql).bind(&uri).execute(&state.db).await;
-
-        Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response())
-    } else {
-        repo::forward_pds_response(resp).await
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_dpop_procedure(
-    state: &AppState,
-    claims: &Claims,
-    input: &Value,
-    collection: &str,
-    action: &ProcedureAction,
-    api_client_id: &str,
-    encryption_key: &[u8; 32],
-    delegate_did: Option<&str>,
-) -> Result<Response, AppError> {
-    // If delegating, verify the caller has write access and resolve the
-    // api_client_id that owns the delegated session.
-    let (target_did, effective_api_client_id, effective_dpop_key_id) =
-        if let Some(did) = delegate_did {
-            let role = crate::delegation::db::get_delegate_role(
-                &state.db,
-                state.db_backend,
-                did,
-                claims.did(),
-            )
-            .await?
-            .ok_or_else(|| AppError::Forbidden("you are not a delegate of this account".into()))?;
-
-            if !role.can_write() {
-                return Err(AppError::Forbidden(
-                    "your role does not have write access to this account".into(),
-                ));
-            }
-
-            let stored_client_id =
-                crate::delegation::db::get_api_client_id(&state.db, state.db_backend, did)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Internal("delegated account missing api_client_id".into())
-                    })?;
-
-            if api_client_id != stored_client_id {
-                return Err(AppError::Forbidden(
-                    "delegation is scoped to a different application".into(),
-                ));
-            }
-
-            // TODO: delegated_accounts needs a dpop_key_id column to identify
-            // which session to use for PDS writes. For now, look up by
-            // (api_client_id, user_did) which works when there's one session.
-            let target_session = crate::oauth::sessions::get_dpop_session_for_user(
-                &state.db,
-                state.db_backend,
-                encryption_key,
-                &stored_client_id,
-                did,
-            )
-            .await?;
-
-            (did, stored_client_id, target_session.dpop_key_id)
-        } else {
-            let dpop_key_id = claims
-                .dpop_key_id()
-                .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
-                .to_string();
-            (claims.did(), api_client_id.to_string(), dpop_key_id)
-        };
-
-    // Strip delegateDid from input — it's a control field, not record data
-    let mut input = input.clone();
-    if let Some(obj) = input.as_object_mut() {
-        obj.remove("delegateDid");
-    }
-
-    let (xrpc_method, pds_body) = match action {
-        ProcedureAction::Create => {
-            let mut record = input.clone();
-            if let Some(obj) = record.as_object_mut() {
-                obj.insert("$type".to_string(), json!(collection));
-                obj.remove("shouldPublish");
-                obj.remove("delegateDid");
-            }
-            (
-                "com.atproto.repo.createRecord",
-                json!({
-                    "repo": target_did,
-                    "collection": collection,
-                    "record": record,
-                }),
-            )
-        }
-        ProcedureAction::Update => {
-            let uri = input
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::BadRequest("missing uri field".into()))?;
-            let rkey = uri
-                .split('/')
-                .next_back()
-                .ok_or_else(|| AppError::Internal("invalid AT URI".into()))?;
-            let mut record = input.clone();
-            if let Some(obj) = record.as_object_mut() {
-                obj.insert("$type".to_string(), json!(collection));
-                obj.remove("uri");
-                obj.remove("shouldPublish");
-                obj.remove("delegateDid");
-            }
-            (
-                "com.atproto.repo.putRecord",
-                json!({
-                    "repo": target_did,
-                    "collection": collection,
-                    "rkey": rkey,
-                    "record": record,
-                }),
-            )
-        }
-        ProcedureAction::Delete => {
-            let uri = input
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::BadRequest("missing uri field".into()))?;
-            let rkey = uri
-                .split('/')
-                .next_back()
-                .ok_or_else(|| AppError::Internal("invalid AT URI".into()))?;
-            (
-                "com.atproto.repo.deleteRecord",
-                json!({
-                    "repo": target_did,
-                    "collection": collection,
-                    "rkey": rkey,
-                }),
-            )
-        }
-        ProcedureAction::Upsert => {
-            let has_uri = input.get("uri").and_then(|v| v.as_str()).is_some();
-            if has_uri {
-                let uri = input["uri"].as_str().unwrap();
-                let rkey = uri
-                    .split('/')
-                    .next_back()
-                    .ok_or_else(|| AppError::Internal("invalid AT URI".into()))?;
-                let mut record = input.clone();
-                if let Some(obj) = record.as_object_mut() {
-                    obj.insert("$type".to_string(), json!(collection));
-                    obj.remove("uri");
-                    obj.remove("shouldPublish");
-                    obj.remove("delegateDid");
-                }
-                (
-                    "com.atproto.repo.putRecord",
-                    json!({
-                        "repo": target_did,
-                        "collection": collection,
-                        "rkey": rkey,
-                        "record": record,
-                    }),
-                )
-            } else {
-                let mut record = input.clone();
-                if let Some(obj) = record.as_object_mut() {
-                    obj.insert("$type".to_string(), json!(collection));
-                    obj.remove("shouldPublish");
-                    obj.remove("delegateDid");
-                }
-                (
-                    "com.atproto.repo.createRecord",
-                    json!({
-                        "repo": target_did,
-                        "collection": collection,
-                        "record": record,
-                    }),
-                )
-            }
-        }
-    };
-
-    let resp = crate::oauth::pds_write::dpop_pds_post(
-        &state.http,
-        &state.db,
-        state.db_backend,
-        encryption_key,
-        &state.oauth,
-        &state.config.plc_url,
-        &effective_api_client_id,
-        target_did,
-        &effective_dpop_key_id,
-        xrpc_method,
-        &pds_body,
-    )
-    .await?;
-
-    repo::forward_pds_response(resp).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_target_scopes_index_uri_to_caller() {
-        // An authenticated caller names a *victim's* record. The record key is
-        // honored, but the index URI must be scoped to the caller's own repo —
-        // otherwise a put/delete would poison or remove the victim's row.
-        let (rkey, index_uri) = resolve_write_target(
-            "did:plc:attacker",
-            "app.some.post",
-            "at://did:plc:victim/app.some.post/rk1",
-        )
-        .unwrap();
-        assert_eq!(rkey, "rk1");
-        assert_eq!(index_uri, "at://did:plc:attacker/app.some.post/rk1");
-    }
-
-    #[test]
-    fn write_target_uses_lexicon_collection_not_client_uri() {
-        // The collection comes from the server-side lexicon, not the client URI.
-        let (_rkey, index_uri) = resolve_write_target(
-            "did:plc:me",
-            "app.real.collection",
-            "at://did:plc:me/app.spoofed.collection/rk",
-        )
-        .unwrap();
-        assert_eq!(index_uri, "at://did:plc:me/app.real.collection/rk");
-    }
-
-    #[test]
-    fn write_target_rejects_empty_rkey() {
-        assert!(resolve_write_target("did:plc:me", "app.foo", "at://did:plc:me/app.foo/").is_err());
-    }
+    Err(super::query::no_script("procedure", method))
 }

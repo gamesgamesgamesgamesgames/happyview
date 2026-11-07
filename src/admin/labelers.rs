@@ -32,6 +32,7 @@ pub(super) async fn list(
         .into_iter()
         .map(
             |(did, status, cursor, created_at, updated_at)| LabelerSummary {
+                declared: state.config.declares_labeler(&did),
                 did,
                 status,
                 cursor,
@@ -71,6 +72,7 @@ pub(super) async fn add(
         .map_err(|e| AppError::Internal(format!("failed to add labeler subscription: {e}")))?;
 
     // Notify the labeler consumer to pick up the new subscription.
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(
@@ -118,6 +120,7 @@ pub(super) async fn update(
         )));
     }
 
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(
@@ -144,6 +147,12 @@ pub(super) async fn delete(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LabelersDelete).await?;
 
+    if state.config.declares_labeler(&did) {
+        return Err(AppError::Conflict(format!(
+            "labeler {did} is declared in happyview.toml; remove it from the file instead"
+        )));
+    }
+
     let backend = state.db_backend;
     let delete_sql = adapt_sql(
         "DELETE FROM happyview_labeler_subscriptions WHERE did = ?",
@@ -168,6 +177,7 @@ pub(super) async fn delete(
         .execute(&state.db)
         .await;
 
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(

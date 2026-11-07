@@ -1,0 +1,18 @@
+// Trigger script: `input` is the trigger's payload; `ctx` describes this
+// invocation (caller, environment, trigger id, and more). Return a value, or
+// nothing to skip the operation.
+//
+// Imports from "internal.*" and installed libraries provide the rest. Types
+// are erased rather than checked, so declare the shapes the script reads.
+
+import log from "internal.logging";
+
+interface Context {
+  trigger: string;
+  caller_did?: string;
+}
+
+export default function handle(input: unknown, ctx: Context) {
+  log.info("script fired", { trigger: ctx.trigger, caller: ctx.caller_did });
+  return input;
+}

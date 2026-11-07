@@ -99,7 +99,7 @@ curl "http://127.0.0.1:3000/admin/events?severity=error&limit=10" -H "$AUTH"
       "subject": "com.example.feed.like",
       "detail": {
         "error": "attempt to index nil value",
-        "script_source": "function handle() ... end",
+        "script_source": "function handle(input, ctx) ... end",
         "input": { "status": "hello" },
         "caller_did": "did:plc:abc123",
         "method": "com.example.feed.like"

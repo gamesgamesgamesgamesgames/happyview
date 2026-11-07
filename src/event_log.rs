@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::AnyPool;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
@@ -197,7 +197,7 @@ pub struct SweepOutcome {
 /// runtime setting rather than a boot-time constant, so an operator can point
 /// this at an arbitrarily large backlog (e.g. set retention to `1` on a
 /// multi-million-row instance) — batching is what keeps that safe.
-const SWEEP_BATCH_SIZE: i64 = 5000;
+pub(crate) const SWEEP_BATCH_SIZE: i64 = 5000;
 
 /// Delete every event log row strictly older than `cutoff`, then reclaim.
 #[cfg(test)]
@@ -267,8 +267,8 @@ async fn delete_before(
 /// Incremental auto-vacuum makes reclamation possible but never automatic;
 /// this is what returns the freed pages to the filesystem. Guarded on having
 /// deleted something, so an idle instance does not issue a pointless pragma
-/// every hour forever, and called once after a whole sweep rather than once
-/// per batch or pass.
+/// every hour forever, and called once after a whole pass rather than once
+/// per batch or sweep.
 async fn reclaim(db: &AnyPool, deleted: u64, backend: DatabaseBackend) -> bool {
     if deleted == 0 || backend != DatabaseBackend::Sqlite {
         return false;
@@ -279,7 +279,7 @@ async fn reclaim(db: &AnyPool, deleted: u64, backend: DatabaseBackend) -> bool {
     {
         Ok(_) => true,
         Err(e) => {
-            tracing::warn!(error = %e, "incremental_vacuum after event log cleanup failed");
+            tracing::warn!(error = %e, "incremental_vacuum after retention cleanup failed");
             false
         }
     }
@@ -309,7 +309,7 @@ pub fn effective_protected_retention(general_days: u32, protected: Option<&str>)
 
 /// Sweep unprotected rows older than `retention_days` and protected rows
 /// older than `protected_retention_days`, then reclaim once. A value of `0`
-/// skips that pass. Protected rows tied to a grant that still exists are kept
+/// skips that sweep. Protected rows tied to a grant that still exists are kept
 /// regardless; if that hold can't be checked, the delete fails and nothing
 /// protected is removed.
 pub async fn run_retention_sweep(
@@ -318,6 +318,20 @@ pub async fn run_retention_sweep(
     protected_retention_days: u32,
     backend: DatabaseBackend,
 ) -> SweepOutcome {
+    let deleted =
+        delete_expired_events(db, retention_days, protected_retention_days, backend).await;
+    let vacuumed = reclaim(db, deleted, backend).await;
+    SweepOutcome { deleted, vacuumed }
+}
+
+/// The deletes of [`run_retention_sweep`], leaving reclamation to the caller
+/// so a retention pass vacuums once across everything it swept.
+async fn delete_expired_events(
+    db: &AnyPool,
+    retention_days: u32,
+    protected_retention_days: u32,
+    backend: DatabaseBackend,
+) -> u64 {
     let days_ago =
         |days: u32| (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
     let mut deleted = 0;
@@ -341,8 +355,7 @@ pub async fn run_retention_sweep(
         )
         .await;
     }
-    let vacuumed = reclaim(db, deleted, backend).await;
-    SweepOutcome { deleted, vacuumed }
+    deleted
 }
 
 /// Delete space access grants that ended (expired or were revoked) more than
@@ -383,25 +396,117 @@ pub async fn sweep_ended_access_grants(
     Ok(deleted)
 }
 
-/// Hourly retention sweep.
-///
-/// The retention value is re-read every iteration rather than captured at
-/// spawn, so an operator can change it without a restart. A value of `0`
-/// therefore skips the sweep and leaves this task running — it must not return,
-/// or disabling retention once would be permanent until the process restarts.
-pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
+/// Days resolved script dead letters are kept unless
+/// `DEAD_LETTER_RETENTION_DAYS` says otherwise.
+pub const DEFAULT_DEAD_LETTER_RETENTION_DAYS: u32 = 30;
+
+/// Parse `DEAD_LETTER_RETENTION_DAYS`. `0` keeps resolved dead letters
+/// indefinitely; anything unparseable falls back to the default.
+pub fn parse_dead_letter_retention_days(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DEAD_LETTER_RETENTION_DAYS)
+}
+
+/// Delete script dead letters resolved more than `retention_days` ago, in
+/// batches for the same reasons as the event log sweep. Unresolved rows are
+/// never touched: they are failures nobody has dealt with yet. Each row holds
+/// a script's full input payload, and one failing hook during a backfill
+/// writes one per record, so resolved rows add up. Returns the rows deleted.
+pub async fn sweep_resolved_dead_letters(
+    db: &AnyPool,
+    retention_days: u32,
+    backend: DatabaseBackend,
+) -> u64 {
+    if retention_days == 0 {
+        return 0;
+    }
+    // `resolved_at` is text on both backends, so `resolved_at < ?` compares
+    // strings against this RFC 3339 cutoff. That orders RFC 3339 values
+    // correctly. Postgres rows resolved before `resolved_at` became text
+    // (20260527000001) hold `YYYY-MM-DD HH:MM:SS+00` instead, whose space
+    // sorts before the cutoff's `T`, so such a row resolved on the cutoff's
+    // date goes in that day's sweep: up to a day early, never late.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    let sql = adapt_sql(
+        "DELETE FROM happyview_dead_letter_scripts WHERE id IN \
+         (SELECT id FROM happyview_dead_letter_scripts WHERE resolved_at IS NOT NULL AND resolved_at < ? LIMIT ?)",
+        backend,
+    );
+
+    let mut deleted: u64 = 0;
+    loop {
+        let affected = match crate::db::query(&sql)
+            .bind(&cutoff)
+            .bind(SWEEP_BATCH_SIZE)
+            .execute(db)
+            .await
+        {
+            Ok(result) => result.rows_affected(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to clean up resolved dead letters");
+                break;
+            }
+        };
+        deleted += affected;
+        if (affected as i64) < SWEEP_BATCH_SIZE {
+            break;
+        }
+    }
+    deleted
+}
+
+/// Hourly retention sweep for event logs, job logs, resolved dead letters and
+/// expired record and account tombstones.
+pub async fn spawn_retention_cleanup(
+    db: AnyPool,
+    backend: DatabaseBackend,
+    dead_letter_retention_days: u32,
+    tombstone_retention_hours: u32,
+    limits: std::sync::Arc<dyn happyview_provider::LimitsProvider>,
+) {
     let interval = tokio::time::Duration::from_secs(3600);
 
     loop {
         tokio::time::sleep(interval).await;
-
-        let retention_days = match crate::admin::settings::get_setting(
+        retention_pass(
             &db,
-            "event_log_retention_days",
             backend,
+            dead_letter_retention_days,
+            tombstone_retention_hours,
+            &limits.limits(),
         )
-        .await
-        {
+        .await;
+    }
+}
+
+/// One pass of the retention sweep.
+///
+/// The event log retention value is re-read every pass rather than captured at
+/// spawn, so an operator can change it without a restart. A value of `0`
+/// therefore skips the sweep and leaves the task running — it must not
+/// return, or disabling retention once would be permanent until the process
+/// restarts. Job logs follow the same setting: they are the same kind of
+/// operational record, and the dashboard reads both as history. Protected
+/// events and ended access grants follow `space_access_log_retention_days`.
+pub(crate) async fn retention_pass(
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    dead_letter_retention_days: u32,
+    tombstone_retention_hours: u32,
+    limits: &happyview_provider::Limits,
+) {
+    let dead_letters = sweep_resolved_dead_letters(db, dead_letter_retention_days, backend).await;
+    if dead_letters > 0 {
+        tracing::info!(count = dead_letters, "cleaned up resolved dead letters");
+    }
+
+    let tombstones = crate::tombstones::sweep(db, backend, tombstone_retention_hours).await;
+    if tombstones > 0 {
+        tracing::info!(count = tombstones, "cleaned up expired tombstones");
+    }
+
+    let retention_days =
+        match crate::admin::settings::get_setting(db, "event_log_retention_days", backend).await {
             Some(v) => v.parse::<u32>().unwrap_or_else(|e| {
                 tracing::warn!(
                     value = %v,
@@ -412,30 +517,44 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
             }),
             None => DEFAULT_RETENTION_DAYS,
         };
+    let protected_days = effective_protected_retention(
+        retention_days,
+        crate::admin::settings::get_setting(db, SPACE_ACCESS_RETENTION_SETTING, backend)
+            .await
+            .as_deref(),
+    );
+    // The host's ceiling holds event and job logs to at most its days, a
+    // setting of 0 (forever) included. Protected events keep their own
+    // retention, worked out above from the setting as configured.
+    let retention_days = limits.cap(happyview_provider::Limit::LogRetentionDays, retention_days);
 
-        let protected_days = effective_protected_retention(
-            retention_days,
-            crate::admin::settings::get_setting(&db, SPACE_ACCESS_RETENTION_SETTING, backend)
-                .await
-                .as_deref(),
-        );
-
-        // Ended grants go first, so the protected pass below sees the hold
-        // their deletion lifts in the same tick.
-        match sweep_ended_access_grants(&db, protected_days, backend).await {
-            Ok(0) => {}
-            Ok(count) => tracing::info!(count, "cleaned up ended space access grants"),
-            Err(e) => tracing::warn!("failed to clean up ended space access grants: {e}"),
+    // Ended grants go before the event sweep, so the protected pass sees the
+    // hold their deletion lifts in the same tick.
+    let grants = match sweep_ended_access_grants(db, protected_days, backend).await {
+        Ok(count) => count,
+        Err(e) => {
+            tracing::warn!("failed to clean up ended space access grants: {e}");
+            0
         }
+    };
+    if grants > 0 {
+        tracing::info!(count = grants, "cleaned up ended space access grants");
+    }
 
-        let outcome = run_retention_sweep(&db, retention_days, protected_days, backend).await;
-        if outcome.deleted > 0 {
-            tracing::info!(
-                count = outcome.deleted,
-                vacuumed = outcome.vacuumed,
-                "cleaned up old event logs"
-            );
-        }
+    let job_logs = crate::jobs::logs::sweep_older_than(db, retention_days, backend).await;
+    if job_logs > 0 {
+        tracing::info!(count = job_logs, "cleaned up old job logs");
+    }
+
+    let events = delete_expired_events(db, retention_days, protected_days, backend).await;
+    let vacuumed = reclaim(
+        db,
+        dead_letters + tombstones + grants + job_logs + events,
+        backend,
+    )
+    .await;
+    if events > 0 {
+        tracing::info!(count = events, vacuumed, "cleaned up old event logs");
     }
 }
 
@@ -866,5 +985,206 @@ mod tests {
         insert_typed(&pool, "ancient-read", "space.moderator_read", &ancient).await;
         run_retention_sweep(&pool, 1, 0, DatabaseBackend::Sqlite).await;
         assert_eq!(remaining_ids(&pool).await, vec!["ancient-read".to_string()]);
+    }
+
+    /// A pass prunes job logs by `event_log_retention_days`, read from the
+    /// settings. The setting here is shorter than the default, so a pass that
+    /// skipped job logs or ignored the setting would keep the 15-day line.
+    #[tokio::test]
+    async fn a_pass_prunes_job_logs_by_the_event_log_retention_setting() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let insert = "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) \
+                      VALUES (?, 'job-1', 'info', ?, ?)";
+        for (message, age_days) in [("fifteen-days", 15), ("five-days", 5)] {
+            crate::db::query(insert)
+                .bind(Uuid::new_v4().to_string())
+                .bind(message)
+                .bind((chrono::Utc::now() - chrono::Duration::days(age_days)).to_rfc3339())
+                .execute(&pool)
+                .await
+                .expect("seed job log");
+        }
+        let messages = || async {
+            let (logs, _) = crate::jobs::logs::list_logs(&pool, backend, "job-1", 10, None)
+                .await
+                .unwrap();
+            logs.into_iter().map(|l| l.message).collect::<Vec<_>>()
+        };
+
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "0", backend)
+            .await
+            .unwrap();
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
+        assert_eq!(
+            messages().await,
+            vec!["fifteen-days", "five-days"],
+            "0 keeps them"
+        );
+
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "10", backend)
+            .await
+            .unwrap();
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
+        assert_eq!(messages().await, vec!["five-days"]);
+    }
+
+    /// HAP-227: the host's log retention ceiling holds job logs and events to
+    /// its days, a setting of forever included, and leaves protected events
+    /// to their own retention.
+    #[tokio::test]
+    async fn the_hosts_ceiling_holds_logs_to_its_days() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let days_ago = |d: i64| (chrono::Utc::now() - chrono::Duration::days(d)).to_rfc3339();
+        insert_typed(&pool, "old-event", "record.created", &days_ago(5)).await;
+        insert_typed(&pool, "new-event", "record.created", &days_ago(1)).await;
+        insert_typed(&pool, "old-protected", "space.access_granted", &days_ago(5)).await;
+        crate::db::query(
+            "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) \
+             VALUES ('log', 'job-1', 'info', 'five-days', ?)",
+        )
+        .bind(days_ago(5))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ceiling = happyview_provider::Limits {
+            log_retention_days: Some(happyview_provider::Cap {
+                max: 3,
+                wording: Default::default(),
+            }),
+            ..Default::default()
+        };
+        crate::admin::settings::put_setting(&pool, "event_log_retention_days", "0", backend)
+            .await
+            .unwrap();
+
+        retention_pass(&pool, backend, 30, 24, &ceiling).await;
+
+        let ids: Vec<(String,)> =
+            crate::db::query_as("SELECT id FROM happyview_event_logs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let ids: Vec<&str> = ids.iter().map(|(id,)| id.as_str()).collect();
+        assert_eq!(ids, ["new-event", "old-protected"]);
+        let (logs,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_job_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(logs, 0);
+    }
+
+    /// A grant that ended past the protected retention goes in the same pass
+    /// as the events it held back, rather than one pass later.
+    #[tokio::test]
+    async fn a_pass_sweeps_ended_grants_before_the_events_they_hold() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let days_ago = |d: i64| (chrono::Utc::now() - chrono::Duration::days(d)).to_rfc3339();
+        crate::db::query(
+            "INSERT INTO happyview_space_access_grants \
+             (id, user_id, user_did, scope, target, reason, created_at, expires_at) \
+             VALUES ('ended', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        )
+        .bind(days_ago(800))
+        .bind(days_ago(400))
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_typed(&pool, "granted", "space.access_granted", &days_ago(800)).await;
+        crate::db::query(
+            "INSERT INTO happyview_space_access_grant_events (event_id, grant_id) \
+             VALUES ('granted', 'ended')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        retention_pass(&pool, backend, 30, 24, &Default::default()).await;
+
+        let grants: (i64,) =
+            crate::db::query_as("SELECT COUNT(*) FROM happyview_space_access_grants")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(grants.0, 0, "the grant ended past the protected retention");
+        assert!(remaining_ids(&pool).await.is_empty());
+    }
+
+    #[test]
+    fn dead_letter_retention_defaults_to_thirty_days() {
+        assert_eq!(parse_dead_letter_retention_days(None), 30);
+        assert_eq!(parse_dead_letter_retention_days(Some("banana")), 30);
+        assert_eq!(parse_dead_letter_retention_days(Some("7")), 7);
+        assert_eq!(
+            parse_dead_letter_retention_days(Some("0")),
+            0,
+            "0 keeps them"
+        );
+    }
+
+    /// Only rows resolved before the cutoff go. Recently resolved rows stay,
+    /// and unresolved rows stay however old, because they are work nobody has
+    /// looked at yet.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_dead_letters_resolved_past_retention() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let marker = format!("dl-sweep-{}", Uuid::new_v4());
+            let old = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+            let recent = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+            let insert = adapt_sql(
+                "INSERT INTO happyview_dead_letter_scripts (script_ref, host_kind, host_id, payload, error, created_at, resolved_at) \
+                 VALUES (?, 'record', ?, '{}', 'boom', ?, ?)",
+                backend,
+            );
+            for (host_id, resolved_at) in [
+                ("resolved-old", Some(old.as_str())),
+                ("resolved-recent", Some(recent.as_str())),
+                ("unresolved-old", None),
+            ] {
+                crate::db::query(&insert)
+                    .bind(&marker)
+                    .bind(host_id)
+                    .bind(&old)
+                    .bind(resolved_at)
+                    .execute(&pool)
+                    .await
+                    .expect("seed dead letter");
+            }
+
+            assert_eq!(
+                sweep_resolved_dead_letters(&pool, 0, backend).await,
+                0,
+                "0 disables the sweep"
+            );
+            assert!(sweep_resolved_dead_letters(&pool, 30, backend).await >= 1);
+
+            let left: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+                "SELECT host_id FROM happyview_dead_letter_scripts WHERE script_ref = ? ORDER BY host_id",
+                backend,
+            ))
+            .bind(&marker)
+            .fetch_all(&pool)
+            .await
+            .expect("remaining rows");
+            assert_eq!(
+                left,
+                vec![
+                    ("resolved-recent".to_string(),),
+                    ("unresolved-old".to_string(),)
+                ],
+                "{backend:?}"
+            );
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_dead_letter_scripts WHERE script_ref = ?",
+                backend,
+            ))
+            .bind(&marker)
+            .execute(&pool)
+            .await
+            .expect("clean up");
+        }
     }
 }

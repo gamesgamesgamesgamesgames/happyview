@@ -6,7 +6,7 @@ use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lua::variables::{self, MASK};
+use crate::script::variables::{self, MASK};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -30,14 +30,14 @@ pub(super) async fn list(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list script variables: {e}")))?;
 
-    let encryption_key = state.config.token_encryption_key.as_ref();
+    let keys = state.config.keyring();
     let vars: Vec<ScriptVariableSummary> = rows
         .into_iter()
         .map(
             |(key, value, encrypted, created_at, updated_at)| ScriptVariableSummary {
                 key,
                 preview: MASK.to_string(),
-                unreadable: variables::open(encryption_key, &value, encrypted != 0).is_none(),
+                unreadable: variables::open(keys.as_ref(), &value, encrypted != 0).is_none(),
                 created_at,
                 updated_at,
             },
@@ -57,7 +57,7 @@ pub(super) async fn upsert(
 
     let backend = state.db_backend;
     let now = now_rfc3339();
-    let sealed = variables::seal(state.config.token_encryption_key.as_ref(), &body.value)
+    let sealed = variables::seal(state.config.keyring().as_ref(), &body.value)
         .map_err(|e| AppError::Internal(format!("failed to encrypt script variable: {e}")))?;
     let sql = adapt_sql(
         r#"

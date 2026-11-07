@@ -48,6 +48,10 @@ pub(super) async fn status(
         "feasibility": feasibility,
         "vacuum": status,
         "journal_size_limit": state.config.sqlite_journal_size_limit,
+        "checkpoint": crate::maintenance::sqlite::last_checkpoint(),
+        "checkpoint_interval_secs": crate::maintenance::sqlite::checkpoint_interval_secs(),
+        "wal_checkpoint_bytes": crate::maintenance::sqlite::wal_limit(&state.config.database_url)
+            .map_or(0, |limit| limit.max_bytes),
     })))
 }
 

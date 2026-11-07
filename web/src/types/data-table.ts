@@ -17,6 +17,8 @@ declare module "@tanstack/react-table" {
     range?: [number, number];
     unit?: string;
     icon?: React.FC<React.SVGProps<SVGSVGElement>>;
+    /** Classes for the column's header and every cell, e.g. to hide it below a breakpoint. */
+    className?: string;
   }
 }
 
@@ -44,4 +46,3 @@ export interface ExtendedColumnSort<TData> extends Omit<ColumnSort, "id"> {
 export interface ExtendedColumnFilter<TData> extends FilterItemSchema {
   id: Extract<keyof TData, string>;
 }
-

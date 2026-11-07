@@ -28,6 +28,8 @@ import {
   IconShieldLock,
   IconChartBar,
   IconLock,
+  IconWorldUpload,
+  IconGauge,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -35,6 +37,7 @@ import { usePathname } from "next/navigation";
 
 import { useAuth } from "@/lib/auth-context";
 import { useConfig } from "@/lib/config-context";
+import type { Features } from "@/lib/config-load";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { usePluginUpdates } from "@/components/plugin-update-provider";
 import { useRestart } from "@/lib/restart-context";
@@ -60,7 +63,7 @@ type NavItem = {
   icon: React.ComponentType;
   requiredPermissions?: string[];
   /** Hidden unless this `/config` feature is on. */
-  requiredFeature?: "spaces" | "space_inspector";
+  requiredFeature?: keyof Features;
 };
 
 const dataItems: NavItem[] = [
@@ -73,7 +76,7 @@ const dataItems: NavItem[] = [
     requiredPermissions: ["spaces:read"],
     requiredFeature: "space_inspector",
   },
-  { title: "Backfill", url: "/dashboard/backfill", icon: IconDatabase },
+  { title: "Backfills", url: "/dashboard/backfill", icon: IconDatabase },
   {
     title: "Jobs",
     url: "/dashboard/jobs",
@@ -123,6 +126,12 @@ const integrationItems: NavItem[] = [
     requiredPermissions: ["scripts:read"],
   },
   {
+    title: "Script performance",
+    url: "/dashboard/settings/scripts/performance",
+    icon: IconGauge,
+    requiredPermissions: ["metrics:read"],
+  },
+  {
     title: "Plugins",
     url: "/dashboard/settings/plugins",
     icon: IconPuzzle,
@@ -160,6 +169,12 @@ const systemItems: NavItem[] = [
     url: "/dashboard/settings/service-identity",
     icon: IconFingerprint,
     requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Lexicon Publishing",
+    url: "/dashboard/settings/lexicon-publishing",
+    icon: IconWorldUpload,
+    requiredPermissions: ["lexicons:read"],
   },
   {
     title: "OAuth Keys",
@@ -202,7 +217,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { addReason, removeReason } = useRestart();
 
   const [deadLetterCount, setDeadLetterCount] = useState(0);
-
   useEffect(() => {
     let cancelled = false;
     async function fetchCount() {
@@ -253,10 +267,24 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     );
   }
 
+  const allUrls = [
+    ...dataItems,
+    ...accessItems,
+    ...integrationItems,
+    ...systemItems,
+  ].map((item) => item.url);
+
+  // The longest matching entry wins, so a page nested under another entry's
+  // path (Script performance under Scripts) lights only its own.
   function isActive(url: string) {
-    return url === "/dashboard"
-      ? pathname === "/dashboard"
-      : pathname.startsWith(url);
+    if (url === "/dashboard") return pathname === "/dashboard";
+    if (!pathname.startsWith(url)) return false;
+    return !allUrls.some(
+      (other) =>
+        other.length > url.length &&
+        other.startsWith(url) &&
+        pathname.startsWith(other),
+    );
   }
 
   const visibleData = filterByPermission(dataItems);

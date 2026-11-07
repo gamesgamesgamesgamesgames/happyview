@@ -203,6 +203,59 @@ async fn domains_duplicate_url_returns_400() {
 
 #[tokio::test]
 #[serial]
+async fn domains_create_stores_the_host_lowercased() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": "HTTP://App.Example.COM:9999/" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["url"], "http://app.example.com:9999");
+    assert!(
+        domain_rows(&app)
+            .await
+            .iter()
+            .any(|(_, url, _)| url == "http://app.example.com:9999"),
+        "the stored row is lowercased"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn domains_create_refuses_a_case_variant_of_an_existing_domain() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+    seed_domain(&app, "other-id", "http://app.example.com:9999", false).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": "http://APP.example.com:9999" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
 async fn domains_cannot_delete_primary() {
     common::require_db!();
     let app = TestApp::new().await;
@@ -709,4 +762,202 @@ async fn domains_set_primary_leaves_exactly_one_primary() {
             .await
             .unwrap();
     assert_eq!(rows, vec![("b".to_string(),)]);
+}
+
+// ---------------------------------------------------------------------------
+// Startup sync with PUBLIC_URL
+// ---------------------------------------------------------------------------
+
+async fn domain_rows(app: &TestApp) -> Vec<(String, String, bool)> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT id, url, is_primary FROM happyview_domains ORDER BY url",
+        app.state.db_backend,
+    );
+    let rows: Vec<(String, String, i32)> = happyview::db::query_as(&sql)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap();
+    rows.into_iter()
+        .map(|(id, url, primary)| (id, url, primary != 0))
+        .collect()
+}
+
+async fn sync(app: &TestApp, public_url: &str) {
+    happyview::domain::sync_primary(&app.state.db, app.state.db_backend, public_url)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_seeds_public_url_when_there_are_no_domains() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    sync(&app, "https://a.example.com").await;
+
+    let rows = domain_rows(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "https://a.example.com");
+    assert!(rows[0].2);
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_makes_an_existing_public_url_domain_primary() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    // The primary was moved to app.example.com, but PUBLIC_URL still names
+    // the old domain, which is still listed. Renaming the primary to it would
+    // break the URL's uniqueness and stop the instance from starting.
+    seed_domain(&app, "old", "https://a.example.com", false).await;
+    seed_domain(&app, "new", "https://app.example.com", true).await;
+
+    sync(&app, "https://a.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("old".into(), "https://a.example.com".into(), true),
+            ("new".into(), "https://app.example.com".into(), false),
+        ]
+    );
+    // A second start changes nothing.
+    sync(&app, "https://a.example.com").await;
+    assert_eq!(domain_rows(&app).await.iter().filter(|r| r.2).count(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_renames_the_primary_when_public_url_is_not_listed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    seed_domain(&app, "primary", "https://a.example.com", true).await;
+    seed_domain(&app, "other", "https://b.example.com", false).await;
+
+    sync(&app, "https://c.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("other".into(), "https://b.example.com".into(), false),
+            ("primary".into(), "https://c.example.com".into(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sync_primary_leaves_a_matching_primary_alone() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    seed_domain(&app, "primary", "https://a.example.com", true).await;
+    seed_domain(&app, "other", "https://b.example.com", false).await;
+
+    sync(&app, "https://a.example.com").await;
+
+    assert_eq!(
+        domain_rows(&app).await,
+        vec![
+            ("primary".into(), "https://a.example.com".into(), true),
+            ("other".into(), "https://b.example.com".into(), false),
+        ]
+    );
+}
+
+/// What a hosting platform does to move an instance to a new public URL:
+/// promote a listed domain with its key, then restart the instance with that
+/// domain as `PUBLIC_URL`. The promotion carries the domain's own client and
+/// signing kid to the primary, and the restart's sync finds the primary
+/// already matching: nothing is renamed and both domains are kept.
+#[tokio::test]
+#[serial]
+async fn a_platform_promotion_survives_the_restart_that_follows_it() {
+    common::require_db!();
+    const PLATFORM_KEY: &str = "hv_0123456789abcdef0123456789abcdef";
+    let mut app = TestApp::new().await;
+    app.state.config.platform_api_key_hash = Some(hex::encode(
+        <sha2::Sha256 as sha2::Digest>::digest(PLATFORM_KEY.as_bytes()),
+    ));
+    let instance_key = happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        None,
+    )
+    .await
+    .expect("ensure instance key");
+    app.state.client_jwks =
+        vec![happyview::oauth::client_keys::to_atrium_jwk(&instance_key).expect("atrium jwk")];
+    app.rebuild_router();
+
+    let old_url = "http://127.0.0.1:0";
+    seed_domain(&app, "slug", old_url, true).await;
+
+    let platform = |method: Method, uri: String, body: Option<Value>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {PLATFORM_KEY}"));
+        match body {
+            Some(b) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    };
+
+    let new_url = "https://custom.e2e-domains-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(platform(
+            Method::POST,
+            "/admin/domains".into(),
+            Some(json!({ "url": new_url })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let new_id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let domain_client = app.state.oauth.get_for_domain(new_url);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(platform(
+            Method::POST,
+            format!("/admin/domains/{new_id}/primary"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (primary_client, kid) = app.state.oauth.primary_client_and_kid();
+    assert!(
+        std::sync::Arc::ptr_eq(&primary_client, &domain_client),
+        "the promoted domain's own client must become the primary one"
+    );
+    assert_eq!(kid.as_deref(), Some(instance_key.kid.as_str()));
+
+    let promoted = vec![
+        ("slug".to_string(), old_url.to_string(), false),
+        (new_id.clone(), new_url.to_string(), true),
+    ];
+    assert_eq!(domain_rows(&app).await, promoted);
+
+    // The restart, with PUBLIC_URL now naming the promoted domain.
+    sync(&app, new_url).await;
+    assert_eq!(
+        domain_rows(&app).await,
+        promoted,
+        "the boot sync after a promotion must change nothing"
+    );
 }

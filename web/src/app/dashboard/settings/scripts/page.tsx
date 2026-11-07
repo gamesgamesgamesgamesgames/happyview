@@ -23,6 +23,7 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
 import { deleteScript, getScripts } from "@/lib/api";
+import { languageLabel } from "@/lib/script-templates";
 import type { Script } from "@/types/scripts";
 import {
   TRIGGER_FAMILY_LABELS,
@@ -122,14 +123,20 @@ export default function ScriptsPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Kind" />
         ),
-        cell: ({ row }) =>
-          row.original.kind ? (
-            <Badge variant="outline">
-              {TRIGGER_KIND_LABELS[row.original.kind]}
-            </Badge>
-          ) : (
-            <Badge variant="destructive">malformed</Badge>
-          ),
+        cell: ({ row }) => (
+          <div className="flex gap-1">
+            {row.original.kind ? (
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[row.original.kind]}
+              </Badge>
+            ) : (
+              <Badge variant="destructive">malformed</Badge>
+            )}
+            {row.original.layer === "project" && (
+              <Badge variant="secondary">Project file</Badge>
+            )}
+          </div>
+        ),
         filterFn: (row, columnId, filterValue) => {
           if (!Array.isArray(filterValue) || filterValue.length === 0)
             return true;
@@ -186,6 +193,66 @@ export default function ScriptsPage() {
         enableSorting: true,
       },
       {
+        id: "needs_migration",
+        accessorFn: (row) => row.needs_migration.length > 0,
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Contract" />
+        ),
+        cell: ({ row }) =>
+          row.original.needs_migration.length > 0 ? (
+            <Badge
+              variant="outline"
+              className="border-amber-500/50 text-amber-500"
+              title={
+                row.original.needs_migration[0] === "unparseable"
+                  ? "Could not parse this script as Lua"
+                  : `Still references: ${row.original.needs_migration.join(", ")}`
+              }
+            >
+              Needs migration
+            </Badge>
+          ) : null,
+        enableSorting: true,
+      },
+      {
+        id: "language",
+        accessorFn: (row) => languageLabel(row.script_type),
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Language" />
+        ),
+        cell: ({ getValue }) => (
+          <span className="text-sm">{getValue<string>()}</span>
+        ),
+        enableSorting: true,
+      },
+      {
+        id: "runnable",
+        accessorFn: (row) => row.runnable,
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Runtime" />
+        ),
+        // Muted rather than destructive: the row is intact, and what is
+        // missing is an install the operator has not done yet.
+        cell: ({ row }) =>
+          row.original.module ? (
+            <Badge
+              variant="secondary"
+              title={`Built from ${row.original.module.path}`}
+            >
+              Module
+            </Badge>
+          ) : row.original.runnable ? null : (
+            <Badge
+              variant="outline"
+              className="text-muted-foreground"
+              title={`No interpreter installed for ${row.original.script_type} scripts`}
+            >
+              Inert
+            </Badge>
+          ),
+        enableSorting: true,
+      },
+      {
         id: "updated_at",
         accessorKey: "updated_at",
         header: ({ column }) => (
@@ -193,7 +260,9 @@ export default function ScriptsPage() {
         ),
         cell: ({ row }) => (
           <span className="text-muted-foreground text-sm">
-            {new Date(row.original.updated_at).toLocaleString()}
+            {row.original.updated_at
+              ? new Date(row.original.updated_at).toLocaleString()
+              : null}
           </span>
         ),
         enableSorting: true,
@@ -235,55 +304,63 @@ export default function ScriptsPage() {
                 <Eye className="size-4" />
               </Link>
             </Button>
-            {hasPermission("scripts:manage") && (
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="destructive"
-                    size="icon"
-                    className="size-8 text-muted-foreground hover:text-destructive"
-                    title="Delete script"
-                    aria-label="Delete script"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Delete script?</AlertDialogTitle>
-                    <AlertDialogDescription asChild>
-                      <div className="flex flex-col gap-3">
-                        <p>
-                          This will permanently remove the script. This action cannot be undone.
-                        </p>
-                        {row.original.recreatable === false && (
-                          <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
-                            <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
-                            <p className="text-xs text-amber-500">
-                              This script&rsquo;s trigger id no longer satisfies
-                              current NSID rules. It will keep firing and can
-                              still be edited in place — but once deleted, it{" "}
-                              <span className="font-medium">
-                                cannot be recreated
-                              </span>{" "}
-                              with the same id. Deletion is not required to
-                              change it.
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original.id)}>
-                      {row.original.recreatable === false ? "Delete anyway" : "Delete"}
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            )}
+            {hasPermission("scripts:manage") &&
+              row.original.layer !== "project" && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="destructive"
+                      size="icon"
+                      className="size-8 text-muted-foreground hover:text-destructive"
+                      title="Delete script"
+                      aria-label="Delete script"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete script?</AlertDialogTitle>
+                      <AlertDialogDescription asChild>
+                        <div className="flex flex-col gap-3">
+                          <p>
+                            This will permanently remove the script. This action
+                            cannot be undone.
+                          </p>
+                          {row.original.recreatable === false && (
+                            <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+                              <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                              <p className="text-xs text-amber-500">
+                                This script&rsquo;s trigger id no longer
+                                satisfies current NSID rules. It will keep
+                                firing and can still be edited in place — but
+                                once deleted, it{" "}
+                                <span className="font-medium">
+                                  cannot be recreated
+                                </span>{" "}
+                                with the same id. Deletion is not required to
+                                change it.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction
+                        variant="destructive"
+                        onClick={() => handleDelete(row.original.id)}
+                      >
+                        {row.original.recreatable === false
+                          ? "Delete anyway"
+                          : "Delete"}
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
           </div>
         ),
         enableSorting: false,

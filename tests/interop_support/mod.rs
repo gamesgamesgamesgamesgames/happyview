@@ -235,17 +235,19 @@ pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) 
     let kem_did_key = happyview_plc::private_key_to_did_key(&kem_raw).unwrap();
 
     let handle = "alice.localhost";
-    let mut genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
-        rotation_key_did_key: did_key.clone(),
-        signing_key_did_key: did_key,
+    let genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
+        rotation_keys: vec![did_key.clone()],
+        verification_methods: std::collections::BTreeMap::from([
+            ("atproto".into(), did_key),
+            ("atproto_kem".into(), kem_did_key.clone()),
+        ]),
+        also_known_as: vec![format!("at://{handle}")],
         service_entries: vec![(
             "atproto_pds".into(),
             "AtprotoPersonalDataServer".into(),
             pds_url.into(),
         )],
     });
-    genesis["alsoKnownAs"] = json!([format!("at://{handle}")]);
-    genesis["verificationMethods"]["atproto_kem"] = json!(kem_did_key);
     let signed = happyview_plc::sign_operation(&genesis, &key).unwrap();
     let did = happyview_plc::derive_did(&signed).unwrap();
 

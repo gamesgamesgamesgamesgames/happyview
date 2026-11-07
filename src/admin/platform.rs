@@ -84,68 +84,71 @@ async fn transfer_super_user(
     did: &str,
     now: &str,
 ) -> Result<String, sqlx::Error> {
-    let mut tx = crate::db::begin_write(db, backend).await?;
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(db, backend).await?;
 
-    let existing: Option<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT id FROM happyview_users WHERE did = ?",
-        backend,
-    ))
-    .bind(did)
-    .fetch_optional(&mut *tx)
-    .await?;
+        let existing: Option<(String,)> = crate::db::query_as(&adapt_sql(
+            "SELECT id FROM happyview_users WHERE did = ?",
+            backend,
+        ))
+        .bind(did)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-    let user_id = match existing {
-        Some((id,)) => {
-            crate::db::query(&adapt_sql(
-                "UPDATE happyview_users SET is_super = ? WHERE id = ?",
-                backend,
-            ))
-            .bind(1_i32)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-            id
+        let user_id = match existing {
+            Some((id,)) => {
+                crate::db::query(&adapt_sql(
+                    "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+                    backend,
+                ))
+                .bind(1_i32)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+                id
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                crate::db::query(&adapt_sql(
+                    "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+                    backend,
+                ))
+                .bind(&id)
+                .bind(did)
+                .bind(1_i32)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                id
+            }
+        };
+
+        crate::db::query(&adapt_sql(
+            "UPDATE happyview_users SET is_super = ? WHERE id <> ?",
+            backend,
+        ))
+        .bind(0_i32)
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let perm_sql = adapt_sql(
+            "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            backend,
+        );
+        for perm in Permission::all() {
+            crate::db::query(&perm_sql)
+                .bind(&user_id)
+                .bind(perm.as_str())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
         }
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            crate::db::query(&adapt_sql(
-                "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
-                backend,
-            ))
-            .bind(&id)
-            .bind(did)
-            .bind(1_i32)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            id
-        }
-    };
 
-    crate::db::query(&adapt_sql(
-        "UPDATE happyview_users SET is_super = ? WHERE id <> ?",
-        backend,
-    ))
-    .bind(0_i32)
-    .bind(&user_id)
-    .execute(&mut *tx)
-    .await?;
-
-    let perm_sql = adapt_sql(
-        "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-        backend,
-    );
-    for perm in Permission::all() {
-        crate::db::query(&perm_sql)
-            .bind(&user_id)
-            .bind(perm.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    tx.commit().await?;
-    Ok(user_id)
+        tx.commit().await?;
+        Ok(user_id)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -160,7 +163,7 @@ mod tests {
     async fn a_transfer_survives_a_write_committed_while_it_waits() {
         let path = std::env::temp_dir().join(format!("hv-super-user-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
-        let pool = crate::db::connect(&url, DatabaseBackend::Sqlite).await;
+        let pool = crate::db::connect_with(&url, DatabaseBackend::Sqlite, 4).await;
 
         // Another connection holds the write lock and has written, as a
         // booting instance's own work does.

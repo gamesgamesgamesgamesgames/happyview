@@ -1,0 +1,16 @@
+[package]
+name = "wasi-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wasi_probe"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

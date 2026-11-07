@@ -69,14 +69,14 @@ Instance settings (app name, logo, TOS/privacy URIs), API keys, users, and label
 
 ## Lua scripts
 
-No changes needed. Lua scripts use SQLite syntax by default, and HappyView translates to Postgres automatically at runtime. This includes:
+`happyview.db` chains need no changes; the host generates Postgres SQL for them. Statements passed to `happyview.sql`'s `raw` do, because raw SQL reaches the backend untranslated:
 
-- `?` placeholders (translated to `$1`, `$2`, etc.)
-- `json_extract()` calls (translated to Postgres JSON operators)
-- `datetime('now')` (translated to `NOW()`)
-- Boolean literals `1`/`0` (work in both backends)
+- `?` placeholders become `$1`, `$2`, etc.
+- `json_extract()` becomes Postgres JSON operators (`->`, `->>`)
+- `datetime('now')` becomes `NOW()`
+- Boolean literals `1`/`0` work in both backends
 
-If you have scripts that already use Postgres-native syntax (e.g., from direct `db.raw()` calls), they will **not** work after switching — HappyView expects SQLite syntax. Use the [codemod tool](postgres-to-sqlite-migration.md#run-the-codemod-tool) to convert them.
+Rewrite them before switching, or branch on `db.backend()` in a script that has to run on both.
 
 ## Rollback
 

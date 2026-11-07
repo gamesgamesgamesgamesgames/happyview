@@ -119,7 +119,9 @@ function GrantReads({ grantId }: { grantId: string }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <span className="text-muted-foreground text-sm">Reads under this grant</span>
+      <span className="text-muted-foreground text-sm">
+        Reads under this grant
+      </span>
       {failed ? (
         <p className="text-destructive text-xs">
           Couldn&apos;t load the reads for this grant.
@@ -190,9 +192,7 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
         </div>
         <div>
           <span className="text-muted-foreground">Actor</span>
-          <p className="font-mono text-xs">
-            {event.actor_did ?? "System"}
-          </p>
+          <p className="font-mono text-xs">{event.actor_did ?? "System"}</p>
         </div>
         <div>
           <span className="text-muted-foreground">Time</span>
@@ -394,8 +394,12 @@ export default function EventsPage() {
           ?.value as string | undefined;
 
         const data = await getEvents({
-          category: categoryFilter?.length ? categoryFilter.join(",") : undefined,
-          severity: severityFilter?.length ? severityFilter.join(",") : undefined,
+          category: categoryFilter?.length
+            ? categoryFilter.join(",")
+            : undefined,
+          severity: severityFilter?.length
+            ? severityFilter.join(",")
+            : undefined,
           subject: subjectFilter || undefined,
           cursor,
           limit: 50,

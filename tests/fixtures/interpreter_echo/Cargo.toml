@@ -1,0 +1,15 @@
+[package]
+name = "interpreter-echo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "interpreter_echo"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

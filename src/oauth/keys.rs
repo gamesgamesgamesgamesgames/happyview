@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::encryption::encrypt;
 
 /// A generated ES256 DPoP keypair with its JWK representation.
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +140,7 @@ pub async fn store_dpop_key(
 pub async fn get_dpop_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    encryption_key: &[u8; 32],
+    encryption_key: &crate::plugin::encryption::Keyring,
     provision_id: &str,
 ) -> Result<(String, String, serde_json::Value, String, Option<String>), AppError> {
     // Returns: (id, api_client_id, private_jwk, thumbprint, pkce_challenge)
@@ -159,13 +159,54 @@ pub async fn get_dpop_key(
     let (id, api_client_id, encrypted, thumbprint, pkce_challenge) =
         row.ok_or_else(|| AppError::NotFound("DPoP key not found".into()))?;
 
-    let decrypted = decrypt(encryption_key, &encrypted)
+    let decrypted = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
 
     let private_jwk: serde_json::Value = serde_json::from_slice(&decrypted)
         .map_err(|e| AppError::Internal(format!("failed to parse DPoP key: {e}")))?;
 
     Ok((id, api_client_id, private_jwk, thumbprint, pkce_challenge))
+}
+
+/// The kid HappyView signed this provision's client assertions with, once
+/// it has signed one.
+pub async fn provision_assertion_kid(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    provision_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT assertion_kid FROM happyview_dpop_keys WHERE provision_id = ?",
+        backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .bind(provision_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP key: {e}")))?;
+    Ok(row.and_then(|(kid,)| kid))
+}
+
+/// Remember the kid that signed this provision's first client assertion,
+/// so its later ones, and the session it becomes, use the same key.
+pub async fn record_provision_assertion_kid(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    provision_id: &str,
+    kid: &str,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_keys SET assertion_kid = ? WHERE provision_id = ? AND assertion_kid IS NULL",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(kid)
+        .bind(provision_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to record the assertion key: {e}")))?;
+    Ok(())
 }
 
 /// Retrieve the JWK thumbprint for a DPoP key by its database ID.

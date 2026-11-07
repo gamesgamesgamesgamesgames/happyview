@@ -1,0 +1,59 @@
+name: Native catch-up
+
+# `dispatch-native-release` in ci.yml builds native binaries for at most one
+# prerelease cut a day and skips the rest, so the last cut of a burst would
+# never get them, and `hpy`, which follows the newest release that has its
+# machine's binary, would stay on an older one. Once a day this builds the
+# newest v3 release if it has none. Only v3 and later: release/v2 ships no
+# native archives, and an archived 2.17.x would become what `hpy` picks.
+#
+# Scheduled workflows run only on the default branch.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: native-catch-up
+  cancel-in-progress: false
+
+jobs:
+  catch-up:
+    runs-on: depot-ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+    steps:
+      - name: Build the newest v3 release if it has no native binaries
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+            --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | test("^v([3-9]|[1-9][0-9]+)\\."))]
+                  | sort_by(.publishedAt) | last | .tagName // empty')
+          if [ -z "$tag" ]; then
+            echo "No v3 release yet."
+            exit 0
+          fi
+          archives=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '[.assets[].name | select(startswith("happyview-") and endswith(".tar.xz"))] | length')
+          if [ "$archives" -gt 0 ]; then
+            echo "$tag already has native binaries."
+            exit 0
+          fi
+          # A dispatched run's head branch is the tag it built. One still
+          # running, or one that succeeded, means nothing is left to do.
+          pending=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml \
+            --event workflow_dispatch --limit 100 \
+            --json status,conclusion,headBranch \
+            --jq "[.[] | select(.headBranch == \"$tag\")
+                       | select(.status != \"completed\" or .conclusion == \"success\")] | length")
+          if [ "$pending" -gt 0 ]; then
+            echo "A native build for $tag is running or already succeeded."
+            exit 0
+          fi
+          echo "Building native binaries for $tag."
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$tag" -f tag="$tag"
+          echo "Dispatched native binaries for $tag." >> "$GITHUB_STEP_SUMMARY"

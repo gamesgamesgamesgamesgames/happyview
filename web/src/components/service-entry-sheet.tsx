@@ -112,7 +112,9 @@ export function ServiceEntrySheet({
     if (selected.size === 0) return;
     try {
       await removeServiceEntryXrpcs(entry.id, Array.from(selected));
-      toast.success(`Removed ${selected.size} XRPC${selected.size > 1 ? "s" : ""}`);
+      toast.success(
+        `Removed ${selected.size} XRPC${selected.size > 1 ? "s" : ""}`,
+      );
       setSelected(new Set());
       await loadXrpcs();
     } catch (e: unknown) {
@@ -220,7 +222,9 @@ export function ServiceEntrySheet({
                     <TableRow>
                       <TableHead className="w-10">
                         <Checkbox
-                          checked={allSelected || (someSelected && "indeterminate")}
+                          checked={
+                            allSelected || (someSelected && "indeterminate")
+                          }
                           onCheckedChange={toggleSelectAll}
                           aria-label="Select all"
                         />
@@ -291,9 +295,7 @@ export function ServiceEntrySheet({
             </AlertDialogTrigger>
             <AlertDialogContent>
               <AlertDialogHeader>
-                <AlertDialogTitle>
-                  Delete {entry.fragment_id}?
-                </AlertDialogTitle>
+                <AlertDialogTitle>Delete {entry.fragment_id}?</AlertDialogTitle>
                 <AlertDialogDescription>
                   This will permanently remove the service entry and its XRPC
                   configuration. The change will take effect in the DID document

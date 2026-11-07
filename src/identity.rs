@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 
-use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
 use crate::dns::NativeDnsResolver;
 use crate::error::AppError;
+use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
 /// The shared handle resolver, wired to HappyView's own DNS resolver and
 /// retrying HTTP client.
@@ -78,6 +78,13 @@ pub async fn resolve_handle(handle: &str) -> Result<String, AppError> {
 
     let parsed = atrium_api::types::string::Handle::new(handle.to_string())
         .map_err(|_| AppError::BadRequest(format!("invalid handle: {handle}")))?;
+    if crate::testing::identity::forging() {
+        return crate::testing::identity::did_for(handle).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "could not resolve handle {handle}: a test run resolves only handles of the form <name>.test, such as alice.test"
+            ))
+        });
+    }
     // The resolver's error text can include the `.well-known` URL and HTTP
     // client detail, so the caller gets a fixed reason and the detail is
     // logged.
@@ -236,7 +243,8 @@ fn did_document_failure(did: &str, failure: &BackfillFailure) -> AppError {
         BackfillErrorKind::RepoNotFound
         | BackfillErrorKind::RepoDeactivated
         | BackfillErrorKind::RepoTakendown
-        | BackfillErrorKind::Other => {
+        | BackfillErrorKind::Other
+        | BackfillErrorKind::ReplayBlock => {
             AppError::BadRequest(format!("could not fetch DID document for {did}"))
         }
     }
@@ -397,7 +405,7 @@ mod tests {
 
     #[test]
     fn transient_did_document_failures_are_bad_gateway() {
-        use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+        use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
         let failure = |kind| BackfillFailure {
             kind,
@@ -436,7 +444,7 @@ mod tests {
 
     #[test]
     fn did_document_failures_name_the_did_but_not_the_failure_detail() {
-        use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+        use happyview_provider::failure::{BackfillErrorKind, BackfillFailure};
 
         for kind in BackfillErrorKind::all() {
             let failure = BackfillFailure {

@@ -7,7 +7,7 @@ use serde_json::json;
 use serial_test::serial;
 use std::time::Duration;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn post_json_with_headers(
@@ -104,12 +104,27 @@ async fn concurrent_refresh_does_not_destroy_session() {
         .mount(&auth_server)
         .await;
 
+    // The PDS accepts the rotated token, as a real one would. Rejecting it too
+    // sent any request that read the session after the winner saved into a
+    // refresh of its own, with the rotated refresh token, so the count below
+    // measured how the tasks happened to be scheduled.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.example.race.get"))
+        .and(header("authorization", "DPoP rotated-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .with_priority(1)
+        .mount(&pds)
+        .await;
+
     // The PDS rejects the expired access token, which is what sends every
-    // request into the refresh path in the first place.
+    // request into the refresh path in the first place. The delay holds the
+    // winner's refresh back, so a task the scheduler starts late still reads
+    // the expired token and the six requests overlap.
     Mock::given(method("GET"))
         .and(path("/xrpc/com.example.race.get"))
         .respond_with(
             ResponseTemplate::new(401)
+                .set_delay(Duration::from_secs(1))
                 .insert_header("www-authenticate", "DPoP error=\"invalid_token\"")
                 .set_body_json(json!({"error": "invalid_token"})),
         )
@@ -131,6 +146,7 @@ async fn concurrent_refresh_does_not_destroy_session() {
     let provision_id = key_body["provision_id"].as_str().unwrap().to_string();
 
     app.mock_session_verification(did, did).await;
+    app.mock_pds_names_issuer(did, &auth_server.uri()).await;
 
     let session_req = post_json_with_headers(
         "/oauth/sessions",
@@ -140,7 +156,6 @@ async fn concurrent_refresh_does_not_destroy_session() {
             "access_token": "expired-access-token",
             "refresh_token": "original-refresh-token",
             "scopes": "atproto",
-            "pds_url": pds.uri(),
             "issuer": auth_server.uri(),
         }),
         vec![
@@ -150,6 +165,17 @@ async fn concurrent_refresh_does_not_destroy_session() {
     );
     let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
     assert_eq!(session_resp.status(), StatusCode::CREATED);
+    // Registration stores the PDS the DID document names; this test's PDS is
+    // its own mock server.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_dpop_sessions SET pds_url = ? WHERE user_did = ?",
+        app.state.db_backend,
+    ))
+    .bind(pds.uri())
+    .bind(did)
+    .execute(&app.state.db)
+    .await
+    .expect("point the session at the PDS mock");
 
     let dpop_key_id: (String,) = happyview::db::query_as(&happyview::db::adapt_sql(
         "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE user_did = ?",
@@ -180,7 +206,7 @@ async fn concurrent_refresh_does_not_destroy_session() {
                 &http,
                 &pool,
                 backend,
-                &encryption_key,
+                &happyview::plugin::encryption::Keyring::from(encryption_key),
                 &registry,
                 &plc_url,
                 &client_id,

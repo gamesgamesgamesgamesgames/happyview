@@ -1,43 +1,16 @@
 use crate::plugin::host::PluginState;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wasmtime::Store;
 
-/// Error returned from a plugin via JSON envelope.
-/// Uses a string code for flexibility in parsing arbitrary error codes from plugins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginEnvelopeError {
-    pub code: String,
-    pub message: String,
-    #[serde(default)]
-    pub retryable: bool,
-}
-
-impl std::fmt::Display for PluginEnvelopeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for PluginEnvelopeError {}
-
-/// JSON envelope for plugin responses.
-/// Plugins return either `{"ok": result}` or `{"error": {...}}`.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum PluginResponse<T> {
-    Ok { ok: T },
-    Error { error: PluginEnvelopeError },
-}
-
-impl<T> PluginResponse<T> {
-    pub fn into_result(self) -> Result<T, PluginEnvelopeError> {
-        match self {
-            PluginResponse::Ok { ok } => Ok(ok),
-            PluginResponse::Error { error } => Err(error),
-        }
-    }
-}
+/// The envelope every plugin export returns: `{"ok": result}` or
+/// `{"error": {code, message, retryable}}`.
+///
+/// Defined in the SDK, which the guests build against, so the two cannot drift.
+/// The names are the host's own: `PluginResponse` for the envelope and
+/// `PluginEnvelopeError` for the error inside it.
+pub use happyview_plugin_sdk::wire::{
+    PluginError as PluginEnvelopeError, Response as PluginResponse,
+};
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
@@ -170,6 +143,8 @@ mod tests {
         assert!(err.to_string().contains("100"));
     }
 
+    /// The envelope is the SDK's, but the host reads it through these names,
+    /// so a rename there would fail here rather than at a call site.
     #[test]
     fn test_plugin_response_ok_parses() {
         let json = r#"{"ok": "hello"}"#;

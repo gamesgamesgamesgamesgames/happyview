@@ -1,6 +1,9 @@
 //! In-process counters, reset by every restart.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use happyview_provider::IngestCounters;
 
 use crate::db::now_rfc3339;
 use crate::telemetry::payload;
@@ -16,11 +19,10 @@ pub(crate) fn add_saturating(atomic: &AtomicU64, delta: u64) {
     }
 }
 
-#[derive(Debug)]
 pub struct Counters {
-    pub jetstream_received: AtomicU64,
-    pub jetstream_matched: AtomicU64,
-    pub jetstream_skipped: AtomicU64,
+    /// Events a record source received, matched and skipped, reported as
+    /// `jetstream_events_*`. Shared with `Host::counters`.
+    pub ingest: Arc<IngestCounters>,
     pub http_bytes_out: AtomicU64,
     pub http_bytes_in: AtomicU64,
     pub xrpc_requests: AtomicU64,
@@ -29,6 +31,27 @@ pub struct Counters {
     pub script_runtime_us: AtomicU64,
     pub job_wait_ms: AtomicU64,
     process_started_at: String,
+}
+
+impl std::fmt::Debug for Counters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Counters")
+            .field("jetstream_received", &self.ingest.received)
+            .field("jetstream_matched", &self.ingest.matched)
+            .field("jetstream_skipped", &self.ingest.skipped)
+            .field("http_bytes_out", &self.http_bytes_out)
+            .field("http_bytes_in", &self.http_bytes_in)
+            .field("xrpc_requests", &self.xrpc_requests)
+            .field(
+                "xrpc_requests_with_credentials",
+                &self.xrpc_requests_with_credentials,
+            )
+            .field("script_executions", &self.script_executions)
+            .field("script_runtime_us", &self.script_runtime_us)
+            .field("job_wait_ms", &self.job_wait_ms)
+            .field("process_started_at", &self.process_started_at)
+            .finish()
+    }
 }
 
 impl Default for Counters {
@@ -40,9 +63,7 @@ impl Default for Counters {
 impl Counters {
     pub fn new() -> Self {
         Self {
-            jetstream_received: AtomicU64::new(0),
-            jetstream_matched: AtomicU64::new(0),
-            jetstream_skipped: AtomicU64::new(0),
+            ingest: Arc::new(IngestCounters::default()),
             http_bytes_out: AtomicU64::new(0),
             http_bytes_in: AtomicU64::new(0),
             xrpc_requests: AtomicU64::new(0),
@@ -65,15 +86,15 @@ impl Counters {
         let mut out = payload::Counters::new();
         out.insert(
             "jetstream_events_received".into(),
-            read(&self.jetstream_received),
+            read(&self.ingest.received),
         );
         out.insert(
             "jetstream_events_matched".into(),
-            read(&self.jetstream_matched),
+            read(&self.ingest.matched),
         );
         out.insert(
             "jetstream_events_skipped".into(),
-            read(&self.jetstream_skipped),
+            read(&self.ingest.skipped),
         );
         out.insert("http_bytes_out".into(), read(&self.http_bytes_out));
         out.insert("http_bytes_in".into(), read(&self.http_bytes_in));
@@ -101,8 +122,8 @@ mod tests {
         let c = Counters::new();
         assert_eq!(c.snapshot().get("jetstream_events_received"), Some(&0));
 
-        c.jetstream_received.fetch_add(3, Ordering::Relaxed);
-        c.jetstream_skipped.fetch_add(2, Ordering::Relaxed);
+        c.ingest.received.fetch_add(3, Ordering::Relaxed);
+        c.ingest.skipped.fetch_add(2, Ordering::Relaxed);
 
         let snap = c.snapshot();
         assert_eq!(snap.get("jetstream_events_received"), Some(&3));
@@ -198,7 +219,7 @@ mod tests {
     #[test]
     fn saturates_rather_than_wrapping_into_a_negative() {
         let c = Counters::new();
-        c.jetstream_received.store(u64::MAX, Ordering::Relaxed);
+        c.ingest.received.store(u64::MAX, Ordering::Relaxed);
         assert_eq!(
             c.snapshot().get("jetstream_events_received"),
             Some(&i64::MAX)

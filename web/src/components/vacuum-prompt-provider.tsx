@@ -49,7 +49,9 @@ interface VacuumStatusContextValue {
   refresh: () => Promise<void>;
 }
 
-const VacuumStatusContext = createContext<VacuumStatusContextValue | null>(null);
+const VacuumStatusContext = createContext<VacuumStatusContextValue | null>(
+  null,
+);
 
 /**
  * Surfaces two things the user would otherwise have to go looking for: that a
@@ -108,7 +110,10 @@ export function VacuumPromptProvider({ children }: { children: ReactNode }) {
   // Restart banner: reflects live status regardless of which page is open.
   useEffect(() => {
     if (status?.backend === "sqlite" && status.vacuum.requested_at) {
-      addReason("vacuum", "A database cleanup is scheduled and will run on the next restart.");
+      addReason(
+        "vacuum",
+        "A database cleanup is scheduled and will run on the next restart.",
+      );
     } else {
       removeReason("vacuum");
     }
@@ -190,7 +195,9 @@ export function VacuumPromptProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <VacuumStatusContext.Provider value={value}>{children}</VacuumStatusContext.Provider>
+    <VacuumStatusContext.Provider value={value}>
+      {children}
+    </VacuumStatusContext.Provider>
   );
 }
 

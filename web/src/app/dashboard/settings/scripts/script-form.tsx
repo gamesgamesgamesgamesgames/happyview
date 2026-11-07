@@ -18,13 +18,13 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { LexiconSummary } from "@/types/lexicons";
-import type { TriggerKind } from "@/types/scripts";
 import {
-  DEFAULT_JOB_SCRIPT_BODY,
-  DEFAULT_SCRIPT_BODY,
-  TRIGGER_KIND_LABELS,
-  parseTriggerId,
-} from "@/types/scripts";
+  defaultBodyFor,
+  isDefaultBody,
+  languageLabel,
+} from "@/lib/script-templates";
+import type { ScriptLanguage, TriggerKind } from "@/types/scripts";
+import { TRIGGER_KIND_LABELS, parseTriggerId } from "@/types/scripts";
 
 /**
  * Sentinel suffix used when the operator picks "Actor" in the lexicon
@@ -69,6 +69,8 @@ export interface ScriptFormState {
   source: string;
   description: string;
   body: string;
+  /** The script's `script_type`: the language its interpreter runs. */
+  language: ScriptLanguage;
 }
 
 /**
@@ -80,6 +82,7 @@ export function stateFromScript(args: {
   id: string;
   description: string | null | undefined;
   body: string;
+  language: ScriptLanguage;
 }): ScriptFormState {
   const parsed = parseTriggerId(args.id);
   const kind = parsed?.kind ?? "record.index";
@@ -93,6 +96,7 @@ export function stateFromScript(args: {
     source,
     description: args.description ?? "",
     body: args.body,
+    language: args.language,
   };
 }
 
@@ -133,11 +137,63 @@ const PROCEDURE_ACTIONS: ActionOption[] = [
 const JOB_ACTIONS: ActionOption[] = [{ kind: "job.run", label: "Job runner" }];
 
 const JOB_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const RESERVED_JOB_PREFIX = "happyview.";
+
+/**
+ * Why `value` cannot name a job, or `null` when it can. The same rules as the
+ * server's trigger grammar, so the form never offers a save the server
+ * refuses.
+ */
+export function jobTypeProblem(value: string): string | null {
+  if (value.length === 0 || value.length > 128) {
+    return "Between 1 and 128 characters.";
+  }
+  if (!JOB_TYPE_PATTERN.test(value)) {
+    return "Lowercase letters, numbers, dots, hyphens, and underscores only.";
+  }
+  if (value.startsWith(RESERVED_JOB_PREFIX)) {
+    return "The happyview. prefix is reserved for built-in jobs.";
+  }
+  if (value.endsWith(".test")) {
+    return "A final .test segment is reserved for test files.";
+  }
+  return null;
+}
 
 export function isValidJobType(value: string): boolean {
-  return (
-    value.length > 0 && value.length <= 128 && JOB_TYPE_PATTERN.test(value)
-  );
+  return jobTypeProblem(value) === null;
+}
+
+/**
+ * Change the trigger kind, swapping the prefilled body along with it while
+ * the operator has not touched it. Each kind reads its return value
+ * differently, so a prefill written for one kind is wrong for another.
+ */
+function withKind(state: ScriptFormState, kind: TriggerKind): ScriptFormState {
+  return {
+    ...state,
+    kind,
+    body: isDefaultBody(state.body)
+      ? defaultBodyFor(kind, state.language)
+      : state.body,
+  };
+}
+
+/**
+ * Change the language, swapping an untouched prefill for that language's.
+ * A body the operator wrote stays, for them to port or to switch back to.
+ */
+export function withLanguage(
+  state: ScriptFormState,
+  language: ScriptLanguage,
+): ScriptFormState {
+  return {
+    ...state,
+    language,
+    body: isDefaultBody(state.body)
+      ? defaultBodyFor(state.kind, language)
+      : state.body,
+  };
 }
 
 function actionsFor(
@@ -181,6 +237,8 @@ export function ScriptForm({
   idLocked,
   lexicons,
   lexiconsLoading,
+  readOnly,
+  languages,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
@@ -189,6 +247,13 @@ export function ScriptForm({
   lexicons?: LexiconSummary[];
   /** True while the lexicon list is being fetched. */
   lexiconsLoading?: boolean;
+  /** For a script a project file owns: everything shows, nothing edits. */
+  readOnly?: boolean;
+  /**
+   * The installed languages to pick from, for a script not yet created. A
+   * stored script keeps its language, so the detail page passes none.
+   */
+  languages?: ScriptLanguage[];
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -203,6 +268,29 @@ export function ScriptForm({
         />
       )}
 
+      {languages && languages.length > 1 && (
+        <div className="flex flex-col gap-1">
+          <Label htmlFor="language" className="text-xs">
+            Language
+          </Label>
+          <Select
+            value={state.language}
+            onValueChange={(v) => onChange(withLanguage(state, v))}
+          >
+            <SelectTrigger id="language" className="w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {languages.map((language) => (
+                <SelectItem key={language} value={language}>
+                  {languageLabel(language)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
       <div className="flex flex-col gap-1">
         <Label htmlFor="description" className="text-xs">
           Description (optional)
@@ -211,6 +299,7 @@ export function ScriptForm({
           id="description"
           value={state.description}
           onChange={(e) => onChange({ ...state, description: e.target.value })}
+          readOnly={readOnly}
           maxLength={300}
           rows={2}
           placeholder="What does this script do?"
@@ -220,13 +309,15 @@ export function ScriptForm({
 
       <div className="flex flex-col flex-1 min-h-[300px] gap-1">
         <Label htmlFor="body" className="text-xs">
-          Lua body
+          {languageLabel(state.language)} body
         </Label>
         <div className="border rounded-md flex-1 min-h-[300px] overflow-hidden">
           <MonacoEditor
             value={state.body}
             onChange={(v) => onChange({ ...state, body: v })}
-            language="lua"
+            language={state.language}
+            trigger={state.suffix ? composeTriggerId(state) : undefined}
+            readOnly={readOnly}
             className="h-full"
           />
         </div>
@@ -265,6 +356,8 @@ function TriggerComposer({
   );
 
   const isJob = state.source === JOB_SOURCE;
+  const jobProblem =
+    state.suffix.length > 0 ? jobTypeProblem(state.suffix) : null;
 
   const stateRef = useRef(state);
   useEffect(() => {
@@ -275,24 +368,16 @@ function TriggerComposer({
     if (actions.length === 0) return;
     const current = stateRef.current;
     if (!actions.some((a) => a.kind === current.kind)) {
-      onChange({ ...current, kind: actions[0].kind });
+      onChange(withKind(current, actions[0].kind));
     }
   }, [actions, onChange]);
 
   function handleSourceChange(next: string) {
-    const wasJob = state.source === JOB_SOURCE;
-    const isNowJob = next === JOB_SOURCE;
-    const bodyIsDefault =
-      state.body === DEFAULT_SCRIPT_BODY ||
-      state.body === DEFAULT_JOB_SCRIPT_BODY;
-
-    if (isNowJob) {
+    if (next === JOB_SOURCE) {
       onChange({
-        ...state,
+        ...withKind(state, "job.run"),
         source: JOB_SOURCE,
         suffix: "",
-        kind: "job.run",
-        body: bodyIsDefault ? DEFAULT_JOB_SCRIPT_BODY : state.body,
       });
       return;
     }
@@ -301,11 +386,9 @@ function TriggerComposer({
       ? state.kind
       : (nextActions[0]?.kind ?? state.kind);
     onChange({
-      ...state,
+      ...withKind(state, nextKind),
       source: next,
       suffix: next,
-      kind: nextKind,
-      body: wasJob && bodyIsDefault ? DEFAULT_SCRIPT_BODY : state.body,
     });
   }
 
@@ -379,15 +462,10 @@ function TriggerComposer({
                 onChange={(e) => onChange({ ...state, suffix: e.target.value })}
                 placeholder="e.g. export, migrate, sync"
                 className="h-8 text-sm font-mono"
-                aria-invalid={
-                  state.suffix.length > 0 && !isValidJobType(state.suffix)
-                }
+                aria-invalid={jobProblem !== null}
               />
-              {state.suffix.length > 0 && !isValidJobType(state.suffix) ? (
-                <p className="text-xs text-destructive">
-                  Lowercase letters, numbers, dots, hyphens, and underscores
-                  only.
-                </p>
+              {jobProblem !== null ? (
+                <p className="text-xs text-destructive">{jobProblem}</p>
               ) : (
                 <p className="text-xs text-muted-foreground">
                   Must match the type passed to{" "}
@@ -406,7 +484,7 @@ function TriggerComposer({
               <Select
                 value={state.kind}
                 onValueChange={(v) =>
-                  onChange({ ...state, kind: v as TriggerKind })
+                  onChange(withKind(state, v as TriggerKind))
                 }
                 disabled={actions.length <= 1}
               >

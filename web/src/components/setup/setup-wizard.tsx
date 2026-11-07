@@ -21,12 +21,7 @@ import {
 } from "@/components/ui/stepper";
 
 type SetupStep =
-  | "mode"
-  | "configure"
-  | "attach-auth"
-  | "verify"
-  | "telemetry"
-  | "complete";
+  "mode" | "configure" | "attach-auth" | "verify" | "telemetry" | "complete";
 
 export function SetupWizard() {
   const [currentStep, setCurrentStep] = useState<SetupStep>("mode");
@@ -164,7 +159,14 @@ export function SetupWizard() {
   const stepOrder = useMemo<SetupStep[]>(
     () =>
       identityMode === "attach_account"
-        ? ["mode", "configure", "attach-auth", "verify", "telemetry", "complete"]
+        ? [
+            "mode",
+            "configure",
+            "attach-auth",
+            "verify",
+            "telemetry",
+            "complete",
+          ]
         : ["mode", "verify", "telemetry", "complete"],
     [identityMode],
   );

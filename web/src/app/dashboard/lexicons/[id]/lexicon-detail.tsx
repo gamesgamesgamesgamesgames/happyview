@@ -8,20 +8,25 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { CodePanels } from "@/components/code-panels";
 import { LexiconServicesSheet } from "@/components/lexicon-services-sheet";
+import { PublishingPanel } from "@/components/lexicon-publishing/publishing-panel";
+import { DeleteLexiconDialog } from "@/components/lexicons/delete-lexicon-dialog";
 import {
+  addNetworkLexicon,
   deleteLexicon,
   deleteNetworkLexicon,
   getLexicon,
   getScripts,
   uploadLexicon,
 } from "@/lib/api";
-import type { LexiconDetail } from "@/types/lexicons";
+import type { LexiconDetail, LexiconSummary } from "@/types/lexicons";
 import type { Script, TriggerKind } from "@/types/scripts";
+import { BackfillHint } from "@/components/backfill-hint";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 
 export default function LexiconDetailPage() {
   const pathname = usePathname();
@@ -38,6 +43,7 @@ export default function LexiconDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savingIndexed, setSavingIndexed] = useState(false);
   const [servicesSheetOpen, setServicesSheetOpen] = useState(false);
 
   const [jsonText, setJsonText] = useState("");
@@ -68,8 +74,7 @@ export default function LexiconDetailPage() {
     load();
   }, [load]);
 
-  const isDirty =
-    jsonText !== originalJson || tokenCost !== originalTokenCost;
+  const isDirty = jsonText !== originalJson || tokenCost !== originalTokenCost;
 
   async function handleSave() {
     if (!lexicon) return;
@@ -80,6 +85,7 @@ export default function LexiconDetailPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: lexicon.backfill,
+        indexed: lexicon.indexed,
         token_cost: tokenCost ? Number(tokenCost) : null,
       });
       load();
@@ -90,14 +96,49 @@ export default function LexiconDetailPage() {
     }
   }
 
-  async function handleDelete() {
+  // Changing one setting writes the lexicon again with every other setting
+  // as stored. A network lexicon is written by tracking it again, which
+  // fetches its current version; a manual one keeps its stored document, so
+  // unsaved edits in the editor are neither sent nor discarded.
+  async function handleIndexedChange(indexed: boolean) {
+    if (!lexicon) return;
+    setSavingIndexed(true);
+    setError(null);
+    try {
+      if (lexicon.source === "network") {
+        await addNetworkLexicon({
+          nsid: lexicon.id,
+          backfill: lexicon.backfill,
+          indexed,
+        });
+        load();
+      } else {
+        await uploadLexicon({
+          lexicon_json: lexicon.lexicon_json,
+          backfill: lexicon.backfill,
+          indexed,
+          token_cost: lexicon.token_cost,
+        });
+        setLexicon(await getLexicon(id));
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingIndexed(false);
+    }
+  }
+
+  async function handleDelete(
+    _lexicon: LexiconSummary,
+    deleteRecords: boolean,
+  ) {
     if (!lexicon) return;
     setDeleting(true);
     try {
       if (lexicon.source === "network") {
-        await deleteNetworkLexicon(lexicon.id);
+        await deleteNetworkLexicon(lexicon.id, deleteRecords);
       } else {
-        await deleteLexicon(lexicon.id);
+        await deleteLexicon(lexicon.id, deleteRecords);
       }
       router.push("/dashboard/lexicons");
     } catch (e: unknown) {
@@ -130,6 +171,9 @@ export default function LexiconDetailPage() {
 
   const isNetwork = lexicon.source === "network";
   const isRecord = lexicon.lexicon_type === "record";
+  // A project file owns this lexicon: it changes by editing the file.
+  const projectPath = lexicon.layer === "project" ? lexicon.path : null;
+  const readOnly = isNetwork || projectPath !== null;
 
   // Triggers that target this lexicon's id, given its type.
   //
@@ -159,6 +203,10 @@ export default function LexiconDetailPage() {
         <div className="p-4 md:p-6">
           {error && <p className="text-destructive text-sm mb-4">{error}</p>}
 
+          <div className="empty:hidden mb-4">
+            <BackfillHint />
+          </div>
+
           {/* Metadata */}
           <div className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-3 lg:grid-cols-4">
             <div>
@@ -181,6 +229,29 @@ export default function LexiconDetailPage() {
             </div>
             {lexicon.lexicon_type === "record" && (
               <div>
+                {projectPath === null && hasPermission("lexicons:create") ? (
+                  <>
+                    <Label htmlFor="indexed" className="text-muted-foreground">
+                      Indexed
+                    </Label>
+                    <Switch
+                      id="indexed"
+                      className="mt-2"
+                      checked={lexicon.indexed}
+                      disabled={savingIndexed}
+                      onCheckedChange={handleIndexedChange}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Label className="text-muted-foreground">Indexed</Label>
+                    <p className="mt-1">{lexicon.indexed ? "Yes" : "No"}</p>
+                  </>
+                )}
+              </div>
+            )}
+            {lexicon.lexicon_type === "record" && (
+              <div>
                 <Label className="text-muted-foreground">Backfill</Label>
                 <p className="mt-1">{lexicon.backfill ? "Yes" : "No"}</p>
               </div>
@@ -193,18 +264,28 @@ export default function LexiconDetailPage() {
                 </p>
               </div>
             )}
-            <div>
-              <Label className="text-muted-foreground">Created</Label>
-              <p className="mt-1 text-sm">
-                {new Date(lexicon.created_at).toLocaleString()}
+            {projectPath && lexicon.shadows_stored && (
+              <p className="text-muted-foreground text-xs">
+                A stored version of this lexicon is kept and answers again if
+                the file is removed.
               </p>
-            </div>
-            <div>
-              <Label className="text-muted-foreground">Updated</Label>
-              <p className="mt-1 text-sm">
-                {new Date(lexicon.updated_at).toLocaleString()}
-              </p>
-            </div>
+            )}
+            {lexicon.created_at && (
+              <div>
+                <Label className="text-muted-foreground">Created</Label>
+                <p className="mt-1 text-sm">
+                  {new Date(lexicon.created_at).toLocaleString()}
+                </p>
+              </div>
+            )}
+            {lexicon.updated_at && (
+              <div>
+                <Label className="text-muted-foreground">Updated</Label>
+                <p className="mt-1 text-sm">
+                  {new Date(lexicon.updated_at).toLocaleString()}
+                </p>
+              </div>
+            )}
             {lexicon.last_fetched_at && (
               <div>
                 <Label className="text-muted-foreground">Last Fetched</Label>
@@ -227,29 +308,41 @@ export default function LexiconDetailPage() {
                   placeholder="default"
                   value={tokenCost}
                   onChange={(e) => setTokenCost(e.target.value)}
-                  disabled={!hasPermission("lexicons:create")}
+                  disabled={
+                    projectPath !== null || !hasPermission("lexicons:create")
+                  }
                 />
               </div>
             )}
           </div>
-
         </div>
 
         <div className="flex flex-col md:flex-row flex-1 min-h-0 gap-6 px-4 md:px-6 overflow-auto">
           <CodePanels
             className="flex-1 min-h-0"
             jsonValue={jsonText}
-            onJsonChange={isNetwork ? undefined : setJsonText}
-            jsonReadOnly={isNetwork}
+            onJsonChange={readOnly ? undefined : setJsonText}
+            jsonReadOnly={readOnly}
           />
 
-          {targetingTriggers.length > 0 && (
-            <ScriptsTargetingPanel
-              lexiconId={lexicon.id}
-              scripts={scripts}
-              entries={targetingTriggers}
-              canManage={hasPermission("scripts:manage")}
-            />
+          {(targetingTriggers.length > 0 || !isNetwork) && (
+            <div className="flex flex-col gap-6 md:w-80 md:flex-shrink-0 lg:w-96">
+              {!isNetwork && (
+                <PublishingPanel
+                  nsid={lexicon.id}
+                  revision={lexicon.revision}
+                  canPublish={hasPermission("lexicons:publish")}
+                />
+              )}
+              {targetingTriggers.length > 0 && (
+                <ScriptsTargetingPanel
+                  lexiconId={lexicon.id}
+                  scripts={scripts}
+                  entries={targetingTriggers}
+                  canManage={hasPermission("scripts:manage")}
+                />
+              )}
+            </div>
           )}
         </div>
 
@@ -261,14 +354,29 @@ export default function LexiconDetailPage() {
 
         {/* Actions */}
         <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 py-2 md:px-6 md:py-4 rounded-b-md">
-          {hasPermission("lexicons:delete") && (
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleting}
-            >
-              {deleting ? "Deleting..." : "Delete Lexicon"}
-            </Button>
+          {projectPath ? (
+            <p className="text-muted-foreground text-sm self-center">
+              Defined by <span className="font-mono">{projectPath}</span>. Edit
+              that file to change this lexicon.
+            </p>
+          ) : lexicon.declared ? (
+            <p className="text-muted-foreground text-sm self-center">
+              Declared in <span className="font-mono">happyview.toml</span>.
+              Remove it from the file to stop tracking it.
+            </p>
+          ) : (
+            hasPermission("lexicons:delete") && (
+              <DeleteLexiconDialog
+                lexicon={lexicon}
+                canDeleteRecords={hasPermission("records:delete-collection")}
+                onConfirm={handleDelete}
+                trigger={
+                  <Button variant="destructive" disabled={deleting}>
+                    {deleting ? "Deleting..." : "Delete Lexicon"}
+                  </Button>
+                }
+              />
+            )
           )}
 
           <div className="flex gap-2">
@@ -282,7 +390,7 @@ export default function LexiconDetailPage() {
                 Services
               </Button>
             )}
-            {hasPermission("lexicons:create") && (
+            {projectPath === null && hasPermission("lexicons:create") && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}
               </Button>
@@ -313,10 +421,8 @@ function ScriptsTargetingPanel({
   });
 
   return (
-    <div className="md:w-80 lg:w-96 md:flex-shrink-0">
-      <Label className="text-muted-foreground mb-3 block">
-        Scripts
-      </Label>
+    <div>
+      <Label className="text-muted-foreground mb-3 block">Scripts</Label>
 
       <ul className="flex flex-col gap-2">
         {slots.map(({ kind, label, triggerId, script }) => (

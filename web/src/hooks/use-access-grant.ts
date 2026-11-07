@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useCallbackRef } from "@/hooks/use-callback-ref";
+import { grantForTarget } from "@/lib/access-grant";
 import { revokeAccessGrant } from "@/lib/api";
 import { toastError } from "@/lib/format";
 import type { AccessGrant } from "@/types/spaces";
@@ -52,10 +53,7 @@ export function useAccessGrant(
     refresh();
   }, [refresh]);
 
-  // Hidden while disabled, and for any target other than the one it was
-  // fetched for.
-  const grant =
-    enabled && found?.key === targetKey ? found.grant : null;
+  const grant = grantForTarget(found, targetKey, enabled);
 
   useEffect(() => {
     if (!grant) return;
@@ -63,7 +61,9 @@ export function useAccessGrant(
       setNow(Date.now());
       if (Date.parse(grant.expires_at) <= Date.now()) {
         setFound((current) =>
-          current?.grant?.id === grant.id ? { ...current, grant: null } : current,
+          current?.grant?.id === grant.id
+            ? { ...current, grant: null }
+            : current,
         );
       }
     }, 1000);

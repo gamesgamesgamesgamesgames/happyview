@@ -67,6 +67,18 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let raw_previous = std::env::var("TOKEN_ENCRYPTION_KEY_PREVIOUS").ok();
+    let previous = match happyview::config::parse_previous_token_encryption_key(
+        raw_previous.as_deref(),
+        Some(&encryption_key),
+    ) {
+        Ok(previous) => previous,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let encryption_key = happyview::plugin::encryption::Keyring::new(encryption_key, previous);
 
     let signing_key =
         match happyview::spaces::service::signing_key_from_pool(&pool, backend, &encryption_key)

@@ -7,18 +7,18 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use axum_extra::extract::cookie::{Cookie, Key, SignedCookieJar};
+use axum_extra::extract::cookie::{Key, SignedCookieJar};
 use rand::Rng;
 use serde::Deserialize;
 
 use crate::admin::auth::UserAuth;
 use crate::auth::COOKIE_NAME;
-use crate::auth::middleware::Claims;
+use crate::auth::middleware::PageClaims;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
 
-fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
     let msg = err.to_string();
     msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
 }
@@ -53,7 +53,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn status(
-    _auth: Claims,
+    _auth: PageClaims,
     State(state): State<AppState>,
 ) -> Result<Json<service_identity::SetupStatus>, AppError> {
     let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;
@@ -177,8 +177,7 @@ async fn plc_register(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Decrypt signing key
@@ -186,7 +185,7 @@ async fn plc_register(
         .signing_key_enc
         .as_ref()
         .ok_or_else(|| AppError::Internal("no signing key stored".into()))?;
-    let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, encryption_key)?;
+    let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, &encryption_key)?;
     let signing_key_did = happyview_plc::private_key_to_did_key(&signing_key_bytes)?;
 
     // Decrypt rotation key
@@ -201,7 +200,7 @@ async fn plc_register(
     let rotation_key_enc = row
         .and_then(|(k,)| k)
         .ok_or_else(|| AppError::Internal("no rotation key stored".into()))?;
-    let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, encryption_key)?;
+    let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, &encryption_key)?;
     let rotation_key_did = happyview_plc::private_key_to_did_key(&rotation_key_bytes)?;
 
     let rotation_signing_key =
@@ -220,8 +219,12 @@ async fn plc_register(
         .collect();
 
     let params = happyview_plc::PlcGenesisParams {
-        rotation_key_did_key: rotation_key_did,
-        signing_key_did_key: signing_key_did,
+        rotation_keys: vec![rotation_key_did],
+        verification_methods: std::collections::BTreeMap::from([(
+            "atproto".to_string(),
+            signing_key_did,
+        )]),
+        also_known_as: vec![],
         service_entries,
     };
 
@@ -286,15 +289,7 @@ async fn plc_request(
             }
             e
         })?;
-    let agent = Agent::new(session);
-
-    // Request PLC operation signature — sends confirmation code to account's email
-    agent
-        .api
-        .com
-        .atproto
-        .identity
-        .request_plc_operation_signature()
+    crate::repo::pds::request_plc_operation_signature(&session)
         .await
         .map_err(|e| {
             if is_pds_session_expired(&e) {
@@ -530,19 +525,10 @@ async fn attach_auth_confirm(
         return Err(AppError::Auth("original_did is not a known user".into()));
     }
 
-    let secure = state.config.public_url.starts_with("https://");
-    let same_site = if secure {
-        axum_extra::extract::cookie::SameSite::None
-    } else {
-        axum_extra::extract::cookie::SameSite::Lax
-    };
-    let mut session_cookie = Cookie::new(COOKIE_NAME, original_did);
-    session_cookie.set_path("/");
-    session_cookie.set_http_only(true);
-    session_cookie.set_same_site(same_site);
-    session_cookie.set_secure(secure);
-
-    let jar = jar.add(session_cookie);
+    let jar = jar.add(crate::auth::session_cookie(
+        original_did,
+        &state.config.public_url,
+    ));
 
     Ok((jar, StatusCode::NO_CONTENT))
 }
@@ -582,11 +568,11 @@ async fn export_rotation_key(
 
     let encryption_key = state
         .config
-        .token_encryption_key
-        .as_ref()
+        .keyring()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let key_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+    let key_bytes = encryption_key
+        .decrypt(&encrypted)
         .map_err(|e| AppError::Internal(format!("failed to decrypt rotation key: {e}")))?;
 
     Ok((

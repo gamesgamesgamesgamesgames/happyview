@@ -1,21 +1,48 @@
 import { toast } from "sonner";
 
+import { ApiError } from "@/lib/api";
+import { limitToast } from "@/lib/limits";
+
 export function toastError(context: string, e: unknown) {
+  // Before the 403 test below: a limit is not a missing permission.
+  if (e instanceof ApiError && e.limitReached) {
+    const { title, description, action } = limitToast(context, e.limitReached);
+    toast.error(title, {
+      description,
+      action: action && {
+        label: action.label,
+        onClick: () => window.open(action.url, "_blank", "noopener,noreferrer"),
+      },
+    });
+    return;
+  }
   const msg = e instanceof Error ? e.message : String(e);
   const lower = msg.toLowerCase();
-  if (lower.includes("unique") || lower.includes("duplicate") || lower.includes("already exists")) {
+  if (
+    lower.includes("unique") ||
+    lower.includes("duplicate") ||
+    lower.includes("already exists")
+  ) {
     toast.error(`${context}: already exists`, {
       description: "An entry with this identifier is already configured.",
     });
     return;
   }
-  if (lower.includes("network") || lower.includes("fetch") || lower.includes("econnrefused")) {
+  if (
+    lower.includes("network") ||
+    lower.includes("fetch") ||
+    lower.includes("econnrefused")
+  ) {
     toast.error(`${context}: connection failed`, {
       description: "Check that the server is running and try again.",
     });
     return;
   }
-  if (lower.includes("unauthorized") || lower.includes("403") || lower.includes("forbidden")) {
+  if (
+    lower.includes("unauthorized") ||
+    lower.includes("403") ||
+    lower.includes("forbidden")
+  ) {
     toast.error(`${context}: permission denied`, {
       description: "You may not have the required permissions for this action.",
     });
@@ -23,7 +50,8 @@ export function toastError(context: string, e: unknown) {
   }
   if (lower.includes("timeout")) {
     toast.error(`${context}: request timed out`, {
-      description: "The server took too long to respond. Try again in a moment.",
+      description:
+        "The server took too long to respond. Try again in a moment.",
     });
     return;
   }
