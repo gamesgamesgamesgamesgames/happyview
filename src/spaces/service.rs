@@ -946,18 +946,31 @@ async fn revoke_member_credentials(
 /// A managedspace has no member list: its managing app decides who reads and
 /// writes. A member row on one would still grant access through
 /// [`require_membership`], around the managing app, so none may be added.
-fn refuse_members_on_managedspace(space: &Space) -> Result<(), AppError> {
-    if matches!(
-        crate::spaces::policy::SpacePolicy::of(space),
-        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
-    ) {
-        return Err(AppError::XrpcError {
-            status: axum::http::StatusCode::BAD_REQUEST,
-            code: "InvalidRequest",
-            message: "a managedspace has no member list; its managing app decides access".into(),
-        });
+fn no_members_on_managedspace() -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        code: "InvalidRequest",
+        message: "a managedspace has no member list; its managing app decides access".into(),
     }
-    Ok(())
+}
+
+/// Insert or update a member, refusing a space that takes none. The policy is
+/// read in the insert's own transaction, under the space's row lock, so an
+/// insert racing a migration cannot land after the member list is discarded.
+async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if !db::lock_space_for_members(&mut *tx, state.db_backend, &member.space_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read space: {e}")))?
+    {
+        return Err(no_members_on_managedspace());
+    }
+    db::add_member(&mut *tx, state.db_backend, member).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit member: {e}")))
 }
 
 /// Upsert a member. `access` of `None` leaves an existing member's read and
@@ -977,7 +990,6 @@ pub(crate) async fn put_member(
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    refuse_members_on_managedspace(&space)?;
 
     let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
     let current = existing.as_ref().map(|m| m.access);
@@ -997,7 +1009,7 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    insert_member(state, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
@@ -1015,7 +1027,6 @@ pub(crate) async fn add_member(
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    refuse_members_on_managedspace(&space)?;
     if db::get_member(&state.db, state.db_backend, &space.id, member_did)
         .await?
         .is_some()
@@ -1033,7 +1044,7 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    insert_member(state, &member).await?;
     Ok(member)
 }
 
@@ -1149,6 +1160,13 @@ pub(crate) async fn create_invite(
         .transpose()?;
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    // Accepting re-checks under the space's row lock; this answers early.
+    if matches!(
+        crate::spaces::policy::SpacePolicy::of(&space),
+        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+    ) {
+        return Err(no_members_on_managedspace());
+    }
     let mut token_bytes = [0u8; 24];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut token_bytes);
     let token = hex::encode(token_bytes);
@@ -1222,6 +1240,7 @@ pub(crate) async fn accept_invite(
                 "You are already a member of this space".into(),
             ));
         }
+        db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space

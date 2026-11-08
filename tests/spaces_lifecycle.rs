@@ -633,3 +633,117 @@ async fn replacing_legacy_rules_keeps_the_member_list_only_for_a_memberspace() {
         );
     }
 }
+
+/// An invite made while a space was a memberspace adds no one once it is a
+/// managedspace: migrating deletes the space's invites, and the invitee can
+/// neither join nor write.
+#[tokio::test]
+#[serial]
+async fn migrating_to_a_managedspace_withdraws_its_invites() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    let (status, body) = post(
+        &app,
+        "dev.happyview.space.createInvite",
+        &creator,
+        json!({ "space": space, "access": { "read": true, "write": true } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = body["token"].as_str().unwrap().to_string();
+
+    update(
+        &app,
+        &creator,
+        &space,
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+    )
+    .await;
+
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+    let invite =
+        happyview::spaces::db::get_invite_by_token_hash(&app.state.db, app.state.db_backend, &hash)
+            .await
+            .unwrap();
+    assert!(invite.is_none(), "the invite outlived the migration");
+
+    let invitee = rand_did("invitee");
+    let (status, body) = post(
+        &app,
+        "dev.happyview.space.acceptInvite",
+        &invitee,
+        json!({ "token": token }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {body}");
+    assert!(!member_dids(&app, &space).await.contains(&invitee));
+
+    let (status, body) = post(
+        &app,
+        "com.atproto.space.createRecord",
+        &invitee,
+        json!({
+            "space": space,
+            "collection": "com.example.note",
+            "record": { "$type": "com.example.note", "text": "hi" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// A managedspace refuses to make an invite, and refuses to honour one that
+/// exists anyway: accepting re-checks the policy where the member is added.
+#[tokio::test]
+#[serial]
+async fn a_managedspace_makes_and_honours_no_invites() {
+    common::require_db!();
+    let (app, creator) = setup().await;
+    let space = create(
+        &app,
+        &creator,
+        "main",
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+    )
+    .await;
+    let (status, body) = post(
+        &app,
+        "dev.happyview.space.createInvite",
+        &creator,
+        json!({ "space": space }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("InvalidRequest"));
+
+    use sha2::Digest;
+    let token = Uuid::new_v4().simple().to_string();
+    let invite = happyview::spaces::types::SpaceInvite {
+        id: Uuid::new_v4().to_string(),
+        space_id: stored(&app, &space).await.id,
+        token_hash: hex::encode(sha2::Sha256::digest(token.as_bytes())),
+        created_by: creator.clone(),
+        access: happyview::spaces::types::MemberAccess::WRITE,
+        max_uses: None,
+        uses: 0,
+        expires_at: None,
+        revoked: false,
+        created_at: happyview::db::now_rfc3339(),
+    };
+    happyview::spaces::db::create_invite(&app.state.db, app.state.db_backend, &invite)
+        .await
+        .unwrap();
+    let invitee = rand_did("invitee");
+    let (status, body) = post(
+        &app,
+        "dev.happyview.space.acceptInvite",
+        &invitee,
+        json!({ "token": token }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(!member_dids(&app, &space).await.contains(&invitee));
+}
