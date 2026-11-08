@@ -106,6 +106,20 @@ pub(crate) async fn verify_space_credential(
             message: "space credential is for a different space".into(),
         });
     }
+    // A space recreated with its type and key keeps its DID, its key and its
+    // address, so a credential minted for the deleted space would verify. It
+    // predates this space, and is refused. Compared in whole seconds, as
+    // `iat` is.
+    let created = chrono::DateTime::parse_from_rfc3339(&space.created_at)
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    if (claims.iat as i64) < created {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "InvalidCredential",
+            message: "space credential was issued before this space was created".into(),
+        });
+    }
     if db::is_space_credential_jti_revoked(&state.db, state.db_backend, &space.id, &claims.jti)
         .await?
     {
@@ -2155,6 +2169,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
             .map(|r| {
                 (
                     r.url.path().trim_start_matches('/').to_string(),
@@ -2395,6 +2410,192 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+    }
+
+    /// A directory that stored a genesis but whose answer was lost refuses a
+    /// second submission of it as misordered. The next create reads the DID's
+    /// log, finds its operation there, and finishes.
+    #[tokio::test]
+    async fn a_genesis_the_directory_already_holds_is_not_submitted_again() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers};
+
+        struct StoreThenFail(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for StoreThenFail {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let mut stored = self.0.lock().unwrap();
+                if stored.is_none() {
+                    *stored = serde_json::from_slice(&request.body).ok();
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "message": "Operations not correctly ordered",
+                    }))
+                }
+            }
+        }
+        // The log cannot be read at first, so the first create fails with
+        // its row left `prepared`; the next create finds the operation there.
+        struct Log(
+            Arc<Mutex<Option<serde_json::Value>>>,
+            std::sync::atomic::AtomicBool,
+        );
+        impl Respond for Log {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return ResponseTemplate::new(500);
+                }
+                match self.0.lock().unwrap().clone() {
+                    Some(op) => ResponseTemplate::new(200).set_body_json(serde_json::json!([op])),
+                    None => ResponseTemplate::new(404),
+                }
+            }
+        }
+
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let stored = Arc::new(Mutex::new(None));
+        let plc = wiremock::MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(StoreThenFail(stored.clone()))
+            .mount(&plc)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path_regex(r"^/did:plc:[a-z2-7]{24}/log$"))
+            .respond_with(Log(stored.clone(), Default::default()))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap_err();
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the directory holds the genesis, so the create finishes");
+        let posts = plc
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        assert_eq!(posts, 1, "the held genesis is not submitted again");
+        let held = stored.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            happyview_plc::derive_did(&held).unwrap(),
+            space.authority_did
+        );
+        assert!(
+            crate::spaces::authority::holds(&state.db, state.db_backend, &space.authority_did)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A submission refused after the directory stored it, as when its answer
+    /// is lost, is checked against the DID's log, and the space is created.
+    #[tokio::test]
+    async fn a_refused_submission_the_directory_holds_still_creates_the_space() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers};
+
+        struct StoreAndFail(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for StoreAndFail {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                *self.0.lock().unwrap() = serde_json::from_slice(&request.body).ok();
+                ResponseTemplate::new(504)
+            }
+        }
+        struct Log(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for Log {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                match self.0.lock().unwrap().clone() {
+                    Some(op) => ResponseTemplate::new(200).set_body_json(serde_json::json!([op])),
+                    None => ResponseTemplate::new(404),
+                }
+            }
+        }
+
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let stored = Arc::new(Mutex::new(None));
+        let plc = wiremock::MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(StoreAndFail(stored.clone()))
+            .mount(&plc)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path_regex(r"^/did:plc:[a-z2-7]{24}/log$"))
+            .respond_with(Log(stored.clone()))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the directory holds the genesis");
+        let held = stored.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            happyview_plc::derive_did(&held).unwrap(),
+            space.authority_did
+        );
+    }
+
+    /// A recreated space keeps its DID and key, so a credential minted for the
+    /// deleted one would verify. One issued before this space was created is
+    /// refused.
+    #[tokio::test]
+    async fn a_credential_older_than_its_space_is_refused() {
+        let (state, _plc) = memory_state_with_plc().await;
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let key = crate::spaces::authority::signing_key(
+            &state.db,
+            state.db_backend,
+            &state.config.keyring().unwrap(),
+            &space.authority_did,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let created = chrono::DateTime::parse_from_rfc3339(&space.created_at)
+            .unwrap()
+            .timestamp() as u64;
+        let credential = |iat: u64| {
+            let claims = crate::spaces::credential::SpaceCredentialClaims {
+                iss: space.authority_did.clone(),
+                sub: format!(
+                    "at://{}/space/{}/{}",
+                    space.did, space.type_nsid, space.skey
+                ),
+                iat,
+                exp: iat + 600,
+                jti: crate::spaces::credential::make_jti(),
+                cnf: None,
+            };
+            crate::spaces::credential::sign_credential_with_kid(&claims, &key, "#atproto").unwrap()
+        };
+
+        let err = super::verify_space_credential(&state, &space, &credential(created - 60))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AppError::XrpcError {
+                    code: "InvalidCredential",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        super::verify_space_credential(&state, &space, &credential(created))
+            .await
+            .expect("a credential issued as the space was created verifies");
     }
 
     /// A deleted space recreated with the same type and key gets its DID back,

@@ -142,6 +142,37 @@ pub async fn fetch_last_operation(
         .map_err(|e| AppError::Internal(format!("failed to parse PLC log: {e}")))
 }
 
+/// The operations in a DID's log, oldest first, or `None` when the directory
+/// knows no such DID.
+///
+/// GET `{plc_url}/{did}/log` returns each operation as it was submitted.
+pub async fn fetch_operation_log(
+    http: &reqwest::Client,
+    plc_url: &str,
+    did: &str,
+) -> Result<Option<Vec<serde_json::Value>>, AppError> {
+    let url = format!("{}/{}/log", plc_url.trim_end_matches('/'), did);
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to fetch PLC log: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "PLC directory returned {status} for log: {body}"
+        )));
+    }
+    resp.json()
+        .await
+        .map(Some)
+        .map_err(|e| AppError::Internal(format!("failed to parse PLC log: {e}")))
+}
+
 /// Decrypt an encrypted key from the database and return the raw bytes.
 pub fn decrypt_key(
     enc_b64: &str,
