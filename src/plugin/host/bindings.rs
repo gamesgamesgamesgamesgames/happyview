@@ -2659,17 +2659,26 @@ async fn host_db_impl(
             }
         }
     }
-    let Some(db) = caller.data().db.clone() else {
+    let Some(main_db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
     let backend = caller.data().db_backend;
-    // Whether the least-privileged Postgres roles were set up at boot. This is an
-    // instance-wide fact carried on `app_state`; a host built without one cannot
-    // know it. On Postgres, rather than guess (and risk running on the privileged
-    // connection when the roles were in fact set up), refuse raw SQL in that
-    // contextless case. Irrelevant on SQLite, which has no such roles.
-    let restricted = match caller.data().app_state.as_ref() {
-        Some(app) => app.plugin_sql_restricted,
+    // Which pool a Postgres plugin statement runs on, and how much the parser must
+    // enforce. The mode is an instance-wide fact carried on `app_state`; a host
+    // built without one cannot know it, so on Postgres it refuses raw SQL rather
+    // than run on the privileged connection. SQLite has no roles; it uses the main
+    // pool and the enforcement value is ignored there.
+    use crate::raw_sql_guard::PluginSqlEnforcement;
+    let (db, enforcement) = match caller.data().app_state.as_ref() {
+        Some(app) => {
+            if let Some(login_pool) = app.plugin_sql_pool.clone() {
+                (login_pool, PluginSqlEnforcement::LoginPool)
+            } else if app.plugin_sql_restricted {
+                (main_db, PluginSqlEnforcement::Role)
+            } else {
+                (main_db, PluginSqlEnforcement::ParserOnly)
+            }
+        }
         None => {
             if backend == crate::db::DatabaseBackend::Postgres {
                 return write_guest_response(
@@ -2681,7 +2690,7 @@ async fn host_db_impl(
                 )
                 .await;
             }
-            false
+            (main_db, PluginSqlEnforcement::ParserOnly)
         }
     };
     // `database:write` may run writes, so its reads run under the write role
@@ -2697,13 +2706,13 @@ async fn host_db_impl(
         crate::raw_sql_guard::PluginSqlMode::Read
     };
     let response = if execute {
-        match super::run_plugin_execute(&db, backend, restricted, &sql, &params).await {
+        match super::run_plugin_execute(&db, backend, enforcement, &sql, &params).await {
             Ok(n) => serde_json::to_vec(&serde_json::json!({"ok": {"rows_affected": n}}))
                 .unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }
     } else {
-        match super::run_plugin_query(&db, backend, restricted, mode, &sql, &params).await {
+        match super::run_plugin_query(&db, backend, enforcement, mode, &sql, &params).await {
             Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }

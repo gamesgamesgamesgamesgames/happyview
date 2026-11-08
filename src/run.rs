@@ -354,22 +354,39 @@ async fn boot(
         "connected to database"
     );
 
-    // Set up the least-privileged roles plugin raw SQL runs under on Postgres.
-    // Soft failure: if the connecting role cannot create or grant them, plugin
-    // SQL falls back to the parser allowlist on this connection and we say how
-    // to enable the roles.
+    // Set up the least-privileged roles and schema plugin raw SQL runs under on
+    // Postgres. Soft failure: if the connecting role cannot create or grant them,
+    // plugin SQL falls back to the parser allowlist on this connection.
     let plugin_sql_restricted =
         crate::plugin::host::ensure_plugin_roles(&db_pool, db_backend).await;
-    if db_backend == db::DatabaseBackend::Postgres && !plugin_sql_restricted {
-        tracing::warn!(
-            "plugin raw SQL will run under the parser allowlist on the main database connection: \
-             the database roles '{}' / '{}' could not be set up. In this fallback, plugin SQL is \
-             restricted to DML (no caller-owned-table DDL) and a fixed function allowlist. Grant \
-             the HappyView database role CREATEROLE, or pre-create those roles and grant them to \
-             it, to run plugin SQL under a least-privileged role with full function.",
-            crate::plugin::host::PLUGIN_ROLE_RO,
-            crate::plugin::host::PLUGIN_ROLE_RW,
-        );
+    // The dedicated login pool, when configured: plugin SQL then runs as an
+    // unprivileged login role on its own connections, the strongest isolation.
+    let plugin_sql_pool = if db_backend == db::DatabaseBackend::Postgres {
+        match crate::config::vars::var("PLUGIN_SQL_DATABASE_URL") {
+            Some(url) if !url.trim().is_empty() => {
+                crate::plugin::host::open_plugin_login_pool(url.trim()).await
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if db_backend == db::DatabaseBackend::Postgres {
+        if plugin_sql_pool.is_some() {
+            info!("plugin raw SQL runs on the dedicated login pool");
+        } else if plugin_sql_restricted {
+            info!("plugin raw SQL runs under the least-privileged roles on the main connection");
+        } else {
+            tracing::warn!(
+                "plugin raw SQL will run under the parser allowlist on the main database \
+                 connection: the roles '{}' / '{}' could not be set up. In this mode plugin SQL is \
+                 restricted to DML and a fixed function allowlist. Grant the HappyView database \
+                 role CREATEROLE (or pre-create those roles and grant them to it), or set \
+                 PLUGIN_SQL_DATABASE_URL to the dedicated login role, to enable the stronger modes.",
+                crate::plugin::host::PLUGIN_ROLE_RO,
+                crate::plugin::host::PLUGIN_ROLE_RW,
+            );
+        }
     }
 
     // The backfill re-mints commits, so it needs the space signing key.
@@ -1176,6 +1193,7 @@ async fn boot(
         metrics,
         test: None,
         plugin_sql_restricted,
+        plugin_sql_pool,
     };
 
     // Populate record_refs once, for records indexed before the table existed.

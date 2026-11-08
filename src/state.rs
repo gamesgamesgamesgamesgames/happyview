@@ -147,6 +147,7 @@ pub fn state_with_pool_on(
         // Tests default to the parser-allowlist boundary; a test that wants the
         // restricted-role path sets this after calling `ensure_plugin_roles`.
         plugin_sql_restricted: false,
+        plugin_sql_pool: None,
     };
     // Backfills and their admin routes work on this state; nothing is started.
     crate::host::attach_jetstream(&mut state, Default::default());

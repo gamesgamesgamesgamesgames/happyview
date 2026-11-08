@@ -157,11 +157,19 @@ pub struct AppState {
     /// no other code path constructs one, so a serving binary never has it.
     pub test: Option<Arc<testing::TestHarness>>,
 
-    /// Whether plugin raw SQL on Postgres runs under the least-privileged
-    /// `happyview_plugin_ro`/`_rw` roles, set up at boot. `false` on SQLite and
-    /// when the roles could not be created; there the parser allowlist in
-    /// `plugin::host::db` is the whole boundary. See `ensure_plugin_roles`.
+    /// Whether the least-privileged `happyview_plugin_ro`/`_rw` roles were set up
+    /// at boot, so plugin raw SQL on the main Postgres pool can run under them
+    /// (`SET LOCAL ROLE`). `false` on SQLite and when the roles could not be
+    /// created. See `plugin::host::db::ensure_plugin_roles`.
     pub plugin_sql_restricted: bool,
+
+    /// The dedicated login pool for plugin raw SQL, connecting **as** the
+    /// least-privileged `happyview_plugin` role (so `session_user` itself is
+    /// unprivileged). Present only when `PLUGIN_SQL_DATABASE_URL` is configured
+    /// and the pool connected. When present, plugin SQL runs here; otherwise it
+    /// runs on the main pool under `plugin_sql_restricted`. See
+    /// `plugin::host::db::open_plugin_login_pool`.
+    pub plugin_sql_pool: Option<sqlx::AnyPool>,
 }
 
 impl AppState {
