@@ -403,3 +403,233 @@ async fn the_simplespace_lifecycle_methods_are_gone() {
         assert_eq!(status, never, "{method}");
     }
 }
+
+async fn get(app: &TestApp, path: &str, did: &str) -> (StatusCode, Value) {
+    let (name, value) = common::auth::admin_cookie_header(did, &app.state.cookie_key);
+    let req = Request::builder()
+        .uri(path)
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, json_of(resp).await)
+}
+
+/// A space that can sign commits and credentials.
+async fn signing_setup() -> (TestApp, String) {
+    let mut app = TestApp::new_with_encryption().await;
+    app.setup_did_web().await;
+    enable_spaces(&app).await;
+    (app, rand_did("creator"))
+}
+
+async fn update(app: &TestApp, creator: &str, space: &str, policy: Value) {
+    let (status, body) = post(
+        app,
+        "com.atproto.space.updateSpace",
+        creator,
+        json!({ "space": space, "policy": policy }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn stored(app: &TestApp, space: &str) -> happyview::spaces::types::Space {
+    happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        space.trim_start_matches("at://").split('/').next().unwrap(),
+        "com.example.forum",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+async fn member_dids(app: &TestApp, space: &str) -> Vec<String> {
+    let row = stored(app, space).await;
+    happyview::spaces::members::resolve_members(&app.state.db, app.state.db_backend, &row.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.did)
+        .collect()
+}
+
+/// The creator writes and reads a space directly, as its owner.
+async fn assert_creator_writes_and_reads(app: &TestApp, creator: &str, space: &str) {
+    let (status, body) = post(
+        app,
+        "com.atproto.space.createRecord",
+        creator,
+        json!({
+            "space": space,
+            "collection": "com.example.note",
+            "record": { "$type": "com.example.note", "text": "hi" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = get(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=com.example.note",
+            urlencoding::encode(space)
+        ),
+        creator,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Migrating a space discards its member list, the creator's row with it.
+/// The creator stands in for the space's authority, and keeps direct access
+/// after a migration either way.
+#[tokio::test]
+#[serial]
+async fn the_creator_keeps_access_across_a_migration_each_way() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+
+    update(
+        &app,
+        &creator,
+        &space,
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+    )
+    .await;
+    assert!(!member_dids(&app, &space).await.contains(&creator));
+    assert_creator_writes_and_reads(&app, &creator, &space).await;
+
+    update(&app, &creator, &space, json!({ "$type": MEMBERSPACE })).await;
+    assert!(!member_dids(&app, &space).await.contains(&creator));
+    assert_creator_writes_and_reads(&app, &creator, &space).await;
+}
+
+/// The creator is issued a credential with no member row, and under a
+/// managing app that would refuse them: here `did:plc:app`, which resolves
+/// to nothing.
+#[tokio::test]
+#[serial]
+async fn the_creator_is_issued_a_credential_whatever_the_policy_says() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+
+    for policy in [
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+        json!({ "$type": MEMBERSPACE }),
+    ] {
+        update(&app, &creator, &space, policy.clone()).await;
+        assert!(!member_dids(&app, &space).await.contains(&creator));
+
+        let (status, body) = get(
+            &app,
+            &format!(
+                "/xrpc/com.atproto.space.getDelegationToken?space={}",
+                urlencoding::encode(&space)
+            ),
+            &creator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{policy}: {body}");
+        let key = {
+            use rand::Rng;
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "space": space,
+                    "credentialKid": happyview::spaces::http_signature::did_key(key.verifying_key()),
+                    "delegationToken": body["token"],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = json_of(resp).await;
+        assert_eq!(status, StatusCode::OK, "{policy}: {body}");
+        assert!(body["credential"].is_string(), "{policy}: {body}");
+    }
+}
+
+/// A managedspace has no member list, so none can be written to it.
+#[tokio::test]
+#[serial]
+async fn a_managedspace_takes_no_members() {
+    common::require_db!();
+    let (app, creator) = setup().await;
+    let space = create(
+        &app,
+        &creator,
+        "main",
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+    )
+    .await;
+    for method in [
+        "com.atproto.simplespace.putMember",
+        "com.atproto.simplespace.addMember",
+    ] {
+        let (status, body) = post(
+            &app,
+            method,
+            &creator,
+            json!({ "space": space, "did": rand_did("member"), "read": true, "write": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {body}");
+        assert_eq!(body["error"], json!("InvalidRequest"), "{method}");
+    }
+}
+
+/// Access rules from before policies existed match no policy. Replacing them
+/// with a managedspace discards the member list; with a memberspace, keeps it.
+#[tokio::test]
+#[serial]
+async fn replacing_legacy_rules_keeps_the_member_list_only_for_a_memberspace() {
+    common::require_db!();
+    for (policy, kept) in [
+        (
+            json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+            false,
+        ),
+        (json!({ "$type": MEMBERSPACE }), true),
+    ] {
+        let (app, creator) = setup().await;
+        let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+        let member = rand_did("member");
+        let (status, _) = post(
+            &app,
+            "com.atproto.simplespace.putMember",
+            &creator,
+            json!({ "space": space, "did": member, "read": true, "write": true }),
+        )
+        .await;
+        assert!(status.is_success());
+
+        let mut row = stored(&app, &space).await;
+        row.read_policy = happyview::spaces::types::Policy::ManagingApp {
+            managing_app: "did:plc:app".into(),
+        };
+        happyview::spaces::db::update_space(&app.state.db, app.state.db_backend, &row)
+            .await
+            .unwrap();
+
+        update(&app, &creator, &space, policy.clone()).await;
+        assert_eq!(
+            member_dids(&app, &space).await.contains(&member),
+            kept,
+            "{policy}"
+        );
+    }
+}

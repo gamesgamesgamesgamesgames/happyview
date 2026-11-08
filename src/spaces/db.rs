@@ -262,7 +262,7 @@ pub async fn list_spaces_for_user(
 }
 
 pub async fn update_space(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space: &Space,
 ) -> Result<bool, AppError> {
@@ -290,7 +290,7 @@ pub async fn update_space(
         .bind(&config_json)
         .bind(&now)
         .bind(&space.id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update space: {e}")))?;
 
@@ -423,7 +423,7 @@ pub async fn add_member(
 /// Discard a space's member list, as migrating it to a policy that keeps none
 /// does. Returns how many members were removed.
 pub async fn remove_all_members(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<u64, AppError> {
@@ -432,7 +432,7 @@ pub async fn remove_all_members(
         backend,
     ))
     .bind(space_id)
-    .execute(pool)
+    .execute(executor)
     .await
     .map(|r| r.rows_affected())
     .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))

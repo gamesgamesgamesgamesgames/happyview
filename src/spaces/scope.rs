@@ -231,13 +231,21 @@ pub(crate) fn grants_cover(
     skey: &str,
     target: SpaceTarget<'_>,
 ) -> bool {
+    // A bare grant takes the declaration's collections as its own. Only NSIDs
+    // count: the declaration is the lexicon author's, not the user's consent,
+    // so a `*` there must not widen a grant to every collection.
+    let declared: Vec<String> = declared
+        .iter()
+        .filter(|c| happyview_nsid::validate_nsid(c).is_ok())
+        .cloned()
+        .collect();
     scopes
         .split_whitespace()
         .filter_map(happyview_scopes::SpacePermission::parse)
         .map(|p| {
             // A `*` space type has no declaration to draw a default from.
             let defaults: &[String] = if p.space_type == space_type {
-                declared
+                &declared
             } else {
                 &[]
             };
@@ -289,6 +297,22 @@ mod grant_tests {
             write("com.example.other")
         ));
         assert!(!covers(grant, &[], write("com.example.post")));
+    }
+
+    #[test]
+    fn a_declared_wildcard_or_non_nsid_is_no_default() {
+        let grant = "space:com.example.forum?authority=*";
+        for declared in ["*", "com.example.*", "not an nsid"] {
+            assert!(
+                !covers(grant, &[declared], write("com.example.post")),
+                "{declared}"
+            );
+        }
+        assert!(covers(
+            grant,
+            &["*", "com.example.post"],
+            write("com.example.post")
+        ));
     }
 
     #[test]

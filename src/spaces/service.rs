@@ -136,6 +136,12 @@ pub(crate) async fn require_membership(
         }
         return Ok(MemberAccess::READ);
     }
+    // The creator stands in for the space's authority, which no one signs in
+    // as, so it keeps access whatever the member list holds, as in
+    // `auth::policy_allows`.
+    if did == space.creator_did {
+        return Ok(MemberAccess::WRITE);
+    }
     let access = members::is_member(&state.db, state.db_backend, &space.id, did)
         .await?
         .ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))?;
@@ -937,6 +943,23 @@ async fn revoke_member_credentials(
     Ok(())
 }
 
+/// A managedspace has no member list: its managing app decides who reads and
+/// writes. A member row on one would still grant access through
+/// [`require_membership`], around the managing app, so none may be added.
+fn refuse_members_on_managedspace(space: &Space) -> Result<(), AppError> {
+    if matches!(
+        crate::spaces::policy::SpacePolicy::of(space),
+        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+    ) {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "a managedspace has no member list; its managing app decides access".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Upsert a member. `access` of `None` leaves an existing member's read and
 /// write untouched, and gives a new one read — so a caller who names only a
 /// DID, or only `is_delegation`, neither grants nor withdraws access.
@@ -954,6 +977,7 @@ pub(crate) async fn put_member(
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    refuse_members_on_managedspace(&space)?;
 
     let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
     let current = existing.as_ref().map(|m| m.access);
@@ -991,6 +1015,7 @@ pub(crate) async fn add_member(
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    refuse_members_on_managedspace(&space)?;
     if db::get_member(&state.db, state.db_backend, &space.id, member_did)
         .await?
         .is_some()

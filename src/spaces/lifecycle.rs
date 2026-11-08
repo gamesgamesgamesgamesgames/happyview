@@ -176,10 +176,18 @@ async fn update_space(
         Err(_) => policy.kind() == MANAGEDSPACE,
     };
     policy.apply(&mut space);
-    db::update_space(&state.db, state.db_backend, &space).await?;
+    // One transaction, so a failed removal cannot leave a managedspace with
+    // the member list of the memberspace it replaced.
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    db::update_space(&mut *tx, state.db_backend, &space).await?;
     if migrating {
-        db::remove_all_members(&state.db, state.db_backend, &space.id).await?;
+        db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
     }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))?;
     Ok(Json(serde_json::json!({})))
 }
 
