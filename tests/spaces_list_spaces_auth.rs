@@ -41,19 +41,17 @@ async fn enable_spaces(app: &TestApp) {
 
 async fn create_space(app: &TestApp, authority: &str) -> String {
     let (name, value) = cookie_for(app, authority);
-    let policy = json!({ "$type": "com.atproto.simplespace.defs#memberListPolicy" });
+    let policy = json!({ "$type": "com.atproto.memberspace.policy" });
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .uri("/xrpc/com.atproto.space.createSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
-                "type": "com.example.forum",
+                "spaceType": "com.example.forum",
                 "skey": format!("s{}", Uuid::new_v4().simple()),
-                "readPolicy": policy,
-                "writePolicy": policy,
-                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+                "policy": policy,
             })
             .to_string(),
         ))

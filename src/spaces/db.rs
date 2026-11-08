@@ -420,6 +420,24 @@ pub async fn add_member(
     Ok(())
 }
 
+/// Discard a space's member list, as migrating it to a policy that keeps none
+/// does. Returns how many members were removed.
+pub async fn remove_all_members(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_members WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))
+}
+
 pub async fn remove_member(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

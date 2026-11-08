@@ -18,62 +18,8 @@ use crate::spaces::{SpaceUri, db, members};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CreateSpaceInput {
-    /// `type` is the earlier name, accepted until v3.
-    #[serde(rename = "spaceType", alias = "type")]
-    pub type_nsid: String,
-    pub skey: String,
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-    // Raw, so `parse_policy` can report an unimplemented variant with its own
-    // error code rather than as a generic deserialize failure.
-    pub read_policy: Option<serde_json::Value>,
-    pub write_policy: Option<serde_json::Value>,
-    pub app_access: Option<serde_json::Value>,
-    pub config: Option<SpaceConfig>,
-    /// One policy for both reads and writes, as clients sent it before the
-    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
-    /// Accepted until v3.
-    pub policy: Option<serde_json::Value>,
-    pub mint_policy: Option<serde_json::Value>,
-    /// The legacy policy's managing app, sent beside it rather than inside.
-    pub managing_app: Option<String>,
-    pub managing_app_did: Option<String>,
-    /// A did:key the creator holds, listed as a rotation key of the space's
-    /// DID ahead of this instance's, so the creator can move the space.
-    pub rotation_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct SpaceUriQuery {
     pub space: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DeleteSpaceInput {
-    pub space: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateSpaceInput {
-    pub space: String,
-    pub display_name: Option<Option<String>>,
-    pub description: Option<Option<String>>,
-    pub read_policy: Option<serde_json::Value>,
-    pub write_policy: Option<serde_json::Value>,
-    pub app_access: Option<serde_json::Value>,
-    pub config: Option<SpaceConfig>,
-    /// One policy for both reads and writes, as clients sent it before the
-    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
-    /// Accepted until v3.
-    pub policy: Option<serde_json::Value>,
-    pub mint_policy: Option<serde_json::Value>,
-    /// The legacy policy's managing app, sent beside it rather than inside.
-    pub managing_app: Option<String>,
-    pub managing_app_did: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,13 +65,6 @@ const LEGACY_NS: &str = "dev.happyview";
 /// [`crate::spaces::routes::protocol_method_table`] for why this is a table.
 pub(crate) fn management_method_table() -> Vec<(String, MethodRouter<AppState>)> {
     vec![
-        (format!("{NS}.simplespace.createSpace"), post(create_space)),
-        (format!("{NS}.simplespace.updateSpace"), post(update_space)),
-        (format!("{NS}.simplespace.deleteSpace"), post(delete_space)),
-        (
-            format!("{NS}.simplespace.getSpace"),
-            get(crate::spaces::routes::get_space),
-        ),
         (format!("{NS}.simplespace.putMember"), post(put_member)),
         (
             format!("{NS}.simplespace.removeMember"),
@@ -147,18 +86,6 @@ pub fn simplespace_routes() -> Router<AppState> {
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.addMember"),
             post(add_member),
-        )
-        .route(
-            &format!("/xrpc/{LEGACY_NS}.space.createSpace"),
-            post(create_space),
-        )
-        .route(
-            &format!("/xrpc/{LEGACY_NS}.space.updateSpace"),
-            post(update_space),
-        )
-        .route(
-            &format!("/xrpc/{LEGACY_NS}.space.deleteSpace"),
-            post(delete_space),
         )
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.putMember"),
@@ -201,157 +128,6 @@ async fn resolve_space(state: &AppState, space_uri: &str) -> Result<Space, AppEr
 // ---------------------------------------------------------------------------
 // Space management handlers
 // ---------------------------------------------------------------------------
-
-/// Convert a supplied policy value, naming the failure.
-///
-/// A host MUST reject a policy it does not implement rather than store one it
-/// cannot enforce, and the rejection carries `UnsupportedPolicy` so a client can
-/// distinguish it from a malformed request.
-fn parse_policy(raw: Option<serde_json::Value>, field: &str) -> Result<Option<Policy>, AppError> {
-    raw.map(|v| {
-        serde_json::from_value(v).map_err(|_| AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "UnsupportedPolicy",
-            message: format!("{field} names a policy this host does not implement"),
-        })
-    })
-    .transpose()
-}
-
-/// The single policy clients sent before reads and writes were split, which
-/// governed both.
-fn legacy_policy(
-    policy: Option<serde_json::Value>,
-    mint_policy: Option<serde_json::Value>,
-    managing_app: Option<String>,
-    managing_app_did: Option<String>,
-) -> Result<Option<Policy>, AppError> {
-    let Some(raw) = policy.or(mint_policy) else {
-        return Ok(None);
-    };
-    let unsupported = || AppError::XrpcError {
-        status: StatusCode::BAD_REQUEST,
-        code: "UnsupportedPolicy",
-        message: "policy names a policy this host does not implement".into(),
-    };
-    let Some(name) = raw.as_str() else {
-        return parse_policy(Some(raw), "policy");
-    };
-    match name {
-        "public" => Ok(Some(Policy::Public)),
-        "member-list" => Ok(Some(Policy::MemberList)),
-        "managing-app" => managing_app
-            .or(managing_app_did)
-            .map(|managing_app| Some(Policy::ManagingApp { managing_app }))
-            .ok_or_else(unsupported),
-        _ => Err(unsupported()),
-    }
-}
-
-fn parse_app_access(raw: Option<serde_json::Value>) -> Result<Option<AppAccess>, AppError> {
-    // Earlier HappyView tagged variants with `type` and a short name.
-    let raw = raw.map(|mut v| {
-        if let Some(obj) = v.as_object_mut()
-            && !obj.contains_key("$type")
-            && let Some(kind) = obj
-                .remove("type")
-                .and_then(|t| t.as_str().map(str::to_string))
-        {
-            obj.insert(
-                "$type".into(),
-                format!("com.atproto.simplespace.defs#{kind}").into(),
-            );
-        }
-        v
-    });
-    raw.map(|v| {
-        serde_json::from_value(v).map_err(|_| AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "UnsupportedAppAccess",
-            message: "appAccess names a variant this host does not implement".into(),
-        })
-    })
-    .transpose()
-}
-
-async fn create_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<CreateSpaceInput>,
-) -> Result<Response, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let legacy = legacy_policy(
-        input.policy,
-        input.mint_policy,
-        input.managing_app,
-        input.managing_app_did,
-    )?;
-    let space = service::create_space(
-        &state,
-        claims.did(),
-        &input.type_nsid,
-        &input.skey,
-        input.display_name,
-        input.description,
-        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
-        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
-        parse_app_access(input.app_access)?,
-        input.config,
-        input.rotation_key.as_deref(),
-    )
-    .await?;
-    let space_uri = format!(
-        "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
-    );
-    let mut response = Json(serde_json::json!({ "uri": space_uri })).into_response();
-    *response.status_mut() = StatusCode::CREATED;
-    Ok(response)
-}
-
-async fn delete_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<DeleteSpaceInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    service::delete_space(&state, claims.did(), &input.space).await?;
-    Ok(Json(serde_json::json!({ "success": true })))
-}
-
-async fn update_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<UpdateSpaceInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let legacy = legacy_policy(
-        input.policy,
-        input.mint_policy,
-        input.managing_app,
-        input.managing_app_did,
-    )?;
-    let space = service::update_space(
-        &state,
-        claims.did(),
-        &input.space,
-        input.display_name,
-        input.description,
-        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
-        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
-        parse_app_access(input.app_access)?,
-        input.config,
-    )
-    .await?;
-    let space_uri = format!(
-        "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
-    );
-    Ok(Json(serde_json::json!({
-        "uri": space_uri,
-        "space": space,
-    })))
-}
 
 async fn list_members(
     State(state): State<AppState>,

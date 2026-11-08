@@ -360,15 +360,15 @@ async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
     let (name, value) = cookie_for(&app, &creator);
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .uri("/xrpc/com.atproto.space.createSpace")
         .header(name.clone(), value.clone())
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "spaceType": "com.example.mint", "skey": "own" }).to_string(),
+            json!({ "spaceType": "com.example.mint", "skey": "own", "policy": { "$type": "com.atproto.memberspace.policy" } }).to_string(),
         ))
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::OK);
     let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
     let space_did = space
         .trim_start_matches("at://")
@@ -756,15 +756,15 @@ async fn create_on_its_own_did(app: &TestApp, creator: &str, skey: &str) -> (Str
     let (name, value) = cookie_for(app, creator);
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .uri("/xrpc/com.atproto.space.createSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "spaceType": "com.example.mint", "skey": skey }).to_string(),
+            json!({ "spaceType": "com.example.mint", "skey": skey, "policy": { "$type": "com.atproto.memberspace.policy" } }).to_string(),
         ))
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::OK);
     let uri = json_of(resp).await["uri"].as_str().unwrap().to_string();
     let did = uri
         .trim_start_matches("at://")

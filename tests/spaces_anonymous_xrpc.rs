@@ -135,13 +135,11 @@ async fn setup_space(app: &mut TestApp, key: &SigningKey) -> (String, String) {
         post_as(
             app,
             CREATOR,
-            "com.atproto.simplespace.createSpace",
+            "com.atproto.space.createSpace",
             json!({
-                "type": "com.example.anongate",
+                "spaceType": "com.example.anongate",
                 "skey": format!("s{}", Uuid::new_v4().simple()),
-                "readPolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "writePolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+                "policy": { "$type": "com.atproto.memberspace.policy" },
             }),
         ),
     )

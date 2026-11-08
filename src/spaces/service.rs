@@ -59,18 +59,6 @@ pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, 
     Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
-pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
-    if let Some(serde_json::Value::Array(allowed)) = space.config.extra.get("allowedCollections")
-        && !allowed.is_empty()
-        && !allowed.iter().any(|v| v.as_str() == Some(collection))
-    {
-        return Err(AppError::BadRequest(format!(
-            "collection '{collection}' is not allowed in this space"
-        )));
-    }
-    Ok(())
-}
-
 /// Verify a space credential this instance issued for `space`, returning its
 /// claims.
 ///
@@ -562,7 +550,6 @@ pub(crate) async fn create_record(
 ) -> Result<(String, String), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
-    check_collection_allowed(&space, collection)?;
 
     let space_uri = format!(
         "at://{}/space/{}/{}",
@@ -657,7 +644,6 @@ pub(crate) async fn put_record(
 ) -> Result<(String, String), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
-    check_collection_allowed(&space, collection)?;
 
     let space_uri = format!(
         "at://{}/space/{}/{}",
@@ -881,22 +867,7 @@ pub(crate) async fn create_space(
     }
     let authority =
         crate::spaces::authority::create(state, did, type_nsid, skey, creator_rotation_key).await?;
-    let mut config = config.unwrap_or_default();
-    if let Some(decl) = state.lexicons.get_space_declaration(type_nsid).await
-        && let Some(collections) = decl.space_collections
-        && !collections.is_empty()
-        && !config.extra.contains_key("allowedCollections")
-    {
-        config.extra.insert(
-            "allowedCollections".to_string(),
-            serde_json::Value::Array(
-                collections
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
+    let config = config.unwrap_or_default();
     let space = Space {
         id: uuid::Uuid::new_v4().to_string(),
         did: authority.clone(),
@@ -1328,59 +1299,6 @@ mod tests {
             ),
         );
         config
-    }
-
-    fn space_with_config(config: SpaceConfig) -> Space {
-        Space {
-            id: "space-id".into(),
-            did: "did:plc:owner".into(),
-            authority_did: "did:plc:owner".into(),
-            creator_did: "did:plc:owner".into(),
-            type_nsid: "com.example.forum".into(),
-            skey: "main".into(),
-            display_name: None,
-            description: None,
-            read_policy: Policy::MemberList,
-            write_policy: Policy::MemberList,
-            app_access: AppAccess::default(),
-            config,
-            revision: None,
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        }
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_listed_collection() {
-        let space = space_with_config(config_with_allowed_collections(&["com.example.allowed"]));
-        assert!(super::check_collection_allowed(&space, "com.example.allowed").is_ok());
-    }
-
-    #[test]
-    fn check_collection_allowed_rejects_unlisted_collection() {
-        let space = space_with_config(config_with_allowed_collections(&["com.example.allowed"]));
-        let err = super::check_collection_allowed(&space, "com.example.denied").unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_any_collection_when_config_absent() {
-        let space = space_with_config(SpaceConfig::default());
-        assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_any_collection_when_list_empty() {
-        let space = space_with_config(config_with_allowed_collections(&[]));
-        assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
     }
 
     #[tokio::test]
@@ -1952,32 +1870,37 @@ mod tests {
         assert!(matches!(err, crate::error::AppError::Forbidden(_)));
     }
 
+    /// Any collection may appear in a space, as Proposal 0016 has it. An
+    /// `allowedCollections` list stored by an earlier HappyView limits nothing.
     #[tokio::test]
-    async fn create_record_rejects_disallowed_collection() {
+    async fn a_stored_collection_list_does_not_limit_writes() {
         require_test_db!();
         let (state, space_uri, member_did) =
             service_test_db_with_config(config_with_allowed_collections(&["com.example.allowed"]))
                 .await;
 
-        let err = super::create_record(
+        super::create_record(
             &state,
             &member_did,
             None,
             &space_uri,
-            "com.example.denied",
-            serde_json::json!({ "text": "no" }),
+            "com.example.unlisted",
+            serde_json::json!({ "text": "yes" }),
         )
         .await
-        .unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
+        .expect("create to an unlisted collection");
+        super::put_record(
+            &state,
+            &member_did,
+            None,
+            &space_uri,
+            "com.example.unlisted",
+            "fixedrkey-put-unlisted",
+            serde_json::json!({ "text": "yes" }),
+            None,
+        )
+        .await
+        .expect("put to an unlisted collection");
     }
 
     #[tokio::test]
@@ -2031,36 +1954,6 @@ mod tests {
         )
         .await
         .expect("empty allowedCollections list should allow any collection");
-    }
-
-    #[tokio::test]
-    async fn put_record_rejects_disallowed_collection() {
-        require_test_db!();
-        let (state, space_uri, member_did) =
-            service_test_db_with_config(config_with_allowed_collections(&["com.example.allowed"]))
-                .await;
-
-        let err = super::put_record(
-            &state,
-            &member_did,
-            None,
-            &space_uri,
-            "com.example.denied",
-            "fixedrkey-put-denied",
-            serde_json::json!({ "text": "no" }),
-            None,
-        )
-        .await
-        .unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
     }
 
     #[tokio::test]
