@@ -96,16 +96,95 @@ pub enum PluginSqlMode {
     Write,
 }
 
-/// Functions a plugin's raw SQL may call on Postgres. An **allowlist**: every
-/// function the real parser sees must be here, so a string-executing or
-/// privilege-escalating built-in (`query_to_xml`, `table_to_xml`, `dblink*`,
+/// True when `name` is one of HappyView's own internal tables that plugin raw
+/// SQL may not reach — the same rule as [`check_raw_sql_tables`], but applied to
+/// a name the real parser extracted. A caller-owned table (anything without the
+/// reserved prefix) is not blocked; plugins are expected to use their own
+/// tables through raw SQL.
+fn is_blocked_internal_table(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    let internal = lname.starts_with(PROTECTED_TABLE_PREFIX)
+        || PROTECTED_EXACT_TABLES.contains(&lname.as_str());
+    internal
+        && !ALLOWED_INTERNAL_TABLES
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&lname))
+}
+
+/// Functions that change session state and so must be refused in **either**
+/// mode and whether or not the roles are set up — the function form of
+/// `SET`/`RESET`. Left in, `set_config('role', …)` / `set_config('search_path',
+/// …)` would do from a statement what the refused `SET` statement cannot.
+const ALWAYS_FORBIDDEN_FUNCTIONS: &[&str] = &["set_config"];
+
+/// True when a write-mode statement is of a kind plugin raw SQL may run.
+///
+/// DML writes are always allowed. Table-shaped DDL (`CREATE`/`ALTER`/`DROP`
+/// TABLE, INDEX, VIEW) is allowed only when `allow_ddl` — i.e. when the
+/// least-privileged roles are in force. Without them the parser is the whole
+/// boundary and DDL is refused outright: `pg_query`'s walker does not descend
+/// into a column `DEFAULT`/`CHECK`/`GENERATED` expression, so a function hidden
+/// there would escape the fallback function check; forbidding DDL in the
+/// fallback closes that without a bespoke walker. Under the roles those
+/// expressions run as the restricted role and are contained there.
+///
+/// This is an **allowlist of statement kinds**, so an unlisted or future kind
+/// fails closed. It leaves out every role/session/privilege and code-defining
+/// kind — `DO`, `CREATE FUNCTION`/`OPERATOR`/`CAST`/`AGGREGATE`/`TRIGGER`/
+/// `RULE`/`EXTENSION`/`LANGUAGE`/`EVENT TRIGGER`, `COPY`, `EXECUTE`/`PREPARE`,
+/// `GRANT`/`REVOKE`, the role statements, `SET`/`RESET`, and transaction
+/// control — which is how the CVE-2018-1058 object-shadowing paths are closed.
+/// `ALTER TABLE … OWNER TO` is refused even though `ALTER TABLE` is allowed.
+fn is_allowed_write_statement(
+    node: Option<&pg_query::protobuf::node::Node>,
+    allow_ddl: bool,
+) -> bool {
+    use pg_query::protobuf::node::Node;
+    match node {
+        Some(
+            Node::SelectStmt(_)
+            | Node::InsertStmt(_)
+            | Node::UpdateStmt(_)
+            | Node::DeleteStmt(_)
+            | Node::MergeStmt(_),
+        ) => true,
+        Some(Node::CreateStmt(_) | Node::IndexStmt(_) | Node::ViewStmt(_) | Node::DropStmt(_)) => {
+            allow_ddl
+        }
+        Some(Node::AlterTableStmt(s)) => allow_ddl && !alter_table_changes_owner(s),
+        _ => false,
+    }
+}
+
+/// True when an `ALTER TABLE` includes an `OWNER TO` sub-command. Changing a
+/// table's owner is a privilege operation, refused even though the rest of
+/// `ALTER TABLE` is allowed.
+fn alter_table_changes_owner(stmt: &pg_query::protobuf::AlterTableStmt) -> bool {
+    use pg_query::protobuf::node::Node;
+    // `AlterTableType::AtChangeOwner` is 28.
+    const AT_CHANGE_OWNER: i32 = 28;
+    stmt.cmds.iter().any(|cmd| {
+        matches!(
+            cmd.node.as_ref(),
+            Some(Node::AlterTableCmd(c)) if c.subtype == AT_CHANGE_OWNER || c.newowner.is_some()
+        )
+    })
+}
+
+/// Functions plugin raw SQL may call on Postgres **when the least-privileged
+/// roles are not available** and the parser is the whole boundary. An
+/// **allowlist**: every function the real parser sees must be here, so a
+/// string-executing built-in (`query_to_xml`, `table_to_xml`, `dblink*`,
 /// `pg_read_file`, …) is refused by default rather than hunted for in a
 /// deny-list. Operators and `CAST`/`::` are not function calls in the parse
 /// tree, so they are allowed without listing; the risk in a cast is never the
 /// cast but the function that consumes its result, which this list gates.
 ///
-/// Extend it on request when a plugin needs a demonstrably-safe function; keep
-/// anything that reads files, runs a string as SQL, opens a connection, or
+/// When the roles *are* available this list is not consulted: the role, which
+/// has no grant on the protected tables, denies such a read at the database, so
+/// a plugin keeps full use of functions over its own tables. Extend it on
+/// request when a plugin needs a demonstrably-safe function in the fallback;
+/// keep anything that reads files, runs a string as SQL, opens a connection, or
 /// touches server state out of it.
 const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
     // Aggregates.
@@ -189,26 +268,39 @@ const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
     "unnest",
 ];
 
-/// Statement/relation/function allowlist for plugin raw SQL **on Postgres**,
-/// enforced by Postgres's own parser (libpg_query via `pg_query`) rather than a
-/// tokenizer. This is what sees SQL that a tokenizer cannot: a table named only
-/// inside a string handed to a built-in never reaches the server, because the
-/// built-in is not an allowed function. It is applied on every Postgres plugin
-/// statement, and is the whole boundary when the least-privileged roles cannot
-/// be set up (see `plugin::host::db`).
+/// Guard plugin raw SQL **on Postgres**, using Postgres's own parser
+/// (libpg_query via `pg_query`) rather than a tokenizer, so SQL hidden in a
+/// string handed to a built-in is seen. Applied on every Postgres plugin
+/// statement; it is the whole boundary when the least-privileged roles are not
+/// available (`roles_available == false`).
 ///
-/// Accepts only: statements of an allowed kind for `mode` (read → `SELECT`
-/// only; write → `SELECT`/`INSERT`/`UPDATE`/`DELETE`), every relation in
-/// [`plugin_nameable_relations`] and in no schema but `public`, and every
-/// function in [`PLUGIN_SQL_FUNCTIONS`]. Refuses `DO`, `CREATE`/DDL, `COPY`,
-/// `EXECUTE`, transaction control and — load-bearing — `SET`/`RESET` (a bare
-/// `RESET ROLE` would otherwise return to the privileged session role and
-/// defeat the restricted role). SQL that does not parse fails closed.
+/// Always enforced:
+/// - **Relations.** No statement may reference one of HappyView's own internal
+///   tables except the allowlisted data ones (`plugin_nameable_relations`).
+///   Caller-owned tables (any name without the reserved prefix) are allowed, so
+///   a plugin keeps using its own tables and DDL on them.
+/// - **Statement kinds.** Read mode permits only `SELECT`; write mode permits
+///   the DML writes and table-shaped DDL (`is_allowed_write_statement`). This
+///   refuses `DO`, `CREATE FUNCTION`, `COPY`, `EXECUTE`, `GRANT`, the role
+///   statements, transaction control and — load-bearing — `SET`/`RESET`, in
+///   both modes.
 ///
-/// It does **not** by itself prove a read is side-effect-free (a data-modifying
-/// CTE, a locking clause, `SELECT … INTO`); the caller gates read-mode SQL with
-/// [`is_read_only`] as well.
-pub fn check_postgres_plugin_sql(sql: &str, mode: PluginSqlMode) -> Result<(), String> {
+/// Enforced only in the fallback (`roles_available == false`), where the parser
+/// is the only boundary:
+/// - **Functions.** Every function called must be on [`PLUGIN_SQL_FUNCTIONS`],
+///   so a string-executing built-in that would read a protected table from a
+///   string literal is refused. When the roles are available this is left to the
+///   role, which the database denies the protected read, so a plugin keeps full
+///   use of functions over its own tables.
+///
+/// SQL that does not parse fails closed. This does not by itself prove a read is
+/// side-effect-free (a data-modifying CTE, a locking clause, `SELECT … INTO`);
+/// the caller gates read-mode SQL with [`is_read_only`] as well.
+pub fn check_postgres_plugin_sql(
+    sql: &str,
+    mode: PluginSqlMode,
+    roles_available: bool,
+) -> Result<(), String> {
     use pg_query::protobuf::node::Node;
 
     let parsed = pg_query::parse(sql).map_err(|e| format!("could not parse SQL: {e}"))?;
@@ -217,73 +309,154 @@ pub fn check_postgres_plugin_sql(sql: &str, mode: PluginSqlMode) -> Result<(), S
         return Err("raw SQL contained no statement".into());
     }
 
-    // Statement kinds. Reject anything that is not a plain query or, in write
-    // mode, a plain DML write — in particular DO blocks, any DDL, COPY, EXECUTE,
-    // transaction control and SET/RESET.
+    // Statement kinds. DDL (caller-owned table management) is allowed only when
+    // the roles are in force; the fallback is DML-only (see
+    // `is_allowed_write_statement`).
+    let allow_ddl = roles_available;
     for raw in &parsed.protobuf.stmts {
         let node = raw.stmt.as_ref().and_then(|n| n.node.as_ref());
-        let allowed = match node {
-            Some(Node::SelectStmt(_)) => true,
-            Some(Node::InsertStmt(_)) | Some(Node::UpdateStmt(_)) | Some(Node::DeleteStmt(_)) => {
-                mode == PluginSqlMode::Write
-            }
-            _ => false,
+        let allowed = match mode {
+            PluginSqlMode::Read => matches!(node, Some(Node::SelectStmt(_))),
+            PluginSqlMode::Write => is_allowed_write_statement(node, allow_ddl),
         };
         if !allowed {
             return Err(match mode {
                 PluginSqlMode::Read => {
-                    "database:read permits only plain SELECT statements in raw SQL".to_string()
+                    "database:read permits only read-only SELECT statements in raw SQL".to_string()
                 }
                 PluginSqlMode::Write => {
-                    "raw SQL permits only SELECT/INSERT/UPDATE/DELETE statements".to_string()
+                    "raw SQL permits data statements and table DDL, not this statement kind"
+                        .to_string()
                 }
             });
         }
     }
 
-    // Relations: every table named (including inside a data-modifying CTE) must
-    // be an allowlisted internal relation, in the public schema or unqualified.
-    for table in parsed.tables() {
-        let (schema, name) = split_qualified(&table);
-        if let Some(schema) = schema
-            && !schema.eq_ignore_ascii_case("public")
-        {
+    // Every relation and function reference in the whole parse tree. The scan
+    // is generic (it walks the serialized tree), so it sees references in a CTE,
+    // a scalar subquery, a `RETURNING` list, an `ON CONFLICT` update and a
+    // `LATERAL` subquery alike — anywhere a reference can hide — not only the
+    // positions `pg_query`'s own `tables()`/`functions()` descend into.
+    let (relations, functions) = scan_relations_and_functions(&parsed);
+
+    // Relations: refuse HappyView's own internal tables (except the allowlisted
+    // data ones). Caller-owned tables pass.
+    for table in &relations {
+        let (_schema, name) = split_qualified(table);
+        if is_blocked_internal_table(name) {
             return Err(format!(
-                "raw SQL cannot reference the relation '{table}' (schema '{schema}' is not allowed)"
-            ));
-        }
-        if !plugin_nameable_relations()
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(name))
-        {
-            return Err(format!(
-                "raw SQL cannot reference the relation '{table}'; plugin SQL may use only HappyView's public data tables"
+                "raw SQL cannot reference the protected internal HappyView table '{table}'"
             ));
         }
     }
 
-    // Functions: allowlist. A string-executing built-in is refused here because
-    // it is not on the list, whatever it was handed.
-    for func in parsed.functions() {
-        let (schema, name) = split_qualified(&func);
-        if let Some(schema) = schema
-            && !(schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("pg_catalog"))
-        {
-            return Err(format!(
-                "raw SQL cannot call '{func}' (schema '{schema}' is not allowed)"
-            ));
-        }
-        if !PLUGIN_SQL_FUNCTIONS
+    // Functions. `set_config` and friends are the function form of SET and are
+    // refused in either mode. The rest of the allowlist is the whole boundary
+    // only when the roles are unavailable (the DML-only fallback). With the
+    // roles, a string-executing built-in is left to the role, which the database
+    // denies, so a plugin keeps full use of functions over its own tables.
+    for func in &functions {
+        let (schema, name) = split_qualified(func);
+        if ALWAYS_FORBIDDEN_FUNCTIONS
             .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+            .any(|f| f.eq_ignore_ascii_case(name))
         {
-            return Err(format!(
-                "raw SQL cannot call the function '{func}'; it is not on the plugin SQL allowlist"
-            ));
+            return Err(format!("raw SQL cannot call the function '{func}'"));
+        }
+        if !roles_available {
+            if let Some(schema) = schema
+                && !(schema.eq_ignore_ascii_case("public")
+                    || schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                return Err(format!(
+                    "raw SQL cannot call '{func}' (schema '{schema}' is not allowed)"
+                ));
+            }
+            if !PLUGIN_SQL_FUNCTIONS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "raw SQL cannot call the function '{func}' unless the plugin SQL database roles are configured; it is not on the fallback allowlist"
+                ));
+            }
         }
     }
 
     Ok(())
+}
+
+/// Collect every relation and function reference in the parse tree, as
+/// `"schema.name"` (or bare `name`). Generic over the whole serialized tree so
+/// no reference position is missed; see the caller for why that matters. The
+/// parse tree is bounded by the plugin's statement size, so the one allocation
+/// is cheap relative to the database round trip it guards.
+fn scan_relations_and_functions(parsed: &pg_query::ParseResult) -> (Vec<String>, Vec<String>) {
+    let mut relations = Vec::new();
+    let mut functions = Vec::new();
+    if let Ok(tree) = serde_json::to_value(&parsed.protobuf) {
+        collect_refs(&tree, &mut relations, &mut functions);
+    }
+    (relations, functions)
+}
+
+/// Walk a serialized parse tree, collecting every relation and function
+/// reference (both possibly schema-qualified).
+///
+/// A relation reference is any object carrying a `relname` string: a `RangeVar`
+/// appears both tagged inside a `Node` (a `FROM` item) and inline as a typed
+/// struct field (`UpdateStmt.relation`, `DeleteStmt.relation`, …), and both
+/// shapes have `relname`. A function reference is any object carrying a
+/// `funcname` array (a `FuncCall`), whose entries are `String` nodes nested
+/// under a `node` wrapper.
+fn collect_refs(
+    value: &serde_json::Value,
+    relations: &mut Vec<String>,
+    functions: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(rel) = map.get("relname").and_then(|v| v.as_str()) {
+                let schema = map
+                    .get("schemaname")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                relations.push(match schema {
+                    Some(s) => format!("{s}.{rel}"),
+                    None => rel.to_string(),
+                });
+            }
+            if let Some(name) = qualified_name_from_string_nodes(map.get("funcname")) {
+                functions.push(name);
+            }
+            for child in map.values() {
+                collect_refs(child, relations, functions);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_refs(child, relations, functions);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn a `funcname` array of `String` nodes
+/// (`[{"node":{"String":{"sval":"lower"}}}]`, or schema-qualified
+/// `[{…"pg_catalog"}, {…"set_config"}]`) into `"schema.name"` or bare `name`,
+/// keeping the last two parts.
+fn qualified_name_from_string_nodes(funcname: Option<&serde_json::Value>) -> Option<String> {
+    let parts: Vec<&str> = funcname?
+        .as_array()?
+        .iter()
+        .filter_map(|n| n.get("node")?.get("String")?.get("sval")?.as_str())
+        .collect();
+    match parts.as_slice() {
+        [] => None,
+        [name] => Some((*name).to_string()),
+        [.., schema, name] => Some(format!("{schema}.{name}")),
+    }
 }
 
 /// Split a possibly schema-qualified name from `pg_query`'s `tables()` /
@@ -1255,17 +1428,142 @@ mod postgres_plugin_guard_tests {
     //! covered by the integration tests in `tests/`.
     use super::{PluginSqlMode::*, check_postgres_plugin_sql};
 
+    // The second boolean is `roles_available`. Most checks hold either way; the
+    // function allowlist applies only when the roles are *not* available.
+    const EITHER: [bool; 2] = [true, false];
+
     #[test]
     fn allows_plain_reads_of_allowlisted_relations() {
+        for roles in EITHER {
+            for sql in [
+                "SELECT * FROM happyview_records WHERE collection = $1",
+                "SELECT count(*) FROM happyview_records_by_collection",
+                "SELECT lower(uri) FROM happyview_record_refs LIMIT 10",
+                "SELECT * FROM public.happyview_labels",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Read, roles).is_ok(),
+                    "should allow (roles={roles}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allows_caller_owned_tables_and_their_ddl_under_the_roles() {
+        // Plugins are expected to use their own tables through raw SQL. DDL is
+        // allowed when the roles are in force; DML and reads either way.
         for sql in [
-            "SELECT * FROM happyview_records WHERE collection = $1",
-            "SELECT count(*) FROM happyview_records_by_collection",
-            "SELECT lower(uri) FROM happyview_record_refs LIMIT 10",
-            "SELECT * FROM public.happyview_labels",
+            "CREATE TABLE IF NOT EXISTS my_plugin_state (k TEXT, v TEXT)",
+            "INSERT INTO my_plugin_state (k, v) VALUES ($1, $2)",
+            "CREATE INDEX my_plugin_state_k ON my_plugin_state (k)",
+            "ALTER TABLE my_plugin_state ADD COLUMN n INT",
+            "CREATE VIEW my_plugin_view AS SELECT k FROM my_plugin_state",
+            "DROP TABLE my_plugin_state",
         ] {
             assert!(
-                check_postgres_plugin_sql(sql, Read).is_ok(),
-                "should allow: {sql}"
+                check_postgres_plugin_sql(sql, Write, true).is_ok(),
+                "should allow a caller-owned table under the roles: {sql}"
+            );
+        }
+        for roles in EITHER {
+            assert!(
+                check_postgres_plugin_sql("INSERT INTO my_plugin_state VALUES ($1)", Write, roles)
+                    .is_ok()
+            );
+            assert!(
+                check_postgres_plugin_sql("SELECT * FROM my_plugin_state", Read, roles).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_ddl_in_the_fallback() {
+        // Without the roles the parser is the only boundary and cannot vouch for
+        // a function hidden in a column DEFAULT/CHECK, so DDL is refused.
+        for sql in [
+            "CREATE TABLE my_plugin_state (k TEXT)",
+            "CREATE INDEX i ON my_plugin_state (k)",
+            "CREATE VIEW v AS SELECT 1",
+            "ALTER TABLE my_plugin_state ADD COLUMN n INT",
+            "DROP TABLE my_plugin_state",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, false).is_err(),
+                "fallback should refuse DDL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_creating_executable_objects_in_either_mode() {
+        // The CVE-2018-1058 object-shadowing surface: nothing a plugin creates
+        // may define code HappyView's own queries could resolve to.
+        for roles in EITHER {
+            for sql in [
+                "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+                "CREATE OR REPLACE FUNCTION public.lower(varchar) RETURNS text AS $$ SELECT 'x' $$ LANGUAGE sql",
+                "CREATE PROCEDURE p() AS $$ BEGIN END $$ LANGUAGE plpgsql",
+                "CREATE OPERATOR === (leftarg = int, rightarg = int, function = int4eq)",
+                "CREATE CAST (int AS text) WITH FUNCTION f(int)",
+                "CREATE AGGREGATE agg(int) (sfunc = int4pl, stype = int)",
+                "CREATE TRIGGER t BEFORE INSERT ON my_plugin_state FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE RULE r AS ON INSERT TO my_plugin_state DO INSTEAD NOTHING",
+                "CREATE EXTENSION dblink",
+                "CREATE LANGUAGE plpython3u",
+                "CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION f()",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, roles).is_err(),
+                    "should refuse creating executable objects (roles={roles}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_function_overload_matching_a_builtin() {
+        // Specifically the shadowing shape: define `public.lower(varchar)` so a
+        // later `lower(x)` in HappyView's own query would resolve to it.
+        for roles in EITHER {
+            assert!(
+                check_postgres_plugin_sql(
+                    "CREATE FUNCTION public.lower(varchar) RETURNS text AS $$ SELECT 'x'::text $$ LANGUAGE sql",
+                    Write,
+                    roles
+                )
+                .is_err(),
+                "should refuse a function overload (roles={roles})"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_set_config_in_either_mode() {
+        for roles in EITHER {
+            for sql in [
+                "SELECT set_config('search_path', 'evil', false)",
+                "SELECT pg_catalog.set_config('role', 'postgres', false)",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Read, roles).is_err(),
+                    "should refuse set_config (roles={roles}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_alter_table_owner_in_either_mode() {
+        for roles in EITHER {
+            assert!(
+                check_postgres_plugin_sql(
+                    "ALTER TABLE my_plugin_state OWNER TO postgres",
+                    Write,
+                    roles
+                )
+                .is_err(),
+                "should refuse ALTER TABLE OWNER (roles={roles})"
             );
         }
     }
@@ -1273,16 +1571,18 @@ mod postgres_plugin_guard_tests {
     #[test]
     fn allows_writes_only_in_write_mode() {
         let sql = "INSERT INTO happyview_jobs (id) VALUES ($1)";
-        assert!(check_postgres_plugin_sql(sql, Write).is_ok());
-        assert!(check_postgres_plugin_sql(sql, Read).is_err());
+        assert!(check_postgres_plugin_sql(sql, Write, true).is_ok());
+        assert!(check_postgres_plugin_sql(sql, Read, true).is_err());
     }
 
     #[test]
-    fn refuses_string_executing_builtins_under_read() {
+    fn string_executing_builtins_are_refused_only_in_the_fallback() {
         // The reads that the tokenizer guard let through: the table name lives
-        // in a string the built-in would execute or resolve, so the parser
-        // never sees it as a relation — but it sees the built-in, which is not
-        // on the function allowlist.
+        // in a string the built-in would execute or resolve. With the roles
+        // unavailable the parser is the boundary and the function allowlist
+        // refuses them. With the roles available the parser lets them through —
+        // the role denies the protected read at the database (see the
+        // integration tests), so a plugin keeps full use of functions.
         for sql in [
             "SELECT query_to_xml('select 1', true, false, '')",
             "SELECT table_to_xml('x'::regclass, true, false, '')",
@@ -1290,58 +1590,100 @@ mod postgres_plugin_guard_tests {
             "SELECT pg_read_file('/etc/passwd')",
         ] {
             assert!(
-                check_postgres_plugin_sql(sql, Read).is_err(),
-                "should refuse: {sql}"
+                check_postgres_plugin_sql(sql, Read, false).is_err(),
+                "fallback should refuse: {sql}"
+            );
+            assert!(
+                check_postgres_plugin_sql(sql, Read, true).is_ok(),
+                "with roles the parser allows (role denies at the db): {sql}"
             );
         }
     }
 
     #[test]
-    fn refuses_direct_reads_of_unallowlisted_relations() {
+    fn refuses_internal_tables_in_either_mode_whether_or_not_roles_are_set_up() {
+        for roles in EITHER {
+            for sql in [
+                "SELECT * FROM happyview_users",
+                "SELECT token_hash FROM happyview_api_keys",
+                "SELECT * FROM happyview_oauth_sessions",
+                "SELECT * FROM public.happyview_users",
+                "SELECT * FROM \"happyview_users\"",
+                // Hidden inside a data-modifying CTE.
+                "WITH x AS (DELETE FROM happyview_users RETURNING id) SELECT * FROM x",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, roles).is_err(),
+                    "should refuse the internal table (roles={roles}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_escape_statements_in_either_mode() {
+        for roles in EITHER {
+            for sql in [
+                "DO $$ BEGIN PERFORM 1; END $$",
+                "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+                "COPY my_table TO '/tmp/x'",
+                "SET ROLE postgres",
+                "RESET ROLE",
+                "SELECT 1; RESET ROLE",
+                "BEGIN",
+                "GRANT ALL ON my_table TO postgres",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, roles).is_err(),
+                    "should refuse the escape statement (roles={roles}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_function_check_sees_every_dml_position() {
+        // The completeness claim: in the DML-only fallback a string-executing
+        // function is caught wherever it hides — a CTE, a scalar subquery, a
+        // RETURNING list, an ON CONFLICT update, a LATERAL subquery. Each must
+        // be refused with the roles unavailable.
         for sql in [
-            "SELECT * FROM happyview_users",
-            "SELECT token_hash FROM happyview_api_keys",
-            "SELECT * FROM happyview_oauth_sessions",
-            "SELECT * FROM pg_catalog.pg_authid",
-            "SELECT * FROM information_schema.tables",
-            "SELECT * FROM \"happyview_users\"",
+            "WITH x AS (SELECT query_to_xml('', true, false, '') AS q) SELECT * FROM x",
+            "SELECT (SELECT query_to_xml('', true, false, '')) AS q",
+            "INSERT INTO caller_t (k) VALUES ('a') RETURNING query_to_xml('', true, false, '')",
+            "INSERT INTO caller_t (k) VALUES ('a') ON CONFLICT (k) DO UPDATE SET v = query_to_xml('', true, false, '')",
+            "SELECT * FROM caller_t, LATERAL (SELECT query_to_xml('', true, false, '')) s",
+            "UPDATE caller_t SET v = query_to_xml('', true, false, '')",
+            "DELETE FROM caller_t WHERE k = query_to_xml('', true, false, '')",
         ] {
             assert!(
-                check_postgres_plugin_sql(sql, Read).is_err(),
-                "should refuse: {sql}"
+                check_postgres_plugin_sql(sql, Write, false).is_err(),
+                "fallback must refuse a hidden string-executing function: {sql}"
             );
         }
     }
 
     #[test]
-    fn refuses_unallowlisted_relation_hidden_in_a_modifying_cte() {
-        let sql = "WITH x AS (DELETE FROM happyview_users RETURNING id) SELECT * FROM x";
-        // Write mode, so the CTE kind is not the refusal — the relation is.
-        assert!(check_postgres_plugin_sql(sql, Write).is_err());
-    }
-
-    #[test]
-    fn refuses_do_ddl_copy_and_set() {
-        for sql in [
-            "DO $$ BEGIN PERFORM 1; END $$",
-            "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
-            "CREATE TABLE t (a int)",
-            "COPY happyview_records TO '/tmp/x'",
-            "SET ROLE postgres",
-            "RESET ROLE",
-            "SELECT * FROM happyview_records; RESET ROLE",
-            "BEGIN",
-        ] {
-            assert!(
-                check_postgres_plugin_sql(sql, Write).is_err(),
-                "should refuse: {sql}"
-            );
+    fn internal_table_is_seen_in_every_position() {
+        // The same completeness, for the relation deny — it holds in either mode.
+        for roles in EITHER {
+            for sql in [
+                "WITH x AS (SELECT id FROM happyview_users) SELECT * FROM x",
+                "SELECT (SELECT count(*) FROM happyview_api_keys) AS n",
+                "SELECT * FROM caller_t WHERE k IN (SELECT token_hash FROM happyview_api_keys)",
+                "SELECT * FROM caller_t, LATERAL (SELECT id FROM happyview_users) u",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, roles).is_err(),
+                    "must refuse the internal table hidden in a subposition (roles={roles}): {sql}"
+                );
+            }
         }
     }
 
     #[test]
     fn refuses_unparseable_sql() {
-        assert!(check_postgres_plugin_sql("SELECT 1 FROM (", Read).is_err());
-        assert!(check_postgres_plugin_sql("", Read).is_err());
+        assert!(check_postgres_plugin_sql("SELECT 1 FROM (", Read, true).is_err());
+        assert!(check_postgres_plugin_sql("", Read, true).is_err());
     }
 }

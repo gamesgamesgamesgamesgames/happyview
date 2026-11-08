@@ -363,9 +363,10 @@ async fn boot(
     if db_backend == db::DatabaseBackend::Postgres && !plugin_sql_restricted {
         tracing::warn!(
             "plugin raw SQL will run under the parser allowlist on the main database connection: \
-             the database roles '{}' / '{}' could not be set up. Grant the HappyView database role \
-             CREATEROLE, or pre-create those roles and grant them to it, to run plugin SQL under a \
-             least-privileged role.",
+             the database roles '{}' / '{}' could not be set up. In this fallback, plugin SQL is \
+             restricted to DML (no caller-owned-table DDL) and a fixed function allowlist. Grant \
+             the HappyView database role CREATEROLE, or pre-create those roles and grant them to \
+             it, to run plugin SQL under a least-privileged role with full function.",
             crate::plugin::host::PLUGIN_ROLE_RO,
             crate::plugin::host::PLUGIN_ROLE_RW,
         );

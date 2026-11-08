@@ -172,7 +172,7 @@ pub async fn run_plugin_query(
     if backend == crate::db::DatabaseBackend::Sqlite {
         return run_query(db, sql, params).await;
     }
-    crate::raw_sql_guard::check_postgres_plugin_sql(sql, mode)?;
+    crate::raw_sql_guard::check_postgres_plugin_sql(sql, mode, restricted)?;
     let role = match mode {
         PluginSqlMode::Read => PLUGIN_ROLE_RO,
         PluginSqlMode::Write => PLUGIN_ROLE_RW,
@@ -216,6 +216,7 @@ pub async fn run_plugin_execute(
     crate::raw_sql_guard::check_postgres_plugin_sql(
         sql,
         crate::raw_sql_guard::PluginSqlMode::Write,
+        restricted,
     )?;
     let query = bind_params(crate::db::query(sql), params)?;
     let mut tx = db
@@ -342,10 +343,35 @@ fn plugin_role_setup_statements() -> Vec<String> {
         format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {PLUGIN_ROLE_RO}"),
         format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {PLUGIN_ROLE_RW}"),
         format!("GRANT USAGE ON SCHEMA public TO {PLUGIN_ROLE_RO}, {PLUGIN_ROLE_RW}"),
+        // The write role may create and manage its own tables in `public`
+        // (plugins are expected to use their own tables through raw SQL), so it
+        // needs CREATE. The read role does not.
+        format!("GRANT CREATE ON SCHEMA public TO {PLUGIN_ROLE_RW}"),
+        // A table the write role creates later must be readable by the read
+        // role (a `database:read` plugin runs under the read role). Default
+        // privileges apply to objects the write role creates from now on.
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {PLUGIN_ROLE_RW} IN SCHEMA public GRANT SELECT ON TABLES TO {PLUGIN_ROLE_RO}"
+        ),
         format!("ALTER ROLE {PLUGIN_ROLE_RO} SET search_path = public"),
         format!("ALTER ROLE {PLUGIN_ROLE_RW} SET search_path = public"),
         // Writes may need sequence counters; sequences hold no data of concern.
         format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {PLUGIN_ROLE_RW}"),
+        // Caller-owned tables already in `public` are owned by the HappyView
+        // role, so the restricted role cannot reach them without a grant. Grant
+        // every non-`happyview_` relation in `public` (tables, partitions and
+        // views) so a plugin keeps access to tables it created before the roles
+        // existed. Future caller tables are created by the write role itself and
+        // need nothing here. Protected internal tables are excluded by prefix.
+        format!(
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v') \
+             AND c.relname NOT LIKE 'happyview\\_%' AND c.relname <> '_sqlx_migrations' LOOP \
+             EXECUTE format('GRANT SELECT ON public.%I TO {PLUGIN_ROLE_RO}', r.relname); \
+             EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO {PLUGIN_ROLE_RW}', r.relname); \
+             END LOOP; END $$"
+        ),
     ];
     for rel in relations {
         stmts.push(format!("GRANT SELECT ON {rel} TO {PLUGIN_ROLE_RO}"));
@@ -611,6 +637,113 @@ mod tests {
         )
         .await
         .expect("a delete through the records view should run under the write role");
+    }
+
+    /// A plugin's own tables keep working under the write role: it can create
+    /// one (needs CREATE on `public`), write and read it. Proves the documented
+    /// caller-owned-table contract is preserved by the role layer.
+    #[tokio::test]
+    #[serial]
+    async fn caller_owned_tables_work_under_the_write_role() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        // Clean up any leftover from a previous run (as the owning connection).
+        crate::db::query("DROP TABLE IF EXISTS hv393_caller_state")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            "CREATE TABLE hv393_caller_state (k TEXT, v TEXT)",
+            &[],
+        )
+        .await
+        .expect("the write role can create its own table");
+        run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            "INSERT INTO hv393_caller_state (k, v) VALUES ($1, $2)",
+            &[json!("a"), json!("1")],
+        )
+        .await
+        .expect("the write role can write its own table");
+        let rows = run_plugin_query(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            PluginSqlMode::Write,
+            "SELECT v FROM hv393_caller_state WHERE k = $1",
+            &[json!("a")],
+        )
+        .await
+        .expect("the write role can read its own table");
+        assert_eq!(rows[0]["v"], json!("1"));
+
+        run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            "DROP TABLE hv393_caller_state",
+            &[],
+        )
+        .await
+        .expect("the write role can drop its own table");
+    }
+
+    /// A table the write role creates is readable by the read role, via the
+    /// default privileges set up at boot — so a `database:read` plugin can read
+    /// a table a `database:write` plugin created.
+    #[tokio::test]
+    #[serial]
+    async fn a_read_role_reads_a_table_the_write_role_created() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        crate::db::query("DROP TABLE IF EXISTS hv393_shared_state")
+            .execute(&db)
+            .await
+            .unwrap();
+        run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            "CREATE TABLE hv393_shared_state (k TEXT)",
+            &[],
+        )
+        .await
+        .expect("write role creates the table");
+        run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            "INSERT INTO hv393_shared_state (k) VALUES ($1)",
+            &[json!("v")],
+        )
+        .await
+        .unwrap();
+
+        // The read role (database:read) reads it.
+        let rows = run_plugin_query(
+            &db,
+            DatabaseBackend::Postgres,
+            true,
+            PluginSqlMode::Read,
+            "SELECT k FROM hv393_shared_state",
+            &[],
+        )
+        .await
+        .expect("the read role should read a table the write role created");
+        assert_eq!(rows[0]["k"], json!("v"));
+
+        crate::db::query("DROP TABLE IF EXISTS hv393_shared_state")
+            .execute(&db)
+            .await
+            .unwrap();
     }
 
     /// Proves the role is a real database boundary, not only a parser check: a
