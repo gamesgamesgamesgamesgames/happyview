@@ -104,6 +104,12 @@ pub struct AppState {
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
+
+    /// Whether `db.raw` on Postgres runs under the least-privileged
+    /// `happyview_plugin` role (set up at boot). `false` on SQLite and when the
+    /// role could not be created; there `db.raw` runs behind the tokenizer guard
+    /// on the main connection. See `lua::db_api::ensure_plugin_role`.
+    pub plugin_sql_restricted: bool,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {

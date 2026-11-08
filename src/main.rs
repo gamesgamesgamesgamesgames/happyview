@@ -50,6 +50,21 @@ async fn main() {
         "connected to database"
     );
 
+    // Set up the least-privileged role `db.raw` runs under on Postgres. Soft
+    // failure: without it, `db.raw` runs behind the tokenizer guard on the main
+    // connection as before.
+    let plugin_sql_restricted =
+        happyview::lua::db_api::ensure_plugin_role(&db_pool, db_backend).await;
+    if db_backend == db::DatabaseBackend::Postgres && !plugin_sql_restricted {
+        tracing::warn!(
+            "db.raw will run behind the tokenizer guard on the main database connection: the \
+             database role '{}' could not be set up. Grant the HappyView database role CREATEROLE, \
+             or pre-create that role and grant it to the HappyView role, to run db.raw under a \
+             least-privileged role.",
+            happyview::lua::db_api::PLUGIN_ROLE,
+        );
+    }
+
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.token_encryption_key.as_ref() {
         Some(key) => happyview::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
@@ -937,6 +952,7 @@ async fn main() {
         verbose_event_logging,
         client_jwks,
         telemetry_counters,
+        plugin_sql_restricted,
     };
 
     jetstream::spawn(state.clone(), collections_rx);

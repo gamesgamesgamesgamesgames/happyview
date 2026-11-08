@@ -687,10 +687,38 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                     }
                 }
 
-                let rows = query
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
+                let rows = if state.plugin_sql_restricted
+                    && state.db_backend == crate::db::DatabaseBackend::Postgres
+                {
+                    // Run under the least-privileged role in its own transaction,
+                    // so the role change and search_path stay off the pooled
+                    // connection the next caller reuses.
+                    let mut tx =
+                        state.db.begin().await.map_err(|e| {
+                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
+                        })?;
+                    crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE}"))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
+                    crate::db::query(&format!("SET LOCAL search_path = {PLUGIN_SCHEMA}, public"))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
+                    let rows = query
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
+                    rows
+                } else {
+                    query
+                        .fetch_all(&state.db)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?
+                };
 
                 // Convert rows to Lua tables
                 let mut lua_rows: Vec<mlua::Value> = Vec::with_capacity(rows.len());
@@ -738,6 +766,84 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
 
     lua.globals().set("db", db_table)?;
     Ok(())
+}
+
+// -- Least-privileged `db.raw` (Postgres) -----------------------------------
+//
+// On Postgres the guard in `check_raw_sql_tables` works on identifiers only, so
+// it is not the real boundary. `db.raw` therefore runs under a restricted role
+// granted only the allowlisted internal tables and with no access to the others,
+// so anything off the allowlist is denied by the database regardless of how the
+// statement is written. The role creates its own tables in a dedicated
+// `happyview_plugin` schema (first on its `search_path`, and not on HappyView's
+// own), so it cannot define an object HappyView's queries would resolve to. When
+// the role cannot be set up, `db.raw` keeps running on the main connection behind
+// the existing guard as before. SQLite is unchanged.
+
+/// The least-privileged role `db.raw` runs under on Postgres.
+pub const PLUGIN_ROLE: &str = "happyview_plugin";
+/// The schema that role may create its own tables in.
+pub const PLUGIN_SCHEMA: &str = "happyview_plugin";
+
+/// Ensure the restricted role and its schema exist, are granted exactly the
+/// allowlisted internal tables, and that the connecting role may `SET ROLE` to
+/// it. Postgres only; returns whether `db.raw` can run under the role.
+/// Idempotent, safe at every boot. Fails soft: if the connecting role lacks the
+/// privilege, the statements are swallowed and the `SET ROLE` probe decides.
+pub async fn ensure_plugin_role(pool: &sqlx::AnyPool, backend: crate::db::DatabaseBackend) -> bool {
+    if backend != crate::db::DatabaseBackend::Postgres {
+        return false;
+    }
+    for stmt in plugin_role_setup_statements() {
+        if let Err(e) = crate::db::query(&stmt).execute(pool).await {
+            tracing::debug!(error = %e, "db.raw plugin role setup statement did not apply");
+        }
+    }
+    let probe = async {
+        let mut tx = pool.begin().await.ok()?;
+        crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE}"))
+            .execute(&mut *tx)
+            .await
+            .ok()?;
+        tx.rollback().await.ok()?;
+        Some(())
+    };
+    probe.await.is_some()
+}
+
+fn plugin_role_setup_statements() -> Vec<String> {
+    let mut stmts = vec![
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{PLUGIN_ROLE}') THEN CREATE ROLE {PLUGIN_ROLE} NOLOGIN; END IF; END $$"
+        ),
+        format!("GRANT {PLUGIN_ROLE} TO CURRENT_USER"),
+        // The role's own tables live here, first on its search_path and not on
+        // HappyView's — so nothing it creates can shadow an object HappyView
+        // resolves (the CVE-2018-1058 class).
+        format!("CREATE SCHEMA IF NOT EXISTS {PLUGIN_SCHEMA} AUTHORIZATION {PLUGIN_ROLE}"),
+        // Re-sync internal-table grants from a clean slate.
+        format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {PLUGIN_ROLE}"),
+        format!("GRANT USAGE ON SCHEMA public TO {PLUGIN_ROLE}"),
+        format!("ALTER ROLE {PLUGIN_ROLE} SET search_path = {PLUGIN_SCHEMA}, public"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {PLUGIN_ROLE}"),
+        // Caller-owned tables already in public are owned by the HappyView role;
+        // grant the restricted role access so they stay reachable. New caller
+        // tables are created in the dedicated schema instead.
+        format!(
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v') \
+             AND c.relname NOT LIKE 'happyview\\_%' AND c.relname <> '_sqlx_migrations' LOOP \
+             EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO {PLUGIN_ROLE}', r.relname); \
+             END LOOP; END $$"
+        ),
+    ];
+    for rel in ALLOWED_INTERNAL_TABLES {
+        stmts.push(format!(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON {rel} TO {PLUGIN_ROLE}"
+        ));
+    }
+    stmts
 }
 
 #[cfg(test)]
@@ -888,6 +994,7 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
+            plugin_sql_restricted: false,
         }
     }
 
@@ -1339,6 +1446,37 @@ mod tests {
         assert!(
             !err.contains("invalid sortDirection"),
             "should have passed validation but got: {err}"
+        );
+    }
+
+    /// The restricted role gets its own schema, placed first on its search_path
+    /// and never on HappyView's, so an object it creates cannot be resolved by
+    /// HappyView's own queries. It is granted the allowlisted internal tables and
+    /// no others.
+    #[test]
+    fn plugin_role_setup_uses_a_dedicated_schema_first_on_the_path() {
+        let stmts = super::plugin_role_setup_statements();
+        let joined = stmts.join("\n");
+        assert!(
+            stmts.iter().any(|s| s.contains(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                super::PLUGIN_SCHEMA
+            ))),
+            "creates the dedicated schema:\n{joined}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains(&format!(
+                "ALTER ROLE {} SET search_path = {}, public",
+                super::PLUGIN_ROLE,
+                super::PLUGIN_SCHEMA
+            ))),
+            "puts the dedicated schema first on the role's search_path:\n{joined}"
+        );
+        // Granted an allowlisted internal table, and not a protected one.
+        assert!(stmts.iter().any(|s| s.contains("happyview_records")));
+        assert!(
+            !joined.contains("happyview_users") && !joined.contains("happyview_oauth"),
+            "must not grant protected tables:\n{joined}"
         );
     }
 }
