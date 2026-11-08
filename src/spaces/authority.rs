@@ -75,6 +75,7 @@ pub(crate) async fn create(
     .await
     .map_err(|e| AppError::Internal(format!("failed to look up a space DID: {e}")))?;
 
+    let reused = existing.is_some();
     let (did, signed, plc_state) = match existing {
         Some((did, genesis_op, plc_state, stored_rotation_key)) => {
             if creator_rotation_key.is_some()
@@ -107,7 +108,19 @@ pub(crate) async fn create(
         return Ok(did);
     }
     if publish {
-        crate::plc::submit_operation(&state.http, &state.config.plc_url, &did, &signed).await?;
+        // A row left `prepared` may name a DID the directory already holds:
+        // the answer to its submission was lost, or a concurrent create got
+        // there first. The directory refuses a second genesis for a DID, so
+        // its log is asked first, and again when a submission is refused.
+        let already = reused && in_directory(state, &did, &signed).await;
+        if !already
+            && let Err(e) =
+                crate::plc::submit_operation(&state.http, &state.config.plc_url, &did, &signed)
+                    .await
+            && !in_directory(state, &did, &signed).await
+        {
+            return Err(e);
+        }
     }
     crate::db::query(&adapt_sql(
         "UPDATE happyview_space_authorities SET plc_state = ?, updated_at = ? WHERE did = ?",
@@ -121,6 +134,19 @@ pub(crate) async fn create(
     .map_err(|e| AppError::Internal(format!("failed to record a space DID as published: {e}")))?;
 
     Ok(did)
+}
+
+/// Whether the directory's log for `did` holds `signed`. A log that cannot be
+/// read counts as not holding it.
+async fn in_directory(state: &AppState, did: &str, signed: &serde_json::Value) -> bool {
+    match crate::plc::fetch_operation_log(&state.http, &state.config.plc_url, did).await {
+        Ok(Some(ops)) => ops.iter().any(|op| op["sig"] == signed["sig"]),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(did, error = %e, "could not read a space DID's log");
+            false
+        }
+    }
 }
 
 /// Generate the keys and genesis operation for a new space DID, and store them
@@ -222,12 +248,20 @@ fn check_publishable(plc_url: &str, public_url: &str) -> Result<(), AppError> {
                     host != "localhost" && !host.ends_with(".localhost")
                 }
                 Some(url::Host::Ipv4(ip)) => {
+                    // 100.64.0.0/10, carrier-grade NAT space.
+                    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
                     !(ip.is_loopback()
                         || ip.is_private()
                         || ip.is_link_local()
-                        || ip.is_unspecified())
+                        || ip.is_unspecified()
+                        || shared)
                 }
-                Some(url::Host::Ipv6(ip)) => !(ip.is_loopback() || ip.is_unspecified()),
+                Some(url::Host::Ipv6(ip)) => {
+                    !(ip.is_loopback()
+                        || ip.is_unspecified()
+                        || ip.is_unique_local()
+                        || ip.is_unicast_link_local())
+                }
                 None => false,
             }
     });
@@ -387,6 +421,10 @@ mod tests {
             "https://happyview.localhost",
             "https://10.0.0.5",
             "https://[::1]",
+            "https://[fd12:3456::1]",
+            "https://[fe80::1]",
+            "https://100.64.0.1",
+            "https://100.127.255.254",
             "http://hv.example.com",
         ] {
             assert!(
@@ -395,6 +433,8 @@ mod tests {
             );
         }
         check_publishable("https://plc.directory", "https://hv.example.com").unwrap();
+        check_publishable("https://plc.directory", "https://100.128.0.1").unwrap();
+        check_publishable("https://plc.directory", "https://[2001:db8::1]").unwrap();
     }
 
     #[test]
