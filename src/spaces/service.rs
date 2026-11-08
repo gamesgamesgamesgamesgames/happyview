@@ -1081,8 +1081,40 @@ pub(crate) async fn update_space(
     if let Some(cfg) = config {
         space.config = cfg;
     }
-    db::update_space(&state.db, state.db_backend, &space).await?;
+    // Rules that now make a managedspace leave it no member list, as
+    // `updateSpace` does on a migration.
+    let managed = matches!(
+        crate::spaces::policy::SpacePolicy::of(&space),
+        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+    );
+    store_space(state, &space, managed).await?;
     Ok(space)
+}
+
+/// Store a space's fields and, with `discard_members`, discard its member
+/// list and its invites, all in one transaction, so a failure cannot leave a
+/// managedspace with the member list of the space it replaced.
+///
+/// The `UPDATE` takes the space's row first, as every member insert does
+/// (`db::lock_space_for_members`), so an insert racing this one either lands
+/// before the list is discarded or sees the new policy.
+pub(crate) async fn store_space(
+    state: &AppState,
+    space: &Space,
+    discard_members: bool,
+) -> Result<(), AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    db::update_space(&mut *tx, state.db_backend, space).await?;
+    if discard_members {
+        db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
+        // An outstanding invite would add a member once accepted.
+        db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))
 }
 
 pub(crate) async fn delete_space(

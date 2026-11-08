@@ -18,7 +18,7 @@ use crate::auth::XrpcClaims;
 use crate::error::AppError;
 use crate::spaces::policy::{MANAGEDSPACE, SpacePolicy};
 use crate::spaces::types::{Space, SpaceConfig};
-use crate::spaces::{db, scope, service};
+use crate::spaces::{scope, service};
 
 pub(crate) fn lifecycle_method_table() -> Vec<(String, MethodRouter<AppState>)> {
     vec![
@@ -176,23 +176,7 @@ async fn update_space(
         Err(_) => policy.kind() == MANAGEDSPACE,
     };
     policy.apply(&mut space);
-    // One transaction, so a failed removal cannot leave a managedspace with
-    // the member list of the memberspace it replaced. The `UPDATE` takes the
-    // space's row first, as every member insert does
-    // (`db::lock_space_for_members`), so an insert racing this one either
-    // lands before the list is discarded or sees the new policy.
-    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
-    db::update_space(&mut *tx, state.db_backend, &space).await?;
-    if migrating {
-        db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
-        // An outstanding invite would add a member once accepted.
-        db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
-    }
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))?;
+    service::store_space(&state, &space, migrating).await?;
     Ok(Json(serde_json::json!({})))
 }
 
