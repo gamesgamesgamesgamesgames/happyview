@@ -663,6 +663,15 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
         lua.create_async_function(move |lua, (sql, params): (String, Option<mlua::Table>)| {
             let state = state_raw.clone();
             async move {
+                // Refused: PLUGIN_SQL_DATABASE_URL was set but the login pool is
+                // unusable, or the plugin schema holds code from a login-pool
+                // session. Refuse db.raw rather than run it on the privileged
+                // connection.
+                if matches!(state.plugin_sql, crate::PluginSqlAccess::Refused) {
+                    return Err(mlua::Error::runtime(
+                        "db.raw is unavailable on this instance",
+                    ));
+                }
                 // Protect HappyView's internal tables (secrets, auth, config,
                 // AppView bookkeeping) from raw access; own tables are fine.
                 check_raw_sql_tables(&sql).map_err(mlua::Error::runtime)?;
@@ -687,37 +696,37 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                     }
                 }
 
-                let rows = if let Some(login_pool) = state.plugin_sql_pool.as_ref() {
-                    // The dedicated login pool: its connections are logged in as
-                    // the unprivileged `happyview_plugin` role, so `session_user`
-                    // is never the privileged HappyView role and there is no
-                    // privileged role for a `RESET ROLE` to return to. `DISCARD
-                    // ALL` on release keeps nothing on the pooled connection. The
-                    // transaction pins `search_path` to the plugin schema first.
-                    let mut tx = login_pool
-                        .begin()
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
-                    crate::db::query(&format!("SET LOCAL search_path = {PLUGIN_SCHEMA}, public"))
+                let rows =
+                    if let crate::PluginSqlAccess::LoginPool(login_pool) = &state.plugin_sql {
+                        // The dedicated login pool: its connections are logged in as
+                        // the unprivileged `happyview_plugin` role, so `session_user`
+                        // is never the privileged HappyView role and there is no
+                        // privileged role for a `RESET ROLE` to return to. `DISCARD
+                        // ALL` on release keeps nothing on the pooled connection. The
+                        // transaction pins `search_path` to the plugin schema first.
+                        let mut tx = login_pool.begin().await.map_err(|e| {
+                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
+                        })?;
+                        crate::db::query(&format!(
+                            "SET LOCAL search_path = {PLUGIN_SCHEMA}, public"
+                        ))
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
-                    let rows = query
-                        .fetch_all(&mut *tx)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
-                    rows
-                } else {
-                    // No login pool configured: run on the main connection behind
-                    // the tokenizer guard above, as before.
-                    query
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?
-                };
+                        let rows = query.fetch_all(&mut *tx).await.map_err(|e| {
+                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
+                        })?;
+                        tx.commit().await.map_err(|e| {
+                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
+                        })?;
+                        rows
+                    } else {
+                        // No login pool configured: run on the main connection behind
+                        // the tokenizer guard above, as before.
+                        query.fetch_all(&state.db).await.map_err(|e| {
+                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
+                        })?
+                    };
 
                 // Convert rows to Lua tables
                 let mut lua_rows: Vec<mlua::Value> = Vec::with_capacity(rows.len());
@@ -807,9 +816,16 @@ pub async fn ensure_plugin_schema(pool: &sqlx::AnyPool, backend: crate::db::Data
 
 /// Open the dedicated login pool for `db.raw` from `url` (a connection string for
 /// the `happyview_plugin` login role). Each released connection is reset with
-/// `DISCARD ALL`, so nothing a statement left on the session outlives it. Returns
-/// `None` (logged) when it cannot connect.
-pub async fn open_plugin_login_pool(url: &str) -> Option<sqlx::AnyPool> {
+/// `DISCARD ALL`, so nothing a statement left on the session outlives it.
+///
+/// **The role is verified, not trusted.** A URL that merely connects is not
+/// enough: if it named a privileged role, `db.raw` would run on a privileged
+/// session user — the condition the pool exists to rule out. After connecting,
+/// the session user is checked against `main_role` and refused unless it is
+/// unprivileged, not the main role or a member of it, has no access to the
+/// protected tables and no `CREATE` on `public`. Returns `None` (logged) when it
+/// cannot connect or fails the check.
+pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::AnyPool> {
     sqlx::any::install_default_drivers();
     let pool = sqlx::any::AnyPoolOptions::new()
         .max_connections(8)
@@ -825,11 +841,73 @@ pub async fn open_plugin_login_pool(url: &str) -> Option<sqlx::AnyPool> {
         .await
         .map_err(|e| tracing::warn!(error = %e, "could not open the db.raw login pool"))
         .ok()?;
-    if let Err(e) = crate::db::query("SELECT 1").fetch_optional(&pool).await {
-        tracing::warn!(error = %e, "the db.raw login pool could not run a query");
+    if !login_role_is_unprivileged(&pool, main_role).await {
         return None;
     }
     Some(pool)
+}
+
+/// Verify the pool's session user is a safe least-privileged role. `to_regclass`
+/// guards against a protected table being absent (a missing table reads as "no
+/// privilege", never an error). Any failure refuses the mode.
+async fn login_role_is_unprivileged(pool: &sqlx::AnyPool, main_role: &str) -> bool {
+    use sqlx::Row;
+    let sql = "SELECT (\
+        NOT r.rolsuper AND NOT r.rolcreaterole AND NOT r.rolcreatedb \
+        AND NOT r.rolreplication AND NOT r.rolbypassrls \
+        AND session_user <> $1 \
+        AND NOT pg_has_role(session_user, $1, 'MEMBER') \
+        AND NOT COALESCE(has_table_privilege(session_user, to_regclass('happyview_users'), 'SELECT'), false) \
+        AND NOT COALESCE(has_table_privilege(session_user, to_regclass('happyview_api_keys'), 'SELECT'), false) \
+        AND NOT COALESCE(has_table_privilege(session_user, to_regclass('happyview_dpop_keys'), 'SELECT'), false) \
+        AND NOT COALESCE(has_table_privilege(session_user, to_regclass('happyview_oauth_sessions'), 'SELECT'), false) \
+        AND NOT has_schema_privilege(session_user, 'public', 'CREATE') \
+    ) AS ok FROM pg_roles r WHERE r.rolname = session_user";
+    let ok = match crate::db::query(sql)
+        .bind(main_role)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(row)) => row.try_get::<bool, _>("ok").unwrap_or(false),
+        _ => false,
+    };
+    if !ok {
+        tracing::error!(
+            "PLUGIN_SQL_DATABASE_URL names a role that is not a safe least-privileged plugin \
+             role; refusing the db.raw login pool. Point it at the unprivileged \
+             'happyview_plugin' role."
+        );
+    }
+    ok
+}
+
+/// Whether the plugin schema holds any function, procedure or (non-internal)
+/// trigger left from a login-pool session. Postgres only; a query error reads as
+/// "present" (fail closed).
+pub async fn plugin_schema_has_code(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> bool {
+    use sqlx::Row;
+    if backend != crate::db::DatabaseBackend::Postgres {
+        return false;
+    }
+    let sql = "SELECT EXISTS (\
+        SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'happyview_plugin' \
+        UNION ALL \
+        SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'happyview_plugin' AND NOT t.tgisinternal \
+    ) AS present";
+    match crate::db::query(sql).fetch_optional(pool).await {
+        Ok(Some(row)) => row.try_get::<bool, _>("present").unwrap_or(true),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(error = %e, "could not check the plugin schema for code; failing closed");
+            true
+        }
+    }
 }
 
 fn plugin_schema_setup_statements() -> Vec<String> {
@@ -1011,7 +1089,7 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-            plugin_sql_pool: None,
+            plugin_sql: crate::PluginSqlAccess::Guard,
         }
     }
 
