@@ -95,7 +95,9 @@ services:
         max-file: "5"
 
   happyview:
-    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:-latest}
+    # No default: `latest` is the newest stable release, which is v2 until
+    # v3 ships, so leaving this unset would run a different major line.
+    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:?Set HAPPYVIEW_VERSION to the release to run, such as 3.0.0-beta.1}
     restart: unless-stopped
 
     depends_on:
