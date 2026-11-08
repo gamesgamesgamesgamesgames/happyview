@@ -120,22 +120,20 @@ fn syncer_key() -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
 }
 
-/// `getSpaceCredential` as the spec shapes it: the delegation token as the
-/// authorization token, signed by the key to bind the credential to.
+/// `getSpaceCredential` as Proposal 0016 shapes it: the space, the key to
+/// bind the credential to, and the delegation token, all in the body.
 fn credential_req(delegation_token: &str, key: Option<&p256::ecdsa::SigningKey>) -> Request<Body> {
-    let authorization = format!("Bearer {delegation_token}");
-    let mut req = Request::builder()
+    let mut body = json!({ "space": space_uri(), "delegationToken": delegation_token });
+    if let Some(key) = key {
+        body["credentialKid"] = json!(happyview::spaces::http_signature::did_key(
+            key.verifying_key()
+        ));
+    }
+    Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.getSpaceCredential")
         .header("content-type", "application/json")
-        .header("authorization", &authorization);
-    if let Some(key) = key {
-        let signed = happyview::spaces::http_signature::sign(key, &authorization, None);
-        for name in ["signature-input", "signature"] {
-            req = req.header(name, signed[name].clone());
-        }
-    }
-    req.body(Body::from(json!({ "space": space_uri() }).to_string()))
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -178,11 +176,12 @@ async fn mints_a_credential_bound_to_the_key_that_signed_for_it() {
     );
 }
 
-/// A delegation token alone is not enough: without a signature there is no key
-/// to bind, and the credential would be a bearer token.
+/// A delegation token alone is not enough: without a key to bind, the
+/// credential would be a bearer token. A key that is not P-256 cannot sign
+/// the requests that use it.
 #[tokio::test]
 #[serial]
-async fn refuses_a_delegation_token_without_a_signature() {
+async fn refuses_a_request_that_names_no_p256_key() {
     common::require_db!();
     let app = TestApp::new_with_encryption().await;
     let token = setup_and_get_delegation_token(&app).await;
@@ -193,8 +192,18 @@ async fn refuses_a_delegation_token_without_a_signature() {
         .oneshot(credential_req(&token, None))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(json_of(resp).await["error"], json!("BadSpaceSignature"));
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+
+    let mut req = credential_req(&token, Some(&syncer_key()));
+    let body = json!({
+        "space": space_uri(),
+        "delegationToken": token,
+        "credentialKid": "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+    });
+    *req.body_mut() = Body::from(body.to_string());
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("InvalidRequest"));
 }
 
 /// A PDS that serves spaces mints delegation tokens with the account's own
@@ -236,7 +245,7 @@ async fn accepts_a_delegation_token_signed_by_the_account() {
         &DelegationTokenClaims {
             iss: MEMBER.to_string(),
             sub: space_uri(),
-            aud: format!("{AUTHORITY}#atproto_space_host"),
+            aud: format!("{AUTHORITY}#atproto_pds"),
             iat: now,
             exp: now + 60,
             jti: Uuid::new_v4().to_string(),
@@ -302,7 +311,7 @@ async fn refuses_a_delegation_token_signed_with_the_encryption_key() {
         &DelegationTokenClaims {
             iss: MEMBER.to_string(),
             sub: space_uri(),
-            aud: format!("{AUTHORITY}#atproto_space_host"),
+            aud: format!("{AUTHORITY}#atproto_pds"),
             iat: now,
             exp: now + 60,
             jti: Uuid::new_v4().to_string(),
@@ -395,16 +404,18 @@ async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
     assert_eq!(claims_of(&token)["aud"], format!("{space_did}#atproto_pds"));
 
     let key = syncer_key();
-    let authorization = format!("Bearer {token}");
-    let signed = happyview::spaces::http_signature::sign(&key, &authorization, None);
     let req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.getSpaceCredential")
         .header("content-type", "application/json")
-        .header("authorization", &authorization)
-        .header("signature-input", signed["signature-input"].clone())
-        .header("signature", signed["signature"].clone())
-        .body(Body::from(json!({ "space": space }).to_string()))
+        .body(Body::from(
+            json!({
+                "space": space,
+                "credentialKid": happyview::spaces::http_signature::did_key(key.verifying_key()),
+                "delegationToken": token,
+            })
+            .to_string(),
+        ))
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -427,4 +438,481 @@ async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
     verifying
         .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
         .expect("the credential verifies against the space DID's published #atproto key");
+}
+
+/// Seed a space under `AUTHORITY` whose read policy is `read_policy`.
+async fn seed_space(app: &TestApp, skey: &str, read_policy: Policy) -> String {
+    let now = now_rfc3339();
+    spaces_db::create_space(
+        &app.state.db,
+        app.state.db_backend,
+        &Space {
+            id: Uuid::new_v4().to_string(),
+            did: AUTHORITY.to_string(),
+            authority_did: AUTHORITY.to_string(),
+            creator_did: AUTHORITY.to_string(),
+            type_nsid: "com.example.mint".to_string(),
+            skey: skey.to_string(),
+            display_name: None,
+            description: None,
+            read_policy,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    format!("at://{AUTHORITY}/space/com.example.mint/{skey}")
+}
+
+fn bare_credential_req(space: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "credentialKid": happyview::spaces::http_signature::did_key(
+                    syncer_key().verifying_key()
+                ),
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// A space anyone may read issues a credential with no delegation token, so a
+/// syncer can read it without acting for a user.
+#[tokio::test]
+#[serial]
+async fn a_public_space_issues_a_credential_without_a_delegation_token() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "public", Policy::Public).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_of(resp).await["credential"].is_string());
+}
+
+/// Any other space needs to know who it is issuing to, and says so in the
+/// error code.
+#[tokio::test]
+#[serial]
+async fn a_member_space_refuses_a_request_without_a_delegation_token() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "members", Policy::MemberList).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("UserNotAuthorized"));
+}
+
+/// A delegation token is addressed to the space host as the authority's
+/// `#atproto_pds`; one addressed to the earlier `#atproto_space_host` is
+/// refused.
+#[tokio::test]
+#[serial]
+async fn refuses_a_delegation_token_addressed_to_the_earlier_service() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    setup_and_get_delegation_token(&app).await;
+    let key = happyview::spaces::delegation_key::load(
+        &app.state.db,
+        app.state.db_backend,
+        &app.state.config.keyring().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("a delegation key, minted by getDelegationToken");
+    let now = chrono::Utc::now().timestamp() as u64;
+    let token = sign_delegation_token(
+        &DelegationTokenClaims {
+            iss: MEMBER.to_string(),
+            sub: space_uri(),
+            aud: format!("{AUTHORITY}#atproto_space_host"),
+            iat: now,
+            exp: now + 60,
+            jti: Uuid::new_v4().to_string(),
+        },
+        &key,
+    )
+    .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidDelegationToken")
+    );
+}
+
+/// An authority revokes credentials by `jti` with `notifyCredentialRevoked`.
+/// Only the space's authority may, a repeat changes nothing, and a revoked
+/// credential is refused from then on.
+#[tokio::test]
+#[serial]
+async fn the_authority_revokes_a_credential_by_jti() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let credential = json_of(resp).await["credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let jti = claims_of(&credential)["jti"].as_str().unwrap().to_string();
+    let space = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let revoke = |auth: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.notifyCredentialRevoked")
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .header("host", "127.0.0.1:0")
+            .body(Body::from(
+                json!({ "space": space_uri(), "credentials": [jti] }).to_string(),
+            ))
+            .unwrap()
+    };
+    let lxm = Some("com.atproto.space.notifyCredentialRevoked");
+
+    let stranger = app
+        .service_auth_jwt_for(&plc_store, "did:plc:stranger", &instance_did, "", lxm)
+        .await;
+    let resp = app.router.clone().oneshot(revoke(stranger)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !spaces_db::is_space_credential_jti_revoked(
+            &app.state.db,
+            app.state.db_backend,
+            &space.id,
+            &jti
+        )
+        .await
+        .unwrap()
+    );
+
+    for _ in 0..2 {
+        let auth = app
+            .service_auth_jwt_for(&plc_store, AUTHORITY, &instance_did, "", lxm)
+            .await;
+        let resp = app.router.clone().oneshot(revoke(auth)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert!(
+        spaces_db::is_space_credential_jti_revoked(
+            &app.state.db,
+            app.state.db_backend,
+            &space.id,
+            &jti
+        )
+        .await
+        .unwrap()
+    );
+}
+
+/// A client attestation is addressed to the space host as the authority's
+/// `#atproto_pds`, and is single use.
+#[tokio::test]
+#[serial]
+async fn a_client_attestation_is_addressed_to_the_space_host_and_used_once() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "attested", Policy::Public).await;
+
+    let app_key = syncer_key();
+    let point = app_key.verifying_key().to_sec1_point(false);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Mock::given(method("GET"))
+        .and(path("/client-metadata.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jwks": { "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": "k1",
+                "x": b64.encode(point.x().unwrap()),
+                "y": b64.encode(point.y().unwrap()),
+            }]},
+        })))
+        .mount(&app.mock_server)
+        .await;
+    let client_id = format!("{}/client-metadata.json", app.mock_server.uri());
+
+    let attestation = |aud: String| {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let header = b64.encode(
+            json!({ "typ": "atproto-client-attestation+jwt", "alg": "ES256", "kid": "k1" })
+                .to_string(),
+        );
+        let payload = b64.encode(
+            json!({
+                "iss": client_id, "sub": client_id, "aud": aud,
+                "iat": now, "exp": now + 60, "jti": Uuid::new_v4().to_string(),
+            })
+            .to_string(),
+        );
+        let signature: p256::ecdsa::Signature =
+            app_key.sign(format!("{header}.{payload}").as_bytes());
+        format!("{header}.{payload}.{}", b64.encode(signature.to_bytes()))
+    };
+    let request = |attestation: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "space": space,
+                    "credentialKid": happyview::spaces::http_signature::did_key(
+                        syncer_key().verifying_key()
+                    ),
+                    "clientAttestation": attestation,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let bare = attestation(AUTHORITY.to_string());
+    let resp = app.router.clone().oneshot(request(&bare)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidClientAttestation")
+    );
+
+    let addressed = attestation(format!("{AUTHORITY}#atproto_pds"));
+    let resp = app
+        .router
+        .clone()
+        .oneshot(request(&addressed))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(request(&addressed))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidClientAttestation")
+    );
+}
+
+/// Create a space on its own DID through `createSpace` as `creator`,
+/// returning its uri and DID.
+async fn create_on_its_own_did(app: &TestApp, creator: &str, skey: &str) -> (String, String) {
+    let (name, value) = cookie_for(app, creator);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "spaceType": "com.example.mint", "skey": skey }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let uri = json_of(resp).await["uri"].as_str().unwrap().to_string();
+    let did = uri
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    (uri, did)
+}
+
+/// A revocation's service auth is bound to its space: one addressed to
+/// another space's DID is refused, though this instance holds both and the
+/// caller is the authority it names.
+#[tokio::test]
+#[serial]
+async fn a_revocation_addressed_to_another_space_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let (space, space_did) = create_on_its_own_did(&app, &creator, "revoked").await;
+    let (_, other_did) = create_on_its_own_did(&app, &creator, "elsewhere").await;
+
+    let revoke = |auth: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.notifyCredentialRevoked")
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .body(Body::from(
+                json!({ "space": space, "credentials": ["some-jti"] }).to_string(),
+            ))
+            .unwrap()
+    };
+    let lxm = Some("com.atproto.space.notifyCredentialRevoked");
+
+    let misaddressed = app
+        .service_auth_jwt_for(&plc_store, &space_did, &other_did, "#atproto_pds", lxm)
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(revoke(misaddressed))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadServiceAudience"));
+
+    let addressed = app
+        .service_auth_jwt_for(&plc_store, &space_did, &space_did, "#atproto_pds", lxm)
+        .await;
+    let resp = app.router.clone().oneshot(revoke(addressed)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Anonymous credential requests, which public spaces allow, spend the
+/// anonymous rate-limit bucket.
+#[tokio::test]
+#[serial]
+async fn anonymous_credential_requests_are_rate_limited() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "limited", Policy::Public).await;
+    app.state.rate_limiter.register_client_limit(
+        "anonymous".into(),
+        Some(1),
+        Some(0.000_1),
+        100,
+        2.0,
+    );
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// The anonymous bucket is charged before a delegation token is looked at, so
+/// a forged token cannot skip it, nor buy an issuer lookup per request.
+#[tokio::test]
+#[serial]
+async fn a_delegation_token_does_not_skip_the_rate_limit() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "forged", Policy::MemberList).await;
+    app.state.rate_limiter.register_client_limit(
+        "anonymous".into(),
+        Some(1),
+        Some(0.000_1),
+        100,
+        2.0,
+    );
+
+    let mut bytes = [0u8; 32];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
+    }
+    let now = chrono::Utc::now().timestamp() as u64;
+    let forged = sign_delegation_token(
+        &DelegationTokenClaims {
+            iss: "did:web:forged.example.com".to_string(),
+            sub: space.clone(),
+            aud: format!("{AUTHORITY}#atproto_pds"),
+            iat: now,
+            exp: now + 60,
+            jti: Uuid::new_v4().to_string(),
+        },
+        &k256::ecdsa::SigningKey::from_slice(&bytes).unwrap(),
+    )
+    .unwrap();
+    let request = |token: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "space": space,
+                    "credentialKid": happyview::spaces::http_signature::did_key(
+                        syncer_key().verifying_key()
+                    ),
+                    "delegationToken": token,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let first = app.router.clone().oneshot(request("")).await.unwrap();
+    assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    for token in ["", forged.as_str()] {
+        let resp = app.router.clone().oneshot(request(token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{token:?}");
+    }
 }
