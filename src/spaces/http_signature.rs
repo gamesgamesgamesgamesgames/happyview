@@ -485,7 +485,6 @@ mod tests {
             r#"("atproto-space-audience" "authorization");tag="atproto-space-credential""#,
             r#"("authorization" "atproto-space-audience" "content-type");tag="atproto-space-credential""#,
             r#"("authorization";sf "atproto-space-audience");tag="atproto-space-credential""#,
-            "not-a-list",
         ] {
             let mut headers = credential_headers(&key);
             set(
@@ -493,8 +492,16 @@ mod tests {
                 "signature-input",
                 &format!("atproto-space-credential={components}"),
             );
-            assert!(verify(&headers, &did).is_err(), "{components}");
+            let err = verify(&headers, &did).unwrap_err();
+            assert!(err.0.contains("must cover exactly"), "{components}: {err}");
         }
+        let mut headers = credential_headers(&key);
+        set(
+            &mut headers,
+            "signature-input",
+            "atproto-space-credential=not-a-list",
+        );
+        assert!(verify(&headers, &did).is_err());
     }
 
     #[test]

@@ -749,3 +749,107 @@ async fn a_client_attestation_is_addressed_to_the_space_host_and_used_once() {
         json!("InvalidClientAttestation")
     );
 }
+
+/// Create a space on its own DID through `createSpace` as `creator`,
+/// returning its uri and DID.
+async fn create_on_its_own_did(app: &TestApp, creator: &str, skey: &str) -> (String, String) {
+    let (name, value) = cookie_for(app, creator);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "spaceType": "com.example.mint", "skey": skey }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let uri = json_of(resp).await["uri"].as_str().unwrap().to_string();
+    let did = uri
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    (uri, did)
+}
+
+/// A revocation's service auth is bound to its space: one addressed to
+/// another space's DID is refused, though this instance holds both and the
+/// caller is the authority it names.
+#[tokio::test]
+#[serial]
+async fn a_revocation_addressed_to_another_space_is_refused() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let (space, space_did) = create_on_its_own_did(&app, &creator, "revoked").await;
+    let (_, other_did) = create_on_its_own_did(&app, &creator, "elsewhere").await;
+
+    let revoke = |auth: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.notifyCredentialRevoked")
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .body(Body::from(
+                json!({ "space": space, "credentials": ["some-jti"] }).to_string(),
+            ))
+            .unwrap()
+    };
+    let lxm = Some("com.atproto.space.notifyCredentialRevoked");
+
+    let misaddressed = app
+        .service_auth_jwt_for(&plc_store, &space_did, &other_did, "#atproto_pds", lxm)
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(revoke(misaddressed))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadServiceAudience"));
+
+    let addressed = app
+        .service_auth_jwt_for(&plc_store, &space_did, &space_did, "#atproto_pds", lxm)
+        .await;
+    let resp = app.router.clone().oneshot(revoke(addressed)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Anonymous credential requests, which public spaces allow, spend the
+/// anonymous rate-limit bucket.
+#[tokio::test]
+#[serial]
+async fn anonymous_credential_requests_are_rate_limited() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "limited", Policy::Public).await;
+    app.state.rate_limiter.register_client_limit(
+        "anonymous".into(),
+        Some(1),
+        Some(0.000_1),
+        100,
+        2.0,
+    );
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
