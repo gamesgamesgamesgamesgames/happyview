@@ -687,18 +687,15 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                     }
                 }
 
-                let rows = if state.plugin_sql_restricted
-                    && state.db_backend == crate::db::DatabaseBackend::Postgres
-                {
-                    // Run under the least-privileged role in its own transaction,
-                    // so the role change and search_path stay off the pooled
-                    // connection the next caller reuses.
-                    let mut tx =
-                        state.db.begin().await.map_err(|e| {
-                            mlua::Error::runtime(format!("db.raw query failed: {e}"))
-                        })?;
-                    crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE}"))
-                        .execute(&mut *tx)
+                let rows = if let Some(login_pool) = state.plugin_sql_pool.as_ref() {
+                    // The dedicated login pool: its connections are logged in as
+                    // the unprivileged `happyview_plugin` role, so `session_user`
+                    // is never the privileged HappyView role and there is no
+                    // privileged role for a `RESET ROLE` to return to. `DISCARD
+                    // ALL` on release keeps nothing on the pooled connection. The
+                    // transaction pins `search_path` to the plugin schema first.
+                    let mut tx = login_pool
+                        .begin()
                         .await
                         .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
                     crate::db::query(&format!("SET LOCAL search_path = {PLUGIN_SCHEMA}, public"))
@@ -714,6 +711,8 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                         .map_err(|e| mlua::Error::runtime(format!("db.raw query failed: {e}")))?;
                     rows
                 } else {
+                    // No login pool configured: run on the main connection behind
+                    // the tokenizer guard above, as before.
                     query
                         .fetch_all(&state.db)
                         .await
@@ -771,64 +770,82 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
 // -- Least-privileged `db.raw` (Postgres) -----------------------------------
 //
 // On Postgres the guard in `check_raw_sql_tables` works on identifiers only, so
-// it is not the real boundary. `db.raw` therefore runs under a restricted role
-// granted only the allowlisted internal tables and with no access to the others,
-// so anything off the allowlist is denied by the database regardless of how the
-// statement is written. The role creates its own tables in a dedicated
-// `happyview_plugin` schema (first on its `search_path`, and not on HappyView's
-// own), so it cannot define an object HappyView's queries would resolve to. When
-// the role cannot be set up, `db.raw` keeps running on the main connection behind
-// the existing guard as before. SQLite is unchanged.
+// it is not the real boundary (SQL hidden in a string a built-in executes never
+// appears as an identifier, and nothing stops a `RESET ROLE`). `db.raw` therefore
+// runs on a dedicated pool that logs in **as** the unprivileged `happyview_plugin`
+// role: its session user has no access to HappyView's tables and there is no
+// privileged role to switch back to, so anything off the allowlisted tables is
+// denied by the database however the statement is written. The role's own tables
+// live in a dedicated `happyview_plugin` schema, first on its `search_path` and
+// never on HappyView's, so it cannot define an object HappyView would resolve.
+// When no login pool is configured (`PLUGIN_SQL_DATABASE_URL` unset), `db.raw`
+// keeps running on the main connection behind the existing guard. SQLite is
+// unchanged.
 
-/// The least-privileged role `db.raw` runs under on Postgres.
+/// The unprivileged role the login pool connects as.
 pub const PLUGIN_ROLE: &str = "happyview_plugin";
-/// The schema that role may create its own tables in.
+/// The schema that role creates its own tables in.
 pub const PLUGIN_SCHEMA: &str = "happyview_plugin";
 
-/// Ensure the restricted role and its schema exist, are granted exactly the
-/// allowlisted internal tables, and that the connecting role may `SET ROLE` to
-/// it. Postgres only; returns whether `db.raw` can run under the role.
-/// Idempotent, safe at every boot. Fails soft: if the connecting role lacks the
-/// privilege, the statements are swallowed and the `SET ROLE` probe decides.
-pub async fn ensure_plugin_role(pool: &sqlx::AnyPool, backend: crate::db::DatabaseBackend) -> bool {
+/// Ensure the plugin schema exists and the `happyview_plugin` login role is
+/// granted exactly the allowlisted internal tables (and the plugin schema it
+/// creates its own objects in). Postgres only, idempotent, and fails soft: the
+/// login role is provisioned out of band (it needs a password), so when it is
+/// absent the grants are swallowed and `db.raw` falls back to the main-pool
+/// guard. The schema is owned by the connecting HappyView role, which grants the
+/// login role CREATE on it, so no role membership is required.
+pub async fn ensure_plugin_schema(pool: &sqlx::AnyPool, backend: crate::db::DatabaseBackend) {
     if backend != crate::db::DatabaseBackend::Postgres {
-        return false;
+        return;
     }
-    for stmt in plugin_role_setup_statements() {
+    for stmt in plugin_schema_setup_statements() {
         if let Err(e) = crate::db::query(&stmt).execute(pool).await {
-            tracing::debug!(error = %e, "db.raw plugin role setup statement did not apply");
+            tracing::debug!(error = %e, "db.raw plugin schema setup statement did not apply");
         }
     }
-    let probe = async {
-        let mut tx = pool.begin().await.ok()?;
-        crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE}"))
-            .execute(&mut *tx)
-            .await
-            .ok()?;
-        tx.rollback().await.ok()?;
-        Some(())
-    };
-    probe.await.is_some()
 }
 
-fn plugin_role_setup_statements() -> Vec<String> {
+/// Open the dedicated login pool for `db.raw` from `url` (a connection string for
+/// the `happyview_plugin` login role). Each released connection is reset with
+/// `DISCARD ALL`, so nothing a statement left on the session outlives it. Returns
+/// `None` (logged) when it cannot connect.
+pub async fn open_plugin_login_pool(url: &str) -> Option<sqlx::AnyPool> {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                crate::db::query("DISCARD ALL").execute(&mut *conn).await?;
+                Ok(true)
+            })
+        })
+        .connect(url)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "could not open the db.raw login pool"))
+        .ok()?;
+    if let Err(e) = crate::db::query("SELECT 1").fetch_optional(&pool).await {
+        tracing::warn!(error = %e, "the db.raw login pool could not run a query");
+        return None;
+    }
+    Some(pool)
+}
+
+fn plugin_schema_setup_statements() -> Vec<String> {
     let mut stmts = vec![
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{PLUGIN_ROLE}') THEN CREATE ROLE {PLUGIN_ROLE} NOLOGIN; END IF; END $$"
-        ),
-        format!("GRANT {PLUGIN_ROLE} TO CURRENT_USER"),
-        // The role's own tables live here, first on its search_path and not on
-        // HappyView's — so nothing it creates can shadow an object HappyView
-        // resolves (the CVE-2018-1058 class).
-        format!("CREATE SCHEMA IF NOT EXISTS {PLUGIN_SCHEMA} AUTHORIZATION {PLUGIN_ROLE}"),
-        // Re-sync internal-table grants from a clean slate.
-        format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {PLUGIN_ROLE}"),
+        // The plugin's own objects live here, first on its search_path and never
+        // on HappyView's — so nothing it defines can shadow an object HappyView
+        // resolves (the CVE-2018-1058 class). The schema is owned by the
+        // HappyView role; the login role is granted CREATE on it.
+        format!("CREATE SCHEMA IF NOT EXISTS {PLUGIN_SCHEMA}"),
+        format!("GRANT USAGE, CREATE ON SCHEMA {PLUGIN_SCHEMA} TO {PLUGIN_ROLE}"),
         format!("GRANT USAGE ON SCHEMA public TO {PLUGIN_ROLE}"),
         format!("ALTER ROLE {PLUGIN_ROLE} SET search_path = {PLUGIN_SCHEMA}, public"),
         format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {PLUGIN_ROLE}"),
         // Caller-owned tables already in public are owned by the HappyView role;
-        // grant the restricted role access so they stay reachable. New caller
-        // tables are created in the dedicated schema instead.
+        // grant the login role access so they stay reachable. New caller tables
+        // are created in the dedicated schema instead.
         format!(
             "DO $$ DECLARE r record; BEGIN \
              FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -994,7 +1011,7 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-            plugin_sql_restricted: false,
+            plugin_sql_pool: None,
         }
     }
 
@@ -1455,7 +1472,7 @@ mod tests {
     /// no others.
     #[test]
     fn plugin_role_setup_uses_a_dedicated_schema_first_on_the_path() {
-        let stmts = super::plugin_role_setup_statements();
+        let stmts = super::plugin_schema_setup_statements();
         let joined = stmts.join("\n");
         assert!(
             stmts.iter().any(|s| s.contains(&format!(

@@ -50,19 +50,32 @@ async fn main() {
         "connected to database"
     );
 
-    // Set up the least-privileged role `db.raw` runs under on Postgres. Soft
-    // failure: without it, `db.raw` runs behind the tokenizer guard on the main
+    // Set up the plugin schema and grants, then open the dedicated login pool
+    // `db.raw` runs on if `PLUGIN_SQL_DATABASE_URL` is configured. Soft failure:
+    // without a login pool, `db.raw` runs behind the tokenizer guard on the main
     // connection as before.
-    let plugin_sql_restricted =
-        happyview::lua::db_api::ensure_plugin_role(&db_pool, db_backend).await;
-    if db_backend == db::DatabaseBackend::Postgres && !plugin_sql_restricted {
-        tracing::warn!(
-            "db.raw will run behind the tokenizer guard on the main database connection: the \
-             database role '{}' could not be set up. Grant the HappyView database role CREATEROLE, \
-             or pre-create that role and grant it to the HappyView role, to run db.raw under a \
-             least-privileged role.",
-            happyview::lua::db_api::PLUGIN_ROLE,
-        );
+    happyview::lua::db_api::ensure_plugin_schema(&db_pool, db_backend).await;
+    let plugin_sql_pool = if db_backend == db::DatabaseBackend::Postgres {
+        match std::env::var("PLUGIN_SQL_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => {
+                happyview::lua::db_api::open_plugin_login_pool(url.trim()).await
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if db_backend == db::DatabaseBackend::Postgres {
+        if plugin_sql_pool.is_some() {
+            info!("db.raw runs on the dedicated login pool as the unprivileged plugin role");
+        } else {
+            tracing::warn!(
+                "db.raw runs behind the tokenizer guard on the main database connection: set \
+                 PLUGIN_SQL_DATABASE_URL to the '{}' login role to run it on a dedicated \
+                 least-privileged pool.",
+                happyview::lua::db_api::PLUGIN_ROLE,
+            );
+        }
     }
 
     // The backfill re-mints commits, so it needs the space signing key.
@@ -952,7 +965,7 @@ async fn main() {
         verbose_event_logging,
         client_jwks,
         telemetry_counters,
-        plugin_sql_restricted,
+        plugin_sql_pool,
     };
 
     jetstream::spawn(state.clone(), collections_rx);

@@ -105,11 +105,12 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
 
-    /// Whether `db.raw` on Postgres runs under the least-privileged
-    /// `happyview_plugin` role (set up at boot). `false` on SQLite and when the
-    /// role could not be created; there `db.raw` runs behind the tokenizer guard
-    /// on the main connection. See `lua::db_api::ensure_plugin_role`.
-    pub plugin_sql_restricted: bool,
+    /// The dedicated login pool for `db.raw` on Postgres, connecting **as** the
+    /// unprivileged `happyview_plugin` role. Present only when
+    /// `PLUGIN_SQL_DATABASE_URL` is configured and the pool connected; then
+    /// `db.raw` runs here. Otherwise it runs on the main connection behind the
+    /// tokenizer guard. See `lua::db_api::open_plugin_login_pool`.
+    pub plugin_sql_pool: Option<sqlx::AnyPool>,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {
