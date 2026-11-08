@@ -106,6 +106,20 @@ pub(crate) async fn verify_space_credential(
             message: "space credential is for a different space".into(),
         });
     }
+    // A space recreated with its type and key keeps its DID, its key and its
+    // address, so a credential minted for the deleted space would verify. It
+    // predates this space, and is refused. Compared in whole seconds, as
+    // `iat` is.
+    let created = chrono::DateTime::parse_from_rfc3339(&space.created_at)
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    if (claims.iat as i64) < created {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "InvalidCredential",
+            message: "space credential was issued before this space was created".into(),
+        });
+    }
     if db::is_space_credential_jti_revoked(&state.db, state.db_backend, &space.id, &claims.jti)
         .await?
     {
@@ -835,28 +849,6 @@ pub(crate) async fn delete_record(
     Ok(())
 }
 
-/// The authority for a space this instance is about to create.
-///
-/// Peers find a space's credential key and host through its authority's DID
-/// document, so the authority must be a DID whose document points here: this
-/// instance's own. Without a published identity nothing resolves to this
-/// instance, and the space is anchored on the creator's DID.
-async fn space_authority_for_new_space(state: &AppState, creator_did: &str) -> String {
-    match crate::auth::service_auth::instance_did(
-        &state.db,
-        state.db_backend,
-        &state.config.public_url,
-    )
-    .await
-    {
-        Ok(did) => did,
-        Err(e) => {
-            tracing::debug!("creating a space under its creator's DID: {e}");
-            creator_did.to_string()
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_space(
     state: &AppState,
@@ -869,18 +861,26 @@ pub(crate) async fn create_space(
     write_policy: Option<Policy>,
     app_access: Option<AppAccess>,
     config: Option<SpaceConfig>,
+    creator_rotation_key: Option<&str>,
 ) -> Result<Space, AppError> {
     if type_nsid.is_empty() || skey.is_empty() {
         return Err(AppError::BadRequest("type and skey are required".into()));
     }
-    let authority = space_authority_for_new_space(state, did).await;
-    let existing =
-        db::get_space_by_address(&state.db, state.db_backend, &authority, type_nsid, skey).await?;
-    if existing.is_some() {
+    // Every space gets a DID of its own, so no two can share an address. A
+    // creator still cannot make two spaces with one type and key: callers
+    // create spaces idempotently by name, and a second would split its members.
+    // Checked before the DID is created, so a refusal leaves none behind.
+    let taken = db::list_spaces_by_owner(&state.db, state.db_backend, did)
+        .await?
+        .into_iter()
+        .any(|s| s.type_nsid == type_nsid && s.skey == skey);
+    if taken {
         return Err(AppError::Conflict(
-            "A space with this address already exists".into(),
+            "You already have a space with this type and key".into(),
         ));
     }
+    let authority =
+        crate::spaces::authority::create(state, did, type_nsid, skey, creator_rotation_key).await?;
     let mut config = config.unwrap_or_default();
     if let Some(decl) = state.lexicons.get_space_declaration(type_nsid).await
         && let Some(collections) = decl.space_collections
@@ -2092,6 +2092,8 @@ mod tests {
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let creator_did = format!("did:plc:creator{unique}");
         let skey = format!("general{unique}");
+        let mut state = state;
+        let _plc = accepting_plc(&mut state).await;
         let space = super::create_space(
             &state,
             &creator_did,
@@ -2103,10 +2105,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("create should succeed");
-        assert_eq!(space.authority_did, creator_did);
+        assert!(space.authority_did.starts_with("did:plc:"));
+        assert_ne!(space.authority_did, creator_did);
+        assert_eq!(space.creator_did, creator_did);
         let access =
             crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &creator_did)
                 .await
@@ -2130,15 +2135,53 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
-    #[tokio::test]
-    async fn creating_a_space_advertises_this_instance_as_space_host() {
-        let state = crate::test_support::test_state_with_pool(
+    /// A PLC directory that accepts every genesis operation, with `state`
+    /// pointed at it. Keep the server for the length of the test.
+    async fn accepting_plc(state: &mut AppState) -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        state.config.plc_url = server.uri();
+        server
+    }
+
+    async fn memory_state_with_plc() -> (AppState, wiremock::MockServer) {
+        let mut state = crate::test_support::test_state_with_pool(
             crate::test_support::migrated_memory_pool().await,
         );
+        let plc = accepting_plc(&mut state).await;
+        (state, plc)
+    }
+
+    /// The genesis operations the mock PLC received, by DID.
+    async fn published(plc: &wiremock::MockServer) -> Vec<(String, serde_json::Value)> {
+        plc.received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| {
+                (
+                    r.url.path().trim_start_matches('/').to_string(),
+                    serde_json::from_slice(&r.body).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn creating_a_space_advertises_this_instance_as_space_host() {
+        let (state, _plc) = memory_state_with_plc().await;
         create_in_memory(&state, "did:plc:creator", "general")
             .await
             .expect("create should succeed");
@@ -2156,10 +2199,8 @@ mod tests {
 
     const INSTANCE_DID: &str = "did:plc:happyviewinstance";
 
-    async fn state_with_instance_identity() -> AppState {
-        let state = crate::test_support::test_state_with_pool(
-            crate::test_support::migrated_memory_pool().await,
-        );
+    async fn state_with_instance_identity() -> (AppState, wiremock::MockServer) {
+        let (state, plc) = memory_state_with_plc().await;
         crate::service_identity::upsert_identity(
             &state.db,
             state.db_backend,
@@ -2171,23 +2212,123 @@ mod tests {
         )
         .await
         .unwrap();
-        state
+        (state, plc)
     }
 
     #[tokio::test]
-    async fn this_instance_is_the_authority_for_spaces_it_creates() {
-        let state = state_with_instance_identity().await;
+    async fn every_space_gets_a_did_of_its_own_hosted_here() {
+        let (state, plc) = state_with_instance_identity().await;
         let space = create_in_memory(&state, "did:plc:creator", "general")
             .await
             .expect("create should succeed");
-        assert_eq!(space.authority_did, INSTANCE_DID);
-        assert_eq!(space.did, INSTANCE_DID);
+        assert_ne!(space.authority_did, INSTANCE_DID);
+        assert_eq!(space.did, space.authority_did);
         assert_eq!(space.creator_did, "did:plc:creator");
+
+        let ops = published(&plc).await;
+        assert_eq!(ops.len(), 1, "one genesis operation: {ops:?}");
+        let (did, op) = &ops[0];
+        assert_eq!(did, &space.authority_did);
+        assert_eq!(happyview_plc::derive_did(op).unwrap(), space.authority_did);
+        assert_eq!(
+            op["services"]["atproto_pds"],
+            serde_json::json!({
+                "type": "AtprotoPersonalDataServer",
+                "endpoint": state.config.public_url,
+            })
+        );
+        assert!(op["verificationMethods"]["atproto"].is_string());
+        assert!(op["verificationMethods"]["atproto_kem"].is_string());
+        assert_ne!(
+            op["verificationMethods"]["atproto"],
+            op["verificationMethods"]["atproto_kem"]
+        );
+        assert_eq!(op["rotationKeys"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_creator_rotation_key_outranks_this_instances() {
+        let (state, plc) = memory_state_with_plc().await;
+        let creator_key = happyview_plc::private_key_to_did_key(&[7u8; 32]).unwrap();
+        let space = super::create_space(
+            &state,
+            "did:plc:creator",
+            "com.example.chat",
+            "general",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&creator_key),
+        )
+        .await
+        .unwrap();
+
+        let (_, op) = published(&plc).await.remove(0);
+        let keys = op["rotationKeys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0],
+            creator_key.as_str(),
+            "the creator's key comes first"
+        );
+        assert!(
+            crate::spaces::authority::holds(&state.db, state.db_backend, &space.authority_did)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_creator_rotation_key_that_is_not_a_did_key_is_refused() {
+        let (state, plc) = memory_state_with_plc().await;
+        let err = super::create_space(
+            &state,
+            "did:plc:creator",
+            "com.example.chat",
+            "general",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("not-a-key"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        assert!(published(&plc).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_space_the_directory_refuses_is_not_created() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let plc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap_err();
+        assert!(
+            db::list_spaces_by_owner(&state.db, state.db_backend, "did:plc:creator")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn the_creator_administers_a_space_this_instance_is_authority_for() {
-        let state = state_with_instance_identity().await;
+        let (state, _plc) = state_with_instance_identity().await;
         let space = create_in_memory(&state, "did:plc:creator", "general")
             .await
             .unwrap();
@@ -2219,27 +2360,281 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
     }
 
+    /// A DID the directory refused is submitted again, unchanged, when the
+    /// space is created again, instead of leaving a stranded key row.
     #[tokio::test]
-    async fn creators_cannot_share_an_skey_under_this_instance() {
-        let state = state_with_instance_identity().await;
-        create_in_memory(&state, "did:plc:alice", "general")
-            .await
-            .unwrap();
-        let err = create_in_memory(&state, "did:plc:bob", "general")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Conflict(_)));
-    }
-
-    #[tokio::test]
-    async fn without_an_instance_identity_the_creator_is_the_authority() {
-        let state = crate::test_support::test_state_with_pool(
+    async fn a_refused_did_is_submitted_again_on_the_next_create() {
+        let mut state = crate::test_support::test_state_with_pool(
             crate::test_support::migrated_memory_pool().await,
         );
+        let plc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&plc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap_err();
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the second create publishes the stored operation");
+
+        let ops = published(&plc).await;
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0], ops[1], "the same operation, for the same DID");
+        assert_eq!(ops[1].0, space.authority_did);
+    }
+
+    /// Two creates of one space that both pass the per-creator check share
+    /// its DID, so the second space row meets the address constraint, and is
+    /// a conflict rather than an internal error.
+    #[tokio::test]
+    async fn a_second_space_at_one_address_is_a_conflict() {
+        let (state, _plc) = memory_state_with_plc().await;
         let space = create_in_memory(&state, "did:plc:creator", "general")
             .await
             .unwrap();
-        assert_eq!(space.authority_did, "did:plc:creator");
+        let twin = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            ..space
+        };
+        let err = db::create_space(&state.db, state.db_backend, &twin)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+    }
+
+    /// A directory that stored a genesis but whose answer was lost refuses a
+    /// second submission of it as misordered. The next create reads the DID's
+    /// log, finds its operation there, and finishes.
+    #[tokio::test]
+    async fn a_genesis_the_directory_already_holds_is_not_submitted_again() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers};
+
+        struct StoreThenFail(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for StoreThenFail {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let mut stored = self.0.lock().unwrap();
+                if stored.is_none() {
+                    *stored = serde_json::from_slice(&request.body).ok();
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "message": "Operations not correctly ordered",
+                    }))
+                }
+            }
+        }
+        // The log cannot be read at first, so the first create fails with
+        // its row left `prepared`; the next create finds the operation there.
+        struct Log(
+            Arc<Mutex<Option<serde_json::Value>>>,
+            std::sync::atomic::AtomicBool,
+        );
+        impl Respond for Log {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return ResponseTemplate::new(500);
+                }
+                match self.0.lock().unwrap().clone() {
+                    Some(op) => ResponseTemplate::new(200).set_body_json(serde_json::json!([op])),
+                    None => ResponseTemplate::new(404),
+                }
+            }
+        }
+
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let stored = Arc::new(Mutex::new(None));
+        let plc = wiremock::MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(StoreThenFail(stored.clone()))
+            .mount(&plc)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path_regex(r"^/did:plc:[a-z2-7]{24}/log$"))
+            .respond_with(Log(stored.clone(), Default::default()))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap_err();
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the directory holds the genesis, so the create finishes");
+        let posts = plc
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        assert_eq!(posts, 1, "the held genesis is not submitted again");
+        let held = stored.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            happyview_plc::derive_did(&held).unwrap(),
+            space.authority_did
+        );
+        assert!(
+            crate::spaces::authority::holds(&state.db, state.db_backend, &space.authority_did)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A submission refused after the directory stored it, as when its answer
+    /// is lost, is checked against the DID's log, and the space is created.
+    #[tokio::test]
+    async fn a_refused_submission_the_directory_holds_still_creates_the_space() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers};
+
+        struct StoreAndFail(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for StoreAndFail {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                *self.0.lock().unwrap() = serde_json::from_slice(&request.body).ok();
+                ResponseTemplate::new(504)
+            }
+        }
+        struct Log(Arc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for Log {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                match self.0.lock().unwrap().clone() {
+                    Some(op) => ResponseTemplate::new(200).set_body_json(serde_json::json!([op])),
+                    None => ResponseTemplate::new(404),
+                }
+            }
+        }
+
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let stored = Arc::new(Mutex::new(None));
+        let plc = wiremock::MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(StoreAndFail(stored.clone()))
+            .mount(&plc)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path_regex(r"^/did:plc:[a-z2-7]{24}/log$"))
+            .respond_with(Log(stored.clone()))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
+
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("the directory holds the genesis");
+        let held = stored.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            happyview_plc::derive_did(&held).unwrap(),
+            space.authority_did
+        );
+    }
+
+    /// A recreated space keeps its DID and key, so a credential minted for the
+    /// deleted one would verify. One issued before this space was created is
+    /// refused.
+    #[tokio::test]
+    async fn a_credential_older_than_its_space_is_refused() {
+        let (state, _plc) = memory_state_with_plc().await;
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let key = crate::spaces::authority::signing_key(
+            &state.db,
+            state.db_backend,
+            &state.config.keyring().unwrap(),
+            &space.authority_did,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let created = chrono::DateTime::parse_from_rfc3339(&space.created_at)
+            .unwrap()
+            .timestamp() as u64;
+        let credential = |iat: u64| {
+            let claims = crate::spaces::credential::SpaceCredentialClaims {
+                iss: space.authority_did.clone(),
+                sub: format!(
+                    "at://{}/space/{}/{}",
+                    space.did, space.type_nsid, space.skey
+                ),
+                iat,
+                exp: iat + 600,
+                jti: crate::spaces::credential::make_jti(),
+                cnf: None,
+            };
+            crate::spaces::credential::sign_credential_with_kid(&claims, &key, "#atproto").unwrap()
+        };
+
+        let err = super::verify_space_credential(&state, &space, &credential(created - 60))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AppError::XrpcError {
+                    code: "InvalidCredential",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        super::verify_space_credential(&state, &space, &credential(created))
+            .await
+            .expect("a credential issued as the space was created verifies");
+    }
+
+    /// A deleted space recreated with the same type and key gets its DID back,
+    /// so its address, which its members' records name, is unchanged.
+    #[tokio::test]
+    async fn a_recreated_space_keeps_its_did() {
+        let (state, plc) = memory_state_with_plc().await;
+        let first = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let uri = format!(
+            "at://{}/space/{}/{}",
+            first.did, first.type_nsid, first.skey
+        );
+        super::delete_space(&state, "did:plc:creator", &uri)
+            .await
+            .unwrap();
+        let again = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        assert_eq!(again.authority_did, first.authority_did);
+        assert_eq!(published(&plc).await.len(), 1, "published once");
+    }
+
+    #[tokio::test]
+    async fn creators_can_share_an_skey_but_one_creator_cannot_reuse_it() {
+        let (state, _plc) = state_with_instance_identity().await;
+        let alice = create_in_memory(&state, "did:plc:alice", "general")
+            .await
+            .unwrap();
+        let bob = create_in_memory(&state, "did:plc:bob", "general")
+            .await
+            .expect("each space has its own DID, so two creators may use one key");
+        assert_ne!(alice.authority_did, bob.authority_did);
+
+        let err = create_in_memory(&state, "did:plc:alice", "general")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
     }
 
     #[tokio::test]
