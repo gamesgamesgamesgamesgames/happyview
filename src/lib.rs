@@ -156,6 +156,12 @@ pub struct AppState {
     /// callers, mocks, single-attempt record scripts — is keyed on this, and
     /// no other code path constructs one, so a serving binary never has it.
     pub test: Option<Arc<testing::TestHarness>>,
+
+    /// Whether plugin raw SQL on Postgres runs under the least-privileged
+    /// `happyview_plugin_ro`/`_rw` roles, set up at boot. `false` on SQLite and
+    /// when the roles could not be created; there the parser allowlist in
+    /// `plugin::host::db` is the whole boundary. See `ensure_plugin_roles`.
+    pub plugin_sql_restricted: bool,
 }
 
 impl AppState {

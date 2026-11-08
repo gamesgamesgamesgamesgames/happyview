@@ -2662,14 +2662,35 @@ async fn host_db_impl(
     let Some(db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
+    let backend = caller.data().db_backend;
+    // Whether the least-privileged Postgres roles were set up at boot. When they
+    // were not, the parser allowlist in `run_plugin_*` is the whole boundary and
+    // the statement runs on the privileged connection. Irrelevant on SQLite.
+    let restricted = caller
+        .data()
+        .app_state
+        .as_ref()
+        .is_some_and(|app| app.plugin_sql_restricted);
+    // `database:write` may run writes, so its reads run under the write role
+    // too; a `database:read`-only plugin runs under the read role in a read-only
+    // transaction.
+    let mode = if caller
+        .data()
+        .capabilities
+        .contains(&PluginCapability::DatabaseWrite)
+    {
+        crate::raw_sql_guard::PluginSqlMode::Write
+    } else {
+        crate::raw_sql_guard::PluginSqlMode::Read
+    };
     let response = if execute {
-        match super::run_execute(&db, &sql, &params).await {
+        match super::run_plugin_execute(&db, backend, restricted, &sql, &params).await {
             Ok(n) => serde_json::to_vec(&serde_json::json!({"ok": {"rows_affected": n}}))
                 .unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }
     } else {
-        match super::run_query(&db, &sql, &params).await {
+        match super::run_plugin_query(&db, backend, restricted, mode, &sql, &params).await {
             Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }

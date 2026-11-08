@@ -79,6 +79,224 @@ pub fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The internal relations a plugin's raw SQL may name, and the relations the
+/// least-privileged Postgres roles are granted. One source of truth so the
+/// parser allowlist in [`check_postgres_plugin_sql`] and the role grants in
+/// `plugin::host::db` cannot drift apart.
+pub fn plugin_nameable_relations() -> &'static [&'static str] {
+    ALLOWED_INTERNAL_TABLES
+}
+
+/// Whether a plugin holds only `database:read` or `database:write`. Chooses the
+/// statement kinds the parser allowlist accepts and, on Postgres, the role the
+/// statement runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginSqlMode {
+    Read,
+    Write,
+}
+
+/// Functions a plugin's raw SQL may call on Postgres. An **allowlist**: every
+/// function the real parser sees must be here, so a string-executing or
+/// privilege-escalating built-in (`query_to_xml`, `table_to_xml`, `dblink*`,
+/// `pg_read_file`, …) is refused by default rather than hunted for in a
+/// deny-list. Operators and `CAST`/`::` are not function calls in the parse
+/// tree, so they are allowed without listing; the risk in a cast is never the
+/// cast but the function that consumes its result, which this list gates.
+///
+/// Extend it on request when a plugin needs a demonstrably-safe function; keep
+/// anything that reads files, runs a string as SQL, opens a connection, or
+/// touches server state out of it.
+const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
+    // Aggregates.
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    // Null / conditional helpers that do parse as calls.
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    // Strings.
+    "lower",
+    "upper",
+    "length",
+    "char_length",
+    "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "substr",
+    "substring",
+    "left",
+    "right",
+    "replace",
+    "concat",
+    "concat_ws",
+    "split_part",
+    "position",
+    "strpos",
+    "starts_with",
+    "format",
+    "md5",
+    "encode",
+    "regexp_replace",
+    // Numbers.
+    "abs",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
+    "mod",
+    "power",
+    "sign",
+    // Time.
+    "now",
+    "statement_timestamp",
+    "clock_timestamp",
+    "date_trunc",
+    "to_timestamp",
+    "to_char",
+    "to_date",
+    "extract",
+    "date_part",
+    "age",
+    "make_timestamptz",
+    // Window ranking.
+    "row_number",
+    "rank",
+    "dense_rank",
+    // JSON (read/build only — no execution).
+    "json_extract_path_text",
+    "jsonb_extract_path_text",
+    "json_array_length",
+    "jsonb_array_length",
+    "json_build_object",
+    "jsonb_build_object",
+    "json_build_array",
+    "jsonb_build_array",
+    "to_json",
+    "to_jsonb",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_object_keys",
+    "array_agg",
+    "string_agg",
+    "jsonb_agg",
+    "json_agg",
+    "unnest",
+];
+
+/// Statement/relation/function allowlist for plugin raw SQL **on Postgres**,
+/// enforced by Postgres's own parser (libpg_query via `pg_query`) rather than a
+/// tokenizer. This is what sees SQL that a tokenizer cannot: a table named only
+/// inside a string handed to a built-in never reaches the server, because the
+/// built-in is not an allowed function. It is applied on every Postgres plugin
+/// statement, and is the whole boundary when the least-privileged roles cannot
+/// be set up (see `plugin::host::db`).
+///
+/// Accepts only: statements of an allowed kind for `mode` (read → `SELECT`
+/// only; write → `SELECT`/`INSERT`/`UPDATE`/`DELETE`), every relation in
+/// [`plugin_nameable_relations`] and in no schema but `public`, and every
+/// function in [`PLUGIN_SQL_FUNCTIONS`]. Refuses `DO`, `CREATE`/DDL, `COPY`,
+/// `EXECUTE`, transaction control and — load-bearing — `SET`/`RESET` (a bare
+/// `RESET ROLE` would otherwise return to the privileged session role and
+/// defeat the restricted role). SQL that does not parse fails closed.
+///
+/// It does **not** by itself prove a read is side-effect-free (a data-modifying
+/// CTE, a locking clause, `SELECT … INTO`); the caller gates read-mode SQL with
+/// [`is_read_only`] as well.
+pub fn check_postgres_plugin_sql(sql: &str, mode: PluginSqlMode) -> Result<(), String> {
+    use pg_query::protobuf::node::Node;
+
+    let parsed = pg_query::parse(sql).map_err(|e| format!("could not parse SQL: {e}"))?;
+
+    if parsed.protobuf.stmts.is_empty() {
+        return Err("raw SQL contained no statement".into());
+    }
+
+    // Statement kinds. Reject anything that is not a plain query or, in write
+    // mode, a plain DML write — in particular DO blocks, any DDL, COPY, EXECUTE,
+    // transaction control and SET/RESET.
+    for raw in &parsed.protobuf.stmts {
+        let node = raw.stmt.as_ref().and_then(|n| n.node.as_ref());
+        let allowed = match node {
+            Some(Node::SelectStmt(_)) => true,
+            Some(Node::InsertStmt(_)) | Some(Node::UpdateStmt(_)) | Some(Node::DeleteStmt(_)) => {
+                mode == PluginSqlMode::Write
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(match mode {
+                PluginSqlMode::Read => {
+                    "database:read permits only plain SELECT statements in raw SQL".to_string()
+                }
+                PluginSqlMode::Write => {
+                    "raw SQL permits only SELECT/INSERT/UPDATE/DELETE statements".to_string()
+                }
+            });
+        }
+    }
+
+    // Relations: every table named (including inside a data-modifying CTE) must
+    // be an allowlisted internal relation, in the public schema or unqualified.
+    for table in parsed.tables() {
+        let (schema, name) = split_qualified(&table);
+        if let Some(schema) = schema
+            && !schema.eq_ignore_ascii_case("public")
+        {
+            return Err(format!(
+                "raw SQL cannot reference the relation '{table}' (schema '{schema}' is not allowed)"
+            ));
+        }
+        if !plugin_nameable_relations()
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "raw SQL cannot reference the relation '{table}'; plugin SQL may use only HappyView's public data tables"
+            ));
+        }
+    }
+
+    // Functions: allowlist. A string-executing built-in is refused here because
+    // it is not on the list, whatever it was handed.
+    for func in parsed.functions() {
+        let (schema, name) = split_qualified(&func);
+        if let Some(schema) = schema
+            && !(schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("pg_catalog"))
+        {
+            return Err(format!(
+                "raw SQL cannot call '{func}' (schema '{schema}' is not allowed)"
+            ));
+        }
+        if !PLUGIN_SQL_FUNCTIONS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "raw SQL cannot call the function '{func}'; it is not on the plugin SQL allowlist"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Split a possibly schema-qualified name from `pg_query`'s `tables()` /
+/// `functions()` (`"public.happyview_records"`) into `(schema, name)`. Only the
+/// last two dot-separated parts matter; a catalog-qualified name keeps its
+/// schema so the caller can reject a non-`public` one.
+fn split_qualified(qualified: &str) -> (Option<&str>, &str) {
+    match qualified.rsplit_once('.') {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, qualified),
+    }
+}
+
 /// Why a raw write to a claimed collection's records is refused.
 pub const CLAIMED_WRITE_REFUSED: &str = "writes to records of a collection stored outside this instance must go through save_local in happyview.record";
 
@@ -1026,5 +1244,104 @@ mod tests {
         // generic dialect ("WHERE" reads as a table name), so this uses SQL
         // that genuinely cannot be parsed as any statement.
         assert!(is_read_only("SELECT 1 FROM (").is_err());
+    }
+}
+
+#[cfg(test)]
+mod postgres_plugin_guard_tests {
+    //! Parse-level checks for the Postgres plugin-SQL allowlist. No database:
+    //! these assert what the parser accepts and refuses. The behaviour that the
+    //! least-privileged role denies the same statements at the database is
+    //! covered by the integration tests in `tests/`.
+    use super::{PluginSqlMode::*, check_postgres_plugin_sql};
+
+    #[test]
+    fn allows_plain_reads_of_allowlisted_relations() {
+        for sql in [
+            "SELECT * FROM happyview_records WHERE collection = $1",
+            "SELECT count(*) FROM happyview_records_by_collection",
+            "SELECT lower(uri) FROM happyview_record_refs LIMIT 10",
+            "SELECT * FROM public.happyview_labels",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Read).is_ok(),
+                "should allow: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_writes_only_in_write_mode() {
+        let sql = "INSERT INTO happyview_jobs (id) VALUES ($1)";
+        assert!(check_postgres_plugin_sql(sql, Write).is_ok());
+        assert!(check_postgres_plugin_sql(sql, Read).is_err());
+    }
+
+    #[test]
+    fn refuses_string_executing_builtins_under_read() {
+        // The reads that the tokenizer guard let through: the table name lives
+        // in a string the built-in would execute or resolve, so the parser
+        // never sees it as a relation — but it sees the built-in, which is not
+        // on the function allowlist.
+        for sql in [
+            "SELECT query_to_xml('select 1', true, false, '')",
+            "SELECT table_to_xml('x'::regclass, true, false, '')",
+            "SELECT query_to_xml_and_xmlschema('select 1', true, false, '')",
+            "SELECT pg_read_file('/etc/passwd')",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Read).is_err(),
+                "should refuse: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_direct_reads_of_unallowlisted_relations() {
+        for sql in [
+            "SELECT * FROM happyview_users",
+            "SELECT token_hash FROM happyview_api_keys",
+            "SELECT * FROM happyview_oauth_sessions",
+            "SELECT * FROM pg_catalog.pg_authid",
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM \"happyview_users\"",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Read).is_err(),
+                "should refuse: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unallowlisted_relation_hidden_in_a_modifying_cte() {
+        let sql = "WITH x AS (DELETE FROM happyview_users RETURNING id) SELECT * FROM x";
+        // Write mode, so the CTE kind is not the refusal — the relation is.
+        assert!(check_postgres_plugin_sql(sql, Write).is_err());
+    }
+
+    #[test]
+    fn refuses_do_ddl_copy_and_set() {
+        for sql in [
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+            "CREATE TABLE t (a int)",
+            "COPY happyview_records TO '/tmp/x'",
+            "SET ROLE postgres",
+            "RESET ROLE",
+            "SELECT * FROM happyview_records; RESET ROLE",
+            "BEGIN",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write).is_err(),
+                "should refuse: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unparseable_sql() {
+        assert!(check_postgres_plugin_sql("SELECT 1 FROM (", Read).is_err());
+        assert!(check_postgres_plugin_sql("", Read).is_err());
     }
 }

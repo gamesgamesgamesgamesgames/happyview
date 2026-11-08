@@ -354,6 +354,23 @@ async fn boot(
         "connected to database"
     );
 
+    // Set up the least-privileged roles plugin raw SQL runs under on Postgres.
+    // Soft failure: if the connecting role cannot create or grant them, plugin
+    // SQL falls back to the parser allowlist on this connection and we say how
+    // to enable the roles.
+    let plugin_sql_restricted =
+        crate::plugin::host::ensure_plugin_roles(&db_pool, db_backend).await;
+    if db_backend == db::DatabaseBackend::Postgres && !plugin_sql_restricted {
+        tracing::warn!(
+            "plugin raw SQL will run under the parser allowlist on the main database connection: \
+             the database roles '{}' / '{}' could not be set up. Grant the HappyView database role \
+             CREATEROLE, or pre-create those roles and grant them to it, to run plugin SQL under a \
+             least-privileged role.",
+            crate::plugin::host::PLUGIN_ROLE_RO,
+            crate::plugin::host::PLUGIN_ROLE_RW,
+        );
+    }
+
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.keyring().as_ref() {
         Some(key) => crate::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
@@ -1157,6 +1174,7 @@ async fn boot(
         limits: limits.provider,
         metrics,
         test: None,
+        plugin_sql_restricted,
     };
 
     // Populate record_refs once, for records indexed before the table existed.
