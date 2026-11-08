@@ -2107,24 +2107,24 @@ async fn get_space_credential(
         code,
         message,
     };
-    // A request without a delegation token is anonymous, and each credential
-    // it mints is a stored row, so it spends the anonymous bucket the XRPC
-    // routes use. Space routes are mounted beside them, not behind them.
-    if input.delegation_token.is_none() {
-        let key = crate::xrpc::ANONYMOUS_CLIENT_KEY;
-        let cost = state.rate_limiter.default_cost_for_type(key, "procedure");
-        if let crate::rate_limit::CheckResult::Limited {
+    // Charged before anything in the request is parsed or verified. A
+    // credential request needs no session, every credential minted is a
+    // stored row, and verifying a delegation token resolves its issuer's DID
+    // before its signature is checked. Space routes are mounted beside the
+    // XRPC routes, not behind their limiter, so this is their limit.
+    let key = crate::xrpc::ANONYMOUS_CLIENT_KEY;
+    let cost = state.rate_limiter.default_cost_for_type(key, "procedure");
+    if let crate::rate_limit::CheckResult::Limited {
+        retry_after,
+        limit,
+        reset,
+    } = state.rate_limiter.check(key, cost)
+    {
+        return Err(AppError::RateLimited {
             retry_after,
             limit,
             reset,
-        } = state.rate_limiter.check(key, cost)
-        {
-            return Err(AppError::RateLimited {
-                retry_after,
-                limit,
-                reset,
-            });
-        }
+        });
     }
     if !crate::spaces::http_signature::is_p256_did_key(&input.credential_kid) {
         return Err(refused(

@@ -853,3 +853,66 @@ async fn anonymous_credential_requests_are_rate_limited() {
         .unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// The anonymous bucket is charged before a delegation token is looked at, so
+/// a forged token cannot skip it, nor buy an issuer lookup per request.
+#[tokio::test]
+#[serial]
+async fn a_delegation_token_does_not_skip_the_rate_limit() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "forged", Policy::MemberList).await;
+    app.state.rate_limiter.register_client_limit(
+        "anonymous".into(),
+        Some(1),
+        Some(0.000_1),
+        100,
+        2.0,
+    );
+
+    let mut bytes = [0u8; 32];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
+    }
+    let now = chrono::Utc::now().timestamp() as u64;
+    let forged = sign_delegation_token(
+        &DelegationTokenClaims {
+            iss: "did:web:forged.example.com".to_string(),
+            sub: space.clone(),
+            aud: format!("{AUTHORITY}#atproto_pds"),
+            iat: now,
+            exp: now + 60,
+            jti: Uuid::new_v4().to_string(),
+        },
+        &k256::ecdsa::SigningKey::from_slice(&bytes).unwrap(),
+    )
+    .unwrap();
+    let request = |token: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "space": space,
+                    "credentialKid": happyview::spaces::http_signature::did_key(
+                        syncer_key().verifying_key()
+                    ),
+                    "delegationToken": token,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let first = app.router.clone().oneshot(request("")).await.unwrap();
+    assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    for token in ["", forged.as_str()] {
+        let resp = app.router.clone().oneshot(request(token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{token:?}");
+    }
+}
