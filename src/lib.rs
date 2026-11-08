@@ -157,19 +157,28 @@ pub struct AppState {
     /// no other code path constructs one, so a serving binary never has it.
     pub test: Option<Arc<testing::TestHarness>>,
 
-    /// Whether the least-privileged `happyview_plugin_ro`/`_rw` roles were set up
-    /// at boot, so plugin raw SQL on the main Postgres pool can run under them
-    /// (`SET LOCAL ROLE`). `false` on SQLite and when the roles could not be
-    /// created. See `plugin::host::db::ensure_plugin_roles`.
-    pub plugin_sql_restricted: bool,
+    /// How plugin raw SQL is isolated on Postgres, decided once at boot. See
+    /// [`PluginSqlAccess`].
+    pub plugin_sql: PluginSqlAccess,
+}
 
-    /// The dedicated login pool for plugin raw SQL, connecting **as** the
-    /// least-privileged `happyview_plugin` role (so `session_user` itself is
-    /// unprivileged). Present only when `PLUGIN_SQL_DATABASE_URL` is configured
-    /// and the pool connected. When present, plugin SQL runs here; otherwise it
-    /// runs on the main pool under `plugin_sql_restricted`. See
-    /// `plugin::host::db::open_plugin_login_pool`.
-    pub plugin_sql_pool: Option<sqlx::AnyPool>,
+/// How plugin raw SQL runs on Postgres (the mode reported at
+/// `/admin/database/status`). Decided at boot and fixed for the process.
+#[derive(Clone)]
+pub enum PluginSqlAccess {
+    /// Its own pool, logged in as the unprivileged `happyview_plugin` role —
+    /// `session_user` has no access to the protected tables.
+    LoginPool(sqlx::AnyPool),
+    /// The main pool, restricted per statement with `SET LOCAL ROLE`.
+    Role,
+    /// The main pool, no role change; the parser is the whole boundary. SQLite
+    /// also uses this (the value is ignored there).
+    ParserOnly,
+    /// Plugin raw SQL is refused on Postgres: `PLUGIN_SQL_DATABASE_URL` was set
+    /// but the login pool could not be opened or verified, or the plugin schema
+    /// holds code from an earlier login-pool session. HappyView still boots;
+    /// only plugin raw SQL is refused.
+    Refused,
 }
 
 impl AppState {

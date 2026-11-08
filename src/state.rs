@@ -145,9 +145,8 @@ pub fn state_with_pool_on(
         metrics: Arc::new(crate::metrics::ScriptMetrics::new()),
         test: None,
         // Tests default to the parser-allowlist boundary; a test that wants the
-        // restricted-role path sets this after calling `ensure_plugin_roles`.
-        plugin_sql_restricted: false,
-        plugin_sql_pool: None,
+        // role or login-pool path sets this after calling `ensure_plugin_roles`.
+        plugin_sql: crate::PluginSqlAccess::ParserOnly,
     };
     // Backfills and their admin routes work on this state; nothing is started.
     crate::host::attach_jetstream(&mut state, Default::default());

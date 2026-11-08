@@ -49,21 +49,19 @@ pub(super) async fn status(
         "vacuum": status,
         // How plugin raw SQL is isolated on Postgres: `login-pool` (its own
         // connection as an unprivileged login role — strongest), `role` (the main
-        // connection under the least-privileged roles), or `parser-only` (the
-        // roles could not be set up; the in-process allowlist on the main
-        // connection). Surfaced so an operator can see the mode without reading
-        // boot logs. Omitted on SQLite, which has no such roles.
+        // connection under the least-privileged roles), `parser-only` (the
+        // in-process allowlist on the main connection), or `refused` (plugin raw
+        // SQL is unavailable: the login pool was configured but could not be
+        // opened/verified, or the plugin schema holds code from an earlier
+        // login-pool session). Omitted on SQLite, which has no such roles.
         "plugin_sql_mode": match state.db_backend {
             DatabaseBackend::Sqlite => serde_json::Value::Null,
-            DatabaseBackend::Postgres => {
-                if state.plugin_sql_pool.is_some() {
-                    serde_json::Value::from("login-pool")
-                } else if state.plugin_sql_restricted {
-                    serde_json::Value::from("role")
-                } else {
-                    serde_json::Value::from("parser-only")
-                }
-            }
+            DatabaseBackend::Postgres => serde_json::Value::from(match state.plugin_sql {
+                crate::PluginSqlAccess::LoginPool(_) => "login-pool",
+                crate::PluginSqlAccess::Role => "role",
+                crate::PluginSqlAccess::ParserOnly => "parser-only",
+                crate::PluginSqlAccess::Refused => "refused",
+            }),
         },
         "journal_size_limit": state.config.sqlite_journal_size_limit,
         "checkpoint": crate::maintenance::sqlite::last_checkpoint(),

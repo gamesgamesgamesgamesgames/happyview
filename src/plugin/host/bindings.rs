@@ -2668,18 +2668,20 @@ async fn host_db_impl(
     // built without one cannot know it, so on Postgres it refuses raw SQL rather
     // than run on the privileged connection. SQLite has no roles; it uses the main
     // pool and the enforcement value is ignored there.
+    use crate::PluginSqlAccess;
     use crate::raw_sql_guard::PluginSqlEnforcement;
-    let (db, enforcement) = match caller.data().app_state.as_ref() {
-        Some(app) => {
-            if let Some(login_pool) = app.plugin_sql_pool.clone() {
-                (login_pool, PluginSqlEnforcement::LoginPool)
-            } else if app.plugin_sql_restricted {
-                (main_db, PluginSqlEnforcement::Role)
-            } else {
-                (main_db, PluginSqlEnforcement::ParserOnly)
-            }
-        }
-        None => {
+    // `Refused`, or no instance context, means plugin raw SQL is unavailable on
+    // Postgres (SQLite still runs — it has no roles and ignores the mode).
+    let access = caller
+        .data()
+        .app_state
+        .as_ref()
+        .map(|app| app.plugin_sql.clone());
+    let (db, enforcement) = match access {
+        Some(PluginSqlAccess::LoginPool(pool)) => (pool, PluginSqlEnforcement::LoginPool),
+        Some(PluginSqlAccess::Role) => (main_db, PluginSqlEnforcement::Role),
+        Some(PluginSqlAccess::ParserOnly) => (main_db, PluginSqlEnforcement::ParserOnly),
+        Some(PluginSqlAccess::Refused) | None => {
             if backend == crate::db::DatabaseBackend::Postgres {
                 return write_guest_response(
                     caller,

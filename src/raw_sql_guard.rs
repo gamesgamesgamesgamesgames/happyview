@@ -205,11 +205,10 @@ const ALWAYS_FORBIDDEN_FUNCTIONS: &[&str] = &[
 /// DML writes are always allowed. Table-shaped DDL (`CREATE`/`ALTER`/`DROP`
 /// TABLE, INDEX, VIEW) is allowed only when `allow_ddl` — i.e. when the
 /// least-privileged roles are in force. Without them the parser is the whole
-/// boundary and DDL is refused outright: `pg_query`'s walker does not descend
-/// into a column `DEFAULT`/`CHECK`/`GENERATED` expression, so a function hidden
-/// there would escape the fallback function check; forbidding DDL in the
-/// fallback closes that without a bespoke walker. Under the roles those
-/// expressions run as the restricted role and are contained there.
+/// boundary, and DDL is refused outright as a conservative simplification (the
+/// generic tree scan does catch a function in a column `DEFAULT`/`CHECK`/
+/// `GENERATED` expression, so this is belt-and-braces, not a required cover).
+/// Under the roles those expressions run as the restricted role in any case.
 ///
 /// This is an **allowlist of statement kinds**, so an unlisted or future kind
 /// fails closed. It leaves out every role/session/privilege and code-defining
@@ -299,6 +298,50 @@ fn ddl_targets_protected_name(node: Option<&pg_query::protobuf::node::Node>) -> 
         }),
         _ => false,
     }
+}
+
+/// True when `name` is in HappyView's reserved namespace — any `happyview_`
+/// prefix (or `_sqlx_migrations`), whether or not it is on the read allowlist. A
+/// plugin may not *create* or *rename to* such a name, even an allowlisted one,
+/// so another plugin's read of that name can't resolve to the plugin's object in
+/// the plugin schema (which precedes `public` on the plugin roles' path).
+fn is_reserved_object_name(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    lname.starts_with(PROTECTED_TABLE_PREFIX) || PROTECTED_EXACT_TABLES.contains(&lname.as_str())
+}
+
+/// The bare name a create/rename statement introduces (not its schema), for the
+/// reserved-name check. `None` for statements that introduce no such name.
+fn introduced_object_name(node: Option<&pg_query::protobuf::node::Node>) -> Option<&str> {
+    use pg_query::protobuf::node::Node as N;
+    let name = match node {
+        Some(N::CreateStmt(s)) => s.relation.as_ref().map(|r| r.relname.as_str()),
+        Some(N::ViewStmt(s)) => s.view.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CreateSeqStmt(s)) => s.sequence.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CompositeTypeStmt(s)) => s.typevar.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CreateTableAsStmt(s)) => s
+            .into
+            .as_ref()
+            .and_then(|i| i.rel.as_ref())
+            .map(|r| r.relname.as_str()),
+        Some(N::IndexStmt(s)) => Some(s.idxname.as_str()),
+        Some(N::CreateTrigStmt(s)) => Some(s.trigname.as_str()),
+        Some(N::RenameStmt(s)) => Some(s.newname.as_str()),
+        Some(N::CreateFunctionStmt(s)) => last_name_part(&s.funcname),
+        Some(N::CreateEnumStmt(s)) => last_name_part(&s.type_name),
+        Some(N::CreateRangeStmt(s)) => last_name_part(&s.type_name),
+        _ => None,
+    };
+    name.filter(|n| !n.is_empty())
+}
+
+/// The last `String` part of a qualified name node list (the object's own name).
+fn last_name_part(nodes: &[pg_query::protobuf::Node]) -> Option<&str> {
+    use pg_query::protobuf::node::Node;
+    nodes.iter().rev().find_map(|n| match n.node.as_ref() {
+        Some(Node::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    })
 }
 
 /// The dotted name parts of one `DROP` object entry.
@@ -403,14 +446,24 @@ fn login_pool_object_allowed(node: Option<&pg_query::protobuf::node::Node>) -> b
         Some(N::CreateTrigStmt(s)) => {
             schema_is_plugin_or_unqualified(schema_of_name_nodes(&s.funcname))
         }
+        Some(N::AlterFunctionStmt(s)) => alter_function_is_safe(s),
         Some(N::CreateSeqStmt(_))
         | Some(N::CompositeTypeStmt(_))
         | Some(N::CreateEnumStmt(_))
-        | Some(N::CreateRangeStmt(_))
-        | Some(N::AlterFunctionStmt(_)) => true,
+        | Some(N::CreateRangeStmt(_)) => true,
         Some(N::CreateTableAsStmt(_)) => !statement_creates_temp_or_into(node),
         _ => false,
     }
+}
+
+/// True when a `DefElem` option is `SECURITY DEFINER`.
+fn defelem_is_security_definer(def: &pg_query::protobuf::DefElem) -> bool {
+    use pg_query::protobuf::node::Node;
+    def.defname.eq_ignore_ascii_case("security")
+        && def
+            .arg
+            .as_ref()
+            .is_some_and(|a| matches!(a.node.as_ref(), Some(Node::Boolean(b)) if b.boolval))
 }
 
 /// True when a `CREATE FUNCTION`/`PROCEDURE` is safe for a plugin: not
@@ -421,27 +474,29 @@ fn create_function_is_trusted(stmt: &pg_query::protobuf::CreateFunctionStmt) -> 
     let mut language = "plpgsql"; // the default when none is named
     for opt in &stmt.options {
         if let Some(Node::DefElem(def)) = opt.node.as_ref() {
-            match def.defname.as_str() {
-                "security" => {
-                    // `arg` is a boolean: true = SECURITY DEFINER.
-                    if let Some(arg) = def.arg.as_ref()
-                        && matches!(arg.node.as_ref(), Some(Node::Boolean(b)) if b.boolval)
-                    {
-                        return false;
-                    }
-                }
-                "language" => {
-                    if let Some(arg) = def.arg.as_ref()
-                        && let Some(Node::String(s)) = arg.node.as_ref()
-                    {
-                        language = s.sval.as_str();
-                    }
-                }
-                _ => {}
+            if defelem_is_security_definer(def) {
+                return false;
+            }
+            if def.defname.eq_ignore_ascii_case("language")
+                && let Some(arg) = def.arg.as_ref()
+                && let Some(Node::String(s)) = arg.node.as_ref()
+            {
+                language = s.sval.as_str();
             }
         }
     }
     matches!(language.to_ascii_lowercase().as_str(), "sql" | "plpgsql")
+}
+
+/// True when an `ALTER FUNCTION` is safe for a plugin: it may not set
+/// `SECURITY DEFINER`, nor add a `SET` action (which could pin a search_path or
+/// other session config on the function). Matches the refusals on `CREATE`.
+fn alter_function_is_safe(stmt: &pg_query::protobuf::AlterFunctionStmt) -> bool {
+    use pg_query::protobuf::node::Node;
+    !stmt.actions.iter().any(|action| {
+        matches!(action.node.as_ref(), Some(Node::DefElem(def))
+            if defelem_is_security_definer(def) || def.defname.eq_ignore_ascii_case("set"))
+    })
 }
 
 /// Functions plugin raw SQL may call on Postgres **when the least-privileged
@@ -612,6 +667,16 @@ pub fn check_postgres_plugin_sql(
             return Err(
                 "raw SQL cannot drop or index a protected internal HappyView object".to_string(),
             );
+        }
+        // A plugin may not create or rename an object into HappyView's reserved
+        // namespace, even an allowlisted name — another plugin's read of that
+        // name would resolve to the plugin's object in the plugin schema.
+        if let Some(name) = introduced_object_name(node)
+            && is_reserved_object_name(name)
+        {
+            return Err(format!(
+                "raw SQL cannot create or rename an object to the reserved name '{name}'"
+            ));
         }
         // A created/altered object must live in the plugin schema, so nothing a
         // plugin defines can be resolved by HappyView's own queries, which never
@@ -1853,6 +1918,41 @@ mod postgres_plugin_guard_tests {
             assert!(
                 check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
                 "login pool should refuse: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_pool_refuses_altering_a_function_to_security_definer_or_set() {
+        for sql in [
+            "ALTER FUNCTION f() SECURITY DEFINER",
+            "ALTER FUNCTION f() SET search_path = public",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
+                "login pool should refuse: {sql}"
+            );
+        }
+        // A benign ALTER (not security/SET) on a plugin-schema function is fine.
+        assert!(check_postgres_plugin_sql("ALTER FUNCTION f() COST 10", Write, LoginPool).is_ok());
+    }
+
+    #[test]
+    fn refuses_creating_or_renaming_to_a_reserved_name() {
+        // Even an allowlisted name may not be *created* or renamed to by a plugin.
+        for (sql, e) in [
+            ("CREATE TABLE happyview_records (a int)", LoginPool),
+            ("CREATE VIEW happyview_labels AS SELECT 1", Role),
+            (
+                "CREATE FUNCTION happyview_evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+                LoginPool,
+            ),
+            ("CREATE SEQUENCE happyview_seq", LoginPool),
+            ("ALTER TABLE my_t RENAME TO happyview_sneaky", Role),
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, e).is_err(),
+                "should refuse a reserved name ({e:?}): {sql}"
             );
         }
     }
