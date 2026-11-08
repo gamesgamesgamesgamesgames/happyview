@@ -2663,14 +2663,27 @@ async fn host_db_impl(
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
     let backend = caller.data().db_backend;
-    // Whether the least-privileged Postgres roles were set up at boot. When they
-    // were not, the parser allowlist in `run_plugin_*` is the whole boundary and
-    // the statement runs on the privileged connection. Irrelevant on SQLite.
-    let restricted = caller
-        .data()
-        .app_state
-        .as_ref()
-        .is_some_and(|app| app.plugin_sql_restricted);
+    // Whether the least-privileged Postgres roles were set up at boot. This is an
+    // instance-wide fact carried on `app_state`; a host built without one cannot
+    // know it. On Postgres, rather than guess (and risk running on the privileged
+    // connection when the roles were in fact set up), refuse raw SQL in that
+    // contextless case. Irrelevant on SQLite, which has no such roles.
+    let restricted = match caller.data().app_state.as_ref() {
+        Some(app) => app.plugin_sql_restricted,
+        None => {
+            if backend == crate::db::DatabaseBackend::Postgres {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "raw SQL is unavailable in this context on Postgres",
+                    ),
+                )
+                .await;
+            }
+            false
+        }
+    };
     // `database:write` may run writes, so its reads run under the write role
     // too; a `database:read`-only plugin runs under the read role in a read-only
     // transaction.

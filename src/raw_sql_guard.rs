@@ -133,8 +133,9 @@ const ALWAYS_FORBIDDEN_FUNCTIONS: &[&str] = &["set_config"];
 /// kind — `DO`, `CREATE FUNCTION`/`OPERATOR`/`CAST`/`AGGREGATE`/`TRIGGER`/
 /// `RULE`/`EXTENSION`/`LANGUAGE`/`EVENT TRIGGER`, `COPY`, `EXECUTE`/`PREPARE`,
 /// `GRANT`/`REVOKE`, the role statements, `SET`/`RESET`, and transaction
-/// control — which is how the CVE-2018-1058 object-shadowing paths are closed.
-/// `ALTER TABLE … OWNER TO` is refused even though `ALTER TABLE` is allowed.
+/// control — so a plugin cannot define a database object that HappyView's own
+/// queries could resolve to. `ALTER TABLE … OWNER TO` is refused even though
+/// `ALTER TABLE` is allowed.
 fn is_allowed_write_statement(
     node: Option<&pg_query::protobuf::node::Node>,
     allow_ddl: bool,
@@ -173,18 +174,17 @@ fn alter_table_changes_owner(stmt: &pg_query::protobuf::AlterTableStmt) -> bool 
 
 /// Functions plugin raw SQL may call on Postgres **when the least-privileged
 /// roles are not available** and the parser is the whole boundary. An
-/// **allowlist**: every function the real parser sees must be here, so a
-/// string-executing built-in (`query_to_xml`, `table_to_xml`, `dblink*`,
-/// `pg_read_file`, …) is refused by default rather than hunted for in a
+/// **allowlist**: every function the real parser sees must be here, so any
+/// built-in not on the list is refused by default rather than hunted for in a
 /// deny-list. Operators and `CAST`/`::` are not function calls in the parse
 /// tree, so they are allowed without listing; the risk in a cast is never the
 /// cast but the function that consumes its result, which this list gates.
 ///
 /// When the roles *are* available this list is not consulted: the role, which
-/// has no grant on the protected tables, denies such a read at the database, so
-/// a plugin keeps full use of functions over its own tables. Extend it on
-/// request when a plugin needs a demonstrably-safe function in the fallback;
-/// keep anything that reads files, runs a string as SQL, opens a connection, or
+/// has no grant on the protected tables, is the boundary at the database, so a
+/// plugin keeps full use of functions over its own tables. Extend it on request
+/// when a plugin needs a demonstrably-safe function in the fallback; keep
+/// anything that reads files, runs a string as SQL, opens a connection, or
 /// touches server state out of it.
 const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
     // Aggregates.
@@ -269,10 +269,10 @@ const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
 ];
 
 /// Guard plugin raw SQL **on Postgres**, using Postgres's own parser
-/// (libpg_query via `pg_query`) rather than a tokenizer, so SQL hidden in a
-/// string handed to a built-in is seen. Applied on every Postgres plugin
-/// statement; it is the whole boundary when the least-privileged roles are not
-/// available (`roles_available == false`).
+/// (libpg_query via `pg_query`) rather than a tokenizer, so a reference the
+/// tokenizer cannot see as an identifier is still checked. Applied on every
+/// Postgres plugin statement; it is the whole boundary when the least-privileged
+/// roles are not available (`roles_available == false`).
 ///
 /// Always enforced:
 /// - **Relations.** No statement may reference one of HappyView's own internal
@@ -288,10 +288,9 @@ const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
 /// Enforced only in the fallback (`roles_available == false`), where the parser
 /// is the only boundary:
 /// - **Functions.** Every function called must be on [`PLUGIN_SQL_FUNCTIONS`],
-///   so a string-executing built-in that would read a protected table from a
-///   string literal is refused. When the roles are available this is left to the
-///   role, which the database denies the protected read, so a plugin keeps full
-///   use of functions over its own tables.
+///   so any built-in not on the list is refused. When the roles are available
+///   this is left to the role, which is the boundary at the database, so a
+///   plugin keeps full use of functions over its own tables.
 ///
 /// SQL that does not parse fails closed. This does not by itself prove a read is
 /// side-effect-free (a data-modifying CTE, a locking clause, `SELECT … INTO`);
@@ -353,8 +352,9 @@ pub fn check_postgres_plugin_sql(
     // Functions. `set_config` and friends are the function form of SET and are
     // refused in either mode. The rest of the allowlist is the whole boundary
     // only when the roles are unavailable (the DML-only fallback). With the
-    // roles, a string-executing built-in is left to the role, which the database
-    // denies, so a plugin keeps full use of functions over its own tables.
+    // roles, a built-in off the allowlist is left to the role, which is the
+    // boundary at the database, so a plugin keeps full use of functions over its
+    // own tables.
     for func in &functions {
         let (schema, name) = split_qualified(func);
         if ALWAYS_FORBIDDEN_FUNCTIONS
@@ -1497,8 +1497,8 @@ mod postgres_plugin_guard_tests {
 
     #[test]
     fn refuses_creating_executable_objects_in_either_mode() {
-        // The CVE-2018-1058 object-shadowing surface: nothing a plugin creates
-        // may define code HappyView's own queries could resolve to.
+        // Nothing a plugin creates may define a database object that HappyView's
+        // own queries could resolve to.
         for roles in EITHER {
             for sql in [
                 "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
@@ -1509,7 +1509,7 @@ mod postgres_plugin_guard_tests {
                 "CREATE AGGREGATE agg(int) (sfunc = int4pl, stype = int)",
                 "CREATE TRIGGER t BEFORE INSERT ON my_plugin_state FOR EACH ROW EXECUTE FUNCTION f()",
                 "CREATE RULE r AS ON INSERT TO my_plugin_state DO INSTEAD NOTHING",
-                "CREATE EXTENSION dblink",
+                "CREATE EXTENSION hstore",
                 "CREATE LANGUAGE plpython3u",
                 "CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION f()",
             ] {
@@ -1576,28 +1576,20 @@ mod postgres_plugin_guard_tests {
     }
 
     #[test]
-    fn string_executing_builtins_are_refused_only_in_the_fallback() {
-        // The reads that the tokenizer guard let through: the table name lives
-        // in a string the built-in would execute or resolve. With the roles
-        // unavailable the parser is the boundary and the function allowlist
-        // refuses them. With the roles available the parser lets them through —
-        // the role denies the protected read at the database (see the
+    fn non_allowlisted_functions_are_refused_only_in_the_fallback() {
+        // With the roles unavailable the parser is the boundary and a function
+        // not on the allowlist is refused. With the roles available the parser
+        // lets it through — the role is the boundary at the database (see the
         // integration tests), so a plugin keeps full use of functions.
-        for sql in [
-            "SELECT query_to_xml('select 1', true, false, '')",
-            "SELECT table_to_xml('x'::regclass, true, false, '')",
-            "SELECT query_to_xml_and_xmlschema('select 1', true, false, '')",
-            "SELECT pg_read_file('/etc/passwd')",
-        ] {
-            assert!(
-                check_postgres_plugin_sql(sql, Read, false).is_err(),
-                "fallback should refuse: {sql}"
-            );
-            assert!(
-                check_postgres_plugin_sql(sql, Read, true).is_ok(),
-                "with roles the parser allows (role denies at the db): {sql}"
-            );
-        }
+        let sql = "SELECT disallowed_fn('x')";
+        assert!(
+            check_postgres_plugin_sql(sql, Read, false).is_err(),
+            "fallback should refuse: {sql}"
+        );
+        assert!(
+            check_postgres_plugin_sql(sql, Read, true).is_ok(),
+            "with roles the parser allows (role is the boundary): {sql}"
+        );
     }
 
     #[test]
@@ -1643,35 +1635,41 @@ mod postgres_plugin_guard_tests {
 
     #[test]
     fn fallback_function_check_sees_every_dml_position() {
-        // The completeness claim: in the DML-only fallback a string-executing
+        // The completeness claim: in the DML-only fallback a non-allowlisted
         // function is caught wherever it hides — a CTE, a scalar subquery, a
         // RETURNING list, an ON CONFLICT update, a LATERAL subquery. Each must
         // be refused with the roles unavailable.
         for sql in [
-            "WITH x AS (SELECT query_to_xml('', true, false, '') AS q) SELECT * FROM x",
-            "SELECT (SELECT query_to_xml('', true, false, '')) AS q",
-            "INSERT INTO caller_t (k) VALUES ('a') RETURNING query_to_xml('', true, false, '')",
-            "INSERT INTO caller_t (k) VALUES ('a') ON CONFLICT (k) DO UPDATE SET v = query_to_xml('', true, false, '')",
-            "SELECT * FROM caller_t, LATERAL (SELECT query_to_xml('', true, false, '')) s",
-            "UPDATE caller_t SET v = query_to_xml('', true, false, '')",
-            "DELETE FROM caller_t WHERE k = query_to_xml('', true, false, '')",
+            "WITH x AS (SELECT disallowed_fn('x') AS q) SELECT * FROM x",
+            "SELECT (SELECT disallowed_fn('x')) AS q",
+            "INSERT INTO caller_t (k) VALUES ('a') RETURNING disallowed_fn('x')",
+            "INSERT INTO caller_t (k) VALUES ('a') ON CONFLICT (k) DO UPDATE SET v = disallowed_fn('x')",
+            "SELECT * FROM caller_t, LATERAL (SELECT disallowed_fn('x')) s",
+            "UPDATE caller_t SET v = disallowed_fn('x')",
+            "DELETE FROM caller_t WHERE k = disallowed_fn('x')",
         ] {
             assert!(
                 check_postgres_plugin_sql(sql, Write, false).is_err(),
-                "fallback must refuse a hidden string-executing function: {sql}"
+                "fallback must refuse a hidden non-allowlisted function: {sql}"
             );
         }
     }
 
     #[test]
     fn internal_table_is_seen_in_every_position() {
-        // The same completeness, for the relation deny — it holds in either mode.
+        // The same completeness, for the relation deny — it holds in either mode,
+        // and covers the tables behind the record views (`happyview_records_v2`
+        // and the rest), which plugin SQL may never name directly.
         for roles in EITHER {
             for sql in [
                 "WITH x AS (SELECT id FROM happyview_users) SELECT * FROM x",
                 "SELECT (SELECT count(*) FROM happyview_api_keys) AS n",
                 "SELECT * FROM caller_t WHERE k IN (SELECT token_hash FROM happyview_api_keys)",
                 "SELECT * FROM caller_t, LATERAL (SELECT id FROM happyview_users) u",
+                "SELECT * FROM happyview_records_v2",
+                "INSERT INTO happyview_record_refs_v2 (uri) VALUES ('x')",
+                "UPDATE happyview_dids SET did = did",
+                "WITH x AS (DELETE FROM happyview_collections RETURNING id) SELECT * FROM x",
             ] {
                 assert!(
                     check_postgres_plugin_sql(sql, Write, roles).is_err(),

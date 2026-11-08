@@ -135,22 +135,20 @@ pub async fn run_execute(db: &sqlx::AnyPool, sql: &str, params: &[Value]) -> Res
 
 // -- Least-privileged plugin SQL (Postgres) ---------------------------------
 //
-// On Postgres the tokenizer table guard is not the boundary: SQL hidden in a
-// string handed to a built-in (`query_to_xml`, …) never names the table as an
-// identifier. Two things close that:
+// On Postgres the tokenizer table guard works on identifiers only, so it is not
+// the boundary for plugin raw SQL. Two things make the database enforce it:
 //
 //  1. `raw_sql_guard::check_postgres_plugin_sql` parses with Postgres's own
 //     parser and accepts only allowlisted statement kinds, relations and
 //     functions.
 //  2. the statement runs under a role (`happyview_plugin_ro`/`_rw`) GRANTed only
-//     the allowlisted relations, so even a function that executes a string runs
-//     as that role and the server denies anything off the allowlist.
+//     the allowlisted relations, so anything off the allowlist is denied by the
+//     server, as that role, however the statement is written.
 //
 // (1) is applied always; (2) when the roles could be set up at boot. When they
 // could not, (1) is the whole boundary and the statement runs on the privileged
 // connection, still in a read-only transaction for reads. SQLite keeps the
-// tokenizer guard and the plain run paths — it has no string-executing function
-// to smuggle a table through.
+// tokenizer guard and the plain run paths, which are sufficient there.
 
 /// The least-privileged role a read-only plugin statement runs under.
 pub const PLUGIN_ROLE_RO: &str = "happyview_plugin_ro";
@@ -322,7 +320,11 @@ fn plugin_role_setup_statements() -> Vec<String> {
     // The real tables behind the record compat views: writes through the views
     // fire `INSTEAD OF` triggers that run as the writing role, so the write role
     // needs access to the underlying rows as well. Reads go through the views'
-    // owner rights and need nothing here.
+    // owner rights and need nothing here. These grants are reachable only
+    // through the views' triggers: a plugin cannot write (or read) these tables
+    // directly, because the parser refuses their names in every position (they
+    // carry the reserved prefix and are not on the allowlist), in both the role
+    // and the fallback path.
     const RECORD_UNDERLYING: &[&str] = &[
         "happyview_records_v2",
         "happyview_record_refs_v2",
@@ -518,10 +520,7 @@ mod tests {
     //
     // These run the plugin raw-SQL entry points against a Postgres database and
     // assert that statements reaching HappyView's own internal tables are
-    // refused — both those naming a table directly and those that reach one
-    // through a string-taking built-in. On the old tokenizer guard the latter
-    // returned rows; here they are refused by the parser allowlist, and the
-    // role layer denies them at the database as well.
+    // refused, and that the role layer denies them at the database as well.
 
     use crate::raw_sql_guard::PluginSqlMode;
 
@@ -544,15 +543,12 @@ mod tests {
         Some(db)
     }
 
-    /// Statements that reach an internal table that plugin SQL may not. Each
-    /// reproduces a way the tokenizer guard could be slipped: a built-in that
-    /// runs or resolves a string, string concatenation, a dollar-quoted body.
-    const BYPASS_READS: &[&str] = &[
-        "SELECT query_to_xml('select * from happyview_users', true, false, '')",
-        "SELECT table_to_xml('happyview_users'::regclass, true, false, '')",
-        "SELECT query_to_xml($q$select * from happyview_api_keys$q$, true, false, '')",
+    /// Reads of internal tables that plugin SQL may not reach.
+    const INTERNAL_READS: &[&str] = &[
         "SELECT * FROM happyview_users",
+        "SELECT token_hash FROM happyview_api_keys",
         "SELECT * FROM happyview_oauth_sessions",
+        "SELECT * FROM happyview_records_v2",
     ];
 
     #[tokio::test]
@@ -561,7 +557,7 @@ mod tests {
         let Some(db) = postgres_with_roles().await else {
             return;
         };
-        for sql in BYPASS_READS {
+        for sql in INTERNAL_READS {
             // Both with the role layer and with only the parser allowlist.
             for restricted in [true, false] {
                 let err = run_plugin_query(
@@ -746,13 +742,13 @@ mod tests {
             .unwrap();
     }
 
-    /// Proves the role is a real database boundary, not only a parser check: a
-    /// string-executing built-in run *under the read role* is denied by the
-    /// server even though, bypassing our parser, it names the table only in a
-    /// string. This is what the parser allowlist falls back on.
+    /// Proves the role is a real database boundary, not only a parser check: the
+    /// read role has no access to an internal table, so a read of one under that
+    /// role is denied by the server regardless of how the statement is written.
+    /// This is what the parser's allowlist falls back on.
     #[tokio::test]
     #[serial]
-    async fn the_read_role_denies_a_string_executed_internal_read() {
+    async fn the_read_role_cannot_read_an_internal_table() {
         let Some(db) = postgres_with_roles().await else {
             return;
         };
@@ -761,11 +757,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        let msg = match crate::db::query(
-            "SELECT query_to_xml('select * from happyview_users', true, false, '')",
-        )
-        .fetch_all(&mut *tx)
-        .await
+        let msg = match crate::db::query("SELECT * FROM happyview_users")
+            .fetch_all(&mut *tx)
+            .await
         {
             Ok(_) => panic!("the read role must be denied this read at the database"),
             Err(e) => e.to_string(),

@@ -47,6 +47,13 @@ pub(super) async fn status(
         "disk": report,
         "feasibility": feasibility,
         "vacuum": status,
+        // On Postgres, whether plugin raw SQL runs under the least-privileged
+        // roles (true) or the in-process allowlist on the main connection
+        // because those roles could not be set up at boot (false). Always false
+        // on SQLite, which has no such roles. Surfaced so an operator can see the
+        // fallback without reading boot logs.
+        "plugin_sql_restricted_roles": state.db_backend == DatabaseBackend::Postgres
+            && state.plugin_sql_restricted,
         "journal_size_limit": state.config.sqlite_journal_size_limit,
         "checkpoint": crate::maintenance::sqlite::last_checkpoint(),
         "checkpoint_interval_secs": crate::maintenance::sqlite::checkpoint_interval_secs(),
