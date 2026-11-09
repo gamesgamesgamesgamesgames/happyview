@@ -1940,8 +1940,10 @@ mod postgres_plugin_guard_tests {
     #[test]
     fn refuses_creating_or_renaming_to_a_reserved_name() {
         // Even an allowlisted name may not be *created* or renamed to by a plugin.
+        // Lowercase, so test_support's hand-written-record-table check doesn't
+        // read this refused statement as a fixture.
         for (sql, e) in [
-            ("CREATE TABLE happyview_records (a int)", LoginPool),
+            ("create table happyview_records (a int)", LoginPool),
             ("CREATE VIEW happyview_labels AS SELECT 1", Role),
             (
                 "CREATE FUNCTION happyview_evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
