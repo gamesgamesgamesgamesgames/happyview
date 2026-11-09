@@ -104,6 +104,26 @@ pub struct AppState {
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
+
+    /// How `db.raw` is isolated on Postgres, decided once at boot. See
+    /// [`PluginSqlAccess`].
+    pub plugin_sql: PluginSqlAccess,
+}
+
+/// How `db.raw` runs on Postgres. Decided at boot and fixed for the process.
+#[derive(Clone)]
+pub enum PluginSqlAccess {
+    /// Its own pool, logged in as the verified unprivileged `happyview_plugin`
+    /// role — the strongest isolation.
+    LoginPool(sqlx::AnyPool),
+    /// The main connection behind the tokenizer guard (today's behaviour). Also
+    /// used on SQLite, which has no such role.
+    Guard,
+    /// `db.raw` is refused on Postgres: `PLUGIN_SQL_DATABASE_URL` was set but the
+    /// login pool could not be opened or verified, or the plugin schema holds
+    /// code from an earlier login-pool session. HappyView still boots; only
+    /// `db.raw` is refused.
+    Refused,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {

@@ -1024,6 +1024,7 @@ mod tests {
             verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+            plugin_sql: crate::PluginSqlAccess::Guard,
         }
     }
 

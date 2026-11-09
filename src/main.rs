@@ -50,6 +50,14 @@ async fn main() {
         "connected to database"
     );
 
+    // Decide how `db.raw` is isolated on Postgres (fixed for the process).
+    let plugin_sql = happyview::lua::db_api::decide_plugin_sql_access(
+        &db_pool,
+        db_backend,
+        std::env::var("PLUGIN_SQL_DATABASE_URL").ok().as_deref(),
+    )
+    .await;
+
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.token_encryption_key.as_ref() {
         Some(key) => happyview::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
@@ -937,6 +945,7 @@ async fn main() {
         verbose_event_logging,
         client_jwks,
         telemetry_counters,
+        plugin_sql,
     };
 
     jetstream::spawn(state.clone(), collections_rx);
@@ -1022,7 +1031,7 @@ async fn main() {
 
 async fn seed_and_load_rate_limit_defaults(
     pool: &sqlx::AnyPool,
-    backend: happyview::db::DatabaseBackend,
+    backend: db::DatabaseBackend,
 ) -> RateLimitDefaults {
     use happyview::rate_limit::{
         SEED_DEFAULT_PROCEDURE_COST, SEED_DEFAULT_PROXY_COST, SEED_DEFAULT_QUERY_COST,
@@ -1031,7 +1040,7 @@ async fn seed_and_load_rate_limit_defaults(
 
     async fn seed_and_read(
         pool: &sqlx::AnyPool,
-        backend: happyview::db::DatabaseBackend,
+        backend: db::DatabaseBackend,
         key: &str,
         seed: u32,
     ) -> u32 {
