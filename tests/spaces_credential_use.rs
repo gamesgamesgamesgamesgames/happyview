@@ -69,13 +69,11 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
         post_as(
             app,
             CREATOR,
-            "com.atproto.simplespace.createSpace",
+            "com.atproto.space.createSpace",
             json!({
-                "type": "com.example.creduse",
+                "spaceType": "com.example.creduse",
                 "skey": format!("s{}", Uuid::new_v4().simple()),
-                "readPolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "writePolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+                "policy": { "$type": "com.atproto.memberspace.policy" },
             }),
         ),
     )
@@ -284,7 +282,7 @@ async fn gets_a_space_with_a_credential_addressed_to_its_authority() {
         .to_string();
 
     let path = format!(
-        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        "/xrpc/com.atproto.space.getSpace?space={}",
         urlencoding::encode(&space)
     );
     let resp = call(&app, read(&path, &credential, &key, &authority)).await;

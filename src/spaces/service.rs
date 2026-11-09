@@ -59,18 +59,6 @@ pub(crate) async fn is_super_admin(state: &AppState, did: &str) -> Result<bool, 
     Ok(row.is_some_and(|(is_super,)| is_super != 0))
 }
 
-pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
-    if let Some(serde_json::Value::Array(allowed)) = space.config.extra.get("allowedCollections")
-        && !allowed.is_empty()
-        && !allowed.iter().any(|v| v.as_str() == Some(collection))
-    {
-        return Err(AppError::BadRequest(format!(
-            "collection '{collection}' is not allowed in this space"
-        )));
-    }
-    Ok(())
-}
-
 /// Verify a space credential this instance issued for `space`, returning its
 /// claims.
 ///
@@ -147,6 +135,12 @@ pub(crate) async fn require_membership(
             ));
         }
         return Ok(MemberAccess::READ);
+    }
+    // The creator stands in for the space's authority, which no one signs in
+    // as, so it keeps access whatever the member list holds, as in
+    // `auth::policy_allows`.
+    if did == space.creator_did {
+        return Ok(MemberAccess::WRITE);
     }
     let access = members::is_member(&state.db, state.db_backend, &space.id, did)
         .await?
@@ -562,7 +556,6 @@ pub(crate) async fn create_record(
 ) -> Result<(String, String), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
-    check_collection_allowed(&space, collection)?;
 
     let space_uri = format!(
         "at://{}/space/{}/{}",
@@ -657,7 +650,6 @@ pub(crate) async fn put_record(
 ) -> Result<(String, String), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
-    check_collection_allowed(&space, collection)?;
 
     let space_uri = format!(
         "at://{}/space/{}/{}",
@@ -881,22 +873,7 @@ pub(crate) async fn create_space(
     }
     let authority =
         crate::spaces::authority::create(state, did, type_nsid, skey, creator_rotation_key).await?;
-    let mut config = config.unwrap_or_default();
-    if let Some(decl) = state.lexicons.get_space_declaration(type_nsid).await
-        && let Some(collections) = decl.space_collections
-        && !collections.is_empty()
-        && !config.extra.contains_key("allowedCollections")
-    {
-        config.extra.insert(
-            "allowedCollections".to_string(),
-            serde_json::Value::Array(
-                collections
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
+    let config = config.unwrap_or_default();
     let space = Space {
         id: uuid::Uuid::new_v4().to_string(),
         did: authority.clone(),
@@ -966,6 +943,36 @@ async fn revoke_member_credentials(
     Ok(())
 }
 
+/// A managedspace has no member list: its managing app decides who reads and
+/// writes. A member row on one would still grant access through
+/// [`require_membership`], around the managing app, so none may be added.
+fn no_members_on_managedspace() -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        code: "InvalidRequest",
+        message: "a managedspace has no member list; its managing app decides access".into(),
+    }
+}
+
+/// Insert or update a member, refusing a space that takes none. The policy is
+/// read in the insert's own transaction, under the space's row lock, so an
+/// insert racing a migration cannot land after the member list is discarded.
+async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if !db::lock_space_for_members(&mut *tx, state.db_backend, &member.space_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read space: {e}")))?
+    {
+        return Err(no_members_on_managedspace());
+    }
+    db::add_member(&mut *tx, state.db_backend, member).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit member: {e}")))
+}
+
 /// Upsert a member. `access` of `None` leaves an existing member's read and
 /// write untouched, and gives a new one read — so a caller who names only a
 /// DID, or only `is_delegation`, neither grants nor withdraws access.
@@ -1002,7 +1009,7 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    insert_member(state, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
@@ -1037,7 +1044,7 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    insert_member(state, &member).await?;
     Ok(member)
 }
 
@@ -1074,8 +1081,40 @@ pub(crate) async fn update_space(
     if let Some(cfg) = config {
         space.config = cfg;
     }
-    db::update_space(&state.db, state.db_backend, &space).await?;
+    // Rules that now make a managedspace leave it no member list, as
+    // `updateSpace` does on a migration.
+    let managed = matches!(
+        crate::spaces::policy::SpacePolicy::of(&space),
+        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+    );
+    store_space(state, &space, managed).await?;
     Ok(space)
+}
+
+/// Store a space's fields and, with `discard_members`, discard its member
+/// list and its invites, all in one transaction, so a failure cannot leave a
+/// managedspace with the member list of the space it replaced.
+///
+/// The `UPDATE` takes the space's row first, as every member insert does
+/// (`db::lock_space_for_members`), so an insert racing this one either lands
+/// before the list is discarded or sees the new policy.
+pub(crate) async fn store_space(
+    state: &AppState,
+    space: &Space,
+    discard_members: bool,
+) -> Result<(), AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    db::update_space(&mut *tx, state.db_backend, space).await?;
+    if discard_members {
+        db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
+        // An outstanding invite would add a member once accepted.
+        db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))
 }
 
 pub(crate) async fn delete_space(
@@ -1153,6 +1192,13 @@ pub(crate) async fn create_invite(
         .transpose()?;
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    // Accepting re-checks under the space's row lock; this answers early.
+    if matches!(
+        crate::spaces::policy::SpacePolicy::of(&space),
+        Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+    ) {
+        return Err(no_members_on_managedspace());
+    }
     let mut token_bytes = [0u8; 24];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut token_bytes);
     let token = hex::encode(token_bytes);
@@ -1226,6 +1272,7 @@ pub(crate) async fn accept_invite(
                 "You are already a member of this space".into(),
             ));
         }
+        db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
@@ -1328,59 +1375,6 @@ mod tests {
             ),
         );
         config
-    }
-
-    fn space_with_config(config: SpaceConfig) -> Space {
-        Space {
-            id: "space-id".into(),
-            did: "did:plc:owner".into(),
-            authority_did: "did:plc:owner".into(),
-            creator_did: "did:plc:owner".into(),
-            type_nsid: "com.example.forum".into(),
-            skey: "main".into(),
-            display_name: None,
-            description: None,
-            read_policy: Policy::MemberList,
-            write_policy: Policy::MemberList,
-            app_access: AppAccess::default(),
-            config,
-            revision: None,
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        }
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_listed_collection() {
-        let space = space_with_config(config_with_allowed_collections(&["com.example.allowed"]));
-        assert!(super::check_collection_allowed(&space, "com.example.allowed").is_ok());
-    }
-
-    #[test]
-    fn check_collection_allowed_rejects_unlisted_collection() {
-        let space = space_with_config(config_with_allowed_collections(&["com.example.allowed"]));
-        let err = super::check_collection_allowed(&space, "com.example.denied").unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_any_collection_when_config_absent() {
-        let space = space_with_config(SpaceConfig::default());
-        assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
-    }
-
-    #[test]
-    fn check_collection_allowed_permits_any_collection_when_list_empty() {
-        let space = space_with_config(config_with_allowed_collections(&[]));
-        assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
     }
 
     #[tokio::test]
@@ -1952,32 +1946,37 @@ mod tests {
         assert!(matches!(err, crate::error::AppError::Forbidden(_)));
     }
 
+    /// Any collection may appear in a space, as Proposal 0016 has it. An
+    /// `allowedCollections` list stored by an earlier HappyView limits nothing.
     #[tokio::test]
-    async fn create_record_rejects_disallowed_collection() {
+    async fn a_stored_collection_list_does_not_limit_writes() {
         require_test_db!();
         let (state, space_uri, member_did) =
             service_test_db_with_config(config_with_allowed_collections(&["com.example.allowed"]))
                 .await;
 
-        let err = super::create_record(
+        super::create_record(
             &state,
             &member_did,
             None,
             &space_uri,
-            "com.example.denied",
-            serde_json::json!({ "text": "no" }),
+            "com.example.unlisted",
+            serde_json::json!({ "text": "yes" }),
         )
         .await
-        .unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
+        .expect("create to an unlisted collection");
+        super::put_record(
+            &state,
+            &member_did,
+            None,
+            &space_uri,
+            "com.example.unlisted",
+            "fixedrkey-put-unlisted",
+            serde_json::json!({ "text": "yes" }),
+            None,
+        )
+        .await
+        .expect("put to an unlisted collection");
     }
 
     #[tokio::test]
@@ -2031,36 +2030,6 @@ mod tests {
         )
         .await
         .expect("empty allowedCollections list should allow any collection");
-    }
-
-    #[tokio::test]
-    async fn put_record_rejects_disallowed_collection() {
-        require_test_db!();
-        let (state, space_uri, member_did) =
-            service_test_db_with_config(config_with_allowed_collections(&["com.example.allowed"]))
-                .await;
-
-        let err = super::put_record(
-            &state,
-            &member_did,
-            None,
-            &space_uri,
-            "com.example.denied",
-            "fixedrkey-put-denied",
-            serde_json::json!({ "text": "no" }),
-            None,
-        )
-        .await
-        .unwrap_err();
-        match err {
-            crate::error::AppError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not allowed"),
-                    "expected 'not allowed' in message, got: {msg}"
-                );
-            }
-            other => panic!("expected BadRequest, got: {other:?}"),
-        }
     }
 
     #[tokio::test]

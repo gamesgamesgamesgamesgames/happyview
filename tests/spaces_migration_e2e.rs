@@ -221,8 +221,8 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
     let (status, body) = hv_post(
         &app,
         &account.did,
-        "com.atproto.simplespace.createSpace",
-        json!({ "type": SPACE_TYPE, "skey": skey }),
+        "com.atproto.space.createSpace",
+        json!({ "spaceType": SPACE_TYPE, "skey": skey, "policy": { "$type": "com.atproto.memberspace.policy" } }),
     )
     .await;
     assert!(

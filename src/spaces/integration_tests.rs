@@ -394,17 +394,6 @@ mod tests {
         assert_eq!(legacy_route, "/xrpc/dev.happyview.space.getMemberGrant");
     }
 
-    #[test]
-    fn create_space_legacy_maps_to_simplespace() {
-        // dev.happyview.space.createSpace is the legacy alias for com.atproto.simplespace.createSpace
-        let legacy = format!("/xrpc/{}.space.createSpace", EXPECTED_LEGACY_NS);
-        let canonical = format!("/xrpc/{}.simplespace.createSpace", EXPECTED_PROTO_NS);
-        // Both paths must be distinct strings that map to the same handler
-        assert_ne!(legacy, canonical);
-        assert_eq!(legacy, "/xrpc/dev.happyview.space.createSpace");
-        assert_eq!(canonical, "/xrpc/com.atproto.simplespace.createSpace");
-    }
-
     // -----------------------------------------------------------------------
     // 6. Read scope validation — cross-module
     // -----------------------------------------------------------------------

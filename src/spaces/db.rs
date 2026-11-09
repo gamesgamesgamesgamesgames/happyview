@@ -262,7 +262,7 @@ pub async fn list_spaces_for_user(
 }
 
 pub async fn update_space(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space: &Space,
 ) -> Result<bool, AppError> {
@@ -290,7 +290,7 @@ pub async fn update_space(
         .bind(&config_json)
         .bind(&now)
         .bind(&space.id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update space: {e}")))?;
 
@@ -383,7 +383,7 @@ fn parse_space_row(r: SpaceRow) -> Result<Space, AppError> {
 // ---------------------------------------------------------------------------
 
 pub async fn add_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<(), AppError> {
@@ -413,11 +413,88 @@ pub async fn add_member(
         .bind(member.is_delegation as i32)
         .bind(&member.granted_by)
         .bind(&now)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))?;
 
     Ok(())
+}
+
+/// Discard a space's member list, as migrating it to a policy that keeps none
+/// does. Returns how many members were removed.
+pub async fn remove_all_members(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_members WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))
+}
+
+/// Whether a space may take members, read under a lock on its row that lasts
+/// until the transaction ends.
+///
+/// Every member insert calls this first in its transaction, and a policy
+/// migration's `UPDATE` takes the same row first in its own, so the two
+/// serialize: an insert either commits before the migration discards the
+/// member list, or sees the new policy. Postgres locks with `FOR UPDATE`;
+/// on SQLite, `BEGIN IMMEDIATE` already serializes every writer.
+///
+/// A `managedspace` takes none: its managing app decides access, and a member
+/// row would grant direct access around it. So does a space that is missing
+/// or does not parse, so this fails closed.
+pub async fn lock_space_for_members(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let lock = match backend {
+        DatabaseBackend::Postgres => " FOR UPDATE",
+        DatabaseBackend::Sqlite => "",
+    };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?{lock}"
+        ),
+        backend,
+    );
+    let row: Option<SpaceRow> = crate::db::query_as(&sql)
+        .bind(space_id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(row
+        .and_then(|r| parse_space_row(r).ok())
+        .is_some_and(|space| {
+            !matches!(
+                crate::spaces::policy::SpacePolicy::of(&space),
+                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+            )
+        }))
+}
+
+/// Delete every invite to a space, as migrating it to a policy that keeps no
+/// member list does. Returns how many were deleted.
+pub async fn delete_invites(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_invites WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to delete invites: {e}")))
 }
 
 pub async fn remove_member(
@@ -1530,6 +1607,8 @@ pub enum InviteClaim {
     /// Revoked, or every use already taken.
     Unavailable,
     AlreadyMember,
+    /// The space takes no members (see [`lock_space_for_members`]).
+    NoMembers,
 }
 
 /// Takes one use of an invite and adds its member, or does neither.
@@ -1558,6 +1637,11 @@ pub async fn claim_invite(
     );
     crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(pool, backend).await?;
+        // The space's row first, as a migration takes it, so the two cannot
+        // deadlock.
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(InviteClaim::NoMembers);
+        }
         let taken = crate::db::query(&take_use)
             .bind(invite_id)
             .execute(&mut *tx)

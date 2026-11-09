@@ -349,7 +349,8 @@ const LEGACY_NS: &str = "dev.happyview";
 /// does. Legacy `dev.happyview.*` aliases are absent: they are not
 /// protocol methods and must not be advertised.
 pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
-    vec![
+    let mut table = crate::spaces::lifecycle::lifecycle_method_table();
+    table.extend(vec![
         (format!("{PROTO_NS}.space.listSpaces"), get(list_spaces)),
         (format!("{PROTO_NS}.space.getRecord"), get(get_record)),
         (format!("{PROTO_NS}.space.listRecords"), get(list_records)),
@@ -403,7 +404,8 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
             post(notify_credential_revoked),
         ),
         (format!("{PROTO_NS}.space.getBlob"), get(get_space_blob)),
-    ]
+    ]);
+    table
 }
 
 pub fn space_routes() -> Router<AppState> {
@@ -433,7 +435,6 @@ pub fn space_routes() -> Router<AppState> {
             get(list_invites),
         )
         // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
-        .route(&format!("/xrpc/{LEGACY_NS}.space.getSpace"), get(get_space))
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.listSpaces"),
             get(list_spaces),
@@ -592,54 +593,6 @@ fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
 // ---------------------------------------------------------------------------
 // Space read handlers
 // ---------------------------------------------------------------------------
-
-/// Served under `com.atproto.simplespace.getSpace`: the lexicons place it in the
-/// management namespace, not the protocol one. The `dev.happyview.*` alias below
-/// is the legacy path.
-pub(crate) async fn get_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Query(query): Query<SpaceUriQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let space = service::resolve_space(&state, &query.space).await?;
-
-    // Only a space admin or a holder of a space credential may read the space.
-    let is_admin = match &xrpc_claims.identity {
-        Some(identity) => {
-            match service::require_space_admin(&state, &space, identity.did()).await {
-                Ok(()) => true,
-                Err(AppError::Forbidden(_)) => false,
-                Err(e) => return Err(e),
-            }
-        }
-        None => false,
-    };
-    if !is_admin {
-        if let Some(token) = &xrpc_claims.space_credential {
-            require_audience(&xrpc_claims, &space.authority_did)?;
-            service::verify_space_credential(&state, &space, token).await?;
-        } else {
-            require_auth(&xrpc_claims)?;
-            return Err(AppError::NotFound("Space not found".into()));
-        }
-    }
-
-    let space_uri = format!(
-        "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
-    );
-    let simplespace_config = serde_json::json!({
-        "$type": "com.atproto.simplespace.defs#spaceConfig",
-        "readPolicy": space.read_policy,
-        "writePolicy": space.write_policy,
-        "appAccess": space.app_access,
-    });
-    Ok(Json(serde_json::json!({
-        "uri": space_uri,
-        "space": space,
-        "config": simplespace_config,
-    })))
-}
 
 async fn list_spaces(
     State(state): State<AppState>,
@@ -846,15 +799,6 @@ async fn apply_writes(
         }
     }
 
-    // The single writes check the collection before they forward; a batch
-    // checks every op before it does, so it cannot carry a collection the
-    // space does not allow.
-    for write in &input.writes {
-        if let WriteOp::Create { collection, .. } | WriteOp::Update { collection, .. } = write {
-            service::check_collection_allowed(&space, collection)?;
-        }
-    }
-
     // A repo hosted on its author's PDS takes the batch there, as the single
     // writes do; writing only HappyView's copy would fork the two, and the
     // next sync would drop what was written here.
@@ -909,7 +853,6 @@ async fn apply_writes(
                 rkey,
                 value,
             } => {
-                service::check_collection_allowed(&space, &collection)?;
                 let rkey = rkey.unwrap_or_else(generate_tid);
                 let cid = service::content_cid(&value)?;
                 let record_uri = format!(
@@ -945,7 +888,6 @@ async fn apply_writes(
                 value,
                 swap_record,
             } => {
-                service::check_collection_allowed(&space, &collection)?;
                 let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",

@@ -179,6 +179,12 @@ async fn policy_allows(
     authority_did: &str,
     access: AccessKind,
 ) -> Result<bool, AppError> {
+    // Proposal 0016 authorizes the authority's own account under every policy.
+    // The authority here is a DID no one signs in as, and its creator stands
+    // in for it.
+    if subject_did == space.creator_did {
+        return Ok(true);
+    }
     match policy {
         Policy::Public => Ok(true),
         Policy::MemberList => {

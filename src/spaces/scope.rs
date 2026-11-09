@@ -2,7 +2,7 @@ use crate::AppState;
 use crate::auth::middleware::Claims;
 use crate::error::AppError;
 use crate::spaces::types::{MemberAccess, Space};
-use happyview_scopes::{ScopePermissions, SpaceTarget};
+use happyview_scopes::SpaceTarget;
 
 /// Check whether the caller may read a specific target repo.
 ///
@@ -147,6 +147,33 @@ pub async fn require_space_scope(
     space: &Space,
     target: SpaceTarget<'_>,
 ) -> Result<(), AppError> {
+    require_space_scope_at(
+        state,
+        claims,
+        &space.type_nsid,
+        &space.authority_did,
+        &space.skey,
+        target,
+    )
+    .await
+}
+
+/// [`require_space_scope`] for a space named by its address, which need not
+/// exist yet: `createSpace` checks `manage=create` before there is a space.
+/// A space created here gets a DID of its own, unknown until it exists, so a
+/// grant covers creating one only with `authority=*`; callers pass `*`.
+///
+/// A grant that names no collections gets the ones the space type's
+/// declaration lists, as Proposal 0016 defines the default, resolved now
+/// rather than when the session was granted.
+pub async fn require_space_scope_at(
+    state: &AppState,
+    claims: &Claims,
+    space_type: &str,
+    authority: &str,
+    skey: &str,
+    target: SpaceTarget<'_>,
+) -> Result<(), AppError> {
     let (Some(client_key), Some(dpop_key_id)) = (claims.client_key(), claims.dpop_key_id()) else {
         return Ok(());
     };
@@ -163,32 +190,179 @@ pub async fn require_space_scope(
         return Ok(());
     };
 
-    let granted = ScopePermissions::parse(&scopes);
-    if granted.allows_space_for_user(
+    let declared = state
+        .lexicons
+        .get_space_declaration(space_type)
+        .await
+        .and_then(|d| d.space_collections)
+        .unwrap_or_default();
+    if grants_cover(
+        &scopes,
         claims.did(),
-        &space.type_nsid,
-        &space.authority_did,
-        &space.skey,
+        &declared,
+        space_type,
+        authority,
+        skey,
         target,
     ) {
         return Ok(());
     }
 
+    let needed = match target {
+        SpaceTarget::Manage(op) => format!("&manage={}", op.as_str()),
+        _ => String::new(),
+    };
     Err(AppError::Forbidden(format!(
         "this session is not authorized for this space: it needs a space: grant covering \
-         {}?authority={}&skey={}. Scopes are fixed when a session is created, so this needs \
-         a new authorization.",
-        space.type_nsid, space.authority_did, space.skey
+         {space_type}?authority={authority}&skey={skey}{needed}. Scopes are fixed when a \
+         session is created, so this needs a new authorization."
     )))
 }
 
+/// Whether the session's `scopes` cover `target` in the space at
+/// (`space_type`, `authority`, `skey`), for the user `user_did`, with a grant
+/// that names no collections taking `declared` for a grant of this space type.
+pub(crate) fn grants_cover(
+    scopes: &str,
+    user_did: &str,
+    declared: &[String],
+    space_type: &str,
+    authority: &str,
+    skey: &str,
+    target: SpaceTarget<'_>,
+) -> bool {
+    // A bare grant takes the declaration's collections as its own. Only NSIDs
+    // count: the declaration is the lexicon author's, not the user's consent,
+    // so a `*` there must not widen a grant to every collection.
+    let declared: Vec<String> = declared
+        .iter()
+        .filter(|c| happyview_nsid::validate_nsid(c).is_ok())
+        .cloned()
+        .collect();
+    scopes
+        .split_whitespace()
+        .filter_map(happyview_scopes::SpacePermission::parse)
+        .map(|p| {
+            // A `*` space type has no declaration to draw a default from.
+            let defaults: &[String] = if p.space_type == space_type {
+                &declared
+            } else {
+                &[]
+            };
+            p.with_resolved_authority(user_did)
+                .with_default_collections(defaults)
+        })
+        .any(|p| p.matches(space_type, authority, skey, target))
+}
+
 #[cfg(test)]
-mod space_scope_gate_tests {
+mod grant_tests {
+    use super::grants_cover;
+    use happyview_scopes::{ManageOp, SpaceAction, SpaceTarget};
+
+    const USER: &str = "did:plc:user";
+    const SPACE: &str = "did:plc:space";
+
+    fn covers(scopes: &str, declared: &[&str], target: SpaceTarget<'_>) -> bool {
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        grants_cover(
+            scopes,
+            USER,
+            &declared,
+            "com.example.forum",
+            SPACE,
+            "main",
+            target,
+        )
+    }
+
+    fn write(collection: &str) -> SpaceTarget<'_> {
+        SpaceTarget::Write {
+            action: SpaceAction::Create,
+            collection,
+        }
+    }
+
+    #[test]
+    fn a_bare_grant_writes_the_declared_collections() {
+        let grant = "space:com.example.forum?authority=*";
+        assert!(covers(
+            grant,
+            &["com.example.post"],
+            write("com.example.post")
+        ));
+        assert!(!covers(
+            grant,
+            &["com.example.post"],
+            write("com.example.other")
+        ));
+        assert!(!covers(grant, &[], write("com.example.post")));
+    }
+
+    #[test]
+    fn a_declared_wildcard_or_non_nsid_is_no_default() {
+        let grant = "space:com.example.forum?authority=*";
+        for declared in ["*", "com.example.*", "not an nsid"] {
+            assert!(
+                !covers(grant, &[declared], write("com.example.post")),
+                "{declared}"
+            );
+        }
+        assert!(covers(
+            grant,
+            &["*", "com.example.post"],
+            write("com.example.post")
+        ));
+    }
+
+    #[test]
+    fn named_collections_replace_the_default() {
+        let grant = "space:com.example.forum?authority=*&collection=com.example.other";
+        assert!(covers(
+            grant,
+            &["com.example.post"],
+            write("com.example.other")
+        ));
+        assert!(!covers(
+            grant,
+            &["com.example.post"],
+            write("com.example.post")
+        ));
+    }
+
+    #[test]
+    fn manage_needs_its_own_parameter() {
+        let target = SpaceTarget::Manage(ManageOp::Update);
+        assert!(!covers("space:com.example.forum?authority=*", &[], target));
+        assert!(covers(
+            "space:com.example.forum?authority=*&manage=update",
+            &[],
+            target
+        ));
+        assert!(!covers(
+            "space:com.example.forum?authority=*&manage=delete",
+            &[],
+            target
+        ));
+    }
+
+    #[test]
+    fn a_bare_grant_covers_only_the_users_own_did() {
+        assert!(!covers(
+            "space:com.example.forum?manage=update",
+            &[],
+            SpaceTarget::Manage(ManageOp::Update)
+        ));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod space_scope_gate_tests {
     use super::*;
     use crate::db::adapt_sql;
     use crate::spaces::types::{AppAccess, Policy, SpaceConfig};
 
-    const USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn a_space() -> Space {
         Space {
@@ -212,19 +386,20 @@ mod space_scope_gate_tests {
 
     /// Seed an API client plus a DPoP session carrying `scopes`, and return
     /// claims naming them.
-    async fn session_with_scopes(state: &AppState, scopes: &str) -> Claims {
+    pub(crate) async fn session_with_scopes(state: &AppState, scopes: &str) -> Claims {
         let now = crate::db::now_rfc3339();
         let client_id = uuid::Uuid::new_v4().to_string();
         let client_key = format!("hvc_{}", uuid::Uuid::new_v4().simple());
         let dpop_key_id = uuid::Uuid::new_v4().to_string();
 
         let sql = adapt_sql(
-            "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at) VALUES (?, ?, '', 'test', '', '', '[]', '', 'confidential', 1, ?, ?, ?)",
+            "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at) VALUES (?, ?, '', 'test', ?, '', '[]', '', 'confidential', 1, ?, ?, ?)",
             state.db_backend,
         );
         crate::db::query(&sql)
             .bind(&client_id)
             .bind(&client_key)
+            .bind(format!("https://client.test/{client_id}"))
             .bind(USER)
             .bind(&now)
             .bind(&now)

@@ -598,7 +598,7 @@ async fn deleting_a_space_notifies_registered_syncers() {
     let (name, value) = common::auth::admin_cookie_header("did:plc:creator", &app.state.cookie_key);
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.deleteSpace")
+        .uri("/xrpc/com.atproto.space.deleteSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(json!({ "space": space }).to_string()))
@@ -702,19 +702,19 @@ async fn create_space_on_its_own_did_with(
     extra: serde_json::Value,
 ) -> String {
     let (name, value) = common::auth::admin_cookie_header(creator, &app.state.cookie_key);
-    let mut body = json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY });
+    let mut body = json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY, "policy": { "$type": "com.atproto.memberspace.policy" } });
     for (k, v) in extra.as_object().unwrap() {
         body[k] = v.clone();
     }
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.createSpace")
+        .uri("/xrpc/com.atproto.space.createSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -927,8 +927,8 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
     let space = create_space_on_its_own_did_with(
         &app,
         &creator,
-        json!({ "writePolicy": {
-            "$type": "com.atproto.simplespace.defs#managingAppPolicy",
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
             "managingApp": "did:plc:forumapp#forum",
         }}),
     )
@@ -1022,7 +1022,7 @@ async fn a_space_on_its_own_did_announces_its_deletion_as_it() {
     let (name, value) = common::auth::admin_cookie_header(&creator, &app.state.cookie_key);
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.deleteSpace")
+        .uri("/xrpc/com.atproto.space.deleteSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(json!({ "space": space }).to_string()))
