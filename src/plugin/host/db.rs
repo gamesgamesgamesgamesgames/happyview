@@ -327,6 +327,83 @@ pub async fn ensure_plugin_roles(
     true
 }
 
+/// Decide how plugin raw SQL is isolated on Postgres, once at boot. Sets up the
+/// roles and schema, then: if `login_url` (`PLUGIN_SQL_DATABASE_URL`) is set,
+/// opens and **verifies** the login pool and **fails closed** (refuses plugin
+/// SQL) rather than downgrading if it cannot; otherwise refuses when the plugin
+/// schema holds code from an earlier login-pool session, else runs in role or
+/// parser-only mode. SQLite is always parser-only (ignored there).
+pub async fn decide_plugin_sql_access(
+    db_pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    login_url: Option<&str>,
+) -> crate::PluginSqlAccess {
+    use crate::PluginSqlAccess;
+    if backend != crate::db::DatabaseBackend::Postgres {
+        return PluginSqlAccess::ParserOnly;
+    }
+    let restricted = ensure_plugin_roles(db_pool, backend).await;
+
+    if let Some(url) = login_url.map(str::trim).filter(|u| !u.is_empty()) {
+        let main_role = main_role_name(db_pool).await;
+        return match open_plugin_login_pool(url, &main_role).await {
+            Some(pool) => {
+                tracing::info!(
+                    "plugin raw SQL runs on the dedicated login pool as an unprivileged role"
+                );
+                PluginSqlAccess::LoginPool(pool)
+            }
+            None => {
+                tracing::error!(
+                    "PLUGIN_SQL_DATABASE_URL is set but the plugin SQL login pool could not be \
+                     opened or verified; refusing plugin raw SQL on Postgres. HappyView otherwise \
+                     boots normally."
+                );
+                PluginSqlAccess::Refused
+            }
+        };
+    }
+
+    // Outside the login pool, objects a plugin left in its schema would run with
+    // the privileged session user, so refuse plugin SQL until they are cleared
+    // (or the login pool is restored).
+    if plugin_schema_has_code(db_pool, backend).await {
+        tracing::error!(
+            "the '{PLUGIN_SCHEMA}' schema holds functions or triggers created in an earlier \
+             login-pool session; refusing plugin raw SQL (they would otherwise run with \
+             HappyView's privileges). Restore PLUGIN_SQL_DATABASE_URL, or drop those objects \
+             from the '{PLUGIN_SCHEMA}' schema, to re-enable plugin SQL."
+        );
+        return PluginSqlAccess::Refused;
+    }
+
+    if restricted {
+        tracing::info!(
+            "plugin raw SQL runs under the least-privileged roles on the main connection"
+        );
+        PluginSqlAccess::Role
+    } else {
+        tracing::warn!(
+            "plugin raw SQL runs under the parser allowlist on the main connection: the roles \
+             '{PLUGIN_ROLE_RO}' / '{PLUGIN_ROLE_RW}' could not be set up. Grant the HappyView \
+             database role CREATEROLE (or pre-create those roles and grant them to it), or set \
+             PLUGIN_SQL_DATABASE_URL to the dedicated login role, to enable the stronger modes."
+        );
+        PluginSqlAccess::ParserOnly
+    }
+}
+
+/// The main pool's login role (`current_user`), for the login-pool role check.
+async fn main_role_name(pool: &sqlx::AnyPool) -> String {
+    match crate::db::query("SELECT current_user::text AS u")
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(row)) => row.try_get::<String, _>("u").unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Open the dedicated login pool for plugin SQL from `url` (a connection string
 /// for the `happyview_plugin` LOGIN role). Each released connection is reset with
 /// `DISCARD ALL`, so no temporary object, advisory lock or session setting a
@@ -342,7 +419,20 @@ pub async fn ensure_plugin_roles(
 /// or fails the check. Postgres only.
 pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::AnyPool> {
     crate::db::install_drivers();
-    let pool = sqlx::any::AnyPoolOptions::new()
+    let pool = plugin_login_pool_options()
+        .connect(url)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "could not open the plugin SQL login pool"))
+        .ok()?;
+    if !login_role_is_unprivileged(&pool, main_role).await {
+        return None;
+    }
+    Some(pool)
+}
+
+/// The login pool's options, including the `DISCARD ALL` reset on release.
+fn plugin_login_pool_options() -> sqlx::any::AnyPoolOptions {
+    sqlx::any::AnyPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .idle_timeout(std::time::Duration::from_secs(300))
@@ -354,14 +444,6 @@ pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::
                 Ok(true)
             })
         })
-        .connect(url)
-        .await
-        .map_err(|e| tracing::warn!(error = %e, "could not open the plugin SQL login pool"))
-        .ok()?;
-    if !login_role_is_unprivileged(&pool, main_role).await {
-        return None;
-    }
-    Some(pool)
 }
 
 /// Verify the pool's session user is a safe least-privileged role. A single
@@ -370,12 +452,17 @@ pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::
 async fn login_role_is_unprivileged(pool: &sqlx::AnyPool, main_role: &str) -> bool {
     // One row, one boolean column `ok`. `has_table_privilege`/`has_schema_privilege`
     // over the protected tables and `public`; role attributes from `pg_roles`;
-    // identity and membership against the main role.
+    // identity and membership against the main role. The login role may be a
+    // member (directly or through another role) of the two plugin roles only, so
+    // a grant of anything else, such as a predefined `pg_*` role, refuses it.
     let sql = "SELECT (\
         NOT r.rolsuper AND NOT r.rolcreaterole AND NOT r.rolcreatedb \
         AND NOT r.rolreplication AND NOT r.rolbypassrls \
         AND session_user <> $1 \
         AND NOT pg_has_role(session_user, $1, 'MEMBER') \
+        AND NOT EXISTS (SELECT 1 FROM pg_roles g \
+            WHERE g.rolname NOT IN (session_user, $2, $3) \
+            AND pg_has_role(session_user, g.oid, 'MEMBER')) \
         AND NOT has_table_privilege(session_user, 'happyview_users', 'SELECT') \
         AND NOT has_table_privilege(session_user, 'happyview_api_keys', 'SELECT') \
         AND NOT has_table_privilege(session_user, 'happyview_dpop_keys', 'SELECT') \
@@ -384,6 +471,8 @@ async fn login_role_is_unprivileged(pool: &sqlx::AnyPool, main_role: &str) -> bo
     ) AS ok FROM pg_roles r WHERE r.rolname = session_user";
     let row = match crate::db::query(sql)
         .bind(main_role)
+        .bind(PLUGIN_ROLE_RO)
+        .bind(PLUGIN_ROLE_RW)
         .fetch_optional(pool)
         .await
     {
@@ -401,8 +490,9 @@ async fn login_role_is_unprivileged(pool: &sqlx::AnyPool, main_role: &str) -> bo
     if !ok {
         tracing::error!(
             "PLUGIN_SQL_DATABASE_URL names a role that is not a safe least-privileged plugin \
-             role (it is privileged, is the main role or a member of it, can read protected \
-             tables, or can create in public). Refusing the login pool. Point it at the \
+             role (it is privileged, is the main role or a member of it, is a member of a \
+             role other than the two plugin roles, can read protected tables, or can create \
+             in public). Refusing the login pool. Point it at the \
              unprivileged 'happyview_plugin' role."
         );
     }
@@ -1044,6 +1134,28 @@ mod tests {
         .await
         .expect("a plugin may define a function in its schema");
 
+        clear_plugin_schema_code(&db).await;
+        drop(login_pool);
+
+        // A membership in any role besides the two plugin roles refuses the pool:
+        // a granted role could carry privileges the checks above don't sample.
+        for stmt in [
+            "DROP ROLE IF EXISTS hv_test_extra_role".to_string(),
+            "CREATE ROLE hv_test_extra_role NOLOGIN".to_string(),
+            format!("GRANT hv_test_extra_role TO {PLUGIN_ROLE_LOGIN}"),
+        ] {
+            crate::db::query(&stmt).execute(&db).await.unwrap();
+        }
+        let with_extra = open_plugin_login_pool(&login_url, "happyview").await;
+        crate::db::query("DROP ROLE hv_test_extra_role")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(
+            with_extra.is_none(),
+            "a login role that is a member of another role must be refused"
+        );
+
         crate::db::query(&format!("ALTER ROLE {PLUGIN_ROLE_LOGIN} NOLOGIN"))
             .execute(&db)
             .await
@@ -1127,38 +1239,150 @@ mod tests {
         let _ = tx.rollback().await;
     }
 
-    /// A read-mode statement runs in a read-only transaction: even under the
-    /// *write* role (which holds the grants to write), a write is refused as
-    /// read-only. This mirrors what `run_plugin_query` sets up for a read, where
-    /// a plain SELECT could call a plugin function; removing `SET TRANSACTION
-    /// READ ONLY` would let the write through.
+    /// A read through `run_plugin_query` runs in a read-only transaction. A
+    /// plain SELECT may call a function that writes (the login pool lets a
+    /// plugin define one), and the read-only transaction is what stops it: the
+    /// error is "read-only", not the read role's missing grant, which would be
+    /// all that stood in the way without it.
     #[tokio::test]
     #[serial]
-    async fn a_read_runs_in_a_read_only_transaction() {
+    async fn a_plugin_read_cannot_write_through_a_function() {
         let Some(db) = postgres_with_roles().await else {
             return;
         };
-        let mut tx = db.begin().await.unwrap();
-        // Same order as `enter_plugin_role` for a read: read-only, then role.
-        crate::db::query("SET TRANSACTION READ ONLY")
-            .execute(&mut *tx)
+        crate::db::query(
+            "CREATE OR REPLACE FUNCTION public.hv_test_read_probe() RETURNS int LANGUAGE sql \
+             AS $$ DELETE FROM happyview_jobs WHERE false; SELECT 1 $$",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let result = run_plugin_query(
+            &db,
+            DatabaseBackend::Postgres,
+            PluginSqlEnforcement::LoginPool,
+            PluginSqlMode::Read,
+            "SELECT hv_test_read_probe() AS n",
+            &[],
+        )
+        .await;
+        crate::db::query("DROP FUNCTION public.hv_test_read_probe()")
+            .execute(&db)
             .await
             .unwrap();
-        crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE_RW}"))
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        // The write role could write this allowlisted table, but the read-only
-        // transaction forbids it.
-        let err = crate::db::query("DELETE FROM happyview_jobs WHERE false")
-            .execute(&mut *tx)
-            .await
-            .expect_err("a read-only transaction must forbid the write");
+        let err = result.expect_err("a read must not write through a function");
         assert!(
-            err.to_string().contains("read-only") || err.to_string().contains("read only"),
+            err.contains("read-only") || err.contains("read only"),
             "expected a read-only error, got: {err}"
         );
-        let _ = tx.rollback().await;
+    }
+
+    /// In parser-only mode the privileged connection does not search the plugin
+    /// schema, so an unqualified name resolves to `public` even when the plugin
+    /// schema holds an object of the same name.
+    #[tokio::test]
+    #[serial]
+    async fn parser_only_resolves_names_outside_the_plugin_schema() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        for stmt in [
+            "DROP TABLE IF EXISTS public.hv_test_path_probe",
+            "DROP TABLE IF EXISTS happyview_plugin.hv_test_path_probe",
+            "CREATE TABLE public.hv_test_path_probe (v text)",
+            "INSERT INTO public.hv_test_path_probe VALUES ('public')",
+            "CREATE TABLE happyview_plugin.hv_test_path_probe (v text)",
+            "INSERT INTO happyview_plugin.hv_test_path_probe VALUES ('plugin')",
+        ] {
+            crate::db::query(stmt).execute(&db).await.unwrap();
+        }
+        let result = run_plugin_query(
+            &db,
+            DatabaseBackend::Postgres,
+            PluginSqlEnforcement::ParserOnly,
+            PluginSqlMode::Read,
+            "SELECT v FROM hv_test_path_probe",
+            &[],
+        )
+        .await;
+        for stmt in [
+            "DROP TABLE public.hv_test_path_probe",
+            "DROP TABLE happyview_plugin.hv_test_path_probe",
+        ] {
+            crate::db::query(stmt).execute(&db).await.unwrap();
+        }
+        let rows = result.expect("parser-only read of a caller table");
+        assert_eq!(rows[0]["v"], json!("public"));
+    }
+
+    /// Drop every routine and trigger in the plugin schema, so a test that needs
+    /// it free of code starts from there.
+    async fn clear_plugin_schema_code(db: &sqlx::AnyPool) {
+        crate::db::query(
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT t.tgname, c.oid::regclass AS rel FROM pg_trigger t \
+               JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'happyview_plugin' AND NOT t.tgisinternal \
+             LOOP EXECUTE format('DROP TRIGGER %I ON %s', r.tgname, r.rel); END LOOP; \
+             FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'happyview_plugin' \
+             LOOP EXECUTE 'DROP ROUTINE ' || r.sig; END LOOP; END $$",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// A login URL that is set but cannot be used refuses plugin SQL rather
+    /// than falling back to a weaker mode: one naming the privileged main role
+    /// (fails the role check) and one that cannot connect.
+    #[tokio::test]
+    #[serial]
+    async fn a_set_but_unusable_login_url_refuses_plugin_sql() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        clear_plugin_schema_code(&db).await;
+        let main_url = std::env::var("TEST_DATABASE_URL").unwrap();
+        for url in [
+            main_url.as_str(),
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+        ] {
+            let access = decide_plugin_sql_access(&db, DatabaseBackend::Postgres, Some(url)).await;
+            assert!(
+                matches!(access, crate::PluginSqlAccess::Refused),
+                "an unusable login URL must refuse plugin SQL: {url}"
+            );
+        }
+        // Without the URL the same database runs in role mode, so the refusals
+        // above came from the URL.
+        let access = decide_plugin_sql_access(&db, DatabaseBackend::Postgres, None).await;
+        assert!(matches!(access, crate::PluginSqlAccess::Role));
+    }
+
+    /// With no login URL, code in the plugin schema refuses plugin SQL: it
+    /// would run with the privileged session user.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_schema_code_without_a_login_url_refuses_plugin_sql() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        clear_plugin_schema_code(&db).await;
+        crate::db::query(
+            "CREATE FUNCTION happyview_plugin.left_behind() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let refused = decide_plugin_sql_access(&db, DatabaseBackend::Postgres, None).await;
+        clear_plugin_schema_code(&db).await;
+        assert!(matches!(refused, crate::PluginSqlAccess::Refused));
+        let cleared = decide_plugin_sql_access(&db, DatabaseBackend::Postgres, None).await;
+        assert!(
+            matches!(cleared, crate::PluginSqlAccess::Role),
+            "with the code dropped, plugin SQL runs in role mode again"
+        );
     }
 
     /// A reused login-pool connection keeps nothing from the previous statement:
@@ -1170,18 +1394,12 @@ mod tests {
             return;
         };
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
-        // A single-connection login pool as the main test role, so release and
-        // re-acquire reuse the one connection. (This exercises the pool's
-        // `after_release`, not the role checks, so build it directly.)
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
+        // The login pool's own options, narrowed to one connection so release
+        // and re-acquire reuse it. Connects as the main test role: this checks
+        // the reset on release, not the role checks.
+        crate::db::install_drivers();
+        let pool = plugin_login_pool_options()
             .max_connections(1)
-            .after_release(|conn, _| {
-                Box::pin(async move {
-                    crate::db::query("DISCARD ALL").execute(&mut *conn).await?;
-                    Ok(true)
-                })
-            })
             .connect(&url)
             .await
             .unwrap();

@@ -295,93 +295,10 @@ struct Booted {
     labeler_subscriptions_rx: watch::Receiver<()>,
 }
 
-/// `run` from connecting to the database through building the state and
-/// starting the record source: everything a served instance has before its
-/// background tasks start and it listens. An `Err` is the exit code to stop
-/// with.
 /// Logs every configuration problem first, before anything slow can push it
 /// out of view. A bad `SESSION_SECRET` does not stop boot, because API-key,
 /// DPoP and service-auth callers need no cookie, but it leaves the dashboard
 /// with no way to sign in, so the error says that and names the fix.
-/// Decide how plugin raw SQL is isolated on Postgres, once at boot. Sets up the
-/// roles and schema, then: if `PLUGIN_SQL_DATABASE_URL` is set, opens and
-/// **verifies** the login pool and **fails closed** (refuses plugin SQL) rather
-/// than downgrading if it cannot; otherwise refuses when the plugin schema holds
-/// code from an earlier login-pool session, else runs in role or parser-only
-/// mode. SQLite is always parser-only (ignored there).
-async fn decide_plugin_sql_access(
-    db_pool: &sqlx::AnyPool,
-    db_backend: db::DatabaseBackend,
-) -> crate::PluginSqlAccess {
-    use crate::PluginSqlAccess;
-    if db_backend != db::DatabaseBackend::Postgres {
-        return PluginSqlAccess::ParserOnly;
-    }
-    let restricted = crate::plugin::host::ensure_plugin_roles(db_pool, db_backend).await;
-
-    let login_url = std::env::var("PLUGIN_SQL_DATABASE_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty());
-    if let Some(url) = login_url {
-        let main_role = main_role_name(db_pool).await;
-        return match crate::plugin::host::open_plugin_login_pool(url.trim(), &main_role).await {
-            Some(pool) => {
-                info!("plugin raw SQL runs on the dedicated login pool as an unprivileged role");
-                PluginSqlAccess::LoginPool(pool)
-            }
-            None => {
-                tracing::error!(
-                    "PLUGIN_SQL_DATABASE_URL is set but the plugin SQL login pool could not be \
-                     opened or verified; refusing plugin raw SQL on Postgres. HappyView otherwise \
-                     boots normally."
-                );
-                PluginSqlAccess::Refused
-            }
-        };
-    }
-
-    // Outside the login pool, objects a plugin left in its schema would run with
-    // the privileged session user, so refuse plugin SQL until they are cleared
-    // (or the login pool is restored).
-    if crate::plugin::host::plugin_schema_has_code(db_pool, db_backend).await {
-        tracing::error!(
-            "the '{schema}' schema holds functions or triggers created in an earlier login-pool \
-             session; refusing plugin raw SQL (they would otherwise run with HappyView's \
-             privileges). Restore PLUGIN_SQL_DATABASE_URL, or drop those objects from the \
-             '{schema}' schema, to re-enable plugin SQL.",
-            schema = crate::plugin::host::PLUGIN_SCHEMA,
-        );
-        return PluginSqlAccess::Refused;
-    }
-
-    if restricted {
-        info!("plugin raw SQL runs under the least-privileged roles on the main connection");
-        PluginSqlAccess::Role
-    } else {
-        tracing::warn!(
-            "plugin raw SQL runs under the parser allowlist on the main connection: the roles \
-             '{}' / '{}' could not be set up. Grant the HappyView database role CREATEROLE (or \
-             pre-create those roles and grant them to it), or set PLUGIN_SQL_DATABASE_URL to the \
-             dedicated login role, to enable the stronger modes.",
-            crate::plugin::host::PLUGIN_ROLE_RO,
-            crate::plugin::host::PLUGIN_ROLE_RW,
-        );
-        PluginSqlAccess::ParserOnly
-    }
-}
-
-/// The main pool's login role (`current_user`), for the login-pool role check.
-async fn main_role_name(pool: &sqlx::AnyPool) -> String {
-    use sqlx::Row;
-    match crate::db::query("SELECT current_user::text AS u")
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(row)) => row.try_get::<String, _>("u").unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
 fn report_config_errors(config: &Config) {
     let errors = config.config_errors();
     for err in &errors {
@@ -397,6 +314,10 @@ fn report_config_errors(config: &Config) {
     }
 }
 
+/// `run` from connecting to the database through building the state and
+/// starting the record source: everything a served instance has before its
+/// background tasks start and it listens. An `Err` is the exit code to stop
+/// with.
 async fn boot(
     config: Config,
     dev_mode: bool,
@@ -434,7 +355,12 @@ async fn boot(
     );
 
     // Decide how plugin raw SQL is isolated on Postgres (fixed for the process).
-    let plugin_sql = decide_plugin_sql_access(&db_pool, db_backend).await;
+    let plugin_sql = crate::plugin::host::decide_plugin_sql_access(
+        &db_pool,
+        db_backend,
+        crate::config::vars::var("PLUGIN_SQL_DATABASE_URL").as_deref(),
+    )
+    .await;
 
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.keyring().as_ref() {
