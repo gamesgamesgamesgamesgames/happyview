@@ -51,7 +51,12 @@ async fn main() {
     );
 
     // Decide how `db.raw` is isolated on Postgres (fixed for the process).
-    let plugin_sql = decide_plugin_sql_access(&db_pool, db_backend).await;
+    let plugin_sql = happyview::lua::db_api::decide_plugin_sql_access(
+        &db_pool,
+        db_backend,
+        std::env::var("PLUGIN_SQL_DATABASE_URL").ok().as_deref(),
+    )
+    .await;
 
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.token_encryption_key.as_ref() {
@@ -1022,73 +1027,6 @@ async fn main() {
         .expect("failed to bind");
 
     axum::serve(listener, app).await.expect("server error");
-}
-
-/// Decide how `db.raw` is isolated on Postgres, once at boot. Sets up the schema,
-/// then: if `PLUGIN_SQL_DATABASE_URL` is set, opens and **verifies** the login
-/// pool and **fails closed** (refuses `db.raw`) if it cannot, rather than
-/// downgrading to the privileged connection; otherwise refuses when the plugin
-/// schema holds code from an earlier login-pool session, else runs behind the
-/// tokenizer guard. SQLite always uses the guard.
-async fn decide_plugin_sql_access(
-    db_pool: &sqlx::AnyPool,
-    db_backend: db::DatabaseBackend,
-) -> happyview::PluginSqlAccess {
-    use happyview::PluginSqlAccess;
-    use happyview::lua::db_api;
-    if db_backend != db::DatabaseBackend::Postgres {
-        return PluginSqlAccess::Guard;
-    }
-    db_api::ensure_plugin_schema(db_pool, db_backend).await;
-
-    let login_url = std::env::var("PLUGIN_SQL_DATABASE_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty());
-    if let Some(url) = login_url {
-        let main_role = main_role_name(db_pool).await;
-        return match db_api::open_plugin_login_pool(url.trim(), &main_role).await {
-            Some(pool) => {
-                info!("db.raw runs on the dedicated login pool as an unprivileged role");
-                PluginSqlAccess::LoginPool(pool)
-            }
-            None => {
-                tracing::error!(
-                    "PLUGIN_SQL_DATABASE_URL is set but the db.raw login pool could not be opened \
-                     or verified; refusing db.raw on Postgres. HappyView otherwise boots normally."
-                );
-                PluginSqlAccess::Refused
-            }
-        };
-    }
-
-    if db_api::plugin_schema_has_code(db_pool, db_backend).await {
-        tracing::error!(
-            "the 'happyview_plugin' schema holds functions or triggers created in an earlier \
-             login-pool session; refusing db.raw (they would otherwise run with HappyView's \
-             privileges). Restore PLUGIN_SQL_DATABASE_URL, or drop those objects, to re-enable it."
-        );
-        return PluginSqlAccess::Refused;
-    }
-
-    tracing::warn!(
-        "db.raw runs behind the tokenizer guard on the main database connection: set \
-         PLUGIN_SQL_DATABASE_URL to the '{}' login role to run it on a dedicated \
-         least-privileged pool.",
-        db_api::PLUGIN_ROLE,
-    );
-    PluginSqlAccess::Guard
-}
-
-/// The main pool's login role (`current_user`), for the login-pool role check.
-async fn main_role_name(pool: &sqlx::AnyPool) -> String {
-    use sqlx::Row;
-    match db::query("SELECT current_user::text AS u")
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(row)) => row.try_get::<String, _>("u").unwrap_or_default(),
-        _ => String::new(),
-    }
 }
 
 async fn seed_and_load_rate_limit_defaults(
