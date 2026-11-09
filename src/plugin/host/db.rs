@@ -585,8 +585,7 @@ fn plugin_role_setup_statements() -> Vec<String> {
         // grant. Grant every non-`happyview_` relation in `public` (tables,
         // partitions and views) so a plugin keeps access to tables it created
         // before the schema existed. New caller tables go to the plugin schema.
-        // Their sequences are granted too. Protected tables are excluded by
-        // prefix.
+        // Protected tables are excluded by prefix.
         format!(
             "DO $$ DECLARE r record; BEGIN \
              FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -596,7 +595,31 @@ fn plugin_role_setup_statements() -> Vec<String> {
              EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO {PLUGIN_ROLE_RW}', r.relname); \
              END LOOP; END $$"
         ),
-        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {PLUGIN_ROLE_RW}"),
+        // Sequences: only those a caller-owned table in `public` owns (a serial
+        // column's, `a`, or an identity column's, `i`), found through the
+        // sequence's dependency on its table rather than by name, since a
+        // renamed table keeps its sequence's old name. Earlier grants are
+        // revoked first so a sequence of a protected table never stays granted.
+        format!(
+            "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {PLUGIN_ROLE_RO}, {PLUGIN_ROLE_RW}"
+        ),
+        format!(
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT s.relname FROM pg_class s \
+             JOIN pg_namespace n ON n.oid = s.relnamespace \
+             JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = s.oid \
+               AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') \
+             JOIN pg_class t ON t.oid = d.refobjid \
+             WHERE n.nspname = 'public' AND s.relkind = 'S' \
+             AND t.relname NOT LIKE 'happyview\\_%' AND t.relname <> '_sqlx_migrations' LOOP \
+             EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE public.%I TO {PLUGIN_ROLE_RW}', r.relname); \
+             END LOOP; END $$"
+        ),
+        // The plugin schema's own sequences, in case one there is not the write
+        // role's (which owns what it creates).
+        format!(
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {PLUGIN_SCHEMA} TO {PLUGIN_ROLE_RW}"
+        ),
     ];
     // The allowlisted internal tables: writes to the record views fire
     // `SECURITY DEFINER` triggers that reach the underlying tables, so the write
@@ -1313,6 +1336,74 @@ mod tests {
         }
         let rows = result.expect("parser-only read of a caller table");
         assert_eq!(rows[0]["v"], json!("public"));
+    }
+
+    /// The write role holds no privilege on a sequence a protected table owns,
+    /// whatever the sequence is named, so it cannot advance one; a caller-owned
+    /// table's sequence stays usable.
+    #[tokio::test]
+    #[serial]
+    async fn the_write_role_reaches_only_caller_table_sequences() {
+        let Some(db) = postgres_with_roles().await else {
+            return;
+        };
+        crate::db::query("DROP TABLE IF EXISTS public.hv_test_serial_caller")
+            .execute(&db)
+            .await
+            .unwrap();
+        crate::db::query("CREATE TABLE public.hv_test_serial_caller (id serial, v text)")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(ensure_plugin_roles(&db, DatabaseBackend::Postgres).await);
+
+        let protected: Vec<String> = crate::db::query(&format!(
+            "SELECT s.relname::text AS seq FROM pg_class s \
+             JOIN pg_namespace n ON n.oid = s.relnamespace \
+             JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = s.oid \
+               AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') \
+             JOIN pg_class t ON t.oid = d.refobjid \
+             WHERE n.nspname = 'public' AND s.relkind = 'S' AND t.relname LIKE 'happyview\\_%' \
+             AND (has_sequence_privilege('{PLUGIN_ROLE_RW}', s.oid, 'USAGE') \
+               OR has_sequence_privilege('{PLUGIN_ROLE_RW}', s.oid, 'SELECT') \
+               OR has_sequence_privilege('{PLUGIN_ROLE_RW}', s.oid, 'UPDATE'))"
+        ))
+        .fetch_all(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<String, _>("seq").unwrap())
+        .collect();
+        assert!(
+            protected.is_empty(),
+            "the write role holds privileges on protected sequences: {protected:?}"
+        );
+
+        let mut tx = db.begin().await.unwrap();
+        crate::db::query(&format!("SET LOCAL ROLE {PLUGIN_ROLE_RW}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let err = crate::db::query("SELECT nextval('happyview_collections_id_seq')")
+            .execute(&mut *tx)
+            .await
+            .expect_err("the write role must not advance a protected sequence");
+        assert!(err.to_string().contains("denied"), "{err}");
+        let _ = tx.rollback().await;
+
+        let inserted = run_plugin_execute(
+            &db,
+            DatabaseBackend::Postgres,
+            PluginSqlEnforcement::Role,
+            "INSERT INTO hv_test_serial_caller (v) VALUES ('x')",
+            &[],
+        )
+        .await;
+        crate::db::query("DROP TABLE public.hv_test_serial_caller")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(inserted.expect("a caller table's serial column works"), 1);
     }
 
     /// Drop every routine and trigger in the plugin schema, so a test that needs
