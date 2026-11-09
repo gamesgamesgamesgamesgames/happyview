@@ -954,23 +954,13 @@ fn no_members_on_managedspace() -> AppError {
     }
 }
 
-/// Insert or update a member, refusing a space that takes none. The policy is
-/// read in the insert's own transaction, under the space's row lock, so an
-/// insert racing a migration cannot land after the member list is discarded.
+/// Insert or update a member, refusing a space that takes none
+/// ([`db::insert_member_if_allowed`]).
 async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), AppError> {
-    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
-    if !db::lock_space_for_members(&mut *tx, state.db_backend, &member.space_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read space: {e}")))?
-    {
+    if !db::insert_member_if_allowed(&state.db, state.db_backend, member).await? {
         return Err(no_members_on_managedspace());
     }
-    db::add_member(&mut *tx, state.db_backend, member).await?;
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to commit member: {e}")))
+    Ok(())
 }
 
 /// Upsert a member. `access` of `None` leaves an existing member's read and
