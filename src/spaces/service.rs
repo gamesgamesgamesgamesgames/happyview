@@ -120,6 +120,14 @@ pub(crate) async fn verify_space_credential(
     Ok(claims)
 }
 
+/// The caller's access to `space`, for a direct read (`require_write` false)
+/// or write.
+///
+/// A space whose read rule is a managing app is read with a credential, which
+/// the managing app decides on ([`crate::spaces::auth`]). Its members get no
+/// direct reads: a space whose rules predate policies can pair a managing-app
+/// read rule with a member list for writes, and that list must not open reads
+/// around the app.
 pub(crate) async fn require_membership(
     state: &AppState,
     space: &Space,
@@ -136,21 +144,41 @@ pub(crate) async fn require_membership(
         }
         return Ok(MemberAccess::READ);
     }
-    // The creator stands in for the space's authority, which no one signs in
-    // as, so it keeps access whatever the member list holds, as in
-    // `auth::policy_allows`.
-    if did == space.creator_did {
-        return Ok(MemberAccess::WRITE);
+    if !require_write
+        && did != space.creator_did
+        && matches!(space.read_policy, Policy::ManagingApp { .. })
+    {
+        return Err(AppError::Forbidden(
+            "This space's managing app decides who reads it; read it with a space credential"
+                .into(),
+        ));
     }
-    let access = members::is_member(&state.db, state.db_backend, &space.id, did)
-        .await?
-        .ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))?;
+    let access = require_member(state, space, did).await?;
     if require_write && !access.can_write() {
         return Err(AppError::Forbidden(
             "Write access is required for this action".into(),
         ));
     }
     Ok(access)
+}
+
+/// The caller's place on `space`'s member list, whatever its rules say about
+/// reads. For a request that reads no space data: a delegation token, which
+/// the caller exchanges for a credential the managing app, if any, decides on.
+pub(crate) async fn require_member(
+    state: &AppState,
+    space: &Space,
+    did: &str,
+) -> Result<MemberAccess, AppError> {
+    // The creator stands in for the space's authority, which no one signs in
+    // as, so it keeps access whatever the member list holds, as in
+    // `auth::policy_allows`.
+    if did == space.creator_did {
+        return Ok(MemberAccess::WRITE);
+    }
+    members::is_member(&state.db, state.db_backend, &space.id, did)
+        .await?
+        .ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))
 }
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS

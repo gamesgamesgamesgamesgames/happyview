@@ -747,3 +747,178 @@ async fn a_managedspace_makes_and_honours_no_invites() {
     assert_eq!(body["error"], json!("InvalidRequest"));
     assert!(!member_dids(&app, &space).await.contains(&invitee));
 }
+
+/// Give `space` rules from before policies: reads through a managing app,
+/// writes by its member list. No policy describes that.
+async fn make_mixed(app: &TestApp, space: &str) {
+    let mut row = stored(app, space).await;
+    row.read_policy = happyview::spaces::types::Policy::ManagingApp {
+        managing_app: "did:plc:app".into(),
+    };
+    row.write_policy = happyview::spaces::types::Policy::MemberList;
+    happyview::spaces::db::update_space(&app.state.db, app.state.db_backend, &row)
+        .await
+        .unwrap();
+}
+
+/// On a space whose read rule is a managing app, a member-list writer still
+/// writes, but reads only with a credential the managing app decides on: a
+/// direct read is refused. A delegation token, their way to that credential,
+/// is still issued, and the creator still reads.
+#[tokio::test]
+#[serial]
+async fn a_member_list_writer_on_an_app_read_space_is_refused_a_direct_read() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    let writer = rand_did("writer");
+    let (status, _) = post(
+        &app,
+        "com.atproto.simplespace.putMember",
+        &creator,
+        json!({ "space": space, "did": writer, "read": true, "write": true }),
+    )
+    .await;
+    assert!(status.is_success());
+    make_mixed(&app, &space).await;
+
+    let (status, body) = post(
+        &app,
+        "com.atproto.space.createRecord",
+        &writer,
+        json!({
+            "space": space,
+            "collection": "com.example.note",
+            "record": { "$type": "com.example.note", "text": "hi" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rkey = body["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let encoded = urlencoding::encode(&space).into_owned();
+    for path in [
+        format!("/xrpc/com.atproto.space.listRecords?space={encoded}&collection=com.example.note"),
+        format!(
+            "/xrpc/com.atproto.space.getRecord?space={encoded}&collection=com.example.note&repo={}&rkey={rkey}",
+            urlencoding::encode(&writer)
+        ),
+        format!("/xrpc/com.atproto.space.listRepos?space={encoded}"),
+    ] {
+        let (status, body) = get(&app, &path, &writer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        let (status, body) = get(&app, &path, &creator).await;
+        assert_eq!(status, StatusCode::OK, "creator, {path}: {body}");
+    }
+
+    let (status, body) = get(
+        &app,
+        &format!("/xrpc/com.atproto.space.getDelegationToken?space={encoded}"),
+        &writer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The rules of a memberspace whose read rule is not a managing app are
+/// untouched: its members still read directly.
+#[tokio::test]
+#[serial]
+async fn a_memberspace_member_still_reads_directly() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    let member = rand_did("member");
+    post(
+        &app,
+        "com.atproto.simplespace.putMember",
+        &creator,
+        json!({ "space": space, "did": member, "read": true, "write": false }),
+    )
+    .await;
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=com.example.note",
+            urlencoding::encode(&space)
+        ),
+        &member,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn retired_policies(app: &TestApp) -> Value {
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .uri("/admin/spaces/retired-policies")
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_of(resp).await
+}
+
+/// Spaces in a retired shape are counted for any operator, and named only
+/// while the space inspector is on. A memberspace and a managedspace are not
+/// retired.
+#[tokio::test]
+#[serial]
+async fn spaces_in_a_retired_shape_are_listed_to_operators() {
+    common::require_db!();
+    let (app, creator) = setup().await;
+    create(&app, &creator, "member", json!({ "$type": MEMBERSPACE })).await;
+    create(
+        &app,
+        &creator,
+        "managed",
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app" }),
+    )
+    .await;
+    let mixed = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    make_mixed(&app, &mixed).await;
+
+    let body = retired_policies(&app).await;
+    assert_eq!(body["count"], json!(1), "{body}");
+    assert!(
+        body.get("spaces").is_none(),
+        "named with the inspector off: {body}"
+    );
+
+    let (name, value) = app.admin_cookie();
+    let enable = Request::builder()
+        .method("PUT")
+        .uri("/admin/settings/feature.space_inspector_enabled")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "value": "true" }).to_string()))
+        .unwrap();
+    assert!(
+        app.router
+            .clone()
+            .oneshot(enable)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let body = retired_policies(&app).await;
+    assert_eq!(body["count"], json!(1), "{body}");
+    assert_eq!(body["spaces"][0]["uri"], json!(mixed), "{body}");
+    assert_eq!(
+        body["spaces"][0]["readPolicy"]["$type"],
+        json!("com.atproto.simplespace.defs#managingAppPolicy")
+    );
+    assert_eq!(
+        body["spaces"][0]["writePolicy"]["$type"],
+        json!("com.atproto.simplespace.defs#memberListPolicy")
+    );
+}

@@ -41,6 +41,7 @@ import type { BackfillSource } from "@/types/backfill";
 import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
+  RetiredSpacesResponse,
   AdminSpaceDetail,
   AccessGrant,
   GrantScope,
@@ -795,6 +796,10 @@ export function getAdminSpaces(limit?: number, cursor?: string) {
   if (limit) params.set("limit", String(limit));
   if (cursor) params.set("cursor", cursor);
   return apiFetch<AdminListSpacesResponse>(`/admin/spaces?${params}`);
+}
+
+export function getRetiredSpaces() {
+  return apiFetch<RetiredSpacesResponse>("/admin/spaces/retired-policies");
 }
 
 export function getAdminSpace(id: string) {

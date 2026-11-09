@@ -1247,7 +1247,7 @@ async fn get_delegation_token(
     let did = claims.did().to_string();
     let space = service::resolve_space(&state, &params.space).await?;
 
-    let membership = service::require_membership(&state, &space, &did, false, None).await?;
+    let membership = service::require_member(&state, &space, &did).await?;
     check_delegation_token_access(membership, false)?;
 
     // A delegation token is exchanged for a credential granting whole-space

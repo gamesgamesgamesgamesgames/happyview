@@ -132,6 +132,26 @@ pub(super) async fn list_spaces(
     Ok(Json(body))
 }
 
+/// GET /admin/spaces/retired-policies — spaces whose rules predate policies
+/// and match none (`spaces::retired`), for their owners to convert.
+///
+/// The count is always answered, so an operator learns there is something to
+/// do. Which spaces they are is space metadata, so like every space
+/// moderation route it needs the inspector on; the boot log names them too.
+pub(super) async fn retired_policies(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SpacesRead).await?;
+    let spaces = crate::spaces::retired::find(&state.db, state.db_backend).await?;
+    let mut body = serde_json::json!({ "count": spaces.len() });
+    if space_access::require_enabled(&state).await.is_ok() {
+        body["spaces"] = serde_json::to_value(&spaces)
+            .map_err(|e| AppError::Internal(format!("failed to serialize spaces: {e}")))?;
+    }
+    Ok(Json(body))
+}
+
 /// GET /admin/spaces/{id} — a space's metadata, members, and collections.
 pub(super) async fn get_space(
     State(state): State<AppState>,
