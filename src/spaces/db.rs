@@ -387,7 +387,16 @@ pub async fn add_member(
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<(), AppError> {
-    let now = now_rfc3339();
+    upsert_member(executor, backend, member)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+async fn upsert_member(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+) -> Result<(), sqlx::Error> {
     let sql = adapt_sql(
         // Upsert: putMember is defined as "add a member or replace their read
         // and write access", so a second call for the same DID must update
@@ -402,7 +411,6 @@ pub async fn add_member(
              is_delegation = excluded.is_delegation",
         backend,
     );
-
     crate::db::query(&sql)
         .bind(&member.id)
         .bind(&member.space_id)
@@ -412,12 +420,34 @@ pub async fn add_member(
         .bind(member.access.read_self as i32)
         .bind(member.is_delegation as i32)
         .bind(&member.granted_by)
-        .bind(&now)
+        .bind(now_rfc3339())
         .execute(executor)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))?;
-
+        .await?;
     Ok(())
+}
+
+/// Add or update a member unless the space takes none, checking under the
+/// space's row lock in the insert's own transaction
+/// ([`lock_space_for_members`]). Returns whether the member was stored.
+///
+/// Retried while the database is busy, as [`claim_invite`] is: on SQLite a
+/// write racing another one would otherwise fail outright.
+pub async fn insert_member_if_allowed(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+) -> Result<bool, AppError> {
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(false);
+        }
+        upsert_member(&mut *tx, backend, member).await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
 }
 
 /// Discard a space's member list, as migrating it to a policy that keeps none
