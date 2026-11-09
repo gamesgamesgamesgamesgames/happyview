@@ -161,6 +161,10 @@ fs4 = "0.13"
 hkdf = "0.13"
 hmac = "0.13"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
+# Postgres's own parser (libpg_query, vendored C — no OpenSSL). Used to enforce
+# the plugin raw-SQL allowlist on Postgres by a real parse rather than a
+# tokenizer, so SQL hidden in string-taking built-ins is seen.
+pg_query = "6"
 subtle = "2"
 mime_guess = "2"
 rust-embed = { version = "8", optional = true }

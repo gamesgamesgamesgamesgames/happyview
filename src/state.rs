@@ -144,6 +144,9 @@ pub fn state_with_pool_on(
         limits: Arc::new(happyview_provider::FixedLimits::default()),
         metrics: Arc::new(crate::metrics::ScriptMetrics::new()),
         test: None,
+        // Tests default to the parser-allowlist boundary; a test that wants the
+        // role or login-pool path sets this after calling `ensure_plugin_roles`.
+        plugin_sql: crate::PluginSqlAccess::ParserOnly,
     };
     // Backfills and their admin routes work on this state; nothing is started.
     crate::host::attach_jetstream(&mut state, Default::default());

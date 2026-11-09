@@ -156,6 +156,29 @@ pub struct AppState {
     /// callers, mocks, single-attempt record scripts — is keyed on this, and
     /// no other code path constructs one, so a serving binary never has it.
     pub test: Option<Arc<testing::TestHarness>>,
+
+    /// How plugin raw SQL is isolated on Postgres, decided once at boot. See
+    /// [`PluginSqlAccess`].
+    pub plugin_sql: PluginSqlAccess,
+}
+
+/// How plugin raw SQL runs on Postgres (the mode reported at
+/// `/admin/database/status`). Decided at boot and fixed for the process.
+#[derive(Clone)]
+pub enum PluginSqlAccess {
+    /// Its own pool, logged in as the unprivileged `happyview_plugin` role —
+    /// `session_user` has no access to the protected tables.
+    LoginPool(sqlx::AnyPool),
+    /// The main pool, restricted per statement with `SET LOCAL ROLE`.
+    Role,
+    /// The main pool, no role change; the parser is the whole boundary. SQLite
+    /// also uses this (the value is ignored there).
+    ParserOnly,
+    /// Plugin raw SQL is refused on Postgres: `PLUGIN_SQL_DATABASE_URL` was set
+    /// but the login pool could not be opened or verified, or the plugin schema
+    /// holds code from an earlier login-pool session. HappyView still boots;
+    /// only plugin raw SQL is refused.
+    Refused,
 }
 
 impl AppState {
