@@ -17,8 +17,9 @@ function ruleLabel(rule: SpaceRule): string {
 }
 
 /**
- * Spaces whose rules predate policies and match none. Their members can no
- * longer read them directly, so each one needs converting. Renders nothing
+ * Spaces whose rules predate policies and match none. Where a managing app's
+ * rule applies, their members no longer have direct access, so each one needs
+ * converting. Renders nothing
  * when there are none. Which spaces they are needs the space inspector on.
  */
 export function RetiredPolicyNotice() {
@@ -41,9 +42,10 @@ export function RetiredPolicyNotice() {
       </span>
       <span className="text-muted-foreground">
         Each one pairs a managing app with a member list or an app allow list,
-        which no space policy describes. Its members can&apos;t read it directly
-        any more; reads go through the managing app. Convert each one to a
-        memberspace or a managedspace.
+        which no space policy describes. Where the managing app&apos;s rule
+        applies, to reads or to writes, its members no longer have direct
+        access; the managing app decides. Convert each one to a memberspace or a
+        managedspace.
       </span>
       {retired.spaces ? (
         <ul className="flex flex-col gap-1">

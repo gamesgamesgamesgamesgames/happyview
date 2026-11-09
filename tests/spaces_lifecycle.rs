@@ -748,17 +748,27 @@ async fn a_managedspace_makes_and_honours_no_invites() {
     assert!(!member_dids(&app, &space).await.contains(&invitee));
 }
 
-/// Give `space` rules from before policies: reads through a managing app,
-/// writes by its member list. No policy describes that.
-async fn make_mixed(app: &TestApp, space: &str) {
-    let mut row = stored(app, space).await;
-    row.read_policy = happyview::spaces::types::Policy::ManagingApp {
+/// Give `space` rules from before policies: one of reads and writes through
+/// a managing app, the other by its member list. No policy describes that.
+async fn make_mixed_rules(app: &TestApp, space: &str, app_reads: bool) {
+    use happyview::spaces::types::Policy;
+    let managing_app = Policy::ManagingApp {
         managing_app: "did:plc:app".into(),
     };
-    row.write_policy = happyview::spaces::types::Policy::MemberList;
+    let mut row = stored(app, space).await;
+    (row.read_policy, row.write_policy) = if app_reads {
+        (managing_app, Policy::MemberList)
+    } else {
+        (Policy::MemberList, managing_app)
+    };
     happyview::spaces::db::update_space(&app.state.db, app.state.db_backend, &row)
         .await
         .unwrap();
+}
+
+/// Reads through a managing app, writes by the member list.
+async fn make_mixed(app: &TestApp, space: &str) {
+    make_mixed_rules(app, space, true).await;
 }
 
 /// On a space whose read rule is a managing app, a member-list writer still
@@ -921,4 +931,60 @@ async fn spaces_in_a_retired_shape_are_listed_to_operators() {
         body["spaces"][0]["writePolicy"]["$type"],
         json!("com.atproto.simplespace.defs#memberListPolicy")
     );
+}
+
+/// On a space whose write rule is a managing app, a member-list reader still
+/// reads directly, but writes only through their own PDS, which the managing
+/// app admits or not: a direct write is refused. The creator still writes.
+#[tokio::test]
+#[serial]
+async fn a_member_list_reader_on_an_app_write_space_is_refused_a_direct_write() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    let member = rand_did("member");
+    let (status, _) = post(
+        &app,
+        "com.atproto.simplespace.putMember",
+        &creator,
+        json!({ "space": space, "did": member, "read": true, "write": true }),
+    )
+    .await;
+    assert!(status.is_success());
+    make_mixed_rules(&app, &space, false).await;
+
+    let record = json!({ "$type": "com.example.note", "text": "hi" });
+    let writes = [
+        (
+            "com.atproto.space.createRecord",
+            json!({ "space": space, "collection": "com.example.note", "record": record }),
+        ),
+        (
+            "com.atproto.space.putRecord",
+            json!({ "space": space, "collection": "com.example.note", "rkey": "a", "record": record }),
+        ),
+        (
+            "com.atproto.space.applyWrites",
+            json!({ "space": space, "writes": [
+                { "action": "create", "collection": "com.example.note", "value": record },
+            ] }),
+        ),
+    ];
+    for (method, body) in &writes {
+        let (status, reply) = post(&app, method, &member, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {reply}");
+    }
+    let (status, reply) = post(&app, writes[0].0, &creator, writes[0].1.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "creator: {reply}");
+
+    let (status, reply) = get(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=com.example.note",
+            urlencoding::encode(&space)
+        ),
+        &member,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
 }

@@ -123,11 +123,12 @@ pub(crate) async fn verify_space_credential(
 /// The caller's access to `space`, for a direct read (`require_write` false)
 /// or write.
 ///
-/// A space whose read rule is a managing app is read with a credential, which
-/// the managing app decides on ([`crate::spaces::auth`]). Its members get no
-/// direct reads: a space whose rules predate policies can pair a managing-app
-/// read rule with a member list for writes, and that list must not open reads
-/// around the app.
+/// Where a space's rule for the access asked for is a managing app, the app
+/// decides, and members get none directly: reads go through a credential the
+/// app decides on, and writes through the writer's own PDS, which the app
+/// admits or not ([`crate::spaces::auth`]). A space whose rules predate
+/// policies can pair a managing app for one with a member list for the other,
+/// and that list must not open the other around the app.
 pub(crate) async fn require_membership(
     state: &AppState,
     space: &Space,
@@ -144,14 +145,18 @@ pub(crate) async fn require_membership(
         }
         return Ok(MemberAccess::READ);
     }
-    if !require_write
-        && did != space.creator_did
-        && matches!(space.read_policy, Policy::ManagingApp { .. })
-    {
-        return Err(AppError::Forbidden(
-            "This space's managing app decides who reads it; read it with a space credential"
-                .into(),
-        ));
+    if did != space.creator_did {
+        if !require_write && matches!(space.read_policy, Policy::ManagingApp { .. }) {
+            return Err(AppError::Forbidden(
+                "This space's managing app decides who reads it; read it with a space credential"
+                    .into(),
+            ));
+        }
+        if require_write && matches!(space.write_policy, Policy::ManagingApp { .. }) {
+            return Err(AppError::Forbidden(
+                "This space's managing app decides who writes to it".into(),
+            ));
+        }
     }
     let access = require_member(state, space, did).await?;
     if require_write && !access.can_write() {
