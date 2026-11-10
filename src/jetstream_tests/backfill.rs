@@ -840,6 +840,30 @@ async fn failure_set(
     .expect("failure set")
 }
 
+/// The states of a job's failure set, in `(did, collection)` order.
+async fn failure_states(state: &AppState, job_id: &str) -> Vec<String> {
+    failure_set(state, job_id)
+        .await
+        .into_iter()
+        .map(|(_, _, _, _, state)| state)
+        .collect()
+}
+
+/// Wait for a spawned job to leave `running`.
+async fn wait_for_job_to_settle(state: &AppState, job_id: &str) -> JobRow {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let job = job_row(state, job_id).await;
+            if job.status != "running" {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the job should finish")
+}
+
 /// `did`'s `listRecords` for `collection` answers `response`, ahead of any
 /// other mock for it, for its next `times` requests.
 async fn fail_records(
@@ -936,9 +960,10 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
         job.processed_repos, job.total_repos,
         "the requeued retry counts toward the total it completes against"
     );
-    assert!(
-        failure_set(&state, &job_id).await.is_empty(),
-        "a refetched repo leaves the failure set"
+    assert_eq!(
+        failure_states(&state, &job_id).await,
+        vec!["recovered".to_string()],
+        "a refetched repo is marked recovered"
     );
     assert_eq!(
         count_for_job(&state, "happyview_backfill_queue", &job_id).await,
@@ -963,7 +988,72 @@ async fn a_retry_that_succeeds_clears_its_pending_row() {
 
     let job = job_row(&state, &job_id).await;
     assert_eq!((job.status.as_str(), job.total_records), ("completed", 1));
-    assert!(failure_set(&state, &job_id).await.is_empty());
+    assert_eq!(
+        failure_states(&state, &job_id).await,
+        vec!["recovered".to_string()]
+    );
+}
+
+/// HAP-421: a retry-failed job that fetches a repo marks the source job's
+/// rows for it recovered, so retrying the source job again has nothing to do
+/// rather than fetching everything a second time.
+#[tokio::test]
+async fn a_successful_retry_recovers_the_source_rows_and_a_second_retry_has_nothing_to_do() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:back", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+    seed_job(
+        &state,
+        "source-job",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    finish_job(
+        &state,
+        "source-job",
+        "completed",
+        "2026-01-02T00:00:00+00:00",
+    )
+    .await;
+    for (collection, phase) in [(POST, "fetch"), ("", "resolve")] {
+        crate::db::query(
+            "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+             VALUES ('source-job', 'did:plc:back', ?, ?, 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(collection)
+        .bind(phase)
+        .execute(&state.db)
+        .await
+        .expect("seed failure");
+    }
+    let retry = || {
+        retry_failed_backfill(
+            State(jobs(&state)),
+            super_auth(&state),
+            Path("source-job".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+    };
+
+    let (_, Json(body)) = retry().await.expect("retry-failed");
+    let retry_id = body["id"].as_str().expect("id").to_string();
+    let job = wait_for_job_to_settle(&state, &retry_id).await;
+    assert_eq!((job.status.as_str(), job.total_records), ("completed", 1));
+    assert_eq!(
+        failure_states(&state, "source-job").await,
+        vec!["recovered".to_string(), "recovered".to_string()],
+        "the fetch and the resolve failure are both recovered"
+    );
+    assert!(
+        matches!(retry().await, Err(AdminError::BadRequest(_))),
+        "nothing is left to retry"
+    );
 }
 
 /// HAP-421: a fetch the job stopped partway through is cancelled, never a

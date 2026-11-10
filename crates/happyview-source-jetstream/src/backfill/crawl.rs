@@ -436,8 +436,9 @@ pub async fn complete_unit(
     complete_unit_clearing(state, queue, unit, pds, records, &[]).await
 }
 
-/// [`complete_unit`], also taking `fetched`, the unit's collections fetched
-/// whole, out of the job's failure set in the same transaction.
+/// [`complete_unit`], also marking `fetched`, the unit's collections fetched
+/// whole, recovered in the failure set (this job's, and the job it retries)
+/// in the same transaction.
 pub async fn complete_unit_clearing(
     state: &JobState,
     queue: &JobQueue,
@@ -450,14 +451,15 @@ pub async fn complete_unit_clearing(
     let job_id = queue.job_id.as_str();
     let mut tx = state.backfill_db.begin().await?;
     if queue.version == QueueVersion::Bounded {
-        let clear = adapt_sql(
-            "DELETE FROM happyview_backfill_failures WHERE job_id = ? AND did = ? AND collection = ?",
-            backend,
-        );
+        let recover = adapt_sql(crate::backfill::errors::RECOVER_SQL, backend);
+        let now = now_rfc3339();
         for collection in fetched {
-            happyview_provider::db::query(&clear)
-                .bind(job_id)
+            happyview_provider::db::query(&recover)
+                .bind(&now)
                 .bind(&unit.did)
+                .bind(job_id)
+                .bind(collection)
+                .bind(job_id)
                 .bind(collection)
                 .execute(&mut *tx)
                 .await?;
@@ -2449,7 +2451,7 @@ pub(crate) async fn run_pds_worker(
                     FetchOutcome::Complete { count } => {
                         retries.cooldowns.record_success(&pds_host);
                         record_late_records(&scope, count as i32).await;
-                        crate::backfill::errors::clear_failure(
+                        crate::backfill::errors::mark_recovered(
                             &state,
                             &queue.job_id,
                             &did,
@@ -2857,7 +2859,7 @@ pub(crate) async fn run_fetching_phase(
                                 FetchOutcome::Complete { count } => {
                                     cooldowns.record_success(&pds_host);
                                     saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
-                                    crate::backfill::errors::clear_failure(
+                                    crate::backfill::errors::mark_recovered(
                                         &state,
                                         job_id.as_str(),
                                         &did,

@@ -252,6 +252,9 @@ pub enum FailureState {
     Pending,
     /// The job gave up on the repo.
     Failed,
+    /// The repo was fetched since: by this job, or by a retry-failed job of
+    /// it. retry-failed no longer selects it.
+    Recovered,
 }
 
 impl FailureState {
@@ -259,6 +262,7 @@ impl FailureState {
         match self {
             Self::Pending => "pending",
             Self::Failed => "failed",
+            Self::Recovered => "recovered",
         }
     }
 }
@@ -306,16 +310,26 @@ pub(crate) async fn mark_failure(
     .await;
 }
 
-/// Take `(did, collection)` out of the job's failure set: it was fetched.
-pub(crate) async fn clear_failure(state: &JobState, job_id: &str, did: &str, collection: &str) {
-    let sql = adapt_sql(
-        "DELETE FROM happyview_backfill_failures WHERE job_id = ? AND did = ? AND collection = ?",
-        state.db_backend,
-    );
+/// Mark `did`'s rows for `collection` recovered: in `job_id`'s failure set,
+/// and in that of the job `job_id` retries (`retry_of`), whose resolve
+/// failures for `did` are recovered too, since `did` resolved here.
+pub(crate) const RECOVER_SQL: &str = "UPDATE happyview_backfill_failures SET state = 'recovered', last_at = ? \
+     WHERE did = ? AND state <> 'recovered' AND ( \
+       (job_id = ? AND collection = ?) \
+       OR (job_id IN (SELECT retry_of FROM happyview_backfill_jobs WHERE id = ? AND retry_of IS NOT NULL) \
+           AND (collection = ? OR phase = 'resolve')))";
+
+/// [`RECOVER_SQL`] for one collection fetched whole.
+pub(crate) async fn mark_recovered(state: &JobState, job_id: &str, did: &str, collection: &str) {
+    let sql = adapt_sql(RECOVER_SQL, state.db_backend);
+    let now = now_rfc3339();
     super::job_write(state, job_id, "failure_set", || {
         happyview_provider::db::query(&sql)
-            .bind(job_id)
+            .bind(&now)
             .bind(did)
+            .bind(job_id)
+            .bind(collection)
+            .bind(job_id)
             .bind(collection)
             .execute(&state.backfill_db)
     })

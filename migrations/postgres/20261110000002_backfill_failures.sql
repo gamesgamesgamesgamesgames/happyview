@@ -7,7 +7,8 @@
 -- only in memory: a pause or restart dropped it with its unit already
 -- completed. These rows are what retry-failed reads, and a resumed job
 -- queues its pending rows again. Like happyview_backfill_errors, they last
--- as long as their job: no flush or retention sweep clears them.
+-- as long as their job: no flush or retention sweep clears them, and a
+-- recovered row is marked, not deleted.
 CREATE TABLE happyview_backfill_failures (
     job_id     TEXT NOT NULL REFERENCES happyview_backfill_jobs(id) ON DELETE CASCADE,
     did        TEXT NOT NULL,
@@ -18,7 +19,8 @@ CREATE TABLE happyview_backfill_failures (
     phase      TEXT NOT NULL,
     -- A BackfillErrorKind, as in happyview_backfill_errors.
     kind       TEXT NOT NULL,
-    -- 'pending': a fetch retry is due; 'failed': the job gave up.
+    -- 'pending': a fetch retry is due; 'failed': the job gave up;
+    -- 'recovered': fetched since, by this job or by a retry-failed job of it.
     state      TEXT NOT NULL,
     attempts   INTEGER NOT NULL DEFAULT 0,
     last_at    TEXT NOT NULL,

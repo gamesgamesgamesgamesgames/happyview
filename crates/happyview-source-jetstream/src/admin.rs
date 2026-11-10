@@ -1194,14 +1194,18 @@ pub async fn retry_failed_backfill(
         ));
     }
 
-    // The failure set is uncapped and per collection; the detail log stops at
-    // `ERROR_DETAIL_CAP` rows and is all a job from before the failure set
-    // has. A pending row of a finished job is a retry it never made.
+    // The failure set is uncapped and per collection. A pending row of a
+    // finished job is a retry it never made; a recovered one was fetched
+    // since, so a second retry-failed after a successful retry has nothing
+    // to do. The capped detail log is read only for a job from before the
+    // failure set, which has no rows in it at all.
     let placeholders = vec!["?"; kinds.len()].join(", ");
     let sql_str = format!(
         "SELECT did FROM happyview_backfill_failures WHERE job_id = ? AND kind IN ({placeholders}) \
+           AND state IN ('pending', 'failed') \
          UNION \
          SELECT did FROM happyview_backfill_errors WHERE job_id = ? AND kind IN ({placeholders}) \
+           AND NOT EXISTS (SELECT 1 FROM happyview_backfill_failures WHERE job_id = ?) \
          ORDER BY did",
     );
     let sql = adapt_sql(&sql_str, backend);
@@ -1213,6 +1217,7 @@ pub async fn retry_failed_backfill(
     for kind in &kinds {
         q = q.bind(*kind);
     }
+    q = q.bind(&job_id);
     let dids: Vec<(String,)> = q
         .fetch_all(&state.db)
         .await
