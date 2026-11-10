@@ -916,8 +916,10 @@ pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::
 /// has prepared on a connection, so dropping them on the server would leave the
 /// next caller to run one that no longer exists. Every `db.raw` call prepares
 /// the same `search_path` and schema-check statements, so that would fail on
-/// almost every reused connection. Prepared statements carry no session state
-/// a script could leave.
+/// almost every reused connection. The driver's statements are protocol-level;
+/// a statement prepared with SQL `PREPARE`, which a script can run through
+/// `db.raw`, is not reset here, so a connection holding one is closed instead
+/// of returned to the pool.
 const LOGIN_POOL_RESET: &str = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
      UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; \
      DISCARD SEQUENCES;";
@@ -935,7 +937,15 @@ fn plugin_login_pool_options() -> sqlx::any::AnyPoolOptions {
                 sqlx::raw_sql(sqlx::AssertSqlSafe(LOGIN_POOL_RESET))
                     .execute(&mut *conn)
                     .await?;
-                Ok(true)
+                // A statement prepared with SQL survives the reset. The driver's
+                // own are protocol-level (`from_sql` false) and stay.
+                let row = crate::db::query(
+                    "SELECT EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql) AS sql_prepared",
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                let sql_prepared: bool = row.try_get("sql_prepared")?;
+                Ok(!sql_prepared)
             })
         })
 }
@@ -2001,6 +2011,11 @@ mod tests {
             return;
         };
         provision_login_role(&db).await;
+        exec(
+            &db,
+            "CREATE SEQUENCE IF NOT EXISTS public.hv_test_reset_seq",
+        )
+        .await;
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
         let pool = one_connection_login_pool(&url).await;
         let before: (String, String) =
@@ -2016,6 +2031,8 @@ mod tests {
                 "CREATE TEMP TABLE left_behind_temp (a int)".to_string(),
                 "SELECT pg_advisory_lock(424242)".to_string(),
                 "DECLARE left_behind_cursor CURSOR WITH HOLD FOR SELECT 1".to_string(),
+                "LISTEN left_behind_channel".to_string(),
+                "SELECT nextval('public.hv_test_reset_seq')".to_string(),
                 format!("SET ROLE {PLUGIN_ROLE}"),
             ] {
                 sqlx::raw_sql(sqlx::AssertSqlSafe(stmt.clone()))
@@ -2026,16 +2043,23 @@ mod tests {
         }
 
         let mut c = pool.acquire().await.unwrap();
-        let row: (String, String, String, Option<String>, i64, i64) = sqlx::query_as(
+        let row: (String, String, String, Option<String>, i64, i64, i64) = sqlx::query_as(
             "SELECT current_user::text, current_setting('search_path'), \
              current_setting('application_name'), to_regclass('pg_temp.left_behind_temp')::text, \
              (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()), \
-             (SELECT count(*) FROM pg_cursors WHERE name = 'left_behind_cursor')",
+             (SELECT count(*) FROM pg_cursors WHERE name = 'left_behind_cursor'), \
+             (SELECT count(*) FROM pg_listening_channels() AS c WHERE c = 'left_behind_channel')",
         )
         .fetch_one(&mut *c)
         .await
         .unwrap();
+        // `currval` is session state: undefined again once the sequence state is
+        // discarded.
+        let currval = crate::db::query("SELECT currval('public.hv_test_reset_seq') AS v")
+            .fetch_one(&mut *c)
+            .await;
         drop(c);
+        exec(&db, "DROP SEQUENCE public.hv_test_reset_seq").await;
         pool.close().await;
         retire_login_role(&db).await;
         assert_eq!(row.0, before.0, "the role is reset");
@@ -2044,6 +2068,41 @@ mod tests {
         assert_eq!(row.3, None, "temporary objects are dropped");
         assert_eq!(row.4, 0, "advisory locks are released");
         assert_eq!(row.5, 0, "cursors are closed");
+        assert_eq!(row.6, 0, "notification channels are unlistened");
+        assert!(currval.is_err(), "sequence state is discarded");
+    }
+
+    /// A statement a script prepares with SQL is not part of the reset, so the
+    /// connection that holds one is closed rather than handed to the next caller.
+    #[tokio::test]
+    #[serial]
+    async fn a_statement_a_script_prepares_never_reaches_the_next_caller() {
+        let Some(db) = postgres_pool().await else {
+            return;
+        };
+        ensure_plugin_schema(&db, DatabaseBackend::Postgres).await;
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let pool = one_connection_login_pool(&url).await;
+        let mut state = test_state();
+        state.plugin_sql = crate::PluginSqlAccess::LoginPool(pool.clone());
+        let lua = setup(&state);
+        let prepared = raw(&lua, "PREPARE left_behind_stmt AS SELECT 1").await;
+
+        let mut c = pool.acquire().await.unwrap();
+        let left: i64 = crate::db::query(
+            "SELECT count(*) AS n FROM pg_prepared_statements WHERE name = 'left_behind_stmt'",
+        )
+        .fetch_one(&mut *c)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+        drop(c);
+        prepared.expect("the script's statement runs");
+        assert_eq!(
+            left, 0,
+            "a SQL-prepared statement must not reach the next caller"
+        );
     }
 
     /// A login-pool connection serves `db.raw` call after call: the reset on
