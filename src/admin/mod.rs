@@ -133,6 +133,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/access", get(spaces::covering_grant))
+        .route("/spaces/{id}/convert", post(spaces::convert_space))
         // Each of these records the read it serves, so a cookie only counts
         // on a request from the dashboard itself; see `csrf::audited_read`.
         .route(

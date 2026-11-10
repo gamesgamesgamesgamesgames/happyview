@@ -864,6 +864,26 @@ async fn a_memberspace_member_still_reads_directly() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+async fn enable_inspector(app: &TestApp) {
+    let (name, value) = app.admin_cookie();
+    let enable = Request::builder()
+        .method("PUT")
+        .uri("/admin/settings/feature.space_inspector_enabled")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "value": "true" }).to_string()))
+        .unwrap();
+    assert!(
+        app.router
+            .clone()
+            .oneshot(enable)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+}
+
 async fn retired_policies(app: &TestApp) -> Value {
     let (name, value) = app.admin_cookie();
     let req = Request::builder()
@@ -902,23 +922,7 @@ async fn spaces_in_a_retired_shape_are_listed_to_operators() {
         "named with the inspector off: {body}"
     );
 
-    let (name, value) = app.admin_cookie();
-    let enable = Request::builder()
-        .method("PUT")
-        .uri("/admin/settings/feature.space_inspector_enabled")
-        .header(name, value)
-        .header("content-type", "application/json")
-        .body(Body::from(json!({ "value": "true" }).to_string()))
-        .unwrap();
-    assert!(
-        app.router
-            .clone()
-            .oneshot(enable)
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
+    enable_inspector(&app).await;
 
     let body = retired_policies(&app).await;
     assert_eq!(body["count"], json!(1), "{body}");
@@ -987,4 +991,181 @@ async fn a_member_list_reader_on_an_app_write_space_is_refused_a_direct_write() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+/// Convert a space through the admin API, as an operator.
+async fn convert(app: &TestApp, space: &str, body: Value) -> (StatusCode, Value) {
+    let id = stored(app, space).await.id;
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/spaces/{id}/convert"))
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, json_of(resp).await)
+}
+
+async fn invite_count(app: &TestApp, space: &str) -> usize {
+    let id = stored(app, space).await.id;
+    happyview::spaces::db::list_invites(&app.state.db, app.state.db_backend, &id)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// A space in a retired shape, with a member-list writer and an invite.
+async fn retired_with_member_and_invite(app: &TestApp, creator: &str) -> (String, String) {
+    let space = create(app, creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    let member = rand_did("member");
+    post(
+        app,
+        "com.atproto.simplespace.putMember",
+        creator,
+        json!({ "space": space, "did": member, "read": true, "write": true }),
+    )
+    .await;
+    let (status, body) = post(
+        app,
+        "dev.happyview.space.createInvite",
+        creator,
+        json!({ "space": space }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    make_mixed(app, &space).await;
+    (space, member)
+}
+
+/// Converted to a memberspace, a retired space keeps its members and
+/// invites, and its members read it directly again.
+#[tokio::test]
+#[serial]
+async fn converting_a_retired_space_to_a_memberspace_keeps_its_members() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let (space, member) = retired_with_member_and_invite(&app, &creator).await;
+
+    let (status, body) = convert(&app, &space, json!({ "to": "memberspace" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["policy"]["$type"], json!(MEMBERSPACE), "{body}");
+    assert!(member_dids(&app, &space).await.contains(&member));
+    assert_eq!(invite_count(&app, &space).await, 1);
+    assert_eq!(retired_policies(&app).await["count"], json!(0));
+
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=com.example.note",
+            urlencoding::encode(&space)
+        ),
+        &member,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Converted to a managedspace, a retired space keeps its managing app and
+/// discards its members and invites.
+#[tokio::test]
+#[serial]
+async fn converting_a_retired_space_to_a_managedspace_discards_its_members() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let (space, member) = retired_with_member_and_invite(&app, &creator).await;
+
+    let (status, body) = convert(&app, &space, json!({ "to": "managedspace" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["policy"],
+        json!({ "$type": MANAGEDSPACE, "managingApp": "did:plc:app", "publishPolicy": false }),
+    );
+    assert!(!member_dids(&app, &space).await.contains(&member));
+    assert_eq!(invite_count(&app, &space).await, 0);
+    assert_eq!(retired_policies(&app).await["count"], json!(0));
+}
+
+/// Only a space in a retired shape converts, and only with the inspector on.
+#[tokio::test]
+#[serial]
+async fn conversion_is_for_retired_spaces_with_the_inspector_on() {
+    common::require_db!();
+    let (app, creator) = setup().await;
+    let (space, _) = retired_with_member_and_invite(&app, &creator).await;
+    let (status, body) = convert(&app, &space, json!({ "to": "memberspace" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("SpaceInspectorDisabled"), "{body}");
+
+    enable_inspector(&app).await;
+    // `stored` finds a space by its key, `main`, so this one has another creator.
+    let policy = create(
+        &app,
+        &rand_did("other"),
+        "main",
+        json!({ "$type": MEMBERSPACE }),
+    )
+    .await;
+    let (status, body) = convert(&app, &policy, json!({ "to": "managedspace" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// Converting needs `spaces:update`: a session with only `spaces:read` is
+/// refused, and the space keeps its rules, members and invites.
+#[tokio::test]
+#[serial]
+async fn conversion_needs_spaces_update() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let (space, member) = retired_with_member_and_invite(&app, &creator).await;
+    let before = stored(&app, &space).await;
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/spaces/{}/convert", before.id))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "to": "managedspace" }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let after = stored(&app, &space).await;
+    assert_eq!(after.read_policy, before.read_policy);
+    assert_eq!(after.write_policy, before.write_policy);
+    assert!(member_dids(&app, &space).await.contains(&member));
+    assert_eq!(invite_count(&app, &space).await, 1);
+    assert_eq!(retired_policies(&app).await["count"], json!(1));
+}
+
+/// A managedspace has no app allow list, so converting a retired space that
+/// has one says which apps it dropped.
+#[tokio::test]
+#[serial]
+async fn a_managedspace_conversion_names_the_allow_list_it_drops() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    make_mixed(&app, &space).await;
+    let mut row = stored(&app, &space).await;
+    row.app_access = happyview::spaces::types::AppAccess::AllowList {
+        allowed: vec!["https://app.example/client-metadata.json".into()],
+    };
+    happyview::spaces::db::update_space(&app.state.db, app.state.db_backend, &row)
+        .await
+        .unwrap();
+
+    let (status, body) = convert(&app, &space, json!({ "to": "managedspace" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["droppedAllowedApps"],
+        json!(["https://app.example/client-metadata.json"])
+    );
 }
