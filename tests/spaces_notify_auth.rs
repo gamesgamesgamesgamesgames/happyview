@@ -1096,3 +1096,101 @@ async fn service_auth_for_one_space_is_refused_on_another() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A space created through `createSpace`, on a did:plc of its own, notified
+/// exactly as the reference PDS (`@atproto/pds`, `fireNotifyWrite`) notifies
+/// it: service auth issued by the writer, `aud` the bare space DID, `lxm`
+/// `com.atproto.space.notifyWrite`, and a body of `space`, `repo`, `rev` and
+/// `hash`.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_reference_pds_on_a_space_of_its_own() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let call = |did: &str, method: &str, body: serde_json::Value| {
+        let (name, value) = common::auth::admin_cookie_header(did, &app.state.cookie_key);
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{method}"))
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": SPACE_TYPE,
+                "skey": SPACE_SKEY,
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let space = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.simplespace.putMember",
+            json!({ "space": space, "did": writer, "read": true, "write": true }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &space_did,
+            "",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
