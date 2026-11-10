@@ -44,8 +44,10 @@ export function RetiredPolicyNotice() {
         Each one pairs a managing app with a member list or an app allow list,
         which no space policy describes. Where the managing app&apos;s rule
         applies, to reads or to writes, its members no longer have direct
-        access; the managing app decides. Convert each one to a memberspace or a
-        managedspace.
+        access; it goes through the managing app&apos;s decision instead. A
+        managing app that doesn&apos;t answer this instance&apos;s access checks
+        leaves those members with no access until the space is converted.
+        Convert each one to a memberspace or a managedspace.
       </span>
       {retired.spaces ? (
         <ul className="flex flex-col gap-1">

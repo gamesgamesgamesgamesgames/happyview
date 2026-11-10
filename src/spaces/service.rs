@@ -158,7 +158,7 @@ pub(crate) async fn require_membership(
             ));
         }
     }
-    let access = require_member(state, space, did).await?;
+    let access = require_on_member_list(state, space, did).await?;
     if require_write && !access.can_write() {
         return Err(AppError::Forbidden(
             "Write access is required for this action".into(),
@@ -170,7 +170,7 @@ pub(crate) async fn require_membership(
 /// The caller's place on `space`'s member list, whatever its rules say about
 /// reads. For a request that reads no space data: a delegation token, which
 /// the caller exchanges for a credential the managing app, if any, decides on.
-pub(crate) async fn require_member(
+pub(crate) async fn require_on_member_list(
     state: &AppState,
     space: &Space,
     did: &str,
