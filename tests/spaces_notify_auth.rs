@@ -502,7 +502,7 @@ async fn a_managing_app_is_reached_through_its_service_entry() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
         .expect(1)
         .mount(&managing_app)
@@ -911,7 +911,7 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
         .mount(&managing_app)
         .await;
@@ -974,6 +974,91 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
         .to_str()
         .unwrap();
     app.assert_signed_as_space(authorization, &space_did).await;
+    // Scoped to Proposal 0016's method, which the managing app checks.
+    use base64::Engine;
+    let token = authorization.trim_start_matches("Bearer ");
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["lxm"],
+        json!("com.atproto.managedspace.checkUserAccess")
+    );
+}
+
+/// A managing app that can't answer the access check, such as one that
+/// doesn't implement it, is an upstream failure (502), not an error of ours
+/// (500), and admits no one.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    let managing_app = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(501).set_body_json(
+            json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
+        ))
+        .mount(&managing_app)
+        .await;
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+
+    let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &newcomer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": newcomer,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
 }
 
 /// A space on its own DID tells its registered syncers it was deleted with

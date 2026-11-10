@@ -116,8 +116,9 @@ pub async fn issue_credential(
     Ok(IssuedCredential { token, expires_at })
 }
 
-/// The method a managing-app service-auth token is scoped to.
-const CHECK_USER_ACCESS_LXM: &str = "com.atproto.simplespace.checkUserAccess";
+/// The method a space authority asks its managing app with, as Proposal 0016
+/// names it, and the method its service-auth token is scoped to.
+const CHECK_USER_ACCESS_LXM: &str = "com.atproto.managedspace.checkUserAccess";
 
 /// Build the query parameters for a `checkUserAccess` call.
 ///
@@ -304,7 +305,7 @@ async fn check_user_access_with_managing_app(
         })?;
 
     let url = format!(
-        "{}/xrpc/com.atproto.simplespace.checkUserAccess",
+        "{}/xrpc/{CHECK_USER_ACCESS_LXM}",
         endpoint.trim_end_matches('/')
     );
 
@@ -360,7 +361,11 @@ async fn check_user_access_with_managing_app(
         .bearer_auth(&token)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("checkUserAccess request failed: {e}")))?;
+        .map_err(|e| {
+            AppError::BadGateway(format!(
+                "the managing app {managing_app} could not be reached: {e}"
+            ))
+        })?;
 
     // A managing app refusing is a denial, not an error. This also covers our
     // own auth being rejected, hence the warn.
@@ -375,17 +380,20 @@ async fn check_user_access_with_managing_app(
         return Ok(false);
     }
 
+    // Anything else is the managing app failing to answer, not a decision:
+    // an upstream error, never one of ours.
     if !resp.status().is_success() {
-        return Err(AppError::Internal(format!(
-            "checkUserAccess returned unexpected status {}",
+        return Err(AppError::BadGateway(format!(
+            "the managing app {managing_app} answered {CHECK_USER_ACCESS_LXM} with {}",
             resp.status()
         )));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("checkUserAccess response parse failed: {e}")))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| {
+        AppError::BadGateway(format!(
+            "the managing app {managing_app} sent an unreadable {CHECK_USER_ACCESS_LXM} answer: {e}"
+        ))
+    })?;
 
     Ok(json
         .get("authorized")
