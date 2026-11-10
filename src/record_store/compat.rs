@@ -307,7 +307,7 @@ fn postgres_statements(names: CompatNames<'_>) -> Vec<String> {
     let mut statements = view_statements(DatabaseBackend::Postgres, names);
     statements.extend([
         format!(
-            r#"CREATE OR REPLACE FUNCTION {r}_write() RETURNS trigger LANGUAGE plpgsql AS $fn$
+            r#"CREATE OR REPLACE FUNCTION {r}_write() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $fn$
 DECLARE
     v_old bigint;
     v_did bigint;
@@ -351,7 +351,7 @@ END $fn$"#
             "CREATE TRIGGER {r}_write INSTEAD OF INSERT OR UPDATE OR DELETE ON {r} FOR EACH ROW EXECUTE FUNCTION {r}_write()"
         ),
         format!(
-            r#"CREATE OR REPLACE FUNCTION {f}_write() RETURNS trigger LANGUAGE plpgsql AS $fn$
+            r#"CREATE OR REPLACE FUNCTION {f}_write() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $fn$
 DECLARE
     v_source bigint;
     v_source_collection bigint;
@@ -407,6 +407,17 @@ END $fn$"#
         ),
         format!(
             "CREATE TRIGGER {f}_write INSTEAD OF INSERT OR UPDATE OR DELETE ON {f} FOR EACH ROW EXECUTE FUNCTION {f}_write()"
+        ),
+        // The write functions run `SECURITY DEFINER` (as HappyView's role) so a
+        // least-privileged plugin role can write records through the view without
+        // a direct grant on the underlying tables. Pin their `search_path` to the
+        // schema HappyView's tables are in, with `pg_temp` last, so a caller's
+        // search path or a temp object cannot redirect them.
+        format!(
+            "DO $$ BEGIN EXECUTE format('ALTER FUNCTION {r}_write() SET search_path = %I, pg_temp', current_schema()); END $$"
+        ),
+        format!(
+            "DO $$ BEGIN EXECUTE format('ALTER FUNCTION {f}_write() SET search_path = %I, pg_temp', current_schema()); END $$"
         ),
     ]);
     statements

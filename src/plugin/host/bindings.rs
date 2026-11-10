@@ -2659,17 +2659,62 @@ async fn host_db_impl(
             }
         }
     }
-    let Some(db) = caller.data().db.clone() else {
+    let Some(main_db) = caller.data().db.clone() else {
         return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
     };
+    let backend = caller.data().db_backend;
+    // Which pool a Postgres plugin statement runs on, and how much the parser must
+    // enforce. The mode is an instance-wide fact carried on `app_state`; a host
+    // built without one cannot know it, so on Postgres it refuses raw SQL rather
+    // than run on the privileged connection. SQLite has no roles; it uses the main
+    // pool and the enforcement value is ignored there.
+    use crate::PluginSqlAccess;
+    use crate::raw_sql_guard::PluginSqlEnforcement;
+    // `Refused`, or no instance context, means plugin raw SQL is unavailable on
+    // Postgres (SQLite still runs — it has no roles and ignores the mode).
+    let access = caller
+        .data()
+        .app_state
+        .as_ref()
+        .map(|app| app.plugin_sql.clone());
+    let (db, enforcement) = match access {
+        Some(PluginSqlAccess::LoginPool(pool)) => (pool, PluginSqlEnforcement::LoginPool),
+        Some(PluginSqlAccess::Role) => (main_db, PluginSqlEnforcement::Role),
+        Some(PluginSqlAccess::ParserOnly) => (main_db, PluginSqlEnforcement::ParserOnly),
+        Some(PluginSqlAccess::Refused) | None => {
+            if backend == crate::db::DatabaseBackend::Postgres {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "raw SQL is unavailable in this context on Postgres",
+                    ),
+                )
+                .await;
+            }
+            (main_db, PluginSqlEnforcement::ParserOnly)
+        }
+    };
+    // `database:write` may run writes, so its reads run under the write role
+    // too; a `database:read`-only plugin runs under the read role in a read-only
+    // transaction.
+    let mode = if caller
+        .data()
+        .capabilities
+        .contains(&PluginCapability::DatabaseWrite)
+    {
+        crate::raw_sql_guard::PluginSqlMode::Write
+    } else {
+        crate::raw_sql_guard::PluginSqlMode::Read
+    };
     let response = if execute {
-        match super::run_execute(&db, &sql, &params).await {
+        match super::run_plugin_execute(&db, backend, enforcement, &sql, &params).await {
             Ok(n) => serde_json::to_vec(&serde_json::json!({"ok": {"rows_affected": n}}))
                 .unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }
     } else {
-        match super::run_query(&db, &sql, &params).await {
+        match super::run_plugin_query(&db, backend, enforcement, mode, &sql, &params).await {
             Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }
