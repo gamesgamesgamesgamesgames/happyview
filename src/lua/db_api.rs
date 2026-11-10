@@ -887,8 +887,9 @@ async fn main_role_name(pool: &sqlx::AnyPool) -> String {
 }
 
 /// Open the dedicated login pool for `db.raw` from `url` (a connection string for
-/// the `happyview_plugin` login role). Each released connection is reset with
-/// `DISCARD ALL`, so nothing a statement left on the session outlives it.
+/// the `happyview_plugin` login role). Each released connection is reset
+/// ([`LOGIN_POOL_RESET`]), so nothing a statement left on the session outlives
+/// it.
 ///
 /// **The role is verified, not trusted.** A URL that merely connects is not
 /// enough: if it named a privileged role, `db.raw` would run on a privileged
@@ -910,7 +911,18 @@ pub async fn open_plugin_login_pool(url: &str, main_role: &str) -> Option<sqlx::
     Some(pool)
 }
 
-/// The login pool's options, including the `DISCARD ALL` reset on release.
+/// What a released login-pool connection is reset with: `DISCARD ALL` without
+/// its `DEALLOCATE ALL`. The driver keeps its own cache of the statements it
+/// has prepared on a connection, so dropping them on the server would leave the
+/// next caller to run one that no longer exists. Every `db.raw` call prepares
+/// the same `search_path` and schema-check statements, so that would fail on
+/// almost every reused connection. Prepared statements carry no session state
+/// a script could leave.
+const LOGIN_POOL_RESET: &str = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
+     UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; \
+     DISCARD SEQUENCES;";
+
+/// The login pool's options, including the [`LOGIN_POOL_RESET`] on release.
 fn plugin_login_pool_options() -> sqlx::any::AnyPoolOptions {
     sqlx::any::AnyPoolOptions::new()
         .max_connections(8)
@@ -918,7 +930,11 @@ fn plugin_login_pool_options() -> sqlx::any::AnyPoolOptions {
         .idle_timeout(std::time::Duration::from_secs(300))
         .after_release(|conn, _meta| {
             Box::pin(async move {
-                crate::db::query("DISCARD ALL").execute(&mut *conn).await?;
+                // One batch over the simple protocol, so the reset itself is
+                // never prepared.
+                sqlx::raw_sql(sqlx::AssertSqlSafe(LOGIN_POOL_RESET))
+                    .execute(&mut *conn)
+                    .await?;
                 Ok(true)
             })
         })
@@ -1900,6 +1916,23 @@ mod tests {
         state.plugin_sql = crate::PluginSqlAccess::LoginPool(login_pool.clone());
         let lua = setup(&state);
         let rows = raw(&lua, "SELECT session_user::text AS s").await.unwrap();
+
+        // The reset runs as the login role itself, and a connection it reset
+        // keeps serving the same calls.
+        let single = one_connection_login_pool(&login_url).await;
+        let mut single_state = test_state();
+        single_state.plugin_sql = crate::PluginSqlAccess::LoginPool(single.clone());
+        let single_lua = setup(&single_state);
+        for _ in 0..3 {
+            let rows = raw(&single_lua, "SELECT session_user::text AS s")
+                .await
+                .expect("a reset login-role connection runs db.raw again");
+            let row: mlua::Table = rows.get(1).unwrap();
+            assert_eq!(row.get::<String>("s").unwrap(), PLUGIN_ROLE);
+        }
+        drop(single_lua);
+        drop(single_state);
+        single.close().await;
         let row: mlua::Table = rows.get(1).unwrap();
         assert_eq!(row.get::<String>("s").unwrap(), PLUGIN_ROLE);
 
@@ -1947,38 +1980,93 @@ mod tests {
         );
     }
 
-    /// A reused login-pool connection keeps nothing from the previous
-    /// statement: the pool's `DISCARD ALL` on release clears a session setting.
+    /// A one-connection login pool, so release and re-acquire reuse it. Connects
+    /// as `url`'s role; the role checks are not what these tests are about.
+    async fn one_connection_login_pool(url: &str) -> sqlx::AnyPool {
+        sqlx::any::install_default_drivers();
+        plugin_login_pool_options()
+            .max_connections(1)
+            .connect(url)
+            .await
+            .unwrap()
+    }
+
+    /// A reused login-pool connection keeps nothing a statement left on the
+    /// session: settings, a session-level role and path, a temporary table, an
+    /// advisory lock and an open cursor are all gone after release.
     #[tokio::test]
     #[serial]
-    async fn the_login_pool_discards_session_state_on_release() {
-        if postgres_pool().await.is_none() {
+    async fn a_released_login_pool_connection_keeps_no_session_state() {
+        let Some(db) = postgres_pool().await else {
             return;
-        }
+        };
+        provision_login_role(&db).await;
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
-        // The login pool's own options, narrowed to one connection so release and
-        // re-acquire reuse it. Connects as the main test role: this checks the
-        // reset on release, not the role checks.
-        sqlx::any::install_default_drivers();
-        let pool = plugin_login_pool_options()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        {
-            let mut c = pool.acquire().await.unwrap();
-            crate::db::query("SET application_name = 'left_behind'")
-                .execute(&mut *c)
+        let pool = one_connection_login_pool(&url).await;
+        let before: (String, String) =
+            sqlx::query_as("SELECT current_user::text, current_setting('search_path')")
+                .fetch_one(&pool)
                 .await
                 .unwrap();
+        {
+            let mut c = pool.acquire().await.unwrap();
+            for stmt in [
+                "SET application_name = 'left_behind'".to_string(),
+                "SET search_path = pg_catalog".to_string(),
+                "CREATE TEMP TABLE left_behind_temp (a int)".to_string(),
+                "SELECT pg_advisory_lock(424242)".to_string(),
+                "DECLARE left_behind_cursor CURSOR WITH HOLD FOR SELECT 1".to_string(),
+                format!("SET ROLE {PLUGIN_ROLE}"),
+            ] {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(stmt.clone()))
+                    .execute(&mut *c)
+                    .await
+                    .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+            }
         }
+
         let mut c = pool.acquire().await.unwrap();
-        let rows = crate::db::query("SELECT current_setting('application_name') AS a")
-            .fetch_all(&mut *c)
-            .await
-            .unwrap();
-        let app_name: String = rows[0].try_get("a").unwrap_or_default();
-        assert_ne!(app_name, "left_behind", "DISCARD ALL should have reset it");
+        let row: (String, String, String, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT current_user::text, current_setting('search_path'), \
+             current_setting('application_name'), to_regclass('pg_temp.left_behind_temp')::text, \
+             (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()), \
+             (SELECT count(*) FROM pg_cursors WHERE name = 'left_behind_cursor')",
+        )
+        .fetch_one(&mut *c)
+        .await
+        .unwrap();
+        drop(c);
+        pool.close().await;
+        retire_login_role(&db).await;
+        assert_eq!(row.0, before.0, "the role is reset");
+        assert_eq!(row.1, before.1, "the search_path is reset");
+        assert_ne!(row.2, "left_behind", "session settings are reset");
+        assert_eq!(row.3, None, "temporary objects are dropped");
+        assert_eq!(row.4, 0, "advisory locks are released");
+        assert_eq!(row.5, 0, "cursors are closed");
+    }
+
+    /// A login-pool connection serves `db.raw` call after call: the reset on
+    /// release keeps the statements the driver has prepared on it. Each call
+    /// prepares the same path and schema-check statements, so a reset that
+    /// dropped them would fail the next caller.
+    #[tokio::test]
+    #[serial]
+    async fn a_reused_login_pool_connection_runs_db_raw_again() {
+        let Some(db) = postgres_pool().await else {
+            return;
+        };
+        ensure_plugin_schema(&db, DatabaseBackend::Postgres).await;
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let pool = one_connection_login_pool(&url).await;
+        let mut state = test_state();
+        state.plugin_sql = crate::PluginSqlAccess::LoginPool(pool);
+        let lua = setup(&state);
+        for _ in 0..3 {
+            raw(&lua, "SELECT 1 AS n")
+                .await
+                .expect("a reused connection runs db.raw again");
+        }
     }
 
     /// The login role holds no privilege on a sequence a protected table owns,
