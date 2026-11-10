@@ -1071,6 +1071,24 @@ pub async fn retry_failed_backfill(
         )));
     }
 
+    // One retry of a job at a time: a second would fetch the same repos
+    // again alongside the first. Once the first has finished, retry ITS
+    // failures (it records its own) rather than this job's again.
+    let unfinished_retry: Option<(String,)> = happyview_provider::db::query_as(&adapt_sql(
+        "SELECT id FROM happyview_backfill_jobs WHERE retry_of = ? \
+         AND status IN ('running', 'pausing', 'paused', 'cancelling') LIMIT 1",
+        backend,
+    ))
+    .bind(&job_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to query retry jobs: {e}")))?;
+    if let Some((retry_id,)) = unfinished_retry {
+        return Err(AdminError::Conflict(format!(
+            "job {retry_id} is already retrying this job's failures; let it finish, then retry its failures"
+        )));
+    }
+
     if source == "replay" {
         if let Some(requested) = &body.kinds
             && !requested.is_empty()
@@ -1125,6 +1143,7 @@ pub async fn retry_failed_backfill(
             crate::archive::SourceChoice::Replay,
         )
         .await?;
+        mark_retry_of(&state, &new_job_id, &job_id).await?;
         crate::backfill::replay_sweeps::insert_retries(&state, &new_job_id, &blocks)
             .await
             .map_err(|e| {
@@ -1215,6 +1234,7 @@ pub async fn retry_failed_backfill(
         SourceChoice::Crawl,
     )
     .await?;
+    mark_retry_of(&state, &new_job_id, &job_id).await?;
 
     state
         .host
@@ -1237,6 +1257,27 @@ pub async fn retry_failed_backfill(
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": new_job_id })),
     ))
+}
+
+/// Record that `retry_id` retries `source_id`'s failures. Written before
+/// the retry is spawned, so a second retry-failed sees it.
+async fn mark_retry_of(
+    state: &JobState,
+    retry_id: &str,
+    source_id: &str,
+) -> Result<(), AdminError> {
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
+            "UPDATE happyview_backfill_jobs SET retry_of = ? WHERE id = ?",
+            state.db_backend,
+        ))
+        .bind(source_id)
+        .bind(retry_id)
+        .execute(&state.db)
+    })
+    .await
+    .map(|_| ())
+    .map_err(|e| AdminError::Internal(format!("failed to record the retried job: {e}")))
 }
 
 /// `DELETE /admin/backfill/{id}/details`.

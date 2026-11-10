@@ -2152,11 +2152,9 @@ pub(crate) async fn finish_unit(
 ) -> Option<(i32, i32)> {
     let (unit, records, any_success, mut failures) = result;
     let records_now = saturating_fetch_add(scope.total_records, records);
-    // A unit cut short stays queued: the resumed job fetches it again.
-    let cut_short = failures
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, FetchOutcome::Cancelled { .. }));
-    if cut_short || scope.cancelled.load(Ordering::Relaxed) {
+    // A unit cut short stays queued: the resumed job fetches it again. A
+    // `Cancelled` outcome only comes from this same flag.
+    if scope.cancelled.load(Ordering::Relaxed) {
         return None;
     }
     if any_success {

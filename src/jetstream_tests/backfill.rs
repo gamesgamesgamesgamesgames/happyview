@@ -1104,6 +1104,114 @@ async fn a_resolve_give_up_is_in_the_failure_set() {
     );
 }
 
+/// HAP-421: a fetch whose retries run out turns its pending row into a
+/// give-up, and a give-up nobody deferred is written as failed too.
+#[tokio::test]
+async fn a_retry_that_runs_out_is_recorded_as_failed() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    fail_records(&mock, "did:plc:down", POST, ResponseTemplate::new(503), 100).await;
+    fail_records(&mock, "did:plc:gone", POST, repo_not_found(), 100).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(
+        &jobs(&state),
+        Some(POST),
+        &["did:plc:down".to_string(), "did:plc:gone".to_string()],
+    )
+    .await
+    .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    assert_eq!(job_row(&state, &job_id).await.status, "completed");
+    let set = failure_set(&state, &job_id).await;
+    assert_eq!(
+        set.iter()
+            .map(|(did, _, _, kind, state)| (did.as_str(), kind.as_str(), state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("did:plc:down", "pds_server_error", "failed"),
+            ("did:plc:gone", "repo_not_found", "failed"),
+        ]
+    );
+}
+
+/// HAP-421: a finished job's failure set outlives a flush and the retention
+/// sweep, as its error log does, so retry-failed never falls back to the
+/// capped log.
+#[tokio::test]
+async fn the_failure_set_outlives_a_flush_and_the_retention_sweep() {
+    let state = state_with_errors_job("job-kept", Some(POST), "{}").await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET completed_at = '2026-01-01T00:00:00+00:00' WHERE id = 'job-kept'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("completed_at");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-kept', 'did:plc:a', ?, 'fetch', 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+
+    flush_job_details(&jobs(&state), "job-kept", 100)
+        .await
+        .expect("flush");
+    flush_finished_details(&jobs(&state), 100)
+        .await
+        .expect("flush all");
+    sweep_backfill_details(&jobs(&state), "2030-01-01T00:00:00+00:00")
+        .await
+        .expect("sweep");
+    assert_eq!(failure_set(&state, "job-kept").await.len(), 1);
+}
+
+/// HAP-421: a second retry-failed of a job is refused while its first retry
+/// is unfinished, and allowed once it has finished.
+#[tokio::test]
+async fn retry_failed_refuses_a_second_retry_while_the_first_is_unfinished() {
+    let state = state_with_errors_job("job-twice", Some(POST), "{}").await;
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-twice', 'did:plc:a', ?, 'fetch', 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+    let retry = || {
+        retry_failed_backfill(
+            State(jobs(&state)),
+            super_auth(&state),
+            Path("job-twice".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+    };
+
+    let (_, Json(body)) = retry().await.expect("first retry");
+    let first = body["id"].as_str().expect("id").to_string();
+    // Let its run end (the collection isn't indexed here, so it fails at
+    // once), then hold it unfinished.
+    for _ in 0..500 {
+        if job_row(&state, &first).await.status != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    finish_job(&state, &first, "paused", "2026-01-02T00:00:00+00:00").await;
+    assert!(
+        matches!(retry().await, Err(AdminError::Conflict(_))),
+        "a second retry runs the same repos again"
+    );
+
+    finish_job(&state, &first, "completed", "2026-01-02T00:00:00+00:00").await;
+    let _ = retry().await.expect("a retry after the first finished");
+}
+
 /// Review focus 1: deferred resolutions occupy the window. If only the
 /// final pass retried them, discovery would wait for room forever.
 #[tokio::test]

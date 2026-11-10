@@ -1385,13 +1385,12 @@ pub(crate) const BACKFILL_DETAIL_TABLES: [&str; 3] = [
 /// is cleared only once the job has finished. A cancelled or failed job can
 /// leave up to a window of units behind.
 ///
-/// `happyview_backfill_failures` is here too: it holds a paused job's pending
-/// fetch retries, and a finished job's failure set that retry-failed reads.
-pub(crate) const BACKFILL_WORK_TABLES: [&str; 3] = [
-    "happyview_backfill_queue",
-    "happyview_backfill_cursors",
-    "happyview_backfill_failures",
-];
+/// `happyview_backfill_failures` is deliberately in neither list. Like
+/// `happyview_backfill_errors`, it lives as long as its job: it is the list
+/// retry-failed reads, and clearing it would leave retry-failed with only the
+/// capped detail log.
+pub(crate) const BACKFILL_WORK_TABLES: [&str; 2] =
+    ["happyview_backfill_queue", "happyview_backfill_cursors"];
 
 /// Statuses a job never leaves.
 pub const FINISHED_STATUSES: [&str; 3] = ["completed", "cancelled", "failed"];

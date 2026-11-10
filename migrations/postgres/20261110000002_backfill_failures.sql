@@ -6,7 +6,8 @@
 -- kept no list of which repos failed. And a fetch deferred for retry lived
 -- only in memory: a pause or restart dropped it with its unit already
 -- completed. These rows are what retry-failed reads, and a resumed job
--- queues its pending rows again.
+-- queues its pending rows again. Like happyview_backfill_errors, they last
+-- as long as their job: no flush or retention sweep clears them.
 CREATE TABLE happyview_backfill_failures (
     job_id     TEXT NOT NULL REFERENCES happyview_backfill_jobs(id) ON DELETE CASCADE,
     did        TEXT NOT NULL,
@@ -26,3 +27,7 @@ CREATE TABLE happyview_backfill_failures (
 
 CREATE INDEX idx_backfill_failures_state
     ON happyview_backfill_failures (job_id, state, kind);
+
+-- The job a retry-failed job retries, so a second retry of the same job is
+-- refused while the first is unfinished.
+ALTER TABLE happyview_backfill_jobs ADD COLUMN retry_of TEXT;
