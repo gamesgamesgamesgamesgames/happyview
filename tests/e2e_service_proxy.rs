@@ -82,6 +82,17 @@ async fn authorization_server(app: &TestApp, scopes: &str) -> MockServer {
 /// Provision a DPoP key and register a session whose PDS is the mock server.
 /// Returns `(client_key, private_jwk)` for signing proofs.
 async fn register_session(app: &TestApp, scopes: &str) -> (String, Value) {
+    // Registration confirms any scope beyond `atproto` with the account's
+    // authorization server, by a refresh. This one grants exactly `scopes`
+    // and hands back the same access token, so the proxied requests below
+    // still carry `TOKEN`.
+    let issuer = authorization_server(app, scopes).await;
+    register_session_at(app, scopes, &issuer).await
+}
+
+/// [`register_session`] against an authorization server the caller set up and
+/// keeps running.
+async fn register_session_at(app: &TestApp, scopes: &str, issuer: &MockServer) -> (String, Value) {
     let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
 
     // A session can only carry scopes its API client is registered for — the
@@ -117,12 +128,6 @@ async fn register_session(app: &TestApp, scopes: &str) -> (String, Value) {
     // client-supplied `pds_url` — so both must point at the mock.
     app.mock_session_verification(DID, DID).await;
     let pds_url = format!("{}/pds/{DID}", app.mock_server.uri());
-
-    // Registration confirms any scope beyond `atproto` with the account's
-    // authorization server, by a refresh. This one grants exactly `scopes`
-    // and hands back the same access token, so the proxied requests below
-    // still carry `TOKEN`.
-    let issuer = authorization_server(app, scopes).await;
 
     let session_req = Request::builder()
         .method("POST")
@@ -711,4 +716,133 @@ async fn a_validation_error_carrying_a_nonce_is_not_retried() {
         attempts, 1,
         "a validation error must not be resent as if it were a nonce challenge"
     );
+}
+
+/// A refresh on the write path (the PDS refused the access token) records the
+/// scope that refresh reports, so the next scope check reads the server's
+/// current answer without asking again.
+#[tokio::test]
+#[serial]
+async fn a_write_path_refresh_records_the_scope_it_reports() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let registered = "atproto repo:com.example.allowed?action=create";
+    let narrowed = "atproto";
+
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(http_method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/oauth/token"),
+        })))
+        .mount(&server)
+        .await;
+    for scope in [registered, narrowed] {
+        Mock::given(http_method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": TOKEN,
+                "refresh_token": "proxy-refresh-token-rotated",
+                "token_type": "DPoP",
+                "expires_in": 3600,
+                "sub": DID,
+                "scope": scope,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(http_method("GET"))
+        .and(path(format!(
+            "/pds/{DID}/.well-known/oauth-protected-resource"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "authorization_servers": [issuer] })),
+        )
+        .mount(&app.mock_server)
+        .await;
+
+    let (client_key, dpop_key) = register_session_at(&app, registered, &server).await;
+    set_routing(&app, ProxyRouting::ServiceProxy);
+
+    // The PDS refuses the token once, which makes HappyView refresh, then
+    // accepts the retry.
+    Mock::given(http_method("POST"))
+        .and(path(format!(
+            "/pds/{DID}/xrpc/com.atproto.repo.createRecord"
+        )))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("www-authenticate", "DPoP error=\"invalid_token\"")
+                .set_body_json(json!({ "error": "invalid_token" })),
+        )
+        .up_to_n_times(1)
+        .mount(&app.mock_server)
+        .await;
+    Mock::given(http_method("POST"))
+        .and(path(format!(
+            "/pds/{DID}/xrpc/com.atproto.repo.createRecord"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "cid": "bafyok" })))
+        .mount(&app.mock_server)
+        .await;
+
+    let req = dpop_request(
+        "POST",
+        "/xrpc/com.atproto.repo.createRecord",
+        &client_key,
+        &dpop_key,
+        Some(&json!({
+            "repo": DID,
+            "collection": "com.example.allowed",
+            "record": {},
+        })),
+        &[],
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let token_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/oauth/token")
+        .count();
+    assert_eq!(token_requests, 2, "registration and the write-path refresh");
+
+    // The next scope check reads the narrowed grant, and asks nothing more.
+    let (api_client_id, dpop_key_id): (String, String) =
+        happyview::db::query_as(&happyview::db::adapt_sql(
+            "SELECT api_client_id, dpop_key_id FROM happyview_dpop_sessions WHERE user_did = ?",
+            app.state.db_backend,
+        ))
+        .bind(DID)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    let granted = happyview::oauth::pds_write::verified_granted_scope(
+        &app.state.http,
+        &app.state.db,
+        app.state.db_backend,
+        &app.state.config.keyring().unwrap(),
+        &app.state.oauth,
+        &app.state.config.plc_url,
+        &api_client_id,
+        DID,
+        &dpop_key_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(granted, narrowed);
+    let token_requests_after = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/oauth/token")
+        .count();
+    assert_eq!(token_requests_after, 2);
 }

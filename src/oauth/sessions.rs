@@ -682,3 +682,84 @@ pub async fn delete_dpop_session_by_id(
 
     Ok(dpop_key_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client, key and session row whose cached grant is `granted`.
+    async fn seed_session(pool: &sqlx::AnyPool, granted: &str) {
+        let now = now_rfc3339();
+        for (sql, binds) in [
+            (
+                "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at) VALUES ('c1', 'hvc_1', '', 'test', 'https://c.example', '', '[]', '', 'confidential', 1, 'did:plc:u', ?, ?)",
+                2,
+            ),
+            (
+                "INSERT INTO happyview_dpop_keys (id, provision_id, api_client_id, private_key_enc, jwk_thumbprint, created_at) VALUES ('k1', 'p1', 'c1', X'00', '', ?)",
+                1,
+            ),
+        ] {
+            let mut q = crate::db::query(sql);
+            for _ in 0..binds {
+                q = q.bind(now.clone());
+            }
+            q.execute(pool).await.unwrap();
+        }
+        crate::db::query(
+            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, scopes, granted_scope, created_at, updated_at) VALUES ('s1', 'c1', 'k1', 'did:plc:u', X'00', 'atproto', ?, ?, ?)",
+        )
+        .bind(granted)
+        .bind(now.clone())
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn scopes(pool: &sqlx::AnyPool) -> String {
+        let (scopes,): (String,) =
+            crate::db::query_as("SELECT scopes FROM happyview_dpop_sessions WHERE id = 's1'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        scopes
+    }
+
+    /// The widening applies only to the row whose grant was checked: once the
+    /// cached grant changed (a re-registration clears it), nothing is updated.
+    #[tokio::test]
+    async fn session_scopes_are_set_only_on_the_row_whose_grant_was_checked() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        seed_session(&pool, "atproto repo:com.example.post").await;
+
+        let stale = set_dpop_session_scopes(
+            &pool,
+            backend,
+            "c1",
+            "did:plc:u",
+            "k1",
+            "atproto repo:com.example.post",
+            "atproto something-else",
+        )
+        .await
+        .unwrap();
+        assert!(!stale, "a different grant must leave the row alone");
+        assert_eq!(scopes(&pool).await, "atproto");
+
+        let checked = set_dpop_session_scopes(
+            &pool,
+            backend,
+            "c1",
+            "did:plc:u",
+            "k1",
+            "atproto repo:com.example.post",
+            "atproto repo:com.example.post",
+        )
+        .await
+        .unwrap();
+        assert!(checked);
+        assert_eq!(scopes(&pool).await, "atproto repo:com.example.post");
+    }
+}
