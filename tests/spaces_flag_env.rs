@@ -23,7 +23,13 @@ const LOCKED: &str = "PLATFORM_LOCKED_SETTINGS";
 struct EnvGuard(Vec<&'static str>);
 
 impl EnvGuard {
+    /// Clears both variables first, so a value inherited from the shell or
+    /// left by another test can't decide a case.
     fn set(vars: &[(&'static str, &str)]) -> Self {
+        for name in [ENV, LOCKED] {
+            // SAFETY: as below.
+            unsafe { std::env::remove_var(name) };
+        }
         for (name, value) in vars {
             // SAFETY: the tests in this target are serial, so no other thread
             // reads the environment while it changes.
@@ -95,6 +101,7 @@ async fn with_neither_a_row_nor_the_variable_spaces_are_off() {
 #[serial]
 async fn with_no_row_the_variable_decides() {
     common::require_db!();
+    let _clear = EnvGuard::set(&[]);
     let app = TestApp::new().await;
     {
         let _env = EnvGuard::set(&[(ENV, "true")]);
@@ -111,6 +118,7 @@ async fn with_no_row_the_variable_decides() {
 #[serial]
 async fn a_stored_row_wins_over_the_variable() {
     common::require_db!();
+    let _clear = EnvGuard::set(&[]);
     let app = TestApp::new().await;
     let _env = EnvGuard::set(&[(ENV, "true")]);
     assert!(store(&app, "false").await.is_success());
@@ -128,6 +136,7 @@ async fn a_stored_row_wins_over_the_variable() {
 #[serial]
 async fn fixed_by_the_platform_the_variable_wins_and_the_row_is_refused() {
     common::require_db!();
+    let _clear = EnvGuard::set(&[]);
     let app = TestApp::new().await;
     assert!(store(&app, "false").await.is_success());
 
