@@ -32,6 +32,10 @@ export interface BackfillJob {
   // False while a network job is still listing repos from the relay; until
   // then `total_repos` counts the repos discovered so far.
   discovery_complete?: boolean;
+  // Collections whose relay listing has a saved cursor short of its end. On
+  // a completed crawl these stopped early and can be resumed from the cursor.
+  // Absent when there are none.
+  discovery_unfinished?: string[];
   // Set for jobs on the bounded queue: how many recent completions the
   // `fetched` repo list keeps. Null for jobs created before it.
   recent_completions_limit?: number | null;

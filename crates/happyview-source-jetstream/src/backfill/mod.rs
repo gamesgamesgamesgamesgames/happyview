@@ -71,6 +71,8 @@ pub struct JobState {
 pub struct JobConfig {
     pub plc_url: String,
     pub relay_url: String,
+    /// How discovery retries a relay page that failed.
+    pub relay_retry: RelayRetry,
 }
 
 impl JobState {
@@ -85,6 +87,7 @@ impl JobState {
             config: JobConfig {
                 plc_url: instance.plc_url,
                 relay_url: instance.relay_url,
+                relay_retry: RelayRetry::default(),
             },
             archive,
             endpoint,
@@ -900,6 +903,26 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         _ => {}
     }
 
+    // Discovery stopped short of the end of a collection's listing: the relay
+    // would not give a page after every retry. The job has not seen the whole
+    // network, so it pauses rather than completes, and resuming it continues
+    // discovery from the saved cursor.
+    if version == QueueVersion::Bounded {
+        match unfinished_discovery(&state, &job_id, &collections).await {
+            Ok(open) if open.is_empty() => {}
+            Ok(open) => {
+                pause_with_discovery_unfinished(&state, &job_id, collection.as_deref(), &open)
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let error = format!("failed to read the backfill discovery state: {e}");
+                fail_job(&state, &job_id, &error).await;
+                return;
+            }
+        }
+    }
+
     // A unit can stay queued when a write about it failed (its PDS was never
     // stored, or its completion was never committed). The job is not done:
     // leave it paused so resuming picks those units up again.
@@ -931,6 +954,92 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
                 "job_id": job_id,
                 "total_repos": final_processed,
                 "total_records": final_records,
+            }),
+        })
+        .await;
+}
+
+/// The collections a bounded job has not finished discovering: none once
+/// `discovery_complete` is set, otherwise each of `collections` whose relay
+/// cursor has not reached the end of its listing.
+pub(crate) async fn unfinished_discovery(
+    state: &JobState,
+    job_id: &str,
+    collections: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT discovery_complete FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    );
+    let (complete,): (i32,) = happyview_provider::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_one(&state.backfill_db)
+        .await?;
+    if complete != 0 {
+        return Ok(Vec::new());
+    }
+    let cursors = load_discovery_cursors(state, job_id).await?;
+    let open = unfinished_collections(collections, &cursors);
+    // `discovery_complete = 0` with every cursor done is a discovery that
+    // ended without recording it; it is still not marked done here, since
+    // only discovery itself says so.
+    Ok(if open.is_empty() {
+        collections.to_vec()
+    } else {
+        open
+    })
+}
+
+/// Pause a bounded job whose discovery stopped short of the end of a
+/// collection's listing, rather than mark it completed on part of the network.
+///
+/// The stage says why, as the reason in `error` does for the dashboard.
+/// Resuming the job continues discovery from each collection's saved cursor.
+pub(crate) async fn pause_with_discovery_unfinished(
+    state: &JobState,
+    job_id: &str,
+    collection: Option<&str>,
+    open: &[String],
+) {
+    let reason = format!(
+        "paused: discovery did not finish for {}; resume to continue from the saved cursor \
+         (see the backfill.discovery_failed events)",
+        open.join(", ")
+    );
+    tracing::warn!(job_id, collections = ?open, "{reason}");
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET status = 'paused', stage = 'discovery_incomplete', error = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "pause", || {
+        happyview_provider::db::query(&sql)
+            .bind(&reason)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        types::BackfillEvent::JobCompleted {
+            job_id: job_id.to_string(),
+            status: "paused".to_string(),
+            error: Some(reason.clone()),
+        },
+    );
+    if let Some(snapshot) = build_job_snapshot(state, job_id).await {
+        publish_event(state, snapshot);
+    }
+    state
+        .host
+        .log_event(ProviderEvent {
+            event_type: "backfill.discovery_incomplete".to_string(),
+            severity: Severity::Warn,
+            actor_did: None,
+            subject: collection.map(str::to_string),
+            detail: serde_json::json!({
+                "job_id": job_id,
+                "collections": open,
+                "reason": reason,
             }),
         })
         .await;

@@ -35,6 +35,13 @@ pub struct BackfillJob {
     /// False while a network job is still listing repos from the relay; until
     /// then `total_repos` is the count discovered so far.
     pub discovery_complete: bool,
+    /// A crawl's collections whose saved relay cursor has not reached the end
+    /// of the listing. While a job runs these are the collections still being
+    /// discovered; on a paused or completed job they are collections whose
+    /// discovery stopped short, which `resume` (or `resume-discovery`, for a
+    /// completed job) continues from the cursor. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub discovery_unfinished: Vec<String>,
     /// For jobs on the bounded queue, how many of the most recent completions
     /// `repos?phase=fetched` lists. `None` for older jobs, which list every
     /// completed repo.

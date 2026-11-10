@@ -24,6 +24,7 @@ import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
   pauseBackfillJob,
+  resumeBackfillDiscovery,
   resumeBackfillJob,
   createBackfillJob,
   getBackfillCollection,
@@ -234,7 +235,9 @@ function statusBadge(job: BackfillJob) {
 
 function phaseIndex(stage: string): number {
   if (isReplayStage(stage)) return REPLAY_STAGES.indexOf(stage);
-  if (stage === "resolving_and_fetching") return 1;
+  // Paused because discovery stopped short; resolving and fetching ran.
+  if (stage === "resolving_and_fetching" || stage === "discovery_incomplete")
+    return 1;
   const idx = PROGRESS_PHASES.indexOf(
     stage as (typeof PROGRESS_PHASES)[number],
   );
@@ -878,6 +881,10 @@ export default function BackfillPage() {
                   await resumeBackfillJob(selectedJob.id);
                   load();
                 }}
+                onResumeDiscovery={async () => {
+                  await resumeBackfillDiscovery(selectedJob.id);
+                  load();
+                }}
                 onRetry={async (kinds) => {
                   await retryFailedBackfill(selectedJob.id, kinds);
                   load();
@@ -900,6 +907,7 @@ function JobDetail({
   onCancel,
   onPause,
   onResume,
+  onResumeDiscovery,
   onRetry,
 }: {
   job: BackfillJob;
@@ -910,11 +918,13 @@ function JobDetail({
   onCancel: () => Promise<void>;
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
+  onResumeDiscovery: () => Promise<void>;
   onRetry: (kinds?: string[]) => Promise<void>;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [resumingDiscovery, setResumingDiscovery] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const current = phaseIndex(job.stage);
   const allDone = job.status === "completed";
@@ -929,6 +939,11 @@ function JobDetail({
     (job.status === "failed" && job.source === "replay");
   // Discovery runs alongside resolving and fetching on the bounded queue.
   const discovering = job.discovery_complete === false;
+  // A completed crawl whose discovery stopped short of a collection's end
+  // (a relay page that kept failing, before HappyView paused on that).
+  const unfinishedDiscovery = job.discovery_unfinished ?? [];
+  const discoveryResumable =
+    allDone && job.source === "crawl" && unfinishedDiscovery.length > 0;
   const bounded = job.recent_completions_limit != null;
   // A bounded job's queue is its work, so the server only clears a finished
   // one; a legacy job can be cleared whenever it isn't running.
@@ -1116,6 +1131,18 @@ function JobDetail({
       toastError("Couldn't resume", e);
     } finally {
       setResuming(false);
+    }
+  }
+
+  async function handleResumeDiscovery() {
+    setResumingDiscovery(true);
+    try {
+      await onResumeDiscovery();
+      toast.success("Discovery resumed");
+    } catch (e: unknown) {
+      toastError("Couldn't resume discovery", e);
+    } finally {
+      setResumingDiscovery(false);
     }
   }
 
@@ -1366,6 +1393,19 @@ function JobDetail({
             </div>
           )}
         </div>
+
+        {discoveryResumable && (
+          <div>
+            <span className="text-muted-foreground text-sm">
+              Discovery stopped early
+            </span>
+            <div className="bg-amber-500/10 text-amber-700 dark:text-amber-400 mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+              The relay listing didn&apos;t reach its end for{" "}
+              {unfinishedDiscovery.join(", ")}. Resume discovery to continue
+              from the saved cursor.
+            </div>
+          </div>
+        )}
 
         {pauseReason ? (
           <div>
@@ -1751,6 +1791,16 @@ function JobDetail({
             onClick={handleResume}
           >
             {resuming ? "Resuming…" : "Resume"}
+          </Button>
+        )}
+        {canCancel && discoveryResumable && (
+          <Button
+            variant="default"
+            size="sm"
+            disabled={resumingDiscovery}
+            onClick={handleResumeDiscovery}
+          >
+            {resumingDiscovery ? "Resuming…" : "Resume discovery"}
           </Button>
         )}
         {canCancel && isActive && !restartsUnlessPaused && (

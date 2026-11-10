@@ -452,6 +452,13 @@ export function pauseBackfillJob(id: string) {
   );
 }
 
+export function resumeBackfillDiscovery(id: string) {
+  return apiFetch<{ id: string; status: string; collections: string[] }>(
+    `/admin/backfill/${id}/resume-discovery`,
+    { method: "POST" },
+  );
+}
+
 export function resumeBackfillJob(id: string) {
   return apiFetch<{ id: string; status: string }>(
     `/admin/backfill/${id}/resume`,

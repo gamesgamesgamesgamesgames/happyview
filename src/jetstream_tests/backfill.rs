@@ -825,6 +825,523 @@ async fn a_resumed_discovery_continues_from_its_saved_cursor() {
     assert_eq!(done, 1);
 }
 
+/// Requests the relay got for `collection`'s listing, by the cursor each one
+/// carried (`None` for the first page).
+async fn relay_requests(mock: &MockServer, collection: &str) -> Vec<Option<String>> {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == "/xrpc/com.atproto.sync.listReposByCollection")
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "collection" && v == collection)
+        })
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "cursor")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
+/// `collection`'s page at `cursor` answers `status` for its next `times`
+/// requests, ahead of any other mock for it.
+async fn fail_relay_page(
+    mock: &MockServer,
+    collection: &str,
+    cursor: Option<&str>,
+    response: ResponseTemplate,
+    times: u64,
+) {
+    let builder = Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.sync.listReposByCollection"))
+        .and(query_param("collection", collection));
+    let builder = match cursor {
+        Some(c) => builder.and(query_param("cursor", c)),
+        None => builder.and(query_param_is_missing("cursor")),
+    };
+    builder
+        .respond_with(response)
+        .up_to_n_times(times)
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+async fn job_stage_and_error(state: &AppState, job_id: &str) -> (String, Option<String>) {
+    crate::db::query_as("SELECT stage, error FROM happyview_backfill_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("job row")
+}
+
+async fn cursor_row(state: &AppState, job_id: &str, collection: &str) -> (Option<String>, i32) {
+    crate::db::query_as(
+        "SELECT relay_cursor, done FROM happyview_backfill_cursors WHERE job_id = ? AND collection = ?",
+    )
+    .bind(job_id)
+    .bind(collection)
+    .fetch_one(&state.db)
+    .await
+    .expect("cursor row")
+}
+
+async fn count_events(state: &AppState, event_type: &str) -> i64 {
+    crate::db::query_as::<(i64,)>("SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = ?")
+        .bind(event_type)
+        .fetch_one(&state.db)
+        .await
+        .expect("count events")
+        .0
+}
+
+/// HAP-422: a relay page that fails on every attempt mid-listing. The job
+/// must not complete on the part of the network it saw: it pauses with its
+/// cursor unfinished, and resuming it continues from that cursor.
+#[tokio::test]
+async fn a_relay_page_that_keeps_failing_pauses_the_job_and_resume_continues_from_its_cursor() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_relay_page(&mock, POST, None, &["did:plc:a"], Some("c1")).await;
+    fail_relay_page(
+        &mock,
+        POST,
+        Some("c1"),
+        ResponseTemplate::new(502),
+        u64::from(super::TEST_RELAY_RETRY.max_attempts),
+    )
+    .await;
+    mount_relay_page(&mock, POST, Some("c1"), &["did:plc:b"], None).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:a", POST, 1).await;
+    mount_records(&mock, "did:plc:b", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &[])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.discovery_complete,
+            job.processed_repos
+        ),
+        ("paused", 0, 1),
+        "a job whose discovery stopped short must not complete"
+    );
+    assert_eq!(
+        cursor_row(&state, &job_id, POST).await,
+        (Some("c1".to_string()), 0)
+    );
+    let (stage, error) = job_stage_and_error(&state, &job_id).await;
+    assert_eq!(stage, "discovery_incomplete");
+    let error = error.expect("the pause says why");
+    assert!(
+        error.contains("discovery did not finish for app.test.post"),
+        "{error}"
+    );
+    assert_eq!(count_events(&state, "backfill.discovery_failed").await, 1);
+    assert_eq!(
+        count_events(&state, "backfill.discovery_incomplete").await,
+        1
+    );
+    let attempts = relay_requests(&mock, POST).await;
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|c| c.as_deref() == Some("c1"))
+            .count() as u32,
+        super::TEST_RELAY_RETRY.max_attempts,
+        "the failing page is retried up to the policy's attempts: {attempts:?}"
+    );
+
+    // An operator resumes the paused job.
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL WHERE id = ?",
+    )
+    .bind(&job_id)
+    .execute(&state.db)
+    .await
+    .expect("resume");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.discovery_complete,
+            job.processed_repos
+        ),
+        ("completed", 1, 2)
+    );
+    assert_eq!(cursor_row(&state, &job_id, POST).await.1, 1);
+    let first_pages = relay_requests(&mock, POST)
+        .await
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
+    assert_eq!(
+        first_pages, 1,
+        "the resumed discovery starts at the saved cursor"
+    );
+}
+
+/// HAP-422: a 5xx from the relay is retried, and the job completes once the
+/// page comes back.
+#[tokio::test]
+async fn a_relay_5xx_is_retried_and_the_job_completes() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_relay_page(&mock, POST, None, &["did:plc:a"], Some("c1")).await;
+    fail_relay_page(&mock, POST, Some("c1"), ResponseTemplate::new(503), 2).await;
+    mount_relay_page(&mock, POST, Some("c1"), &["did:plc:b"], None).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:a", POST, 1).await;
+    mount_records(&mock, "did:plc:b", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &[])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.discovery_complete,
+            job.processed_repos
+        ),
+        ("completed", 1, 2)
+    );
+    assert_eq!(count_events(&state, "backfill.discovery_failed").await, 0);
+    let c1 = relay_requests(&mock, POST)
+        .await
+        .into_iter()
+        .filter(|c| c.as_deref() == Some("c1"))
+        .count();
+    assert_eq!(c1, 3, "two 503s, then the page");
+}
+
+/// HAP-422: a relay body that does not parse is retried like a 5xx.
+#[tokio::test]
+async fn an_unreadable_relay_page_is_retried() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    fail_relay_page(
+        &mock,
+        POST,
+        None,
+        ResponseTemplate::new(200).set_body_string("<html>bad gateway</html>"),
+        1,
+    )
+    .await;
+    mount_relay_page(&mock, POST, None, &["did:plc:a"], None).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:a", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &[])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.discovery_complete,
+            job.processed_repos
+        ),
+        ("completed", 1, 1)
+    );
+}
+
+/// HAP-422: of two collections, one whose listing fails leaves the job
+/// paused naming it, while the other finishes.
+#[tokio::test]
+async fn a_failed_collection_is_named_while_the_others_finish() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST, LIKE]).await;
+    mount_relay_page(&mock, POST, None, &["did:plc:a"], None).await;
+    fail_relay_page(
+        &mock,
+        LIKE,
+        None,
+        ResponseTemplate::new(500),
+        u64::from(super::TEST_RELAY_RETRY.max_attempts),
+    )
+    .await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:a", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), None, &[])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!((job.status.as_str(), job.discovery_complete), ("paused", 0));
+    let (_, error) = job_stage_and_error(&state, &job_id).await;
+    let error = error.expect("the pause says why");
+    assert!(error.contains(LIKE) && !error.contains(POST), "{error}");
+}
+
+#[test]
+fn the_relay_backoff_doubles_up_to_its_cap_and_honours_retry_after() {
+    let policy = RelayRetry {
+        max_attempts: 8,
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(60),
+    };
+    // Jitter 1.0 is the top of the range: the backoff itself.
+    let top = |n| relay_retry_delay(&policy, n, None, 1.0);
+    assert_eq!(top(1), Duration::from_secs(1));
+    assert_eq!(top(2), Duration::from_secs(2));
+    assert_eq!(top(5), Duration::from_secs(16));
+    assert_eq!(top(7), Duration::from_secs(60));
+    assert_eq!(top(40), Duration::from_secs(60));
+    // Jitter 0.0 halves it.
+    assert_eq!(
+        relay_retry_delay(&policy, 3, None, 0.0),
+        Duration::from_secs(2)
+    );
+    // A Retry-After longer than the backoff wins; a shorter one does not.
+    assert_eq!(
+        relay_retry_delay(&policy, 1, Some(Duration::from_secs(30)), 0.5),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        relay_retry_delay(&policy, 5, Some(Duration::from_secs(1)), 1.0),
+        Duration::from_secs(16)
+    );
+}
+
+/// Wait for a spawned job to leave `running`.
+async fn wait_for_job_to_settle(state: &AppState, job_id: &str) -> JobRow {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let job = job_row(state, job_id).await;
+            if job.status != "running" {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the job should finish")
+}
+
+/// HAP-422: a job that completed before discovery stopped treating a failed
+/// page as the end, with an unfinished cursor, is reopened by an operator and
+/// discovers from that cursor.
+#[tokio::test]
+async fn resume_discovery_reopens_a_completed_job_from_its_unfinished_cursor() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    seed_job(
+        &state,
+        "done-early",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET status = 'completed', source = 'crawl', processed_repos = 5, \
+         total_repos = 5, completed_at = '2026-01-02T00:00:00+00:00' WHERE id = 'done-early'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("complete job");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES ('done-early', ?, 'c9', 0)",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed cursor");
+    fail_relay_page(&mock, POST, None, ResponseTemplate::new(500), 1000).await;
+    mount_relay_page(&mock, POST, Some("c9"), &["did:plc:late"], None).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:late", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let Json(body) = resume_discovery_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path("done-early".to_string()),
+    )
+    .await
+    .expect("resume discovery");
+    assert_eq!(body["status"], "running");
+    assert_eq!(body["collections"], serde_json::json!([POST]));
+
+    let job = wait_for_job_to_settle(&state, "done-early").await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.discovery_complete,
+            job.processed_repos,
+            job.total_repos
+        ),
+        ("completed", 1, 6, 6)
+    );
+    assert_eq!(cursor_row(&state, "done-early", POST).await.1, 1);
+    assert!(
+        relay_requests(&mock, POST)
+            .await
+            .iter()
+            .all(Option::is_some),
+        "discovery must not restart from the first page"
+    );
+    assert_eq!(count_events(&state, "backfill.discovery_resumed").await, 1);
+}
+
+/// HAP-422: resume-discovery refuses a job with nothing to resume, and one
+/// that is not completed.
+#[tokio::test]
+async fn resume_discovery_refuses_a_job_with_nothing_to_resume() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    seed_job(
+        &state,
+        "all-done",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET status = 'completed', source = 'crawl' WHERE id = 'all-done'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("complete job");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES ('all-done', ?, NULL, 1)",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed cursor");
+    let refused = resume_discovery_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path("all-done".to_string()),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AdminError::BadRequest(_))),
+        "a finished discovery has nothing to resume"
+    );
+
+    seed_job(
+        &state,
+        "still-running",
+        Some(POST),
+        "network",
+        "resolving_and_fetching",
+        2,
+        false,
+    )
+    .await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET source = 'crawl' WHERE id = 'still-running'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("source");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES ('still-running', ?, 'c1', 0)",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed cursor");
+    let refused = resume_discovery_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path("still-running".to_string()),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AdminError::BadRequest(_))),
+        "a running job is not reopened"
+    );
+    assert_eq!(job_row(&state, "still-running").await.status, "running");
+}
+
+/// HAP-422: the job list names the collections whose discovery is unfinished.
+#[tokio::test]
+async fn the_job_list_names_unfinished_discovery() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    seed_job(
+        &state,
+        "partial",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    crate::db::query(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES ('partial', ?, 'c1', 0)",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed cursor");
+    // An executor checkpoints in the cursor table with `done = 0`.
+    seed_job(
+        &state,
+        "executor",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET source = 'store-pass' WHERE id = 'executor'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("source");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES ('executor', ?, 'x1', 0)",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed checkpoint");
+    let Json(listed) = backfill_status(State(jobs(&state)), super_auth(&state))
+        .await
+        .expect("list jobs");
+    let job = listed.iter().find(|j| j.id == "partial").expect("listed");
+    assert_eq!(job.discovery_unfinished, vec![POST.to_string()]);
+    let job = listed.iter().find(|j| j.id == "executor").expect("listed");
+    assert!(
+        job.discovery_unfinished.is_empty(),
+        "an executor's checkpoint is not discovery"
+    );
+}
+
 /// Review focus 1: deferred resolutions occupy the window. If only the
 /// final pass retried them, discovery would wait for room forever.
 #[tokio::test]
