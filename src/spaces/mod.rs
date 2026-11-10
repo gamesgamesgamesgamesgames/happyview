@@ -20,6 +20,7 @@ pub mod oplog;
 pub mod pds_support;
 pub mod policy;
 pub mod rebuild;
+pub mod retired;
 pub mod routes;
 pub mod scope;
 pub mod service;

@@ -118,6 +118,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/spaces", get(spaces::list_spaces))
         .route("/spaces/inspector", get(space_access::inspector_status))
+        .route("/spaces/retired-policies", get(spaces::retired_policies))
         .route(
             "/spaces/access-grants",
             get(space_access::list_grants).post(space_access::create_grant),
