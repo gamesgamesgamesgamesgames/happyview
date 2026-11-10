@@ -113,8 +113,10 @@ fn flag(space: &Space, name: &str) -> bool {
 ///
 /// To a memberspace, a managing-app rule becomes the member list, a public
 /// rule stays public, and an app allow list and the publish flags carry over.
-/// To a managedspace, the managing app is the one the rules name, or
-/// `managing_app` when the read and write rules name different ones.
+/// To a managedspace, the managing app is the one the rules name. When the
+/// read and write rules name two different ones, `managing_app` picks one of
+/// them, and is refused otherwise. An app allow list doesn't carry over: a
+/// managedspace has none ([`dropped_allow_list`]).
 pub fn conversion(
     space: &Space,
     to: ConvertTo,
@@ -133,26 +135,40 @@ pub fn conversion(
             publish_members: flag(space, "publishMembers"),
         })),
         ConvertTo::Managedspace => {
-            let named: Vec<&str> = [&space.read_policy, &space.write_policy]
+            let mut named: Vec<&str> = [&space.read_policy, &space.write_policy]
                 .into_iter()
                 .filter_map(|rule| match rule {
                     Policy::ManagingApp { managing_app } => Some(managing_app.as_str()),
                     _ => None,
                 })
                 .collect();
-            let app = match managing_app {
-                Some(app) => app.to_string(),
-                None => match named.as_slice() {
-                    [one] => one.to_string(),
-                    [a, b] if a == b => a.to_string(),
-                    _ => {
-                        return Err(AppError::BadRequest(
-                            "this space's rules name more than one managing app; say which one \
-                             the managedspace keeps"
-                                .into(),
-                        ));
-                    }
-                },
+            named.dedup();
+            let refuse = |message: String| Err(AppError::BadRequest(message));
+            let app = match (named.as_slice(), managing_app) {
+                ([one], None) => one.to_string(),
+                ([one], Some(_)) => {
+                    return refuse(format!(
+                        "this space's rules name one managing app, {one}, which the \
+                         managedspace keeps; managingApp is only for a space whose rules \
+                         name two"
+                    ));
+                }
+                ([a, b], Some(chosen)) if chosen == *a || chosen == *b => chosen.to_string(),
+                ([a, b], Some(_)) => {
+                    return refuse(format!(
+                        "managingApp must be one of the two managing apps this space's \
+                         rules name: {a} or {b}"
+                    ));
+                }
+                ([a, b], None) => {
+                    return refuse(format!(
+                        "this space's rules name two managing apps, {a} and {b}; say with \
+                         managingApp which one the managedspace keeps"
+                    ));
+                }
+                _ => {
+                    return refuse("this space's rules name no managing app".into());
+                }
             };
             SpacePolicy::parse(serde_json::json!({
                 "$type": crate::spaces::policy::MANAGEDSPACE,
@@ -160,6 +176,15 @@ pub fn conversion(
                 "publishPolicy": flag(space, "publishPolicy"),
             }))
         }
+    }
+}
+
+/// The app allow list a conversion to `to` discards, if any: a managedspace
+/// keeps none.
+pub fn dropped_allow_list(space: &Space, to: ConvertTo) -> Option<Vec<String>> {
+    match (&space.app_access, to) {
+        (AppAccess::AllowList { allowed }, ConvertTo::Managedspace) => Some(allowed.clone()),
+        _ => None,
     }
 }
 
@@ -223,6 +248,32 @@ mod tests {
             }))
             .unwrap()
         );
+    }
+
+    #[test]
+    fn a_single_named_app_takes_no_override() {
+        let mixed = space(Policy::MemberList, app("did:plc:app"), AppAccess::Open);
+        assert!(conversion(&mixed, ConvertTo::Managedspace, Some("did:plc:app")).is_err());
+        assert!(conversion(&mixed, ConvertTo::Managedspace, Some("did:plc:other")).is_err());
+    }
+
+    #[test]
+    fn the_override_must_be_one_of_the_two_named_apps() {
+        let mixed = space(app("did:plc:a"), app("did:plc:b"), AppAccess::Open);
+        assert!(conversion(&mixed, ConvertTo::Managedspace, Some("did:plc:c")).is_err());
+    }
+
+    #[test]
+    fn only_a_managedspace_conversion_drops_the_allow_list() {
+        let allow = AppAccess::AllowList {
+            allowed: vec!["https://app.example/client-metadata.json".into()],
+        };
+        let mixed = space(app("did:plc:app"), Policy::MemberList, allow);
+        assert_eq!(
+            dropped_allow_list(&mixed, ConvertTo::Managedspace),
+            Some(vec!["https://app.example/client-metadata.json".into()])
+        );
+        assert_eq!(dropped_allow_list(&mixed, ConvertTo::Memberspace), None);
     }
 
     #[test]

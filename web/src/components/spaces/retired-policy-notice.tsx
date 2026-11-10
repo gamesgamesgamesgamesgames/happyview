@@ -22,6 +22,8 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 
 function ruleLabel(rule: SpaceRule): string {
   switch (rule.$type) {
@@ -49,6 +51,16 @@ const CONVERSIONS = {
   },
 } as const;
 
+/** The managing apps a space's rules name, without repeats. */
+function namedApps(space: RetiredSpace): string[] {
+  const apps = [space.readPolicy, space.writePolicy].flatMap((rule) =>
+    rule.$type === "com.atproto.simplespace.defs#managingAppPolicy"
+      ? [rule.managingApp]
+      : [],
+  );
+  return [...new Set(apps)];
+}
+
 function ConvertActions({
   space,
   onConverted,
@@ -57,11 +69,20 @@ function ConvertActions({
   onConverted: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const apps = namedApps(space);
+  // Rules that name two managing apps need the operator to pick the one the
+  // managedspace keeps.
+  const [chosenApp, setChosenApp] = useState<string | undefined>(undefined);
+  const allowList = space.appAccess.allowed ?? [];
 
   async function convert(to: keyof typeof CONVERSIONS) {
     setBusy(true);
     try {
-      await convertRetiredSpace(space.id, to);
+      await convertRetiredSpace(
+        space.id,
+        to,
+        to === "managedspace" && apps.length > 1 ? chosenApp : undefined,
+      );
       onConverted();
     } catch (e: unknown) {
       toastError("Couldn't convert the space", e);
@@ -72,29 +93,64 @@ function ConvertActions({
 
   return (
     <div className="flex flex-wrap gap-2 pt-1">
-      {(Object.keys(CONVERSIONS) as (keyof typeof CONVERSIONS)[]).map((to) => (
-        <AlertDialog key={to}>
-          <AlertDialogTrigger asChild>
-            <Button variant="outline" size="sm" disabled={busy}>
-              {CONVERSIONS[to].label}
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>{CONVERSIONS[to].title}</AlertDialogTitle>
-              <AlertDialogDescription>
-                {CONVERSIONS[to].description}
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={() => convert(to)}>
+      {(Object.keys(CONVERSIONS) as (keyof typeof CONVERSIONS)[]).map((to) => {
+        const pickApp = to === "managedspace" && apps.length > 1;
+        return (
+          <AlertDialog key={to}>
+            <AlertDialogTrigger asChild>
+              <Button variant="outline" size="sm" disabled={busy}>
                 {CONVERSIONS[to].label}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-      ))}
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{CONVERSIONS[to].title}</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {CONVERSIONS[to].description}
+                  {to === "managedspace" && allowList.length > 0
+                    ? ` Its app allow list (${allowList.length} ${
+                        allowList.length === 1 ? "app" : "apps"
+                      }) is dropped too, because a managedspace has none.`
+                    : ""}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              {pickApp && (
+                <RadioGroup
+                  value={chosenApp ?? ""}
+                  onValueChange={setChosenApp}
+                  aria-label="Managing app the managedspace keeps"
+                  className="gap-2"
+                >
+                  <span className="text-sm">
+                    This space&apos;s rules name two managing apps. Which one
+                    does the managedspace keep?
+                  </span>
+                  {apps.map((app) => (
+                    <div key={app} className="flex items-center gap-2">
+                      <RadioGroupItem value={app} id={`${space.id}-${app}`} />
+                      <Label
+                        htmlFor={`${space.id}-${app}`}
+                        className="font-mono text-xs break-all"
+                      >
+                        {app}
+                      </Label>
+                    </div>
+                  ))}
+                </RadioGroup>
+              )}
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={pickApp && !chosenApp}
+                  onClick={() => convert(to)}
+                >
+                  {CONVERSIONS[to].label}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        );
+      })}
     </div>
   );
 }

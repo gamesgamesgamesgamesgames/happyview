@@ -806,11 +806,16 @@ export function getRetiredSpaces() {
 export function convertRetiredSpace(
   id: string,
   to: "memberspace" | "managedspace",
+  managingApp?: string,
 ) {
-  return apiFetch<{ uri: string; policy: unknown }>(
-    `/admin/spaces/${encodeURIComponent(id)}/convert`,
-    { method: "POST", body: JSON.stringify({ to }) },
-  );
+  return apiFetch<{
+    uri: string;
+    policy: unknown;
+    droppedAllowedApps?: string[];
+  }>(`/admin/spaces/${encodeURIComponent(id)}/convert`, {
+    method: "POST",
+    body: JSON.stringify({ to, managingApp }),
+  });
 }
 
 export function getAdminSpace(id: string) {

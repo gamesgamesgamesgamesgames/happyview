@@ -1113,3 +1113,59 @@ async fn conversion_is_for_retired_spaces_with_the_inspector_on() {
     let (status, body) = convert(&app, &policy, json!({ "to": "managedspace" })).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
+
+/// Converting needs `spaces:update`: a session with only `spaces:read` is
+/// refused, and the space keeps its rules, members and invites.
+#[tokio::test]
+#[serial]
+async fn conversion_needs_spaces_update() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let (space, member) = retired_with_member_and_invite(&app, &creator).await;
+    let before = stored(&app, &space).await;
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/spaces/{}/convert", before.id))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "to": "managedspace" }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let after = stored(&app, &space).await;
+    assert_eq!(after.read_policy, before.read_policy);
+    assert_eq!(after.write_policy, before.write_policy);
+    assert!(member_dids(&app, &space).await.contains(&member));
+    assert_eq!(invite_count(&app, &space).await, 1);
+    assert_eq!(retired_policies(&app).await["count"], json!(1));
+}
+
+/// A managedspace has no app allow list, so converting a retired space that
+/// has one says which apps it dropped.
+#[tokio::test]
+#[serial]
+async fn a_managedspace_conversion_names_the_allow_list_it_drops() {
+    common::require_db!();
+    let (app, creator) = signing_setup().await;
+    enable_inspector(&app).await;
+    let space = create(&app, &creator, "main", json!({ "$type": MEMBERSPACE })).await;
+    make_mixed(&app, &space).await;
+    let mut row = stored(&app, &space).await;
+    row.app_access = happyview::spaces::types::AppAccess::AllowList {
+        allowed: vec!["https://app.example/client-metadata.json".into()],
+    };
+    happyview::spaces::db::update_space(&app.state.db, app.state.db_backend, &row)
+        .await
+        .unwrap();
+
+    let (status, body) = convert(&app, &space, json!({ "to": "managedspace" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["droppedAllowedApps"],
+        json!(["https://app.example/client-metadata.json"])
+    );
+}

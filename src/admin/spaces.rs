@@ -162,8 +162,8 @@ pub(super) struct ConvertInput {
 
 /// POST /admin/spaces/{id}/convert — give a space in a retired shape a
 /// policy. To a memberspace, the member list governs and members and invites
-/// stay; to a managedspace, the managing app governs, and members and invites
-/// are discarded. A space that already has a policy is changed with
+/// stay; to a managedspace, the managing app governs, and members, invites and
+/// any app allow list are discarded (the response names a discarded list). A space that already has a policy is changed with
 /// `updateSpace` instead.
 pub(super) async fn convert_space(
     State(state): State<AppState>,
@@ -187,6 +187,7 @@ pub(super) async fn convert_space(
     });
     let policy =
         crate::spaces::retired::conversion(&space, input.to, input.managing_app.as_deref())?;
+    let dropped_allowed_apps = crate::spaces::retired::dropped_allow_list(&space, input.to);
     policy.apply(&mut space);
     let managed = matches!(policy, SpacePolicy::Managed(_));
     service::store_space(&state, &space, managed).await?;
@@ -204,12 +205,18 @@ pub(super) async fn convert_space(
                 "from": before,
                 "to": policy,
                 "members_discarded": managed,
+                "dropped_allowed_apps": dropped_allowed_apps,
             }),
         },
         state.db_backend,
     )
     .await;
-    Ok(Json(serde_json::json!({ "uri": uri, "policy": policy })))
+    let mut body = serde_json::json!({ "uri": uri, "policy": policy });
+    if let Some(dropped) = dropped_allowed_apps {
+        // A managedspace has no app allow list; say what went.
+        body["droppedAllowedApps"] = dropped.into();
+    }
+    Ok(Json(body))
 }
 
 /// GET /admin/spaces/{id} — a space's metadata, members, and collections.
