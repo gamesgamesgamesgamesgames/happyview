@@ -187,7 +187,10 @@ pub async fn require_space_scope_at(
     )
     .await?
     else {
-        return Ok(());
+        // DPoP claims with no session behind them hold no grant at all.
+        return Err(AppError::Forbidden(
+            "this session is not authorized for this space: no session is registered for it".into(),
+        ));
     };
 
     let declared = state
@@ -196,16 +199,48 @@ pub async fn require_space_scope_at(
         .await
         .and_then(|d| d.space_collections)
         .unwrap_or_default();
-    if grants_cover(
-        &scopes,
-        claims.did(),
-        &declared,
-        space_type,
-        authority,
-        skey,
-        target,
-    ) {
-        return Ok(());
+    let covered_by = |scopes: &str| {
+        grants_cover(
+            scopes,
+            claims.did(),
+            &declared,
+            space_type,
+            authority,
+            skey,
+            target,
+        )
+    };
+    if covered_by(&scopes) {
+        // The registered scopes are the app's word; the session also needs
+        // what its authorization server granted to cover the target. A grant
+        // that cannot be read refuses rather than falling back.
+        let encryption_key = state
+            .config
+            .keyring()
+            .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
+        let granted = crate::oauth::pds_write::verified_granted_scope(
+            &state.http,
+            &state.db,
+            state.db_backend,
+            &encryption_key,
+            &state.oauth,
+            &state.config.plc_url,
+            &api_client_id,
+            claims.did(),
+            dpop_key_id,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not confirm a session's grant for a space request");
+            AppError::Forbidden(
+                "HappyView could not confirm this session's grant with its authorization \
+                 server, so it is not authorized for this space. Sign in again."
+                    .into(),
+            )
+        })?;
+        if covered_by(&granted) {
+            return Ok(());
+        }
     }
 
     let needed = match target {
@@ -384,9 +419,21 @@ pub(crate) mod space_scope_gate_tests {
         }
     }
 
-    /// Seed an API client plus a DPoP session carrying `scopes`, and return
-    /// claims naming them.
+    /// Seed an API client plus a DPoP session carrying `scopes`, which its
+    /// authorization server granted in full, and return claims naming them.
     pub(crate) async fn session_with_scopes(state: &AppState, scopes: &str) -> Claims {
+        session_with_grant(state, scopes, Some(scopes)).await
+    }
+
+    /// [`session_with_scopes`] for a session registered with `scopes` whose
+    /// authorization server granted `granted`, cached with a live access token.
+    /// `None` leaves no grant on record and the token expired, so reading the
+    /// grant needs a refresh this seeded session cannot make.
+    pub(crate) async fn session_with_grant(
+        state: &AppState,
+        scopes: &str,
+        granted: Option<&str>,
+    ) -> Claims {
         let now = crate::db::now_rfc3339();
         let client_id = uuid::Uuid::new_v4().to_string();
         let client_key = format!("hvc_{}", uuid::Uuid::new_v4().simple());
@@ -421,15 +468,21 @@ pub(crate) mod space_scope_gate_tests {
             .expect("seed dpop key");
 
         let sql = adapt_sql(
-            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, scopes, created_at, updated_at) VALUES (?, ?, ?, ?, X'00', ?, ?, ?)",
+            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, scopes, granted_scope, token_expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, X'00', ?, ?, ?, ?, ?)",
             state.db_backend,
         );
+        let expires_at = match granted {
+            Some(_) => (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            None => (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        };
         crate::db::query(&sql)
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&client_id)
             .bind(&dpop_key_id)
             .bind(USER)
             .bind(scopes)
+            .bind(granted)
+            .bind(&expires_at)
             .bind(&now)
             .bind(&now)
             .execute(&state.db)
@@ -456,6 +509,78 @@ pub(crate) mod space_scope_gate_tests {
         require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
             .await
             .expect("a covering grant must pass");
+    }
+
+    #[tokio::test]
+    async fn a_registered_scope_the_server_did_not_grant_is_refused() {
+        // The app registered a space grant; its authorization server granted
+        // only `atproto`. The registered scope alone authorizes nothing.
+        let state = test_state().await;
+        let claims = session_with_grant(
+            &state,
+            &format!("atproto space:com.example.forum?authority={USER}"),
+            Some("atproto"),
+        )
+        .await;
+
+        let err = require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+            .await
+            .expect_err("a grant the server never made must be refused");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_cannot_be_read_is_refused() {
+        let state = test_state().await;
+        let claims = session_with_grant(
+            &state,
+            &format!("atproto space:com.example.forum?authority={USER}"),
+            None,
+        )
+        .await;
+
+        let err = require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+            .await
+            .expect_err("an unconfirmed grant must not fall back to the registered scope");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_server_grant_alone_does_not_widen_the_registered_scope() {
+        // Both must cover the target: a broad grant does not extend a session
+        // the app registered more narrowly.
+        let state = test_state().await;
+        let claims = session_with_grant(
+            &state,
+            "atproto",
+            Some(&format!("atproto space:com.example.forum?authority={USER}")),
+        )
+        .await;
+
+        assert!(
+            require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dpop_claims_with_no_session_behind_them_are_refused() {
+        let state = test_state().await;
+        let claims = session_with_scopes(
+            &state,
+            &format!("atproto space:com.example.forum?authority={USER}"),
+        )
+        .await;
+        crate::db::query("DELETE FROM happyview_dpop_sessions")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let err = require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+            .await
+            .expect_err("no session means no grant");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
     }
 
     #[tokio::test]
