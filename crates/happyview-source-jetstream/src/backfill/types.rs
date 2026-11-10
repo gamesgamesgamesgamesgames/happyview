@@ -14,6 +14,11 @@ pub struct CreateBackfillBody {
     pub dids: Option<Vec<String>>,
     /// `auto`, `replay` or `crawl`; `BACKFILL_SOURCE` when absent.
     pub source: Option<String>,
+    /// Start the collection's relay listing at this cursor rather than its
+    /// first page: a network crawl of `collection` only, which picks up where
+    /// another job's discovery stopped (see `discovery_unfinished`).
+    #[serde(default)]
+    pub relay_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -36,12 +41,12 @@ pub struct BackfillJob {
     /// then `total_repos` is the count discovered so far.
     pub discovery_complete: bool,
     /// A crawl's collections whose saved relay cursor has not reached the end
-    /// of the listing. While a job runs these are the collections still being
-    /// discovered; on a paused or completed job they are collections whose
-    /// discovery stopped short, which `resume` (or `resume-discovery`, for a
-    /// completed job) continues from the cursor. Left out when empty.
+    /// of the listing, with that cursor. While a job runs these are the
+    /// collections still being discovered. On a paused job, `resume` continues
+    /// from them; on a completed one (from before discovery paused on a relay
+    /// error), a new backfill with `relay_cursor` does. Left out when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub discovery_unfinished: Vec<String>,
+    pub discovery_unfinished: Vec<UnfinishedDiscovery>,
     /// For jobs on the bounded queue, how many of the most recent completions
     /// `repos?phase=fetched` lists. `None` for older jobs, which list every
     /// completed repo.
@@ -58,6 +63,15 @@ pub struct BackfillJob {
     pub hooks: Option<JobHookStats>,
     /// The hook stats kept with the job when it ended.
     pub hook_stats: Option<serde_json::Value>,
+}
+
+/// One collection whose relay listing a crawl has not finished.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnfinishedDiscovery {
+    pub collection: String,
+    /// The cursor of the next page to list; `None` when not even the first
+    /// page was listed.
+    pub relay_cursor: Option<String>,
 }
 
 /// Where a replay job's running sweep is, and what it has cost.

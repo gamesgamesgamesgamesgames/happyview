@@ -1241,6 +1241,81 @@ pub(crate) async fn insert_network_job(
     Ok(())
 }
 
+/// Create and spawn a network crawl of `collection` whose discovery starts at
+/// `relay_cursor` rather than the listing's first page.
+///
+/// This is how a crawl that completed before discovery paused on a relay
+/// error is finished: a new job, from the cursor the old one stopped at (its
+/// `discovery_unfinished`, or a copy kept elsewhere). The old job is left as
+/// it is, so a finished job never changes status, and the cursor comes from
+/// the request, so the old job's rows need not exist any more. The job row
+/// and its cursor go in together.
+pub async fn start_crawl_from_cursor(
+    state: &JobState,
+    collection: &str,
+    relay_cursor: &str,
+    actor_did: &str,
+) -> Result<String, AdminError> {
+    if relay_cursor.trim().is_empty() {
+        return Err(AdminError::BadRequest("relay_cursor is empty".into()));
+    }
+    if state.compose.executor(collection).is_some() {
+        return Err(AdminError::BadRequest(format!(
+            "{collection} is backfilled by its executor, which does not crawl the relay"
+        )));
+    }
+    let job_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    let job_sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source) \
+         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 0, ?, ?, 'crawl')",
+        state.db_backend,
+    );
+    let cursor_sql = adapt_sql(
+        "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES (?, ?, ?, 0)",
+        state.db_backend,
+    );
+    happyview_provider::db::retry_on_busy(|| async {
+        let mut tx = state.db.begin().await?;
+        happyview_provider::db::query(&job_sql)
+            .bind(&job_id)
+            .bind(collection)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        happyview_provider::db::query(&cursor_sql)
+            .bind(&job_id)
+            .bind(collection)
+            .bind(relay_cursor)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    })
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to create backfill job: {e}")))?;
+
+    state
+        .host
+        .log_event(ProviderEvent {
+            event_type: "backfill.started".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(actor_did.to_string()),
+            subject: Some(collection.to_string()),
+            detail: serde_json::json!({
+                "job_id": job_id.clone(),
+                "scope": "network",
+                "account_count": 0,
+                "source": "crawl",
+                "relay_cursor": relay_cursor,
+            }),
+        })
+        .await;
+    spawn_job(state, &job_id, Some(collection.to_string()));
+    Ok(job_id)
+}
+
 pub(crate) async fn start_backfill(
     state: &JobState,
     collection: Option<String>,

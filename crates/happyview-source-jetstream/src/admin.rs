@@ -21,7 +21,7 @@ use crate::archive::SourceChoice;
 use crate::backfill::errors::{BackfillErrorKind, ERROR_DETAIL_CAP, ErrorCounts};
 use crate::backfill::types::{
     BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob,
-    CreateBackfillBody, ReplayProgress,
+    CreateBackfillBody, ReplayProgress, UnfinishedDiscovery,
 };
 use crate::backfill::*;
 
@@ -66,6 +66,29 @@ pub async fn create_backfill(
         }
     })
     .await?;
+
+    if let Some(cursor) = body.relay_cursor {
+        let Some(collection) = body.collection else {
+            return Err(AdminError::BadRequest(
+                "relay_cursor needs the collection it is a cursor of".into(),
+            ));
+        };
+        if !dids.is_empty() {
+            return Err(AdminError::BadRequest(
+                "relay_cursor is for a network crawl; account backfills discover nothing".into(),
+            ));
+        }
+        if body.source.is_some() && source != SourceChoice::Crawl {
+            return Err(AdminError::BadRequest(
+                "relay_cursor continues a relay listing, so the backfill must crawl".into(),
+            ));
+        }
+        let job_id = start_crawl_from_cursor(&state, &collection, &cursor, &admin.did).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": job_id, "status": "running" })),
+        ));
+    }
 
     let requested = body.source.is_some().then_some(source);
     let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, requested).await?;
@@ -348,102 +371,6 @@ pub(crate) async fn resume_backfill(
     }
 }
 
-/// POST /admin/backfill/{id}/resume-discovery — reopen a completed crawl
-/// job whose discovery stopped short, and continue discovering from each
-/// unfinished collection's saved relay cursor.
-///
-/// Jobs that completed before HappyView stopped treating a failed relay page
-/// as the end of a collection can carry a cursor with `done = 0` under
-/// `discovery_complete = 1`. This is how they finish. The job keeps its id,
-/// counters and failures; only repos past the saved cursor are discovered.
-pub async fn resume_discovery_backfill(
-    State(state): State<JobState>,
-    AdminUser(admin): AdminUser,
-    Path(job_id): Path<String>,
-) -> Result<Json<Value>, AdminError> {
-    admin.require("backfill:create")?;
-    let backend = state.db_backend;
-
-    let row: Option<(String, String, String, i32, Option<String>)> =
-        happyview_provider::db::query_as(&adapt_sql(
-            "SELECT status, source, scope, queue_version, collection FROM happyview_backfill_jobs WHERE id = ?",
-            backend,
-        ))
-        .bind(&job_id)
-        .fetch_optional(&state.backfill_db)
-        .await
-        .map_err(|e| AdminError::Internal(format!("failed to query backfill job: {e}")))?;
-    let Some((status, source, scope, queue_version, collection)) = row else {
-        return Err(AdminError::NotFound("backfill job not found".into()));
-    };
-    if source != "crawl"
-        || scope == "dids"
-        || QueueVersion::from_column(queue_version) != QueueVersion::Bounded
-    {
-        return Err(AdminError::BadRequest(
-            "only a network crawl on the bounded queue discovers repos".into(),
-        ));
-    }
-    if status != "completed" {
-        return Err(AdminError::BadRequest(format!(
-            "job is not completed (status: {status}); a paused job continues discovery when resumed"
-        )));
-    }
-
-    let open: Vec<(String,)> = happyview_provider::db::query_as(&adapt_sql(
-        "SELECT collection FROM happyview_backfill_cursors WHERE job_id = ? AND done = 0 ORDER BY collection",
-        backend,
-    ))
-    .bind(&job_id)
-    .fetch_all(&state.backfill_db)
-    .await
-    .map_err(|e| AdminError::Internal(format!("failed to read discovery cursors: {e}")))?;
-    let open: Vec<String> = open.into_iter().map(|(c,)| c).collect();
-    if open.is_empty() {
-        return Err(AdminError::BadRequest(
-            "discovery reached the end of every collection's listing; nothing to resume".into(),
-        ));
-    }
-
-    // Conditional, so of two requests at once only one runs the job.
-    let reopened = happyview_provider::db::retry_on_busy(|| {
-        happyview_provider::db::query(&adapt_sql(
-            "UPDATE happyview_backfill_jobs SET status = 'running', stage = 'resolving_and_fetching', \
-             discovery_complete = 0, error = NULL, completed_at = NULL \
-             WHERE id = ? AND status = 'completed'",
-            backend,
-        ))
-        .bind(&job_id)
-        .execute(&state.backfill_db)
-    })
-    .await
-    .map_err(|e| AdminError::Internal(format!("failed to reopen backfill job: {e}")))?
-    .rows_affected();
-    if reopened == 0 {
-        return Err(AdminError::BadRequest(
-            "job is not completed (it was resumed or changed meanwhile)".into(),
-        ));
-    }
-
-    spawn_job(&state, &job_id, collection.clone());
-
-    state
-        .host
-        .log_event(ProviderEvent {
-            event_type: "backfill.discovery_resumed".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(admin.did.clone()),
-            subject: collection,
-            detail: serde_json::json!({ "job_id": job_id, "collections": open }),
-        })
-        .await;
-    Ok(Json(serde_json::json!({
-        "id": job_id,
-        "status": "running",
-        "collections": open,
-    })))
-}
-
 /// GET /admin/backfill/status — list all backfill jobs.
 pub async fn backfill_status(
     State(state): State<JobState>,
@@ -524,16 +451,22 @@ pub async fn backfill_status(
         )
         .collect();
 
-    let open_cursors: Vec<(String, String)> = happyview_provider::db::query_as(&adapt_sql(
-        "SELECT job_id, collection FROM happyview_backfill_cursors WHERE done = 0 ORDER BY job_id, collection",
+    let open_cursors: Vec<(String, String, Option<String>)> = happyview_provider::db::query_as(&adapt_sql(
+        "SELECT job_id, collection, relay_cursor FROM happyview_backfill_cursors WHERE done = 0 ORDER BY job_id, collection",
         backend,
     ))
     .fetch_all(&state.backfill_db)
     .await
     .map_err(|e| AdminError::Internal(format!("failed to list backfill discovery cursors: {e}")))?;
-    let mut unfinished: HashMap<String, Vec<String>> = HashMap::new();
-    for (job_id, collection) in open_cursors {
-        unfinished.entry(job_id).or_default().push(collection);
+    let mut unfinished: HashMap<String, Vec<UnfinishedDiscovery>> = HashMap::new();
+    for (job_id, collection, relay_cursor) in open_cursors {
+        unfinished
+            .entry(job_id)
+            .or_default()
+            .push(UnfinishedDiscovery {
+                collection,
+                relay_cursor,
+            });
     }
 
     let jobs: Vec<BackfillJob> = rows
@@ -1409,10 +1342,6 @@ pub(crate) fn router() -> axum::Router<JobState> {
         .route("/backfill/{id}/cancel", post(cancel_backfill))
         .route("/backfill/{id}/pause", post(pause_backfill))
         .route("/backfill/{id}/resume", post(resume_backfill))
-        .route(
-            "/backfill/{id}/resume-discovery",
-            post(resume_discovery_backfill),
-        )
         .route("/backfill/{id}/events", get(backfill_events))
         .route("/backfill/{id}/repos", get(backfill_repos))
         .route("/backfill/{id}/pds-summary", get(backfill_pds_summary))

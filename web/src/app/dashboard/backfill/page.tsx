@@ -24,7 +24,6 @@ import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
   pauseBackfillJob,
-  resumeBackfillDiscovery,
   resumeBackfillJob,
   createBackfillJob,
   getBackfillCollection,
@@ -881,8 +880,16 @@ export default function BackfillPage() {
                   await resumeBackfillJob(selectedJob.id);
                   load();
                 }}
-                onResumeDiscovery={async () => {
-                  await resumeBackfillDiscovery(selectedJob.id);
+                onContinueDiscovery={async () => {
+                  // A new crawl per collection, from where this one stopped.
+                  for (const open of selectedJob.discovery_unfinished ?? []) {
+                    if (!open.relay_cursor) continue;
+                    await createBackfillJob({
+                      collection: open.collection,
+                      source: "crawl",
+                      relay_cursor: open.relay_cursor,
+                    });
+                  }
                   load();
                 }}
                 onRetry={async (kinds) => {
@@ -907,7 +914,7 @@ function JobDetail({
   onCancel,
   onPause,
   onResume,
-  onResumeDiscovery,
+  onContinueDiscovery,
   onRetry,
 }: {
   job: BackfillJob;
@@ -918,13 +925,13 @@ function JobDetail({
   onCancel: () => Promise<void>;
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
-  onResumeDiscovery: () => Promise<void>;
+  onContinueDiscovery: () => Promise<void>;
   onRetry: (kinds?: string[]) => Promise<void>;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
-  const [resumingDiscovery, setResumingDiscovery] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const current = phaseIndex(job.stage);
   const allDone = job.status === "completed";
@@ -941,8 +948,10 @@ function JobDetail({
   const discovering = job.discovery_complete === false;
   // A completed crawl whose discovery stopped short of a collection's end
   // (a relay page that kept failing, before HappyView paused on that).
-  const unfinishedDiscovery = job.discovery_unfinished ?? [];
-  const discoveryResumable =
+  const unfinishedDiscovery = (job.discovery_unfinished ?? []).filter(
+    (open) => open.relay_cursor,
+  );
+  const discoveryContinuable =
     allDone && job.source === "crawl" && unfinishedDiscovery.length > 0;
   const bounded = job.recent_completions_limit != null;
   // A bounded job's queue is its work, so the server only clears a finished
@@ -1134,15 +1143,15 @@ function JobDetail({
     }
   }
 
-  async function handleResumeDiscovery() {
-    setResumingDiscovery(true);
+  async function handleContinueDiscovery() {
+    setContinuing(true);
     try {
-      await onResumeDiscovery();
-      toast.success("Discovery resumed");
+      await onContinueDiscovery();
+      toast.success("Backfill started from the saved cursor");
     } catch (e: unknown) {
-      toastError("Couldn't resume discovery", e);
+      toastError("Couldn't continue discovery", e);
     } finally {
-      setResumingDiscovery(false);
+      setContinuing(false);
     }
   }
 
@@ -1394,15 +1403,15 @@ function JobDetail({
           )}
         </div>
 
-        {discoveryResumable && (
+        {discoveryContinuable && (
           <div>
             <span className="text-muted-foreground text-sm">
               Discovery stopped early
             </span>
             <div className="bg-amber-500/10 text-amber-700 dark:text-amber-400 mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
               The relay listing didn&apos;t reach its end for{" "}
-              {unfinishedDiscovery.join(", ")}. Resume discovery to continue
-              from the saved cursor.
+              {unfinishedDiscovery.map((open) => open.collection).join(", ")}.
+              Continue discovery starts a new backfill from the saved cursor.
             </div>
           </div>
         )}
@@ -1793,14 +1802,14 @@ function JobDetail({
             {resuming ? "Resuming…" : "Resume"}
           </Button>
         )}
-        {canCancel && discoveryResumable && (
+        {canCancel && discoveryContinuable && (
           <Button
             variant="default"
             size="sm"
-            disabled={resumingDiscovery}
-            onClick={handleResumeDiscovery}
+            disabled={continuing}
+            onClick={handleContinueDiscovery}
           >
-            {resumingDiscovery ? "Resuming…" : "Resume discovery"}
+            {continuing ? "Starting…" : "Continue discovery"}
           </Button>
         )}
         {canCancel && isActive && !restartsUnlessPaused && (

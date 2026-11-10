@@ -431,6 +431,8 @@ export function createBackfillJob(body: {
   collection?: string;
   dids?: string[];
   source?: BackfillSource;
+  // Start the collection's relay listing here instead of at its first page.
+  relay_cursor?: string;
 }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
@@ -448,13 +450,6 @@ export function cancelBackfillJob(id: string) {
 export function pauseBackfillJob(id: string) {
   return apiFetch<{ id: string; status: string }>(
     `/admin/backfill/${id}/pause`,
-    { method: "POST" },
-  );
-}
-
-export function resumeBackfillDiscovery(id: string) {
-  return apiFetch<{ id: string; status: string; collections: string[] }>(
-    `/admin/backfill/${id}/resume-discovery`,
     { method: "POST" },
   );
 }
