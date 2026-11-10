@@ -802,6 +802,17 @@ export function getRetiredSpaces() {
   return apiFetch<RetiredSpacesResponse>("/admin/spaces/retired-policies");
 }
 
+/** Give a space in a retired policy shape a policy. */
+export function convertRetiredSpace(
+  id: string,
+  to: "memberspace" | "managedspace",
+) {
+  return apiFetch<{ uri: string; policy: unknown }>(
+    `/admin/spaces/${encodeURIComponent(id)}/convert`,
+    { method: "POST", body: JSON.stringify({ to }) },
+  );
+}
+
 export function getAdminSpace(id: string) {
   return apiFetch<AdminSpaceDetail>(`/admin/spaces/${encodeURIComponent(id)}`);
 }

@@ -152,6 +152,66 @@ pub(super) async fn retired_policies(
     Ok(Json(body))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConvertInput {
+    to: crate::spaces::retired::ConvertTo,
+    /// Needed only when the space's rules name two different managing apps.
+    managing_app: Option<String>,
+}
+
+/// POST /admin/spaces/{id}/convert — give a space in a retired shape a
+/// policy. To a memberspace, the member list governs and members and invites
+/// stay; to a managedspace, the managing app governs, and members and invites
+/// are discarded. A space that already has a policy is changed with
+/// `updateSpace` instead.
+pub(super) async fn convert_space(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+    Json(input): Json<ConvertInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::spaces::policy::SpacePolicy;
+    auth.require(Permission::SpacesUpdate).await?;
+    space_access::require_enabled(&state).await?;
+    let mut space = load_space(&state, &id).await?;
+    if SpacePolicy::of(&space).is_ok() {
+        return Err(AppError::Conflict(
+            "This space already has a policy; change it with com.atproto.space.updateSpace".into(),
+        ));
+    }
+    let before = serde_json::json!({
+        "read_policy": space.read_policy,
+        "write_policy": space.write_policy,
+        "app_access": space.app_access,
+    });
+    let policy =
+        crate::spaces::retired::conversion(&space, input.to, input.managing_app.as_deref())?;
+    policy.apply(&mut space);
+    let managed = matches!(policy, SpacePolicy::Managed(_));
+    service::store_space(&state, &space, managed).await?;
+
+    let uri = space_uri(&space);
+    crate::event_log::log_event(
+        &state.db,
+        EventLog {
+            event_type: "space.policy_converted".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(uri.clone()),
+            detail: serde_json::json!({
+                "user_id": auth.user_id,
+                "from": before,
+                "to": policy,
+                "members_discarded": managed,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "uri": uri, "policy": policy })))
+}
+
 /// GET /admin/spaces/{id} — a space's metadata, members, and collections.
 pub(super) async fn get_space(
     State(state): State<AppState>,
