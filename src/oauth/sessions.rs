@@ -29,7 +29,9 @@ pub struct DpopSessionInfo {
 /// Store or update a DPoP session.
 ///
 /// Uses ON CONFLICT to upsert — if a session already exists for this
-/// (api_client_id, user_did, dpop_key_id), it updates the token data.
+/// (api_client_id, user_did, dpop_key_id), it updates the token data. New tokens
+/// clear the cached granted scope, which described the old ones; a refresh
+/// records the grant its own response reports.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_dpop_session(
     pool: &sqlx::AnyPool,
@@ -68,6 +70,7 @@ pub async fn store_dpop_session(
                scopes = EXCLUDED.scopes,
                pds_url = EXCLUDED.pds_url,
                issuer = EXCLUDED.issuer,
+               granted_scope = NULL,
                updated_at = EXCLUDED.updated_at"#,
         backend,
     );
@@ -169,9 +172,11 @@ pub async fn get_granted_scope_and_expiry(
         .map_err(|e| AppError::Internal(format!("failed to read granted scope: {e}")))
 }
 
-/// Replace the scopes a session was registered with. Only a registration that
-/// HappyView has checked against the authorization server's grant sets them
-/// beyond `atproto`.
+/// Replace the scopes a session was registered with, if its cached grant is
+/// still `granted`: the grant they were checked against. Only a registration
+/// that HappyView has checked against the authorization server's grant sets
+/// them beyond `atproto`. Answers whether the row was updated; a concurrent
+/// re-registration in between clears the grant, and so leaves it as it is.
 pub async fn set_dpop_session_scopes(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -179,21 +184,23 @@ pub async fn set_dpop_session_scopes(
     user_did: &str,
     dpop_key_id: &str,
     scopes: &str,
-) -> Result<(), AppError> {
+    granted: &str,
+) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "UPDATE happyview_dpop_sessions SET scopes = ? \
-         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ? AND granted_scope = ?",
         backend,
     );
-    crate::db::query(&sql)
+    let result = crate::db::query(&sql)
         .bind(scopes)
         .bind(api_client_id)
         .bind(user_did)
         .bind(dpop_key_id)
+        .bind(granted)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to store session scopes: {e}")))?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Look up a DPoP session by api_client_id, user_did, and dpop_key_id, decrypting tokens.

@@ -410,7 +410,8 @@ async fn retry_after_refresh(
             );
             creds.session = fresh_session;
         } else if let Err(e) =
-            refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+            refresh_and_record_grant(http, pool, backend, encryption_key, oauth_registry, creds)
+                .await
         {
             if !is_invalid_grant_error(&e) {
                 return Err(e);
@@ -948,6 +949,34 @@ pub async fn verified_granted_scope(
     Ok(granted)
 }
 
+/// How long a refreshed access token is assumed to live when the token
+/// response omits `expires_in`.
+const UNKNOWN_TOKEN_LIFETIME_SECS: i64 = 300;
+
+/// [`refresh_access_token`], recording the grant the response reports for the
+/// session, so a later scope check reuses what the server said rather than
+/// refreshing again. A response that reports none leaves no grant on record.
+async fn refresh_and_record_grant(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    creds: &mut DpopCredentials,
+) -> Result<(), AppError> {
+    let granted =
+        refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await?;
+    super::sessions::set_granted_scope(
+        pool,
+        backend,
+        &creds.session.api_client_id,
+        &creds.session.dpop_key_id,
+        &creds.session.user_did,
+        granted.as_deref(),
+    )
+    .await
+}
+
 /// An unknown expiry counts as expired: it is the case that re-checks.
 fn token_expired(expires_at: Option<&str>) -> bool {
     expires_at
@@ -1042,8 +1071,15 @@ async fn apply_refresh_response(
     let new_refresh_token = token_resp["refresh_token"].as_str();
 
     let expires_in = token_resp["expires_in"].as_u64();
-    let new_expires_at = expires_in
-        .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
+    // A response that omits `expires_in` says nothing about how long the new
+    // token lives, and the expiry the app registered with described the token
+    // it replaced. Assume a short lifetime, which bounds how long the grant
+    // this refresh reports is reused.
+    let new_expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(
+            expires_in.map_or(UNKNOWN_TOKEN_LIFETIME_SECS, |secs| secs as i64),
+        ))
+    .to_rfc3339();
 
     super::sessions::store_dpop_session(
         pool,
@@ -1055,9 +1091,7 @@ async fn apply_refresh_response(
         &creds.session.user_did,
         new_access_token,
         new_refresh_token.or(creds.session.refresh_token.as_deref()),
-        new_expires_at
-            .as_deref()
-            .or(creds.session.token_expires_at.as_deref()),
+        Some(new_expires_at.as_str()),
         &creds.session.scopes,
         creds.session.pds_url.as_deref(),
         creds.session.issuer.as_deref(),
@@ -1070,9 +1104,7 @@ async fn apply_refresh_response(
     if let Some(rt) = new_refresh_token {
         creds.session.refresh_token = Some(rt.to_string());
     }
-    if let Some(ref exp) = new_expires_at {
-        creds.session.token_expires_at = Some(exp.clone());
-    }
+    creds.session.token_expires_at = Some(new_expires_at);
 
     tracing::info!(
         user_did = %creds.session.user_did,

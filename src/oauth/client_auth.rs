@@ -207,8 +207,8 @@ pub async fn validate_scopes(
 /// The server answers with any `include:` already expanded into the
 /// permissions it stands for, so a registered `include:X` is covered when
 /// every permission it expands to is. HappyView expands it with its own copy
-/// of the set; one it cannot resolve expands to nothing, and grants nothing
-/// here either.
+/// of the set; one it cannot resolve proves nothing about the grant, so it is
+/// not covered unless the server granted the `include:` itself.
 pub async fn scopes_beyond_grant(
     registered: &str,
     granted: &str,
@@ -231,7 +231,7 @@ pub async fn scopes_beyond_grant(
         if scope.starts_with("include:") {
             let mut expanded = Vec::new();
             expand_permission_set(&scope, lexicons, &mut expanded).await;
-            if expanded.iter().all(|p| held.covers_scope(p)) {
+            if !expanded.is_empty() && expanded.iter().all(|p| held.covers_scope(p)) {
                 continue;
             }
         }
@@ -512,6 +512,58 @@ mod tests {
             )
             .await,
             vec!["include:com.example.authBasic".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_include_this_instance_cannot_resolve_is_not_covered() {
+        let reg = empty_registry();
+        assert_eq!(
+            scopes_beyond_grant("atproto include:com.attacker.unknownSet", "atproto", &reg).await,
+            vec!["include:com.attacker.unknownSet".to_string()]
+        );
+        // Granted as the `include:` itself, it is covered without expanding.
+        assert!(
+            scopes_beyond_grant(
+                "atproto include:com.attacker.unknownSet",
+                "atproto include:com.attacker.unknownSet",
+                &reg,
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_include_covers_the_permissions_it_expands_to() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": { "main": { "type": "permission-set", "permissions": [
+                { "type": "permission", "resource": "repo", "collection": ["com.example.profile"] }
+            ] } }
+        });
+        reg.upsert(crate::lexicon::ParsedLexicon::parse(raw, 1, None).unwrap())
+            .await;
+
+        assert!(
+            scopes_beyond_grant(
+                "atproto repo:com.example.profile?action=create",
+                "atproto include:com.example.authBasic",
+                &reg,
+            )
+            .await
+            .is_empty()
+        );
+        assert_eq!(
+            scopes_beyond_grant(
+                "atproto repo:com.example.other?action=create",
+                "atproto include:com.example.authBasic",
+                &reg,
+            )
+            .await,
+            vec!["repo:com.example.other?action=create".to_string()]
         );
     }
 

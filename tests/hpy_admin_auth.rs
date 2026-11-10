@@ -342,8 +342,108 @@ async fn a_scope_the_server_did_not_grant_is_refused_at_sign_in() {
     assert_eq!(token_requests(&server).await, 1);
 
     // No session was left behind for the refused registration.
+    assert_eq!(dpop_sessions_for(&app, &did).await, 0);
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_ne!(status, StatusCode::OK, "{body}");
+}
+
+async fn dpop_sessions_for(app: &common::app::TestApp, did: &str) -> i64 {
+    let sql = happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    );
+    let (n,): (i64,) = happyview::db::query_as(&sql)
+        .bind(did)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    n
+}
+
+/// While the authorization server is asked, the session holds `atproto` only:
+/// the scopes the app registered are stored only once the grant covers them.
+#[tokio::test]
+#[serial]
+async fn a_session_holds_only_atproto_until_its_grant_is_confirmed() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let server = issuer(&app, &did, true).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(token_response(&did, ADMIN_GRANT, 3600))
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&server)
+        .await;
+
+    let registering = {
+        let app_router = app.router.clone();
+        let issuer = server.uri();
+        let did = did.clone();
+        let verifier = "hpy-test-verifier-0123456789abcdef0123456789";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let resp = app_router
+            .clone()
+            .oneshot(post_json(
+                "/oauth/dpop-keys",
+                &json!({ "pkce_challenge": challenge }),
+                &Client::hpy().headers(),
+            ))
+            .await
+            .unwrap();
+        let provision = response_json(resp).await;
+        tokio::spawn(async move {
+            app_router
+                .oneshot(post_json(
+                    "/oauth/sessions",
+                    &json!({
+                        "provision_id": provision["provision_id"],
+                        "pkce_verifier": verifier,
+                        "did": did,
+                        "access_token": "slow-token",
+                        "refresh_token": "slow-token-refresh",
+                        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                        "scopes": ADMIN_GRANT,
+                        "issuer": issuer,
+                    }),
+                    &Client::hpy().headers(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+
+    // Wait for the row while the token endpoint is still holding the refresh.
+    let sql = happyview::db::adapt_sql(
+        "SELECT scopes FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    );
+    let mut held = None;
+    for _ in 0..100 {
+        let row: Option<(String,)> = happyview::db::query_as(&sql)
+            .bind(&did)
+            .fetch_optional(&app.state.db)
+            .await
+            .unwrap();
+        if let Some((scopes,)) = row {
+            held = Some(scopes);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(held.as_deref(), Some("atproto"));
+
+    assert_eq!(registering.await.unwrap(), StatusCode::CREATED);
+    let row: (String,) = happyview::db::query_as(&sql)
+        .bind(&did)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(row.0, ADMIN_GRANT);
 }
 
 /// Nothing about the rule is particular to hpy: an ordinary registered app's
@@ -947,4 +1047,43 @@ async fn a_space_scope_registers_only_when_the_server_granted_it() {
         .filter_map(Value::as_str)
         .collect();
     assert!(scopes.contains(&space), "{body}");
+}
+
+/// A refresh whose response omits `expires_in` says nothing about the new
+/// token's lifetime, so the grant it reports is reused only briefly, never for
+/// as long as the expiry the app registered with.
+#[tokio::test]
+#[serial]
+async fn a_grant_without_an_expiry_is_reused_only_briefly() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let mut response = token_response(&did, ADMIN_GRANT, 3600);
+    response.as_object_mut().unwrap().remove("expires_in");
+    let server = authorization_server(&app, &did, true, &[response]).await;
+    let (status, body, _, _) = register(
+        &app,
+        &Client::hpy(),
+        &did,
+        &server.uri(),
+        ADMIN_GRANT,
+        "app-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let sql = happyview::db::adapt_sql(
+        "SELECT token_expires_at FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    );
+    let (expires_at,): (String,) = happyview::db::query_as(&sql)
+        .bind(&did)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).unwrap();
+    assert!(
+        expires_at < chrono::Utc::now() + chrono::Duration::minutes(10),
+        "the app's one-hour expiry must not carry over: {expires_at}"
+    );
 }
