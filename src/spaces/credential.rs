@@ -17,6 +17,10 @@ pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 10 * 60;
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
 
 pub const DELEGATION_TOKEN_TYP: &str = "atproto-space-delegation+jwt";
+
+/// The only `kid` a delegation token may carry: Proposal 0016 binds it to the
+/// account's own signing key.
+pub const DELEGATION_TOKEN_KID: &str = "#atproto";
 pub const SPACE_CREDENTIAL_TYP: &str = "atproto-space-credential+jwt";
 
 /// Peek at a JWT's header to check its `typ` field without verifying the signature.
@@ -72,7 +76,7 @@ pub fn sign_delegation_token(
     let header = serde_json::json!({
         "alg": "ES256K",
         "typ": DELEGATION_TOKEN_TYP,
-        "kid": "#atproto",
+        "kid": DELEGATION_TOKEN_KID,
     });
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -103,34 +107,42 @@ pub fn verify_delegation_token(
 }
 
 /// Verify a delegation token minted by the account itself, as a PDS that serves
-/// spaces does, against the key its DID document names in the token's `kid`.
+/// spaces does, against the account's `#atproto` key in its DID document.
 pub async fn verify_account_delegation_token(
     token: &str,
     http: &reqwest::Client,
     plc_url: &str,
     accepted_aud: &[&str],
 ) -> Result<DelegationTokenClaims, AppError> {
-    let (header, claims) = peek_jwt::<DelegationTokenClaims>(token)
+    let (_, claims) = peek_jwt::<DelegationTokenClaims>(token)
         .ok_or_else(|| AppError::Auth("invalid delegation token format".into()))?;
-    let fragment = header["kid"].as_str().unwrap_or("#atproto");
-    let fragment = if fragment.starts_with('#') {
-        fragment.to_string()
-    } else {
-        format!("#{fragment}")
-    };
-
     let did_doc = profile::resolve_did_document(http, plc_url, &claims.iss).await?;
+    let key = delegation_signing_key(&did_doc, &claims.iss)?;
+    verify_delegation_token_with_key(token, &key, accepted_aud)
+}
+
+/// The account's `#atproto` key: the only one a delegation token may be signed
+/// with, whatever other keys the DID document lists.
+fn delegation_signing_key(
+    did_doc: &profile::DidDocument,
+    iss: &str,
+) -> Result<SpaceVerifyingKey, AppError> {
+    let qualified = format!("{iss}{DELEGATION_TOKEN_KID}");
     let method = did_doc
         .verification_method
         .iter()
-        .find(|v| v.id == fragment || v.id == format!("{}{fragment}", claims.iss))
-        .ok_or_else(|| AppError::Auth(format!("delegation token signer has no {fragment} key")))?;
+        .find(|v| v.id == DELEGATION_TOKEN_KID || v.id == qualified)
+        .ok_or_else(|| {
+            AppError::Auth(format!(
+                "delegation token signer has no {DELEGATION_TOKEN_KID} key"
+            ))
+        })?;
     let multibase = method.public_key_multibase.as_deref().ok_or_else(|| {
         AppError::Auth(format!(
-            "{fragment} verification method missing publicKeyMultibase"
+            "{DELEGATION_TOKEN_KID} verification method missing publicKeyMultibase"
         ))
     })?;
-    verify_delegation_token_with_key(token, &multikey_to_space_key(multibase)?, accepted_aud)
+    multikey_to_space_key(multibase)
 }
 
 /// An unverified JWT's header and claims.
@@ -171,6 +183,12 @@ pub fn verify_delegation_token_with_key(
     if header["typ"].as_str() != Some(DELEGATION_TOKEN_TYP) {
         return Err(AppError::Auth(format!(
             "delegation token typ must be {DELEGATION_TOKEN_TYP}"
+        )));
+    }
+
+    if header["kid"].as_str() != Some(DELEGATION_TOKEN_KID) {
+        return Err(AppError::Auth(format!(
+            "delegation token kid must be {DELEGATION_TOKEN_KID}"
         )));
     }
 
@@ -842,6 +860,116 @@ mod tests {
         let result = verify_delegation_token(&token, &verifying_key, &[claims.aud.as_str()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("typ"));
+    }
+
+    /// A delegation token for `claims` signed by `key`, with `header` as given.
+    fn sign_with_header(
+        header: serde_json::Value,
+        claims: &DelegationTokenClaims,
+        key: &K256SigningKey,
+    ) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let message = format!("{header_b64}.{payload_b64}");
+        let sig: K256Signature = key.sign(message.as_bytes());
+        format!(
+            "{header_b64}.{payload_b64}.{}",
+            URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        )
+    }
+
+    /// `key` as a secp256k1 `publicKeyMultibase`.
+    fn k256_multikey(key: &K256SigningKey) -> String {
+        let mut bytes = vec![0xe7, 0x01];
+        bytes.extend_from_slice(K256VerifyingKey::from(key).to_sec1_point(true).as_bytes());
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    /// A DID document listing `methods` as (id, key) pairs.
+    fn did_doc(methods: &[(&str, &K256SigningKey)]) -> profile::DidDocument {
+        serde_json::from_value(serde_json::json!({
+            "verificationMethod": methods
+                .iter()
+                .map(|(id, key)| serde_json::json!({
+                    "id": id,
+                    "type": "Multikey",
+                    "publicKeyMultibase": k256_multikey(key),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn delegation_requires_the_atproto_kid() {
+        let key = make_k256_signing_key();
+        let vk = SpaceVerifyingKey::K256(K256VerifyingKey::from(&key));
+        let claims = make_delegation_claims();
+        let aud = [claims.aud.as_str()];
+
+        let good = sign_with_header(
+            serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP, "kid": "#atproto" }),
+            &claims,
+            &key,
+        );
+        assert!(verify_delegation_token_with_key(&good, &vk, &aud).is_ok());
+
+        // Signed by the right key, but naming anything else, or nothing.
+        for header in [
+            serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP }),
+            serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP, "kid": "atproto" }),
+            serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP, "kid": "#atproto_label" }),
+            serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP, "kid": "did:plc:member#atproto" }),
+        ] {
+            let token = sign_with_header(header.clone(), &claims, &key);
+            let err = verify_delegation_token_with_key(&token, &vk, &aud)
+                .expect_err(&format!("must refuse {header}"));
+            assert!(err.to_string().contains("kid"), "{err}");
+        }
+    }
+
+    #[test]
+    fn delegation_verifies_only_against_the_accounts_atproto_key() {
+        let atproto = make_k256_signing_key();
+        let other = K256SigningKey::from_slice(&[0x77u8; 32][..]).unwrap();
+        let claims = make_delegation_claims();
+        let aud = [claims.aud.as_str()];
+        let doc = did_doc(&[("#atproto", &atproto), ("#atproto_label", &other)]);
+        let key = delegation_signing_key(&doc, &claims.iss).unwrap();
+
+        let header = |kid: &str| serde_json::json!({ "alg": "ES256K", "typ": DELEGATION_TOKEN_TYP, "kid": kid });
+        let by_atproto = sign_with_header(header("#atproto"), &claims, &atproto);
+        assert!(verify_delegation_token_with_key(&by_atproto, &key, &aud).is_ok());
+
+        // Another key the account lists is not the account's delegation key,
+        // whether the token names it or claims to be `#atproto`.
+        let named = sign_with_header(header("#atproto_label"), &claims, &other);
+        assert!(verify_delegation_token_with_key(&named, &key, &aud).is_err());
+        let claimed = sign_with_header(header("#atproto"), &claims, &other);
+        assert!(verify_delegation_token_with_key(&claimed, &key, &aud).is_err());
+    }
+
+    #[test]
+    fn delegation_key_is_found_by_either_id_form_and_only_for_atproto() {
+        let atproto = make_k256_signing_key();
+        let other = K256SigningKey::from_slice(&[0x77u8; 32][..]).unwrap();
+        let iss = "did:plc:member";
+
+        assert!(delegation_signing_key(&did_doc(&[("#atproto", &atproto)]), iss).is_ok());
+        assert!(
+            delegation_signing_key(&did_doc(&[("did:plc:member#atproto", &atproto)]), iss).is_ok()
+        );
+        // A document with no `#atproto` key has no delegation key, even when it
+        // lists others.
+        let err = delegation_signing_key(&did_doc(&[("#atproto_label", &other)]), iss)
+            .err()
+            .expect("no #atproto key");
+        assert!(err.to_string().contains("#atproto"), "{err}");
+        // Another DID's `#atproto` key is not this account's.
+        assert!(
+            delegation_signing_key(&did_doc(&[("did:plc:someoneelse#atproto", &atproto)]), iss)
+                .is_err()
+        );
     }
 
     #[test]
