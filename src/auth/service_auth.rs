@@ -620,7 +620,7 @@ mod outbound_tests {
             &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app.example.com#forum",
-            "com.atproto.simplespace.checkUserAccess",
+            "com.atproto.managedspace.checkUserAccess",
         )
         .await
         .expect("mint");
@@ -635,7 +635,7 @@ mod outbound_tests {
         let payload = decode_part(parts[1]);
         assert_eq!(payload["iss"], "did:plc:instance");
         assert_eq!(payload["aud"], "did:web:app.example.com#forum");
-        assert_eq!(payload["lxm"], "com.atproto.simplespace.checkUserAccess");
+        assert_eq!(payload["lxm"], "com.atproto.managedspace.checkUserAccess");
         assert!(payload["exp"].as_u64().unwrap() > payload["iat"].as_u64().unwrap());
         assert!(!payload["jti"].as_str().unwrap().is_empty());
     }
@@ -678,7 +678,7 @@ mod outbound_tests {
             &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app#f",
-            "com.atproto.simplespace.checkUserAccess",
+            "com.atproto.managedspace.checkUserAccess",
         )
         .await
         .expect("mint");

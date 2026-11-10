@@ -502,7 +502,7 @@ async fn a_managing_app_is_reached_through_its_service_entry() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
         .expect(1)
         .mount(&managing_app)
@@ -911,7 +911,7 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
         .mount(&managing_app)
         .await;
@@ -974,6 +974,166 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
         .to_str()
         .unwrap();
     app.assert_signed_as_space(authorization, &space_did).await;
+    // Scoped to Proposal 0016's method, which the managing app checks.
+    use base64::Engine;
+    let token = authorization.trim_start_matches("Bearer ");
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["lxm"],
+        json!("com.atproto.managedspace.checkUserAccess")
+    );
+    // Addressed to the managing app's service, as the policy names it.
+    assert_eq!(payload["aud"], json!("did:plc:forumapp#forum"));
+}
+
+/// How the managing app in [`notify_through_managing_app`] answers.
+enum ManagingAppAnswer {
+    /// It answers every access check with this.
+    Responds(wiremock::ResponseTemplate),
+    /// Its service endpoint is a port nothing listens on.
+    Unreachable,
+}
+
+/// A newcomer's `notifyWrite` to a space a managing app governs, answered by
+/// the app as `answer` says. The space admits the newcomer only if the app
+/// says so, so the status is the app's decision as HappyView reads it.
+async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    // Kept alive until the request is answered.
+    let managing_app = MockServer::start().await;
+    let endpoint = match answer {
+        ManagingAppAnswer::Responds(response) => {
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::Unreachable => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        }
+    };
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": endpoint }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+
+    let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &newcomer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": newcomer,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+fn answers(status: u16, body: serde_json::Value) -> ManagingAppAnswer {
+    ManagingAppAnswer::Responds(wiremock::ResponseTemplate::new(status).set_body_json(body))
+}
+
+/// The managing app admitting the user admits them.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_authorizes_admits_the_writer() {
+    common::require_db!();
+    let status = notify_through_managing_app(answers(200, json!({ "authorized": true }))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A managing app refusing the request, by status or by answer, is a denial:
+/// the space doesn't admit the writer.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_refusing_denies_the_writer() {
+    common::require_db!();
+    for (label, answer) in [
+        ("403", answers(403, json!({ "error": "Forbidden" }))),
+        ("401", answers(401, json!({ "error": "AuthRequired" }))),
+        (
+            "authorized false",
+            answers(200, json!({ "authorized": false })),
+        ),
+        ("no authorized field", answers(200, json!({}))),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+    }
+}
+
+/// A managing app that can't answer the access check is an upstream failure
+/// (502), not an error of ours (500), and admits no one: one that doesn't
+/// implement it, one whose answer isn't JSON, and one nobody can reach.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
+    common::require_db!();
+    for (label, answer) in [
+        (
+            "501",
+            answers(
+                501,
+                json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
+            ),
+        ),
+        (
+            "a text/plain 200",
+            ManagingAppAnswer::Responds(
+                wiremock::ResponseTemplate::new(200).set_body_raw("authorized", "text/plain"),
+            ),
+        ),
+        ("a closed port", ManagingAppAnswer::Unreachable),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}");
+    }
 }
 
 /// A space on its own DID tells its registered syncers it was deleted with
@@ -1095,4 +1255,102 @@ async fn service_auth_for_one_space_is_refused_on_another() {
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A space created through `createSpace`, on a did:plc of its own, notified
+/// exactly as the reference PDS (`@atproto/pds`, `fireNotifyWrite`) notifies
+/// it: service auth issued by the writer, `aud` the bare space DID, `lxm`
+/// `com.atproto.space.notifyWrite`, and a body of `space`, `repo`, `rev` and
+/// `hash`.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_reference_pds_on_a_space_of_its_own() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let call = |did: &str, method: &str, body: serde_json::Value| {
+        let (name, value) = common::auth::admin_cookie_header(did, &app.state.cookie_key);
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{method}"))
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": SPACE_TYPE,
+                "skey": SPACE_SKEY,
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let space = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.simplespace.putMember",
+            json!({ "space": space, "did": writer, "read": true, "write": true }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &space_did,
+            "",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
