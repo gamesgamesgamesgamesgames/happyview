@@ -408,6 +408,44 @@ async fn provision_dpop_key(
     ))
 }
 
+/// Refuse a registration whose scopes go beyond what the session's
+/// authorization server granted. The grant is read from a refresh HappyView
+/// makes itself, at an issuer the user's PDS names (see
+/// [`super::pds_write::refresh_for_granted_scope`]): the scope in the app's own
+/// token response is relayed by the app, so it cannot vouch for itself. The
+/// refresh rotates the tokens the app handed over; from here HappyView holds
+/// the session's only live ones.
+async fn check_registered_scopes_against_grant(
+    state: &AppState,
+    encryption_key: &[u8; 32],
+    api_client_id: &str,
+    did: &str,
+    dpop_key_id: &str,
+    registered: &str,
+) -> Result<(), AppError> {
+    let granted = super::pds_write::refresh_for_granted_scope(
+        &state.http,
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.oauth,
+        &state.config.plc_url,
+        api_client_id,
+        did,
+        dpop_key_id,
+    )
+    .await?;
+    let missing = client_auth::scopes_beyond_grant(registered, &granted, &state.lexicons).await;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "the authorization server did not grant these scopes: {}. Register the session with \
+         the scope the authorization server granted.",
+        missing.join(" ")
+    )))
+}
+
 /// POST /oauth/sessions — register a token set after OAuth callback.
 ///
 /// Client credentials come from `X-Client-Key` and `X-Client-Secret` headers.
@@ -491,6 +529,21 @@ async fn register_session(
         return Err(e);
     }
 
+    // Anything beyond `atproto` is checked against what the authorization
+    // server granted, which HappyView learns from a refresh of its own. With
+    // no refresh token there is nothing to ask it with.
+    let needs_grant = happyview_scopes::parse_scope_list(&body.scopes)
+        .iter()
+        .any(|scope| scope != "atproto");
+    if needs_grant && body.refresh_token.is_none() {
+        return Err(AppError::BadRequest(
+            "a session registered without a refresh token may hold only the 'atproto' scope: \
+             HappyView confirms any other scope with the authorization server by refreshing \
+             the session's token"
+                .into(),
+        ));
+    }
+
     // Verify the access token actually belongs to the claimed DID. The `did` in
     // the request body is client-supplied and untrusted; without this check any
     // holder of a provisioned DPoP key could register a session for an arbitrary
@@ -540,7 +593,8 @@ async fn register_session(
         &body.access_token,
         body.refresh_token.as_deref(),
         body.expires_at.as_deref(),
-        &body.scopes,
+        // Held at `atproto` until the grant below covers the rest.
+        if needs_grant { "atproto" } else { &body.scopes },
         body.pds_url.as_deref(),
         body.issuer.as_deref(),
         signing_kid.as_deref(),
@@ -563,6 +617,48 @@ async fn register_session(
             error = %e,
             "failed to re-pin DPoP session signing_kid after registration"
         );
+    }
+
+    if needs_grant {
+        if let Err(e) = check_registered_scopes_against_grant(
+            &state,
+            encryption_key,
+            &client.id,
+            &body.did,
+            &dpop_key_id,
+            &body.scopes,
+        )
+        .await
+        {
+            tracing::warn!(
+                client_key = %client_key,
+                did = %body.did,
+                registered_scopes = %body.scopes,
+                error = %e,
+                "session registration refused: scopes not confirmed by the authorization server"
+            );
+            if let Err(del) = sessions::delete_dpop_session(
+                &state.db,
+                state.db_backend,
+                &client.id,
+                &body.did,
+                &dpop_key_id,
+            )
+            .await
+            {
+                tracing::error!(error = %del, "failed to remove a refused session registration");
+            }
+            return Err(e);
+        }
+        sessions::set_dpop_session_scopes(
+            &state.db,
+            state.db_backend,
+            &client.id,
+            &body.did,
+            &dpop_key_id,
+            &body.scopes,
+        )
+        .await?;
     }
 
     // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT

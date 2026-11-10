@@ -198,6 +198,46 @@ pub async fn validate_scopes(
     Ok(())
 }
 
+/// The scopes in `registered` that `granted` does not cover: the ones a session
+/// asks for that its authorization server never granted. Empty when the grant
+/// covers them all.
+///
+/// The server answers with any `include:` already expanded into the
+/// permissions it stands for, so a registered `include:X` is covered when
+/// every permission it expands to is. HappyView expands it with its own copy
+/// of the set; one it cannot resolve expands to nothing, and grants nothing
+/// here either.
+pub async fn scopes_beyond_grant(
+    registered: &str,
+    granted: &str,
+    lexicons: &crate::lexicon::LexiconRegistry,
+) -> Vec<String> {
+    let mut held: Vec<String> = Vec::new();
+    for scope in happyview_scopes::parse_scope_list(granted) {
+        if scope.starts_with("include:") {
+            expand_permission_set(&scope, lexicons, &mut held).await;
+        }
+        held.push(scope);
+    }
+    let held = happyview_scopes::ScopePermissions::from_scopes(held);
+
+    let mut missing = Vec::new();
+    for scope in happyview_scopes::parse_scope_list(registered) {
+        if held.covers_scope(&scope) {
+            continue;
+        }
+        if scope.starts_with("include:") {
+            let mut expanded = Vec::new();
+            expand_permission_set(&scope, lexicons, &mut expanded).await;
+            if expanded.iter().all(|p| held.covers_scope(p)) {
+                continue;
+            }
+        }
+        missing.push(scope);
+    }
+    missing
+}
+
 /// Expand an `include:<nsid>` scope into the permissions its lexicon declares.
 ///
 /// Resolution is the only part that is HappyView's: fetch the lexicon, hand the
@@ -330,6 +370,89 @@ mod tests {
 
     fn empty_registry() -> crate::lexicon::LexiconRegistry {
         crate::lexicon::LexiconRegistry::new()
+    }
+
+    #[tokio::test]
+    async fn a_registration_within_the_grant_has_nothing_beyond_it() {
+        let reg = empty_registry();
+        let space = "space:com.example.forum?authority=*&manage=create";
+        assert!(
+            scopes_beyond_grant(
+                &format!("atproto {space}"),
+                &format!("atproto {space}"),
+                &reg
+            )
+            .await
+            .is_empty()
+        );
+        assert!(
+            scopes_beyond_grant(
+                "atproto repo:com.example.post?action=create",
+                "atproto repo:com.example.post",
+                &reg,
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_beyond_the_grant_names_what_was_not_granted() {
+        let reg = empty_registry();
+        let space = "space:com.example.forum?authority=*&manage=create&manage=delete&collection=*";
+        let missing = scopes_beyond_grant(
+            &format!("atproto repo:com.example.post {space}"),
+            "atproto repo:com.example.post",
+            &reg,
+        )
+        .await;
+        assert_eq!(missing, vec![space.to_string()]);
+
+        let missing = scopes_beyond_grant(
+            "atproto repo:com.example.post?action=create&action=delete",
+            "atproto repo:com.example.post?action=create",
+            &reg,
+        )
+        .await;
+        assert_eq!(missing.len(), 1, "{missing:?}");
+    }
+
+    #[tokio::test]
+    async fn a_registered_include_is_covered_by_its_expanded_grant() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": { "main": { "type": "permission-set", "permissions": [
+                { "type": "permission", "resource": "repo", "collection": ["com.example.profile"] }
+            ] } }
+        });
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            raw,
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        let expanded = "atproto repo:com.example.profile?action=create \
+                        repo:com.example.profile?action=update repo:com.example.profile?action=delete";
+        assert!(
+            scopes_beyond_grant("atproto include:com.example.authBasic", expanded, &reg)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            scopes_beyond_grant(
+                "atproto include:com.example.authBasic",
+                "atproto repo:com.example.profile?action=create",
+                &reg,
+            )
+            .await,
+            vec!["include:com.example.authBasic".to_string()]
+        );
     }
 
     #[tokio::test]

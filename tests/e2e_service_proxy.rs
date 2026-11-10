@@ -21,7 +21,7 @@ use serial_test::serial;
 use std::sync::Arc;
 use tower::ServiceExt;
 use wiremock::matchers::{header, method as http_method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::app::TestApp;
 
@@ -42,6 +42,43 @@ fn set_routing(app: &TestApp, routing: ProxyRouting) {
 }
 
 /// Provision a DPoP key and register a session whose PDS is the mock server.
+/// An authorization server for `DID`, named by the mock PDS, whose refresh
+/// grants `scopes`. Needed only while the session registers.
+async fn authorization_server(app: &TestApp, scopes: &str) -> MockServer {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(http_method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/oauth/token"),
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": TOKEN,
+            "refresh_token": "proxy-refresh-token-rotated",
+            "token_type": "DPoP",
+            "expires_in": 3600,
+            "sub": DID,
+            "scope": scopes,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("GET"))
+        .and(path(format!(
+            "/pds/{DID}/.well-known/oauth-protected-resource"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "authorization_servers": [issuer] })),
+        )
+        .mount(&app.mock_server)
+        .await;
+    server
+}
+
 /// Returns `(client_key, private_jwk)` for signing proofs.
 async fn register_session(app: &TestApp, scopes: &str) -> (String, Value) {
     let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
@@ -80,6 +117,12 @@ async fn register_session(app: &TestApp, scopes: &str) -> (String, Value) {
     app.mock_session_verification(DID, DID).await;
     let pds_url = format!("{}/pds/{DID}", app.mock_server.uri());
 
+    // Registration confirms any scope beyond `atproto` with the account's
+    // authorization server, by a refresh. This one grants exactly `scopes`
+    // and hands back the same access token, so the proxied requests below
+    // still carry `TOKEN`.
+    let issuer = authorization_server(app, scopes).await;
+
     let session_req = Request::builder()
         .method("POST")
         .uri("/oauth/sessions")
@@ -92,8 +135,11 @@ async fn register_session(app: &TestApp, scopes: &str) -> (String, Value) {
                 "provision_id": provision_id,
                 "did": DID,
                 "access_token": TOKEN,
+                "refresh_token": "proxy-refresh-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "scopes": scopes,
                 "pds_url": pds_url,
+                "issuer": issuer.uri(),
             }))
             .unwrap(),
         ))

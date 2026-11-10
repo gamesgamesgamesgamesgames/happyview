@@ -325,6 +325,33 @@ pub async fn dpop_key_id_for_session(
     Ok(row.map(|(id,)| id))
 }
 
+/// Replace the scopes a session was registered with. Only a registration that
+/// HappyView has checked against the authorization server's grant sets them
+/// beyond `atproto`.
+pub async fn set_dpop_session_scopes(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+    scopes: &str,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_sessions SET scopes = ? \
+         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(scopes)
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to store session scopes: {e}")))?;
+    Ok(())
+}
+
 /// Delete a DPoP session by api_client_id, user_did, and dpop_key_id (device-specific).
 pub async fn delete_dpop_session(
     pool: &sqlx::AnyPool,
