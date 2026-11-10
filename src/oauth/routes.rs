@@ -422,8 +422,8 @@ async fn check_registered_scopes_against_grant(
     did: &str,
     dpop_key_id: &str,
     registered: &str,
-) -> Result<(), AppError> {
-    let granted = super::pds_write::refresh_for_granted_scope(
+) -> Result<String, AppError> {
+    let (granted, checked_at) = super::pds_write::refresh_for_granted_scope(
         &state.http,
         &state.db,
         state.db_backend,
@@ -437,7 +437,7 @@ async fn check_registered_scopes_against_grant(
     .await?;
     let missing = client_auth::scopes_beyond_grant(registered, &granted, &state.lexicons).await;
     if missing.is_empty() {
-        return Ok(());
+        return Ok(checked_at);
     }
     Err(AppError::BadRequest(format!(
         "the authorization server did not grant these scopes: {}. Register the session with \
@@ -620,7 +620,7 @@ async fn register_session(
     }
 
     if needs_grant {
-        if let Err(e) = check_registered_scopes_against_grant(
+        let checked = check_registered_scopes_against_grant(
             &state,
             encryption_key,
             &client.id,
@@ -628,8 +628,38 @@ async fn register_session(
             &dpop_key_id,
             &body.scopes,
         )
-        .await
-        {
+        .await;
+        let widened = match &checked {
+            Ok(checked_at) => {
+                sessions::set_dpop_session_scopes(
+                    &state.db,
+                    state.db_backend,
+                    &client.id,
+                    &body.did,
+                    &dpop_key_id,
+                    &body.scopes,
+                    checked_at,
+                )
+                .await
+            }
+            Err(_) => Ok(false),
+        };
+        // A refused check removes the session it held at `atproto`. A lost race
+        // leaves the row alone: it is the other registration's now.
+        let (refusal, remove) = match (checked, widened) {
+            (Err(e), _) => (Some(e), true),
+            (Ok(_), Err(e)) => (Some(e), false),
+            (Ok(_), Ok(false)) => (
+                Some(AppError::Conflict(
+                    "the session was registered again while its scopes were being checked; \
+                     register it again"
+                        .into(),
+                )),
+                false,
+            ),
+            (Ok(_), Ok(true)) => (None, false),
+        };
+        if let Some(e) = refusal {
             tracing::warn!(
                 client_key = %client_key,
                 did = %body.did,
@@ -637,28 +667,20 @@ async fn register_session(
                 error = %e,
                 "session registration refused: scopes not confirmed by the authorization server"
             );
-            if let Err(del) = sessions::delete_dpop_session(
-                &state.db,
-                state.db_backend,
-                &client.id,
-                &body.did,
-                &dpop_key_id,
-            )
-            .await
+            if remove
+                && let Err(del) = sessions::delete_dpop_session(
+                    &state.db,
+                    state.db_backend,
+                    &client.id,
+                    &body.did,
+                    &dpop_key_id,
+                )
+                .await
             {
                 tracing::error!(error = %del, "failed to remove a refused session registration");
             }
             return Err(e);
         }
-        sessions::set_dpop_session_scopes(
-            &state.db,
-            state.db_backend,
-            &client.id,
-            &body.did,
-            &dpop_key_id,
-            &body.scopes,
-        )
-        .await?;
     }
 
     // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT

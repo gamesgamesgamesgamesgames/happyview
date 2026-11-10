@@ -917,7 +917,9 @@ async fn apply_refresh_response(
 /// response HappyView receives carries the granted scope, with any `include:`
 /// already expanded. The refresh goes to the session's issuer only once the
 /// user's own PDS lists it, since an app that could pick the issuer could pick
-/// the answer. It rotates the session's tokens.
+/// the answer. It rotates the session's tokens. Answers the grant along with
+/// the session's `updated_at` as that refresh left it, so the caller can act
+/// only on the row it checked.
 #[allow(clippy::too_many_arguments)]
 pub async fn refresh_for_granted_scope(
     http: &reqwest::Client,
@@ -929,7 +931,7 @@ pub async fn refresh_for_granted_scope(
     api_client_id: &str,
     user_did: &str,
     dpop_key_id: &str,
-) -> Result<String, AppError> {
+) -> Result<(String, String), AppError> {
     let slot = refresh_lock(api_client_id, user_did, dpop_key_id);
     let _guard = slot.lock().await;
 
@@ -949,7 +951,7 @@ pub async fn refresh_for_granted_scope(
     let pds = resolve_pds_from_did(http, plc_url, user_did).await?;
     verify_issuer_of(http, &pds, &issuer).await?;
 
-    refresh_access_token(
+    let granted = refresh_access_token(
         http,
         pool,
         backend,
@@ -962,7 +964,19 @@ pub async fn refresh_for_granted_scope(
         AppError::Forbidden(
             "the authorization server did not say what it granted this session".into(),
         )
-    })
+    })?;
+    let updated_at = super::sessions::get_dpop_session_updated_at(
+        pool,
+        backend,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::Conflict("the session was removed while it was being checked".into())
+    })?;
+    Ok((granted, updated_at))
 }
 
 fn issuer_refused() -> AppError {

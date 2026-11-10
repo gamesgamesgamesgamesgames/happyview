@@ -75,6 +75,24 @@ async fn register(
     scopes: &str,
     refresh_token: Option<&str>,
 ) -> (StatusCode, Value) {
+    register_with_issuer(
+        app,
+        client_scopes,
+        scopes,
+        refresh_token,
+        Some(server.uri()),
+    )
+    .await
+}
+
+/// [`register`] naming `issuer`, or no issuer at all.
+async fn register_with_issuer(
+    app: &TestApp,
+    client_scopes: &str,
+    scopes: &str,
+    refresh_token: Option<&str>,
+    issuer: Option<String>,
+) -> (StatusCode, Value) {
     let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
     let sql = happyview::db::adapt_sql(
         "UPDATE happyview_api_clients SET scopes = ? WHERE id = ?",
@@ -105,8 +123,10 @@ async fn register(
         "access_token": "app-access-token",
         "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
         "scopes": scopes,
-        "issuer": server.uri(),
     });
+    if let Some(issuer) = issuer {
+        body["issuer"] = json!(issuer);
+    }
     if let Some(token) = refresh_token {
         body["refresh_token"] = json!(token);
     }
@@ -235,4 +255,136 @@ async fn an_issuer_the_pds_does_not_name_is_never_asked() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(token_requests(&server).await, 0);
     assert_eq!(stored_sessions(&app).await, 0);
+}
+
+/// With no issuer there is no authorization server to ask, so a scope beyond
+/// `atproto` is refused and nothing is stored.
+#[tokio::test]
+#[serial]
+async fn a_registration_without_an_issuer_holds_only_atproto() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let requested = format!("atproto {SPACE}");
+    let server = authorization_server(&app, &requested, true).await;
+
+    let (status, body) = register_with_issuer(&app, &requested, &requested, Some("rt"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(token_requests(&server).await, 0);
+    assert_eq!(stored_sessions(&app).await, 0);
+}
+
+/// While the authorization server is asked, the session holds `atproto` only:
+/// the scopes the app registered are stored only once the grant covers them.
+#[tokio::test]
+#[serial]
+async fn a_session_holds_only_atproto_until_its_grant_is_confirmed() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let requested = format!("atproto {SPACE}");
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/oauth/token"),
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "refreshed-refresh-token",
+                    "token_type": "DPoP",
+                    "expires_in": 3600,
+                    "sub": DID,
+                    "scope": requested,
+                }))
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&server)
+        .await;
+    app.mock_session_verification(DID, DID).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/pds/{DID}/.well-known/oauth-protected-resource"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "authorization_servers": [issuer] })),
+        )
+        .mount(&app.mock_server)
+        .await;
+
+    let (client_key, client_secret, client_id) = app.create_api_client("confidential", None).await;
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_api_clients SET scopes = ? WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&requested)
+        .bind(&client_id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/oauth/dpop-keys")
+        .header("content-type", "application/json")
+        .header("x-client-key", &client_key)
+        .header("x-client-secret", &client_secret)
+        .body(Body::from("{}"))
+        .unwrap();
+    let provision = response_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let session_req = Request::builder()
+        .method("POST")
+        .uri("/oauth/sessions")
+        .header("content-type", "application/json")
+        .header("x-client-key", &client_key)
+        .header("x-client-secret", &client_secret)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "provision_id": provision["provision_id"],
+                "did": DID,
+                "access_token": "app-access-token",
+                "refresh_token": "rt",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "scopes": requested,
+                "issuer": issuer,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let router = app.router.clone();
+    let registering =
+        tokio::spawn(async move { router.oneshot(session_req).await.unwrap().status() });
+
+    let sql = happyview::db::adapt_sql(
+        "SELECT scopes FROM happyview_dpop_sessions WHERE user_did = ?",
+        app.state.db_backend,
+    );
+    let mut held = None;
+    for _ in 0..100 {
+        let row: Option<(String,)> = happyview::db::query_as(&sql)
+            .bind(DID)
+            .fetch_optional(&app.state.db)
+            .await
+            .unwrap();
+        if let Some((scopes,)) = row {
+            held = Some(scopes);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(held.as_deref(), Some("atproto"));
+
+    assert_eq!(registering.await.unwrap(), StatusCode::CREATED);
+    let (stored,): (String,) = happyview::db::query_as(&sql)
+        .bind(DID)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, requested);
 }

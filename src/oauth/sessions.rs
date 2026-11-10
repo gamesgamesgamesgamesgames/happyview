@@ -325,9 +325,35 @@ pub async fn dpop_key_id_for_session(
     Ok(row.map(|(id,)| id))
 }
 
-/// Replace the scopes a session was registered with. Only a registration that
-/// HappyView has checked against the authorization server's grant sets them
-/// beyond `atproto`.
+/// The session's `updated_at`, which every store of its tokens rewrites.
+pub async fn get_dpop_session_updated_at(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT updated_at FROM happyview_dpop_sessions \
+         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(user_did)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read the session: {e}")))?;
+    Ok(row.map(|(at,)| at))
+}
+
+/// Replace the scopes a session was registered with, if its row is still the
+/// one checked: `updated_at` as the checking refresh left it. Only a
+/// registration that HappyView has checked against the authorization server's
+/// grant sets them beyond `atproto`. Answers whether the row was updated; a
+/// concurrent re-registration in between rewrites `updated_at`, and so leaves
+/// it as it is.
 pub async fn set_dpop_session_scopes(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -335,21 +361,23 @@ pub async fn set_dpop_session_scopes(
     user_did: &str,
     dpop_key_id: &str,
     scopes: &str,
-) -> Result<(), AppError> {
+    checked_at: &str,
+) -> Result<bool, AppError> {
     let sql = adapt_sql(
         "UPDATE happyview_dpop_sessions SET scopes = ? \
-         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+         WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ? AND updated_at = ?",
         backend,
     );
-    crate::db::query(&sql)
+    let result = crate::db::query(&sql)
         .bind(scopes)
         .bind(api_client_id)
         .bind(user_did)
         .bind(dpop_key_id)
+        .bind(checked_at)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to store session scopes: {e}")))?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Delete a DPoP session by api_client_id, user_did, and dpop_key_id (device-specific).
