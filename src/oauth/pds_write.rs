@@ -894,6 +894,20 @@ pub async fn verified_granted_scope(
     let slot = refresh_lock(api_client_id, user_did, dpop_key_id);
     let _guard = slot.lock().await;
 
+    // A live cached answer needs neither the tokens nor the network.
+    if let Some((Some(scope), expires_at)) = super::sessions::get_granted_scope_and_expiry(
+        pool,
+        backend,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?
+        && !token_expired(expires_at.as_deref())
+    {
+        return Ok(scope);
+    }
+
     let mut creds = resolve_credentials(
         http,
         pool,
@@ -905,13 +919,6 @@ pub async fn verified_granted_scope(
         dpop_key_id,
     )
     .await?;
-
-    if !token_expired(creds.session.token_expires_at.as_deref())
-        && let Some(scope) =
-            super::sessions::get_granted_scope(pool, backend, &creds.session.id).await?
-    {
-        return Ok(scope);
-    }
 
     verify_issuer(http, plc_url, user_did, creds.session.issuer.as_deref()).await?;
 

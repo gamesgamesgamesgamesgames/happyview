@@ -318,16 +318,32 @@ async fn a_granted_session_reaches_admin_with_the_users_permissions() {
 
 #[tokio::test]
 #[serial]
-async fn the_scope_an_app_claims_grants_nothing() {
+async fn a_scope_the_server_did_not_grant_is_refused_at_sign_in() {
     common::require_db!();
     let app = seeded_app().await;
     let did = app.admin_did.clone();
     let server =
         authorization_server(&app, &did, true, &[token_response(&did, "atproto", 3600)]).await;
-    let (_, key) = sign_in(&app, &did, &server.uri(), ADMIN_GRANT, "app-token").await;
+    let (status, body, _, key) = register(
+        &app,
+        &Client::hpy(),
+        &did,
+        &server.uri(),
+        ADMIN_GRANT,
+        "app-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("did not grant") && error.contains("rpc:dev.happyview.admin.manage"),
+        "{body}"
+    );
+    assert_eq!(token_requests(&server).await, 1);
 
+    // No session was left behind for the refused registration.
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_ne!(status, StatusCode::OK, "{body}");
 }
 
 /// Nothing about the rule is particular to hpy: an ordinary registered app's
@@ -414,9 +430,15 @@ async fn a_grant_for_another_account_counts_for_nothing() {
         &[token_response("did:plc:someoneelse", ADMIN_GRANT, 3600)],
     )
     .await;
-    let (_, key) = sign_in(&app, &did, &server.uri(), ADMIN_GRANT, "app-token").await;
-
-    let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
+    let (status, body, _, _) = register(
+        &app,
+        &Client::hpy(),
+        &did,
+        &server.uri(),
+        ADMIN_GRANT,
+        "app-token",
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
@@ -426,25 +448,27 @@ async fn an_expired_token_reads_the_grant_again() {
     common::require_db!();
     let app = seeded_app().await;
     let did = app.admin_did.clone();
-    // The first refresh grants admin and expires at once; the next one finds
-    // the grant gone.
+    // Sign-in's refresh and the next one grant admin and expire at once; the
+    // one after finds the grant gone.
     let server = authorization_server(
         &app,
         &did,
         true,
         &[
             token_response(&did, ADMIN_GRANT, 0),
+            token_response(&did, ADMIN_GRANT, 0),
             token_response(&did, "atproto", 3600),
         ],
     )
     .await;
     let (_, key) = sign_in(&app, &did, &server.uri(), ADMIN_GRANT, "app-token").await;
+    assert_eq!(token_requests(&server).await, 1);
 
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(token_requests(&server).await, 2);
+    assert_eq!(token_requests(&server).await, 3);
 }
 
 #[tokio::test]
@@ -467,8 +491,8 @@ async fn signing_in_again_forgets_the_previous_grant() {
     let (status, body) = dpop_get(&app, "/admin/plugins", &key, "app-token").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // The same device registers fresh tokens: what was verified for the old
-    // ones no longer stands.
+    // The same device registers fresh tokens, asking for nothing beyond
+    // `atproto`: what was verified for the old ones no longer stands.
     let resp = app
         .router
         .clone()
@@ -481,7 +505,7 @@ async fn signing_in_again_forgets_the_previous_grant() {
                 "access_token": "second-token",
                 "refresh_token": "second-refresh-token",
                 "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-                "scopes": ADMIN_GRANT,
+                "scopes": "atproto",
                 "issuer": server.uri(),
             }),
             &[("x-client-key", cli_client::CLIENT_KEY)],
@@ -779,4 +803,148 @@ async fn a_sign_in_keeps_its_key_across_a_promotion() {
     let verifier = "after-promotion-verifier-0123456789abcdef01";
     let later = provision(&app, verifier).await;
     assert_eq!(mint_for_provision(&app, &later, verifier).await, new.kid);
+}
+
+/// Registers a session the way [`register`] does but without a refresh token.
+async fn register_without_refresh(
+    app: &common::app::TestApp,
+    did: &str,
+    issuer: &str,
+    claimed_scope: &str,
+) -> (StatusCode, Value) {
+    let verifier = "hpy-test-verifier-0123456789abcdef0123456789";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let client = Client::hpy();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/dpop-keys",
+            &json!({ "pkce_challenge": challenge }),
+            &client.headers(),
+        ))
+        .await
+        .unwrap();
+    let provision = response_json(resp).await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(post_json(
+            "/oauth/sessions",
+            &json!({
+                "provision_id": provision["provision_id"],
+                "pkce_verifier": verifier,
+                "did": did,
+                "access_token": "no-refresh-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "scopes": claimed_scope,
+                "issuer": issuer,
+            }),
+            &client.headers(),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, response_json(resp).await)
+}
+
+/// Without a refresh token HappyView has no way to ask the authorization server
+/// what it granted, so only `atproto` is accepted.
+#[tokio::test]
+#[serial]
+async fn a_session_without_a_refresh_token_holds_only_atproto() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let server =
+        authorization_server(&app, &did, true, &[token_response(&did, ADMIN_GRANT, 3600)]).await;
+
+    let (status, body) = register_without_refresh(&app, &did, &server.uri(), ADMIN_GRANT).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("without a refresh token"),
+        "{body}"
+    );
+
+    let (status, body) = register_without_refresh(&app, &did, &server.uri(), "atproto").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(token_requests(&server).await, 0);
+}
+
+/// An app may register a session for exactly what its user's authorization
+/// server granted, through any client allowed those scopes, and for no more.
+#[tokio::test]
+#[serial]
+async fn a_space_scope_registers_only_when_the_server_granted_it() {
+    common::require_db!();
+    let app = seeded_app().await;
+    let did = app.admin_did.clone();
+    let space = "space:com.example.conformance.space?authority=*&manage=create&manage=update&manage=delete&collection=*";
+    let origin = "https://app.example".to_string();
+    let (key, _, _) = app
+        .create_api_client("public", Some(vec![origin.clone()]))
+        .await;
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_api_clients SET scopes = ? WHERE client_key = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(format!("atproto {space}"))
+        .bind(&key)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    let client = Client {
+        key,
+        origin: Some(origin),
+    };
+    let requested = format!("atproto {space}");
+
+    // The user consented to `atproto` only: the app's claim of the space
+    // scope is refused, and nothing is stored.
+    let server = keyed_authorization_server(
+        &app,
+        &did,
+        &[
+            ("atproto-only-token", token_response(&did, "atproto", 3600)),
+            ("space-token", token_response(&did, &requested, 3600)),
+        ],
+    )
+    .await;
+    let (status, body, _, _) = register(
+        &app,
+        &client,
+        &did,
+        &server.uri(),
+        &requested,
+        "atproto-only-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains(space),
+        "{body}"
+    );
+
+    // Granted, the same registration is accepted with the scope it asked for.
+    let (status, body, _, _) = register(
+        &app,
+        &client,
+        &did,
+        &server.uri(),
+        &requested,
+        "space-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let scopes: Vec<&str> = body["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(scopes.contains(&space), "{body}");
 }
