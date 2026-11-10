@@ -1179,6 +1179,53 @@ mod tests {
         assert_eq!(who[0]["s"], json!(PLUGIN_ROLE_LOGIN));
         assert_eq!(who[0]["c"], json!(PLUGIN_ROLE_RW));
 
+        // A statement may not change the role it runs under, through either
+        // entry point, and the next statement still runs as the same roles.
+        for sql in [
+            "RESET ROLE",
+            "SET ROLE NONE",
+            "SET SESSION AUTHORIZATION DEFAULT",
+        ] {
+            for mode in [PluginSqlMode::Read, PluginSqlMode::Write] {
+                assert!(
+                    run_plugin_query(
+                        &login_pool,
+                        DatabaseBackend::Postgres,
+                        PluginSqlEnforcement::LoginPool,
+                        mode,
+                        sql,
+                        &[],
+                    )
+                    .await
+                    .is_err(),
+                    "the login pool must refuse {sql} ({mode:?})"
+                );
+            }
+            assert!(
+                run_plugin_execute(
+                    &login_pool,
+                    DatabaseBackend::Postgres,
+                    PluginSqlEnforcement::LoginPool,
+                    sql,
+                    &[],
+                )
+                .await
+                .is_err(),
+                "the login pool must refuse {sql} as an execute"
+            );
+        }
+        let again = run_plugin_query(
+            &login_pool,
+            DatabaseBackend::Postgres,
+            PluginSqlEnforcement::LoginPool,
+            PluginSqlMode::Write,
+            "SELECT session_user::text AS s, current_user::text AS c",
+            &[],
+        )
+        .await
+        .expect("runs on the login pool");
+        assert_eq!(again, who);
+
         // A plugin defines its own function in its schema, then calls it.
         run_plugin_execute(
             &login_pool,
