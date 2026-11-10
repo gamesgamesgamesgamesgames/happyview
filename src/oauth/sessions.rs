@@ -596,3 +596,82 @@ pub async fn delete_dpop_session_by_id(
 
     Ok(dpop_key_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client, key and session row last written at `updated_at`.
+    async fn seed_session(pool: &sqlx::AnyPool, updated_at: &str) {
+        let now = now_rfc3339();
+        crate::db::query(
+            "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, is_active, created_by, created_at, updated_at) VALUES ('c1', 'hvc_1', '', 'test', 'https://c.example', '', '[]', '', 'confidential', 1, 'did:plc:u', ?, ?)",
+        )
+        .bind(now.clone())
+        .bind(now.clone())
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::db::query(
+            "INSERT INTO happyview_dpop_keys (id, provision_id, api_client_id, private_key_enc, jwk_thumbprint, created_at) VALUES ('k1', 'p1', 'c1', X'00', '', ?)",
+        )
+        .bind(now.clone())
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::db::query(
+            "INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, scopes, created_at, updated_at) VALUES ('s1', 'c1', 'k1', 'did:plc:u', X'00', 'atproto', ?, ?)",
+        )
+        .bind(now)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn scopes(pool: &sqlx::AnyPool) -> String {
+        let (scopes,): (String,) =
+            crate::db::query_as("SELECT scopes FROM happyview_dpop_sessions WHERE id = 's1'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        scopes
+    }
+
+    /// The widening applies only to the row the checking refresh left: once
+    /// something else rewrote it (a re-registration), nothing is updated.
+    #[tokio::test]
+    async fn session_scopes_are_set_only_on_the_row_that_was_checked() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        seed_session(&pool, "2026-11-10T00:00:00.000000001+00:00").await;
+
+        let stale = set_dpop_session_scopes(
+            &pool,
+            backend,
+            "c1",
+            "did:plc:u",
+            "k1",
+            "atproto repo:com.example.post",
+            "2026-11-10T00:00:00.000000000+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(!stale, "a rewritten row must be left alone");
+        assert_eq!(scopes(&pool).await, "atproto");
+
+        let checked = set_dpop_session_scopes(
+            &pool,
+            backend,
+            "c1",
+            "did:plc:u",
+            "k1",
+            "atproto repo:com.example.post",
+            "2026-11-10T00:00:00.000000001+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(checked);
+        assert_eq!(scopes(&pool).await, "atproto repo:com.example.post");
+    }
+}
