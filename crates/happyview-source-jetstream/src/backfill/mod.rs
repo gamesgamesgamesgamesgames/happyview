@@ -1250,6 +1250,10 @@ pub(crate) async fn insert_network_job(
 /// it is, so a finished job never changes status, and the cursor comes from
 /// the request, so the old job's rows need not exist any more. The job row
 /// and its cursor go in together.
+///
+/// Refused while another crawl of `collection` across the network is
+/// unfinished (running, paused or stopping): continuing the same listing
+/// twice would fetch the same repos twice.
 pub async fn start_crawl_from_cursor(
     state: &JobState,
     collection: &str,
@@ -1276,8 +1280,21 @@ pub async fn start_crawl_from_cursor(
         "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES (?, ?, ?, 0)",
         state.db_backend,
     );
-    happyview_provider::db::retry_on_busy(|| async {
+    let busy_sql = adapt_sql(
+        "SELECT id FROM happyview_backfill_jobs WHERE collection = ? AND scope = 'network' \
+         AND source IN ('crawl', 'auto') AND status IN ('running', 'pausing', 'paused', 'cancelling') LIMIT 1",
+        state.db_backend,
+    );
+    let created = happyview_provider::db::retry_on_busy(|| async {
         let mut tx = state.db.begin().await?;
+        let busy: Option<(String,)> = happyview_provider::db::query_as(&busy_sql)
+            .bind(collection)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some((other,)) = busy {
+            tx.rollback().await?;
+            return Ok(Err(other));
+        }
         happyview_provider::db::query(&job_sql)
             .bind(&job_id)
             .bind(collection)
@@ -1291,10 +1308,16 @@ pub async fn start_crawl_from_cursor(
             .bind(relay_cursor)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(Ok(()))
     })
     .await
     .map_err(|e| AdminError::Internal(format!("failed to create backfill job: {e}")))?;
+    if let Err(other) = created {
+        return Err(AdminError::Conflict(format!(
+            "job {other} is already crawling {collection}; let it finish before continuing discovery"
+        )));
+    }
 
     state
         .host
@@ -1308,7 +1331,9 @@ pub async fn start_crawl_from_cursor(
                 "scope": "network",
                 "account_count": 0,
                 "source": "crawl",
-                "relay_cursor": relay_cursor,
+                // A prefix, to tell continuations apart: the whole cursor
+                // stays in the job's own rows.
+                "relay_cursor_prefix": relay_cursor.chars().take(12).collect::<String>(),
             }),
         })
         .await;

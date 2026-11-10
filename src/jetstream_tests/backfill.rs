@@ -1202,7 +1202,93 @@ async fn a_crawl_started_from_a_relay_cursor_discovers_only_what_follows_it() {
     .fetch_one(&state.db)
     .await
     .expect("started event");
-    assert!(detail.contains("\"relay_cursor\":\"c9\""), "{detail}");
+    assert!(
+        detail.contains("\"relay_cursor_prefix\":\"c9\"") && !detail.contains("\"relay_cursor\""),
+        "only a prefix of the cursor is logged: {detail}"
+    );
+}
+
+/// HAP-422: a second continuation of a collection is refused while a crawl
+/// of it is unfinished, so the same tail isn't fetched twice.
+#[tokio::test]
+async fn a_continuation_is_refused_while_a_crawl_of_the_collection_is_unfinished() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    seed_job(
+        &state,
+        "busy",
+        Some(POST),
+        "network",
+        "resolving_and_fetching",
+        2,
+        false,
+    )
+    .await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET status = 'paused', source = 'crawl' WHERE id = 'busy'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("pause");
+
+    let refused = create_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        cursor_body(Some(POST), None, None, "c9"),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AdminError::Conflict(ref m)) if m.contains("busy")),
+        "a paused crawl of the collection blocks a continuation"
+    );
+    let (jobs_made,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_backfill_jobs")
+        .fetch_one(&state.db)
+        .await
+        .expect("count jobs");
+    assert_eq!(jobs_made, 1);
+}
+
+struct NeverRuns;
+
+#[async_trait::async_trait]
+impl happyview_source_jetstream::compose::BackfillExecutor for NeverRuns {
+    fn name(&self) -> &'static str {
+        "store-pass"
+    }
+
+    async fn run(
+        &self,
+        _job: happyview_source_jetstream::compose::JobHandle,
+        _collection: &str,
+    ) -> Result<happyview_source_jetstream::compose::JobTotals, String> {
+        panic!("a refused continuation runs nothing");
+    }
+}
+
+/// HAP-422: an executor's collection isn't crawled, so a relay cursor for it
+/// is refused.
+#[tokio::test]
+async fn a_relay_cursor_for_an_executor_collection_is_refused() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    let mut jobs = jobs(&state);
+    let executor: std::sync::Arc<dyn happyview_source_jetstream::compose::BackfillExecutor> =
+        std::sync::Arc::new(NeverRuns);
+    jobs.compose.executor_for = Some(std::sync::Arc::new(move |c: &str| {
+        (c == POST).then(|| std::sync::Arc::clone(&executor))
+    }));
+    let refused = create_backfill(
+        State(jobs),
+        super_auth(&state),
+        cursor_body(Some(POST), None, None, "c9"),
+    )
+    .await;
+    assert!(matches!(refused, Err(AdminError::BadRequest(_))));
+    let (jobs_made,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_backfill_jobs")
+        .fetch_one(&state.db)
+        .await
+        .expect("count jobs");
+    assert_eq!(jobs_made, 0);
 }
 
 /// HAP-422: a relay cursor belongs to one collection's network crawl.

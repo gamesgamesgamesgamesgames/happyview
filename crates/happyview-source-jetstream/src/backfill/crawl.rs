@@ -926,7 +926,9 @@ pub(crate) async fn fetch_relay_page(
     let mut failures: u32 = 0;
     loop {
         let (error, retry_after) = match state.http.get(url).send().await {
-            Err(e) => (format!("relay request failed: {e}"), None),
+            // Without the URL: it carries the relay cursor, which goes no
+            // further than the job's own rows.
+            Err(e) => (format!("relay request failed: {}", e.without_url()), None),
             Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 let wait = parse_retry_after(r.headers());
                 tracing::warn!(collection, wait, "rate limited by relay, sleeping");
