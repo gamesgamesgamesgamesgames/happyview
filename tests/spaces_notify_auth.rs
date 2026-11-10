@@ -987,35 +987,52 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
         payload["lxm"],
         json!("com.atproto.managedspace.checkUserAccess")
     );
+    // Addressed to the managing app's service, as the policy names it.
+    assert_eq!(payload["aud"], json!("did:plc:forumapp#forum"));
 }
 
-/// A managing app that can't answer the access check, such as one that
-/// doesn't implement it, is an upstream failure (502), not an error of ours
-/// (500), and admits no one.
-#[tokio::test]
-#[serial]
-async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+/// How the managing app in [`notify_through_managing_app`] answers.
+enum ManagingAppAnswer {
+    /// It answers every access check with this.
+    Responds(wiremock::ResponseTemplate),
+    /// Its service endpoint is a port nothing listens on.
+    Unreachable,
+}
 
-    common::require_db!();
+/// A newcomer's `notifyWrite` to a space a managing app governs, answered by
+/// the app as `answer` says. The space admits the newcomer only if the app
+/// says so, so the status is the app's decision as HappyView reads it.
+async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
     let app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     enable_spaces(&app).await;
 
+    // Kept alive until the request is answered.
     let managing_app = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(501).set_body_json(
-            json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
-        ))
-        .mount(&managing_app)
-        .await;
+    let endpoint = match answer {
+        ManagingAppAnswer::Responds(response) => {
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::Unreachable => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        }
+    };
     plc_store.write().await.insert(
         "did:plc:forumapp".to_string(),
         json!({
             "id": "did:plc:forumapp",
             "verificationMethod": [],
-            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": endpoint }],
         }),
     );
     let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
@@ -1055,10 +1072,68 @@ async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
             .to_string(),
         ))
         .unwrap();
-    assert_eq!(
-        app.router.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::BAD_GATEWAY
-    );
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+fn answers(status: u16, body: serde_json::Value) -> ManagingAppAnswer {
+    ManagingAppAnswer::Responds(wiremock::ResponseTemplate::new(status).set_body_json(body))
+}
+
+/// The managing app admitting the user admits them.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_authorizes_admits_the_writer() {
+    common::require_db!();
+    let status = notify_through_managing_app(answers(200, json!({ "authorized": true }))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A managing app refusing the request, by status or by answer, is a denial:
+/// the space doesn't admit the writer.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_refusing_denies_the_writer() {
+    common::require_db!();
+    for (label, answer) in [
+        ("403", answers(403, json!({ "error": "Forbidden" }))),
+        ("401", answers(401, json!({ "error": "AuthRequired" }))),
+        (
+            "authorized false",
+            answers(200, json!({ "authorized": false })),
+        ),
+        ("no authorized field", answers(200, json!({}))),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+    }
+}
+
+/// A managing app that can't answer the access check is an upstream failure
+/// (502), not an error of ours (500), and admits no one: one that doesn't
+/// implement it, one whose answer isn't JSON, and one nobody can reach.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
+    common::require_db!();
+    for (label, answer) in [
+        (
+            "501",
+            answers(
+                501,
+                json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
+            ),
+        ),
+        (
+            "a text/plain 200",
+            ManagingAppAnswer::Responds(
+                wiremock::ResponseTemplate::new(200).set_body_raw("authorized", "text/plain"),
+            ),
+        ),
+        ("a closed port", ManagingAppAnswer::Unreachable),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}");
+    }
 }
 
 /// A space on its own DID tells its registered syncers it was deleted with

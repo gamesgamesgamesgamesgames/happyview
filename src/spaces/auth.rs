@@ -362,8 +362,11 @@ async fn check_user_access_with_managing_app(
         .send()
         .await
         .map_err(|e| {
+            // The transport error can name the app's endpoint; it goes to the
+            // log, not to the caller.
+            tracing::warn!(managing_app, error = %e, "could not reach the managing app");
             AppError::BadGateway(format!(
-                "the managing app {managing_app} could not be reached: {e}"
+                "the managing app {managing_app} could not be reached"
             ))
         })?;
 
@@ -390,8 +393,9 @@ async fn check_user_access_with_managing_app(
     }
 
     let json: serde_json::Value = resp.json().await.map_err(|e| {
+        tracing::warn!(managing_app, error = %e, "the managing app's answer is unreadable");
         AppError::BadGateway(format!(
-            "the managing app {managing_app} sent an unreadable {CHECK_USER_ACCESS_LXM} answer: {e}"
+            "the managing app {managing_app} sent an unreadable {CHECK_USER_ACCESS_LXM} answer"
         ))
     })?;
 
