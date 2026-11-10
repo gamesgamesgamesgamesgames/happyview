@@ -241,6 +241,127 @@ impl ErrorRecorder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The failure set
+// ---------------------------------------------------------------------------
+
+/// Where a `happyview_backfill_failures` row stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureState {
+    /// A fetch retry is due. A resumed job queues the repo again.
+    Pending,
+    /// The job gave up on the repo.
+    Failed,
+}
+
+impl FailureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Record that `(did, collection)` is pending a retry or was given up on, in
+/// the job's uncapped failure set.
+///
+/// Unlike `ErrorRecorder::record`, this is per collection and has no cap:
+/// it is the list retry-failed reads, and what a resumed job queues again.
+/// A failed write is logged as `backfill.write_failed`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mark_failure(
+    state: &JobState,
+    job_id: &str,
+    did: &str,
+    collection: &str,
+    phase: &str,
+    kind: BackfillErrorKind,
+    failure_state: FailureState,
+    attempts: u32,
+) {
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_failures \
+         (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (job_id, did, collection) DO UPDATE SET \
+         phase = excluded.phase, kind = excluded.kind, state = excluded.state, \
+         attempts = excluded.attempts, last_at = excluded.last_at",
+        state.db_backend,
+    );
+    let now = now_rfc3339();
+    let attempts = i32::try_from(attempts).unwrap_or(i32::MAX);
+    super::job_write(state, job_id, "failure_set", || {
+        happyview_provider::db::query(&sql)
+            .bind(job_id)
+            .bind(did)
+            .bind(collection)
+            .bind(phase)
+            .bind(kind.as_str())
+            .bind(failure_state.as_str())
+            .bind(attempts)
+            .bind(&now)
+            .execute(&state.backfill_db)
+    })
+    .await;
+}
+
+/// Take `(did, collection)` out of the job's failure set: it was fetched.
+pub(crate) async fn clear_failure(state: &JobState, job_id: &str, did: &str, collection: &str) {
+    let sql = adapt_sql(
+        "DELETE FROM happyview_backfill_failures WHERE job_id = ? AND did = ? AND collection = ?",
+        state.db_backend,
+    );
+    super::job_write(state, job_id, "failure_set", || {
+        happyview_provider::db::query(&sql)
+            .bind(job_id)
+            .bind(did)
+            .bind(collection)
+            .execute(&state.backfill_db)
+    })
+    .await;
+}
+
+/// Queue a bounded job's pending fetch retries again, one unit per
+/// `(did, collection)`, so a job paused or restarted mid-retry fetches them
+/// on resume. Each unit added counts toward `total_repos`, as its completion
+/// counts toward `processed_repos`. Returns the units added.
+pub async fn requeue_pending_failures(state: &JobState, job_id: &str) -> Result<u64, sqlx::Error> {
+    let backend = state.db_backend;
+    let insert = adapt_sql(
+        "INSERT INTO happyview_backfill_queue (job_id, collection, did) \
+         SELECT job_id, collection, did FROM happyview_backfill_failures \
+         WHERE job_id = ? AND state = 'pending' AND phase = 'fetch' AND collection <> '' \
+         ON CONFLICT DO NOTHING",
+        backend,
+    );
+    let total = adapt_sql(
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            super::saturating_counter("total_repos", "?", backend)
+        ),
+        backend,
+    );
+    happyview_provider::db::retry_on_busy(|| async {
+        let mut tx = state.backfill_db.begin().await?;
+        let added = happyview_provider::db::query(&insert)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if added > 0 {
+            happyview_provider::db::query(&total)
+                .bind(i32::try_from(added).unwrap_or(i32::MAX))
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(added)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
