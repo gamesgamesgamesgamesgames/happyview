@@ -7,7 +7,13 @@ import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 
 /** Shown in place of the space moderation pages while the inspector is off. */
-export function InspectorDisabled({ title }: { title: string }) {
+export function InspectorDisabled({
+  title,
+  children,
+}: {
+  title: string;
+  children?: React.ReactNode;
+}) {
   const { hasPermission } = useCurrentUser();
 
   return (
@@ -22,6 +28,7 @@ export function InspectorDisabled({ title }: { title: string }) {
             <Link href="/dashboard/settings/general/">Open settings</Link>
           </Button>
         )}
+        {children}
       </div>
     </>
   );

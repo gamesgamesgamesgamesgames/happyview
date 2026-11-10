@@ -313,6 +313,26 @@ pub async fn delete_space(
     Ok(result.rows_affected() > 0)
 }
 
+/// Every space with a managing-app read or write rule: the managedspaces, and
+/// any whose rules predate policies and pair a managing app with something
+/// else. [`crate::spaces::retired`] tells the two apart.
+pub async fn list_spaces_with_managing_app_rules(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Vec<Space>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces \
+         WHERE read_policy LIKE '%managingAppPolicy%' OR write_policy LIKE '%managingAppPolicy%' \
+         ORDER BY created_at, id",
+        backend,
+    );
+    let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
+    rows.into_iter().map(parse_space_row).collect()
+}
+
 type SpaceRow = (
     String,         // id
     String,         // did
