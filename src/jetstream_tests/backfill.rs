@@ -1260,6 +1260,41 @@ async fn the_failure_set_outlives_a_flush_and_the_retention_sweep() {
     assert_eq!(failure_set(&state, "job-kept").await.len(), 1);
 }
 
+/// HAP-421: a job with a failure set retries from it alone. Its capped error
+/// log is read only for a job from before the failure set, so a repo it
+/// lists that the failure set has as recovered is not retried again.
+#[tokio::test]
+async fn retry_failed_reads_the_error_log_only_without_a_failure_set() {
+    let state = state_with_errors_job("job-both", Some(POST), "{}").await;
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-both', 'did:plc:back', ?, 'fetch', 'timeout', 'recovered', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+    insert_error(
+        &state,
+        "job-both",
+        "did:plc:back",
+        "fetch",
+        BackfillErrorKind::Timeout,
+    )
+    .await;
+    let refused = retry_failed_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path("job-both".to_string()),
+        Json(RetryFailedBody { kinds: None }),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AdminError::BadRequest(_))),
+        "the error log's copy of a recovered repo is not retried"
+    );
+}
+
 /// HAP-421: a second retry-failed of a job is refused while its first retry
 /// is unfinished, and allowed once it has finished.
 #[tokio::test]

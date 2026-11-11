@@ -456,6 +456,8 @@ pub async fn complete_unit_clearing(
         for collection in fetched {
             happyview_provider::db::query(&recover)
                 .bind(&now)
+                .bind(job_id)
+                .bind(job_id)
                 .bind(&unit.did)
                 .bind(job_id)
                 .bind(collection)

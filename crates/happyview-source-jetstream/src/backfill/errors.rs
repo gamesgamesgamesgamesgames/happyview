@@ -313,11 +313,17 @@ pub(crate) async fn mark_failure(
 /// Mark `did`'s rows for `collection` recovered: in `job_id`'s failure set,
 /// and in that of the job `job_id` retries (`retry_of`), whose resolve
 /// failures for `did` are recovered too, since `did` resolved here.
+///
+/// `job_id IN (…) AND did = ?` leads so Postgres can use the primary key: it
+/// runs in every unit's completion, over a table no sweep clears. A `NULL`
+/// `retry_of` drops out of the `IN`.
+///
+/// Binds: now, job_id, job_id, did, job_id, collection, job_id, collection.
 pub(crate) const RECOVER_SQL: &str = "UPDATE happyview_backfill_failures SET state = 'recovered', last_at = ? \
-     WHERE did = ? AND state <> 'recovered' AND ( \
-       (job_id = ? AND collection = ?) \
-       OR (job_id IN (SELECT retry_of FROM happyview_backfill_jobs WHERE id = ? AND retry_of IS NOT NULL) \
-           AND (collection = ? OR phase = 'resolve')))";
+     WHERE job_id IN (?, (SELECT retry_of FROM happyview_backfill_jobs WHERE id = ?)) \
+       AND did = ? AND state <> 'recovered' \
+       AND ((job_id = ? AND collection = ?) \
+            OR (job_id <> ? AND (collection = ? OR phase = 'resolve')))";
 
 /// [`RECOVER_SQL`] for one collection fetched whole.
 pub(crate) async fn mark_recovered(state: &JobState, job_id: &str, did: &str, collection: &str) {
@@ -326,6 +332,8 @@ pub(crate) async fn mark_recovered(state: &JobState, job_id: &str, did: &str, co
     super::job_write(state, job_id, "failure_set", || {
         happyview_provider::db::query(&sql)
             .bind(&now)
+            .bind(job_id)
+            .bind(job_id)
             .bind(did)
             .bind(job_id)
             .bind(collection)
