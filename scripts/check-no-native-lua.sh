@@ -14,13 +14,16 @@ normal_deps() {
     cargo tree --quiet --edges normal --prefix none --format '{p}' "$@" | sort -u
 }
 
-if normal_deps | grep -q '^mlua '; then
+# Each check reads the graph from a here-string, not a pipe: `grep -q` exits
+# at its first match, and under pipefail the SIGPIPE that leaves the writer
+# with would turn a match into a miss, letting the first check pass silently.
+if grep -q '^mlua ' <<<"$(normal_deps)"; then
     echo "mlua is in the default dependency graph" >&2
     cargo tree --edges normal --invert mlua >&2
     exit 1
 fi
 
-if ! normal_deps --features lua-reference | grep -q '^mlua '; then
+if ! grep -q '^mlua ' <<<"$(normal_deps --features lua-reference)"; then
     echo "mlua is absent under --features lua-reference, so this check sees nothing" >&2
     exit 1
 fi
