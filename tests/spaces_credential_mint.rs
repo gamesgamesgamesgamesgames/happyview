@@ -954,3 +954,37 @@ async fn a_delegation_token_does_not_skip_the_rate_limit() {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{token:?}");
     }
 }
+
+/// An account the space no longer admits gets the same answer as one it never
+/// knew, even with a delegation token it obtained while it was a member.
+#[tokio::test]
+#[serial]
+async fn an_account_the_space_no_longer_admits_is_told_it_was_not_found() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let space = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        spaces_db::remove_member(&app.state.db, app.state.db_backend, &space.id, MEMBER)
+            .await
+            .unwrap()
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
+}
