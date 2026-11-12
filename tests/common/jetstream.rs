@@ -1156,6 +1156,28 @@ async fn get_block(
         .into_response()
 }
 
+/// When nonzero, every new connection sends a ping this often after its
+/// queued frames, and no data. Process-wide: set it through [`PingEvery`],
+/// which puts it back when dropped.
+pub static PING_EVERY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pings every `ms` on each new connection until dropped, so a test that
+/// fails can't leave them on for the next.
+pub struct PingEvery;
+
+impl PingEvery {
+    pub fn set(ms: u64) -> Self {
+        PING_EVERY_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for PingEvery {
+    fn drop(&mut self) {
+        PING_EVERY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn serve(
     mut socket: WebSocket,
     frames: Vec<String>,
@@ -1173,8 +1195,15 @@ async fn serve(
             return;
         }
     }
+    let ping_ms = PING_EVERY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut pinger = tokio::time::interval(std::time::Duration::from_millis(ping_ms.max(1)));
     loop {
         tokio::select! {
+            _ = pinger.tick(), if ping_ms > 0 => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            }
             _ = kick.changed() => {
                 let _ = socket.send(Message::Close(None)).await;
                 return;
