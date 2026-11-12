@@ -2249,11 +2249,6 @@ impl ExchangeGeneration {
         }
     }
 
-    /// The error for a user the space does not admit: `SpaceNotFound`, so a
-    /// refusal discloses nothing about the space. The Nov 12 text says so; the
-    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
-    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
-    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
     /// The `kid` a credential for this request is signed under, where the
     /// space is on a DID of its own. Simplespace verifiers look the key up as
     /// `#atproto_space`, which a space DID publishes beside `#atproto`.
@@ -2264,6 +2259,11 @@ impl ExchangeGeneration {
         }
     }
 
+    /// The error for a user the space does not admit: `SpaceNotFound`, so a
+    /// refusal discloses nothing about the space. The Nov 12 text says so; the
+    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
+    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
+    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
     fn refused_user(self) -> AppError {
         AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,
