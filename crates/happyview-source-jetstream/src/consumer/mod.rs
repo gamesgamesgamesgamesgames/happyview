@@ -518,6 +518,8 @@ enum Ended {
     CollectionsChanged,
     Closed(String),
     Renumbered,
+    /// No data frame for this long: the socket is open but silent.
+    Stalled(Duration),
 }
 
 /// Clears the status's worker counters when `run` exits by any path.
@@ -748,6 +750,12 @@ async fn run_session(
             std::future::pending::<()>().await;
         }
     });
+    // Pushed back by every data frame. An open socket that delivers nothing
+    // ends the session here rather than waiting on the peer forever: TCP
+    // alone may never notice a connection the far side has dropped. Pings
+    // don't count, as a server can answer them while its stream is stuck.
+    let stall_timeout = settings.stall_timeout;
+    let mut stalled = std::pin::pin!(tokio::time::sleep(stall_timeout.unwrap_or_default()));
 
     let ended = loop {
         tokio::select! {
@@ -757,6 +765,10 @@ async fn run_session(
                     Some(Err(e)) => break Ended::Closed(e.to_string()),
                     None => break Ended::Closed("connection closed".to_string()),
                 };
+                if let (Message::Text(_) | Message::Binary(_), Some(timeout)) = (&message, stall_timeout) {
+                    stalled.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    status::frame_received();
+                }
                 let text = match message {
                     Message::Text(text) => text.as_str().to_owned(),
                     Message::Binary(frame) => match dictionary.as_deref() {
@@ -863,6 +875,9 @@ async fn run_session(
                 since_flush = 0;
             }
             _ = &mut collections_changed => break Ended::CollectionsChanged,
+            _ = &mut stalled, if stall_timeout.is_some() => {
+                break Ended::Stalled(stall_timeout.unwrap_or_default());
+            }
         }
     };
 
@@ -892,6 +907,29 @@ async fn run_session(
         Ended::Renumbered => {
             tracing::warn!("jetstream's seqs started over; reconnecting by witnessed time");
             SessionEnd::Renumbered
+        }
+        Ended::Stalled(timeout) => {
+            tracing::warn!(
+                idle_secs = timeout.as_secs(),
+                "no frame from jetstream for {}s; reconnecting",
+                timeout.as_secs()
+            );
+            state
+                .host
+                .log_event(ProviderEvent {
+                    event_type: "jetstream.stalled".to_string(),
+                    severity: Severity::Warn,
+                    actor_did: None,
+                    subject: None,
+                    detail: serde_json::json!({
+                        "idle_secs": timeout.as_secs(),
+                        "host": host,
+                        "protocol": protocol.as_str(),
+                        "delivered": delivered,
+                    }),
+                })
+                .await;
+            SessionEnd::Closed { delivered }
         }
         Ended::Closed(reason) => {
             tracing::warn!(%reason, "jetstream disconnected");

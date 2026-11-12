@@ -23,6 +23,14 @@ pub(crate) struct JetstreamStatus {
     pub applied_time_us: Option<i64>,
     /// Milliseconds from `applied_time_us` to now.
     pub lag_ms: Option<i64>,
+    /// When the current connection last delivered a data frame, in unix
+    /// milliseconds; `None` before its first one.
+    pub last_frame_ms: Option<i64>,
+    /// Milliseconds since the current connection last delivered a data frame,
+    /// or since it connected when none has arrived yet; `None` while
+    /// disconnected. Unlike `lag_ms`, it grows on a stalled connection even
+    /// before anything was applied.
+    pub idle_ms: Option<i64>,
     /// Events waiting in each worker's queue.
     pub worker_queue_depths: Vec<usize>,
     /// Per worker, when the job it is applying (or retrying) started, in unix
@@ -36,11 +44,19 @@ pub(crate) struct JetstreamStatus {
 #[derive(Default)]
 struct Live {
     status: JetstreamStatus,
+    /// When the current connection was made, in unix milliseconds.
+    connected_ms: Option<i64>,
     depths: Option<Arc<Vec<AtomicUsize>>>,
     busy_since: Option<Arc<Vec<AtomicI64>>>,
 }
 
 static LIVE: LazyLock<Mutex<Live>> = LazyLock::new(Mutex::default);
+
+/// The last data frame's arrival, in unix milliseconds; `NO_FRAME` for none
+/// on this connection. An atomic, not part of `LIVE`, because it is written
+/// once per frame.
+static LAST_FRAME_MS: AtomicI64 = AtomicI64::new(NO_FRAME);
+const NO_FRAME: i64 = i64::MIN;
 
 fn live() -> MutexGuard<'static, Live> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
@@ -53,10 +69,19 @@ pub(crate) fn connected(protocol: Protocol, host: &str, dictionary_id: Option<u3
     live.status.connected = true;
     live.status.compression = dictionary_id.is_some();
     live.status.dictionary_id = dictionary_id;
+    live.connected_ms = Some(chrono::Utc::now().timestamp_millis());
+    LAST_FRAME_MS.store(NO_FRAME, Ordering::Relaxed);
+}
+
+/// A data frame arrived on the current connection.
+pub(crate) fn frame_received() {
+    LAST_FRAME_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
 }
 
 pub(crate) fn disconnected() {
-    live().status.connected = false;
+    let mut live = live();
+    live.status.connected = false;
+    live.connected_ms = None;
 }
 
 pub(crate) fn applied(point: &CursorPoint) {
@@ -87,6 +112,17 @@ fn snapshot_at(now_us: i64) -> JetstreamStatus {
     let mut status = live.status.clone();
     status.now_ms = now_us / 1000;
     status.lag_ms = status.applied_time_us.map(|t| ((now_us - t) / 1000).max(0));
+    let now_ms = now_us / 1000;
+    let last_frame = LAST_FRAME_MS.load(Ordering::Relaxed);
+    status.last_frame_ms = (status.connected && last_frame != NO_FRAME).then_some(last_frame);
+    status.idle_ms = if status.connected {
+        status
+            .last_frame_ms
+            .or(live.connected_ms)
+            .map(|since| (now_ms - since).max(0))
+    } else {
+        None
+    };
     status.worker_queue_depths = live
         .depths
         .as_ref()
@@ -135,8 +171,28 @@ mod tests {
 
         assert_eq!(status.now_ms, 3_500);
 
+        // Connected with no frame yet: idle since the connection, and no
+        // last frame. (The connection's time is the real clock, so only
+        // its presence is checked here.)
+        assert_eq!(status.last_frame_ms, None);
+        let now_us = chrono::Utc::now().timestamp_micros();
+        assert!(snapshot_at(now_us).idle_ms.is_some());
+        // A frame at 2.0 s, seen at 3.5 s: idle 1.5 s, while lag still
+        // counts from what was applied.
+        LAST_FRAME_MS.store(2_000, Ordering::Relaxed);
+        let status = snapshot_at(3_500_000);
+        assert_eq!(status.last_frame_ms, Some(2_000));
+        assert_eq!(status.idle_ms, Some(1_500));
+        assert_eq!(status.lag_ms, Some(2_500));
+        // A new connection starts without a last frame.
+        connected(Protocol::V2, "js.example.com", Some(7));
+        assert_eq!(snapshot_at(3_500_000).last_frame_ms, None);
+
         disconnected();
-        assert!(!snapshot_at(3_500_000).connected);
+        let status = snapshot_at(3_500_000);
+        assert!(!status.connected);
+        assert_eq!(status.last_frame_ms, None);
+        assert_eq!(status.idle_ms, None);
 
         clear_workers();
         let status = snapshot_at(3_500_000);
