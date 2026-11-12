@@ -1211,6 +1211,38 @@ export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
 }
 
+/** A HappyView version the update check found. */
+export interface HappyViewOffer {
+  version: string;
+  channel: string;
+  releasedAt: string | null;
+  /** The release notes. */
+  releaseUrl: string | null;
+  upgradeGuideUrl: string;
+  /** Always `routine` until releases can be marked as security fixes. */
+  severity: "routine" | "security";
+}
+
+/** What `/admin/update-status` says about this instance's version. */
+export interface UpdateStatus {
+  state: "unknown" | "current" | "available" | "disabled" | "dev";
+  current: string;
+  channel: string | null;
+  /** A newer version on this instance's own channel. */
+  available: HappyViewOffer | null;
+  /** A version on another line worth knowing about, never an upgrade
+   * offer: a prerelease's version released as stable, or a new major. */
+  otherLine: HappyViewOffer | null;
+  checkedAt: string | null;
+  lastError: string | null;
+  /** A hosting platform upgrades this instance. */
+  managed: boolean;
+}
+
+export function getUpdateStatus() {
+  return apiFetch<UpdateStatus>("/admin/update-status");
+}
+
 export function addPlugin(body: { url: string; sha256?: string }) {
   return apiFetch<PluginSummary>("/admin/plugins", {
     method: "POST",

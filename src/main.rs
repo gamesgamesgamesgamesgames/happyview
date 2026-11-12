@@ -895,6 +895,22 @@ async fn main() {
         official_registry.clone(),
     );
 
+    // v2 has no telemetry_managed_by, so a 2.x instance is never reported as
+    // run by a hosting platform.
+    let update_check_config = happyview::update_check::UpdateCheckConfig::from_env();
+    let update_status = happyview::update_check::UpdateStatus::initial(
+        happyview::version::version(),
+        update_check_config.enabled(),
+        false,
+    )
+    .into_shared();
+    happyview::update_check::spawn_check_task(
+        update_check_config,
+        update_status.clone(),
+        db_pool.clone(),
+        db_backend,
+    );
+
     let proxy_config = {
         let json_str =
             happyview::admin::settings::get_setting(&db_pool, "xrpc_proxy_config", db_backend)
@@ -940,6 +956,7 @@ async fn main() {
         attestation_signer,
         official_registry,
         official_registry_config,
+        update_status,
         proxy_config,
         backfill_events_tx,
         verbose_event_logging,

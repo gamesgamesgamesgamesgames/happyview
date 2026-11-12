@@ -826,6 +826,12 @@ mod tests {
             )),
             official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
             ),
+            update_status: crate::update_check::UpdateStatus::initial(
+                crate::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 crate::proxy_config::ProxyConfig::default(),
             ))),
