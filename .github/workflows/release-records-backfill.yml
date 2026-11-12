@@ -41,7 +41,6 @@ jobs:
   plan:
     runs-on: depot-ubuntu-24.04
     env:
-      GH_TOKEN: ${{ github.token }}
       REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
       LEGACY: ${{ inputs.include-legacy && '--include-legacy' || '' }}
     steps:
@@ -51,6 +50,8 @@ jobs:
           persist-credentials: false
 
       - name: List the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # shellcheck disable=SC2086 # LEGACY is one flag or nothing.
           bash scripts/registry/backfill-list.sh $LEGACY > releases.json
@@ -71,8 +72,10 @@ jobs:
           releases: releases.json
           dry-run: "true"
 
+  # Writes only when the dispatch turns dry-run off and publishing is on for
+  # the repository, the same switch the release job's publish waits on.
   publish:
-    if: ${{ !inputs.dry-run }}
+    if: ${{ !inputs.dry-run && vars.PUBLISH_RELEASE_RECORDS == 'true' }}
     needs: plan
     runs-on: depot-ubuntu-24.04
     environment: release-records
