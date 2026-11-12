@@ -820,7 +820,9 @@ pub(crate) struct DiscoveryCursor {
 
 /// Why one collection's discovery stopped short.
 pub(crate) enum DiscoveryError {
-    /// The relay would not list the collection. As before, it is skipped.
+    /// The relay would not give a page, after every retry. The collection's
+    /// cursor stays where it was, so the job does not complete and resuming it
+    /// continues from there.
     Relay(String),
     /// The queue could not be written. The job fails rather than finishing
     /// on a partial list.
@@ -853,6 +855,19 @@ pub(crate) async fn load_discovery_cursors(
         .collect())
 }
 
+/// The collections in `collections` whose listing has not reached its end:
+/// no saved cursor, or one with `done = 0`.
+pub(crate) fn unfinished_collections(
+    collections: &[String],
+    cursors: &HashMap<String, DiscoveryCursor>,
+) -> Vec<String> {
+    collections
+        .iter()
+        .filter(|c| !cursors.get(*c).is_some_and(|cursor| cursor.done))
+        .cloned()
+        .collect()
+}
+
 pub(crate) async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i32, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT total_repos FROM happyview_backfill_jobs WHERE id = ?",
@@ -865,46 +880,125 @@ pub(crate) async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i3
     Ok(total.unwrap_or(0))
 }
 
-/// One `listReposByCollection` page, sleeping through rate limits. `Ok(None)`
-/// means the job stopped while it waited out a rate limit.
+/// How discovery retries a relay page that failed with a transport error, a
+/// 5xx or a body it could not read. A 429 is waited out as before and does not
+/// count as a failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayRetry {
+    /// Attempts per page, the first included. Once they are spent, the
+    /// collection's discovery stops at its saved cursor and the job does not
+    /// complete.
+    pub max_attempts: u32,
+    /// The wait after the first failure. Each later failure doubles it.
+    pub base_delay: Duration,
+    /// The longest wait between attempts, before jitter and `Retry-After`.
+    pub max_delay: Duration,
+}
+
+impl Default for RelayRetry {
+    /// About two minutes of retries per page: 1, 2, 4, 8, 16, 32 and 60
+    /// seconds, each jittered.
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The wait after the `failures`-th failed attempt at a relay page: the
+/// doubling backoff, capped, then jittered into its upper half by `jitter`
+/// (from `[0, 1)`), and never shorter than the relay's `Retry-After`.
+pub fn relay_retry_delay(
+    policy: &RelayRetry,
+    failures: u32,
+    retry_after: Option<Duration>,
+    jitter: f64,
+) -> Duration {
+    let doublings = failures.saturating_sub(1).min(20);
+    let backoff = policy
+        .base_delay
+        .saturating_mul(1u32 << doublings)
+        .min(policy.max_delay);
+    let jittered = backoff.mul_f64(0.5 + jitter.clamp(0.0, 1.0) / 2.0);
+    match retry_after {
+        Some(wait) => jittered.max(wait),
+        None => jittered,
+    }
+}
+
+/// Sleep for `wait` in one-second slices, so a pause or cancel is not held up
+/// by a long wait. Returns false if the job stopped meanwhile.
+pub(crate) async fn sleep_unless_cancelled(wait: Duration, cancelled: &AtomicBool) -> bool {
+    let until = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < until {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_secs(1)))
+            .await;
+    }
+    !cancelled.load(Ordering::Relaxed)
+}
+
+/// One `listReposByCollection` page. Rate limits are slept through; transport
+/// errors, 5xx responses and bodies that do not parse are retried under
+/// `state.config.relay_retry`. `Ok(None)` means the job stopped while it
+/// waited. An `Err` is a page the relay would not give after every attempt
+/// (or a 4xx, which no retry changes).
 pub(crate) async fn fetch_relay_page(
     state: &JobState,
     url: &str,
     collection: &str,
     cancelled: &AtomicBool,
 ) -> Result<Option<ListReposResponse>, String> {
-    let resp = loop {
-        let r = state
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("relay request failed: {e}"))?;
-        if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = parse_retry_after(r.headers());
-            tracing::warn!(collection, wait, "rate limited by relay, sleeping");
-            // In slices, so a pause or cancel is not held up by a long reset.
-            let until = tokio::time::Instant::now() + Duration::from_secs(wait);
-            while tokio::time::Instant::now() < until {
-                if cancelled.load(Ordering::Relaxed) {
+    let policy = state.config.relay_retry;
+    let mut failures: u32 = 0;
+    loop {
+        let (error, retry_after) = match state.http.get(url).send().await {
+            // Without the URL: it carries the relay cursor, which goes no
+            // further than the job's own rows.
+            Err(e) => (format!("relay request failed: {}", e.without_url()), None),
+            Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let wait = parse_retry_after(r.headers());
+                tracing::warn!(collection, wait, "rate limited by relay, sleeping");
+                if !sleep_unless_cancelled(Duration::from_secs(wait), cancelled).await {
                     return Ok(None);
                 }
-                tokio::time::sleep_until(
-                    until.min(tokio::time::Instant::now() + Duration::from_secs(1)),
-                )
-                .await;
+                continue;
             }
-            continue;
+            Ok(r) if r.status().is_server_error() => {
+                let headers = r.headers();
+                let retry_after = (headers.contains_key("retry-after")
+                    || headers.contains_key("ratelimit-reset"))
+                .then(|| Duration::from_secs(parse_retry_after(headers)));
+                (format!("relay returned {}", r.status()), retry_after)
+            }
+            Ok(r) if !r.status().is_success() => {
+                return Err(format!("relay returned {}", r.status()));
+            }
+            Ok(r) => match r.json::<ListReposResponse>().await {
+                Ok(body) => return Ok(Some(body)),
+                Err(e) => (format!("invalid relay response: {e}"), None),
+            },
+        };
+        failures += 1;
+        if failures >= policy.max_attempts.max(1) {
+            return Err(format!("{error} (gave up after {failures} attempts)"));
         }
-        break r;
-    };
-    if !resp.status().is_success() {
-        return Err(format!("relay returned {}", resp.status()));
+        let wait = relay_retry_delay(&policy, failures, retry_after, rand::random::<f64>());
+        tracing::warn!(
+            collection,
+            attempt = failures,
+            wait_ms = wait.as_millis() as u64,
+            error,
+            "relay page failed, retrying"
+        );
+        if !sleep_unless_cancelled(wait, cancelled).await {
+            return Ok(None);
+        }
     }
-    resp.json()
-        .await
-        .map(Some)
-        .map_err(|e| format!("invalid relay response: {e}"))
 }
 
 /// Enqueue one relay page, save the cursor that follows it and add to the
@@ -1110,7 +1204,7 @@ pub(crate) async fn discover_all(
 
     // Each future owns its handles rather than borrowing this function's, so
     // the stream stays `Send` inside the spawned discovery task.
-    let outcomes: Vec<(String, Result<bool, DiscoveryError>)> = stream::iter(collections)
+    let outcomes: Vec<(String, Result<bool, DiscoveryError>)> = stream::iter(collections.clone())
         .map(|collection| {
             let start = cursors.get(&collection).cloned();
             let state = state.clone();
@@ -1140,6 +1234,7 @@ pub(crate) async fn discover_all(
         .await;
 
     let mut stopped = false;
+    let mut unfinished = false;
     let mut database_error = None;
     for (collection, outcome) in outcomes {
         match outcome {
@@ -1150,9 +1245,11 @@ pub(crate) async fn discover_all(
                 database_error = Some(e);
             }
             Err(DiscoveryError::Relay(e)) => {
-                // As before, a collection the relay will not list is skipped
-                // rather than failing the job.
-                tracing::warn!(job_id, collection = %collection, error = %e, "failed to discover repos, skipping");
+                // Not skipped: the collection's cursor stays unfinished, so
+                // the job pauses rather than completes, and resuming it
+                // picks discovery up from that cursor.
+                unfinished = true;
+                tracing::warn!(job_id, collection = %collection, error = %e, "failed to discover repos; discovery is unfinished");
                 state
                     .host
                     .log_event(ProviderEvent {
@@ -1173,7 +1270,19 @@ pub(crate) async fn discover_all(
     if let Some(e) = database_error {
         return Err(e);
     }
-    if stopped {
+    if stopped || unfinished {
+        return Ok(());
+    }
+
+    // Every collection said it reached the end of its listing. Check that
+    // against the saved cursors before saying so for good: a resumed job
+    // never runs discovery again once it is marked complete.
+    let saved = load_discovery_cursors(state, job_id)
+        .await
+        .map_err(|e| format!("failed to read the backfill discovery cursors: {e}"))?;
+    let open = unfinished_collections(&collections, &saved);
+    if !open.is_empty() {
+        tracing::warn!(job_id, collections = ?open, "backfill discovery has unfinished cursors; not marking it complete");
         return Ok(());
     }
 
