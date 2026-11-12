@@ -787,6 +787,12 @@ async fn apply_writes(
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
+    for write in &input.writes {
+        let (WriteOp::Create { collection, .. }
+        | WriteOp::Update { collection, .. }
+        | WriteOp::Delete { collection, .. }) = write;
+        crate::spaces::publish::refuse_direct_write(collection)?;
+    }
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_membership(
         &state,
