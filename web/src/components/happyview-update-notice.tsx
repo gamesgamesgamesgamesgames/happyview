@@ -12,7 +12,7 @@ import {
   type UpdateStatus,
 } from "@/lib/api";
 
-/** The server checks every six hours; the dashboard asks it this often. */
+/** The server checks once a day; the dashboard asks it this often. */
 const POLL_MS = 30 * 60 * 1000;
 
 /** How long a security notice stays dismissed. A routine one stays
