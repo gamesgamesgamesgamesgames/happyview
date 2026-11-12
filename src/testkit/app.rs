@@ -191,6 +191,7 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_backfill_completions",
                 "happyview_backfill_pds_stats",
                 "happyview_backfill_cursors",
+                "happyview_backfill_failures",
                 "happyview_backfill_queue",
                 "happyview_backfill_replay_retries",
                 "happyview_backfill_replay_sweeps",

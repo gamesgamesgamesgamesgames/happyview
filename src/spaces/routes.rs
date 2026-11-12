@@ -2108,25 +2108,23 @@ async fn get_space_credential(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let space = service::resolve_space(&state, &input.space)
-        .await
-        .map_err(|e| match e {
-            AppError::NotFound(_) => refused("SpaceNotFound", "space not found".into()),
-            e => e,
-        })?;
+    // Everything the assertions are checked against comes from the address,
+    // so they are verified before the space is looked up, and a request
+    // carrying bad ones is answered the same whether the space exists or not.
+    let address = crate::spaces::SpaceUri::parse(&input.space)?;
     let space_uri = format!(
         "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
+        address.did, address.type_nsid, address.skey
     );
     // Proposal 0016 addresses both assertions to the space host, the
     // authority's `#atproto_pds`. Simplespace addressed a delegation token to
     // `#atproto_space_host`, and a client attestation to the bare DID.
-    let host_aud = format!("{}#atproto_pds", space.did);
-    let legacy_host_aud = format!("{}#atproto_space_host", space.did);
+    let host_aud = format!("{}#atproto_pds", address.did);
+    let legacy_host_aud = format!("{}#atproto_space_host", address.did);
     let (delegation_auds, attestation_aud): (Vec<&str>, &str) = match generation {
         ExchangeGeneration::G0 => (
             vec![legacy_host_aud.as_str(), host_aud.as_str()],
-            space.did.as_str(),
+            address.did.as_str(),
         ),
         _ => (vec![host_aud.as_str()], host_aud.as_str()),
     };
@@ -2171,13 +2169,17 @@ async fn get_space_credential(
         None => None,
     };
 
-    crate::spaces::auth::check_app_access(&space, client_id.as_deref()).map_err(|e| {
-        AppError::XrpcError {
-            status: StatusCode::FORBIDDEN,
-            code: "AppNotAuthorized",
-            message: e.to_string(),
-        }
-    })?;
+    let space = service::resolve_space(&state, &space_uri)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => refused("SpaceNotFound", "space not found".into()),
+            e => e,
+        })?;
+
+    // The account is settled before the app: an account the space does not
+    // admit is answered `SpaceNotFound` (`refused_user`), whichever app it
+    // came through. The app is checked in `issue_credential`, after the
+    // space's policy admits the account.
 
     // A space that anyone may read needs no user. A managing app may decide
     // a read with no user, so its space asks it, with no `repo`: only an app
