@@ -57,6 +57,12 @@ pub const UPGRADE_GUIDE_URL: &str = "https://happyview.dev/docs/guides/upgrading
 /// hundred bytes.
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 
+/// The largest DID document read. One is a few hundred bytes.
+const MAX_DID_DOC_BYTES: usize = 64 * 1024;
+
+/// The longest one whole check may take, every request included.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The settings row the last good answer is kept in, so a restart while the
 /// publisher's PDS is down still knows what it knew.
 const SETTING_KEY: &str = "update_check_last";
@@ -247,8 +253,10 @@ pub enum CheckError {
     Resolve(String),
     #[error("request to the publisher's PDS failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("the publisher's PDS answered {status} for {what}")]
+    #[error("the publisher's PDS answered HTTP {status} for {what}")]
     Status { what: String, status: u16 },
+    #[error("the update check took longer than {0:?}")]
+    TimedOut(Duration),
     #[error("the publisher's PDS answered {what} with {name}")]
     Xrpc { what: String, name: String },
     #[error("{0}")]
@@ -268,6 +276,65 @@ fn parse(version: &str) -> Option<semver::Version> {
 /// `version` with its prerelease dropped: `3.0.0-beta.4` is `3.0.0`.
 fn release_of(v: &semver::Version) -> semver::Version {
     semver::Version::new(v.major, v.minor, v.patch)
+}
+
+/// The body of `response`, at most `limit` bytes.
+async fn read_body(
+    response: reqwest::Response,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>, CheckError> {
+    use crate::plugin::registry_source::{ReadError, read_capped};
+    match read_capped(response, limit).await {
+        Ok(b) => Ok(b),
+        Err(ReadError::Http(e)) => Err(e.into()),
+        Err(ReadError::TooLarge { limit }) => Err(CheckError::Invalid(format!(
+            "{what} is larger than {limit} bytes"
+        ))),
+    }
+}
+
+/// The publisher's PDS, from its DID document in the PLC directory. The
+/// document is read with a size cap, and only an https endpoint is used.
+async fn resolve_pds(
+    client: &reqwest::Client,
+    plc_url: &str,
+    https_only: bool,
+) -> Result<String, CheckError> {
+    let url = format!("{}/{PUBLISHER_DID}", plc_url.trim_end_matches('/'));
+    let response = client.get(&url).send().await?;
+    let status = response.status();
+    let bytes = read_body(response, MAX_DID_DOC_BYTES, "the publisher's DID document").await?;
+    if !status.is_success() {
+        return Err(CheckError::Resolve(format!(
+            "the PLC directory answered HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| CheckError::Resolve(format!("the DID document isn't JSON: {e}")))?;
+    if doc["id"].as_str() != Some(PUBLISHER_DID) {
+        return Err(CheckError::Resolve(
+            "the DID document is for another DID".into(),
+        ));
+    }
+    let full_id = format!("{PUBLISHER_DID}#atproto_pds");
+    let endpoint = doc["service"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| {
+            let id = s["id"].as_str();
+            id == Some("#atproto_pds") || id == Some(full_id.as_str())
+        })
+        .and_then(|s| s["serviceEndpoint"].as_str())
+        .ok_or_else(|| CheckError::Resolve("the DID document names no PDS".into()))?;
+    if https_only && !is_https(endpoint) {
+        return Err(CheckError::Resolve(format!(
+            "the publisher's PDS is not an https URL: {endpoint}"
+        )));
+    }
+    Ok(endpoint.to_owned())
 }
 
 /// A record as `com.atproto.repo.getRecord` answers it.
@@ -296,16 +363,7 @@ async fn get_record(
     );
     let response = client.get(&url).send().await?;
     let status = response.status();
-    let bytes = match crate::plugin::registry_source::read_capped(response, MAX_RECORD_BYTES).await
-    {
-        Ok(b) => b,
-        Err(crate::plugin::registry_source::ReadError::Http(e)) => return Err(e.into()),
-        Err(crate::plugin::registry_source::ReadError::TooLarge { limit }) => {
-            return Err(CheckError::Invalid(format!(
-                "{what} is larger than {limit} bytes"
-            )));
-        }
-    };
+    let bytes = read_body(response, MAX_RECORD_BYTES, &what).await?;
     let body: Option<Value> = serde_json::from_slice(&bytes).ok();
     if let Some(name) = body
         .as_ref()
@@ -322,13 +380,16 @@ async fn get_record(
         };
     }
     match body {
-        Some(value) if status.is_success() => serde_json::from_value(value)
-            .map(Some)
-            .map_err(|e| CheckError::Invalid(format!("{what} is unreadable: {e}"))),
-        _ => Err(CheckError::Status {
+        _ if !status.is_success() => Err(CheckError::Status {
             what,
             status: status.as_u16(),
         }),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| CheckError::Invalid(format!("{what} is unreadable: {e}"))),
+        None => Err(CheckError::Invalid(format!(
+            "the publisher's PDS answered {what} with something that isn't JSON"
+        ))),
     }
 }
 
@@ -391,6 +452,17 @@ pub async fn check_once(
     plc_url: &str,
     previous: &UpdateStatus,
 ) -> Result<UpdateStatus, CheckError> {
+    check_once_with(client, plc_url, previous, true).await
+}
+
+/// [`check_once`], with the https requirement on the PDS endpoint as a
+/// parameter so tests can serve a PDS over plain http. Always `true` in use.
+async fn check_once_with(
+    client: &reqwest::Client,
+    plc_url: &str,
+    previous: &UpdateStatus,
+    https_only: bool,
+) -> Result<UpdateStatus, CheckError> {
     let current = previous.current.as_str();
     let mut next = UpdateStatus {
         last_error: None,
@@ -405,14 +477,16 @@ pub async fn check_once(
         return Ok(next);
     };
 
-    let pds = crate::profile::resolve_pds_endpoint_once(client, plc_url, PUBLISHER_DID)
-        .await
-        .map_err(|e| CheckError::Resolve(e.message))?;
+    let pds = resolve_pds(client, plc_url, https_only).await?;
 
     let channel = line.channel();
     let own = resolve(client, &pds, &channel).await?;
     next.channel = Some(channel.clone());
+    // Only a newer version on this very line is offered: a channel record
+    // pointing at another line's version is not an upgrade, whatever its
+    // number.
     next.available = own
+        .filter(|r| Line::of(&r.version).as_ref() == Some(&line))
         .filter(|r| parse(&r.version).is_some_and(|offered| offered > running))
         .map(|r| r.offer(&channel, current));
     next.state = if next.available.is_some() {
@@ -422,19 +496,25 @@ pub async fn check_once(
     };
 
     // The stable line, mentioned when it has something for this instance: a
-    // prerelease's own version released, or a newer major.
-    if let Some(stable) = resolve(client, &pds, LATEST).await?
-        && let Some(stable_version) = parse(&stable.version)
-    {
-        let worth_mentioning = match &line {
-            Line::Stable { major } => stable_version.major > *major,
-            Line::Beta { .. } | Line::Alpha { .. } => {
-                stable_version.pre.is_empty() && stable_version >= release_of(&running)
+    // prerelease's own version released, or a newer major. Only ever a
+    // stable release. Reading it is a separate question from the instance's
+    // own line, so a failure here keeps the answer above and says why.
+    match resolve(client, &pds, LATEST).await {
+        Ok(Some(stable)) => {
+            if let Some(stable_version) = parse(&stable.version).filter(|v| v.pre.is_empty()) {
+                let worth_mentioning = match &line {
+                    Line::Stable { major } => stable_version.major > *major,
+                    Line::Beta { .. } | Line::Alpha { .. } => {
+                        stable_version >= release_of(&running)
+                    }
+                };
+                if worth_mentioning {
+                    next.other_line = Some(stable.offer(LATEST, current));
+                }
             }
-        };
-        if worth_mentioning {
-            next.other_line = Some(stable.offer(LATEST, current));
         }
+        Ok(None) => {}
+        Err(e) => next.last_error = Some(format!("reading the latest channel: {e}")),
     }
     Ok(next)
 }
@@ -485,43 +565,63 @@ pub fn spawn_check_task(
         return None;
     }
     Some(tokio::spawn(async move {
-        {
+        let (dev, current) = {
+            let s = status.read().await;
+            (s.state == State::Dev, s.current.clone())
+        };
+        if dev {
+            return;
+        }
+        // Read before taking the lock, so the dashboard is never kept
+        // waiting on the database.
+        if let Some(stored) = load_stored(&db, backend, &current).await {
             let mut s = status.write().await;
-            if s.state == State::Dev {
-                return;
-            }
-            if let Some(stored) = load_stored(&db, backend, &s.current).await {
-                *s = UpdateStatus {
-                    managed: s.managed,
-                    ..stored
-                };
-            }
+            *s = UpdateStatus {
+                managed: s.managed,
+                ..stored
+            };
         }
         let jitter = rand::random_range(0..STARTUP_JITTER.as_secs());
         tokio::time::sleep(Duration::from_secs(jitter)).await;
         let client = client();
         loop {
-            let previous = status.read().await.clone();
-            match check_once(&client, &config.plc_url, &previous).await {
-                Ok(next) => {
-                    if let Some(offer) = &next.available {
-                        tracing::info!(
-                            current = %next.current,
-                            available = %offer.version,
-                            "update_check: a newer HappyView is available"
-                        );
-                    }
-                    store(&db, backend, &next).await;
-                    *status.write().await = next;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "update_check: check failed");
-                    status.write().await.last_error = Some(e.to_string());
-                }
-            }
+            run_check(&client, &config.plc_url, &status, &db, backend).await;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
     }))
+}
+
+/// One pass of the background task: check, within [`CHECK_TIMEOUT`], and
+/// either store and serve the new answer or keep the last good one and say
+/// why the check failed.
+pub async fn run_check(
+    client: &reqwest::Client,
+    plc_url: &str,
+    status: &SharedUpdateStatus,
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) {
+    let previous = status.read().await.clone();
+    let result = tokio::time::timeout(CHECK_TIMEOUT, check_once(client, plc_url, &previous))
+        .await
+        .unwrap_or(Err(CheckError::TimedOut(CHECK_TIMEOUT)));
+    match result {
+        Ok(next) => {
+            if let Some(offer) = &next.available {
+                tracing::info!(
+                    current = %next.current,
+                    available = %offer.version,
+                    "update_check: a newer HappyView is available"
+                );
+            }
+            store(db, backend, &next).await;
+            *status.write().await = next;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "update_check: check failed");
+            status.write().await.last_error = Some(e.to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -668,10 +768,11 @@ mod tests {
         }
 
         async fn check(&self, current: &str) -> Result<UpdateStatus, CheckError> {
-            check_once(
+            check_once_with(
                 &reqwest::Client::new(),
                 &self.server.uri(),
                 &UpdateStatus::initial(current, true, false),
+                false,
             )
             .await
         }
@@ -827,6 +928,174 @@ mod tests {
                 .await
                 .unwrap_or_default()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_pointing_at_another_lines_version_is_not_offered() {
+        let p = Publisher::start().await;
+        p.channel("v2", "3.0.0").await;
+        p.channel("v3-beta", "3.0.0-alpha.70").await;
+        let stable = p.check("2.17.3").await.unwrap();
+        assert!(stable.available.is_none(), "{stable:?}");
+        let beta = p.check("3.0.0-beta.12").await.unwrap();
+        assert!(beta.available.is_none(), "{beta:?}");
+    }
+
+    #[tokio::test]
+    async fn latest_on_a_prerelease_is_never_mentioned() {
+        let p = Publisher::start().await;
+        p.channel("v2", "2.17.3").await;
+        p.channel(LATEST, "3.0.1-beta.1").await;
+        assert!(p.check("2.17.3").await.unwrap().other_line.is_none());
+        assert!(p.check("3.0.0-beta.12").await.unwrap().other_line.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_latest_keeps_the_own_line_answer() {
+        let p = Publisher::start().await;
+        p.channel("v2", "2.17.4").await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .and(query_param("rkey", format!("{PROJECT}.{LATEST}")))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .mount(&p.server)
+            .await;
+        let status = p.check("2.17.3").await.unwrap();
+        assert_eq!(status.available.expect("offer").version, "2.17.4");
+        assert!(status.other_line.is_none());
+        assert!(status.last_error.expect("why").contains("latest"));
+    }
+
+    #[tokio::test]
+    async fn a_channel_must_point_at_a_happyview_version() {
+        let p = Publisher::start().await;
+        let (value, cid) = version_record("2.17.4");
+        let rkey = "other.2.17.4";
+        p.record(VERSION, rkey, value, &cid).await;
+        p.channel_to(
+            "v2",
+            &format!("at://{PUBLISHER_DID}/{VERSION}/{rkey}"),
+            &cid,
+        )
+        .await;
+        assert!(p.check("2.17.3").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pds_that_is_not_https_is_refused() {
+        let p = Publisher::start().await;
+        p.channel("v2", "2.17.4").await;
+        let err = check_once(
+            &reqwest::Client::new(),
+            &p.server.uri(),
+            &UpdateStatus::initial("2.17.3", true, false),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_did_document_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{PUBLISHER_DID}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("x".repeat(MAX_DID_DOC_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let err = check_once_with(
+            &reqwest::Client::new(),
+            &server.uri(),
+            &UpdateStatus::initial("2.17.3", true, false),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_is_not_json_says_so() {
+        let p = Publisher::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+            .with_priority(1)
+            .mount(&p.server)
+            .await;
+        let err = p.check("2.17.3").await.unwrap_err();
+        assert!(err.to_string().contains("isn't JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_check_off_spawns_nothing_and_sends_nothing() {
+        // SAFETY: serialised with every other test that touches the environment.
+        unsafe { std::env::set_var("UPDATE_CHECK", "off") };
+        let config = UpdateCheckConfig::from_env("http://127.0.0.1:9");
+        unsafe { std::env::remove_var("UPDATE_CHECK") };
+        assert!(!config.enabled);
+        let status = Arc::new(RwLock::new(UpdateStatus::initial("2.17.3", false, false)));
+        let pool = crate::test_support::migrated_memory_pool().await;
+        assert!(spawn_check_task(config, status.clone(), pool, DatabaseBackend::Sqlite).is_none());
+        assert_eq!(status.read().await.state, State::Disabled);
+    }
+
+    #[tokio::test]
+    async fn a_failed_pass_keeps_the_last_good_answer() {
+        let p = Publisher::start().await;
+        p.channel("v2", "2.17.4").await;
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let status = Arc::new(RwLock::new(UpdateStatus::initial("2.17.3", true, false)));
+        let good = p.check("2.17.3").await.unwrap();
+        *status.write().await = good.clone();
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .mount(&p.server)
+            .await;
+        run_check(
+            &reqwest::Client::new(),
+            &p.server.uri(),
+            &status,
+            &pool,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
+        let after = status.read().await.clone();
+        assert_eq!(after.available, good.available);
+        assert_eq!(after.state, State::Available);
+        assert!(after.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stored_answer_is_only_reused_for_the_same_version() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut answer = UpdateStatus::initial("2.17.3", true, false);
+        answer.state = State::Current;
+        store(&pool, DatabaseBackend::Sqlite, &answer).await;
+        assert_eq!(
+            load_stored(&pool, DatabaseBackend::Sqlite, "2.17.3").await,
+            Some(answer.clone())
+        );
+        assert_eq!(
+            load_stored(&pool, DatabaseBackend::Sqlite, "2.17.4").await,
+            None
+        );
+        // A second store replaces the first.
+        answer.state = State::Available;
+        store(&pool, DatabaseBackend::Sqlite, &answer).await;
+        assert_eq!(
+            load_stored(&pool, DatabaseBackend::Sqlite, "2.17.3")
+                .await
+                .unwrap()
+                .state,
+            State::Available
         );
     }
 
