@@ -2280,6 +2280,11 @@ fn exchange_generation(
     headers: &axum::http::HeaderMap,
 ) -> Result<(ExchangeGeneration, String), AppError> {
     match (&input.credential_key, &input.credential_kid) {
+        (Some(key), Some(kid)) if key != kid => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "credentialKey and credentialKid name different keys".into(),
+        }),
         (Some(key), _) => Ok((ExchangeGeneration::G2, key.clone())),
         (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid.clone())),
         (None, None) => {

@@ -586,6 +586,25 @@ async fn the_key_to_bind_is_named_either_way() {
         "the error names the field the request used"
     );
 
+    // Naming two different keys is refused rather than resolved.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(json!({
+            "space": space,
+            "credentialKey": key,
+            "credentialKid": happyview::spaces::http_signature::did_key(syncer_key().verifying_key()),
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_of(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("different keys")
+    );
+
     // Naming neither is the simplespace exchange, which needs its signature.
     let resp = app
         .router

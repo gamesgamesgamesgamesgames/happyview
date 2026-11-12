@@ -460,3 +460,93 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
         .unwrap();
     app.assert_signed_as_space(authorization, authority).await;
 }
+
+fn get_as(app: &TestApp, did: &str, path: &str) -> Request<Body> {
+    let (name, value) = cookie_for(app, did);
+    Request::builder()
+        .uri(path)
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `simplespace.getSpace`, and its `dev.happyview` alias, give a space the
+/// caller may not read the answer they give a space that does not exist.
+#[tokio::test]
+#[serial]
+async fn simplespace_get_space_answers_a_refusal_as_not_found() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let missing = format!("at://{space_did}/space/com.example.creduse/nothing-here");
+
+    for nsid in [
+        "com.atproto.simplespace.getSpace",
+        "dev.happyview.space.getSpace",
+    ] {
+        let path = |space: &str| format!("/xrpc/{nsid}?space={}", urlencoding::encode(space));
+
+        let resp = call(&app, get_as(&app, CREATOR, &path(&missing))).await;
+        let status = resp.status();
+        let absent = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{nsid}: {absent}");
+        assert_eq!(absent["error"], json!("SpaceNotFound"), "{nsid}");
+
+        let stranger = format!("did:plc:stranger{}", Uuid::new_v4().simple());
+        let resp = call(&app, get_as(&app, &stranger, &path(&space))).await;
+        assert_eq!(resp.status(), status, "{nsid}: a non-owner");
+        assert_eq!(json_of(resp).await, absent, "{nsid}: a non-owner");
+
+        let resp = call(&app, read(&path(&space), &credential, &key, MEMBER)).await;
+        assert_eq!(resp.status(), status, "{nsid}: another audience");
+        assert_eq!(json_of(resp).await, absent, "{nsid}: another audience");
+
+        let resp = call(&app, read(&path(&space), &credential, &key, &space_did)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{nsid}: addressed to the space"
+        );
+        let resp = call(&app, get_as(&app, CREATOR, &path(&space))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}: the owner");
+    }
+}
+
+/// `listSpaces` gives the space's revision to its owner, not to a member.
+#[tokio::test]
+#[serial]
+async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let (space, _) = setup(&mut app, &key()).await;
+    let listed = |did: &'static str| {
+        let app = &app;
+        let space = space.clone();
+        async move {
+            let resp = call(app, get_as(app, did, "/xrpc/com.atproto.space.listSpaces")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            json_of(resp).await["spaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["space"] == json!(space))
+                .cloned()
+                .expect("listed")
+        }
+    };
+    let as_member = listed(MEMBER).await;
+    assert!(as_member["spaceRev"].is_null(), "{as_member}");
+    assert!(
+        as_member["repoRev"].is_string(),
+        "the member wrote: {as_member}"
+    );
+    let as_owner = listed(CREATOR).await;
+    assert!(as_owner["spaceRev"].is_string(), "{as_owner}");
+}
