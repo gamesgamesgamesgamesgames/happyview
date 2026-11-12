@@ -21,7 +21,7 @@ use crate::archive::SourceChoice;
 use crate::backfill::errors::{BackfillErrorKind, ERROR_DETAIL_CAP, ErrorCounts};
 use crate::backfill::types::{
     BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob,
-    CreateBackfillBody, ReplayProgress,
+    CreateBackfillBody, ReplayProgress, UnfinishedDiscovery,
 };
 use crate::backfill::*;
 
@@ -66,6 +66,29 @@ pub async fn create_backfill(
         }
     })
     .await?;
+
+    if let Some(cursor) = body.relay_cursor {
+        let Some(collection) = body.collection else {
+            return Err(AdminError::BadRequest(
+                "relay_cursor needs the collection it is a cursor of".into(),
+            ));
+        };
+        if !dids.is_empty() {
+            return Err(AdminError::BadRequest(
+                "relay_cursor is for a network crawl; account backfills discover nothing".into(),
+            ));
+        }
+        if body.source.is_some() && source != SourceChoice::Crawl {
+            return Err(AdminError::BadRequest(
+                "relay_cursor continues a relay listing, so the backfill must crawl".into(),
+            ));
+        }
+        let job_id = start_crawl_from_cursor(&state, &collection, &cursor, &admin.did).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": job_id, "status": "running" })),
+        ));
+    }
 
     let requested = body.source.is_some().then_some(source);
     let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, requested).await?;
@@ -428,6 +451,24 @@ pub async fn backfill_status(
         )
         .collect();
 
+    let open_cursors: Vec<(String, String, Option<String>)> = happyview_provider::db::query_as(&adapt_sql(
+        "SELECT job_id, collection, relay_cursor FROM happyview_backfill_cursors WHERE done = 0 ORDER BY job_id, collection",
+        backend,
+    ))
+    .fetch_all(&state.backfill_db)
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to list backfill discovery cursors: {e}")))?;
+    let mut unfinished: HashMap<String, Vec<UnfinishedDiscovery>> = HashMap::new();
+    for (job_id, collection, relay_cursor) in open_cursors {
+        unfinished
+            .entry(job_id)
+            .or_default()
+            .push(UnfinishedDiscovery {
+                collection,
+                relay_cursor,
+            });
+    }
+
     let jobs: Vec<BackfillJob> = rows
         .into_iter()
         .map(
@@ -453,6 +494,12 @@ pub async fn backfill_status(
                     .remove(&id)
                     .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None, None));
                 let hooks = state.host.job_hook_stats(&id);
+                // An executor checkpoints in the same cursor table, always
+                // with `done = 0`; only a crawl's cursors are discovery.
+                let discovery_unfinished = unfinished
+                    .remove(&id)
+                    .filter(|_| matches!(source.as_str(), "crawl" | "auto"))
+                    .unwrap_or_default();
                 // Written by this crate as JSON, so a row that does not parse
                 // was edited by hand and is left out rather than failing the
                 // listing.
@@ -483,6 +530,7 @@ pub async fn backfill_status(
                     completed_at,
                     created_at,
                     discovery_complete: discovery_complete != 0,
+                    discovery_unfinished,
                     recent_completions_limit: (QueueVersion::from_column(queue_version)
                         == QueueVersion::Bounded)
                         .then_some(RECENT_COMPLETIONS_PER_JOB),

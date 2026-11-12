@@ -431,6 +431,8 @@ export function createBackfillJob(body: {
   collection?: string;
   dids?: string[];
   source?: BackfillSource;
+  // Start the collection's relay listing here instead of at its first page.
+  relay_cursor?: string;
 }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
