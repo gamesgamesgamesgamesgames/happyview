@@ -1509,3 +1509,103 @@ async fn the_status_endpoint_reports_the_live_stream() {
     );
     assert!(status["lag_ms"].as_i64().is_some_and(|lag| lag > 0));
 }
+
+/// Pings keep arriving but no data frame does: still a stall.
+#[tokio::test]
+#[serial]
+async fn pings_do_not_keep_a_silent_connection_alive() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push([js::create(1, "did:plc:quiet", GAME, "r1", game("x"))]);
+    let _pings = common::jetstream::PingEvery::set(200);
+    let consumer = start(
+        &app,
+        Settings {
+            stall_timeout: Some(Duration::from_millis(1500)),
+            ..settings(&mock)
+        },
+    );
+    wait_until!("seq 1 applied", applied_through(&app, 1).await);
+    wait_until!("a reconnect despite pings", mock.connections().len() >= 2);
+    drop(consumer);
+}
+
+/// The cursor flush ticks every 5 s; it must not keep a quiet connection
+/// alive when the timeout is longer than the tick.
+#[tokio::test]
+#[serial]
+async fn a_timeout_longer_than_the_flush_tick_still_stalls() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push([js::create(1, "did:plc:quiet", GAME, "r1", game("x"))]);
+    let consumer = start(
+        &app,
+        Settings {
+            stall_timeout: Some(Duration::from_secs(7)),
+            ..settings(&mock)
+        },
+    );
+    wait_until!("seq 1 applied", applied_through(&app, 1).await);
+    let mut reconnected = false;
+    for _ in 0..150 {
+        if mock.connections().len() >= 2 {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(reconnected, "a 7 s stall timeout never fired within 15 s");
+    drop(consumer);
+}
+
+/// Workers blocked long past the timeout (a full queue, so dispatch waits):
+/// no false stall while frames wait. Postgres only: it blocks every apply
+/// with a table lock.
+#[tokio::test]
+#[serial]
+async fn backpressure_longer_than_the_timeout_is_not_a_stall() {
+    let Some(app) = app().await else { return };
+    if app.state.db_backend != DatabaseBackend::Postgres {
+        return;
+    }
+    let mock = MockJetstream::start().await;
+    let n: i64 = 1500;
+    mock.push((1..=n).map(|s| js::create(s, "did:plc:busy", GAME, &format!("r{s}"), game("x"))));
+    // Hold a lock on the records table so every apply waits.
+    let mut tx = app.state.db.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE happyview_records IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .expect("lock");
+    let consumer = start(
+        &app,
+        Settings {
+            workers: 1,
+            stall_timeout: Some(Duration::from_millis(1500)),
+            ..settings(&mock)
+        },
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    tx.rollback().await.expect("unlock");
+    for _ in 0..600 {
+        if applied_through(&app, n).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(applied_through(&app, n).await, "not all applied");
+    // The mock then goes silent, so a genuine stall follows. It must come
+    // only after the first connection delivered everything: a false stall at
+    // the unblock reconnects from an earlier seq.
+    wait_until!(
+        "the genuine stall's reconnect",
+        mock.connections().len() >= 2
+    );
+    let n_s = n.to_string();
+    assert_eq!(
+        mock.connections()[1].param("cursor").as_deref(),
+        Some(n_s.as_str()),
+        "a false stall reconnected mid-stream"
+    );
+    drop(consumer);
+}

@@ -765,9 +765,16 @@ async fn run_session(
                     Some(Err(e)) => break Ended::Closed(e.to_string()),
                     None => break Ended::Closed("connection closed".to_string()),
                 };
-                if let (Message::Text(_) | Message::Binary(_), Some(timeout)) = (&message, stall_timeout) {
-                    stalled.as_mut().reset(tokio::time::Instant::now() + timeout);
+                if matches!(message, Message::Text(_) | Message::Binary(_)) {
+                    // The status's last frame, whether or not stalls are
+                    // timed: `idle_ms` is read by monitoring either way.
                     status::frame_received();
+                    // The first of two resets: this one covers a frame that
+                    // ends in `continue` below, the second (after handling)
+                    // one whose handling waited without reading the socket.
+                    if let Some(timeout) = stall_timeout {
+                        stalled.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
                 }
                 let text = match message {
                     Message::Text(text) => text.as_str().to_owned(),
