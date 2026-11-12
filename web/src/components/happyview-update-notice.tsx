@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { LifecycleNotice } from "@/components/plugin-lifecycle";
 import { Button } from "@/components/ui/button";
@@ -118,6 +118,7 @@ export function HappyViewUpdateNotice() {
   // loaded, which is after hydration, so the server-rendered markup and
   // the first client render agree.
   const [dismissal, setDismissal] = useState<Dismissal | null>(readDismissal);
+  const notice = useRef<HTMLElement>(null);
 
   const offer = status?.available;
   if (!status || !offer || isDismissed(offer, dismissal)) return null;
@@ -128,13 +129,28 @@ export function HappyViewUpdateNotice() {
     : `HappyView ${offer.version} is available. You're on ${status.current}.`;
 
   const dismiss = () => {
+    // The notice is about to go, and the button with it. Focus moves to the
+    // page's heading (or its main content) rather than dropping to <body>.
+    const main = notice.current?.closest("main");
     const d = { version: offer.version, at: Date.now() };
     writeDismissal(d);
     setDismissal(d);
+    requestAnimationFrame(() => {
+      const target = main?.querySelector<HTMLElement>("h1") ?? main;
+      if (!target) return;
+      if (!target.hasAttribute("tabindex"))
+        target.setAttribute("tabindex", "-1");
+      target.focus();
+    });
   };
 
   return (
-    <div className="px-4 pt-4 md:px-6" data-testid="happyview-update-notice">
+    <section
+      ref={notice}
+      aria-label="HappyView update"
+      className="px-4 pt-4 md:px-6"
+      data-testid="happyview-update-notice"
+    >
       <LifecycleNotice tone={security ? "danger" : "info"} title={title}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="flex flex-col gap-1">
@@ -150,6 +166,6 @@ export function HappyViewUpdateNotice() {
           </Button>
         </div>
       </LifecycleNotice>
-    </div>
+    </section>
   );
 }

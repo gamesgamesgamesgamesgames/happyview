@@ -92,7 +92,11 @@ function UpdateLine({ status }: { status: UpdateStatus | null }) {
       summary = <>Up to date on the {status.channel} channel.</>;
       break;
     case "unknown":
-      summary = <>Not checked yet.</>;
+      summary = status.lastError ? (
+        <>No check has succeeded yet.</>
+      ) : (
+        <>Not checked yet.</>
+      );
       break;
     case "disabled":
       summary = <>Update checks are off (UPDATE_CHECK=off).</>;
