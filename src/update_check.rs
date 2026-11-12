@@ -601,8 +601,22 @@ pub async fn run_check(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
 ) {
+    run_check_with(client, plc_url, status, db, backend, true).await
+}
+
+/// [`run_check`], with the https requirement on the PDS endpoint as a
+/// parameter so tests can serve a PDS over plain http. Always `true` in use.
+async fn run_check_with(
+    client: &reqwest::Client,
+    plc_url: &str,
+    status: &SharedUpdateStatus,
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    https_only: bool,
+) {
     let previous = status.read().await.clone();
-    let result = tokio::time::timeout(CHECK_TIMEOUT, check_once(client, plc_url, &previous))
+    let check = check_once_with(client, plc_url, &previous, https_only);
+    let result = tokio::time::timeout(CHECK_TIMEOUT, check)
         .await
         .unwrap_or(Err(CheckError::TimedOut(CHECK_TIMEOUT)));
     match result {
@@ -1064,12 +1078,13 @@ mod tests {
         // Paused after the setup above, which has real timeouts of its own:
         // from here the clock only moves when nothing else can.
         tokio::time::pause();
-        run_check(
+        run_check_with(
             &reqwest::Client::new(),
             &p.server.uri(),
             &status,
             &pool,
             DatabaseBackend::Sqlite,
+            false,
         )
         .await;
         let after = status.read().await.clone();
@@ -1119,12 +1134,13 @@ mod tests {
             .with_priority(1)
             .mount(&p.server)
             .await;
-        run_check(
+        run_check_with(
             &reqwest::Client::new(),
             &p.server.uri(),
             &status,
             &pool,
             DatabaseBackend::Sqlite,
+            false,
         )
         .await;
         let after = status.read().await.clone();
