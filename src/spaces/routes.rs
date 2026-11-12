@@ -357,6 +357,7 @@ const LEGACY_NS: &str = "dev.happyview";
 /// protocol methods and must not be advertised.
 pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
     let mut table = crate::spaces::lifecycle::lifecycle_method_table();
+    table.extend(crate::spaces::memberspace::memberspace_method_table());
     table.extend(vec![
         (format!("{PROTO_NS}.space.listSpaces"), get(list_spaces)),
         (format!("{PROTO_NS}.space.getRecord"), get(get_record)),

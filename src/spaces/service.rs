@@ -1154,6 +1154,146 @@ pub(crate) async fn delete_space(
     Ok(())
 }
 
+/// A member list entry as the protocol shapes it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct MemberEntry {
+    pub did: String,
+    pub read: bool,
+    pub write: bool,
+}
+
+/// The error for a member method on a space whose policy keeps no member list.
+pub(crate) fn policy_mismatch() -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        code: "PolicyMismatch",
+        message: "the space does not have a memberspace policy".into(),
+    }
+}
+
+fn require_memberspace(space: &Space) -> Result<(), AppError> {
+    match crate::spaces::policy::SpacePolicy::of(space) {
+        Ok(crate::spaces::policy::SpacePolicy::Member(_)) => Ok(()),
+        _ => Err(policy_mismatch()),
+    }
+}
+
+fn require_dids<'a>(dids: impl IntoIterator<Item = &'a str>) -> Result<(), AppError> {
+    for did in dids {
+        if !did.starts_with("did:") || did.len() < 7 {
+            return Err(AppError::XrpcError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "InvalidRequest",
+                message: format!("{did:?} is not a DID"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Add members or replace their access, all in one transaction under the
+/// space's row lock, as `memberspace.putMembers` does. A DID listed twice
+/// takes its last entry. A member whose write access is withdrawn leaves the
+/// writer set, and one whose read access is withdrawn loses its credentials.
+///
+/// The caller has checked that `actor_did` may manage `space`.
+pub(crate) async fn put_members(
+    state: &AppState,
+    actor_did: &str,
+    space: &Space,
+    entries: Vec<MemberEntry>,
+) -> Result<(), AppError> {
+    require_memberspace(space)?;
+    require_dids(entries.iter().map(|e| e.did.as_str()))?;
+    // The last entry for a DID wins, in the order the DIDs first appeared.
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: std::collections::HashMap<String, MemberEntry> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if !latest.contains_key(&entry.did) {
+            order.push(entry.did.clone());
+        }
+        latest.insert(entry.did.clone(), entry);
+    }
+    let entries: Vec<MemberEntry> = order
+        .into_iter()
+        .filter_map(|did| latest.remove(&did))
+        .collect();
+
+    let stored = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        if !db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await? {
+            return Ok(false);
+        }
+        for entry in &entries {
+            let member = SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: space.id.clone(),
+                did: entry.did.clone(),
+                access: MemberAccess {
+                    read: entry.read,
+                    write: entry.write,
+                    read_self: false,
+                },
+                is_delegation: false,
+                granted_by: Some(actor_did.to_string()),
+                created_at: now_rfc3339(),
+            };
+            db::upsert_member(&mut *tx, state.db_backend, &member).await?;
+            if !entry.write {
+                db::remove_writer(&mut *tx, state.db_backend, &space.id, &entry.did).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))?;
+    if !stored {
+        return Err(policy_mismatch());
+    }
+    for entry in entries.iter().filter(|e| !e.read) {
+        revoke_member_credentials(state, space, &entry.did).await?;
+    }
+    Ok(())
+}
+
+/// Remove members, all in one transaction, as `memberspace.removeMembers`
+/// does. DIDs that are not members are ignored and keep any place they have
+/// in the writer set; each removed member leaves it, and loses its
+/// credentials. Returns the DIDs removed.
+///
+/// The caller has checked that `actor_did` may manage `space`.
+pub(crate) async fn remove_members(
+    state: &AppState,
+    space: &Space,
+    dids: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    require_memberspace(space)?;
+    require_dids(dids.iter().map(String::as_str))?;
+    let removed = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let mut removed = Vec::new();
+        for did in &dids {
+            if removed.contains(did) {
+                continue;
+            }
+            if db::remove_direct_member(&mut *tx, state.db_backend, &space.id, did).await? {
+                db::remove_writer(&mut *tx, state.db_backend, &space.id, did).await?;
+                removed.push(did.clone());
+            }
+        }
+        tx.commit().await?;
+        Ok(removed)
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))?;
+    for did in &removed {
+        revoke_member_credentials(state, space, did).await?;
+    }
+    Ok(removed)
+}
+
 pub(crate) async fn remove_member(
     state: &AppState,
     actor_did: &str,
