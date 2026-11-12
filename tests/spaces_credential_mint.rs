@@ -442,6 +442,16 @@ async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
 
 /// Seed a space under `AUTHORITY` whose read policy is `read_policy`.
 async fn seed_space(app: &TestApp, skey: &str, read_policy: Policy) -> String {
+    seed_space_with_apps(app, skey, read_policy, AppAccess::Open).await
+}
+
+/// As [`seed_space`], with `app_access`.
+async fn seed_space_with_apps(
+    app: &TestApp,
+    skey: &str,
+    read_policy: Policy,
+    app_access: AppAccess,
+) -> String {
     let now = now_rfc3339();
     spaces_db::create_space(
         &app.state.db,
@@ -457,7 +467,7 @@ async fn seed_space(app: &TestApp, skey: &str, read_policy: Policy) -> String {
             description: None,
             read_policy,
             write_policy: Policy::MemberList,
-            app_access: AppAccess::Open,
+            app_access,
             config: SpaceConfig::default(),
             revision: None,
             created_at: now.clone(),
@@ -506,8 +516,8 @@ async fn a_public_space_issues_a_credential_without_a_delegation_token() {
     assert!(json_of(resp).await["credential"].is_string());
 }
 
-/// Any other space needs to know who it is issuing to, and says so in the
-/// error code.
+/// Any other space needs to know who it is issuing to, and answers as if it
+/// did not exist.
 #[tokio::test]
 #[serial]
 async fn a_member_space_refuses_a_request_without_a_delegation_token() {
@@ -522,8 +532,36 @@ async fn a_member_space_refuses_a_request_without_a_delegation_token() {
         .oneshot(bare_credential_req(&space))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(json_of(resp).await["error"], json!("UserNotAuthorized"));
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
+}
+
+/// An account the space does not admit gets the same answer whichever app it
+/// comes through: the app is only weighed for an account the space admits.
+#[tokio::test]
+#[serial]
+async fn the_account_is_settled_before_the_app() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space_with_apps(
+        &app,
+        "apps",
+        Policy::MemberList,
+        AppAccess::AllowList {
+            allowed: vec!["https://allowed.example/client-metadata.json".into()],
+        },
+    )
+    .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bare_credential_req(&space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
 }
 
 /// A delegation token is addressed to the space host as the authority's

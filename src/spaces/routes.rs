@@ -2131,26 +2131,18 @@ async fn get_space_credential(
         None => None,
     };
 
-    crate::spaces::auth::check_app_access(&space, client_id.as_deref()).map_err(|e| {
-        AppError::XrpcError {
-            status: StatusCode::FORBIDDEN,
-            code: "AppNotAuthorized",
-            message: e.to_string(),
-        }
-    })?;
+    // The account is settled before the app: an account the space does not
+    // admit is told only that the space was not found, whichever app it came
+    // through, so the answer says nothing about the space. The app is checked
+    // in `issue_credential`, after the space's policy admits the account.
+    let not_found = || refused("SpaceNotFound", "space not found".into());
 
     // A space that anyone may read needs no user; any other has to know who
     // it is issuing to.
     let subject = match subject {
         Some(subject) => subject,
         None if space.read_policy == crate::spaces::types::Policy::Public => String::new(),
-        None => {
-            return Err(AppError::XrpcError {
-                status: StatusCode::UNAUTHORIZED,
-                code: "UserNotAuthorized",
-                message: "this space requires a delegation token".into(),
-            });
-        }
+        None => return Err(not_found()),
     };
 
     let issued = crate::spaces::auth::issue_credential(
@@ -2168,11 +2160,7 @@ async fn get_space_credential(
     )
     .await
     .map_err(|e| match e {
-        AppError::Forbidden(message) => AppError::XrpcError {
-            status: StatusCode::FORBIDDEN,
-            code: "UserNotAuthorized",
-            message,
-        },
+        AppError::Forbidden(_) => not_found(),
         e => e,
     })?;
 
