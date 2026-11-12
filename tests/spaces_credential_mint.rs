@@ -988,3 +988,113 @@ async fn an_account_the_space_no_longer_admits_is_told_it_was_not_found() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
 }
+
+/// The assertions in a request are checked against its address before the
+/// space is looked up, so a bad delegation token or client attestation is
+/// answered alike for a space that exists and one that does not.
+#[tokio::test]
+#[serial]
+async fn bad_assertions_are_answered_alike_for_any_address() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let existing = seed_space(&app, "assertions", Policy::MemberList).await;
+    let missing = format!("at://{AUTHORITY}/space/com.example.mint/no-such-space");
+    let key = happyview::spaces::http_signature::did_key(syncer_key().verifying_key());
+
+    for field in ["delegationToken", "clientAttestation"] {
+        let mut answers = Vec::new();
+        for space in [&existing, &missing] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "space": space,
+                        "credentialKid": key,
+                        field: "garbage.garbage.garbage",
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let resp = app.router.clone().oneshot(req).await.unwrap();
+            answers.push((resp.status(), json_of(resp).await["error"].clone()));
+        }
+        assert_eq!(answers[0], answers[1], "{field}: {answers:?}");
+        assert_eq!(answers[0].0, StatusCode::BAD_REQUEST, "{field}");
+    }
+}
+
+/// An account the space admits, coming through an app its allow list does
+/// not name, is told the app is not authorized.
+#[tokio::test]
+#[serial]
+async fn an_admitted_account_through_another_app_is_told_the_app_is_not_authorized() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    // A space anyone may read admits every account.
+    let space = seed_space_with_apps(
+        &app,
+        "other-app",
+        Policy::Public,
+        AppAccess::AllowList {
+            allowed: vec!["https://allowed.example/client-metadata.json".into()],
+        },
+    )
+    .await;
+
+    let app_key = syncer_key();
+    let point = app_key.verifying_key().to_sec1_point(false);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Mock::given(method("GET"))
+        .and(path("/client-metadata.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jwks": { "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": "k1",
+                "x": b64.encode(point.x().unwrap()),
+                "y": b64.encode(point.y().unwrap()),
+            }]},
+        })))
+        .mount(&app.mock_server)
+        .await;
+    let client_id = format!("{}/client-metadata.json", app.mock_server.uri());
+    let now = chrono::Utc::now().timestamp() as u64;
+    let header = b64.encode(
+        json!({ "typ": "atproto-client-attestation+jwt", "alg": "ES256", "kid": "k1" }).to_string(),
+    );
+    let payload = b64.encode(
+        json!({
+            "iss": client_id, "sub": client_id, "aud": format!("{AUTHORITY}#atproto_pds"),
+            "iat": now, "exp": now + 60, "jti": Uuid::new_v4().to_string(),
+        })
+        .to_string(),
+    );
+    let signature: p256::ecdsa::Signature = app_key.sign(format!("{header}.{payload}").as_bytes());
+    let attestation = format!("{header}.{payload}.{}", b64.encode(signature.to_bytes()));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "credentialKid": happyview::spaces::http_signature::did_key(
+                    syncer_key().verifying_key()
+                ),
+                "clientAttestation": attestation,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_of(resp).await["error"], json!("AppNotAuthorized"));
+}
