@@ -550,3 +550,57 @@ async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
     let as_owner = listed(CREATOR).await;
     assert!(as_owner["spaceRev"].is_string(), "{as_owner}");
 }
+
+/// Withdrawing a member's read access through `putMembers`, or removing the
+/// member through `removeMembers`, revokes the credentials issued for it.
+#[tokio::test]
+#[serial]
+async fn the_batch_member_methods_revoke_a_members_credentials() {
+    common::require_db!();
+    for (nsid, body) in [
+        (
+            "com.atproto.memberspace.putMembers",
+            json!({ "members": [{ "did": MEMBER, "read": false, "write": false }] }),
+        ),
+        (
+            "com.atproto.memberspace.removeMembers",
+            json!({ "dids": [MEMBER] }),
+        ),
+    ] {
+        let mut app = TestApp::new_with_encryption().await;
+        let key = key();
+        let (space, credential) = setup(&mut app, &key).await;
+        let resp = call(
+            &app,
+            read(
+                &latest_commit_path(&space, MEMBER),
+                &credential,
+                &key,
+                MEMBER,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}: before");
+
+        let mut body = body.clone();
+        body["space"] = json!(space);
+        let resp = call(&app, post_as(&app, CREATOR, nsid, body)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}");
+
+        let resp = call(
+            &app,
+            read(
+                &latest_commit_path(&space, MEMBER),
+                &credential,
+                &key,
+                MEMBER,
+            ),
+        )
+        .await;
+        assert!(
+            !resp.status().is_success(),
+            "{nsid}: revoked, got {}",
+            resp.status()
+        );
+    }
+}
