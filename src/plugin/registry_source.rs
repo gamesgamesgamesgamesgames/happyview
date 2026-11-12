@@ -1182,11 +1182,37 @@ mod tests {
             serde_json::json!([version(HP, "lua", "1.2.0", "active", true, "available")]),
         )
         .await;
-        let entries = fetch_catalogue(&reqwest::Client::new(), &source(&server))
-            .await
-            .unwrap();
+        // Plugin-shaped versions for the server project too, so it is
+        // readable: only its kind keeps it out of the catalogue.
+        mount_versions(
+            &server,
+            HP,
+            "happyview",
+            serde_json::json!([version(
+                HP,
+                "happyview",
+                "2.17.4",
+                "active",
+                true,
+                "available"
+            )]),
+        )
+        .await;
+        let listing = fetch_listing(
+            &reqwest::Client::new(),
+            &source(&server),
+            RefreshMode::Full,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
         assert_eq!(
-            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            listing
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
             ["lua"]
         );
     }

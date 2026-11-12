@@ -1019,6 +1019,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_did_document_for_another_did_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{PUBLISHER_DID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "did:plc:someoneelse",
+                "service": [{
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": server.uri(),
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let err = check_once_with(
+            &reqwest::Client::new(),
+            &server.uri(),
+            &UpdateStatus::initial("2.17.3", true, false),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("another DID"), "{err}");
+    }
+
+    /// A PDS that never answers can't hold a pass open: it gives up after
+    /// CHECK_TIMEOUT, keeps the last good answer and says why.
+    #[tokio::test]
+    async fn a_pass_gives_up_after_the_check_timeout() {
+        let p = Publisher::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(CHECK_TIMEOUT + Duration::from_secs(60)),
+            )
+            .with_priority(1)
+            .mount(&p.server)
+            .await;
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut known = UpdateStatus::initial("2.17.3", true, false);
+        known.state = State::Current;
+        let status = Arc::new(RwLock::new(known.clone()));
+        // Paused after the setup above, which has real timeouts of its own:
+        // from here the clock only moves when nothing else can.
+        tokio::time::pause();
+        run_check(
+            &reqwest::Client::new(),
+            &p.server.uri(),
+            &status,
+            &pool,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
+        let after = status.read().await.clone();
+        assert_eq!(after.state, State::Current);
+        let why = after.last_error.expect("why");
+        assert!(why.contains("longer than"), "{why}");
+    }
+
+    #[tokio::test]
     async fn a_record_that_is_not_json_says_so() {
         let p = Publisher::start().await;
         Mock::given(method("GET"))
