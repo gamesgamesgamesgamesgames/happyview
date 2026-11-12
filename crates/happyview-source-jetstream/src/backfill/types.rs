@@ -69,8 +69,9 @@ pub struct BackfillJob {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct UnfinishedDiscovery {
     pub collection: String,
-    /// The cursor of the next page to list; `None` when not even the first
-    /// page was listed.
+    /// The cursor of the next page to list. A crawl writes its cursor row
+    /// only once a page is listed, so a crawl's is always set; the field
+    /// stays optional only because the cursor column is nullable.
     pub relay_cursor: Option<String>,
 }
 
