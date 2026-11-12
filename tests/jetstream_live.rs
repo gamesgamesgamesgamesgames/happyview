@@ -1485,6 +1485,7 @@ async fn the_status_endpoint_reports_the_live_stream() {
     mock.push(
         (701..=703).map(|s| js::create(s, "did:plc:status", GAME, &format!("r{s}"), game("x"))),
     );
+    let started_ms = chrono::Utc::now().timestamp_millis();
     let _consumer = start(&app, settings(&mock));
 
     wait_until!("seq 703 applied", applied_through(&app, 703).await);
@@ -1508,6 +1509,18 @@ async fn the_status_endpoint_reports_the_live_stream() {
         Some(8)
     );
     assert!(status["lag_ms"].as_i64().is_some_and(|lag| lag > 0));
+    // Stamped on every data frame although this consumer times no stalls
+    // (`settings` sets no stall timeout).
+    assert!(
+        status["last_frame_ms"]
+            .as_i64()
+            .is_some_and(|t| t >= started_ms),
+        "no last frame stamp: {status}"
+    );
+    assert!(
+        status["idle_ms"].as_i64().is_some(),
+        "no idle time: {status}"
+    );
 }
 
 /// Pings keep arriving but no data frame does: still a stall.
