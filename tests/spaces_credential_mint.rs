@@ -1098,3 +1098,97 @@ async fn an_admitted_account_through_another_app_is_told_the_app_is_not_authoriz
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(json_of(resp).await["error"], json!("AppNotAuthorized"));
 }
+
+/// A client attestation from an app whose metadata this test serves,
+/// addressed to `aud`. Returns the attestation and the app's client id.
+async fn attestation_from_an_app(app: &TestApp, aud: &str) -> (String, String) {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let app_key = syncer_key();
+    let point = app_key.verifying_key().to_sec1_point(false);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Mock::given(method("GET"))
+        .and(path("/client-metadata.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jwks": { "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": "k1",
+                "x": b64.encode(point.x().unwrap()),
+                "y": b64.encode(point.y().unwrap()),
+            }]},
+        })))
+        .mount(&app.mock_server)
+        .await;
+    let client_id = format!("{}/client-metadata.json", app.mock_server.uri());
+    let now = chrono::Utc::now().timestamp() as u64;
+    let header = b64.encode(
+        json!({ "typ": "atproto-client-attestation+jwt", "alg": "ES256", "kid": "k1" }).to_string(),
+    );
+    let payload = b64.encode(
+        json!({
+            "iss": client_id, "sub": client_id, "aud": aud,
+            "iat": now, "exp": now + 60, "jti": Uuid::new_v4().to_string(),
+        })
+        .to_string(),
+    );
+    let signature: p256::ecdsa::Signature = app_key.sign(format!("{header}.{payload}").as_bytes());
+    (
+        format!("{header}.{payload}.{}", b64.encode(signature.to_bytes())),
+        client_id,
+    )
+}
+
+/// An account the space does not admit is answered `SpaceNotFound` even when
+/// it comes through an app the space does not allow: the account is settled
+/// first.
+#[tokio::test]
+#[serial]
+async fn a_refused_account_through_another_app_is_told_the_space_was_not_found() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let mut space = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    space.app_access = AppAccess::AllowList {
+        allowed: vec!["https://allowed.example/client-metadata.json".into()],
+    };
+    spaces_db::update_space(&app.state.db, app.state.db_backend, &space)
+        .await
+        .unwrap();
+    assert!(
+        spaces_db::remove_member(&app.state.db, app.state.db_backend, &space.id, MEMBER)
+            .await
+            .unwrap()
+    );
+    let (attestation, _) = attestation_from_an_app(&app, &format!("{AUTHORITY}#atproto_pds")).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space_uri(),
+                "credentialKid": happyview::spaces::http_signature::did_key(
+                    syncer_key().verifying_key()
+                ),
+                "delegationToken": token,
+                "clientAttestation": attestation,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
+}
