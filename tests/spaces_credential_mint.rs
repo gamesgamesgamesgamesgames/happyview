@@ -388,6 +388,20 @@ async fn a_credential_for_a_space_on_its_own_did_is_signed_as_that_did() {
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .expect("the space's DID was published");
     assert_eq!(happyview_plc::derive_did(&genesis).unwrap(), space_did);
+    // Simplespace syncers find the same key as `#atproto_space`, and this
+    // instance as `#atproto_space_host`.
+    assert_eq!(
+        genesis["verificationMethods"]["atproto_space"],
+        genesis["verificationMethods"]["atproto"]
+    );
+    assert_eq!(
+        genesis["services"]["atproto_space_host"]["type"],
+        json!("AtprotoSpaceHost")
+    );
+    assert_eq!(
+        genesis["services"]["atproto_space_host"]["endpoint"],
+        genesis["services"]["atproto_pds"]["endpoint"]
+    );
 
     let req = Request::builder()
         .method("GET")
@@ -528,7 +542,7 @@ async fn a_member_space_refuses_a_request_without_a_delegation_token() {
 
 /// The key to bind is named `credentialKey` since the Nov 12 revision and
 /// `credentialKid` before it; both are accepted. A request naming neither is
-/// the simplespace exchange, which is refused by name.
+/// the simplespace exchange.
 #[tokio::test]
 #[serial]
 async fn the_key_to_bind_is_named_either_way() {
@@ -572,16 +586,15 @@ async fn the_key_to_bind_is_named_either_way() {
         "the error names the field the request used"
     );
 
+    // Naming neither is the simplespace exchange, which needs its signature.
     let resp = app
         .router
         .clone()
         .oneshot(ask(json!({ "space": space })))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = json_of(resp).await;
-    assert_eq!(body["error"], json!("InvalidRequest"));
-    assert!(body["message"].as_str().unwrap().contains("simplespace"));
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceSignature"));
 }
 
 /// A delegation token is addressed to the space host as the authority's
@@ -973,4 +986,278 @@ async fn a_delegation_token_does_not_skip_the_rate_limit() {
         let resp = app.router.clone().oneshot(request(token)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{token:?}");
     }
+}
+
+/// A space on its own DID, created by a fresh creator, with a delegation
+/// token for it from this instance. Returns the space URI, its DID, the
+/// token, and the DID's genesis operation.
+async fn own_did_space_and_token(app: &TestApp, skey: &str) -> (String, String, String, Value) {
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let (name, value) = cookie_for(app, &creator);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.createSpace")
+        .header(name.clone(), value.clone())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "spaceType": "com.example.mint", "skey": skey, "policy": { "$type": "com.atproto.memberspace.policy" } }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let space = json_of(resp).await["space"].as_str().unwrap().to_string();
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let genesis: Value = app
+        .mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path() == format!("/{space_did}"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the space's DID was published");
+
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencoding::encode(&space)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = json_of(resp).await["token"].as_str().unwrap().to_string();
+    (space, space_did, token, genesis)
+}
+
+/// The simplespace exchange: the delegation token as the bearer token, and the
+/// key to bind named by an `atproto-space` signature over `Authorization`.
+fn simplespace_credential_req(
+    space: &str,
+    token: &str,
+    key: &p256::ecdsa::SigningKey,
+) -> Request<Body> {
+    let headers =
+        happyview::spaces::http_signature::sign_legacy(key, &format!("Bearer {token}"), None);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json");
+    for (name, value) in &headers {
+        req = req.header(name, value);
+    }
+    req.body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap()
+}
+
+/// A simplespace client exchanges its delegation token as it always did. Its
+/// credential names the key `#atproto_space`, which the space DID publishes
+/// beside `#atproto`, and it presents the credential under the
+/// `Atproto-Space` scheme.
+#[tokio::test]
+#[serial]
+async fn a_simplespace_client_gets_and_uses_a_credential_its_way() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let (space, space_did, token, genesis) = own_did_space_and_token(&app, "simple").await;
+    let key = syncer_key();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(simplespace_credential_req(&space, &token, &key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let credential = json_of(resp).await["credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let parts: Vec<&str> = credential.split('.').collect();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header: Value = serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+    assert_eq!(header["kid"], "#atproto_space");
+    let claims = claims_of(&credential);
+    assert_eq!(claims["iss"], space_did);
+    assert_eq!(
+        claims["cnf"]["kid"],
+        json!(happyview::spaces::http_signature::did_key(
+            key.verifying_key()
+        ))
+    );
+    let published = genesis["verificationMethods"]["atproto_space"]
+        .as_str()
+        .unwrap();
+    let (_, multikey) = multibase::decode(published.trim_start_matches("did:key:")).unwrap();
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&multikey[2..]).unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&b64.decode(parts[2]).unwrap()).unwrap();
+    verifying
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .expect("the credential verifies against the published #atproto_space key");
+
+    // Presented the simplespace way, the credential reads the space.
+    let headers = happyview::spaces::http_signature::sign_legacy(
+        &key,
+        &format!("Atproto-Space {credential}"),
+        Some(&space_did),
+    );
+    let mut req = Request::builder().uri(format!(
+        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        urlencoding::encode(&space)
+    ));
+    for (name, value) in &headers {
+        req = req.header(name, value);
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Signed by another key, it does not.
+    let headers = happyview::spaces::http_signature::sign_legacy(
+        &syncer_key(),
+        &format!("Atproto-Space {credential}"),
+        Some(&space_did),
+    );
+    let mut req = Request::builder().uri(format!(
+        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        urlencoding::encode(&space)
+    ));
+    for (name, value) in &headers {
+        req = req.header(name, value);
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The simplespace exchange binds the key its signature names, so a request
+/// with no such signature, or a token signed by someone else, gets nothing.
+#[tokio::test]
+#[serial]
+async fn a_simplespace_exchange_needs_its_signature_and_its_token() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let (space, _, token, _) = own_did_space_and_token(&app, "unsigned").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceSignature"));
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(simplespace_credential_req(
+            &space,
+            "not-a-token",
+            &syncer_key(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidDelegationToken")
+    );
+}
+
+/// A simplespace PDS addresses its delegation tokens to the space host as
+/// `#atproto_space_host`. The simplespace exchange accepts that; the Oct 29
+/// and Nov 12 exchanges, which address `#atproto_pds`, do not.
+#[tokio::test]
+#[serial]
+async fn the_simplespace_exchange_accepts_a_token_for_the_space_host() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    setup_and_get_delegation_token(&app).await;
+
+    let mut bytes = [0u8; 32];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
+    }
+    let account_key = k256::ecdsa::SigningKey::from_slice(&bytes).unwrap();
+    let mut multikey = vec![0xe7, 0x01];
+    multikey.extend_from_slice(account_key.verifying_key().to_sec1_point(true).as_bytes());
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    plc_store.write().await.insert(
+        MEMBER.to_string(),
+        json!({
+            "id": MEMBER,
+            "verificationMethod": [{
+                "id": format!("{MEMBER}#atproto"),
+                "type": "Multikey",
+                "controller": MEMBER,
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
+            }],
+            "service": [],
+        }),
+    );
+    let token = || {
+        let now = chrono::Utc::now().timestamp() as u64;
+        sign_delegation_token(
+            &DelegationTokenClaims {
+                iss: MEMBER.to_string(),
+                sub: space_uri(),
+                aud: format!("{AUTHORITY}#atproto_space_host"),
+                iat: now,
+                exp: now + 60,
+                jti: Uuid::new_v4().to_string(),
+            },
+            &account_key,
+        )
+        .unwrap()
+    };
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token(), Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "Oct 29 exchange");
+    assert_eq!(
+        json_of(resp).await["error"],
+        json!("InvalidDelegationToken")
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(simplespace_credential_req(
+            &space_uri(),
+            &token(),
+            &syncer_key(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "simplespace exchange");
 }

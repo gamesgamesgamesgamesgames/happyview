@@ -464,15 +464,32 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     service_auth: None,
                 })
             }
-            // The simplespace generation's scheme. Its credentials are signed
-            // by the authority's `#atproto_space` key, which a space DID here
-            // does not publish yet (HAP-388 H1–H3), so it is refused by name
-            // rather than as an unknown scheme. Accepting it slots in here.
-            Some(h) if legacy_space_credential_token(h).is_some() => Err(AppError::Auth(
-                "the Atproto-Space credential scheme (simplespace) is not supported by this \
-                 host yet; present the credential with Atproto-Space-Credential"
-                    .into(),
-            )),
+            // The simplespace scheme: the same credential, presented with an
+            // `atproto-space` signature over `Authorization` and the audience.
+            Some(h) if legacy_space_credential_token(h).is_some() => {
+                let token = legacy_space_credential_token(h).unwrap_or_default();
+                if !is_space_route(parts.uri.path()) {
+                    return Err(AppError::Auth(
+                        "space credentials are only accepted on space routes".into(),
+                    ));
+                }
+                let bound_key =
+                    crate::spaces::credential::peek_bound_key(token).ok_or_else(|| {
+                        AppError::Auth("space credential is not bound to a key".into())
+                    })?;
+                crate::spaces::http_signature::verify_legacy(&parts.headers, Some(&bound_key))?;
+                let audience = parts
+                    .headers
+                    .get(crate::spaces::http_signature::AUDIENCE_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                Ok(XrpcClaims {
+                    identity: None,
+                    space_credential: Some(token.to_string()),
+                    space_audience: audience,
+                    service_auth: None,
+                })
+            }
             Some(_) => Err(AppError::Auth("invalid Authorization scheme".into())),
             None => {
                 // No auth header — try cookie auth, fall back to anonymous
