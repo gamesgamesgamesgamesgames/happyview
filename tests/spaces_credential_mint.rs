@@ -506,8 +506,8 @@ async fn a_public_space_issues_a_credential_without_a_delegation_token() {
     assert!(json_of(resp).await["credential"].is_string());
 }
 
-/// Any other space needs to know who it is issuing to, and says so in the
-/// error code.
+/// Any other space needs to know who it is issuing to, and answers as if it
+/// did not exist, so a refusal discloses nothing about it.
 #[tokio::test]
 #[serial]
 async fn a_member_space_refuses_a_request_without_a_delegation_token() {
@@ -522,8 +522,66 @@ async fn a_member_space_refuses_a_request_without_a_delegation_token() {
         .oneshot(bare_credential_req(&space))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(json_of(resp).await["error"], json!("UserNotAuthorized"));
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
+}
+
+/// The key to bind is named `credentialKey` since the Nov 12 revision and
+/// `credentialKid` before it; both are accepted. A request naming neither is
+/// the simplespace exchange, which is refused by name.
+#[tokio::test]
+#[serial]
+async fn the_key_to_bind_is_named_either_way() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "named", Policy::Public).await;
+    let key = happyview::spaces::http_signature::did_key(syncer_key().verifying_key());
+    let ask = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    for field in ["credentialKey", "credentialKid"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(ask(json!({ "space": space, field: key })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{field}");
+        assert!(json_of(resp).await["credential"].is_string(), "{field}");
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(
+            json!({ "space": space, "credentialKey": "did:key:nope" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_of(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("credentialKey"),
+        "the error names the field the request used"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(json!({ "space": space })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_of(resp).await;
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(body["message"].as_str().unwrap().contains("simplespace"));
 }
 
 /// A delegation token is addressed to the space host as the authority's

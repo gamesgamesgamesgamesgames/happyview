@@ -464,6 +464,15 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     service_auth: None,
                 })
             }
+            // The simplespace generation's scheme. Its credentials are signed
+            // by the authority's `#atproto_space` key, which a space DID here
+            // does not publish yet (HAP-388 H1–H3), so it is refused by name
+            // rather than as an unknown scheme. Accepting it slots in here.
+            Some(h) if legacy_space_credential_token(h).is_some() => Err(AppError::Auth(
+                "the Atproto-Space credential scheme (simplespace) is not supported by this \
+                 host yet; present the credential with Atproto-Space-Credential"
+                    .into(),
+            )),
             Some(_) => Err(AppError::Auth("invalid Authorization scheme".into())),
             None => {
                 // No auth header — try cookie auth, fall back to anonymous
@@ -518,6 +527,14 @@ fn space_credential_token(authorization: &str) -> Option<&str> {
     let (scheme, token) = authorization.split_once(' ')?;
     let token = token.trim_start();
     (scheme.eq_ignore_ascii_case("Atproto-Space-Credential") && !token.is_empty()).then_some(token)
+}
+
+/// The token in an `Authorization` value using the simplespace generation's
+/// `Atproto-Space` scheme.
+fn legacy_space_credential_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start();
+    (scheme.eq_ignore_ascii_case("Atproto-Space") && !token.is_empty()).then_some(token)
 }
 
 async fn try_parse_service_auth(
@@ -656,6 +673,22 @@ mod tests {
             "Atproto-Space-Credentials tok",
         ] {
             assert_eq!(space_credential_token(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_simplespace_scheme_is_told_apart_from_the_current_one() {
+        use super::{legacy_space_credential_token, space_credential_token};
+        for value in ["Atproto-Space tok", "atproto-space tok"] {
+            assert_eq!(legacy_space_credential_token(value), Some("tok"), "{value}");
+            assert_eq!(space_credential_token(value), None, "{value}");
+        }
+        for value in [
+            "Atproto-Space-Credential tok",
+            "Atproto-Space",
+            "Bearer tok",
+        ] {
+            assert_eq!(legacy_space_credential_token(value), None, "{value}");
         }
     }
 

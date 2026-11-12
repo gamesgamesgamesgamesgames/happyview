@@ -152,3 +152,69 @@ async fn list_spaces_lists_another_account_only_for_a_super_admin() {
         assert!(uris.contains(&space), "{method}: super admin sees {space}");
     }
 }
+
+/// Each listed space carries its reference as `uri` (Oct 29) and `space`
+/// (Nov 12), and `spaceDid` narrows the list to one authority. The owner sees
+/// the space's revision.
+#[tokio::test]
+#[serial]
+async fn list_spaces_speaks_both_revisions() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    let owner = rand_did("owner");
+    let first = create_space(&app, &owner).await;
+    let second = create_space(&app, &owner).await;
+
+    let list = |query: String| {
+        let app = &app;
+        let owner = owner.clone();
+        async move {
+            let (name, value) = cookie_for(app, &owner);
+            let req = Request::builder()
+                .uri(format!("/xrpc/com.atproto.space.listSpaces{query}"))
+                .header(name, value)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&body).unwrap()["spaces"]
+                .as_array()
+                .unwrap()
+                .clone()
+        }
+    };
+
+    let all = list(String::new()).await;
+    assert_eq!(all.len(), 2);
+    for view in &all {
+        assert_eq!(view["uri"], view["space"], "{view}");
+    }
+
+    let did_of = |uri: &str| {
+        uri.trim_start_matches("at://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let narrowed = list(format!(
+        "?spaceDid={}",
+        urlencoding::encode(&did_of(&second))
+    ))
+    .await;
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0]["space"], json!(second));
+
+    let narrowed = list(format!(
+        "?spaceDid={}",
+        urlencoding::encode(&did_of(&first))
+    ))
+    .await;
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0]["space"], json!(first));
+
+    let none = list("?spaceDid=did%3Aplc%3Anobody".into()).await;
+    assert!(none.is_empty());
+}

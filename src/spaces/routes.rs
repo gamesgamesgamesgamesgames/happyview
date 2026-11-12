@@ -140,7 +140,12 @@ pub(crate) struct SpaceUriQuery {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListSpacesQuery {
+    /// Whose spaces to list: the caller's own unless a super admin asks for
+    /// another account's. HappyView's meaning, not the Oct 29 lexicon's, which
+    /// used `did` to filter by authority.
     did: Option<String>,
+    /// Lists only spaces under this authority DID (Nov 12).
+    space_did: Option<String>,
     /// Lists only spaces of this type. `type` is the earlier name, accepted
     /// until v3.
     #[serde(rename = "spaceType", alias = "type")]
@@ -215,9 +220,11 @@ struct RevokeInviteInput {
 #[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
     space: String,
-    /// The P-256 did:key the credential is bound to. Every request using the
-    /// credential is signed by it.
-    credential_kid: String,
+    /// The P-256 did:key the credential is bound to, as the Nov 12 text names
+    /// it. Every request using the credential is signed by it.
+    credential_key: Option<String>,
+    /// The same key under its Oct 29 name.
+    credential_kid: Option<String>,
     /// Establishes the user being acted for, for spaces that gate on users.
     delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
@@ -616,18 +623,34 @@ async fn list_spaces(
         state.db_backend,
         &did,
         query.space_type.as_deref(),
+        query.space_did.as_deref(),
         limit,
         query.cursor.as_deref(),
     )
     .await?;
 
+    // Each view carries its reference under both names: `uri` (Oct 29) and
+    // `space` (Nov 12), and the Nov 12 repo and space revisions.
     let spaces_json: Vec<serde_json::Value> = views
         .into_iter()
         .map(|v| {
-            serde_json::json!({
+            let mut view = serde_json::json!({
                 "uri": v.uri,
+                "space": v.uri,
                 "isOwner": v.is_owner,
-            })
+            });
+            if let Some(rev) = v.repo_rev {
+                view["repoRev"] = rev.into();
+            }
+            if let Some(data) = v.repo_data {
+                view["data"] = crate::spaces::commit::encode_lex_bytes(&data);
+            }
+            if v.is_owner
+                && let Some(rev) = v.space_rev
+            {
+                view["spaceRev"] = rev.into();
+            }
+            view
         })
         .collect();
 
@@ -2071,10 +2094,11 @@ async fn get_space_credential(
             reset,
         });
     }
-    if !crate::spaces::http_signature::is_p256_did_key(&input.credential_kid) {
+    let (generation, credential_key) = exchange_generation(&input)?;
+    if !crate::spaces::http_signature::is_p256_did_key(credential_key) {
         return Err(refused(
             "InvalidRequest",
-            "credentialKid must be a P-256 did:key".into(),
+            format!("{} must be a P-256 did:key", generation.key_field()),
         ));
     }
 
@@ -2139,17 +2163,22 @@ async fn get_space_credential(
         }
     })?;
 
-    // A space that anyone may read needs no user; any other has to know who
-    // it is issuing to.
+    // A space that anyone may read needs no user. A managing app may decide
+    // a read with no user, so its space asks it, with no `repo`: only an app
+    // on the Nov 12 revision (`checkAccess`) can be asked that, and one on an
+    // earlier revision is taken to refuse, as those revisions did. Any other
+    // space has to know who it is issuing to.
     let subject = match subject {
         Some(subject) => subject,
-        None if space.read_policy == crate::spaces::types::Policy::Public => String::new(),
+        None if matches!(
+            space.read_policy,
+            crate::spaces::types::Policy::Public | crate::spaces::types::Policy::ManagingApp { .. }
+        ) =>
+        {
+            String::new()
+        }
         None => {
-            return Err(AppError::XrpcError {
-                status: StatusCode::UNAUTHORIZED,
-                code: "UserNotAuthorized",
-                message: "this space requires a delegation token".into(),
-            });
+            return Err(generation.refused_user());
         }
     };
 
@@ -2164,15 +2193,11 @@ async fn get_space_credential(
         &subject,
         client_id.as_deref(),
         &space.authority_did,
-        Some(&input.credential_kid),
+        Some(credential_key),
     )
     .await
     .map_err(|e| match e {
-        AppError::Forbidden(message) => AppError::XrpcError {
-            status: StatusCode::FORBIDDEN,
-            code: "UserNotAuthorized",
-            message,
-        },
+        AppError::Forbidden(_) => generation.refused_user(),
         e => e,
     })?;
 
@@ -2180,6 +2205,59 @@ async fn get_space_credential(
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
+}
+
+/// Which revision of Proposal 0016 a `getSpaceCredential` request follows,
+/// told by the field naming the key to bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeGeneration {
+    /// Oct 29: `credentialKid`.
+    G1,
+    /// Nov 12 (proposals #143): `credentialKey`.
+    G2,
+}
+
+impl ExchangeGeneration {
+    fn key_field(self) -> &'static str {
+        match self {
+            Self::G1 => "credentialKid",
+            Self::G2 => "credentialKey",
+        }
+    }
+
+    /// The error for a user the space does not admit: `SpaceNotFound`, so a
+    /// refusal discloses nothing about the space. The Nov 12 text says so; the
+    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
+    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
+    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
+    fn refused_user(self) -> AppError {
+        AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "SpaceNotFound",
+            message: "space not found".into(),
+        }
+    }
+}
+
+/// The request's generation and the key it names. A request naming neither
+/// field is the simplespace exchange, which binds the key by a signature over
+/// the request and is issued under the authority's `#atproto_space` key. It
+/// needs that key published on each space DID (HAP-388 H1–H3, a follow-up
+/// PR), so until then it is refused by name; supporting it slots in here.
+fn exchange_generation(
+    input: &GetSpaceCredentialInput,
+) -> Result<(ExchangeGeneration, &str), AppError> {
+    match (&input.credential_key, &input.credential_kid) {
+        (Some(key), _) => Ok((ExchangeGeneration::G2, key)),
+        (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid)),
+        (None, None) => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "credentialKey is required. The simplespace credential exchange, which \
+                      names no key, is not supported by this host yet"
+                .into(),
+        }),
+    }
 }
 
 /// Verify a delegation token for `space_uri` and record it as used, returning

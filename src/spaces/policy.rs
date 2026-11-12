@@ -171,19 +171,35 @@ impl SpacePolicy {
     /// managing app with an app allow list; neither is a policy, and the error
     /// says so, so its owner can replace it with `updateSpace`.
     pub fn of(space: &Space) -> Result<Self, AppError> {
+        Self::from_rules(
+            &space.read_policy,
+            &space.write_policy,
+            &space.app_access,
+            &space.config,
+        )
+    }
+
+    /// The policy that a read policy, write policy and app access, as
+    /// `simplespace` configured a space, amount to. A combination with no
+    /// policy is `UnsupportedPolicy`.
+    pub fn from_rules(
+        read_policy: &Policy,
+        write_policy: &Policy,
+        app_access: &AppAccess,
+        config: &SpaceConfig,
+    ) -> Result<Self, AppError> {
         let flag = |name: &str| {
-            space
-                .config
+            config
                 .extra
                 .get(name)
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
         };
-        let allowed_apps = match &space.app_access {
+        let allowed_apps = match app_access {
             AppAccess::Open => None,
             AppAccess::AllowList { allowed } => Some(allowed.clone()),
         };
-        match (&space.read_policy, &space.write_policy) {
+        match (read_policy, write_policy) {
             (
                 Policy::ManagingApp { managing_app },
                 Policy::ManagingApp {

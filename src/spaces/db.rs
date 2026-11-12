@@ -194,42 +194,68 @@ pub struct SpaceView {
     pub uri: String,
     pub is_owner: bool,
     pub created_at: String,
+    /// The listed account's repo in the space, if it has written there.
+    pub repo_rev: Option<String>,
+    pub repo_data: Option<Vec<u8>>,
+    /// The space's own revision.
+    pub space_rev: Option<String>,
 }
 
+/// The spaces `did` is a member of, oldest membership first.
+///
+/// `authority` narrows them to spaces under that DID, as `listSpaces`'s
+/// `spaceDid` does.
 pub async fn list_spaces_for_user(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     did: &str,
     space_type: Option<&str>,
+    authority: Option<&str>,
     limit: i64,
     cursor: Option<&str>,
 ) -> Result<(Vec<SpaceView>, Option<String>), AppError> {
     let decoded_cursor = cursor.and_then(decode_cursor);
-    let type_clause = if space_type.is_some() {
-        " AND s.type_nsid = ?"
+    let mut filters = String::new();
+    if space_type.is_some() {
+        filters.push_str(" AND s.type_nsid = ?");
+    }
+    if authority.is_some() {
+        filters.push_str(" AND s.did = ?");
+    }
+    let uri_expr = "('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey)";
+    let cursor_clause = if decoded_cursor.is_some() {
+        format!(" AND (sm.created_at > ? OR (sm.created_at = ? AND {uri_expr} > ?))")
     } else {
-        ""
+        String::new()
     };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at, rs.rev, rs.hash, s.revision \
+             FROM happyview_space_members sm \
+             JOIN happyview_spaces s ON s.id = sm.space_id \
+             LEFT JOIN happyview_space_repo_state rs ON rs.space_id = s.id AND rs.author_did = sm.member_did \
+             WHERE sm.member_did = ?{filters}{cursor_clause} \
+             ORDER BY sm.created_at ASC, {uri_expr} ASC LIMIT ?"
+        ),
+        backend,
+    );
 
-    let sql = if decoded_cursor.is_some() {
-        adapt_sql(
-            &format!(
-                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
-            ),
-            backend,
-        )
-    } else {
-        adapt_sql(
-            &format!(
-                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
-            ),
-            backend,
-        )
-    };
-
-    let mut query = crate::db::query_as::<(String, String, String, String, String)>(&sql).bind(did);
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<String>,
+    );
+    let mut query = crate::db::query_as::<Row>(&sql).bind(did);
     if let Some(space_type) = space_type {
         query = query.bind(space_type);
+    }
+    if let Some(authority) = authority {
+        query = query.bind(authority);
     }
     if let Some((ref ts, ref uri)) = decoded_cursor {
         query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
@@ -244,10 +270,24 @@ pub async fn list_spaces_for_user(
     let views: Vec<SpaceView> = rows
         .into_iter()
         .map(
-            |(space_did, creator_did, type_nsid, skey, created_at)| SpaceView {
-                uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
-                is_owner: creator_did == did,
+            |(
+                space_did,
+                creator_did,
+                type_nsid,
+                skey,
                 created_at,
+                repo_rev,
+                repo_data,
+                space_rev,
+            )| {
+                SpaceView {
+                    uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
+                    is_owner: creator_did == did,
+                    created_at,
+                    repo_rev,
+                    repo_data,
+                    space_rev,
+                }
             },
         )
         .collect();

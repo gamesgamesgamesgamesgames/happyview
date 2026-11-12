@@ -911,8 +911,10 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
+        .and(path("/xrpc/com.atproto.managedspace.checkAccess"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "read": true, "write": true })),
+        )
         .mount(&managing_app)
         .await;
     plc_store.write().await.insert(
@@ -974,7 +976,7 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
         .to_str()
         .unwrap();
     app.assert_signed_as_space(authorization, &space_did).await;
-    // Scoped to Proposal 0016's method, which the managing app checks.
+    // Scoped to the method it is sent with, which the managing app checks.
     use base64::Engine;
     let token = authorization.trim_start_matches("Bearer ");
     let payload: serde_json::Value = serde_json::from_slice(
@@ -985,7 +987,7 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
     .unwrap();
     assert_eq!(
         payload["lxm"],
-        json!("com.atproto.managedspace.checkUserAccess")
+        json!("com.atproto.managedspace.checkAccess")
     );
     // Addressed to the managing app's service, as the policy names it.
     assert_eq!(payload["aud"], json!("did:plc:forumapp#forum"));
@@ -995,6 +997,9 @@ async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
 enum ManagingAppAnswer {
     /// It answers every access check with this.
     Responds(wiremock::ResponseTemplate),
+    /// It implements only the method at this path, answering it with this;
+    /// any other path is a 404.
+    OnlyAt(&'static str, wiremock::ResponseTemplate),
     /// Its service endpoint is a port nothing listens on.
     Unreachable,
 }
@@ -1003,7 +1008,32 @@ enum ManagingAppAnswer {
 /// the app as `answer` says. The space admits the newcomer only if the app
 /// says so, so the status is the app's decision as HappyView reads it.
 async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
-    use wiremock::matchers::method;
+    notify_through_managing_app_asked(answer).await.0
+}
+
+/// As [`notify_through_managing_app`], also returning the `lxm` of every
+/// token the app was sent, in order.
+async fn notify_through_managing_app_asked(answer: ManagingAppAnswer) -> (StatusCode, Vec<String>) {
+    let (status, asked, _) = through_managing_app(answer, Ask::NotifyWrite).await;
+    (status, asked)
+}
+
+/// What is sent to the space a managing app governs.
+enum Ask {
+    /// A newcomer's `notifyWrite`.
+    NotifyWrite,
+    /// A `getSpaceCredential` with no delegation token.
+    CredentialWithoutUser,
+}
+
+/// Send `ask` to a space whose managing app answers as `answer` says,
+/// returning the status, the `lxm` of every token the app was sent, in order,
+/// and the response body.
+async fn through_managing_app(
+    answer: ManagingAppAnswer,
+    ask: Ask,
+) -> (StatusCode, Vec<String>, serde_json::Value) {
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer};
 
     let app = TestApp::new().await;
@@ -1015,6 +1045,14 @@ async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
     let endpoint = match answer {
         ManagingAppAnswer::Responds(response) => {
             Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::OnlyAt(at, response) => {
+            Mock::given(method("GET"))
+                .and(path(at))
                 .respond_with(response)
                 .mount(&managing_app)
                 .await;
@@ -1047,32 +1085,139 @@ async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
     .await;
     let space_did = space_did_of(&space);
 
-    let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
-    let auth = app
-        .service_auth_jwt_for(
-            &plc_store,
-            &newcomer,
-            &space_did,
-            "#atproto_pds",
-            Some("com.atproto.space.notifyWrite"),
-        )
-        .await;
-    let req = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header("content-type", "application/json")
-        .header("authorization", auth)
-        .body(Body::from(
-            json!({
-                "space": space,
-                "repo": newcomer,
-                "rev": "3lzq2b3k4c22a",
-                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
-            })
-            .to_string(),
-        ))
+    let req = match ask {
+        Ask::NotifyWrite => {
+            let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+            let auth = app
+                .service_auth_jwt_for(
+                    &plc_store,
+                    &newcomer,
+                    &space_did,
+                    "#atproto_pds",
+                    Some("com.atproto.space.notifyWrite"),
+                )
+                .await;
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .header("content-type", "application/json")
+                .header("authorization", auth)
+                .body(Body::from(
+                    json!({
+                        "space": space,
+                        "repo": newcomer,
+                        "rev": "3lzq2b3k4c22a",
+                        "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+        Ask::CredentialWithoutUser => {
+            let key = {
+                use rand::Rng;
+                let mut bytes = [0u8; 32];
+                rand::rng().fill_bytes(&mut bytes);
+                p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+            };
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "space": space,
+                        "credentialKey": happyview::spaces::http_signature::did_key(
+                            key.verifying_key()
+                        ),
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+    };
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
         .unwrap();
-    app.router.clone().oneshot(req).await.unwrap().status()
+    let body = serde_json::from_slice(&body).unwrap_or_default();
+    let lxms = managing_app
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| {
+            use base64::Engine;
+            let token = request
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .trim_start_matches("Bearer ");
+            let payload: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).unwrap_or_default())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            payload["lxm"].as_str().unwrap_or_default().to_string()
+        })
+        .collect();
+    (status, lxms, body)
+}
+
+/// With no delegation token, a managed space asks its managing app about a
+/// read with no `repo`, and issues a credential if the app allows it. Only
+/// `checkAccess` can ask that: an app on an earlier revision is not asked,
+/// and the space answers as if it did not exist.
+#[tokio::test]
+#[serial]
+async fn a_managed_space_asks_its_app_about_a_read_with_no_user() {
+    common::require_db!();
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkAccess",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": true, "write": false })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["credential"].is_string());
+    assert_eq!(
+        asked,
+        vec!["com.atproto.managedspace.checkAccess".to_string()]
+    );
+
+    let (status, _, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkAccess",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": false, "write": false })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkUserAccess",
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+    assert_eq!(
+        asked,
+        vec!["com.atproto.managedspace.checkAccess".to_string()],
+        "an Oct 29 app cannot be asked about a read with no user"
+    );
 }
 
 fn answers(status: u16, body: serde_json::Value) -> ManagingAppAnswer {
@@ -1084,8 +1229,58 @@ fn answers(status: u16, body: serde_json::Value) -> ManagingAppAnswer {
 #[serial]
 async fn a_managing_app_that_authorizes_admits_the_writer() {
     common::require_db!();
-    let status = notify_through_managing_app(answers(200, json!({ "authorized": true }))).await;
+    let status =
+        notify_through_managing_app(answers(200, json!({ "read": false, "write": true }))).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A managing app built on an earlier revision implements only its
+/// `checkUserAccess`. It is asked with `checkAccess` first, then with the
+/// newest method it answers, each with a token scoped to that method.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_on_an_earlier_revision_is_asked_with_its_method() {
+    common::require_db!();
+    let authorized =
+        || wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true }));
+    let check_access = "com.atproto.managedspace.checkAccess".to_string();
+    let oct29 = "com.atproto.managedspace.checkUserAccess".to_string();
+    let simplespace = "com.atproto.simplespace.checkUserAccess".to_string();
+
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.managedspace.checkUserAccess",
+        authorized(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "Oct 29 app");
+    assert_eq!(asked, vec![check_access.clone(), oct29.clone()]);
+
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.simplespace.checkUserAccess",
+        authorized(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "simplespace app");
+    assert_eq!(asked, vec![check_access, oct29, simplespace]);
+}
+
+/// An earlier revision's answer is read as that revision words it: an
+/// `{authorized}` answer from `checkAccess` decides nothing.
+#[tokio::test]
+#[serial]
+async fn a_check_access_answer_is_read_as_read_and_write() {
+    common::require_db!();
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.managedspace.checkAccess",
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        asked.len(),
+        1,
+        "an answer is a decision; no older method is tried"
+    );
 }
 
 /// A managing app refusing the request, by status or by answer, is a denial:
@@ -1098,10 +1293,10 @@ async fn a_managing_app_refusing_denies_the_writer() {
         ("403", answers(403, json!({ "error": "Forbidden" }))),
         ("401", answers(401, json!({ "error": "AuthRequired" }))),
         (
-            "authorized false",
-            answers(200, json!({ "authorized": false })),
+            "write false",
+            answers(200, json!({ "read": true, "write": false })),
         ),
-        ("no authorized field", answers(200, json!({}))),
+        ("no write field", answers(200, json!({}))),
     ] {
         let status = notify_through_managing_app(answer).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
