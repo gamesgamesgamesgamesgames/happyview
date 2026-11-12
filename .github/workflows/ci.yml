@@ -853,6 +853,9 @@ jobs:
       - name: Version stamp
         run: bash scripts/stamp-version.test.sh
 
+      - name: Test the registry publishing scripts
+        run: bash scripts/registry.test.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -1475,6 +1478,136 @@ jobs:
           docker buildx imagetools create \
             -t "${GHCR_IMAGE}:latest" \
             "${GHCR_IMAGE}:${{ needs.release.outputs.version }}"
+
+  # ---------------------------------------------------------------------------
+  # Release records — the release as software.release records in
+  # happyview.dev's repo, which running instances read to learn of a newer
+  # HappyView. Written straight to the publisher's PDS by
+  # happyproto/actions/release-publish; nothing goes through a registry.
+  #
+  # Every release runs one of two jobs. Until the repository variable
+  # PUBLISH_RELEASE_RECORDS is `true`, plan-release-records runs the action as
+  # a dry run, with public reads only and no credentials, so each release
+  # shows what it would write. Once it is `true`, publish-release-records
+  # writes, in the release-records environment that holds the app password
+  # and that only the release branches can use. Neither is upstream of
+  # anything, so a PDS outage leaves a red job to re-run, never a release
+  # without images.
+  #
+  # REGISTRY_LATEST_MAJOR names the stable major `latest` follows (2 until
+  # 3.0.0 ships). release/v2 publishes 2.x releases with a job of its own.
+  # ---------------------------------------------------------------------------
+  plan-release-records:
+    needs: [release, build]
+    if: >-
+      always()
+      && vars.PUBLISH_RELEASE_RECORDS != 'true'
+      && needs.release.result == 'success'
+      && needs.build.result == 'success'
+      && needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    concurrency:
+      group: publish-release-records
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      TAG: v${{ needs.release.outputs.version }}
+      REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Describe the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          entry="$(bash scripts/registry/release-inputs.sh "$TAG")"
+          echo "$entry" | jq .
+          {
+            echo "version=$(jq -r .version <<<"$entry")"
+            echo "repository=$(jq -r .repository <<<"$entry")"
+            echo "commit=$(jq -r .commit <<<"$entry")"
+            echo "tag=$(jq -r .tag <<<"$entry")"
+            echo "changelog-url=$(jq -r '."changelog-url"' <<<"$entry")"
+            echo "published-at=$(jq -r '."published-at"' <<<"$entry")"
+            echo "channels=$(jq -r '.channels | join(",")' <<<"$entry")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Plan the release records (dry run)
+        uses: happyproto/actions/release-publish@v1
+        with:
+          identifier: did:plc:qneu5uamqs6cug7sjobbaexm
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          version: ${{ steps.release.outputs.version }}
+          repository: ${{ steps.release.outputs.repository }}
+          commit: ${{ steps.release.outputs.commit }}
+          tag: ${{ steps.release.outputs.tag }}
+          changelog-url: ${{ steps.release.outputs.changelog-url }}
+          published-at: ${{ steps.release.outputs.published-at }}
+          channels: ${{ steps.release.outputs.channels }}
+          dry-run: "true"
+
+  publish-release-records:
+    needs: [release, build]
+    if: >-
+      always()
+      && vars.PUBLISH_RELEASE_RECORDS == 'true'
+      && needs.release.result == 'success'
+      && needs.build.result == 'success'
+      && needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    environment: release-records
+    concurrency:
+      group: publish-release-records
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      TAG: v${{ needs.release.outputs.version }}
+      REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Describe the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          entry="$(bash scripts/registry/release-inputs.sh "$TAG")"
+          echo "$entry" | jq .
+          {
+            echo "version=$(jq -r .version <<<"$entry")"
+            echo "repository=$(jq -r .repository <<<"$entry")"
+            echo "commit=$(jq -r .commit <<<"$entry")"
+            echo "tag=$(jq -r .tag <<<"$entry")"
+            echo "changelog-url=$(jq -r '."changelog-url"' <<<"$entry")"
+            echo "published-at=$(jq -r '."published-at"' <<<"$entry")"
+            echo "channels=$(jq -r '.channels | join(",")' <<<"$entry")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release records
+        uses: happyproto/actions/release-publish@v1
+        with:
+          identifier: ${{ secrets.RELEASE_RECORDS_IDENTIFIER }}
+          password: ${{ secrets.RELEASE_RECORDS_APP_PASSWORD }}
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          version: ${{ steps.release.outputs.version }}
+          repository: ${{ steps.release.outputs.repository }}
+          commit: ${{ steps.release.outputs.commit }}
+          tag: ${{ steps.release.outputs.tag }}
+          changelog-url: ${{ steps.release.outputs.changelog-url }}
+          published-at: ${{ steps.release.outputs.published-at }}
+          channels: ${{ steps.release.outputs.channels }}
+          dry-run: "false"
 
   # ---------------------------------------------------------------------------
   # SDK — per-package tests + releases
