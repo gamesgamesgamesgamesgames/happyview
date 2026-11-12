@@ -2248,6 +2248,11 @@ fn exchange_generation(
     input: &GetSpaceCredentialInput,
 ) -> Result<(ExchangeGeneration, &str), AppError> {
     match (&input.credential_key, &input.credential_kid) {
+        (Some(key), Some(kid)) if key != kid => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "credentialKey and credentialKid name different keys".into(),
+        }),
         (Some(key), _) => Ok((ExchangeGeneration::G2, key)),
         (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid)),
         (None, None) => Err(AppError::XrpcError {

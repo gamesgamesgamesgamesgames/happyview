@@ -458,8 +458,25 @@ async fn get_space(
     xrpc_claims: XrpcClaims,
     Query(query): Query<SpaceUriQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let space = resolve_space(&state, &query.space).await?;
-    crate::spaces::lifecycle::authorize_reader(&state, &xrpc_claims, &space).await?;
+    // A space that does not exist and one the caller may not read get one
+    // answer, `SpaceNotFound`.
+    let not_found = || AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "SpaceNotFound",
+        message: "space not found".into(),
+    };
+    let space = resolve_space(&state, &query.space)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => not_found(),
+            e => e,
+        })?;
+    crate::spaces::lifecycle::authorize_reader(&state, &xrpc_claims, &space)
+        .await
+        .map_err(|e| match e {
+            AppError::Internal(_) | AppError::BadGateway(_) => e,
+            _ => not_found(),
+        })?;
     let config = serde_json::json!({
         "$type": "com.atproto.simplespace.defs#spaceConfig",
         "readPolicy": space.read_policy,
