@@ -572,3 +572,65 @@ async fn the_published_collections_are_never_written_directly() {
     assert!(records.is_empty(), "{records:?}");
     assert_eq!(member_records(&app, &space).await.len(), 2);
 }
+
+#[tokio::test]
+#[serial]
+async fn an_accepted_invite_is_published() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let invitee = rand_did("invitee");
+    let space = create(&app, &owner, memberspace(json!({ "publishMembers": true }))).await;
+    let (status, body) = post(
+        &app,
+        &owner,
+        "dev.happyview.space.createInvite",
+        json!({ "space": space, "access": { "read": true, "write": false } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = post(
+        &app,
+        &invitee,
+        "dev.happyview.space.acceptInvite",
+        json!({ "token": body["token"] }),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(
+        member_records(&app, &space)
+            .await
+            .contains(&(invitee.clone(), true, false))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_space_named_as_a_member_is_not_published_as_one() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let space = create(&app, &owner, memberspace(json!({ "publishMembers": true }))).await;
+    let other = create(&app, &owner, memberspace(json!({}))).await;
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": space, "did": other, "read": true, "write": false, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // A later full republish leaves it out too.
+    update(&app, &owner, &space, memberspace(json!({}))).await;
+    update(
+        &app,
+        &owner,
+        &space,
+        memberspace(json!({ "publishMembers": true })),
+    )
+    .await;
+    assert_eq!(
+        member_records(&app, &space).await,
+        vec![(owner.clone(), true, true)]
+    );
+}
