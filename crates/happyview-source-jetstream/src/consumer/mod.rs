@@ -869,10 +869,25 @@ async fn run_session(
                     Ok(Frame::Skip) => {}
                     Err(e) => tracing::warn!(error = %e, "skipping an unparseable jetstream frame"),
                 }
+                // Handling the frame may have waited a long time (a full
+                // worker queue, a cursor save) without reading the socket.
+                // Only time spent waiting on the socket counts towards a
+                // stall, so the clock starts again now.
+                if let Some(timeout) = stall_timeout {
+                    stalled.as_mut().reset(tokio::time::Instant::now() + timeout);
+                }
             }
             _ = ticker.tick() => {
+                let flushing = tokio::time::Instant::now();
                 flush(state, host, watermark, &mut session.save_barrier, &mut last_saved).await;
                 since_flush = 0;
+                // As for a frame: the save's own time isn't waiting on the
+                // socket. Pushed back by it, not restarted, so a quiet
+                // connection still stalls although this ticks every 5 s.
+                if stall_timeout.is_some() {
+                    let deadline = stalled.deadline() + flushing.elapsed();
+                    stalled.as_mut().reset(deadline);
+                }
             }
             _ = &mut collections_changed => break Ended::CollectionsChanged,
             _ = &mut stalled, if stall_timeout.is_some() => {
