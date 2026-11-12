@@ -1385,6 +1385,503 @@ async fn the_job_list_names_unfinished_discovery() {
     );
 }
 
+/// A job's failure set, as `(did, collection, phase, kind, state)`, in order.
+async fn failure_set(
+    state: &AppState,
+    job_id: &str,
+) -> Vec<(String, String, String, String, String)> {
+    crate::db::query_as(
+        "SELECT did, collection, phase, kind, state FROM happyview_backfill_failures \
+         WHERE job_id = ? ORDER BY did, collection",
+    )
+    .bind(job_id)
+    .fetch_all(&state.db)
+    .await
+    .expect("failure set")
+}
+
+/// The states of a job's failure set, in `(did, collection)` order.
+async fn failure_states(state: &AppState, job_id: &str) -> Vec<String> {
+    failure_set(state, job_id)
+        .await
+        .into_iter()
+        .map(|(_, _, _, _, state)| state)
+        .collect()
+}
+
+/// `did`'s `listRecords` for `collection` answers `response`, ahead of any
+/// other mock for it, for its next `times` requests.
+async fn fail_records(
+    mock: &MockServer,
+    did: &str,
+    collection: &str,
+    response: ResponseTemplate,
+    times: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .and(query_param("repo", did))
+        .and(query_param("collection", collection))
+        .respond_with(response)
+        .up_to_n_times(times)
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+fn repo_not_found() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "error": "InvalidRequest",
+        "message": "Could not find repo",
+    }))
+}
+
+/// HAP-421: a fetch deferred for retry survives a pause. Before, the retry
+/// lived only in memory and its unit was completed, so the resumed job never
+/// fetched the repo again and nothing recorded the loss.
+#[tokio::test]
+async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_repo() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    // The first attempt fails retryably. The retry waits out the host's
+    // cooldown (500 ms), and the pause lands meanwhile.
+    fail_records(&mock, "did:plc:slow", POST, ResponseTemplate::new(503), 1).await;
+    mount_records(&mock, "did:plc:slow", POST, 2).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:slow".to_string()])
+        .await
+        .expect("create job");
+    let pauser = {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        tokio::spawn(async move {
+            // Wait for the first attempt to defer the repo.
+            for _ in 0..200 {
+                if !failure_set(&state, &job_id).await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            request_pause(&jobs(&state), &job_id).await;
+        })
+    };
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+    pauser.await.expect("pauser");
+
+    assert_eq!(job_row(&state, &job_id).await.status, "paused");
+    assert_eq!(
+        failure_set(&state, &job_id).await,
+        vec![(
+            "did:plc:slow".to_string(),
+            POST.to_string(),
+            "fetch".to_string(),
+            "pds_server_error".to_string(),
+            "pending".to_string()
+        )],
+        "the deferred retry is persisted as pending"
+    );
+    assert_eq!(
+        count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+        0,
+        "the unit itself completed"
+    );
+
+    crate::db::query("UPDATE happyview_backfill_jobs SET status = 'running' WHERE id = ?")
+        .bind(&job_id)
+        .execute(&state.db)
+        .await
+        .expect("resume");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.total_records),
+        ("completed", 2),
+        "the resumed job refetches the repo"
+    );
+    assert_eq!(
+        job.processed_repos, job.total_repos,
+        "the requeued retry counts toward the total it completes against"
+    );
+    assert_eq!(
+        failure_states(&state, &job_id).await,
+        vec!["recovered".to_string()],
+        "a refetched repo is marked recovered"
+    );
+    assert_eq!(
+        count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+        0
+    );
+}
+
+/// HAP-421: a retry that succeeds takes its repo out of the failure set.
+#[tokio::test]
+async fn a_retry_that_succeeds_clears_its_pending_row() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    fail_records(&mock, "did:plc:flaky", POST, ResponseTemplate::new(503), 1).await;
+    mount_records(&mock, "did:plc:flaky", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:flaky".to_string()])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!((job.status.as_str(), job.total_records), ("completed", 1));
+    assert_eq!(
+        failure_states(&state, &job_id).await,
+        vec!["recovered".to_string()]
+    );
+}
+
+/// HAP-421: a retry-failed job that fetches a repo marks the source job's
+/// rows for it recovered, so retrying the source job again has nothing to do
+/// rather than fetching everything a second time.
+#[tokio::test]
+async fn a_successful_retry_recovers_the_source_rows_and_a_second_retry_has_nothing_to_do() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:back", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+    seed_job(
+        &state,
+        "source-job",
+        Some(POST),
+        "network",
+        "completed",
+        2,
+        true,
+    )
+    .await;
+    finish_job(
+        &state,
+        "source-job",
+        "completed",
+        "2026-01-02T00:00:00+00:00",
+    )
+    .await;
+    for (collection, phase) in [(POST, "fetch"), ("", "resolve")] {
+        crate::db::query(
+            "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+             VALUES ('source-job', 'did:plc:back', ?, ?, 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(collection)
+        .bind(phase)
+        .execute(&state.db)
+        .await
+        .expect("seed failure");
+    }
+    let retry = || {
+        retry_failed_backfill(
+            State(jobs(&state)),
+            super_auth(&state),
+            Path("source-job".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+    };
+
+    let (_, Json(body)) = retry().await.expect("retry-failed");
+    let retry_id = body["id"].as_str().expect("id").to_string();
+    let job = wait_for_job_to_settle(&state, &retry_id).await;
+    assert_eq!((job.status.as_str(), job.total_records), ("completed", 1));
+    assert_eq!(
+        failure_states(&state, "source-job").await,
+        vec!["recovered".to_string(), "recovered".to_string()],
+        "the fetch and the resolve failure are both recovered"
+    );
+    assert!(
+        matches!(retry().await, Err(AdminError::BadRequest(_))),
+        "nothing is left to retry"
+    );
+}
+
+/// HAP-421: a fetch the job stopped partway through is cancelled, never a
+/// success.
+#[tokio::test]
+async fn a_fetch_cut_short_by_a_stop_is_not_complete() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    let outcome = fetch_records_page_loop(
+        &jobs(&state),
+        "no-job",
+        &mock.uri(),
+        "did:plc:any",
+        POST,
+        Some("c7".to_string()),
+        &AtomicBool::new(true),
+    )
+    .await;
+    match outcome {
+        FetchOutcome::Cancelled { count, cursor } => {
+            assert_eq!((count, cursor.as_deref()), (0, Some("c7")));
+        }
+        _ => panic!("a stopped fetch must report Cancelled"),
+    }
+}
+
+/// HAP-421: give-ups past the 10,000-row detail cap still go into the
+/// failure set, one row per collection, and retry-failed finds them there.
+#[tokio::test]
+async fn give_ups_past_the_detail_cap_are_kept_and_retried() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST, LIKE]).await;
+    mount_plc(&mock).await;
+    for did in ["did:plc:gone1", "did:plc:gone2"] {
+        for collection in [POST, LIKE] {
+            fail_records(&mock, did, collection, repo_not_found(), 10).await;
+        }
+    }
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(
+        &jobs(&state),
+        None,
+        &["did:plc:gone1".to_string(), "did:plc:gone2".to_string()],
+    )
+    .await
+    .expect("create job");
+    // The detail log is already full.
+    crate::db::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ? - 1) \
+         INSERT INTO happyview_backfill_errors (job_id, did, collection, phase, kind, message, attempts, last_at) \
+         SELECT ?, 'did:plc:old' || i, NULL, 'fetch', 'timeout', 'boom', 1, '2026-01-01T00:00:00+00:00' FROM n",
+    )
+    .bind(ERROR_DETAIL_CAP)
+    .bind(&job_id)
+    .execute(&state.db)
+    .await
+    .expect("fill the detail log");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    assert_eq!(job_row(&state, &job_id).await.status, "completed");
+    assert_eq!(
+        count_for_job(&state, "happyview_backfill_errors", &job_id).await,
+        ERROR_DETAIL_CAP,
+        "the detail cap still holds"
+    );
+    let set = failure_set(&state, &job_id).await;
+    let expected: Vec<(String, String, String, String, String)> =
+        ["did:plc:gone1", "did:plc:gone2"]
+            .into_iter()
+            .flat_map(|did| {
+                let mut collections = [LIKE, POST];
+                collections.sort();
+                collections.map(|c| {
+                    (
+                        did.to_string(),
+                        c.to_string(),
+                        "fetch".to_string(),
+                        "repo_not_found".to_string(),
+                        "failed".to_string(),
+                    )
+                })
+            })
+            .collect();
+    assert_eq!(set, expected);
+
+    let (status, Json(body)) = retry_failed_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path(job_id.clone()),
+        Json(RetryFailedBody {
+            kinds: Some(vec!["repo_not_found".to_string()]),
+        }),
+    )
+    .await
+    .expect("retry-failed");
+    assert_eq!(status, StatusCode::CREATED);
+    let retry_id = body["id"].as_str().expect("id").to_string();
+    let retried: Vec<(String,)> = crate::db::query_as(
+        "SELECT did FROM happyview_backfill_queue WHERE job_id = ? ORDER BY did",
+    )
+    .bind(&retry_id)
+    .fetch_all(&state.db)
+    .await
+    .expect("retry units");
+    assert_eq!(
+        retried,
+        vec![
+            ("did:plc:gone1".to_string(),),
+            ("did:plc:gone2".to_string(),)
+        ],
+        "retry-failed reads the failure set, not only the capped detail log"
+    );
+}
+
+/// HAP-421: a resolve give-up goes into the failure set too.
+#[tokio::test]
+async fn a_resolve_give_up_is_in_the_failure_set() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    Mock::given(method("GET"))
+        .and(path("/did:plc:nobody"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:nobody".to_string()])
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let set = failure_set(&state, &job_id).await;
+    assert_eq!(set.len(), 1, "{set:?}");
+    assert_eq!(
+        (set[0].0.as_str(), set[0].2.as_str(), set[0].4.as_str()),
+        ("did:plc:nobody", "resolve", "failed")
+    );
+}
+
+/// HAP-421: a fetch whose retries run out turns its pending row into a
+/// give-up, and a give-up nobody deferred is written as failed too.
+#[tokio::test]
+async fn a_retry_that_runs_out_is_recorded_as_failed() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    fail_records(&mock, "did:plc:down", POST, ResponseTemplate::new(503), 100).await;
+    fail_records(&mock, "did:plc:gone", POST, repo_not_found(), 100).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(
+        &jobs(&state),
+        Some(POST),
+        &["did:plc:down".to_string(), "did:plc:gone".to_string()],
+    )
+    .await
+    .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    assert_eq!(job_row(&state, &job_id).await.status, "completed");
+    let set = failure_set(&state, &job_id).await;
+    assert_eq!(
+        set.iter()
+            .map(|(did, _, _, kind, state)| (did.as_str(), kind.as_str(), state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("did:plc:down", "pds_server_error", "failed"),
+            ("did:plc:gone", "repo_not_found", "failed"),
+        ]
+    );
+}
+
+/// HAP-421: a finished job's failure set outlives a flush and the retention
+/// sweep, as its error log does, so retry-failed never falls back to the
+/// capped log.
+#[tokio::test]
+async fn the_failure_set_outlives_a_flush_and_the_retention_sweep() {
+    let state = state_with_errors_job("job-kept", Some(POST), "{}").await;
+    crate::db::query(
+        "UPDATE happyview_backfill_jobs SET completed_at = '2026-01-01T00:00:00+00:00' WHERE id = 'job-kept'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("completed_at");
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-kept', 'did:plc:a', ?, 'fetch', 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+
+    flush_job_details(&jobs(&state), "job-kept", 100)
+        .await
+        .expect("flush");
+    flush_finished_details(&jobs(&state), 100)
+        .await
+        .expect("flush all");
+    sweep_backfill_details(&jobs(&state), "2030-01-01T00:00:00+00:00")
+        .await
+        .expect("sweep");
+    assert_eq!(failure_set(&state, "job-kept").await.len(), 1);
+}
+
+/// HAP-421: a job with a failure set retries from it alone. Its capped error
+/// log is read only for a job from before the failure set, so a repo it
+/// lists that the failure set has as recovered is not retried again.
+#[tokio::test]
+async fn retry_failed_reads_the_error_log_only_without_a_failure_set() {
+    let state = state_with_errors_job("job-both", Some(POST), "{}").await;
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-both', 'did:plc:back', ?, 'fetch', 'timeout', 'recovered', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+    insert_error(
+        &state,
+        "job-both",
+        "did:plc:back",
+        "fetch",
+        BackfillErrorKind::Timeout,
+    )
+    .await;
+    let refused = retry_failed_backfill(
+        State(jobs(&state)),
+        super_auth(&state),
+        Path("job-both".to_string()),
+        Json(RetryFailedBody { kinds: None }),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AdminError::BadRequest(_))),
+        "the error log's copy of a recovered repo is not retried"
+    );
+}
+
+/// HAP-421: a second retry-failed of a job is refused while its first retry
+/// is unfinished, and allowed once it has finished.
+#[tokio::test]
+async fn retry_failed_refuses_a_second_retry_while_the_first_is_unfinished() {
+    let state = state_with_errors_job("job-twice", Some(POST), "{}").await;
+    crate::db::query(
+        "INSERT INTO happyview_backfill_failures (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES ('job-twice', 'did:plc:a', ?, 'fetch', 'timeout', 'failed', 3, '2026-01-01T00:00:00+00:00')",
+    )
+    .bind(POST)
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+    let retry = || {
+        retry_failed_backfill(
+            State(jobs(&state)),
+            super_auth(&state),
+            Path("job-twice".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+    };
+
+    let (_, Json(body)) = retry().await.expect("first retry");
+    let first = body["id"].as_str().expect("id").to_string();
+    // Let its run end (the collection isn't indexed here, so it fails at
+    // once), then hold it unfinished.
+    for _ in 0..500 {
+        if job_row(&state, &first).await.status != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    finish_job(&state, &first, "paused", "2026-01-02T00:00:00+00:00").await;
+    assert!(
+        matches!(retry().await, Err(AdminError::Conflict(_))),
+        "a second retry runs the same repos again"
+    );
+
+    finish_job(&state, &first, "completed", "2026-01-02T00:00:00+00:00").await;
+    let _ = retry().await.expect("a retry after the first finished");
+}
+
 /// Review focus 1: deferred resolutions occupy the window. If only the
 /// final pass retried them, discovery would wait for room forever.
 #[tokio::test]
@@ -4409,7 +4906,7 @@ async fn a_page_that_cannot_be_written_is_a_fetch_failure() {
             );
             assert_eq!((count, cursor), (0, None));
         }
-        FetchOutcome::Complete { .. } => {
+        FetchOutcome::Complete { .. } | FetchOutcome::Cancelled { .. } => {
             panic!("a page that cannot be written must not complete")
         }
     }

@@ -87,8 +87,15 @@ pub async fn issue_credential_as(
         public_url,
         plc_url,
     };
-    check_app_access(space, client_id)?;
+    // The account first, then the app, so only an account the space admits
+    // learns that its app is the obstacle. A refused account is `Forbidden`;
+    // a refused app is `AppNotAuthorized`.
     check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
+    check_app_access(space, client_id).map_err(|e| AppError::XrpcError {
+        status: axum::http::StatusCode::FORBIDDEN,
+        code: "AppNotAuthorized",
+        message: e.to_string(),
+    })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1119,6 +1126,63 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    /// The account is weighed before the app: one the space does not admit
+    /// is refused as an account, whatever app it comes through, and only one
+    /// it admits is told the app is not allowed.
+    #[tokio::test]
+    async fn the_account_is_weighed_before_the_app() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut space = test_space(AppAccess::AllowList {
+            allowed: vec!["good-app".into()],
+        });
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, DatabaseBackend::Sqlite, &space)
+            .await
+            .unwrap();
+        let issue = |subject: String| {
+            let (pool, space) = (pool.clone(), space.clone());
+            async move {
+                issue_credential(
+                    &pool,
+                    DatabaseBackend::Sqlite,
+                    &reqwest::Client::new(),
+                    &crate::plugin::encryption::Keyring::from(
+                        crate::test_support::TEST_ENCRYPTION_KEY,
+                    ),
+                    "http://happyview.test",
+                    "http://plc.test",
+                    &space,
+                    &subject,
+                    Some("other-app"),
+                    &space.authority_did,
+                    None,
+                )
+                .await
+            }
+        };
+
+        let stranger = issue("did:plc:stranger".into()).await;
+        assert!(
+            matches!(stranger, Err(AppError::Forbidden(_))),
+            "{:?}",
+            stranger.err()
+        );
+
+        // The creator stands in for the authority, which every policy admits.
+        let admitted = issue(space.creator_did.clone()).await;
+        assert!(
+            matches!(
+                admitted,
+                Err(AppError::XrpcError {
+                    code: "AppNotAuthorized",
+                    ..
+                })
+            ),
+            "{:?}",
+            admitted.err()
+        );
     }
 
     #[test]
