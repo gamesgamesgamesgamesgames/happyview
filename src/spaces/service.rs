@@ -960,20 +960,27 @@ pub(crate) async fn create_space(
 /// `read_self` is HappyView-local and never sent over the wire, so a caller
 /// replacing read/write access has not asked to lift an own-records-only
 /// restriction.
-/// Revoke a member's credentials, and tell the hosts that verify them.
+/// Revoke a member's credentials in the caller's transaction, the one that
+/// changes their membership, so the two commit together. Returns the `jti`s
+/// of the credentials that were outstanding, for [`announce_revoked`] to send
+/// once the transaction commits.
 async fn revoke_member_credentials(
-    state: &AppState,
-    space: &Space,
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
     member_did: &str,
-) -> Result<(), AppError> {
-    let jtis =
-        db::outstanding_credential_jtis(&state.db, state.db_backend, &space.id, member_did).await?;
-    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
-        .await?;
+) -> Result<Vec<String>, AppError> {
+    let jtis = db::outstanding_credential_jtis(&mut *conn, backend, space_id, member_did).await?;
+    db::revoke_space_credentials_for_member(&mut *conn, backend, space_id, member_did).await?;
+    Ok(jtis)
+}
+
+/// Tell the hosts that verify a space's credentials which were revoked, once
+/// the revocation has committed.
+fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
     if !jtis.is_empty() {
         notifications::announce_revoked_credentials(state, space, jtis);
     }
-    Ok(())
 }
 
 /// A managedspace has no member list: its managing app decides who reads and
@@ -1032,11 +1039,30 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
-    // A credential is the member's read access, so it goes when that does.
-    if !member.access.read {
-        revoke_member_credentials(state, &space, member_did).await?;
-    }
+    // The member and, when read access goes, their credentials change in one
+    // transaction under the space's row lock, as `putMembers` does.
+    let jtis = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        if !db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await? {
+            return Ok(Err(no_members_on_managedspace()));
+        }
+        db::upsert_member(&mut *tx, state.db_backend, &member).await?;
+        // A credential is the member's read access, so it goes when that does.
+        let jtis = if member.access.read {
+            Vec::new()
+        } else {
+            match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did).await
+            {
+                Ok(jtis) => jtis,
+                Err(e) => return Ok(Err(e)),
+            }
+        };
+        tx.commit().await?;
+        Ok(Ok(jtis))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
+    announce_revoked(state, &space, jtis);
     Ok(member)
 }
 
@@ -1220,11 +1246,15 @@ pub(crate) async fn put_members(
         .filter_map(|did| latest.remove(&did))
         .collect();
 
+    // As in `remove_members`, withdrawing read access and revoking the
+    // credentials that go with it commit together; only telling the
+    // verifying hosts waits for the commit.
     let stored = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         if !db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await? {
-            return Ok(false);
+            return Ok(Ok(None));
         }
+        let mut jtis = Vec::new();
         for entry in &entries {
             let member = SpaceMember {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1243,18 +1273,24 @@ pub(crate) async fn put_members(
             if !entry.write {
                 db::remove_writer(&mut *tx, state.db_backend, &space.id, &entry.did).await?;
             }
+            if !entry.read {
+                match revoke_member_credentials(&mut tx, state.db_backend, &space.id, &entry.did)
+                    .await
+                {
+                    Ok(outstanding) => jtis.extend(outstanding),
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
         }
         tx.commit().await?;
-        Ok(true)
+        Ok(Ok(Some(jtis)))
     })
     .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))?;
-    if !stored {
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))??;
+    let Some(jtis) = stored else {
         return Err(policy_mismatch());
-    }
-    for entry in entries.iter().filter(|e| !e.read) {
-        revoke_member_credentials(state, space, &entry.did).await?;
-    }
+    };
+    announce_revoked(state, space, jtis);
     Ok(())
 }
 
@@ -1286,21 +1322,7 @@ pub(crate) async fn remove_members(
             }
             if db::remove_direct_member(&mut *tx, state.db_backend, &space.id, did).await? {
                 db::remove_writer(&mut *tx, state.db_backend, &space.id, did).await?;
-                let revoked = async {
-                    let outstanding =
-                        db::outstanding_credential_jtis(&mut *tx, state.db_backend, &space.id, did)
-                            .await?;
-                    db::revoke_space_credentials_for_member(
-                        &mut *tx,
-                        state.db_backend,
-                        &space.id,
-                        did,
-                    )
-                    .await?;
-                    Ok::<_, AppError>(outstanding)
-                }
-                .await;
-                match revoked {
+                match revoke_member_credentials(&mut tx, state.db_backend, &space.id, did).await {
                     Ok(outstanding) => jtis.extend(outstanding),
                     Err(e) => return Ok(Err(e)),
                 }
@@ -1312,9 +1334,7 @@ pub(crate) async fn remove_members(
     })
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
-    if !jtis.is_empty() {
-        notifications::announce_revoked_credentials(state, space, jtis);
-    }
+    announce_revoked(state, space, jtis);
     Ok(removed)
 }
 
@@ -1326,8 +1346,30 @@ pub(crate) async fn remove_member(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    revoke_member_credentials(state, &space, member_did).await?;
-    let removed = db::remove_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    // The removal and the revocation of the member's credentials commit
+    // together, under the space's row lock, as in `remove_members`. The
+    // credentials are revoked even when no member row is found, as they
+    // always were.
+    let (removed, jtis) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await?;
+        let jtis = match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did)
+            .await
+        {
+            Ok(jtis) => jtis,
+            Err(e) => return Ok(Err(e)),
+        };
+        let removed =
+            match db::remove_member(&mut *tx, state.db_backend, &space.id, member_did).await {
+                Ok(removed) => removed,
+                Err(e) => return Ok(Err(e)),
+            };
+        tx.commit().await?;
+        Ok(Ok((removed, jtis)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove member: {e}")))??;
+    announce_revoked(state, &space, jtis);
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }

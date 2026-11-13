@@ -373,6 +373,33 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
     .await;
 }
 
+/// Withdrawing read access with `putMembers` tells the hosts too, once the
+/// change and its revocations have committed.
+#[tokio::test]
+#[serial]
+async fn withdrawing_read_with_put_members_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.memberspace.putMembers",
+            json!({ "space": space, "members": [{ "did": MEMBER, "read": false, "write": false }] }),
+        )
+    })
+    .await;
+}
+
+/// So does simplespace's `removeMember`.
+#[tokio::test]
+#[serial]
+async fn removing_a_member_the_simplespace_way_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.simplespace.removeMember",
+            json!({ "space": space, "did": MEMBER }),
+        )
+    })
+    .await;
+}
+
 /// Removing a member with `removeMembers` tells the hosts too, once the
 /// removal and its revocations have committed.
 #[tokio::test]

@@ -1609,3 +1609,83 @@ async fn the_simplespace_exchange_takes_an_attestation_for_the_bare_space_did() 
         }
     }
 }
+
+/// A credential issued while a member's removal is committing follows the
+/// removal: the credential is stored in a transaction that waits on the space
+/// row the removal holds and checks the member list again before the insert,
+/// so it is refused rather than left standing after the removal's revocation.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_a_removal_commits_follows_the_removal() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let backend = app.state.db_backend;
+    let token = setup_and_get_delegation_token(&app).await;
+    let space = spaces_db::get_space_by_address(
+        &app.state.db,
+        backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // A removal, as `removeMembers` makes it: the space row first, then the
+    // member and its outstanding credentials (none yet), not yet committed.
+    let mut removal = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    spaces_db::lock_space_for_members(&mut *removal, backend, &space.id)
+        .await
+        .unwrap();
+    assert!(
+        spaces_db::remove_member(&mut *removal, backend, &space.id, MEMBER)
+            .await
+            .unwrap()
+    );
+    spaces_db::revoke_space_credentials_for_member(&mut *removal, backend, &space.id, MEMBER)
+        .await
+        .unwrap();
+
+    // The request is admitted by the member list as committed, and reaches
+    // the insert while the removal is still open.
+    let router = app.router.clone();
+    let key = syncer_key();
+    let mint = tokio::spawn(async move {
+        let resp = router
+            .oneshot(credential_req(&token, Some(&key)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_of(resp).await)
+    });
+    if backend == happyview::db::DatabaseBackend::Postgres {
+        // Wait until the request is waiting on a lock.
+        for _ in 0..100 {
+            let waiting: i64 = happyview::db::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&app.state.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    removal.commit().await.unwrap();
+
+    let (status, body) = mint.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+    let outstanding =
+        spaces_db::outstanding_credential_jtis(&app.state.db, backend, &space.id, MEMBER)
+            .await
+            .unwrap();
+    assert!(outstanding.is_empty(), "{outstanding:?}");
+}

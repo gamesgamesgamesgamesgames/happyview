@@ -139,8 +139,9 @@ pub async fn issue_credential_as(
     store_credential_record(
         pool,
         backend,
-        &space.id,
+        space,
         subject_did,
+        client_id,
         &token_hash,
         &claims.jti,
         exp,
@@ -359,13 +360,7 @@ async fn check_mint_policy(
         AccessKind::Read,
     )
     .await?;
-    if granted {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(
-            "managing app denied access to this space".into(),
-        ))
-    }
+    if granted { Ok(()) } else { Err(refused()) }
 }
 
 /// Ask a managing app whether `user_did` may read or write the space, with
@@ -849,11 +844,27 @@ fn generate_space_keypair() -> Result<SpaceKeypair, AppError> {
     Ok(SpaceKeypair { private_jwk })
 }
 
+/// Record an issued credential, in a transaction that reads the space again
+/// under a share lock on its row and checks the subject is still admitted
+/// before the insert.
+///
+/// Member changes and policy updates take the same row for update, so they
+/// and the insert are ordered: a member change that commits first is seen
+/// here, and one that commits after finds this credential and revokes it.
+/// A member list is checked again in full ([`members::is_member_locked`]).
+/// A managing app's answer can't be asked again under the lock (it is a
+/// network call), so it stands as long as the space still names that app.
+/// The app access rules are checked again too. A refusal is `Forbidden`
+/// or `AppNotAuthorized`, as the first check's would be.
+///
+/// [`members::is_member_locked`]: crate::spaces::members::is_member_locked
+#[allow(clippy::too_many_arguments)]
 async fn store_credential_record(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    space_id: &str,
+    checked: &Space,
     issued_to: &str,
+    client_id: Option<&str>,
     token_hash: &str,
     jti: &str,
     expires_at_epoch: u64,
@@ -863,24 +874,83 @@ async fn store_credential_record(
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
 
-    let sql = adapt_sql(
+    let lock = match backend {
+        DatabaseBackend::Postgres => " FOR SHARE",
+        DatabaseBackend::Sqlite => "",
+    };
+    let insert = adapt_sql(
         "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        let current =
+            crate::spaces::db::get_space_locked(&mut *tx, backend, &checked.id, lock).await;
+        let current = match current {
+            Ok(Some(space)) => space,
+            Ok(None) => return Ok(Err(refused())),
+            Err(e) => return Ok(Err(e)),
+        };
+        match still_admitted(&mut tx, backend, checked, &current, issued_to, client_id).await {
+            Ok(()) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+        crate::db::query(&insert)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&checked.id)
+            .bind(issued_to)
+            .bind(token_hash)
+            .bind(jti)
+            .bind(&expires_at)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Ok(()))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to store credential record: {e}")))?
+}
 
-    crate::db::query(&sql)
-        .bind(Uuid::new_v4().to_string())
-        .bind(space_id)
-        .bind(issued_to)
-        .bind(token_hash)
-        .bind(jti)
-        .bind(&expires_at)
-        .bind(&now)
-        .execute(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to store credential record: {e}")))?;
+/// The refusal [`check_mint_policy`] gives, so a refusal under the lock reads
+/// the same.
+fn refused() -> AppError {
+    AppError::Forbidden("managing app denied access to this space".into())
+}
 
-    Ok(())
+/// Whether `subject_did` is still admitted to read `current`, the space as
+/// read again under its row lock, having been admitted to `checked`.
+async fn still_admitted(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    backend: DatabaseBackend,
+    checked: &Space,
+    current: &Space,
+    subject_did: &str,
+    client_id: Option<&str>,
+) -> Result<(), AppError> {
+    // The creator stands in for the authority under every policy.
+    let admitted = subject_did == current.creator_did
+        || match &current.read_policy {
+            Policy::Public => true,
+            Policy::MemberList => crate::spaces::members::is_member_locked(
+                &mut *tx,
+                backend,
+                &current.id,
+                subject_did,
+            )
+            .await?
+            .is_some_and(|m| m.can_read() && !m.restricted_to_own_records()),
+            // The app's answer was about the app the space named then.
+            Policy::ManagingApp { .. } => current.read_policy == checked.read_policy,
+        };
+    if !admitted {
+        return Err(refused());
+    }
+    check_app_access(current, client_id).map_err(|e| AppError::XrpcError {
+        status: axum::http::StatusCode::FORBIDDEN,
+        code: "AppNotAuthorized",
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]

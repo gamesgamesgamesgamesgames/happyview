@@ -74,8 +74,30 @@ pub async fn get_space(
     row.map(parse_space_row).transpose()
 }
 
+/// A space, read under `lock` (`" FOR SHARE"`, `" FOR UPDATE"` or `""`),
+/// which holds its row until the transaction ends.
+pub async fn get_space_locked(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    id: &str,
+    lock: &str,
+) -> Result<Option<Space>, AppError> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?{lock}"
+        ),
+        backend,
+    );
+    let row: Option<SpaceRow> = crate::db::query_as(&sql)
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get space: {e}")))?;
+    row.map(parse_space_row).transpose()
+}
+
 pub async fn get_space_by_address(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     did: &str,
     type_nsid: &str,
@@ -90,7 +112,7 @@ pub async fn get_space_by_address(
         .bind(did)
         .bind(type_nsid)
         .bind(skey)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space: {e}")))?;
 
@@ -588,7 +610,7 @@ pub async fn delete_invites(
 }
 
 pub async fn remove_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -601,7 +623,7 @@ pub async fn remove_member(
     let result = crate::db::query(&sql)
         .bind(space_id)
         .bind(did)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to remove member: {e}")))?;
 
@@ -772,7 +794,7 @@ pub async fn get_member(
 }
 
 pub async fn list_direct_members(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
@@ -783,7 +805,7 @@ pub async fn list_direct_members(
 
     let rows: Vec<MemberRow> = crate::db::query_as(&sql)
         .bind(space_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
 
