@@ -16,6 +16,11 @@
 //! The DID also publishes `#atproto_kem`, because the authority has a space
 //! repo of its own (for published policy and member records) and this instance
 //! is its repo host.
+//!
+//! For syncers written before the Oct 29 text, the DID also publishes its
+//! `#atproto` key a second time as `#atproto_space`, and this instance as
+//! `#atproto_space_host`: that revision found a space's host and the key its
+//! credentials are signed with under those names.
 
 use p256::ecdsa::SigningKey;
 use rand::Rng;
@@ -27,6 +32,17 @@ use crate::plugin::encryption::Keyring;
 
 /// The `kid` of everything signed with an authority's `#atproto` key.
 pub const SIGNING_KID: &str = "#atproto";
+
+/// The verification method under which simplespace syncers find the key a
+/// space's credentials are signed with. A space DID publishes its `#atproto`
+/// key under this name too.
+pub const LEGACY_SIGNING_METHOD: &str = "atproto_space";
+
+/// The `kid` of a credential issued to a simplespace client.
+pub const LEGACY_SIGNING_KID: &str = "#atproto_space";
+
+/// The service under which simplespace clients find a space's host.
+pub const LEGACY_HOST_SERVICE: &str = "atproto_space_host";
 
 /// Stored and signed, not yet accepted by the directory.
 const PLC_PREPARED: &str = "prepared";
@@ -174,13 +190,22 @@ async fn prepare(
         verification_methods: std::collections::BTreeMap::from([
             ("atproto".to_string(), did_key(&signing)?),
             ("atproto_kem".to_string(), did_key(&kem)?),
+            // The same key, under the name simplespace syncers look up.
+            (LEGACY_SIGNING_METHOD.to_string(), did_key(&signing)?),
         ]),
         also_known_as: vec![],
-        service_entries: vec![(
-            "atproto_pds".into(),
-            "AtprotoPersonalDataServer".into(),
-            state.config.public_url.clone(),
-        )],
+        service_entries: vec![
+            (
+                "atproto_pds".into(),
+                "AtprotoPersonalDataServer".into(),
+                state.config.public_url.clone(),
+            ),
+            (
+                LEGACY_HOST_SERVICE.into(),
+                "AtprotoSpaceHost".into(),
+                state.config.public_url.clone(),
+            ),
+        ],
     };
     // A creator key that is not a P-256 or secp256k1 did:key fails here, as a
     // bad request naming the key.

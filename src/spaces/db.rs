@@ -452,7 +452,7 @@ pub async fn add_member(
         .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
 }
 
-async fn upsert_member(
+pub(crate) async fn upsert_member(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     member: &SpaceMember,
@@ -647,7 +647,7 @@ pub async fn is_space_credential_jti_revoked(
 
 /// The `jti`s of a member's credentials that are neither revoked nor expired.
 pub async fn outstanding_credential_jtis(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -659,7 +659,7 @@ pub async fn outstanding_credential_jtis(
     .bind(space_id)
     .bind(did)
     .bind(now_rfc3339())
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
@@ -731,7 +731,7 @@ pub async fn purge_expired_credentials(
 /// Revoke all active space credentials issued to `did` within `space_id`.
 /// Returns the number of credentials revoked.
 pub async fn revoke_space_credentials_for_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -744,7 +744,7 @@ pub async fn revoke_space_credentials_for_member(
         .bind(now_rfc3339())
         .bind(space_id)
         .bind(did)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
     Ok(result.rows_affected())
@@ -788,6 +788,75 @@ pub async fn list_direct_members(
         .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
 
     rows.into_iter().map(parse_member_row).collect()
+}
+
+/// A page of a space's direct members, by DID, after `after`. Rows naming
+/// another space (`is_delegation`) are not members by DID and are left out.
+pub async fn list_member_page(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SpaceMember>, AppError> {
+    let after_clause = if after.is_some() {
+        " AND member_did > ?"
+    } else {
+        ""
+    };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0{after_clause} ORDER BY member_did ASC LIMIT ?"
+        ),
+        backend,
+    );
+    let mut query = crate::db::query_as::<MemberRow>(&sql).bind(space_id);
+    if let Some(after) = after {
+        query = query.bind(after);
+    }
+    let rows: Vec<MemberRow> = query
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
+    rows.into_iter().map(parse_member_row).collect()
+}
+
+/// Remove a member by DID in the caller's transaction, returning whether one
+/// was there. Rows naming another space are not touched.
+pub async fn remove_direct_member(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<bool, sqlx::Error> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_members WHERE space_id = ? AND member_did = ? AND is_delegation = 0",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(did)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected() > 0)
+}
+
+/// Drop a repo from a space's writer set, returning whether it was in it.
+pub async fn remove_writer(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<bool, sqlx::Error> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_writers WHERE space_id = ? AND repo_did = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(did)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected() > 0)
 }
 
 pub async fn list_spaces_for_member(

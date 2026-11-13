@@ -13,6 +13,7 @@ pub mod http_signature;
 pub mod lifecycle;
 pub mod lthash;
 pub mod members;
+pub mod memberspace;
 pub mod native_client;
 pub mod native_sync;
 pub mod notifications;

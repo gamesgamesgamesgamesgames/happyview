@@ -364,6 +364,32 @@ async fn a_credential_stops_working_when_its_member_is_removed() {
 #[tokio::test]
 #[serial]
 async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.simplespace.putMember",
+            json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
+        )
+    })
+    .await;
+}
+
+/// Removing a member with `removeMembers` tells the hosts too, once the
+/// removal and its revocations have committed.
+#[tokio::test]
+#[serial]
+async fn removing_a_member_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.memberspace.removeMembers",
+            json!({ "space": space, "dids": [MEMBER] }),
+        )
+    })
+    .await;
+}
+
+/// Revoke `MEMBER`'s credential with the request `revoke` builds, and check
+/// that the host of `MEMBER`'s native repo hears about it once, as the space.
+async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static str, Value)) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -420,12 +446,8 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
         .unwrap();
     drop(conn);
 
-    space_admin(
-        &app,
-        "com.atproto.simplespace.putMember",
-        json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
-    )
-    .await;
+    let (nsid, body) = revoke(&space);
+    space_admin(&app, nsid, body).await;
 
     let mut received = Vec::new();
     for _ in 0..50 {
@@ -549,4 +571,108 @@ async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
     );
     let as_owner = listed(CREATOR).await;
     assert!(as_owner["spaceRev"].is_string(), "{as_owner}");
+}
+
+/// Withdrawing a member's read access through `putMembers`, or removing the
+/// member through `removeMembers`, revokes the credentials issued for it.
+#[tokio::test]
+#[serial]
+async fn the_batch_member_methods_revoke_a_members_credentials() {
+    common::require_db!();
+    for (nsid, body) in [
+        (
+            "com.atproto.memberspace.putMembers",
+            json!({ "members": [{ "did": MEMBER, "read": false, "write": false }] }),
+        ),
+        (
+            "com.atproto.memberspace.removeMembers",
+            json!({ "dids": [MEMBER] }),
+        ),
+    ] {
+        let mut app = TestApp::new_with_encryption().await;
+        let key = key();
+        let (space, credential) = setup(&mut app, &key).await;
+        let resp = call(
+            &app,
+            read(
+                &latest_commit_path(&space, MEMBER),
+                &credential,
+                &key,
+                MEMBER,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}: before");
+
+        let mut body = body.clone();
+        body["space"] = json!(space);
+        let resp = call(&app, post_as(&app, CREATOR, nsid, body)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}");
+
+        let resp = call(
+            &app,
+            read(
+                &latest_commit_path(&space, MEMBER),
+                &credential,
+                &key,
+                MEMBER,
+            ),
+        )
+        .await;
+        assert!(
+            !resp.status().is_success(),
+            "{nsid}: revoked, got {}",
+            resp.status()
+        );
+    }
+}
+
+/// A credential is accepted on space routes only, under either scheme: a
+/// presentation that a space route would take is refused anywhere else.
+#[tokio::test]
+#[serial]
+async fn a_credential_is_refused_off_the_space_routes_under_either_scheme() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    let presentations = [
+        (
+            "Atproto-Space-Credential",
+            http_signature::sign(
+                &key,
+                &format!("Atproto-Space-Credential {credential}"),
+                MEMBER,
+            ),
+        ),
+        (
+            "Atproto-Space",
+            http_signature::sign_legacy(&key, &format!("Atproto-Space {credential}"), Some(MEMBER)),
+        ),
+    ];
+    for (scheme, signed) in presentations {
+        let request = |path: &str| {
+            let mut req = Request::builder().uri(path);
+            for (name, value) in &signed {
+                req = req.header(name, value);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        // The presentation itself is good: a space route takes it.
+        let resp = call(&app, request(&latest_commit_path(&space, MEMBER))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{scheme} on a space route");
+
+        let resp = call(
+            &app,
+            request(&format!("/xrpc/app.bsky.actor.getProfile?actor={MEMBER}")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{scheme}");
+        let body = json_of(resp).await;
+        assert!(
+            body.to_string().contains("only accepted on space routes"),
+            "{scheme}: {body}"
+        );
+    }
 }

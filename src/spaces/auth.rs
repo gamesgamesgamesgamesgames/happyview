@@ -45,6 +45,41 @@ pub async fn issue_credential(
     authority_did: &str,
     bound_key: Option<&str>,
 ) -> Result<IssuedCredential, AppError> {
+    issue_credential_as(
+        pool,
+        backend,
+        http,
+        encryption_key,
+        public_url,
+        plc_url,
+        space,
+        subject_did,
+        client_id,
+        authority_did,
+        bound_key,
+        crate::spaces::authority::SIGNING_KID,
+    )
+    .await
+}
+
+/// [`issue_credential`], naming the credential's key `kid` when the space is
+/// on a DID of its own: `#atproto`, or `#atproto_space`, under which the DID
+/// publishes the same key for simplespace verifiers.
+#[allow(clippy::too_many_arguments)]
+pub async fn issue_credential_as(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    http: &reqwest::Client,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    public_url: &str,
+    plc_url: &str,
+    space: &Space,
+    subject_did: &str,
+    client_id: Option<&str>,
+    authority_did: &str,
+    bound_key: Option<&str>,
+    kid: &str,
+) -> Result<IssuedCredential, AppError> {
     let auth_ctx = ServiceAuthCtx {
         pool,
         backend,
@@ -90,11 +125,7 @@ pub async fn issue_credential(
         crate::spaces::authority::signing_key(pool, backend, encryption_key, &space.authority_did)
             .await?
     {
-        crate::spaces::credential::sign_credential_with_kid(
-            &claims,
-            &signing_key,
-            crate::spaces::authority::SIGNING_KID,
-        )?
+        crate::spaces::credential::sign_credential_with_kid(&claims, &signing_key, kid)?
     } else if is_instance_authority(pool, backend, public_url, space).await {
         let signing_key =
             crate::spaces::service::load_signing_key(pool, backend, encryption_key).await?;
