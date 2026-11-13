@@ -678,3 +678,50 @@ async fn an_access_check_on_a_wide_deep_graph_stays_cheap() {
         "an access check took {per_check:?}"
     );
 }
+
+/// A removal whose cascade didn't finish is finished by a retry: the retry
+/// finds nothing left to remove, and still revokes what the first left.
+#[tokio::test]
+#[serial]
+async fn a_retried_removal_revokes_what_the_first_attempt_left() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    mint(&app, &a, &member).await;
+
+    // The first attempt removed the reference and stopped there.
+    let row = space_row(&app, &a).await;
+    happyview::db::query(&format!(
+        "DELETE FROM happyview_space_nested WHERE space_id = '{}'",
+        row.id
+    ))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(outstanding(&app, &a, &member).await, 1);
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "dev.happyview.space.removeNestedSpace",
+        json!({ "space": a, "nested": b }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        outstanding(&app, &a, &member).await,
+        0,
+        "revoked on the retry"
+    );
+}

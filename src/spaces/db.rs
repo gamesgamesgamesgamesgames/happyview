@@ -676,6 +676,24 @@ pub async fn outstanding_credential_jtis(
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
 }
 
+/// The accounts holding outstanding credentials for a space.
+pub async fn outstanding_credential_subjects(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT DISTINCT issued_to FROM happyview_space_credentials WHERE space_id = ? AND revoked_at IS NULL AND expires_at > ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(now_rfc3339())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list credential holders: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 /// The members whose repos in a space are hosted on their own PDS.
 pub async fn list_native_repo_authors(
     pool: &sqlx::AnyPool,

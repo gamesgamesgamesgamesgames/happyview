@@ -236,10 +236,14 @@ pub(crate) async fn remove_nested(
         .map_err(|_| invalid(format!("{nested:?} is not a space address")))?;
     let address = format!("at://{}/space/{}/{}", uri.did, uri.type_nsid, uri.skey);
     let cascade = Cascade::before(state, space, true).await?;
-    if !db::delete_nested(&state.db, state.db_backend, &space.id, &address).await? {
+    let removed = db::delete_nested(&state.db, state.db_backend, &space.id, &address).await?;
+    // Run even when nothing was removed: a retry of a removal whose cascade
+    // failed finishes it here.
+    cascade.after(state).await?;
+    if !removed {
         return Err(invalid(format!("{address} is not nested in this space")));
     }
-    cascade.after(state).await
+    Ok(())
 }
 
 /// The effective lists of a changed space's dependents, taken before the
@@ -324,8 +328,21 @@ impl Cascade {
                 if now.map(|e| e.access) != Some(was.access) {
                     changed.push(did.clone());
                 }
-                if was.access.read && !now.is_some_and(|e| e.access.read) {
-                    service::revoke_member_credentials(state, &space, did).await?;
+            }
+            // Every outstanding credential whose account no longer reads the
+            // space is revoked, not only those of accounts that changed just
+            // now, so a retry finishes what a failed request left undone.
+            if space.read_policy == crate::spaces::types::Policy::MemberList {
+                for did in
+                    db::outstanding_credential_subjects(&state.db, state.db_backend, &space.id)
+                        .await?
+                {
+                    if did.is_empty() || did == space.creator_did {
+                        continue;
+                    }
+                    if !after.get(&did).is_some_and(|e| e.access.read) {
+                        service::revoke_member_credentials(state, &space, &did).await?;
+                    }
                 }
             }
             for did in after.keys() {
