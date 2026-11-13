@@ -179,6 +179,24 @@ pub async fn replace_hash(
 }
 
 /// The current time as a TID, or one past `prev` if the clock has not moved on.
+/// The space's current revision: the latest a writer was sequenced at, or
+/// `None` before the space's first update.
+pub async fn current_space_rev(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let (rev,): (Option<String>,) = crate::db::query_as(&adapt_sql(
+        "SELECT MAX(space_rev) FROM happyview_space_writers WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read the space revision: {e}")))?;
+    Ok(rev)
+}
+
 fn next_space_rev(prev: Option<&str>) -> String {
     let now = tid::generate_tid();
     match prev.and_then(tid::tid_to_number) {

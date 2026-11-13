@@ -229,6 +229,10 @@ struct GetSpaceCredentialInput {
     delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
     client_attestation: Option<String>,
+    /// A notification registration, which `authorizeSpaceSync` can carry in
+    /// the merged Nov 12 text. HappyView doesn't take registrations this way
+    /// yet, so a request carrying one is refused rather than half-served.
+    notify: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +384,11 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         ),
         (
             format!("{PROTO_NS}.space.getSpaceCredential"),
+            post(get_space_credential),
+        ),
+        // The merged Nov 12 name of the same exchange.
+        (
+            format!("{PROTO_NS}.space.authorizeSpaceSync"),
             post(get_space_credential),
         ),
         (
@@ -2095,6 +2104,14 @@ async fn get_space_credential(
             reset,
         });
     }
+    if input.notify.is_some() {
+        return Err(refused(
+            "InvalidRequest",
+            "this host does not take notification registrations through \
+             authorizeSpaceSync yet; omit notify"
+                .into(),
+        ));
+    }
     let (generation, credential_key) = exchange_generation(&input, &headers)?;
     let credential_key = credential_key.as_str();
     if !crate::spaces::http_signature::is_p256_did_key(credential_key) {
@@ -2220,10 +2237,18 @@ async fn get_space_credential(
         e => e,
     })?;
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "credential": issued.token,
         "expiresAt": issued.expires_at,
-    })))
+    });
+    // The space's current revision, which the merged Nov 12 text returns
+    // beside the credential. Omitted before the space's first update.
+    if let Some(space_rev) =
+        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
+    {
+        body["spaceRev"] = space_rev.into();
+    }
+    Ok(Json(body))
 }
 
 /// Which revision of Proposal 0016 a `getSpaceCredential` request follows,
