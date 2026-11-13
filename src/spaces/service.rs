@@ -1271,25 +1271,49 @@ pub(crate) async fn remove_members(
 ) -> Result<Vec<String>, AppError> {
     require_memberspace(space)?;
     require_dids(dids.iter().map(String::as_str))?;
-    let removed = crate::db::retry_on_busy(|| async {
+    // The removals and their credential revocations commit together, so a
+    // request that fails after them can't leave a removed member's credentials
+    // standing for a retry to miss. Only telling the verifying hosts waits for
+    // the commit.
+    let (removed, jtis) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await?;
         let mut removed = Vec::new();
+        let mut jtis = Vec::new();
         for did in &dids {
             if removed.contains(did) {
                 continue;
             }
             if db::remove_direct_member(&mut *tx, state.db_backend, &space.id, did).await? {
                 db::remove_writer(&mut *tx, state.db_backend, &space.id, did).await?;
+                let revoked = async {
+                    let outstanding =
+                        db::outstanding_credential_jtis(&mut *tx, state.db_backend, &space.id, did)
+                            .await?;
+                    db::revoke_space_credentials_for_member(
+                        &mut *tx,
+                        state.db_backend,
+                        &space.id,
+                        did,
+                    )
+                    .await?;
+                    Ok::<_, AppError>(outstanding)
+                }
+                .await;
+                match revoked {
+                    Ok(outstanding) => jtis.extend(outstanding),
+                    Err(e) => return Ok(Err(e)),
+                }
                 removed.push(did.clone());
             }
         }
         tx.commit().await?;
-        Ok(removed)
+        Ok(Ok((removed, jtis)))
     })
     .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))?;
-    for did in &removed {
-        revoke_member_credentials(state, space, did).await?;
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
+    if !jtis.is_empty() {
+        notifications::announce_revoked_credentials(state, space, jtis);
     }
     Ok(removed)
 }
