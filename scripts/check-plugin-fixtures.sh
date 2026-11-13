@@ -40,7 +40,10 @@ wanted_count=$(printf '%s' "$wanted" | grep -c . || true)
 for dir in tests/fixtures/*/; do
   [ -f "$dir/Cargo.toml" ] || continue
   name=$(basename "$dir")
-  if ! printf '%s\n' "${PLUGIN_FIXTURES[@]}" | grep -q "^tests/fixtures/$name/"; then
+  # A here-string, not a pipe: `grep -q` exits at its first match, and
+  # under pipefail the SIGPIPE that leaves printf with fails the pipeline,
+  # so a listed fixture was reported unlisted.
+  if ! grep -q "^tests/fixtures/$name/" <<<"$(printf '%s\n' "${PLUGIN_FIXTURES[@]}")"; then
     echo "fixture is unlisted, so nothing checks it: $name"
     echo "  add its artefact path to plugin-fixtures.sh"
     status=1
