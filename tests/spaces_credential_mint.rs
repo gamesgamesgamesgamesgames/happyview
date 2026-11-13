@@ -1689,3 +1689,35 @@ async fn a_credential_issued_while_a_removal_commits_follows_the_removal() {
             .unwrap();
     assert!(outstanding.is_empty(), "{outstanding:?}");
 }
+
+/// A simplespace exchange asking for a credential bound to a DPoP key
+/// thumbprint is told this host binds credentials to a did:key.
+#[tokio::test]
+#[serial]
+async fn a_simplespace_exchange_naming_a_dpop_key_is_told_the_binding_offered() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "dpop", Policy::Public).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "space": space, "dpopJkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I" })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_of(resp).await;
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did:key"),
+        "{body}"
+    );
+}
