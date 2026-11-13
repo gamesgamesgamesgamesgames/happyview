@@ -92,6 +92,17 @@
     message: "getLatestCommit answered 400"
     evidence:
       status: "400"
+- assertion: mac.vary-header
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      status: "400"
 - assertion: oplog.entry-shape
   cause: repo-host-pre-0016
   reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
