@@ -400,6 +400,57 @@ async fn removing_a_member_the_simplespace_way_notifies_the_hosts_of_native_repo
     .await;
 }
 
+/// Moving a space to a policy that keeps no member list discards the list
+/// and revokes its members' credentials, and tells the hosts too.
+#[tokio::test]
+#[serial]
+async fn discarding_the_member_list_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.space.updateSpace",
+            json!({ "space": space, "policy": {
+                "$type": "com.atproto.managedspace.policy",
+                "managingApp": "did:plc:app",
+            }}),
+        )
+    })
+    .await;
+}
+
+/// The credential itself is refused once the member list it was issued from
+/// is discarded.
+#[tokio::test]
+#[serial]
+async fn a_credential_stops_working_when_the_member_list_is_discarded() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    space_admin(
+        &app,
+        "com.atproto.space.updateSpace",
+        json!({ "space": space, "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:app",
+        }}),
+    )
+    .await;
+
+    let resp = call(
+        &app,
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &key,
+            MEMBER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("CredentialRevoked"));
+}
+
 /// Removing a member with `removeMembers` tells the hosts too, once the
 /// removal and its revocations have committed.
 #[tokio::test]

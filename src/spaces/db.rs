@@ -591,6 +591,43 @@ pub async fn lock_space_for_members(
         }))
 }
 
+/// Revoke the outstanding credentials of a space's direct members, as
+/// discarding its member list does. Returns the `jti`s that were
+/// outstanding, for the hosts that verify them to be told.
+pub async fn revoke_member_list_credentials(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let members =
+        "SELECT member_did FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0";
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        &format!(
+            "SELECT jti FROM happyview_space_credentials WHERE space_id = ? AND issued_to IN ({members}) AND revoked_at IS NULL AND jti IS NOT NULL AND expires_at > ?"
+        ),
+        backend,
+    ))
+    .bind(space_id)
+    .bind(space_id)
+    .bind(now_rfc3339())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
+    crate::db::query(&adapt_sql(
+        &format!(
+            "UPDATE happyview_space_credentials SET revoked_at = ? WHERE space_id = ? AND issued_to IN ({members}) AND revoked_at IS NULL"
+        ),
+        backend,
+    ))
+    .bind(now_rfc3339())
+    .bind(space_id)
+    .bind(space_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
 /// Delete every invite to a space, as migrating it to a policy that keeps no
 /// member list does. Returns how many were deleted.
 pub async fn delete_invites(

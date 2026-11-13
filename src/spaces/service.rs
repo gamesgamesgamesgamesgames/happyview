@@ -1141,8 +1141,10 @@ pub(crate) async fn update_space(
 }
 
 /// Store a space's fields and, with `discard_members`, discard its member
-/// list and its invites, all in one transaction, so a failure cannot leave a
-/// managedspace with the member list of the space it replaced.
+/// list, its members' credentials and its invites, all in one transaction,
+/// so a failure cannot leave a managedspace with the member list of the
+/// space it replaced, or that list's credentials. The hosts that verify the
+/// revoked credentials are told once it commits.
 ///
 /// The `UPDATE` takes the space's row first, as every member insert does
 /// (`db::lock_space_for_members`), so an insert racing this one either lands
@@ -1156,14 +1158,19 @@ pub(crate) async fn store_space(
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
     db::update_space(&mut *tx, state.db_backend, space).await?;
+    let mut jtis = Vec::new();
     if discard_members {
+        // The credentials go with the list they were issued from.
+        jtis = db::revoke_member_list_credentials(&mut tx, state.db_backend, &space.id).await?;
         db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
         // An outstanding invite would add a member once accepted.
         db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
     }
     tx.commit()
         .await
-        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))
+        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))?;
+    announce_revoked(state, space, jtis);
+    Ok(())
 }
 
 pub(crate) async fn delete_space(
