@@ -225,6 +225,7 @@ pub async fn run(command: crate::cli::Command, providers: Providers) -> std::pro
     crate::jobs::worker::spawn_recovery(state.clone());
     crate::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
     crate::reseal::spawn_boot_check(state.clone());
+    crate::spaces::retired::spawn_boot_check(state.clone());
 
     {
         let keepalive_state = state.clone();
@@ -295,10 +296,6 @@ struct Booted {
     labeler_subscriptions_rx: watch::Receiver<()>,
 }
 
-/// `run` from connecting to the database through building the state and
-/// starting the record source: everything a served instance has before its
-/// background tasks start and it listens. An `Err` is the exit code to stop
-/// with.
 /// Logs every configuration problem first, before anything slow can push it
 /// out of view. A bad `SESSION_SECRET` does not stop boot, because API-key,
 /// DPoP and service-auth callers need no cookie, but it leaves the dashboard
@@ -318,6 +315,10 @@ fn report_config_errors(config: &Config) {
     }
 }
 
+/// `run` from connecting to the database through building the state and
+/// starting the record source: everything a served instance has before its
+/// background tasks start and it listens. An `Err` is the exit code to stop
+/// with.
 async fn boot(
     config: Config,
     dev_mode: bool,
@@ -353,6 +354,14 @@ async fn boot(
         backend = ?db_backend,
         "connected to database"
     );
+
+    // Decide how plugin raw SQL is isolated on Postgres (fixed for the process).
+    let plugin_sql = crate::plugin::host::decide_plugin_sql_access(
+        &db_pool,
+        db_backend,
+        crate::config::vars::var("PLUGIN_SQL_DATABASE_URL").as_deref(),
+    )
+    .await;
 
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.keyring().as_ref() {
@@ -1074,6 +1083,21 @@ async fn boot(
         db_backend,
     );
 
+    let update_check_config = crate::update_check::UpdateCheckConfig::from_env(&config.plc_url);
+    let update_status: crate::update_check::SharedUpdateStatus = std::sync::Arc::new(
+        tokio::sync::RwLock::new(crate::update_check::UpdateStatus::initial(
+            crate::version::version(),
+            update_check_config.enabled,
+            config.telemetry_managed_by.is_some(),
+        )),
+    );
+    crate::update_check::spawn_check_task(
+        update_check_config,
+        update_status.clone(),
+        db_pool.clone(),
+        db_backend,
+    );
+
     let proxy_config = {
         let json_str =
             crate::admin::settings::get_setting(&db_pool, "xrpc_proxy_config", db_backend).await;
@@ -1148,6 +1172,7 @@ async fn boot(
         attestation_signer,
         official_registry,
         official_registry_config,
+        update_status,
         proxy_config,
         verbose_event_logging,
         ignored_keeps: Arc::default(),
@@ -1157,6 +1182,7 @@ async fn boot(
         limits: limits.provider,
         metrics,
         test: None,
+        plugin_sql,
     };
 
     // Populate record_refs once, for records indexed before the table existed.

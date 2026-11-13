@@ -121,6 +121,7 @@ impl TestApp {
 
         let mock_server = MockServer::start().await;
         let mock_url = mock_server.uri();
+        accept_space_did_genesis(&mock_server).await;
 
         let admin_did = "did:plc:testadmin".to_string();
         let admin_token = "test-admin-token".to_string();
@@ -956,5 +957,67 @@ impl TestApp {
         } else {
             serde_json::from_slice(&bytes).unwrap()
         }
+    }
+}
+
+/// Accept every space DID's genesis operation at the mock PLC (`plc_url`), since
+/// creating a space publishes a did:plc. Mounted at the lowest priority, so a
+/// test that mounts its own PLC (`plc::setup_mock_plc`) still receives the
+/// operations it records.
+async fn accept_space_did_genesis(server: &MockServer) {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/did:plc:[a-z2-7]{24}$"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(u8::MAX)
+        .mount(server)
+        .await;
+}
+
+impl TestApp {
+    /// The `#atproto` key a space DID's genesis operation published, read from
+    /// the operation the mock PLC (`plc_url`) received, whichever mock
+    /// answered it.
+    pub async fn published_atproto_key(&self, did: &str) -> p256::ecdsa::VerifyingKey {
+        let genesis: serde_json::Value = self
+            .mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == format!("/{did}"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .unwrap_or_else(|| panic!("no genesis operation was published for {did}"));
+        let did_key = genesis["verificationMethods"]["atproto"].as_str().unwrap();
+        let (_, multikey) = multibase::decode(did_key.trim_start_matches("did:key:")).unwrap();
+        assert_eq!(&multikey[..2], &[0x80, 0x24], "a P-256 key");
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&multikey[2..]).unwrap()
+    }
+
+    /// Assert `authorization` (`Bearer <jwt>`) is service auth issued by the
+    /// space DID `did`, signed with the key its genesis operation published.
+    pub async fn assert_signed_as_space(&self, authorization: &str, did: &str) {
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .expect("a Bearer token");
+        let parts: Vec<&str> = token.split('.').collect();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(
+            payload["iss"],
+            serde_json::json!(did),
+            "issued as the space DID"
+        );
+        let signature = p256::ecdsa::Signature::from_slice(&b64.decode(parts[2]).unwrap()).unwrap();
+        self.published_atproto_key(did)
+            .await
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("signed with the space DID's published #atproto key");
     }
 }

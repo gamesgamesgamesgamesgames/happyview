@@ -133,6 +133,9 @@ pub fn state_with_pool_on(
             crate::plugin::official_registry::OfficialRegistryState::default(),
         )),
         official_registry_config: crate::plugin::official_registry::RegistryConfig::production(),
+        update_status: Arc::new(tokio::sync::RwLock::new(
+            crate::update_check::UpdateStatus::initial(crate::version::version(), false, false),
+        )),
         proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
             crate::proxy_config::ProxyConfig::default(),
         ))),
@@ -144,6 +147,9 @@ pub fn state_with_pool_on(
         limits: Arc::new(happyview_provider::FixedLimits::default()),
         metrics: Arc::new(crate::metrics::ScriptMetrics::new()),
         test: None,
+        // Tests default to the parser-allowlist boundary; a test that wants the
+        // role or login-pool path sets this after calling `ensure_plugin_roles`.
+        plugin_sql: crate::PluginSqlAccess::ParserOnly,
     };
     // Backfills and their admin routes work on this state; nothing is started.
     crate::host::attach_jetstream(&mut state, Default::default());

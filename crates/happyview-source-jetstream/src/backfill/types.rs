@@ -14,6 +14,11 @@ pub struct CreateBackfillBody {
     pub dids: Option<Vec<String>>,
     /// `auto`, `replay` or `crawl`; `BACKFILL_SOURCE` when absent.
     pub source: Option<String>,
+    /// Start the collection's relay listing at this cursor rather than its
+    /// first page: a network crawl of `collection` only, which picks up where
+    /// another job's discovery stopped (see `discovery_unfinished`).
+    #[serde(default)]
+    pub relay_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +40,13 @@ pub struct BackfillJob {
     /// False while a network job is still listing repos from the relay; until
     /// then `total_repos` is the count discovered so far.
     pub discovery_complete: bool,
+    /// A crawl's collections whose saved relay cursor has not reached the end
+    /// of the listing, with that cursor. While a job runs these are the
+    /// collections still being discovered. On a paused job, `resume` continues
+    /// from them; on a completed one (from before discovery paused on a relay
+    /// error), a new backfill with `relay_cursor` does. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub discovery_unfinished: Vec<UnfinishedDiscovery>,
     /// For jobs on the bounded queue, how many of the most recent completions
     /// `repos?phase=fetched` lists. `None` for older jobs, which list every
     /// completed repo.
@@ -51,6 +63,16 @@ pub struct BackfillJob {
     pub hooks: Option<JobHookStats>,
     /// The hook stats kept with the job when it ended.
     pub hook_stats: Option<serde_json::Value>,
+}
+
+/// One collection whose relay listing a crawl has not finished.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnfinishedDiscovery {
+    pub collection: String,
+    /// The cursor of the next page to list. A crawl writes its cursor row
+    /// only once a page is listed, so a crawl's is always set; the field
+    /// stays optional only because the cursor column is nullable.
+    pub relay_cursor: Option<String>,
 }
 
 /// Where a replay job's running sweep is, and what it has cost.

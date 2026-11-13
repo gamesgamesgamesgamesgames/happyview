@@ -52,8 +52,15 @@ pub async fn issue_credential(
         public_url,
         plc_url,
     };
-    check_app_access(space, client_id)?;
+    // The account first, then the app, so only an account the space admits
+    // learns that its app is the obstacle. A refused account is `Forbidden`;
+    // a refused app is `AppNotAuthorized`.
     check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
+    check_app_access(space, client_id).map_err(|e| AppError::XrpcError {
+        status: axum::http::StatusCode::FORBIDDEN,
+        code: "AppNotAuthorized",
+        message: e.to_string(),
+    })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -75,10 +82,20 @@ pub async fn issue_credential(
         }),
     };
 
-    // A space this instance is authority for is verified against the
-    // `#atproto_space` key in the instance's DID document. Earlier spaces are
-    // anchored on their creator's DID and keep their per-space key.
-    let token = if is_instance_authority(pool, backend, public_url, space).await {
+    // A space on its own DID signs with that DID's `#atproto` key. A space
+    // this instance is authority for is verified against the `#atproto_space`
+    // key in the instance's DID document. Earlier spaces are anchored on their
+    // creator's DID and keep their per-space key.
+    let token = if let Some(signing_key) =
+        crate::spaces::authority::signing_key(pool, backend, encryption_key, &space.authority_did)
+            .await?
+    {
+        crate::spaces::credential::sign_credential_with_kid(
+            &claims,
+            &signing_key,
+            crate::spaces::authority::SIGNING_KID,
+        )?
+    } else if is_instance_authority(pool, backend, public_url, space).await {
         let signing_key =
             crate::spaces::service::load_signing_key(pool, backend, encryption_key).await?;
         crate::spaces::credential::sign_credential_with_key(&claims, &signing_key)?
@@ -106,35 +123,82 @@ pub async fn issue_credential(
     Ok(IssuedCredential { token, expires_at })
 }
 
-/// The method a managing-app service-auth token is scoped to.
-const CHECK_USER_ACCESS_LXM: &str = "com.atproto.simplespace.checkUserAccess";
+/// The methods a space authority can ask its managing app with, newest
+/// first: `checkAccess` (Nov 12), then `checkUserAccess` under
+/// `managedspace` (Oct 29) and under `simplespace` (before). An app is asked
+/// with the newest it answers, and each service-auth token is scoped to the
+/// method it is sent with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckMethod {
+    Nov12,
+    Oct29,
+    Simplespace,
+}
 
-/// Build the query parameters for a `checkUserAccess` call.
-///
-/// A query, not a procedure: the lexicon defines GET with `space`, `user` and a
-/// required `access`. Extracted so the wire shape can be asserted without
-/// standing up DID resolution.
-fn check_user_access_params(
-    space_uri: &str,
-    user_did: &str,
-    client_id: Option<&str>,
-    access: AccessKind,
-) -> Vec<(&'static str, String)> {
-    let mut params = vec![
-        ("space", space_uri.to_string()),
-        ("user", user_did.to_string()),
-        ("access", access.as_str().to_string()),
-    ];
+impl CheckMethod {
+    const NEWEST_FIRST: [Self; 3] = [Self::Nov12, Self::Oct29, Self::Simplespace];
 
-    // Omitted for write checks: notifyWrite does not identify the application
-    // that originated the write, so there is no client to name.
-    if access == AccessKind::Read
-        && let Some(cid) = client_id
-    {
-        params.push(("clientId", cid.to_string()));
+    fn nsid(self) -> &'static str {
+        match self {
+            Self::Nov12 => "com.atproto.managedspace.checkAccess",
+            Self::Oct29 => "com.atproto.managedspace.checkUserAccess",
+            Self::Simplespace => "com.atproto.simplespace.checkUserAccess",
+        }
     }
 
-    params
+    /// The query parameters for this method, or `None` when it cannot ask the
+    /// question. Only `checkAccess` can ask about a read with no user (a
+    /// request with no delegation token); the older methods require one.
+    fn params(
+        self,
+        space_uri: &str,
+        user_did: Option<&str>,
+        client_id: Option<&str>,
+        access: AccessKind,
+    ) -> Option<Vec<(&'static str, String)>> {
+        let mut params = vec![("space", space_uri.to_string())];
+        match self {
+            Self::Nov12 => {
+                if let Some(user) = user_did {
+                    params.push(("repo", user.to_string()));
+                }
+            }
+            Self::Oct29 | Self::Simplespace => {
+                params.push(("user", user_did?.to_string()));
+                params.push(("access", access.as_str().to_string()));
+            }
+        }
+        // Omitted for write checks: a write notification does not identify
+        // the application that originated the write, so there is no client to
+        // name.
+        if access == AccessKind::Read
+            && let Some(cid) = client_id
+        {
+            params.push(("clientId", cid.to_string()));
+        }
+        Some(params)
+    }
+
+    /// The app's decision, from its answer: `{read, write}` from
+    /// `checkAccess`, `{authorized}` from the older methods.
+    fn decision(self, answer: &serde_json::Value, access: AccessKind) -> bool {
+        let field = match self {
+            Self::Nov12 => access.as_str(),
+            Self::Oct29 | Self::Simplespace => "authorized",
+        };
+        answer.get(field).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+}
+
+/// Whether an answer says the app does not implement the method asked, so
+/// the next older one should be tried. A 400 counts only when it names
+/// `MethodNotImplemented`, since a 400 is also how an app refuses a request
+/// it understood.
+fn method_not_implemented(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+        || status == reqwest::StatusCode::NOT_IMPLEMENTED
+        || (status == reqwest::StatusCode::BAD_REQUEST
+            && body.get("error").and_then(|e| e.as_str()) == Some("MethodNotImplemented"))
 }
 
 /// Which permission a policy check is about.
@@ -169,6 +233,12 @@ async fn policy_allows(
     authority_did: &str,
     access: AccessKind,
 ) -> Result<bool, AppError> {
+    // Proposal 0016 authorizes the authority's own account under every policy.
+    // The authority here is a DID no one signs in as, and its creator stands
+    // in for it.
+    if subject_did == space.creator_did {
+        return Ok(true);
+    }
     match policy {
         Policy::Public => Ok(true),
         Policy::MemberList => {
@@ -197,7 +267,8 @@ async fn policy_allows(
                 auth_ctx,
                 managing_app,
                 &space_uri,
-                subject_did,
+                // An empty subject is a request with no delegation token.
+                (!subject_did.is_empty()).then_some(subject_did),
                 client_id,
                 authority_did,
                 access,
@@ -266,13 +337,18 @@ async fn check_mint_policy(
     }
 }
 
+/// Ask a managing app whether `user_did` may read or write the space, with
+/// the newest method it answers (see [`CheckMethod`]). `None` asks about a
+/// read with no user, which only `checkAccess` can express; an app that
+/// answers only an older method is taken to refuse it, as those revisions
+/// did.
 #[allow(clippy::too_many_arguments)]
 async fn check_user_access_with_managing_app(
     http: &reqwest::Client,
     auth_ctx: ServiceAuthCtx<'_>,
     managing_app: &str,
     space_uri: &str,
-    user_did: &str,
+    user_did: Option<&str>,
     client_id: Option<&str>,
     authority_did: &str,
     access: AccessKind,
@@ -287,80 +363,147 @@ async fn check_user_access_with_managing_app(
             ))
         })?;
 
-    let url = format!(
-        "{}/xrpc/com.atproto.simplespace.checkUserAccess",
-        endpoint.trim_end_matches('/')
-    );
+    // Every check starts from the newest method rather than one remembered,
+    // so an app that upgrades is asked its new way at once. An app on an
+    // earlier revision costs one unanswered request per method it lacks.
+    for method in &CheckMethod::NEWEST_FIRST {
+        let Some(params) = method.params(space_uri, user_did, client_id, access) else {
+            return Ok(false);
+        };
+        match ask_managing_app(
+            http,
+            auth_ctx,
+            &endpoint,
+            managing_app,
+            authority_did,
+            *method,
+            &params,
+        )
+        .await?
+        {
+            Answer::Decided(answer) => return Ok(method.decision(&answer, access)),
+            Answer::Refused => return Ok(false),
+            Answer::NotImplemented => continue,
+        }
+    }
+    Err(AppError::BadGateway(format!(
+        "the managing app {managing_app} implements none of {}",
+        CheckMethod::NEWEST_FIRST.map(CheckMethod::nsid).join(", ")
+    )))
+}
 
-    let params = check_user_access_params(space_uri, user_did, client_id, access);
+/// A managing app's answer to one method.
+enum Answer {
+    Decided(serde_json::Value),
+    /// It refused the check, or our authentication. A denial, not an error.
+    Refused,
+    /// It does not implement the method.
+    NotImplemented,
+}
+
+async fn ask_managing_app(
+    http: &reqwest::Client,
+    auth_ctx: ServiceAuthCtx<'_>,
+    endpoint: &str,
+    managing_app: &str,
+    authority_did: &str,
+    method: CheckMethod,
+    params: &[(&'static str, String)],
+) -> Result<Answer, AppError> {
+    let nsid = method.nsid();
+    let url = format!("{}/xrpc/{nsid}", endpoint.trim_end_matches('/'));
 
     // The lexicon requires service auth from the authority, and the reference
     // managing app verifies it and rejects anything without one. `aud` is the
     // managing app's service identifier and `lxm` pins the token to this single
     // method.
-    let token = crate::auth::service_auth::mint_service_auth(
+    let token = match crate::spaces::authority::mint_service_auth(
         auth_ctx.pool,
         auth_ctx.backend,
         auth_ctx.encryption_key,
-        auth_ctx.public_url,
+        authority_did,
         managing_app,
-        CHECK_USER_ACCESS_LXM,
+        nsid,
     )
-    .await?;
-
-    // The managing app expects the space authority as `iss`. When the authority
-    // is not this instance we cannot sign for it, so fail here rather than send
-    // a token the app will reject as the wrong issuer.
-    let instance_did = crate::auth::service_auth::instance_did(
-        auth_ctx.pool,
-        auth_ctx.backend,
-        auth_ctx.public_url,
-    )
-    .await?;
-    if instance_did != authority_did {
-        return Err(AppError::Internal(format!(
-            "cannot authenticate a managing-app check for authority {authority_did}: \
-             this instance signs as {instance_did}"
-        )));
-    }
+    .await?
+    {
+        Some(token) => token,
+        None => {
+            // The managing app expects the space authority as `iss`. A space
+            // created before space DIDs existed can be signed for only when its
+            // authority is this instance, so fail rather than send a token the
+            // app will reject as the wrong issuer.
+            let instance_did = crate::auth::service_auth::instance_did(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                auth_ctx.public_url,
+            )
+            .await?;
+            if instance_did != authority_did {
+                return Err(AppError::Internal(format!(
+                    "cannot authenticate a managing-app check for authority {authority_did}: \
+                     this instance signs as {instance_did}"
+                )));
+            }
+            crate::auth::service_auth::mint_service_auth(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                auth_ctx.encryption_key,
+                auth_ctx.public_url,
+                managing_app,
+                nsid,
+            )
+            .await?
+        }
+    };
 
     let resp = http
         .get(&url)
-        .query(&params)
+        .query(params)
         .bearer_auth(&token)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("checkUserAccess request failed: {e}")))?;
+        .map_err(|e| {
+            // The transport error can name the app's endpoint; it goes to the
+            // log, not to the caller.
+            tracing::warn!(managing_app, error = %e, "could not reach the managing app");
+            AppError::BadGateway(format!(
+                "the managing app {managing_app} could not be reached"
+            ))
+        })?;
+    let status = resp.status();
 
     // A managing app refusing is a denial, not an error. This also covers our
     // own auth being rejected, hence the warn.
-    if resp.status() == reqwest::StatusCode::FORBIDDEN
-        || resp.status() == reqwest::StatusCode::UNAUTHORIZED
-    {
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
         tracing::warn!(
-            status = %resp.status(),
+            %status,
             managing_app,
+            method = nsid,
             "managing app refused the access check; this is a denial, but check service auth"
         );
-        return Ok(false);
+        return Ok(Answer::Refused);
     }
 
-    if !resp.status().is_success() {
-        return Err(AppError::Internal(format!(
-            "checkUserAccess returned unexpected status {}",
-            resp.status()
+    let body = resp.bytes().await.unwrap_or_default();
+    let json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    if method_not_implemented(status, json.as_ref().unwrap_or(&serde_json::Value::Null)) {
+        return Ok(Answer::NotImplemented);
+    }
+
+    // Anything else is the managing app failing to answer, not a decision:
+    // an upstream error, never one of ours.
+    if !status.is_success() {
+        return Err(AppError::BadGateway(format!(
+            "the managing app {managing_app} answered {nsid} with {status}"
         )));
     }
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("checkUserAccess response parse failed: {e}")))?;
-
-    Ok(json
-        .get("authorized")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false))
+    json.map(Answer::Decided).ok_or_else(|| {
+        tracing::warn!(managing_app, "the managing app's answer is unreadable");
+        AppError::BadGateway(format!(
+            "the managing app {managing_app} sent an unreadable {nsid} answer"
+        ))
+    })
 }
 
 /// Resolve a DID's `#atproto_pds` service endpoint from its DID document.
@@ -527,6 +670,14 @@ pub(crate) async fn space_verifying_key(
     public_url: &str,
     space: &Space,
 ) -> Result<crate::spaces::commit::SpaceVerifyingKey, AppError> {
+    if let Some(signing_key) =
+        crate::spaces::authority::signing_key(pool, backend, encryption_key, &space.authority_did)
+            .await?
+    {
+        return Ok(crate::spaces::commit::SpaceVerifyingKey::P256(
+            *signing_key.verifying_key(),
+        ));
+    }
     if is_instance_authority(pool, backend, public_url, space).await {
         let method =
             crate::verification_methods::get_method_by_fragment(pool, backend, "#atproto_space")
@@ -946,6 +1097,63 @@ mod tests {
         assert!(matches!(result, Err(AppError::Forbidden(_))));
     }
 
+    /// The account is weighed before the app: one the space does not admit
+    /// is refused as an account, whatever app it comes through, and only one
+    /// it admits is told the app is not allowed.
+    #[tokio::test]
+    async fn the_account_is_weighed_before_the_app() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut space = test_space(AppAccess::AllowList {
+            allowed: vec!["good-app".into()],
+        });
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, DatabaseBackend::Sqlite, &space)
+            .await
+            .unwrap();
+        let issue = |subject: String| {
+            let (pool, space) = (pool.clone(), space.clone());
+            async move {
+                issue_credential(
+                    &pool,
+                    DatabaseBackend::Sqlite,
+                    &reqwest::Client::new(),
+                    &crate::plugin::encryption::Keyring::from(
+                        crate::test_support::TEST_ENCRYPTION_KEY,
+                    ),
+                    "http://happyview.test",
+                    "http://plc.test",
+                    &space,
+                    &subject,
+                    Some("other-app"),
+                    &space.authority_did,
+                    None,
+                )
+                .await
+            }
+        };
+
+        let stranger = issue("did:plc:stranger".into()).await;
+        assert!(
+            matches!(stranger, Err(AppError::Forbidden(_))),
+            "{:?}",
+            stranger.err()
+        );
+
+        // The creator stands in for the authority, which every policy admits.
+        let admitted = issue(space.creator_did.clone()).await;
+        assert!(
+            matches!(
+                admitted,
+                Err(AppError::XrpcError {
+                    code: "AppNotAuthorized",
+                    ..
+                })
+            ),
+            "{:?}",
+            admitted.err()
+        );
+    }
+
     #[test]
     fn generate_keypair_produces_valid_jwk() {
         let kp = generate_space_keypair().unwrap();
@@ -970,44 +1178,109 @@ mod managing_app_tests {
 
     const SPACE: &str = "at://did:plc:auth/space/com.example.forum/main";
 
-    #[test]
-    fn read_checks_carry_space_user_access_and_client() {
-        let params =
-            check_user_access_params(SPACE, "did:plc:user", Some("https://app"), AccessKind::Read);
-
-        assert_eq!(get(&params, "space").as_deref(), Some(SPACE));
-        // The lexicon names this parameter `user`, and the reference managing
-        // app reads that key.
-        assert_eq!(get(&params, "user").as_deref(), Some("did:plc:user"));
-        assert_eq!(get(&params, "access").as_deref(), Some("read"));
-        assert_eq!(get(&params, "clientId").as_deref(), Some("https://app"));
-        assert!(
-            get(&params, "did").is_none(),
-            "the lexicon parameter is `user`, not `did`"
-        );
+    fn params(
+        method: CheckMethod,
+        user: Option<&str>,
+        client: Option<&str>,
+        access: AccessKind,
+    ) -> Vec<(&'static str, String)> {
+        method
+            .params(SPACE, user, client, access)
+            .expect("expressible")
     }
 
     #[test]
-    fn access_is_always_present() {
-        // Required by the lexicon: bulletin 400s without it, so omitting it
-        // makes every managing-app check fail regardless of policy.
-        for access in [AccessKind::Read, AccessKind::Write] {
-            let params = check_user_access_params(SPACE, "did:plc:user", None, access);
-            assert!(get(&params, "access").is_some());
+    fn check_access_names_the_account_repo_and_asks_no_access_kind() {
+        let p = params(
+            CheckMethod::Nov12,
+            Some("did:plc:user"),
+            Some("https://app"),
+            AccessKind::Read,
+        );
+        assert_eq!(get(&p, "space").as_deref(), Some(SPACE));
+        assert_eq!(get(&p, "repo").as_deref(), Some("did:plc:user"));
+        assert_eq!(get(&p, "clientId").as_deref(), Some("https://app"));
+        assert!(get(&p, "user").is_none());
+        assert!(get(&p, "access").is_none(), "checkAccess answers both");
+    }
+
+    #[test]
+    fn check_access_can_ask_about_a_read_with_no_user() {
+        let p = params(CheckMethod::Nov12, None, None, AccessKind::Read);
+        assert!(get(&p, "repo").is_none());
+        for older in [CheckMethod::Oct29, CheckMethod::Simplespace] {
+            assert!(
+                older.params(SPACE, None, None, AccessKind::Read).is_none(),
+                "{older:?} requires a user"
+            );
+        }
+    }
+
+    #[test]
+    fn older_checks_carry_space_user_access_and_client() {
+        for method in [CheckMethod::Oct29, CheckMethod::Simplespace] {
+            let p = params(
+                method,
+                Some("did:plc:user"),
+                Some("https://app"),
+                AccessKind::Read,
+            );
+            assert_eq!(get(&p, "space").as_deref(), Some(SPACE));
+            // The lexicon names this parameter `user`, and the reference
+            // managing app reads that key.
+            assert_eq!(get(&p, "user").as_deref(), Some("did:plc:user"));
+            assert_eq!(get(&p, "access").as_deref(), Some("read"));
+            assert_eq!(get(&p, "clientId").as_deref(), Some("https://app"));
+            assert!(get(&p, "did").is_none());
+            assert!(get(&p, "repo").is_none());
+            // Required by the lexicon: bulletin 400s without it.
+            let p = params(method, Some("did:plc:user"), None, AccessKind::Write);
+            assert_eq!(get(&p, "access").as_deref(), Some("write"));
         }
     }
 
     #[test]
     fn write_checks_omit_the_client_id() {
-        let params = check_user_access_params(
-            SPACE,
-            "did:plc:user",
-            Some("https://app"),
-            AccessKind::Write,
-        );
+        for method in CheckMethod::NEWEST_FIRST {
+            let p = params(
+                method,
+                Some("did:plc:user"),
+                Some("https://app"),
+                AccessKind::Write,
+            );
+            assert!(get(&p, "clientId").is_none(), "{method:?}");
+        }
+    }
 
-        assert_eq!(get(&params, "access").as_deref(), Some("write"));
-        assert!(get(&params, "clientId").is_none());
+    #[test]
+    fn each_method_is_decided_by_its_own_answer() {
+        let both = serde_json::json!({ "read": true, "write": false });
+        assert!(CheckMethod::Nov12.decision(&both, AccessKind::Read));
+        assert!(!CheckMethod::Nov12.decision(&both, AccessKind::Write));
+        let authorized = serde_json::json!({ "authorized": true });
+        assert!(!CheckMethod::Nov12.decision(&authorized, AccessKind::Read));
+        for method in [CheckMethod::Oct29, CheckMethod::Simplespace] {
+            assert!(method.decision(&authorized, AccessKind::Read));
+            assert!(!method.decision(&both, AccessKind::Read));
+        }
+    }
+
+    #[test]
+    fn only_a_missing_method_moves_to_an_older_one() {
+        use reqwest::StatusCode;
+        let none = serde_json::Value::Null;
+        assert!(method_not_implemented(StatusCode::NOT_FOUND, &none));
+        assert!(method_not_implemented(StatusCode::NOT_IMPLEMENTED, &none));
+        assert!(method_not_implemented(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": "MethodNotImplemented" })
+        ));
+        assert!(!method_not_implemented(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": "InvalidRequest" })
+        ));
+        assert!(!method_not_implemented(StatusCode::BAD_GATEWAY, &none));
+        assert!(!method_not_implemented(StatusCode::OK, &none));
     }
 
     #[test]

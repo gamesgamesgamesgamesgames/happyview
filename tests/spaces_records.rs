@@ -1328,13 +1328,12 @@ async fn apply_writes_delete_of_nonexistent_record_returns_not_found() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// A space whose config declares `allowedCollections` must reject an
-/// applyWrites `create` op targeting a collection not on that list (400),
-/// so a write-member can't use applyWrites to bypass the enforcement that
-/// createRecord/putRecord already apply.
+/// Any collection may appear in a space, as Proposal 0016 has it, so an
+/// `allowedCollections` list stored by an earlier HappyView limits no
+/// applyWrites op.
 #[tokio::test]
 #[serial]
-async fn apply_writes_rejects_create_op_with_disallowed_collection() {
+async fn apply_writes_accepts_a_collection_a_stored_list_omits() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
@@ -1354,7 +1353,7 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
     let writes = json!([write_op_create(
         "com.example.denied",
         Some("should-not-exist"),
-        &json!({ "text": "should be rejected" }),
+        &json!({ "text": "accepted" }),
     )]);
     let resp = app
         .router
@@ -1367,9 +1366,9 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    // confirm nothing landed
+    // it landed
     let get_resp = app
         .router
         .clone()
@@ -1381,100 +1380,7 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
         ))
         .await
         .unwrap();
-    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
-}
-
-/// A batch for a repo hosted on its author's PDS is checked against
-/// `allowedCollections` before it is forwarded, as a single write is: the
-/// answer is the collection's 400, not the forward's.
-#[tokio::test]
-#[serial]
-async fn apply_writes_checks_allowed_collections_before_forwarding() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("authority");
-    let writer = rand_did("writer");
-    let skey = rand_skey("space");
-    let (space_id, space_uri) = create_space_with_config(
-        &app,
-        &authority,
-        &skey,
-        config_with_allowed_collections(&["com.example.allowed"]),
-    )
-    .await;
-    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
-
-    let mut conn = app.state.db.acquire().await.unwrap();
-    let mut repo_state =
-        spaces_db::get_or_create_repo_state(&mut conn, app.state.db_backend, &space_id, &writer)
-            .await
-            .unwrap();
-    repo_state.host_mode = happyview::spaces::host_mode::HostMode::Native;
-    spaces_db::update_repo_state(&mut *conn, app.state.db_backend, &repo_state)
-        .await
-        .unwrap();
-    drop(conn);
-
-    let writes = json!([write_op_create(
-        "com.example.denied",
-        None,
-        &json!({ "text": "should be rejected" }),
-    )]);
-    let resp = app
-        .router
-        .clone()
-        .oneshot(apply_writes_req(
-            &space_uri,
-            writes,
-            None,
-            Some(cookie_for(&app, &writer)),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-/// A space whose config declares `allowedCollections` must reject an
-/// applyWrites `update` op targeting a collection not on that list (400).
-#[tokio::test]
-#[serial]
-async fn apply_writes_rejects_update_op_with_disallowed_collection() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("authority");
-    let writer = rand_did("writer");
-    let skey = rand_skey("space");
-    let (space_id, space_uri) = create_space_with_config(
-        &app,
-        &authority,
-        &skey,
-        config_with_allowed_collections(&["com.example.allowed"]),
-    )
-    .await;
-    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
-
-    let writes = json!([write_op_update(
-        "com.example.denied",
-        "some-rkey",
-        &json!({ "text": "should be rejected" }),
-        None,
-    )]);
-    let resp = app
-        .router
-        .clone()
-        .oneshot(apply_writes_req(
-            &space_uri,
-            writes,
-            None,
-            Some(cookie_for(&app, &writer)),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(get_resp.status(), StatusCode::OK);
 }
 
 /// applyWrites' `delete` op is NOT gated by `allowedCollections` — deleting

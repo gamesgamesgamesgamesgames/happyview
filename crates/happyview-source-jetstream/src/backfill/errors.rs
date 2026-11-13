@@ -241,6 +241,149 @@ impl ErrorRecorder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The failure set
+// ---------------------------------------------------------------------------
+
+/// Where a `happyview_backfill_failures` row stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureState {
+    /// A fetch retry is due. A resumed job queues the repo again.
+    Pending,
+    /// The job gave up on the repo.
+    Failed,
+    /// The repo was fetched since: by this job, or by a retry-failed job of
+    /// it. retry-failed no longer selects it.
+    Recovered,
+}
+
+impl FailureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+/// Record that `(did, collection)` is pending a retry or was given up on, in
+/// the job's uncapped failure set.
+///
+/// Unlike `ErrorRecorder::record`, this is per collection and has no cap:
+/// it is the list retry-failed reads, and what a resumed job queues again.
+/// A failed write is logged as `backfill.write_failed`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mark_failure(
+    state: &JobState,
+    job_id: &str,
+    did: &str,
+    collection: &str,
+    phase: &str,
+    kind: BackfillErrorKind,
+    failure_state: FailureState,
+    attempts: u32,
+) {
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_failures \
+         (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (job_id, did, collection) DO UPDATE SET \
+         phase = excluded.phase, kind = excluded.kind, state = excluded.state, \
+         attempts = excluded.attempts, last_at = excluded.last_at",
+        state.db_backend,
+    );
+    let now = now_rfc3339();
+    let attempts = i32::try_from(attempts).unwrap_or(i32::MAX);
+    super::job_write(state, job_id, "failure_set", || {
+        happyview_provider::db::query(&sql)
+            .bind(job_id)
+            .bind(did)
+            .bind(collection)
+            .bind(phase)
+            .bind(kind.as_str())
+            .bind(failure_state.as_str())
+            .bind(attempts)
+            .bind(&now)
+            .execute(&state.backfill_db)
+    })
+    .await;
+}
+
+/// Mark `did`'s rows for `collection` recovered: in `job_id`'s failure set,
+/// and in that of the job `job_id` retries (`retry_of`), whose resolve
+/// failures for `did` are recovered too, since `did` resolved here.
+///
+/// `job_id IN (…) AND did = ?` leads so Postgres can use the primary key: it
+/// runs in every unit's completion, over a table no sweep clears. A `NULL`
+/// `retry_of` drops out of the `IN`.
+///
+/// Binds: now, job_id, job_id, did, job_id, collection, job_id, collection.
+pub(crate) const RECOVER_SQL: &str = "UPDATE happyview_backfill_failures SET state = 'recovered', last_at = ? \
+     WHERE job_id IN (?, (SELECT retry_of FROM happyview_backfill_jobs WHERE id = ?)) \
+       AND did = ? AND state <> 'recovered' \
+       AND ((job_id = ? AND collection = ?) \
+            OR (job_id <> ? AND (collection = ? OR phase = 'resolve')))";
+
+/// [`RECOVER_SQL`] for one collection fetched whole.
+pub(crate) async fn mark_recovered(state: &JobState, job_id: &str, did: &str, collection: &str) {
+    let sql = adapt_sql(RECOVER_SQL, state.db_backend);
+    let now = now_rfc3339();
+    super::job_write(state, job_id, "failure_set", || {
+        happyview_provider::db::query(&sql)
+            .bind(&now)
+            .bind(job_id)
+            .bind(job_id)
+            .bind(did)
+            .bind(job_id)
+            .bind(collection)
+            .bind(job_id)
+            .bind(collection)
+            .execute(&state.backfill_db)
+    })
+    .await;
+}
+
+/// Queue a bounded job's pending fetch retries again, one unit per
+/// `(did, collection)`, so a job paused or restarted mid-retry fetches them
+/// on resume. Each unit added counts toward `total_repos`, as its completion
+/// counts toward `processed_repos`. Returns the units added.
+pub async fn requeue_pending_failures(state: &JobState, job_id: &str) -> Result<u64, sqlx::Error> {
+    let backend = state.db_backend;
+    let insert = adapt_sql(
+        "INSERT INTO happyview_backfill_queue (job_id, collection, did) \
+         SELECT job_id, collection, did FROM happyview_backfill_failures \
+         WHERE job_id = ? AND state = 'pending' AND phase = 'fetch' AND collection <> '' \
+         ON CONFLICT DO NOTHING",
+        backend,
+    );
+    let total = adapt_sql(
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            super::saturating_counter("total_repos", "?", backend)
+        ),
+        backend,
+    );
+    happyview_provider::db::retry_on_busy(|| async {
+        let mut tx = state.backfill_db.begin().await?;
+        let added = happyview_provider::db::query(&insert)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if added > 0 {
+            happyview_provider::db::query(&total)
+                .bind(i32::try_from(added).unwrap_or(i32::MAX))
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(added)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,6 +36,7 @@ mod stats;
 mod storage;
 mod telemetry;
 pub(crate) mod types;
+mod update_status;
 mod users;
 mod verification_methods;
 
@@ -118,6 +119,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/spaces", get(spaces::list_spaces))
         .route("/spaces/inspector", get(space_access::inspector_status))
+        .route("/spaces/retired-policies", get(spaces::retired_policies))
         .route(
             "/spaces/access-grants",
             get(space_access::list_grants).post(space_access::create_grant),
@@ -132,6 +134,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/access", get(spaces::covering_grant))
+        .route("/spaces/{id}/convert", post(spaces::convert_space))
         // Each of these records the read it serves, so a cookie only counts
         // on a request from the dashboard itself; see `csrf::audited_read`.
         .route(
@@ -277,6 +280,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/settings/{key}",
             put(settings::upsert).delete(settings::delete),
         )
+        .route("/update-status", get(update_status::get))
         .route("/plugins", post(plugins::add).get(plugins::list))
         .route("/plugins/preview", post(plugins::preview))
         .route("/plugins/official", get(plugins::list_official))

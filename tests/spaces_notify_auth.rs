@@ -502,7 +502,7 @@ async fn a_managing_app_is_reached_through_its_service_entry() {
 
     let managing_app = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .and(path("/xrpc/com.atproto.managedspace.checkUserAccess"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
         .expect(1)
         .mount(&managing_app)
@@ -598,7 +598,7 @@ async fn deleting_a_space_notifies_registered_syncers() {
     let (name, value) = common::auth::admin_cookie_header("did:plc:creator", &app.state.cookie_key);
     let req = Request::builder()
         .method("POST")
-        .uri("/xrpc/com.atproto.simplespace.deleteSpace")
+        .uri("/xrpc/com.atproto.space.deleteSpace")
         .header(name, value)
         .header("content-type", "application/json")
         .body(Body::from(json!({ "space": space }).to_string()))
@@ -687,4 +687,865 @@ async fn notify_write_accepts_the_bare_authority_did_as_audience() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Create a space through `createSpace` as `creator`, returning its uri. It is
+/// created on a DID of its own.
+async fn create_space_on_its_own_did(app: &TestApp, creator: &str) -> String {
+    create_space_on_its_own_did_with(app, creator, json!({})).await
+}
+
+/// `create_space_on_its_own_did`, with `extra` merged into the request.
+async fn create_space_on_its_own_did_with(
+    app: &TestApp,
+    creator: &str,
+    extra: serde_json::Value,
+) -> String {
+    let (name, value) = common::auth::admin_cookie_header(creator, &app.state.cookie_key);
+    let mut body = json!({ "spaceType": SPACE_TYPE, "skey": SPACE_SKEY, "policy": { "$type": "com.atproto.memberspace.policy" } });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.createSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["uri"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// `notifyWrite` to a space on its own DID, with service auth addressed to
+/// `aud_fragment` of that DID, on an instance that exposes no identity of its
+/// own.
+async fn notify_space_did(aud_fragment: &str) -> StatusCode {
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let space_did = space.trim_start_matches("at://").split('/').next().unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            space_did,
+            aud_fragment,
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Proposal 0016 addresses a space host as its authority's `#atproto_pds`. A
+/// space DID this instance holds is an audience in its own right, whatever
+/// identity the instance itself exposes.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_service_auth_addressed_to_the_space_did() {
+    common::require_db!();
+    assert_eq!(notify_space_did("#atproto_pds").await, StatusCode::OK);
+    assert_eq!(notify_space_did("").await, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_another_service_of_the_space_did() {
+    common::require_db!();
+    assert_eq!(
+        notify_space_did("#atproto_labeler").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A space on its own DID forwards write notifications signed as that DID,
+/// with the key its genesis operation published as `#atproto`.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_forwards_notifications_signed_as_it() {
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &space_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let received = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1, "the syncer should be notified once");
+    let token = received[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("Bearer ")
+        .to_string();
+    let parts: Vec<&str> = token.split('.').collect();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+    assert_eq!(payload["iss"], json!(space_did));
+
+    let genesis = plc_store
+        .read()
+        .await
+        .get(&space_did)
+        .cloned()
+        .expect("the space's DID was published");
+    let published = genesis["verificationMethods"]["atproto"].as_str().unwrap();
+    let (_, multikey) = multibase::decode(published.trim_start_matches("did:key:")).unwrap();
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&multikey[2..]).unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&b64.decode(parts[2]).unwrap()).unwrap();
+    verifying
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .expect("signed with the space DID's #atproto key");
+}
+
+fn space_did_of(space: &str) -> String {
+    space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A space on its own DID asks its managing app with service auth signed as
+/// that DID.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_asks_its_managing_app_as_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    let managing_app = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.managedspace.checkAccess"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "read": true, "write": true })),
+        )
+        .mount(&managing_app)
+        .await;
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+
+    let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &newcomer,
+            &space_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": newcomer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let asked = managing_app.received_requests().await.unwrap();
+    assert_eq!(asked.len(), 1, "the managing app is asked once");
+    let authorization = asked[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, &space_did).await;
+    // Scoped to the method it is sent with, which the managing app checks.
+    use base64::Engine;
+    let token = authorization.trim_start_matches("Bearer ");
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["lxm"],
+        json!("com.atproto.managedspace.checkAccess")
+    );
+    // Addressed to the managing app's service, as the policy names it.
+    assert_eq!(payload["aud"], json!("did:plc:forumapp#forum"));
+}
+
+/// How the managing app in [`notify_through_managing_app`] answers.
+enum ManagingAppAnswer {
+    /// It answers every access check with this.
+    Responds(wiremock::ResponseTemplate),
+    /// It implements only the method at this path, answering it with this;
+    /// any other path is a 404.
+    OnlyAt(&'static str, wiremock::ResponseTemplate),
+    /// Its service endpoint is a port nothing listens on.
+    Unreachable,
+}
+
+/// A newcomer's `notifyWrite` to a space a managing app governs, answered by
+/// the app as `answer` says. The space admits the newcomer only if the app
+/// says so, so the status is the app's decision as HappyView reads it.
+async fn notify_through_managing_app(answer: ManagingAppAnswer) -> StatusCode {
+    notify_through_managing_app_asked(answer).await.0
+}
+
+/// As [`notify_through_managing_app`], also returning the `lxm` of every
+/// token the app was sent, in order.
+async fn notify_through_managing_app_asked(answer: ManagingAppAnswer) -> (StatusCode, Vec<String>) {
+    let (status, asked, _) = through_managing_app(answer, Ask::NotifyWrite).await;
+    (status, asked)
+}
+
+/// What is sent to the space a managing app governs.
+enum Ask {
+    /// A newcomer's `notifyWrite`.
+    NotifyWrite,
+    /// A `getSpaceCredential` with no delegation token.
+    CredentialWithoutUser,
+}
+
+/// Send `ask` to a space whose managing app answers as `answer` says,
+/// returning the status, the `lxm` of every token the app was sent, in order,
+/// and the response body.
+async fn through_managing_app(
+    answer: ManagingAppAnswer,
+    ask: Ask,
+) -> (StatusCode, Vec<String>, serde_json::Value) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    // Kept alive until the request is answered.
+    let managing_app = MockServer::start().await;
+    let endpoint = match answer {
+        ManagingAppAnswer::Responds(response) => {
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::OnlyAt(at, response) => {
+            Mock::given(method("GET"))
+                .and(path(at))
+                .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::Unreachable => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        }
+    };
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": endpoint }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+
+    let req = match ask {
+        Ask::NotifyWrite => {
+            let newcomer = format!("did:plc:newcomer{}", Uuid::new_v4().simple());
+            let auth = app
+                .service_auth_jwt_for(
+                    &plc_store,
+                    &newcomer,
+                    &space_did,
+                    "#atproto_pds",
+                    Some("com.atproto.space.notifyWrite"),
+                )
+                .await;
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .header("content-type", "application/json")
+                .header("authorization", auth)
+                .body(Body::from(
+                    json!({
+                        "space": space,
+                        "repo": newcomer,
+                        "rev": "3lzq2b3k4c22a",
+                        "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+        Ask::CredentialWithoutUser => {
+            let key = {
+                use rand::Rng;
+                let mut bytes = [0u8; 32];
+                rand::rng().fill_bytes(&mut bytes);
+                p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+            };
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "space": space,
+                        "credentialKey": happyview::spaces::http_signature::did_key(
+                            key.verifying_key()
+                        ),
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+    };
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&body).unwrap_or_default();
+    let lxms = managing_app
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| {
+            use base64::Engine;
+            let token = request
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .trim_start_matches("Bearer ");
+            let payload: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).unwrap_or_default())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            payload["lxm"].as_str().unwrap_or_default().to_string()
+        })
+        .collect();
+    (status, lxms, body)
+}
+
+/// With no delegation token, a managed space asks its managing app about a
+/// read with no `repo`, and issues a credential if the app allows it. Only
+/// `checkAccess` can ask that: an app on an earlier revision is not asked,
+/// and the space answers as if it did not exist.
+#[tokio::test]
+#[serial]
+async fn a_managed_space_asks_its_app_about_a_read_with_no_user() {
+    common::require_db!();
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkAccess",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": true, "write": false })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["credential"].is_string());
+    assert_eq!(
+        asked,
+        vec!["com.atproto.managedspace.checkAccess".to_string()]
+    );
+
+    let (status, _, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkAccess",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": false, "write": false })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::OnlyAt(
+            "/xrpc/com.atproto.managedspace.checkUserAccess",
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })),
+        ),
+        Ask::CredentialWithoutUser,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+    assert_eq!(
+        asked,
+        vec!["com.atproto.managedspace.checkAccess".to_string()],
+        "an Oct 29 app cannot be asked about a read with no user"
+    );
+}
+
+fn answers(status: u16, body: serde_json::Value) -> ManagingAppAnswer {
+    ManagingAppAnswer::Responds(wiremock::ResponseTemplate::new(status).set_body_json(body))
+}
+
+/// The managing app admitting the user admits them.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_authorizes_admits_the_writer() {
+    common::require_db!();
+    let status =
+        notify_through_managing_app(answers(200, json!({ "read": false, "write": true }))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A managing app built on an earlier revision implements only its
+/// `checkUserAccess`. It is asked with `checkAccess` first, then with the
+/// newest method it answers, each with a token scoped to that method.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_on_an_earlier_revision_is_asked_with_its_method() {
+    common::require_db!();
+    let authorized =
+        || wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true }));
+    let check_access = "com.atproto.managedspace.checkAccess".to_string();
+    let oct29 = "com.atproto.managedspace.checkUserAccess".to_string();
+    let simplespace = "com.atproto.simplespace.checkUserAccess".to_string();
+
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.managedspace.checkUserAccess",
+        authorized(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "Oct 29 app");
+    assert_eq!(asked, vec![check_access.clone(), oct29.clone()]);
+
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.simplespace.checkUserAccess",
+        authorized(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "simplespace app");
+    assert_eq!(asked, vec![check_access, oct29, simplespace]);
+}
+
+/// An earlier revision's answer is read as that revision words it: an
+/// `{authorized}` answer from `checkAccess` decides nothing.
+#[tokio::test]
+#[serial]
+async fn a_check_access_answer_is_read_as_read_and_write() {
+    common::require_db!();
+    let (status, asked) = notify_through_managing_app_asked(ManagingAppAnswer::OnlyAt(
+        "/xrpc/com.atproto.managedspace.checkAccess",
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        asked.len(),
+        1,
+        "an answer is a decision; no older method is tried"
+    );
+}
+
+/// A managing app refusing the request, by status or by answer, is a denial:
+/// the space doesn't admit the writer.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_refusing_denies_the_writer() {
+    common::require_db!();
+    for (label, answer) in [
+        ("403", answers(403, json!({ "error": "Forbidden" }))),
+        ("401", answers(401, json!({ "error": "AuthRequired" }))),
+        (
+            "write false",
+            answers(200, json!({ "read": true, "write": false })),
+        ),
+        ("no write field", answers(200, json!({}))),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+    }
+}
+
+/// A managing app that can't answer the access check is an upstream failure
+/// (502), not an error of ours (500), and admits no one: one that doesn't
+/// implement it, one whose answer isn't JSON, and one nobody can reach.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
+    common::require_db!();
+    for (label, answer) in [
+        (
+            "501",
+            answers(
+                501,
+                json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
+            ),
+        ),
+        (
+            "a text/plain 200",
+            ManagingAppAnswer::Responds(
+                wiremock::ResponseTemplate::new(200).set_body_raw("authorized", "text/plain"),
+            ),
+        ),
+        ("a closed port", ManagingAppAnswer::Unreachable),
+    ] {
+        let status = notify_through_managing_app(answer).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}");
+    }
+}
+
+/// A space on its own DID tells its registered syncers it was deleted with
+/// service auth signed as that DID.
+#[tokio::test]
+#[serial]
+async fn a_space_on_its_own_did_announces_its_deletion_as_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &creator).await;
+    let space_did = space_did_of(&space);
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &space_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.notifySpaceDeleted"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&syncer)
+        .await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let (name, value) = common::auth::admin_cookie_header(&creator, &app.state.cookie_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.deleteSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    assert!(
+        app.router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let mut received = Vec::new();
+    for _ in 0..50 {
+        received = syncer.received_requests().await.unwrap_or_default();
+        if !received.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(received.len(), 1, "the syncer is told once");
+    let authorization = received[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, &space_did).await;
+}
+
+/// Service auth addressed to one space's DID is refused on another space's
+/// routes, though this instance holds both DIDs.
+#[tokio::test]
+#[serial]
+async fn service_auth_for_one_space_is_refused_on_another() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did(&app, &writer).await;
+    let other = create_space_on_its_own_did_with(&app, &writer, json!({ "skey": "other" })).await;
+    let other_did = space_did_of(&other);
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &other_did,
+            "#atproto_pds",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A space created through `createSpace`, on a did:plc of its own, notified
+/// exactly as the reference PDS (`@atproto/pds`, `fireNotifyWrite`) notifies
+/// it: service auth issued by the writer, `aud` the bare space DID, `lxm`
+/// `com.atproto.space.notifyWrite`, and a body of `space`, `repo`, `rev` and
+/// `hash`.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_reference_pds_on_a_space_of_its_own() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let writer = format!("did:plc:writer{}", Uuid::new_v4().simple());
+    let call = |did: &str, method: &str, body: serde_json::Value| {
+        let (name, value) = common::auth::admin_cookie_header(did, &app.state.cookie_key);
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{method}"))
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": SPACE_TYPE,
+                "skey": SPACE_SKEY,
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let space = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(call(
+            &creator,
+            "com.atproto.simplespace.putMember",
+            json!({ "space": space, "did": writer, "read": true, "write": true }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &writer,
+            &space_did,
+            "",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": writer,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }

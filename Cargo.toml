@@ -82,7 +82,7 @@ cid = "0.11"
 ciborium = "0.2"
 ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
-libsqlite3-sys = { version = "0.30", default-features = false }
+libsqlite3-sys = { version = "0.39", default-features = false }
 multibase = "0.9"
 p256 = { version = "0.14", features = ["pkcs8", "ecdsa", "ecdh"] }
 uuid = { version = "1", features = ["v4"] }
@@ -161,6 +161,10 @@ fs4 = "0.13"
 hkdf = "0.13"
 hmac = "0.13"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
+# Postgres's own parser (libpg_query, vendored C — no OpenSSL). Used to enforce
+# the plugin raw-SQL allowlist on Postgres by a real parse rather than a
+# tokenizer, so SQL hidden in string-taking built-ins is seen.
+pg_query = "6"
 subtle = "2"
 mime_guess = "2"
 rust-embed = { version = "8", optional = true }
@@ -225,14 +229,16 @@ rcgen = "0.14"
 wat = "1"
 tempfile = "3"
 
-# sqlx-core 0.9.0's pool maintenance task can spin a worker thread at 100% CPU
-# when `num_idle` underflows (launchbadge/sqlx#4289). Remove this section and
-# bump `sqlx` once a release includes that fix.
+# sqlx 0.9.0 lacks two fixes on sqlx's main branch: its pool maintenance task
+# can spin a worker thread at 100% CPU when `num_idle` underflows
+# (launchbadge/sqlx#4289), and it caps libsqlite3-sys below 0.39, the first
+# release with the SQLite fix for RUSTSEC-2026-0459 (launchbadge/sqlx#4502).
+# Remove this section and bump `sqlx` once a release includes both.
 [patch.crates-io]
-sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
-sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25" }
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }

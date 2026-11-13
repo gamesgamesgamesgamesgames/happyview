@@ -163,6 +163,7 @@ impl RegistrySource {
             &["ProjectNotFound", "ActorNotFound"],
         )
         .await
+        .map(|p: Option<ProjectView>| p.filter(ProjectView::is_plugin))
     }
 
     /// Every version of a project, newest indexed first, following cursors.
@@ -192,7 +193,9 @@ impl RegistrySource {
                 url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
             }
             let page: Page = get(client, "listVersions", url).await?;
-            versions.extend(page.versions);
+            // Only a plugin's versions, whatever a registry answers for this
+            // name.
+            versions.extend(page.versions.into_iter().filter(VersionView::is_plugin));
             match next_cursor(cursor.as_deref(), page.cursor) {
                 Some(next) => cursor = Some(next),
                 None => return Ok(versions),
@@ -228,6 +231,7 @@ impl RegistrySource {
             &["VersionNotFound", "ProjectNotFound"],
         )
         .await
+        .map(|v: Option<VersionView>| v.filter(VersionView::is_plugin))
     }
 
     /// The version a channel points at, or `None` when the channel or the
@@ -252,6 +256,7 @@ impl RegistrySource {
             &["ChannelNotFound", "VersionNotFound", "ProjectNotFound"],
         )
         .await
+        .map(|v: Option<VersionView>| v.filter(VersionView::is_plugin))
     }
 }
 
@@ -320,6 +325,10 @@ pub struct ProjectView {
     #[serde(default)]
     pub handle: Option<String>,
     pub name: String,
+    /// `plugin` or `server`. The registry serves only plugins and sends none;
+    /// a project that says otherwise is never taken for a plugin.
+    #[serde(default)]
+    pub kind: Option<String>,
     #[serde(default)]
     pub publication: Publication,
     #[serde(default)]
@@ -335,6 +344,12 @@ pub struct ProjectView {
 }
 
 impl ProjectView {
+    /// Whether the project is a plugin. One with no kind is, since the
+    /// registry lists only plugins.
+    pub fn is_plugin(&self) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == "plugin")
+    }
+
     /// Everything a catalogue entry takes from the project listing, as one
     /// string. Two reads with the same fingerprint describe the same project
     /// at the same channel heads, so the versions behind them need not be
@@ -440,6 +455,9 @@ pub struct VersionView {
     pub did: String,
     pub name: String,
     pub version: String,
+    /// `plugin` or `server`; see [`ProjectView::kind`].
+    #[serde(default)]
+    pub kind: Option<String>,
     /// The `software.release.manifest` record, not the plugin's own manifest
     /// file: that one is `artifact.manifest`.
     #[serde(default)]
@@ -459,6 +477,19 @@ pub struct VersionView {
 }
 
 impl VersionView {
+    /// Whether the version is a plugin's, by its kind and its artifact type.
+    /// Defence in depth: the registry indexes only plugin projects, and
+    /// HappyView's own releases are never in it, but every plugin read drops
+    /// anything that isn't a plugin, whatever a registry answers.
+    pub fn is_plugin(&self) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == "plugin")
+            && self
+                .artifact
+                .kind
+                .as_deref()
+                .is_none_or(|t| t == "at.happyproto.plugin.v1")
+    }
+
     /// Whether this version may be installed: its lifecycle allows it, the
     /// registry holds its bytes, and it isn't suspect. One the registry has
     /// not copied yet, or has lost at the source, has nothing to fetch. A
@@ -482,6 +513,10 @@ pub struct StrongRef {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginArtifact {
+    /// The artifact's `$type`. Anything but `at.happyproto.plugin.v1` is not
+    /// a plugin.
+    #[serde(default, rename = "$type")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub package: BlobRef,
     #[serde(default)]
@@ -689,6 +724,9 @@ pub async fn fetch_listing(
     let projects = source.search_projects(client).await?;
     let mut listing = Listing::default();
     for project in projects {
+        if !project.is_plugin() {
+            continue;
+        }
         let key = (project.did.clone(), project.name.clone());
         // The whole point of the fingerprint: a project that has not moved
         // costs no `listVersions` call at all, which in a steady state is
@@ -1020,6 +1058,163 @@ mod tests {
             )
             .mount(server)
             .await;
+    }
+
+    /// Something that isn't a plugin, as a misbehaving registry might answer
+    /// for a name: a version marked `server`, with an artifact of another
+    /// type.
+    fn not_a_plugin(v: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uri": version_uri(HP, "happyview", v),
+            "cid": "bafynotaplugin",
+            "did": HP,
+            "name": "happyview",
+            "kind": "server",
+            "version": v,
+            "artifact": { "$type": "software.release.defs#gitRevision" },
+            "availability": "available",
+            "suspect": false,
+            "lifecycle": { "state": "active", "installable": true, "events": [] },
+        })
+    }
+
+    /// Install by name, the installed-plugin refresh and the catalogue all
+    /// read through these, so none of them can ever take something that
+    /// isn't a plugin for one, whatever the registry answers.
+    #[tokio::test]
+    async fn no_plugin_read_ever_returns_what_is_not_a_plugin() {
+        let server = MockServer::start().await;
+        for method_name in ["resolveChannel", "getVersion"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/xrpc/at.happyproto.registry.{method_name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(not_a_plugin("2.17.4")))
+                .mount(&server)
+                .await;
+        }
+        // No kind, but an artifact of another type: still not a plugin.
+        let mut unmarked = not_a_plugin("2.17.3");
+        unmarked.as_object_mut().unwrap().remove("kind");
+        // A kind of server with a plugin artifact: not a plugin either.
+        let mut mislabelled = version(HP, "happyview", "2.17.2", "active", true, "available");
+        mislabelled["kind"] = "server".into();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.listVersions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [not_a_plugin("2.17.4"), unmarked, mislabelled],
+            })))
+            .mount(&server)
+            .await;
+        let mut server_project = project(HP, "happyview", serde_json::json!({}));
+        server_project["kind"] = "server".into();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.getProject"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(server_project))
+            .mount(&server)
+            .await;
+
+        let src = source(&server);
+        let client = reqwest::Client::new();
+        assert!(
+            src.resolve_channel(&client, HP, "happyview", "latest")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            src.get_version(&client, HP, "happyview", "2.17.4")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            src.list_versions(&client, HP, "happyview")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            src.get_project(&client, HP, "happyview")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A plugin's own reads are untouched: no kind and a plugin artifact is
+    /// a plugin.
+    #[tokio::test]
+    async fn a_plugin_without_a_kind_is_still_a_plugin() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/at.happyproto.registry.getVersion"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(version(
+                HP,
+                "lua",
+                "1.2.0",
+                "active",
+                true,
+                "available",
+            )))
+            .mount(&server)
+            .await;
+        let got = source(&server)
+            .get_version(&reqwest::Client::new(), HP, "lua", "1.2.0")
+            .await
+            .unwrap();
+        assert_eq!(got.expect("a plugin").version, "1.2.0");
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_skips_a_project_that_is_not_a_plugin() {
+        let server = MockServer::start().await;
+        let mut happyview = project(HP, "happyview", serde_json::json!({}));
+        happyview["kind"] = "server".into();
+        let lua = project(
+            HP,
+            "lua",
+            serde_json::json!({ "latest": channel(HP, "lua", "1.2.0", "active", "available") }),
+        );
+        mount_projects(&server, serde_json::json!([happyview, lua])).await;
+        mount_versions(
+            &server,
+            HP,
+            "lua",
+            serde_json::json!([version(HP, "lua", "1.2.0", "active", true, "available")]),
+        )
+        .await;
+        // Plugin-shaped versions for the server project too, so it is
+        // readable: only its kind keeps it out of the catalogue.
+        mount_versions(
+            &server,
+            HP,
+            "happyview",
+            serde_json::json!([version(
+                HP,
+                "happyview",
+                "2.17.4",
+                "active",
+                true,
+                "available"
+            )]),
+        )
+        .await;
+        let listing = fetch_listing(
+            &reqwest::Client::new(),
+            &source(&server),
+            RefreshMode::Full,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["lua"]
+        );
     }
 
     #[tokio::test]

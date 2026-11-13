@@ -43,7 +43,14 @@ pub async fn create_space(
         .bind(&now)
         .execute(pool)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to create space: {e}")))?;
+        .map_err(
+            |e| match e.as_database_error().map(|d| d.is_unique_violation()) {
+                // Two creates of one space share its DID, so the second meets the
+                // address constraint.
+                Some(true) => AppError::Conflict("A space with this address already exists".into()),
+                _ => AppError::Internal(format!("failed to create space: {e}")),
+            },
+        )?;
 
     Ok(())
 }
@@ -187,42 +194,68 @@ pub struct SpaceView {
     pub uri: String,
     pub is_owner: bool,
     pub created_at: String,
+    /// The listed account's repo in the space, if it has written there.
+    pub repo_rev: Option<String>,
+    pub repo_data: Option<Vec<u8>>,
+    /// The space's own revision.
+    pub space_rev: Option<String>,
 }
 
+/// The spaces `did` is a member of, oldest membership first.
+///
+/// `authority` narrows them to spaces under that DID, as `listSpaces`'s
+/// `spaceDid` does.
 pub async fn list_spaces_for_user(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     did: &str,
     space_type: Option<&str>,
+    authority: Option<&str>,
     limit: i64,
     cursor: Option<&str>,
 ) -> Result<(Vec<SpaceView>, Option<String>), AppError> {
     let decoded_cursor = cursor.and_then(decode_cursor);
-    let type_clause = if space_type.is_some() {
-        " AND s.type_nsid = ?"
+    let mut filters = String::new();
+    if space_type.is_some() {
+        filters.push_str(" AND s.type_nsid = ?");
+    }
+    if authority.is_some() {
+        filters.push_str(" AND s.did = ?");
+    }
+    let uri_expr = "('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey)";
+    let cursor_clause = if decoded_cursor.is_some() {
+        format!(" AND (sm.created_at > ? OR (sm.created_at = ? AND {uri_expr} > ?))")
     } else {
-        ""
+        String::new()
     };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at, rs.rev, rs.hash, s.revision \
+             FROM happyview_space_members sm \
+             JOIN happyview_spaces s ON s.id = sm.space_id \
+             LEFT JOIN happyview_space_repo_state rs ON rs.space_id = s.id AND rs.author_did = sm.member_did \
+             WHERE sm.member_did = ?{filters}{cursor_clause} \
+             ORDER BY sm.created_at ASC, {uri_expr} ASC LIMIT ?"
+        ),
+        backend,
+    );
 
-    let sql = if decoded_cursor.is_some() {
-        adapt_sql(
-            &format!(
-                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
-            ),
-            backend,
-        )
-    } else {
-        adapt_sql(
-            &format!(
-                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
-            ),
-            backend,
-        )
-    };
-
-    let mut query = crate::db::query_as::<(String, String, String, String, String)>(&sql).bind(did);
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<String>,
+    );
+    let mut query = crate::db::query_as::<Row>(&sql).bind(did);
     if let Some(space_type) = space_type {
         query = query.bind(space_type);
+    }
+    if let Some(authority) = authority {
+        query = query.bind(authority);
     }
     if let Some((ref ts, ref uri)) = decoded_cursor {
         query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
@@ -237,10 +270,24 @@ pub async fn list_spaces_for_user(
     let views: Vec<SpaceView> = rows
         .into_iter()
         .map(
-            |(space_did, creator_did, type_nsid, skey, created_at)| SpaceView {
-                uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
-                is_owner: creator_did == did,
+            |(
+                space_did,
+                creator_did,
+                type_nsid,
+                skey,
                 created_at,
+                repo_rev,
+                repo_data,
+                space_rev,
+            )| {
+                SpaceView {
+                    uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
+                    is_owner: creator_did == did,
+                    created_at,
+                    repo_rev,
+                    repo_data,
+                    space_rev,
+                }
             },
         )
         .collect();
@@ -255,7 +302,7 @@ pub async fn list_spaces_for_user(
 }
 
 pub async fn update_space(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space: &Space,
 ) -> Result<bool, AppError> {
@@ -283,7 +330,7 @@ pub async fn update_space(
         .bind(&config_json)
         .bind(&now)
         .bind(&space.id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update space: {e}")))?;
 
@@ -304,6 +351,26 @@ pub async fn delete_space(
         .map_err(|e| AppError::Internal(format!("failed to delete space: {e}")))?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Every space with a managing-app read or write rule: the managedspaces, and
+/// any whose rules predate policies and pair a managing app with something
+/// else. [`crate::spaces::retired`] tells the two apart.
+pub async fn list_spaces_with_managing_app_rules(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Vec<Space>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces \
+         WHERE read_policy LIKE '%managingAppPolicy%' OR write_policy LIKE '%managingAppPolicy%' \
+         ORDER BY created_at, id",
+        backend,
+    );
+    let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
+    rows.into_iter().map(parse_space_row).collect()
 }
 
 type SpaceRow = (
@@ -376,11 +443,20 @@ fn parse_space_row(r: SpaceRow) -> Result<Space, AppError> {
 // ---------------------------------------------------------------------------
 
 pub async fn add_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<(), AppError> {
-    let now = now_rfc3339();
+    upsert_member(executor, backend, member)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+async fn upsert_member(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+) -> Result<(), sqlx::Error> {
     let sql = adapt_sql(
         // Upsert: putMember is defined as "add a member or replace their read
         // and write access", so a second call for the same DID must update
@@ -395,7 +471,6 @@ pub async fn add_member(
              is_delegation = excluded.is_delegation",
         backend,
     );
-
     crate::db::query(&sql)
         .bind(&member.id)
         .bind(&member.space_id)
@@ -405,12 +480,111 @@ pub async fn add_member(
         .bind(member.access.read_self as i32)
         .bind(member.is_delegation as i32)
         .bind(&member.granted_by)
-        .bind(&now)
-        .execute(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))?;
-
+        .bind(now_rfc3339())
+        .execute(executor)
+        .await?;
     Ok(())
+}
+
+/// Add or update a member unless the space takes none, checking under the
+/// space's row lock in the insert's own transaction
+/// ([`lock_space_for_members`]). Returns whether the member was stored.
+///
+/// Retried while the database is busy, as [`claim_invite`] is: on SQLite a
+/// write racing another one would otherwise fail outright.
+pub async fn insert_member_if_allowed(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+) -> Result<bool, AppError> {
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(false);
+        }
+        upsert_member(&mut *tx, backend, member).await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// Discard a space's member list, as migrating it to a policy that keeps none
+/// does. Returns how many members were removed.
+pub async fn remove_all_members(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_members WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))
+}
+
+/// Whether a space may take members, read under a lock on its row that lasts
+/// until the transaction ends.
+///
+/// Every member insert calls this first in its transaction, and a policy
+/// migration's `UPDATE` takes the same row first in its own, so the two
+/// serialize: an insert either commits before the migration discards the
+/// member list, or sees the new policy. Postgres locks with `FOR UPDATE`;
+/// on SQLite, `BEGIN IMMEDIATE` already serializes every writer.
+///
+/// A `managedspace` takes none: its managing app decides access, and a member
+/// row would grant direct access around it. So does a space that is missing
+/// or does not parse, so this fails closed.
+pub async fn lock_space_for_members(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let lock = match backend {
+        DatabaseBackend::Postgres => " FOR UPDATE",
+        DatabaseBackend::Sqlite => "",
+    };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?{lock}"
+        ),
+        backend,
+    );
+    let row: Option<SpaceRow> = crate::db::query_as(&sql)
+        .bind(space_id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(row
+        .and_then(|r| parse_space_row(r).ok())
+        .is_some_and(|space| {
+            !matches!(
+                crate::spaces::policy::SpacePolicy::of(&space),
+                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+            )
+        }))
+}
+
+/// Delete every invite to a space, as migrating it to a policy that keeps no
+/// member list does. Returns how many were deleted.
+pub async fn delete_invites(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_invites WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to delete invites: {e}")))
 }
 
 pub async fn remove_member(
@@ -506,6 +680,52 @@ pub async fn list_native_repo_authors(
     .await
     .map_err(|e| AppError::Internal(format!("failed to list native repos: {e}")))?;
     Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
+/// Mark this space's credentials with any of `jtis` revoked, as an authority's
+/// `notifyCredentialRevoked` asks. Idempotent: a credential already revoked
+/// keeps its first revocation time. Returns how many were newly revoked.
+pub async fn revoke_space_credentials_by_jti(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    jtis: &[String],
+) -> Result<u64, AppError> {
+    let now = now_rfc3339();
+    let mut revoked = 0;
+    for jti in jtis {
+        let result = crate::db::query(&adapt_sql(
+            "UPDATE happyview_space_credentials SET revoked_at = ? WHERE space_id = ? AND jti = ? AND revoked_at IS NULL",
+            backend,
+        ))
+        .bind(&now)
+        .bind(space_id)
+        .bind(jti)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
+        revoked += result.rows_affected();
+    }
+    Ok(revoked)
+}
+
+/// Delete credential records that expired before `cutoff`. A credential is
+/// refused once it expires, so its record, and any revocation on it, matters
+/// only until then.
+pub async fn purge_expired_credentials(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    cutoff: &str,
+) -> Result<u64, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_credentials WHERE expires_at < ?",
+        backend,
+    ))
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to purge expired space credentials: {e}")))
 }
 
 /// Revoke all active space credentials issued to `did` within `space_id`.
@@ -1380,7 +1600,9 @@ pub async fn find_blob_authors(
 // Delegation token uses
 // ---------------------------------------------------------------------------
 
-/// Record a delegation token as used, returning `false` if it already was.
+/// Record a single-use token as used, returning `false` if it already was.
+/// Delegation tokens are keyed by the issuing DID and client attestations by
+/// the `client_id`, so the two cannot collide.
 pub async fn consume_delegation_token(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -1475,6 +1697,8 @@ pub enum InviteClaim {
     /// Revoked, or every use already taken.
     Unavailable,
     AlreadyMember,
+    /// The space takes no members (see [`lock_space_for_members`]).
+    NoMembers,
 }
 
 /// Takes one use of an invite and adds its member, or does neither.
@@ -1503,6 +1727,11 @@ pub async fn claim_invite(
     );
     crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(pool, backend).await?;
+        // The space's row first, as a migration takes it, so the two cannot
+        // deadlock.
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(InviteClaim::NoMembers);
+        }
         let taken = crate::db::query(&take_use)
             .bind(invite_id)
             .execute(&mut *tx)

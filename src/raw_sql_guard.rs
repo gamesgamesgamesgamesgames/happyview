@@ -14,17 +14,17 @@ const PROTECTED_TABLE_PREFIX: &str = "happyview_";
 const PROTECTED_EXACT_TABLES: &[&str] = &["_sqlx_migrations"];
 
 /// Internal tables `db.raw` is allowed to read and write despite the reserved
-/// prefix: public AppView data and space *data*. Everything else `happyview_*`
-/// stays blocked — secrets and tokens (`happyview_dpop_keys`/`_sessions`,
-/// `happyview_api_keys`, `happyview_oauth_*`, `happyview_script_variables`),
-/// auth/privilege state (`happyview_users`/`_user_permissions`, the delegation
-/// tables), trust config (`happyview_domains`, `happyview_instance_settings`),
-/// and cryptographic material (`happyview_space_credentials`, and
-/// `happyview_space_repo_state` which holds commit-signature key material).
+/// prefix: public AppView data and background jobs. Everything else
+/// `happyview_*` stays blocked — secrets and tokens (`happyview_dpop_keys`/
+/// `_sessions`, `happyview_api_keys`, `happyview_oauth_*`,
+/// `happyview_script_variables`), auth/privilege state
+/// (`happyview_users`/`_user_permissions`, the delegation tables), trust config
+/// (`happyview_domains`, `happyview_instance_settings`), cryptographic
+/// material, and every space table.
 ///
-/// Space membership/records are exposed because a space defines *access*, not
-/// confidentiality — whether to expose otherwise-private space data through the
-/// AppView is left to the admin.
+/// Space tables are reached only through `happyview.spaces`, which applies the
+/// space's access rules for its caller. Raw SQL reads and writes rows
+/// directly, outside those rules.
 const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     // Public AppView data.
     "happyview_records",
@@ -34,13 +34,6 @@ const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     crate::catalog::lexicon_rows::TABLE,
     // Background jobs.
     "happyview_jobs",
-    // Space data (not the credential/key-material tables).
-    "happyview_spaces",
-    "happyview_space_members",
-    "happyview_space_records",
-    "happyview_space_record_oplog",
-    "happyview_space_notify_registrations",
-    "happyview_space_dids",
 ];
 
 /// Reject a raw SQL string that references a protected internal table.
@@ -84,6 +77,771 @@ pub fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The internal relations a plugin's raw SQL may name, and the relations the
+/// least-privileged Postgres roles are granted. One source of truth so the
+/// parser allowlist in [`check_postgres_plugin_sql`] and the role grants in
+/// `plugin::host::db` cannot drift apart.
+pub fn plugin_nameable_relations() -> &'static [&'static str] {
+    ALLOWED_INTERNAL_TABLES
+}
+
+/// Whether a plugin holds only `database:read` or `database:write`. Chooses the
+/// statement kinds the parser allowlist accepts and, on Postgres, the role the
+/// statement runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginSqlMode {
+    Read,
+    Write,
+}
+
+/// How a Postgres plugin statement is isolated at the database — which decides
+/// how much the parser must enforce on top.
+///
+/// - `LoginPool`: a separate connection that logs in **as** a least-privileged
+///   role, so `session_user` itself has no access to the protected tables and
+///   there is no privileged role to switch back to. The role is the boundary, so
+///   the function allowlist is not needed (the deny-list still applies).
+/// - `Role`: the main (privileged) connection, restricted per statement with
+///   `SET LOCAL ROLE`. `session_user` is still privileged, so the function
+///   allowlist is applied as well, to stop a statement reaching a
+///   privilege-regaining or SQL-text-executing built-in.
+/// - `ParserOnly`: the roles could not be set up; the main privileged connection
+///   with no role change. The parser is the whole boundary: DML only, the
+///   function allowlist, and relations restricted to the `public` schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginSqlEnforcement {
+    LoginPool,
+    Role,
+    ParserOnly,
+}
+
+impl PluginSqlEnforcement {
+    fn allows_ddl(self) -> bool {
+        self != PluginSqlEnforcement::ParserOnly
+    }
+    fn applies_function_allowlist(self) -> bool {
+        self != PluginSqlEnforcement::LoginPool
+    }
+    fn restricts_to_public_schema(self) -> bool {
+        self == PluginSqlEnforcement::ParserOnly
+    }
+}
+
+/// True when `name` is one of HappyView's own internal tables that plugin raw
+/// SQL may not reach — the same rule as [`check_raw_sql_tables`], but applied to
+/// a name the real parser extracted. A caller-owned table (anything without the
+/// reserved prefix) is not blocked; plugins are expected to use their own
+/// tables through raw SQL.
+fn is_blocked_internal_table(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    let internal = lname.starts_with(PROTECTED_TABLE_PREFIX)
+        || PROTECTED_EXACT_TABLES.contains(&lname.as_str());
+    internal
+        && !ALLOWED_INTERNAL_TABLES
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&lname))
+}
+
+/// Built-ins refused in **every** mode, including the login pool — defense in
+/// depth on top of the role boundary. Three groups:
+///
+/// - the function form of `SET` (`set_config`), which could change the session
+///   role or search_path from inside a statement;
+/// - functions that execute a SQL string passed as text, which would run that
+///   text without it passing the parser;
+/// - functions that leave session state the per-statement `SET LOCAL` does not
+///   undo — session advisory locks and large objects — so nothing a plugin does
+///   outlives its statement on a pooled connection;
+/// - functions that read server files or open outbound connections.
+///
+/// This is a deny-list and so is kept narrow and specific; it backs the role and
+/// (outside the login pool) the function allowlist, which are the real
+/// boundaries.
+const ALWAYS_FORBIDDEN_FUNCTIONS: &[&str] = &[
+    // The function form of SET.
+    "set_config",
+    // Execute a SQL string given as text.
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "ts_stat",
+    "ts_rewrite",
+    "dblink",
+    "dblink_exec",
+    "dblink_connect",
+    "dblink_connect_u",
+    // Session-lifetime state that `SET LOCAL` does not release.
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "lo_import",
+    "lo_export",
+    "lo_create",
+    "lo_creat",
+    "lo_unlink",
+    "lo_from_bytea",
+    "lo_put",
+    "lo_get",
+    "lo_open",
+    "lowrite",
+    "loread",
+    // Server files.
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+];
+
+/// True when a write-mode statement is of a kind plugin raw SQL may run.
+///
+/// DML writes are always allowed. Table-shaped DDL (`CREATE`/`ALTER`/`DROP`
+/// TABLE, INDEX, VIEW) is allowed only when `allow_ddl` — i.e. when the
+/// least-privileged roles are in force. Without them the parser is the whole
+/// boundary, and DDL is refused outright as a conservative simplification (the
+/// generic tree scan does catch a function in a column `DEFAULT`/`CHECK`/
+/// `GENERATED` expression, so this is belt-and-braces, not a required cover).
+/// Under the roles those expressions run as the restricted role in any case.
+///
+/// This is an **allowlist of statement kinds**, so an unlisted or future kind
+/// fails closed. It leaves out every role/session/privilege and code-defining
+/// kind — `DO`, `CREATE FUNCTION`/`OPERATOR`/`CAST`/`AGGREGATE`/`TRIGGER`/
+/// `RULE`/`EXTENSION`/`LANGUAGE`/`EVENT TRIGGER`, `COPY`, `EXECUTE`/`PREPARE`,
+/// `GRANT`/`REVOKE`, the role statements, `SET`/`RESET`, and transaction
+/// control — so a plugin cannot define a database object that HappyView's own
+/// queries could resolve to. `ALTER TABLE … OWNER TO` is refused even though
+/// `ALTER TABLE` is allowed.
+fn is_allowed_write_statement(
+    node: Option<&pg_query::protobuf::node::Node>,
+    allow_ddl: bool,
+) -> bool {
+    use pg_query::protobuf::node::Node;
+    if statement_creates_temp_or_into(node) {
+        // A temp object (or `SELECT … INTO`) outlives `SET LOCAL` on the pooled
+        // connection and, because it lands in `pg_temp` which resolves first,
+        // could shadow a name HappyView's own queries use. Refused in every mode.
+        return false;
+    }
+    match node {
+        Some(
+            Node::SelectStmt(_)
+            | Node::InsertStmt(_)
+            | Node::UpdateStmt(_)
+            | Node::DeleteStmt(_)
+            | Node::MergeStmt(_),
+        ) => true,
+        Some(Node::CreateStmt(_) | Node::IndexStmt(_) | Node::ViewStmt(_) | Node::DropStmt(_)) => {
+            allow_ddl
+        }
+        Some(Node::AlterTableStmt(s)) => allow_ddl && !alter_table_changes_owner(s),
+        _ => false,
+    }
+}
+
+/// True when a `RangeVar`'s `relpersistence` marks it a temporary object.
+fn is_temp_relation(rel: Option<&pg_query::protobuf::RangeVar>) -> bool {
+    rel.is_some_and(|r| r.relpersistence == "t")
+}
+
+/// True when the statement creates a temporary object, or is `SELECT … INTO`
+/// (which creates a table). Refused in every mode (see
+/// [`is_allowed_write_statement`]); also checked for a bare `SELECT` read.
+fn statement_creates_temp_or_into(node: Option<&pg_query::protobuf::node::Node>) -> bool {
+    use pg_query::protobuf::node::Node;
+    match node {
+        Some(Node::SelectStmt(s)) => s.into_clause.is_some(),
+        Some(Node::CreateStmt(s)) => is_temp_relation(s.relation.as_ref()),
+        Some(Node::ViewStmt(s)) => is_temp_relation(s.view.as_ref()),
+        Some(Node::CreateTableAsStmt(s)) => s
+            .into
+            .as_ref()
+            .is_some_and(|into| is_temp_relation(into.rel.as_ref())),
+        _ => false,
+    }
+}
+
+/// True when an `ALTER TABLE` includes an `OWNER TO` sub-command. Changing a
+/// table's owner is a privilege operation, refused even though the rest of
+/// `ALTER TABLE` is allowed.
+fn alter_table_changes_owner(stmt: &pg_query::protobuf::AlterTableStmt) -> bool {
+    use pg_query::protobuf::node::Node;
+    // `AlterTableType::AtChangeOwner` is 28.
+    const AT_CHANGE_OWNER: i32 = 28;
+    stmt.cmds.iter().any(|cmd| {
+        matches!(
+            cmd.node.as_ref(),
+            Some(Node::AlterTableCmd(c)) if c.subtype == AT_CHANGE_OWNER || c.newowner.is_some()
+        )
+    })
+}
+
+/// Protected internal names a `DROP` or `CREATE INDEX` must not target. `DROP`'s
+/// object names and a new index's name are not `RangeVar`s, so the generic
+/// relation scan does not see them; check them here.
+fn ddl_targets_protected_name(node: Option<&pg_query::protobuf::node::Node>) -> bool {
+    use pg_query::protobuf::node::Node;
+    match node {
+        Some(Node::IndexStmt(s)) => is_blocked_internal_table(&s.idxname),
+        Some(Node::DropStmt(s)) => s.objects.iter().any(|obj| {
+            // Each object is a `List` of `String` name parts; the last is the
+            // object's own name.
+            drop_object_names(obj)
+                .last()
+                .is_some_and(|name| is_blocked_internal_table(name))
+        }),
+        _ => false,
+    }
+}
+
+/// True when `name` is in HappyView's reserved namespace — any `happyview_`
+/// prefix (or `_sqlx_migrations`), whether or not it is on the read allowlist. A
+/// plugin may not *create* or *rename to* such a name, even an allowlisted one,
+/// so another plugin's read of that name can't resolve to the plugin's object in
+/// the plugin schema (which precedes `public` on the plugin roles' path).
+fn is_reserved_object_name(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    lname.starts_with(PROTECTED_TABLE_PREFIX) || PROTECTED_EXACT_TABLES.contains(&lname.as_str())
+}
+
+/// The bare name a create/rename statement introduces (not its schema), for the
+/// reserved-name check. `None` for statements that introduce no such name.
+fn introduced_object_name(node: Option<&pg_query::protobuf::node::Node>) -> Option<&str> {
+    use pg_query::protobuf::node::Node as N;
+    let name = match node {
+        Some(N::CreateStmt(s)) => s.relation.as_ref().map(|r| r.relname.as_str()),
+        Some(N::ViewStmt(s)) => s.view.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CreateSeqStmt(s)) => s.sequence.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CompositeTypeStmt(s)) => s.typevar.as_ref().map(|r| r.relname.as_str()),
+        Some(N::CreateTableAsStmt(s)) => s
+            .into
+            .as_ref()
+            .and_then(|i| i.rel.as_ref())
+            .map(|r| r.relname.as_str()),
+        Some(N::IndexStmt(s)) => Some(s.idxname.as_str()),
+        Some(N::CreateTrigStmt(s)) => Some(s.trigname.as_str()),
+        Some(N::RenameStmt(s)) => Some(s.newname.as_str()),
+        Some(N::CreateFunctionStmt(s)) => last_name_part(&s.funcname),
+        Some(N::CreateEnumStmt(s)) => last_name_part(&s.type_name),
+        Some(N::CreateRangeStmt(s)) => last_name_part(&s.type_name),
+        _ => None,
+    };
+    name.filter(|n| !n.is_empty())
+}
+
+/// The last `String` part of a qualified name node list (the object's own name).
+fn last_name_part(nodes: &[pg_query::protobuf::Node]) -> Option<&str> {
+    use pg_query::protobuf::node::Node;
+    nodes.iter().rev().find_map(|n| match n.node.as_ref() {
+        Some(Node::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    })
+}
+
+/// The dotted name parts of one `DROP` object entry.
+fn drop_object_names(obj: &pg_query::protobuf::Node) -> Vec<&str> {
+    use pg_query::protobuf::node::Node;
+    let mut parts = Vec::new();
+    if let Some(Node::List(list)) = obj.node.as_ref() {
+        for item in &list.items {
+            if let Some(Node::String(s)) = item.node.as_ref() {
+                parts.push(s.sval.as_str());
+            }
+        }
+    } else if let Some(Node::String(s)) = obj.node.as_ref() {
+        parts.push(s.sval.as_str());
+    }
+    parts
+}
+
+/// The schema the plugin's own objects live in.
+const PLUGIN_SCHEMA: &str = "happyview_plugin";
+
+/// True when a schema a DDL statement names is the plugin schema or is left
+/// unqualified (so it resolves to the plugin schema, first on the role's path).
+fn schema_is_plugin_or_unqualified(schema: &str) -> bool {
+    schema.is_empty() || schema.eq_ignore_ascii_case(PLUGIN_SCHEMA)
+}
+
+/// The explicit schema of a name node list (`schema.name` → `schema`), or empty.
+fn schema_of_name_nodes(nodes: &[pg_query::protobuf::Node]) -> &str {
+    use pg_query::protobuf::node::Node;
+    let parts: Vec<&str> = nodes
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2]
+    } else {
+        ""
+    }
+}
+
+fn rangevar_schema(rv: Option<&pg_query::protobuf::RangeVar>) -> &str {
+    rv.map(|r| r.schemaname.as_str()).unwrap_or("")
+}
+
+/// The schema a DDL statement's created/altered/dropped object is in, when the
+/// statement is one whose object is confined to the plugin schema. `None` for a
+/// statement with no single such target (DML, or a kind handled elsewhere).
+fn ddl_object_schema(node: Option<&pg_query::protobuf::node::Node>) -> Option<&str> {
+    use pg_query::protobuf::node::Node as N;
+    match node {
+        Some(N::CreateStmt(s)) => Some(rangevar_schema(s.relation.as_ref())),
+        Some(N::ViewStmt(s)) => Some(rangevar_schema(s.view.as_ref())),
+        Some(N::IndexStmt(s)) => Some(rangevar_schema(s.relation.as_ref())),
+        Some(N::AlterTableStmt(s)) => Some(rangevar_schema(s.relation.as_ref())),
+        Some(N::CreateSeqStmt(s)) => Some(rangevar_schema(s.sequence.as_ref())),
+        Some(N::CreateTableAsStmt(s)) => Some(
+            s.into
+                .as_ref()
+                .map(|i| rangevar_schema(i.rel.as_ref()))
+                .unwrap_or(""),
+        ),
+        Some(N::CompositeTypeStmt(s)) => Some(rangevar_schema(s.typevar.as_ref())),
+        Some(N::CreateEnumStmt(s)) => Some(schema_of_name_nodes(&s.type_name)),
+        Some(N::CreateRangeStmt(s)) => Some(schema_of_name_nodes(&s.type_name)),
+        Some(N::CreateFunctionStmt(s)) => Some(schema_of_name_nodes(&s.funcname)),
+        Some(N::CreateTrigStmt(s)) => Some(rangevar_schema(s.relation.as_ref())),
+        Some(N::AlterFunctionStmt(s)) => Some(
+            s.func
+                .as_ref()
+                .map(|f| schema_of_name_nodes(&f.objname))
+                .unwrap_or(""),
+        ),
+        _ => None,
+    }
+}
+
+/// True when a `CREATE TRIGGER` attaches to one of HappyView's own relations
+/// (anything with the reserved prefix, including the allowlisted views). A
+/// plugin may trigger only on its own tables.
+fn trigger_targets_happyview_relation(node: Option<&pg_query::protobuf::node::Node>) -> bool {
+    use pg_query::protobuf::node::Node;
+    matches!(node, Some(Node::CreateTrigStmt(s))
+    if s.relation.as_ref().is_some_and(|r| {
+        r.relname.to_ascii_lowercase().starts_with(PROTECTED_TABLE_PREFIX)
+    }))
+}
+
+/// Object kinds the **login pool** additionally allows a plugin to define in its
+/// own schema: functions, procedures, triggers, sequences, types and
+/// `CREATE TABLE AS`. Only in the login pool, because in any mode where
+/// `session_user` is still privileged a plpgsql body could `RESET ROLE` out.
+/// `SECURITY DEFINER` and untrusted languages are refused; the schema and
+/// trigger-target checks are applied by the caller.
+fn login_pool_object_allowed(node: Option<&pg_query::protobuf::node::Node>) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    match node {
+        Some(N::CreateFunctionStmt(s)) => create_function_is_trusted(s),
+        Some(N::CreateTrigStmt(s)) => {
+            schema_is_plugin_or_unqualified(schema_of_name_nodes(&s.funcname))
+        }
+        Some(N::AlterFunctionStmt(s)) => alter_function_is_safe(s),
+        Some(N::CreateSeqStmt(_))
+        | Some(N::CompositeTypeStmt(_))
+        | Some(N::CreateEnumStmt(_))
+        | Some(N::CreateRangeStmt(_)) => true,
+        Some(N::CreateTableAsStmt(_)) => !statement_creates_temp_or_into(node),
+        _ => false,
+    }
+}
+
+/// True when a `DefElem` option is `SECURITY DEFINER`.
+fn defelem_is_security_definer(def: &pg_query::protobuf::DefElem) -> bool {
+    use pg_query::protobuf::node::Node;
+    def.defname.eq_ignore_ascii_case("security")
+        && def
+            .arg
+            .as_ref()
+            .is_some_and(|a| matches!(a.node.as_ref(), Some(Node::Boolean(b)) if b.boolval))
+}
+
+/// True when a `CREATE FUNCTION`/`PROCEDURE` is safe for a plugin: not
+/// `SECURITY DEFINER` (a plugin's own function never needs it) and written in a
+/// trusted language (`sql`/`plpgsql`), not one that loads native code.
+fn create_function_is_trusted(stmt: &pg_query::protobuf::CreateFunctionStmt) -> bool {
+    use pg_query::protobuf::node::Node;
+    let mut language = "plpgsql"; // the default when none is named
+    for opt in &stmt.options {
+        if let Some(Node::DefElem(def)) = opt.node.as_ref() {
+            if defelem_is_security_definer(def) {
+                return false;
+            }
+            if def.defname.eq_ignore_ascii_case("language")
+                && let Some(arg) = def.arg.as_ref()
+                && let Some(Node::String(s)) = arg.node.as_ref()
+            {
+                language = s.sval.as_str();
+            }
+        }
+    }
+    matches!(language.to_ascii_lowercase().as_str(), "sql" | "plpgsql")
+}
+
+/// True when an `ALTER FUNCTION` is safe for a plugin: it may not set
+/// `SECURITY DEFINER`, nor add a `SET` action (which could pin a search_path or
+/// other session config on the function). Matches the refusals on `CREATE`.
+fn alter_function_is_safe(stmt: &pg_query::protobuf::AlterFunctionStmt) -> bool {
+    use pg_query::protobuf::node::Node;
+    !stmt.actions.iter().any(|action| {
+        matches!(action.node.as_ref(), Some(Node::DefElem(def))
+            if defelem_is_security_definer(def) || def.defname.eq_ignore_ascii_case("set"))
+    })
+}
+
+/// Functions plugin raw SQL may call on Postgres **when the least-privileged
+/// roles are not available** and the parser is the whole boundary. An
+/// **allowlist**: every function the real parser sees must be here, so any
+/// built-in not on the list is refused by default rather than hunted for in a
+/// deny-list. Operators and `CAST`/`::` are not function calls in the parse
+/// tree, so they are allowed without listing; the risk in a cast is never the
+/// cast but the function that consumes its result, which this list gates.
+///
+/// When the roles *are* available this list is not consulted: the role, which
+/// has no grant on the protected tables, is the boundary at the database, so a
+/// plugin keeps full use of functions over its own tables. Extend it on request
+/// when a plugin needs a demonstrably-safe function in the fallback; keep
+/// anything that reads files, runs a string as SQL, opens a connection, or
+/// touches server state out of it.
+const PLUGIN_SQL_FUNCTIONS: &[&str] = &[
+    // Aggregates.
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    // Null / conditional helpers that do parse as calls.
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    // Strings.
+    "lower",
+    "upper",
+    "length",
+    "char_length",
+    "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "substr",
+    "substring",
+    "left",
+    "right",
+    "replace",
+    "concat",
+    "concat_ws",
+    "split_part",
+    "position",
+    "strpos",
+    "starts_with",
+    "format",
+    "md5",
+    "encode",
+    "regexp_replace",
+    // Numbers.
+    "abs",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
+    "mod",
+    "power",
+    "sign",
+    // Time.
+    "now",
+    "statement_timestamp",
+    "clock_timestamp",
+    "date_trunc",
+    "to_timestamp",
+    "to_char",
+    "to_date",
+    "extract",
+    "date_part",
+    "age",
+    "make_timestamptz",
+    // Window ranking.
+    "row_number",
+    "rank",
+    "dense_rank",
+    // JSON (read/build only — no execution).
+    "json_extract_path_text",
+    "jsonb_extract_path_text",
+    "json_array_length",
+    "jsonb_array_length",
+    "json_build_object",
+    "jsonb_build_object",
+    "json_build_array",
+    "jsonb_build_array",
+    "to_json",
+    "to_jsonb",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_object_keys",
+    "array_agg",
+    "string_agg",
+    "jsonb_agg",
+    "json_agg",
+    "unnest",
+];
+
+/// Guard plugin raw SQL **on Postgres**, using Postgres's own parser
+/// (libpg_query via `pg_query`) rather than a tokenizer, so a reference the
+/// tokenizer cannot see as an identifier is still checked. `enforcement` says how
+/// the statement is isolated at the database and so how much the parser must add.
+///
+/// Always enforced, in every mode:
+/// - **Relations.** No statement may reference one of HappyView's own internal
+///   tables except the allowlisted data ones (`plugin_nameable_relations`);
+///   caller-owned tables pass. A `DROP` or `CREATE INDEX` may not target a
+///   protected name either.
+/// - **Statement kinds.** Read mode permits only a plain `SELECT`; write mode
+///   permits DML and — outside `ParserOnly` — `CREATE`/`ALTER`/`DROP` of TABLE,
+///   INDEX, VIEW. Temporary objects and `SELECT … INTO` are refused. This also
+///   refuses `DO`, `CREATE FUNCTION`, `COPY`, `EXECUTE`, `GRANT`, the role
+///   statements, transaction control and — load-bearing — `SET`/`RESET`.
+/// - **Forbidden functions.** The [`ALWAYS_FORBIDDEN_FUNCTIONS`] deny-list, which
+///   backs the role even in the login pool.
+///
+/// Enforced outside the login pool (`Role` and `ParserOnly`), where
+/// `session_user` is still privileged:
+/// - **Function allowlist.** Every function called must be on
+///   [`PLUGIN_SQL_FUNCTIONS`]. In `ParserOnly` the relation and function schemas
+///   are also restricted to `public`.
+///
+/// SQL that does not parse, or that cannot be scanned, fails closed. This does
+/// not by itself prove a read is side-effect-free; the caller gates read-mode SQL
+/// with [`is_read_only`] as well.
+pub fn check_postgres_plugin_sql(
+    sql: &str,
+    mode: PluginSqlMode,
+    enforcement: PluginSqlEnforcement,
+) -> Result<(), String> {
+    use pg_query::protobuf::node::Node;
+
+    let parsed = pg_query::parse(sql).map_err(|e| format!("could not parse SQL: {e}"))?;
+
+    if parsed.protobuf.stmts.is_empty() {
+        return Err("raw SQL contained no statement".into());
+    }
+
+    // Statement kinds. DDL (caller-owned table management) is allowed unless the
+    // parser is the whole boundary; temporary objects and `SELECT … INTO` never.
+    let allow_ddl = enforcement.allows_ddl();
+    let login_pool = enforcement == PluginSqlEnforcement::LoginPool;
+    for raw in &parsed.protobuf.stmts {
+        let node = raw.stmt.as_ref().and_then(|n| n.node.as_ref());
+        let allowed = match mode {
+            PluginSqlMode::Read => {
+                matches!(node, Some(Node::SelectStmt(_))) && !statement_creates_temp_or_into(node)
+            }
+            PluginSqlMode::Write => {
+                is_allowed_write_statement(node, allow_ddl)
+                    // The login pool additionally lets a plugin define its own
+                    // functions, triggers and types in its own schema.
+                    || (login_pool && login_pool_object_allowed(node))
+            }
+        };
+        if !allowed {
+            return Err(match mode {
+                PluginSqlMode::Read => {
+                    "database:read permits only read-only SELECT statements in raw SQL".to_string()
+                }
+                PluginSqlMode::Write => {
+                    "raw SQL permits data statements and table DDL, not this statement kind"
+                        .to_string()
+                }
+            });
+        }
+        if ddl_targets_protected_name(node) {
+            return Err(
+                "raw SQL cannot drop or index a protected internal HappyView object".to_string(),
+            );
+        }
+        // A plugin may not create or rename an object into HappyView's reserved
+        // namespace, even an allowlisted name — another plugin's read of that
+        // name would resolve to the plugin's object in the plugin schema.
+        if let Some(name) = introduced_object_name(node)
+            && is_reserved_object_name(name)
+        {
+            return Err(format!(
+                "raw SQL cannot create or rename an object to the reserved name '{name}'"
+            ));
+        }
+        // A created/altered object must live in the plugin schema, so nothing a
+        // plugin defines can be resolved by HappyView's own queries, which never
+        // search it.
+        if let Some(schema) = ddl_object_schema(node)
+            && !schema_is_plugin_or_unqualified(schema)
+        {
+            return Err(format!(
+                "raw SQL may only create objects in the '{PLUGIN_SCHEMA}' schema, not '{schema}'"
+            ));
+        }
+        // A plugin's trigger may attach only to its own tables, never one of
+        // HappyView's (including the allowlisted record views).
+        if trigger_targets_happyview_relation(node) {
+            return Err("raw SQL cannot attach a trigger to a HappyView table".to_string());
+        }
+    }
+
+    // Every relation and function reference in the whole parse tree. The scan
+    // is generic (it walks the serialized tree), so it sees references in a CTE,
+    // a scalar subquery, a `RETURNING` list, an `ON CONFLICT` update and a
+    // `LATERAL` subquery alike — anywhere a reference can hide. It fails closed
+    // if the tree cannot be serialized.
+    let (relations, functions) = scan_relations_and_functions(&parsed)?;
+
+    // Relations: refuse HappyView's own internal tables (except the allowlisted
+    // data ones). Caller-owned tables pass. In `ParserOnly` a non-`public`
+    // relation is refused too, since the privileged connection could otherwise
+    // read a catalog or another schema.
+    for table in &relations {
+        let (schema, name) = split_qualified(table);
+        if is_blocked_internal_table(name) {
+            return Err(format!(
+                "raw SQL cannot reference the protected internal HappyView table '{table}'"
+            ));
+        }
+        if enforcement.restricts_to_public_schema()
+            && let Some(schema) = schema
+            && !schema.eq_ignore_ascii_case("public")
+        {
+            return Err(format!(
+                "raw SQL cannot reference '{table}' (schema '{schema}' is not allowed here)"
+            ));
+        }
+    }
+
+    // Functions. The deny-list applies in every mode. The allowlist applies
+    // outside the login pool, where `session_user` is still privileged.
+    let apply_allowlist = enforcement.applies_function_allowlist();
+    for func in &functions {
+        let (schema, name) = split_qualified(func);
+        if ALWAYS_FORBIDDEN_FUNCTIONS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+        {
+            return Err(format!("raw SQL cannot call the function '{func}'"));
+        }
+        if apply_allowlist {
+            if let Some(schema) = schema
+                && !(schema.eq_ignore_ascii_case("public")
+                    || schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                return Err(format!(
+                    "raw SQL cannot call '{func}' (schema '{schema}' is not allowed)"
+                ));
+            }
+            if !PLUGIN_SQL_FUNCTIONS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "raw SQL cannot call the function '{func}'; it is not on the plugin SQL allowlist"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect every relation and function reference in the parse tree, as
+/// `"schema.name"` (or bare `name`). Generic over the whole serialized tree so
+/// no reference position is missed; see the caller for why that matters. Fails
+/// closed when the tree cannot be serialized, rather than scanning nothing. The
+/// parse tree is bounded by the plugin's statement size, so the one allocation
+/// is cheap relative to the database round trip it guards.
+fn scan_relations_and_functions(
+    parsed: &pg_query::ParseResult,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let tree = serde_json::to_value(&parsed.protobuf)
+        .map_err(|e| format!("could not analyze SQL: {e}"))?;
+    let mut relations = Vec::new();
+    let mut functions = Vec::new();
+    collect_refs(&tree, &mut relations, &mut functions);
+    Ok((relations, functions))
+}
+
+/// Walk a serialized parse tree, collecting every relation and function
+/// reference (both possibly schema-qualified).
+///
+/// A relation reference is any object carrying a `relname` string: a `RangeVar`
+/// appears both tagged inside a `Node` (a `FROM` item) and inline as a typed
+/// struct field (`UpdateStmt.relation`, `DeleteStmt.relation`, …), and both
+/// shapes have `relname`. A function reference is any object carrying a
+/// `funcname` array (a `FuncCall`), whose entries are `String` nodes nested
+/// under a `node` wrapper.
+fn collect_refs(
+    value: &serde_json::Value,
+    relations: &mut Vec<String>,
+    functions: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(rel) = map.get("relname").and_then(|v| v.as_str()) {
+                let schema = map
+                    .get("schemaname")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                relations.push(match schema {
+                    Some(s) => format!("{s}.{rel}"),
+                    None => rel.to_string(),
+                });
+            }
+            if let Some(name) = qualified_name_from_string_nodes(map.get("funcname")) {
+                functions.push(name);
+            }
+            for child in map.values() {
+                collect_refs(child, relations, functions);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_refs(child, relations, functions);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn a `funcname` array of `String` nodes
+/// (`[{"node":{"String":{"sval":"lower"}}}]`, or schema-qualified
+/// `[{…"pg_catalog"}, {…"set_config"}]`) into `"schema.name"` or bare `name`,
+/// keeping the last two parts.
+fn qualified_name_from_string_nodes(funcname: Option<&serde_json::Value>) -> Option<String> {
+    let parts: Vec<&str> = funcname?
+        .as_array()?
+        .iter()
+        .filter_map(|n| n.get("node")?.get("String")?.get("sval")?.as_str())
+        .collect();
+    match parts.as_slice() {
+        [] => None,
+        [name] => Some((*name).to_string()),
+        [.., schema, name] => Some(format!("{schema}.{name}")),
+    }
+}
+
+/// Split a possibly schema-qualified name from `pg_query`'s `tables()` /
+/// `functions()` (`"public.happyview_records"`) into `(schema, name)`. Only the
+/// last two dot-separated parts matter; a catalog-qualified name keeps its
+/// schema so the caller can reject a non-`public` one.
+fn split_qualified(qualified: &str) -> (Option<&str>, &str) {
+    match qualified.rsplit_once('.') {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, qualified),
+    }
 }
 
 /// Why a raw write to a claimed collection's records is refused.
@@ -790,9 +1548,6 @@ mod tests {
             .is_ok()
         );
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_jobs").is_ok());
-        // Space data (access, not confidentiality).
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_records").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_members").is_ok());
     }
 
     #[test]
@@ -805,12 +1560,50 @@ mod tests {
         assert!(super::check_raw_sql_tables("UPDATE happyview_users SET is_super = true").is_err());
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_domains").is_err());
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_instance_settings").is_err());
-        // Space credential / key-material tables stay blocked even though other
-        // space tables are allowed.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_credentials").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_repo_state").is_err());
+        // Space tables, which `happyview.spaces` reaches with access checks.
+        for table in [
+            "happyview_spaces",
+            "happyview_space_members",
+            "happyview_space_records",
+            "happyview_space_record_oplog",
+            "happyview_space_notify_registrations",
+            "happyview_space_dids",
+            "happyview_space_credentials",
+            "happyview_space_repo_state",
+        ] {
+            assert!(
+                super::check_raw_sql_tables(&format!("SELECT * FROM {table}")).is_err(),
+                "{table} should be blocked"
+            );
+        }
+        assert!(
+            super::check_raw_sql_tables(
+                "INSERT INTO happyview_space_members (id, space_id, member_did) VALUES ($1, $2, $3)"
+            )
+            .is_err()
+        );
         // The migration bookkeeping table is off-limits too.
         assert!(super::check_raw_sql_tables("SELECT * FROM _sqlx_migrations").is_err());
+    }
+
+    /// Every space table the migrations create, including any added later, is
+    /// out of raw SQL's reach.
+    #[tokio::test]
+    async fn no_migrated_space_table_is_reachable() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let tables: Vec<(String,)> = crate::db::query_as(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name LIKE 'happyview\\_space%' ESCAPE '\\'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(tables.len() >= 6, "found {tables:?}");
+        for (table,) in tables {
+            assert!(
+                super::check_raw_sql_tables(&format!("SELECT * FROM {table}")).is_err(),
+                "{table} is reachable from raw SQL"
+            );
+        }
     }
 
     #[test]
@@ -998,5 +1791,349 @@ mod tests {
         // generic dialect ("WHERE" reads as a table name), so this uses SQL
         // that genuinely cannot be parsed as any statement.
         assert!(is_read_only("SELECT 1 FROM (").is_err());
+    }
+}
+
+#[cfg(test)]
+mod postgres_plugin_guard_tests {
+    //! Parse-level checks for the Postgres plugin-SQL guard. No database: these
+    //! assert what the parser accepts and refuses in each enforcement mode. That
+    //! the database denies the same statements under the roles is covered by the
+    //! integration tests.
+    use super::PluginSqlEnforcement::*;
+    use super::{PluginSqlEnforcement, PluginSqlMode::*, check_postgres_plugin_sql};
+
+    const ALL: [PluginSqlEnforcement; 3] = [LoginPool, Role, ParserOnly];
+    /// The modes that allow caller table DDL (everything but parser-only).
+    const DDL_MODES: [PluginSqlEnforcement; 2] = [LoginPool, Role];
+
+    #[test]
+    fn allows_plain_reads_of_allowlisted_relations() {
+        for e in ALL {
+            for sql in [
+                "SELECT * FROM happyview_records WHERE collection = $1",
+                "SELECT count(*) FROM happyview_records_by_collection",
+                "SELECT lower(uri) FROM happyview_record_refs LIMIT 10",
+                "SELECT * FROM public.happyview_labels",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Read, e).is_ok(),
+                    "should allow ({e:?}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allows_caller_table_ddl_in_ddl_modes() {
+        for e in DDL_MODES {
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS my_plugin_state (k TEXT, v TEXT)",
+                "INSERT INTO my_plugin_state (k, v) VALUES ($1, $2)",
+                "CREATE INDEX my_plugin_state_k ON my_plugin_state (k)",
+                "ALTER TABLE my_plugin_state ADD COLUMN n INT",
+                "CREATE VIEW my_plugin_view AS SELECT k FROM my_plugin_state",
+                "DROP TABLE my_plugin_state",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, e).is_ok(),
+                    "should allow caller DDL ({e:?}): {sql}"
+                );
+            }
+        }
+        // DML and reads work in every mode, including parser-only.
+        for e in ALL {
+            assert!(
+                check_postgres_plugin_sql("INSERT INTO my_plugin_state VALUES ($1)", Write, e)
+                    .is_ok()
+            );
+            assert!(check_postgres_plugin_sql("SELECT * FROM my_plugin_state", Read, e).is_ok());
+        }
+    }
+
+    #[test]
+    fn parser_only_refuses_ddl() {
+        for sql in [
+            "CREATE TABLE my_plugin_state (k TEXT)",
+            "CREATE INDEX i ON my_plugin_state (k)",
+            "CREATE VIEW v AS SELECT 1",
+            "ALTER TABLE my_plugin_state ADD COLUMN n INT",
+            "DROP TABLE my_plugin_state",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, ParserOnly).is_err(),
+                "parser-only should refuse DDL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_objects_refused_outside_the_login_pool() {
+        // In role and parser-only modes the session user is privileged, so a
+        // plugin may not define functions, triggers or other executable objects.
+        for e in [Role, ParserOnly] {
+            for sql in [
+                "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+                "CREATE PROCEDURE p() AS $$ BEGIN END $$ LANGUAGE plpgsql",
+                "CREATE TRIGGER t BEFORE INSERT ON my_plugin_state FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TYPE my_t AS (a int)",
+                "CREATE SEQUENCE my_seq",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, e).is_err(),
+                    "should refuse executable objects ({e:?}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn login_pool_allows_plugin_objects_in_its_schema() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
+            "CREATE FUNCTION happyview_plugin.g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$",
+            "CREATE TRIGGER t BEFORE INSERT ON my_plugin_state FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TYPE my_t AS (a int)",
+            "CREATE SEQUENCE my_seq",
+            "CREATE TABLE snapshot AS SELECT * FROM my_plugin_state",
+            // A function named like a built-in is fine: it lands in the plugin
+            // schema, which HappyView never searches.
+            "CREATE FUNCTION lower(varchar) RETURNS text LANGUAGE sql AS $$ SELECT 'x'::text $$",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_ok(),
+                "login pool should allow a plugin object: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_pool_refuses_security_definer_and_untrusted_language() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN 1; END $$",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE c AS 'x', 'y'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpython3u AS $$ return 1 $$",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
+                "login pool should refuse: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_pool_refuses_altering_a_function_to_security_definer_or_set() {
+        for sql in [
+            "ALTER FUNCTION f() SECURITY DEFINER",
+            "ALTER FUNCTION f() SET search_path = public",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
+                "login pool should refuse: {sql}"
+            );
+        }
+        // A benign ALTER (not security/SET) on a plugin-schema function is fine.
+        assert!(check_postgres_plugin_sql("ALTER FUNCTION f() COST 10", Write, LoginPool).is_ok());
+    }
+
+    #[test]
+    fn refuses_creating_or_renaming_to_a_reserved_name() {
+        // Even an allowlisted name may not be *created* or renamed to by a plugin.
+        // Lowercase, so test_support's hand-written-record-table check doesn't
+        // read this refused statement as a fixture.
+        for (sql, e) in [
+            ("create table happyview_records (a int)", LoginPool),
+            ("CREATE VIEW happyview_labels AS SELECT 1", Role),
+            (
+                "CREATE FUNCTION happyview_evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+                LoginPool,
+            ),
+            ("CREATE SEQUENCE happyview_seq", LoginPool),
+            ("ALTER TABLE my_t RENAME TO happyview_sneaky", Role),
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, e).is_err(),
+                "should refuse a reserved name ({e:?}): {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_pool_refuses_objects_outside_the_plugin_schema() {
+        for sql in [
+            "CREATE FUNCTION public.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            "CREATE TABLE public.x (a int)",
+            "CREATE VIEW public.v AS SELECT 1",
+            "CREATE FUNCTION public.lower(varchar) RETURNS text LANGUAGE sql AS $$ SELECT 'x'::text $$",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
+                "login pool should refuse a non-plugin-schema object: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_pool_refuses_a_trigger_on_a_happyview_table() {
+        for sql in [
+            "CREATE TRIGGER t BEFORE INSERT ON happyview_records FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TRIGGER t BEFORE INSERT ON happyview_jobs FOR EACH ROW EXECUTE FUNCTION f()",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, LoginPool).is_err(),
+                "login pool should refuse a trigger on a HappyView table: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn always_refused_object_kinds() {
+        // These stay refused in every mode, login pool included.
+        for e in ALL {
+            for sql in [
+                "CREATE OPERATOR === (leftarg = int, rightarg = int, function = int4eq)",
+                "CREATE CAST (int AS text) WITH FUNCTION f(int)",
+                "CREATE AGGREGATE agg(int) (sfunc = int4pl, stype = int)",
+                "CREATE RULE r AS ON INSERT TO my_plugin_state DO INSTEAD NOTHING",
+                "CREATE EXTENSION hstore",
+                "CREATE LANGUAGE plpython3u",
+                "CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION f()",
+                "DO $$ BEGIN PERFORM 1; END $$",
+                "COPY my_table TO '/tmp/x'",
+                "SET ROLE postgres",
+                "RESET ROLE",
+                "SELECT 1; RESET ROLE",
+                "SET LOCAL ROLE postgres",
+                "SET SESSION AUTHORIZATION postgres",
+                "RESET SESSION AUTHORIZATION",
+                "RESET ALL",
+                "BEGIN",
+                "GRANT ALL ON my_table TO postgres",
+                "ALTER TABLE my_plugin_state OWNER TO postgres",
+                "CREATE TEMP TABLE t (a int)",
+                "SELECT 1 INTO x",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, e).is_err(),
+                    "should refuse in every mode ({e:?}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deny_list_functions_refused_in_every_mode() {
+        // Session-state and SQL-text-executing built-ins are refused even in the
+        // login pool, where the function allowlist is otherwise skipped.
+        for e in ALL {
+            for sql in [
+                "SELECT disallowed_fn('x')", // only refused here outside the login pool
+                "SELECT set_config('search_path', 'x', false)",
+                "SELECT pg_advisory_lock(1)",
+                "SELECT lo_import('/etc/passwd')",
+                "SELECT pg_read_file('/etc/passwd')",
+            ] {
+                let res = check_postgres_plugin_sql(sql, Read, e);
+                // `disallowed_fn` is allowed in the login pool (allowlist skipped);
+                // everything else is on the deny-list and refused everywhere.
+                if sql.contains("disallowed_fn") && e == LoginPool {
+                    assert!(res.is_ok(), "login pool allows a plain function: {sql}");
+                } else {
+                    assert!(res.is_err(), "should refuse ({e:?}): {sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_internal_tables_in_every_mode() {
+        for e in ALL {
+            for sql in [
+                "SELECT * FROM happyview_users",
+                "SELECT token_hash FROM happyview_api_keys",
+                "SELECT * FROM public.happyview_users",
+                "SELECT * FROM \"happyview_users\"",
+                "WITH x AS (DELETE FROM happyview_users RETURNING id) SELECT * FROM x",
+                // The tables behind the record views, in several positions.
+                "SELECT * FROM happyview_records_v2",
+                "INSERT INTO happyview_record_refs_v2 (uri) VALUES ('x')",
+                "UPDATE happyview_dids SET did = did",
+                "WITH x AS (DELETE FROM happyview_collections RETURNING id) SELECT * FROM x",
+                "SELECT (SELECT count(*) FROM happyview_api_keys) AS n",
+                "SELECT * FROM caller_t, LATERAL (SELECT id FROM happyview_users) u",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, e).is_err(),
+                    "should refuse the internal table ({e:?}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_dropping_or_indexing_a_protected_name() {
+        for e in ALL {
+            for sql in [
+                "DROP TABLE happyview_users",
+                "DROP TABLE happyview_records_v2",
+                "CREATE INDEX happyview_sneaky ON my_plugin_state (k)",
+            ] {
+                assert!(
+                    check_postgres_plugin_sql(sql, Write, e).is_err(),
+                    "should refuse ({e:?}): {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_allowlisted_functions_refused_outside_the_login_pool() {
+        let sql = "SELECT disallowed_fn('x')";
+        assert!(check_postgres_plugin_sql(sql, Read, Role).is_err());
+        assert!(check_postgres_plugin_sql(sql, Read, ParserOnly).is_err());
+        assert!(check_postgres_plugin_sql(sql, Read, LoginPool).is_ok());
+    }
+
+    #[test]
+    fn parser_only_restricts_relations_to_public() {
+        // On the privileged connection a non-public schema must not be read.
+        assert!(
+            check_postgres_plugin_sql("SELECT * FROM pg_catalog.pg_authid", Read, ParserOnly)
+                .is_err()
+        );
+        // Under a role the database denies it instead, so the parser lets it by.
+        for e in DDL_MODES {
+            assert!(
+                check_postgres_plugin_sql("SELECT * FROM pg_catalog.pg_authid", Read, e).is_ok(),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_function_check_sees_every_dml_position() {
+        // In parser-only (DML-only) a non-allowlisted function is caught wherever
+        // it hides: a CTE, a scalar subquery, RETURNING, ON CONFLICT, LATERAL.
+        for sql in [
+            "WITH x AS (SELECT disallowed_fn('x') AS q) SELECT * FROM x",
+            "SELECT (SELECT disallowed_fn('x')) AS q",
+            "INSERT INTO caller_t (k) VALUES ('a') RETURNING disallowed_fn('x')",
+            "INSERT INTO caller_t (k) VALUES ('a') ON CONFLICT (k) DO UPDATE SET v = disallowed_fn('x')",
+            "SELECT * FROM caller_t, LATERAL (SELECT disallowed_fn('x')) s",
+            "UPDATE caller_t SET v = disallowed_fn('x')",
+            "DELETE FROM caller_t WHERE k = disallowed_fn('x')",
+        ] {
+            assert!(
+                check_postgres_plugin_sql(sql, Write, ParserOnly).is_err(),
+                "parser-only must refuse a hidden non-allowlisted function: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unparseable_sql() {
+        assert!(check_postgres_plugin_sql("SELECT 1 FROM (", Read, Role).is_err());
+        assert!(check_postgres_plugin_sql("", Read, Role).is_err());
     }
 }

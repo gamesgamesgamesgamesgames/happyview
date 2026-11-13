@@ -33,7 +33,9 @@ name: happyview-prod-sqlite
 
 services:
   happyview:
-    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:-latest}
+    # No default: `latest` is the newest stable release, which is v2 until
+    # v3 ships, so leaving this unset would run a different major line.
+    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:?Set HAPPYVIEW_VERSION to the release to run, such as 3.0.0-beta.1}
     restart: unless-stopped
 
     # Published on loopback by default — the reverse proxy in front is what
@@ -101,6 +103,7 @@ services:
       JETSTREAM_PROTOCOL: ${JETSTREAM_PROTOCOL:-auto}
       JETSTREAM_COMPRESSION: ${JETSTREAM_COMPRESSION:-true}
       JETSTREAM_WORKERS: ${JETSTREAM_WORKERS:-8}
+      JETSTREAM_STALL_TIMEOUT_SECS: ${JETSTREAM_STALL_TIMEOUT_SECS:-60}
       JETSTREAM_API_KEY: ${JETSTREAM_API_KEY:-}
       BACKFILL_SOURCE: ${BACKFILL_SOURCE:-crawl}
       RELAY_URL: ${RELAY_URL:-https://bsky.network}

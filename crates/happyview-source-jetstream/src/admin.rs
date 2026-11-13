@@ -21,7 +21,7 @@ use crate::archive::SourceChoice;
 use crate::backfill::errors::{BackfillErrorKind, ERROR_DETAIL_CAP, ErrorCounts};
 use crate::backfill::types::{
     BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob,
-    CreateBackfillBody, ReplayProgress,
+    CreateBackfillBody, ReplayProgress, UnfinishedDiscovery,
 };
 use crate::backfill::*;
 
@@ -66,6 +66,29 @@ pub async fn create_backfill(
         }
     })
     .await?;
+
+    if let Some(cursor) = body.relay_cursor {
+        let Some(collection) = body.collection else {
+            return Err(AdminError::BadRequest(
+                "relay_cursor needs the collection it is a cursor of".into(),
+            ));
+        };
+        if !dids.is_empty() {
+            return Err(AdminError::BadRequest(
+                "relay_cursor is for a network crawl; account backfills discover nothing".into(),
+            ));
+        }
+        if body.source.is_some() && source != SourceChoice::Crawl {
+            return Err(AdminError::BadRequest(
+                "relay_cursor continues a relay listing, so the backfill must crawl".into(),
+            ));
+        }
+        let job_id = start_crawl_from_cursor(&state, &collection, &cursor, &admin.did).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": job_id, "status": "running" })),
+        ));
+    }
 
     let requested = body.source.is_some().then_some(source);
     let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, requested).await?;
@@ -428,6 +451,24 @@ pub async fn backfill_status(
         )
         .collect();
 
+    let open_cursors: Vec<(String, String, Option<String>)> = happyview_provider::db::query_as(&adapt_sql(
+        "SELECT job_id, collection, relay_cursor FROM happyview_backfill_cursors WHERE done = 0 ORDER BY job_id, collection",
+        backend,
+    ))
+    .fetch_all(&state.backfill_db)
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to list backfill discovery cursors: {e}")))?;
+    let mut unfinished: HashMap<String, Vec<UnfinishedDiscovery>> = HashMap::new();
+    for (job_id, collection, relay_cursor) in open_cursors {
+        unfinished
+            .entry(job_id)
+            .or_default()
+            .push(UnfinishedDiscovery {
+                collection,
+                relay_cursor,
+            });
+    }
+
     let jobs: Vec<BackfillJob> = rows
         .into_iter()
         .map(
@@ -453,6 +494,12 @@ pub async fn backfill_status(
                     .remove(&id)
                     .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None, None));
                 let hooks = state.host.job_hook_stats(&id);
+                // An executor checkpoints in the same cursor table, always
+                // with `done = 0`; only a crawl's cursors are discovery.
+                let discovery_unfinished = unfinished
+                    .remove(&id)
+                    .filter(|_| matches!(source.as_str(), "crawl" | "auto"))
+                    .unwrap_or_default();
                 // Written by this crate as JSON, so a row that does not parse
                 // was edited by hand and is left out rather than failing the
                 // listing.
@@ -483,6 +530,7 @@ pub async fn backfill_status(
                     completed_at,
                     created_at,
                     discovery_complete: discovery_complete != 0,
+                    discovery_unfinished,
                     recent_completions_limit: (QueueVersion::from_column(queue_version)
                         == QueueVersion::Bounded)
                         .then_some(RECENT_COMPLETIONS_PER_JOB),
@@ -1071,6 +1119,24 @@ pub async fn retry_failed_backfill(
         )));
     }
 
+    // One retry of a job at a time: a second would fetch the same repos
+    // again alongside the first. Once the first has finished, retry ITS
+    // failures (it records its own) rather than this job's again.
+    let unfinished_retry: Option<(String,)> = happyview_provider::db::query_as(&adapt_sql(
+        "SELECT id FROM happyview_backfill_jobs WHERE retry_of = ? \
+         AND status IN ('running', 'pausing', 'paused', 'cancelling') LIMIT 1",
+        backend,
+    ))
+    .bind(&job_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to query retry jobs: {e}")))?;
+    if let Some((retry_id,)) = unfinished_retry {
+        return Err(AdminError::Conflict(format!(
+            "job {retry_id} is already retrying this job's failures; let it finish, then retry its failures"
+        )));
+    }
+
     if source == "replay" {
         if let Some(requested) = &body.kinds
             && !requested.is_empty()
@@ -1125,6 +1191,7 @@ pub async fn retry_failed_backfill(
             crate::archive::SourceChoice::Replay,
         )
         .await?;
+        mark_retry_of(&state, &new_job_id, &job_id).await?;
         crate::backfill::replay_sweeps::insert_retries(&state, &new_job_id, &blocks)
             .await
             .map_err(|e| {
@@ -1175,15 +1242,30 @@ pub async fn retry_failed_backfill(
         ));
     }
 
+    // The failure set is uncapped and per collection. A pending row of a
+    // finished job is a retry it never made; a recovered one was fetched
+    // since, so a second retry-failed after a successful retry has nothing
+    // to do. The capped detail log is read only for a job from before the
+    // failure set, which has no rows in it at all.
     let placeholders = vec!["?"; kinds.len()].join(", ");
     let sql_str = format!(
-        "SELECT DISTINCT did FROM happyview_backfill_errors WHERE job_id = ? AND kind IN ({placeholders})",
+        "SELECT did FROM happyview_backfill_failures WHERE job_id = ? AND kind IN ({placeholders}) \
+           AND state IN ('pending', 'failed') \
+         UNION \
+         SELECT did FROM happyview_backfill_errors WHERE job_id = ? AND kind IN ({placeholders}) \
+           AND NOT EXISTS (SELECT 1 FROM happyview_backfill_failures WHERE job_id = ?) \
+         ORDER BY did",
     );
     let sql = adapt_sql(&sql_str, backend);
     let mut q = happyview_provider::db::query_as::<(String,)>(&sql).bind(&job_id);
     for kind in &kinds {
         q = q.bind(*kind);
     }
+    q = q.bind(&job_id);
+    for kind in &kinds {
+        q = q.bind(*kind);
+    }
+    q = q.bind(&job_id);
     let dids: Vec<(String,)> = q
         .fetch_all(&state.db)
         .await
@@ -1205,6 +1287,7 @@ pub async fn retry_failed_backfill(
         SourceChoice::Crawl,
     )
     .await?;
+    mark_retry_of(&state, &new_job_id, &job_id).await?;
 
     state
         .host
@@ -1227,6 +1310,27 @@ pub async fn retry_failed_backfill(
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": new_job_id })),
     ))
+}
+
+/// Record that `retry_id` retries `source_id`'s failures. Written before
+/// the retry is spawned, so a second retry-failed sees it.
+async fn mark_retry_of(
+    state: &JobState,
+    retry_id: &str,
+    source_id: &str,
+) -> Result<(), AdminError> {
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
+            "UPDATE happyview_backfill_jobs SET retry_of = ? WHERE id = ?",
+            state.db_backend,
+        ))
+        .bind(source_id)
+        .bind(retry_id)
+        .execute(&state.db)
+    })
+    .await
+    .map(|_| ())
+    .map_err(|e| AdminError::Internal(format!("failed to record the retried job: {e}")))
 }
 
 /// `DELETE /admin/backfill/{id}/details`.

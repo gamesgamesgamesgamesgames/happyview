@@ -1183,3 +1183,68 @@ async fn an_unreadable_policy_column_falls_back_to_member_list() {
     // restrictive policy rather than Public.
     assert_eq!(back.read_policy, Policy::MemberList);
 }
+
+/// A member insert reads the policy under the space's row lock. One that
+/// starts while a migration to a managedspace holds the row waits for it,
+/// then sees the managedspace and stores nothing, rather than reading the old
+/// policy and landing a member after the list was discarded.
+#[tokio::test]
+#[serial]
+async fn a_member_insert_waits_for_a_migration_holding_the_space() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space = make_space(&new_id(), "did:plc:lock-owner", "com.example.lock", "main");
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let mut migration = happyview::db::begin_write(&pool, backend)
+        .await
+        .expect("begin failed");
+    let mut managed = space.clone();
+    let managing_app = Policy::ManagingApp {
+        managing_app: "did:plc:app".into(),
+    };
+    managed.read_policy = managing_app.clone();
+    managed.write_policy = managing_app;
+    spaces_db::update_space(&mut *migration, backend, &managed)
+        .await
+        .expect("update_space failed");
+    spaces_db::remove_all_members(&mut *migration, backend, &space.id)
+        .await
+        .expect("remove_all_members failed");
+
+    let member = SpaceMember {
+        id: new_id(),
+        space_id: space.id.clone(),
+        did: "did:plc:lock-member".into(),
+        access: MemberAccess::WRITE,
+        is_delegation: false,
+        granted_by: None,
+        created_at: now_rfc3339(),
+    };
+    let insert = {
+        let (pool, member) = (pool.clone(), member.clone());
+        tokio::spawn(
+            async move { spaces_db::insert_member_if_allowed(&pool, backend, &member).await },
+        )
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !insert.is_finished(),
+        "the insert did not wait for the migration holding the space"
+    );
+
+    migration.commit().await.expect("commit failed");
+    let stored = insert.await.unwrap().expect("insert failed");
+    assert!(!stored, "a member was stored on the managedspace");
+    assert!(
+        spaces_db::get_member(&pool, backend, &space.id, &member.did)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

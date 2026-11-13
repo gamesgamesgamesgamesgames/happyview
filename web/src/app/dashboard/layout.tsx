@@ -7,6 +7,7 @@ import { getSetupStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useConfig } from "@/lib/config-context";
 import { AppSidebar } from "@/components/app-sidebar";
+import { HappyViewUpdateNotice } from "@/components/happyview-update-notice";
 import { PluginUpdateProvider } from "@/components/plugin-update-provider";
 import { TelemetryPrompt } from "@/components/telemetry-prompt";
 import { VacuumPromptProvider } from "@/components/vacuum-prompt-provider";
@@ -68,7 +69,10 @@ export default function DashboardLayout({
             }
           >
             <AppSidebar variant="inset" />
-            <SidebarInset>{children}</SidebarInset>
+            <SidebarInset>
+              <HappyViewUpdateNotice />
+              {children}
+            </SidebarInset>
           </SidebarProvider>
         </VacuumPromptProvider>
         <TelemetryPrompt />

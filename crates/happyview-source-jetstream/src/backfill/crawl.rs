@@ -433,9 +433,40 @@ pub async fn complete_unit(
     pds: &str,
     records: i32,
 ) -> Result<bool, sqlx::Error> {
+    complete_unit_clearing(state, queue, unit, pds, records, &[]).await
+}
+
+/// [`complete_unit`], also marking `fetched`, the unit's collections fetched
+/// whole, recovered in the failure set (this job's, and the job it retries)
+/// in the same transaction.
+pub async fn complete_unit_clearing(
+    state: &JobState,
+    queue: &JobQueue,
+    unit: &WorkUnit,
+    pds: &str,
+    records: i32,
+    fetched: &[String],
+) -> Result<bool, sqlx::Error> {
     let backend = state.db_backend;
     let job_id = queue.job_id.as_str();
     let mut tx = state.backfill_db.begin().await?;
+    if queue.version == QueueVersion::Bounded {
+        let recover = adapt_sql(crate::backfill::errors::RECOVER_SQL, backend);
+        let now = now_rfc3339();
+        for collection in fetched {
+            happyview_provider::db::query(&recover)
+                .bind(&now)
+                .bind(job_id)
+                .bind(job_id)
+                .bind(&unit.did)
+                .bind(job_id)
+                .bind(collection)
+                .bind(job_id)
+                .bind(collection)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
     let removed = match queue.version {
         QueueVersion::Legacy => {
             let sql = adapt_sql(
@@ -789,7 +820,9 @@ pub(crate) struct DiscoveryCursor {
 
 /// Why one collection's discovery stopped short.
 pub(crate) enum DiscoveryError {
-    /// The relay would not list the collection. As before, it is skipped.
+    /// The relay would not give a page, after every retry. The collection's
+    /// cursor stays where it was, so the job does not complete and resuming it
+    /// continues from there.
     Relay(String),
     /// The queue could not be written. The job fails rather than finishing
     /// on a partial list.
@@ -822,6 +855,19 @@ pub(crate) async fn load_discovery_cursors(
         .collect())
 }
 
+/// The collections in `collections` whose listing has not reached its end:
+/// no saved cursor, or one with `done = 0`.
+pub(crate) fn unfinished_collections(
+    collections: &[String],
+    cursors: &HashMap<String, DiscoveryCursor>,
+) -> Vec<String> {
+    collections
+        .iter()
+        .filter(|c| !cursors.get(*c).is_some_and(|cursor| cursor.done))
+        .cloned()
+        .collect()
+}
+
 pub(crate) async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i32, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT total_repos FROM happyview_backfill_jobs WHERE id = ?",
@@ -834,46 +880,125 @@ pub(crate) async fn job_total_repos(state: &JobState, job_id: &str) -> Result<i3
     Ok(total.unwrap_or(0))
 }
 
-/// One `listReposByCollection` page, sleeping through rate limits. `Ok(None)`
-/// means the job stopped while it waited out a rate limit.
+/// How discovery retries a relay page that failed with a transport error, a
+/// 5xx or a body it could not read. A 429 is waited out as before and does not
+/// count as a failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayRetry {
+    /// Attempts per page, the first included. Once they are spent, the
+    /// collection's discovery stops at its saved cursor and the job does not
+    /// complete.
+    pub max_attempts: u32,
+    /// The wait after the first failure. Each later failure doubles it.
+    pub base_delay: Duration,
+    /// The longest wait between attempts, before jitter and `Retry-After`.
+    pub max_delay: Duration,
+}
+
+impl Default for RelayRetry {
+    /// About two minutes of retries per page: 1, 2, 4, 8, 16, 32 and 60
+    /// seconds, each jittered.
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The wait after the `failures`-th failed attempt at a relay page: the
+/// doubling backoff, capped, then jittered into its upper half by `jitter`
+/// (from `[0, 1)`), and never shorter than the relay's `Retry-After`.
+pub fn relay_retry_delay(
+    policy: &RelayRetry,
+    failures: u32,
+    retry_after: Option<Duration>,
+    jitter: f64,
+) -> Duration {
+    let doublings = failures.saturating_sub(1).min(20);
+    let backoff = policy
+        .base_delay
+        .saturating_mul(1u32 << doublings)
+        .min(policy.max_delay);
+    let jittered = backoff.mul_f64(0.5 + jitter.clamp(0.0, 1.0) / 2.0);
+    match retry_after {
+        Some(wait) => jittered.max(wait),
+        None => jittered,
+    }
+}
+
+/// Sleep for `wait` in one-second slices, so a pause or cancel is not held up
+/// by a long wait. Returns false if the job stopped meanwhile.
+pub(crate) async fn sleep_unless_cancelled(wait: Duration, cancelled: &AtomicBool) -> bool {
+    let until = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < until {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_secs(1)))
+            .await;
+    }
+    !cancelled.load(Ordering::Relaxed)
+}
+
+/// One `listReposByCollection` page. Rate limits are slept through; transport
+/// errors, 5xx responses and bodies that do not parse are retried under
+/// `state.config.relay_retry`. `Ok(None)` means the job stopped while it
+/// waited. An `Err` is a page the relay would not give after every attempt
+/// (or a 4xx, which no retry changes).
 pub(crate) async fn fetch_relay_page(
     state: &JobState,
     url: &str,
     collection: &str,
     cancelled: &AtomicBool,
 ) -> Result<Option<ListReposResponse>, String> {
-    let resp = loop {
-        let r = state
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("relay request failed: {e}"))?;
-        if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = parse_retry_after(r.headers());
-            tracing::warn!(collection, wait, "rate limited by relay, sleeping");
-            // In slices, so a pause or cancel is not held up by a long reset.
-            let until = tokio::time::Instant::now() + Duration::from_secs(wait);
-            while tokio::time::Instant::now() < until {
-                if cancelled.load(Ordering::Relaxed) {
+    let policy = state.config.relay_retry;
+    let mut failures: u32 = 0;
+    loop {
+        let (error, retry_after) = match state.http.get(url).send().await {
+            // Without the URL: it carries the relay cursor, which goes no
+            // further than the job's own rows.
+            Err(e) => (format!("relay request failed: {}", e.without_url()), None),
+            Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let wait = parse_retry_after(r.headers());
+                tracing::warn!(collection, wait, "rate limited by relay, sleeping");
+                if !sleep_unless_cancelled(Duration::from_secs(wait), cancelled).await {
                     return Ok(None);
                 }
-                tokio::time::sleep_until(
-                    until.min(tokio::time::Instant::now() + Duration::from_secs(1)),
-                )
-                .await;
+                continue;
             }
-            continue;
+            Ok(r) if r.status().is_server_error() => {
+                let headers = r.headers();
+                let retry_after = (headers.contains_key("retry-after")
+                    || headers.contains_key("ratelimit-reset"))
+                .then(|| Duration::from_secs(parse_retry_after(headers)));
+                (format!("relay returned {}", r.status()), retry_after)
+            }
+            Ok(r) if !r.status().is_success() => {
+                return Err(format!("relay returned {}", r.status()));
+            }
+            Ok(r) => match r.json::<ListReposResponse>().await {
+                Ok(body) => return Ok(Some(body)),
+                Err(e) => (format!("invalid relay response: {e}"), None),
+            },
+        };
+        failures += 1;
+        if failures >= policy.max_attempts.max(1) {
+            return Err(format!("{error} (gave up after {failures} attempts)"));
         }
-        break r;
-    };
-    if !resp.status().is_success() {
-        return Err(format!("relay returned {}", resp.status()));
+        let wait = relay_retry_delay(&policy, failures, retry_after, rand::random::<f64>());
+        tracing::warn!(
+            collection,
+            attempt = failures,
+            wait_ms = wait.as_millis() as u64,
+            error,
+            "relay page failed, retrying"
+        );
+        if !sleep_unless_cancelled(wait, cancelled).await {
+            return Ok(None);
+        }
     }
-    resp.json()
-        .await
-        .map(Some)
-        .map_err(|e| format!("invalid relay response: {e}"))
 }
 
 /// Enqueue one relay page, save the cursor that follows it and add to the
@@ -1079,7 +1204,7 @@ pub(crate) async fn discover_all(
 
     // Each future owns its handles rather than borrowing this function's, so
     // the stream stays `Send` inside the spawned discovery task.
-    let outcomes: Vec<(String, Result<bool, DiscoveryError>)> = stream::iter(collections)
+    let outcomes: Vec<(String, Result<bool, DiscoveryError>)> = stream::iter(collections.clone())
         .map(|collection| {
             let start = cursors.get(&collection).cloned();
             let state = state.clone();
@@ -1109,6 +1234,7 @@ pub(crate) async fn discover_all(
         .await;
 
     let mut stopped = false;
+    let mut unfinished = false;
     let mut database_error = None;
     for (collection, outcome) in outcomes {
         match outcome {
@@ -1119,9 +1245,11 @@ pub(crate) async fn discover_all(
                 database_error = Some(e);
             }
             Err(DiscoveryError::Relay(e)) => {
-                // As before, a collection the relay will not list is skipped
-                // rather than failing the job.
-                tracing::warn!(job_id, collection = %collection, error = %e, "failed to discover repos, skipping");
+                // Not skipped: the collection's cursor stays unfinished, so
+                // the job pauses rather than completes, and resuming it
+                // picks discovery up from that cursor.
+                unfinished = true;
+                tracing::warn!(job_id, collection = %collection, error = %e, "failed to discover repos; discovery is unfinished");
                 state
                     .host
                     .log_event(ProviderEvent {
@@ -1142,7 +1270,19 @@ pub(crate) async fn discover_all(
     if let Some(e) = database_error {
         return Err(e);
     }
-    if stopped {
+    if stopped || unfinished {
+        return Ok(());
+    }
+
+    // Every collection said it reached the end of its listing. Check that
+    // against the saved cursors before saying so for good: a resumed job
+    // never runs discovery again once it is marked complete.
+    let saved = load_discovery_cursors(state, job_id)
+        .await
+        .map_err(|e| format!("failed to read the backfill discovery cursors: {e}"))?;
+    let open = unfinished_collections(&collections, &saved);
+    if !open.is_empty() {
+        tracing::warn!(job_id, collections = ?open, "backfill discovery has unfinished cursors; not marking it complete");
         return Ok(());
     }
 
@@ -1565,6 +1705,17 @@ pub(crate) async fn give_up_resolution(
     attempts: u32,
 ) {
     run.deferred_units.remove(&unit);
+    crate::backfill::errors::mark_failure(
+        &ctx.state,
+        &ctx.queue.job_id,
+        &unit.did,
+        &unit.collection,
+        "resolve",
+        failure.kind,
+        crate::backfill::errors::FailureState::Failed,
+        attempts,
+    )
+    .await;
     if run.recorded.insert(unit.did.clone()) {
         ctx.recorder
             .record(
@@ -1888,7 +2039,7 @@ pub(crate) type RecordedDids = std::collections::HashSet<String>;
 pub fn retryable_give_ups_first(failures: &mut [(String, FetchOutcome)]) {
     failures.sort_by_key(|(_, outcome)| match outcome {
         FetchOutcome::Failed { failure, .. } => !failure.kind.is_retryable(),
-        FetchOutcome::Complete { .. } => true,
+        FetchOutcome::Complete { .. } | FetchOutcome::Cancelled { .. } => true,
     });
 }
 
@@ -1917,6 +2068,19 @@ pub(crate) async fn defer_or_give_up_fetch(
 ) {
     let now = std::time::Instant::now();
     if failure.kind.is_retryable() && attempts < max_attempts {
+        // Persisted, so a pause or restart before the retry does not lose
+        // it: the resumed job queues the repo again.
+        crate::backfill::errors::mark_failure(
+            state,
+            &queue.job_id,
+            &did,
+            &collection,
+            "fetch",
+            failure.kind,
+            crate::backfill::errors::FailureState::Pending,
+            attempts,
+        )
+        .await;
         cooldowns.record_failure(pds_host, failure.retry_after, now);
         deferred.push(DeferredItem {
             payload: (did, collection, cursor),
@@ -1966,6 +2130,19 @@ pub(crate) async fn record_fetch_give_up(
     failure: &crate::backfill::errors::BackfillFailure,
     attempts: u32,
 ) {
+    // Every collection, past the detail cap too: this is the list
+    // retry-failed reads.
+    crate::backfill::errors::mark_failure(
+        state,
+        &queue.job_id,
+        did,
+        collection,
+        "fetch",
+        failure.kind,
+        crate::backfill::errors::FailureState::Failed,
+        attempts,
+    )
+    .await;
     if !recorded.insert(did.to_string()) {
         return;
     }
@@ -2056,6 +2233,8 @@ pub(crate) type UnitFetchResult = (WorkUnit, i32, bool, Vec<(String, FetchOutcom
 /// What settling a unit needs from its worker.
 pub(crate) struct WorkerScope<'a> {
     pub state: &'a JobState,
+    /// Every collection the job targets.
+    pub collections: &'a [String],
     pub queue: &'a JobQueue,
     pub pds_endpoint: &'a str,
     pub pds_host: &'a str,
@@ -2086,6 +2265,8 @@ pub(crate) async fn finish_unit(
 ) -> Option<(i32, i32)> {
     let (unit, records, any_success, mut failures) = result;
     let records_now = saturating_fetch_add(scope.total_records, records);
+    // A unit cut short stays queued: the resumed job fetches it again. A
+    // `Cancelled` outcome only comes from this same flag.
     if scope.cancelled.load(Ordering::Relaxed) {
         return None;
     }
@@ -2093,6 +2274,13 @@ pub(crate) async fn finish_unit(
         retries.cooldowns.record_success(scope.pds_host);
     }
     retryable_give_ups_first(&mut failures);
+    // Collections this attempt fetched whole. A unit queued again from a
+    // pending retry leaves the failure set once it is fetched.
+    let fetched: Vec<String> = unit
+        .collections(scope.collections)
+        .into_iter()
+        .filter(|c| !failures.iter().any(|(failed, _)| failed == c))
+        .collect();
     for (collection, outcome) in failures {
         let FetchOutcome::Failed {
             cursor, failure, ..
@@ -2120,7 +2308,14 @@ pub(crate) async fn finish_unit(
     }
 
     let removed = job_write(scope.state, &scope.queue.job_id, "complete_unit", || {
-        complete_unit(scope.state, scope.queue, &unit, scope.pds_endpoint, records)
+        complete_unit_clearing(
+            scope.state,
+            scope.queue,
+            &unit,
+            scope.pds_endpoint,
+            records,
+            &fetched,
+        )
     })
     .await;
     release_slot(scope.queue, removed);
@@ -2199,7 +2394,8 @@ pub(crate) async fn fetch_unit(
                 count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
                 any_success = true;
             }
-            outcome @ FetchOutcome::Failed { count: c, .. } => {
+            outcome @ (FetchOutcome::Failed { count: c, .. }
+            | FetchOutcome::Cancelled { count: c, .. }) => {
                 count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
                 failures.push((collection.clone(), outcome));
             }
@@ -2246,6 +2442,7 @@ pub(crate) async fn run_pds_worker(
     let pds_host = host_of(&pds_endpoint);
     let scope = WorkerScope {
         state: &state,
+        collections: &collections,
         queue: &queue,
         pds_endpoint: &pds_endpoint,
         pds_host: &pds_host,
@@ -2365,6 +2562,19 @@ pub(crate) async fn run_pds_worker(
                     FetchOutcome::Complete { count } => {
                         retries.cooldowns.record_success(&pds_host);
                         record_late_records(&scope, count as i32).await;
+                        crate::backfill::errors::mark_recovered(
+                            &state,
+                            &queue.job_id,
+                            &did,
+                            &collection,
+                        )
+                        .await;
+                    }
+                    FetchOutcome::Cancelled { count, .. } => {
+                        // The pending row stays, so the resumed job fetches
+                        // the repo again.
+                        record_late_records(&scope, count as i32).await;
+                        break;
                     }
                     FetchOutcome::Failed {
                         count,
@@ -2553,6 +2763,11 @@ pub(crate) async fn run_fetching_phase(
                                         did_records += count as i32;
                                         failures.push((collection.clone(), outcome));
                                     }
+                                    // The repo stays pending below.
+                                    FetchOutcome::Cancelled { count, .. } => {
+                                        did_records += count as i32;
+                                        break;
+                                    }
                                 }
                             }
                             (did, did_records, any_success, failures)
@@ -2639,6 +2854,19 @@ pub(crate) async fn run_fetching_phase(
                         let recorder = Arc::clone(&recorder);
 
                         async move {
+                            if let Some((did, collection, failure)) = &give_up {
+                                crate::backfill::errors::mark_failure(
+                                    &state,
+                                    job_id.as_str(),
+                                    did,
+                                    collection,
+                                    "fetch",
+                                    failure.kind,
+                                    crate::backfill::errors::FailureState::Failed,
+                                    1,
+                                )
+                                .await;
+                            }
                             if let Some((did, collection, failure)) = give_up {
                                 recorder
                                     .record(
@@ -2653,6 +2881,11 @@ pub(crate) async fn run_fetching_phase(
                                     .await;
                             }
 
+                            // A repo cut short by a pause or cancel stays
+                            // pending, so the resumed job fetches it again.
+                            if cancelled.load(Ordering::Relaxed) {
+                                return;
+                            }
                             // Mark DID as completed
                             let sql = adapt_sql(
                                 "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
@@ -2737,6 +2970,17 @@ pub(crate) async fn run_fetching_phase(
                                 FetchOutcome::Complete { count } => {
                                     cooldowns.record_success(&pds_host);
                                     saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
+                                    crate::backfill::errors::mark_recovered(
+                                        &state,
+                                        job_id.as_str(),
+                                        &did,
+                                        &collection,
+                                    )
+                                    .await;
+                                }
+                                FetchOutcome::Cancelled { count, .. } => {
+                                    saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
+                                    break;
                                 }
                                 FetchOutcome::Failed { count, cursor, failure } => {
                                     saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
@@ -2809,6 +3053,12 @@ pub enum FetchOutcome {
     Complete {
         count: u32,
     },
+    /// The job stopped before the collection was drained. Never a success:
+    /// the repo has only the pages fetched so far.
+    Cancelled {
+        count: u32,
+        cursor: Option<String>,
+    },
     Failed {
         count: u32,
         // Read by the deferred-retry wiring in both fetch call sites, to
@@ -2838,7 +3088,7 @@ pub async fn fetch_records_page_loop(
     let mut count: u32 = 0;
     loop {
         if cancelled.load(Ordering::Relaxed) {
-            break;
+            return FetchOutcome::Cancelled { count, cursor };
         }
 
         let mut url = format!(
@@ -2970,6 +3220,14 @@ pub(crate) async fn run_queue(
     discovery_complete: bool,
     window: i64,
 ) -> Result<(i32, i32), String> {
+    if version == QueueVersion::Bounded {
+        let requeued = crate::backfill::errors::requeue_pending_failures(state, job_id)
+            .await
+            .map_err(|e| format!("failed to queue the job's pending retries again: {e}"))?;
+        if requeued > 0 {
+            tracing::info!(job_id, requeued, "queued pending fetch retries again");
+        }
+    }
     let queued = match version {
         QueueVersion::Legacy => 0,
         QueueVersion::Bounded => queued_units(state, job_id)

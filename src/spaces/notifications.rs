@@ -50,6 +50,8 @@ pub struct WebhookSigner<'a> {
     pub encryption_key: &'a crate::plugin::encryption::Keyring,
     pub public_url: &'a str,
     pub plc_url: &'a str,
+    /// The space's authority, which deliveries are signed as.
+    pub authority_did: &'a str,
 }
 
 /// Whether the missing-key warning has been logged, so it is once a process.
@@ -125,11 +127,12 @@ async fn mint(
     lxm: &str,
 ) -> Option<String> {
     let signer = signer?;
-    match crate::auth::service_auth::mint_service_auth(
+    match crate::spaces::authority::mint_service_auth_or_instance(
         pool,
         backend,
         signer.encryption_key,
         signer.public_url,
+        signer.authority_did,
         &reg.service,
         lxm,
     )
@@ -315,10 +318,25 @@ async fn webhook_worker(
             }
         };
         let keyring = state.config.keyring();
+        // Deliveries are signed as the space's authority. A batch whose space
+        // cannot be read, or was deleted while it waited, is dropped rather
+        // than signed as someone else.
+        let authority_did = match db::get_space(&state.db, state.db_backend, &space_id).await {
+            Ok(Some(space)) => space.authority_did,
+            Ok(None) => {
+                tracing::debug!(space_id, "dropping webhook batch for a deleted space");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(space_id, error = %e, "dropping webhook batch: its space could not be read");
+                continue;
+            }
+        };
         let signer = keyring.as_ref().map(|encryption_key| WebhookSigner {
             encryption_key,
             public_url: &state.config.public_url,
             plc_url: &state.config.plc_url,
+            authority_did: &authority_did,
         });
         if let Err(e) = dispatch_write_notifications(
             &state.db,
@@ -365,6 +383,7 @@ pub fn announce_space_deleted(
                         encryption_key,
                         public_url: &state.config.public_url,
                         plc_url: &state.config.plc_url,
+                        authority_did: &space.authority_did,
                     });
                     post_webhook(
                         &state.http,
@@ -382,11 +401,12 @@ pub fn announce_space_deleted(
                         tracing::warn!("TOKEN_ENCRYPTION_KEY is required to sign a space deletion");
                         continue;
                     };
-                    let token = match crate::auth::service_auth::mint_service_auth(
+                    let token = match crate::spaces::authority::mint_service_auth_or_instance(
                         &state.db,
                         state.db_backend,
                         key,
                         &state.config.public_url,
+                        &space.authority_did,
                         &reg.service,
                         NOTIFY_SPACE_DELETED_LXM,
                     )
@@ -499,13 +519,18 @@ async fn deliver_repo_update(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign write notifications".into())
     })?;
     let body = update.body();
+    let authority_did = db::get_space(&state.db, state.db_backend, space_id)
+        .await?
+        .map(|space| space.authority_did)
+        .ok_or_else(|| AppError::NotFound("space not found".into()))?;
 
     for reg in &registrations {
-        let token = match crate::auth::service_auth::mint_service_auth(
+        let token = match crate::spaces::authority::mint_service_auth_or_instance(
             &state.db,
             state.db_backend,
             encryption_key,
             &state.config.public_url,
+            &authority_did,
             &reg.service,
             NOTIFY_WRITE_LXM,
         )
@@ -581,7 +606,12 @@ async fn deliver_revocations(
         &state.config.public_url,
     )
     .await;
-    if instance.ok().as_deref() != Some(space.authority_did.as_str()) {
+    // A space on its own DID revokes as that DID. One created before space
+    // DIDs existed can sign only as this instance, so it revokes only when its
+    // authority is this instance.
+    let own_did =
+        crate::spaces::authority::holds(&state.db, state.db_backend, &space.authority_did).await?;
+    if !own_did && instance.ok().as_deref() != Some(space.authority_did.as_str()) {
         return Ok(());
     }
     let encryption_key = &state.config.keyring().ok_or_else(|| {
@@ -612,11 +642,12 @@ async fn deliver_revocations(
         );
         for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
             // Addressed to the repo, which is what its host accepts service auth for.
-            let token = crate::auth::service_auth::mint_service_auth(
+            let token = crate::spaces::authority::mint_service_auth_or_instance(
                 &state.db,
                 state.db_backend,
                 encryption_key,
                 &state.config.public_url,
+                &space.authority_did,
                 &repo,
                 NOTIFY_CREDENTIAL_REVOKED_LXM,
             )
@@ -759,6 +790,7 @@ mod tests {
             encryption_key: keyring,
             public_url: "https://hv.example",
             plc_url: plc,
+            authority_did: "did:plc:instance",
         }
     }
 
@@ -1032,6 +1064,59 @@ mod tests {
         verifying
             .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
             .expect("the receiver can verify it against the instance's DID document key");
+    }
+
+    /// A space on its own DID signs its webhook deliveries as that DID, with
+    /// its `#atproto` key, not as this instance.
+    #[tokio::test]
+    async fn a_space_on_its_own_did_signs_its_webhooks_as_it() {
+        const SPACE_KEY: [u8; 32] = [0x44; 32];
+        const SPACE_DID: &str = "did:plc:spaceofitsown";
+        let (pool, backend) = pool(true).await;
+        let sealed = crate::plugin::encryption::encrypt(
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            &SPACE_KEY,
+        )
+        .unwrap();
+        crate::db::query(
+            "INSERT INTO happyview_space_authorities (did, signing_key_enc, kem_key_enc, rotation_key_enc, genesis_op, plc_state, created_by, space_type, skey, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', 'published', 'did:plc:creator', 'com.example.forum', 'main', '', '')",
+        )
+        .bind(SPACE_DID)
+        .bind(sealed.clone())
+        .bind(sealed.clone())
+        .bind(sealed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let delivery = Delivery::new().await;
+        let plc = plc_listing(&delivery.receiver.uri()).await;
+        let keyring = keyring();
+        let request = delivery
+            .send(
+                &pool,
+                backend,
+                Some(WebhookSigner {
+                    authority_did: SPACE_DID,
+                    ..signer(&keyring, &plc.uri())
+                }),
+                NOTIFY_WRITE_LXM,
+                &payload(),
+            )
+            .await;
+
+        let (claims, parts) = claims(&request);
+        assert_eq!(claims["iss"], SPACE_DID);
+        assert_eq!(claims["aud"], SERVICE);
+        let verifying = *p256::ecdsa::SigningKey::from_slice(&SPACE_KEY)
+            .unwrap()
+            .verifying_key();
+        let signature =
+            p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(&parts[2]).unwrap())
+                .unwrap();
+        verifying
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("signed with the space DID's key");
     }
 
     #[tokio::test]

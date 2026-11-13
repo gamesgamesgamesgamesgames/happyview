@@ -41,6 +41,7 @@ import type { BackfillSource } from "@/types/backfill";
 import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
+  RetiredSpacesResponse,
   AdminSpaceDetail,
   AccessGrant,
   GrantScope,
@@ -430,6 +431,8 @@ export function createBackfillJob(body: {
   collection?: string;
   dids?: string[];
   source?: BackfillSource;
+  // Start the collection's relay listing here instead of at its first page.
+  relay_cursor?: string;
 }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
@@ -795,6 +798,26 @@ export function getAdminSpaces(limit?: number, cursor?: string) {
   if (limit) params.set("limit", String(limit));
   if (cursor) params.set("cursor", cursor);
   return apiFetch<AdminListSpacesResponse>(`/admin/spaces?${params}`);
+}
+
+export function getRetiredSpaces() {
+  return apiFetch<RetiredSpacesResponse>("/admin/spaces/retired-policies");
+}
+
+/** Give a space in a retired policy shape a policy. */
+export function convertRetiredSpace(
+  id: string,
+  to: "memberspace" | "managedspace",
+  managingApp?: string,
+) {
+  return apiFetch<{
+    uri: string;
+    policy: unknown;
+    droppedAllowedApps?: string[];
+  }>(`/admin/spaces/${encodeURIComponent(id)}/convert`, {
+    method: "POST",
+    body: JSON.stringify({ to, managingApp }),
+  });
 }
 
 export function getAdminSpace(id: string) {
@@ -1481,6 +1504,37 @@ export type {
 
 export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
+}
+
+/** A HappyView version the update check found. */
+export interface HappyViewOffer {
+  version: string;
+  channel: string;
+  /** The release notes. */
+  releaseUrl: string | null;
+  upgradeGuideUrl: string;
+  /** Always `routine` until releases can be marked as security fixes. */
+  severity: "routine" | "security";
+}
+
+/** What `/admin/update-status` says about this instance's version. */
+export interface UpdateStatus {
+  state: "unknown" | "current" | "available" | "disabled" | "dev";
+  current: string;
+  channel: string | null;
+  /** A newer version on this instance's own channel. */
+  available: HappyViewOffer | null;
+  /** A version on another line worth knowing about, never an upgrade
+   * offer: a prerelease's version released as stable, or a new major. */
+  otherLine: HappyViewOffer | null;
+  checkedAt: string | null;
+  lastError: string | null;
+  /** A hosting platform upgrades this instance. */
+  managed: boolean;
+}
+
+export function getUpdateStatus() {
+  return apiFetch<UpdateStatus>("/admin/update-status");
 }
 
 /** A registry project and which of its versions: a channel to follow

@@ -234,7 +234,9 @@ function statusBadge(job: BackfillJob) {
 
 function phaseIndex(stage: string): number {
   if (isReplayStage(stage)) return REPLAY_STAGES.indexOf(stage);
-  if (stage === "resolving_and_fetching") return 1;
+  // Paused because discovery stopped short; resolving and fetching ran.
+  if (stage === "resolving_and_fetching" || stage === "discovery_incomplete")
+    return 1;
   const idx = PROGRESS_PHASES.indexOf(
     stage as (typeof PROGRESS_PHASES)[number],
   );
@@ -724,6 +726,20 @@ export default function BackfillPage() {
   }, [load]);
 
   const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null;
+  // Collections a crawl created after the selected job covers: its
+  // discovery has been continued (or redone) already.
+  const continuedCollections = selectedJob
+    ? jobs
+        .filter(
+          (j) =>
+            j.id !== selectedJob.id &&
+            j.source === "crawl" &&
+            j.scope === "network" &&
+            j.collection != null &&
+            j.created_at > selectedJob.created_at,
+        )
+        .map((j) => j.collection as string)
+    : [];
   const sseActive =
     selectedJob != null &&
     (selectedJob.status === "running" ||
@@ -878,6 +894,24 @@ export default function BackfillPage() {
                   await resumeBackfillJob(selectedJob.id);
                   load();
                 }}
+                onContinueDiscovery={async () => {
+                  // A new crawl per collection, from where this one stopped.
+                  const started: string[] = [];
+                  for (const open of selectedJob.discovery_unfinished ?? []) {
+                    if (!open.relay_cursor) continue;
+                    if (continuedCollections.includes(open.collection))
+                      continue;
+                    const { id } = await createBackfillJob({
+                      collection: open.collection,
+                      source: "crawl",
+                      relay_cursor: open.relay_cursor,
+                    });
+                    started.push(id);
+                  }
+                  load();
+                  return started;
+                }}
+                continuedCollections={continuedCollections}
                 onRetry={async (kinds) => {
                   await retryFailedBackfill(selectedJob.id, kinds);
                   load();
@@ -900,6 +934,8 @@ function JobDetail({
   onCancel,
   onPause,
   onResume,
+  onContinueDiscovery,
+  continuedCollections,
   onRetry,
 }: {
   job: BackfillJob;
@@ -910,11 +946,16 @@ function JobDetail({
   onCancel: () => Promise<void>;
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
+  onContinueDiscovery: () => Promise<string[]>;
+  // Collections a later crawl already covers, so their continuation isn't
+  // offered twice.
+  continuedCollections: string[];
   onRetry: (kinds?: string[]) => Promise<void>;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const current = phaseIndex(job.stage);
   const allDone = job.status === "completed";
@@ -929,6 +970,14 @@ function JobDetail({
     (job.status === "failed" && job.source === "replay");
   // Discovery runs alongside resolving and fetching on the bounded queue.
   const discovering = job.discovery_complete === false;
+  // A completed crawl whose discovery stopped short of a collection's end
+  // (a relay page that kept failing, before HappyView paused on that).
+  const unfinishedDiscovery = (job.discovery_unfinished ?? []).filter(
+    (open) =>
+      open.relay_cursor && !continuedCollections.includes(open.collection),
+  );
+  const discoveryContinuable =
+    allDone && job.source === "crawl" && unfinishedDiscovery.length > 0;
   const bounded = job.recent_completions_limit != null;
   // A bounded job's queue is its work, so the server only clears a finished
   // one; a legacy job can be cleared whenever it isn't running.
@@ -1116,6 +1165,20 @@ function JobDetail({
       toastError("Couldn't resume", e);
     } finally {
       setResuming(false);
+    }
+  }
+
+  async function handleContinueDiscovery() {
+    setContinuing(true);
+    try {
+      const started = await onContinueDiscovery();
+      toast.success(
+        `Started ${started.length === 1 ? "backfill" : "backfills"} ${started.join(", ")} from the saved cursor`,
+      );
+    } catch (e: unknown) {
+      toastError("Couldn't continue discovery", e);
+    } finally {
+      setContinuing(false);
     }
   }
 
@@ -1366,6 +1429,19 @@ function JobDetail({
             </div>
           )}
         </div>
+
+        {discoveryContinuable && (
+          <div>
+            <span className="text-muted-foreground text-sm">
+              Discovery stopped early
+            </span>
+            <div className="bg-amber-500/10 text-amber-700 dark:text-amber-400 mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+              The relay listing didn&apos;t reach its end for{" "}
+              {unfinishedDiscovery.map((open) => open.collection).join(", ")}.
+              Continue discovery starts a new backfill from the saved cursor.
+            </div>
+          </div>
+        )}
 
         {pauseReason ? (
           <div>
@@ -1751,6 +1827,16 @@ function JobDetail({
             onClick={handleResume}
           >
             {resuming ? "Resuming…" : "Resume"}
+          </Button>
+        )}
+        {canCancel && discoveryContinuable && (
+          <Button
+            variant="default"
+            size="sm"
+            disabled={continuing}
+            onClick={handleContinueDiscovery}
+          >
+            {continuing ? "Starting…" : "Continue discovery"}
           </Button>
         )}
         {canCancel && isActive && !restartsUnlessPaused && (

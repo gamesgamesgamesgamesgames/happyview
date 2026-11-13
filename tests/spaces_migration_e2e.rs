@@ -207,7 +207,9 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
         .try_init();
 
     let account = pds_account().await;
-    let scope = format!("space:{SPACE_TYPE}?collection={COLLECTION}");
+    // Each space has a DID of its own, created with the space, so the grant
+    // names any authority: a bare `space:` scope covers only the user's own DID.
+    let scope = format!("space:{SPACE_TYPE}?authority=*&collection={COLLECTION}");
 
     let mut app = TestApp::new().await;
     app.point_at_real_identity(PLC, &["atproto", &scope]);
@@ -219,8 +221,8 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
     let (status, body) = hv_post(
         &app,
         &account.did,
-        "com.atproto.simplespace.createSpace",
-        json!({ "type": SPACE_TYPE, "skey": skey }),
+        "com.atproto.space.createSpace",
+        json!({ "spaceType": SPACE_TYPE, "skey": skey, "policy": { "$type": "com.atproto.memberspace.policy" } }),
     )
     .await;
     assert!(
@@ -247,10 +249,17 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
         );
     }
 
+    // The space has a DID of its own, which its uri names.
+    let space_did = space_uri
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .expect("a space did")
+        .to_string();
     let space = happyview::spaces::db::get_space_by_address(
         &app.state.db,
         app.state.db_backend,
-        &account.did,
+        &space_did,
         SPACE_TYPE,
         &skey,
     )

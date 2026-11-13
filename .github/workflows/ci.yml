@@ -95,6 +95,7 @@ jobs:
       oauth-client-node: ${{ steps.filter.outputs.oauth-client-node }}
       lex-agent: ${{ steps.filter.outputs.lex-agent }}
       nsid: ${{ steps.filter.outputs.nsid }}
+      moved-docs: ${{ steps.filter.outputs.moved-docs }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -150,6 +151,41 @@ jobs:
             nsid:
               - 'crates/happyview-nsid/**'
               - 'packages/nsid/**'
+            # Read by `docs-moved`. Added and modified files only, so a change
+            # that deletes the old tree passes. A rename counts as a delete of
+            # the old path and an add of the new one, so moving a file in here
+            # is caught too.
+            moved-docs:
+              - added|modified: 'packages/docs/**'
+              - added|modified: 'docs/**'
+
+  # ---------------------------------------------------------------------------
+  # Docs guard — HappyView's docs live in their own repos (HAP-379).
+  # ---------------------------------------------------------------------------
+  # Fails a change that adds or modifies a file under `packages/docs/` or a
+  # top-level `docs/`; deleting them passes. Unlike the jobs below it runs on a
+  # draft too, since it costs seconds, and it fails rather than skips when
+  # `changes` did not succeed, because a skipped check satisfies a ruleset that
+  # requires it.
+  docs-moved:
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-docs-moved
+      cancel-in-progress: true
+    needs: changes
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Path detection ran
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: test "$RESULT" = success
+
+      - name: Refuse changes to the moved docs
+        if: needs.changes.outputs.moved-docs == 'true'
+        run: |
+          echo "::error::HappyView's docs moved out of this repo. v3 docs: happyproto/happyview-docs. v2 docs: happyproto/happyview-docs-legacy. Open a companion PR there."
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
@@ -817,6 +853,9 @@ jobs:
       - name: Version stamp
         run: bash scripts/stamp-version.test.sh
 
+      - name: Test the registry publishing scripts
+        run: bash scripts/registry.test.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -1136,7 +1175,7 @@ jobs:
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
       && needs.portability.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability, build-server, coverage, audit, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
+    needs: [changes, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, frontend, playwright, lint, portability, build-server, coverage, audit, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard, docs-moved]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
@@ -1441,6 +1480,136 @@ jobs:
             "${GHCR_IMAGE}:${{ needs.release.outputs.version }}"
 
   # ---------------------------------------------------------------------------
+  # Release records — the release as software.release records in
+  # happyview.dev's repo, which running instances read to learn of a newer
+  # HappyView. Written straight to the publisher's PDS by
+  # happyproto/actions/release-publish; nothing goes through a registry.
+  #
+  # Every release runs one of two jobs. Until the repository variable
+  # PUBLISH_RELEASE_RECORDS is `true`, plan-release-records runs the action as
+  # a dry run, with public reads only and no credentials, so each release
+  # shows what it would write. Once it is `true`, publish-release-records
+  # writes, in the release-records environment that holds the app password
+  # and that only the release branches can use. Neither is upstream of
+  # anything, so a PDS outage leaves a red job to re-run, never a release
+  # without images.
+  #
+  # REGISTRY_LATEST_MAJOR names the stable major `latest` follows (2 until
+  # 3.0.0 ships). release/v2 publishes 2.x releases with a job of its own.
+  # ---------------------------------------------------------------------------
+  plan-release-records:
+    needs: [release, build]
+    if: >-
+      always()
+      && vars.PUBLISH_RELEASE_RECORDS != 'true'
+      && needs.release.result == 'success'
+      && needs.build.result == 'success'
+      && needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    concurrency:
+      group: publish-release-records
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      TAG: v${{ needs.release.outputs.version }}
+      REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Describe the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          entry="$(bash scripts/registry/release-inputs.sh "$TAG")"
+          echo "$entry" | jq .
+          {
+            echo "version=$(jq -r .version <<<"$entry")"
+            echo "repository=$(jq -r .repository <<<"$entry")"
+            echo "commit=$(jq -r .commit <<<"$entry")"
+            echo "tag=$(jq -r .tag <<<"$entry")"
+            echo "changelog-url=$(jq -r '."changelog-url"' <<<"$entry")"
+            echo "published-at=$(jq -r '."published-at"' <<<"$entry")"
+            echo "channels=$(jq -r '.channels | join(",")' <<<"$entry")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Plan the release records (dry run)
+        uses: happyproto/actions/release-publish@v1
+        with:
+          identifier: did:plc:qneu5uamqs6cug7sjobbaexm
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          version: ${{ steps.release.outputs.version }}
+          repository: ${{ steps.release.outputs.repository }}
+          commit: ${{ steps.release.outputs.commit }}
+          tag: ${{ steps.release.outputs.tag }}
+          changelog-url: ${{ steps.release.outputs.changelog-url }}
+          published-at: ${{ steps.release.outputs.published-at }}
+          channels: ${{ steps.release.outputs.channels }}
+          dry-run: "true"
+
+  publish-release-records:
+    needs: [release, build]
+    if: >-
+      always()
+      && vars.PUBLISH_RELEASE_RECORDS == 'true'
+      && needs.release.result == 'success'
+      && needs.build.result == 'success'
+      && needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    environment: release-records
+    concurrency:
+      group: publish-release-records
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      TAG: v${{ needs.release.outputs.version }}
+      REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Describe the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          entry="$(bash scripts/registry/release-inputs.sh "$TAG")"
+          echo "$entry" | jq .
+          {
+            echo "version=$(jq -r .version <<<"$entry")"
+            echo "repository=$(jq -r .repository <<<"$entry")"
+            echo "commit=$(jq -r .commit <<<"$entry")"
+            echo "tag=$(jq -r .tag <<<"$entry")"
+            echo "changelog-url=$(jq -r '."changelog-url"' <<<"$entry")"
+            echo "published-at=$(jq -r '."published-at"' <<<"$entry")"
+            echo "channels=$(jq -r '.channels | join(",")' <<<"$entry")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release records
+        uses: happyproto/actions/release-publish@v1
+        with:
+          identifier: ${{ secrets.RELEASE_RECORDS_IDENTIFIER }}
+          password: ${{ secrets.RELEASE_RECORDS_APP_PASSWORD }}
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          version: ${{ steps.release.outputs.version }}
+          repository: ${{ steps.release.outputs.repository }}
+          commit: ${{ steps.release.outputs.commit }}
+          tag: ${{ steps.release.outputs.tag }}
+          changelog-url: ${{ steps.release.outputs.changelog-url }}
+          published-at: ${{ steps.release.outputs.published-at }}
+          channels: ${{ steps.release.outputs.channels }}
+          dry-run: "false"
+
+  # ---------------------------------------------------------------------------
   # SDK — per-package tests + releases
   # ---------------------------------------------------------------------------
   test-oauth-client:
@@ -1593,7 +1762,7 @@ jobs:
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
-    needs: [changes, test-oauth-client, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
+    needs: [changes, test-oauth-client, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, test-nsid, mirror, e2e-tests-shard, e2e-tests-sqlite-shard, docs-moved]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1785,7 +1954,7 @@ jobs:
       && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
-    needs: [changes, test-nsid, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, mirror, e2e-tests-shard, e2e-tests-sqlite-shard]
+    needs: [changes, test-nsid, build-server, unit-tests, e2e-tests, e2e-tests-sqlite, lua-differential, coverage, frontend, lint, portability, audit, playwright, pr-build, pr-build-metadata, test-oauth-client, test-oauth-client-browser, test-oauth-client-node, test-lex-agent, mirror, e2e-tests-shard, e2e-tests-sqlite-shard, docs-moved]
     runs-on: ubuntu-latest
     permissions:
       contents: write
