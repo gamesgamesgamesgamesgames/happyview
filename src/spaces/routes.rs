@@ -2259,11 +2259,11 @@ impl ExchangeGeneration {
         }
     }
 
-    /// The error for a user the space does not admit: `SpaceNotFound`, so a
-    /// refusal discloses nothing about the space. The Nov 12 text says so; the
-    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
-    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
-    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
+    /// The error for a user the space does not admit: `SpaceNotFound`, as the
+    /// Nov 12 text specifies. The Oct 29 text named the user
+    /// (`UserNotAuthorized`), and HappyView answers every generation the Nov 12
+    /// way (HAP-388 H4). `SpaceNotFound` is in the Oct 29 lexicon too, so an
+    /// Oct 29 client stays within it.
     fn refused_user(self) -> AppError {
         AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,

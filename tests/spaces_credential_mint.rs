@@ -1556,3 +1556,56 @@ async fn a_refused_account_through_another_app_is_told_the_space_was_not_found()
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
 }
+
+/// Simplespace addressed a client attestation to the space's bare DID. The
+/// simplespace exchange takes one so addressed, and not one addressed to the
+/// Nov 12 audience, which simplespace clients never used.
+#[tokio::test]
+#[serial]
+async fn the_simplespace_exchange_takes_an_attestation_for_the_bare_space_did() {
+    common::require_db!();
+    // Each case gets an app of its own: a delegation token is used once, and
+    // each app serves one attesting client's metadata.
+    for (case, nov12_aud) in [("did", false), ("pds", true)] {
+        let app = TestApp::new_with_encryption().await;
+        enable_spaces(&app).await;
+        let key = syncer_key();
+        let (space, space_did, token, _) =
+            own_did_space_and_token(&app, &format!("attested-{case}")).await;
+        let aud = if nov12_aud {
+            format!("{space_did}#atproto_pds")
+        } else {
+            space_did.clone()
+        };
+        let (attestation, _) = attestation_from_an_app(&app, &aud).await;
+
+        let headers =
+            happyview::spaces::http_signature::sign_legacy(&key, &format!("Bearer {token}"), None);
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json");
+        for (name, value) in &headers {
+            req = req.header(name, value);
+        }
+        let req = req
+            .body(Body::from(
+                json!({ "space": space, "clientAttestation": attestation }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = json_of(resp).await;
+        if nov12_aud {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], json!("InvalidClientAttestation"), "{body}");
+            assert!(
+                body["message"].as_str().unwrap().contains("aud"),
+                "refused for its audience: {body}"
+            );
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["credential"].is_string(), "{body}");
+        }
+    }
+}
