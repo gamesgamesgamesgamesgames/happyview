@@ -364,6 +364,32 @@ async fn a_credential_stops_working_when_its_member_is_removed() {
 #[tokio::test]
 #[serial]
 async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.simplespace.putMember",
+            json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
+        )
+    })
+    .await;
+}
+
+/// Removing a member with `removeMembers` tells the hosts too, once the
+/// removal and its revocations have committed.
+#[tokio::test]
+#[serial]
+async fn removing_a_member_notifies_the_hosts_of_native_repos() {
+    revocation_reaches_the_native_host(|space| {
+        (
+            "com.atproto.memberspace.removeMembers",
+            json!({ "space": space, "dids": [MEMBER] }),
+        )
+    })
+    .await;
+}
+
+/// Revoke `MEMBER`'s credential with the request `revoke` builds, and check
+/// that the host of `MEMBER`'s native repo hears about it once, as the space.
+async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static str, Value)) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -420,12 +446,8 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
         .unwrap();
     drop(conn);
 
-    space_admin(
-        &app,
-        "com.atproto.simplespace.putMember",
-        json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
-    )
-    .await;
+    let (nsid, body) = revoke(&space);
+    space_admin(&app, nsid, body).await;
 
     let mut received = Vec::new();
     for _ in 0..50 {
