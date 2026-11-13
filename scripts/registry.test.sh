@@ -27,6 +27,9 @@ case "$1 $2" in
     case "$3" in v[0-9]*) ;; *) exit 1 ;; esac
     draft=false; [ "$3" = v9.9.9 ] && draft=true
     echo '{"publishedAt":"2026-11-01T12:00:00Z","url":"https://github.com/gamesgamesgamesgamesgames/happyview/releases/tag/'"$3"'","isDraft":'"$draft"'}' ;;
+  "release list")
+    printf '%s\n' v3.0.0-alpha.10 v3.0.0-beta.2 v2.17.4 v3.0.0-alpha.9 \
+      v2.17.0-dev.2 v2.16.0-beta.1 v2.1.0 v1.0.0 @happyview/oauth-client-v1.4.3 ;;
   "api repos/gamesgamesgamesgamesgames/happyview/commits/"*)
     echo 0123456789abcdef0123456789abcdef01234567 ;;
   *) echo "unexpected gh $*" >&2; exit 1 ;;
@@ -54,5 +57,22 @@ n="$(bash "$here/registry/release-inputs.sh" v3.0.0-beta.2 --no-channels)"
 if REGISTRY_LATEST_MAJOR=2 bash "$here/registry/release-inputs.sh" v9.9.9 2>/dev/null; then fail "a draft release was accepted"; fi
 if bash "$here/registry/release-inputs.sh" 'v1.0.0|x' 2>/dev/null; then fail "a bad tag was accepted"; fi
 if bash "$here/registry/release-inputs.sh" v2.17.4 2>/dev/null; then fail "channels without REGISTRY_LATEST_MAJOR"; fi
+
+# --- backfill-list.sh -------------------------------------------------------------
+REGISTRY_LATEST_MAJOR=2 bash "$here/registry/backfill-list.sh" >"$work/list.json" 2>"$work/plan" \
+    || { cat "$work/plan" >&2; fail "backfill-list failed"; }
+order="$(jq -r 'map(.version) | join(" ")' "$work/list.json")"
+[ "$order" = "2.1.0 2.17.4 3.0.0-alpha.9 3.0.0-alpha.10 3.0.0-beta.2" ] || fail "order: $order"
+# Only each channel's newest version carries that channel.
+[ "$(jq -c 'map({(.version): .channels}) | add' "$work/list.json")" \
+    = '{"2.1.0":[],"2.17.4":["latest","v2"],"3.0.0-alpha.9":[],"3.0.0-alpha.10":["v3-alpha"],"3.0.0-beta.2":["v3-beta"]}' ] \
+    || fail "channels: $(jq -c 'map({(.version): .channels}) | add' "$work/list.json")"
+grep -q "5 releases" "$work/plan" || fail "summary"
+
+REGISTRY_LATEST_MAJOR=2 bash "$here/registry/backfill-list.sh" --include-legacy >"$work/legacy.json" 2>/dev/null
+[ "$(jq length "$work/legacy.json")" = 8 ] || fail "legacy scope: $(jq length "$work/legacy.json")"
+# A 2.x beta is in v2-beta, never v3-beta.
+[ "$(jq -c '.[] | select(.version == "2.16.0-beta.1") | .channels' "$work/legacy.json")" = '["v2-beta"]' ] \
+    || fail "2.x beta channel"
 
 echo "registry scripts: ok"
