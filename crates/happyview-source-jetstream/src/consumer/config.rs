@@ -17,6 +17,11 @@ pub(crate) const INVALID_REQUEST_RETRY: Duration = Duration::from_secs(3600);
 /// How long a session waits for its in-flight events before reconnecting
 /// anyway. The saved cursor then stops before them.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a connection may go without a data frame before it is treated as
+/// stalled and reconnected. Jetstream sends every subscriber the network's
+/// account and identity events whatever its collection filter, so a healthy
+/// connection carries frames every few seconds.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) const V2_SUBSCRIBE_PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
 pub(crate) const V1_SUBSCRIBE_PATH: &str = "/subscribe";
@@ -72,6 +77,26 @@ pub(crate) fn parse_compression(raw: Option<&str>) -> bool {
                 "JETSTREAM_COMPRESSION must be true or false; using true"
             );
             true
+        }
+    }
+}
+
+/// `JETSTREAM_STALL_TIMEOUT_SECS`: whole seconds, `0` to never treat a quiet
+/// connection as stalled. Unset or unparseable: [`STALL_TIMEOUT`].
+pub(crate) fn parse_stall_timeout(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(STALL_TIMEOUT);
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                default = STALL_TIMEOUT.as_secs(),
+                "JETSTREAM_STALL_TIMEOUT_SECS must be a whole number of seconds; using the default"
+            );
+            Some(STALL_TIMEOUT)
         }
     }
 }
@@ -213,6 +238,9 @@ pub struct Settings {
     pub workers: usize,
     pub invalid_request_retry: Duration,
     pub drain_timeout: Duration,
+    /// A connection with no data frame for this long is reconnected
+    /// (`JETSTREAM_STALL_TIMEOUT_SECS`); `None` never does.
+    pub stall_timeout: Option<Duration>,
 }
 
 impl Settings {
@@ -225,6 +253,7 @@ impl Settings {
             workers: parse_workers(var("JETSTREAM_WORKERS").as_deref()),
             invalid_request_retry: INVALID_REQUEST_RETRY,
             drain_timeout: DRAIN_TIMEOUT,
+            stall_timeout: parse_stall_timeout(var("JETSTREAM_STALL_TIMEOUT_SECS").as_deref()),
         }
     }
 }
@@ -250,6 +279,19 @@ mod tests {
         for off in ["false", "0", "no", "OFF"] {
             assert!(!parse_compression(Some(off)), "{off}");
         }
+    }
+
+    #[test]
+    fn the_stall_timeout_defaults_to_a_minute_and_zero_turns_it_off() {
+        assert_eq!(parse_stall_timeout(None), Some(STALL_TIMEOUT));
+        assert_eq!(parse_stall_timeout(Some(" ")), Some(STALL_TIMEOUT));
+        assert_eq!(
+            parse_stall_timeout(Some("90")),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(parse_stall_timeout(Some("0")), None);
+        assert_eq!(parse_stall_timeout(Some("-5")), Some(STALL_TIMEOUT));
+        assert_eq!(parse_stall_timeout(Some("1m")), Some(STALL_TIMEOUT));
     }
 
     #[test]

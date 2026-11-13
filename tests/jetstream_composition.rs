@@ -107,6 +107,7 @@ fn settings(mock: &MockJetstream) -> Settings {
         workers: 2,
         invalid_request_retry: Duration::from_millis(100),
         drain_timeout: DRAIN_TIMEOUT,
+        stall_timeout: None,
     }
 }
 

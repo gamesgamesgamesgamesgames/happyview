@@ -36,6 +36,7 @@ mod stats;
 mod storage;
 mod telemetry;
 pub(crate) mod types;
+mod update_status;
 mod users;
 mod verification_methods;
 
@@ -279,6 +280,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/settings/{key}",
             put(settings::upsert).delete(settings::delete),
         )
+        .route("/update-status", get(update_status::get))
         .route("/plugins", post(plugins::add).get(plugins::list))
         .route("/plugins/preview", post(plugins::preview))
         .route("/plugins/official", get(plugins::list_official))

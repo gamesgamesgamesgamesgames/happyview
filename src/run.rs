@@ -1083,6 +1083,21 @@ async fn boot(
         db_backend,
     );
 
+    let update_check_config = crate::update_check::UpdateCheckConfig::from_env(&config.plc_url);
+    let update_status: crate::update_check::SharedUpdateStatus = std::sync::Arc::new(
+        tokio::sync::RwLock::new(crate::update_check::UpdateStatus::initial(
+            crate::version::version(),
+            update_check_config.enabled,
+            config.telemetry_managed_by.is_some(),
+        )),
+    );
+    crate::update_check::spawn_check_task(
+        update_check_config,
+        update_status.clone(),
+        db_pool.clone(),
+        db_backend,
+    );
+
     let proxy_config = {
         let json_str =
             crate::admin::settings::get_setting(&db_pool, "xrpc_proxy_config", db_backend).await;
@@ -1157,6 +1172,7 @@ async fn boot(
         attestation_signer,
         official_registry,
         official_registry_config,
+        update_status,
         proxy_config,
         verbose_event_logging,
         ignored_keeps: Arc::default(),
