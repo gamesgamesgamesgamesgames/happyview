@@ -72,6 +72,7 @@ pub mod testing;
 pub mod testkit;
 pub mod tid;
 pub mod tombstones;
+pub mod update_check;
 pub mod verification_methods;
 pub mod version;
 pub mod xrpc;
@@ -139,6 +140,8 @@ pub struct AppState {
     pub attestation_signer: Option<Arc<plugin::attestation::AttestationSigner>>,
     pub official_registry: SharedRegistry,
     pub official_registry_config: RegistryConfig,
+    /// What the last check for a newer HappyView found.
+    pub update_status: update_check::SharedUpdateStatus,
     pub proxy_config: Arc<arc_swap::ArcSwap<proxy_config::ProxyConfig>>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Ignored keep-on-delete reports, rate-limited per collection.

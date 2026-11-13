@@ -133,6 +133,9 @@ pub fn state_with_pool_on(
             crate::plugin::official_registry::OfficialRegistryState::default(),
         )),
         official_registry_config: crate::plugin::official_registry::RegistryConfig::production(),
+        update_status: Arc::new(tokio::sync::RwLock::new(
+            crate::update_check::UpdateStatus::initial(crate::version::version(), false, false),
+        )),
         proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
             crate::proxy_config::ProxyConfig::default(),
         ))),
