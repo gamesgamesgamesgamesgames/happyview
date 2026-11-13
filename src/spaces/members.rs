@@ -300,3 +300,30 @@ pub async fn is_member(
         .remove(did)
         .map(|e| e.access))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::covers;
+
+    #[test]
+    fn no_cap_covers_every_cap() {
+        for cap in [
+            None,
+            Some((true, true)),
+            Some((true, false)),
+            Some((false, false)),
+        ] {
+            assert!(covers(None, cap), "{cap:?}");
+        }
+    }
+
+    #[test]
+    fn a_cap_covers_only_caps_it_grants_at_least() {
+        assert!(!covers(Some((true, true)), None));
+        assert!(covers(Some((true, true)), Some((true, false))));
+        assert!(covers(Some((true, false)), Some((true, false))));
+        // A read-only path seen first doesn't hide a read-write one.
+        assert!(!covers(Some((true, false)), Some((true, true))));
+        assert!(!covers(Some((false, true)), Some((true, false))));
+    }
+}
