@@ -634,3 +634,65 @@ async fn a_space_named_as_a_member_is_not_published_as_one() {
         vec![(owner.clone(), true, true)]
     );
 }
+
+/// Syncers hear about the authority's commit as about any other write.
+#[tokio::test]
+#[serial]
+async fn syncers_hear_about_a_published_member() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let a = rand_did("a");
+    let space = create(&app, &owner, memberspace(json!({ "publishMembers": true }))).await;
+    let row = space_row(&app, &space).await;
+    happyview::spaces::db::register_notify(
+        &app.state.db,
+        app.state.db_backend,
+        &happyview::spaces::types::NotifyRegistration {
+            id: Uuid::new_v4().to_string(),
+            space_id: row.id.clone(),
+            service: rand_did("syncer"),
+            endpoint: format!("{}/hooks/published", app.mock_server.uri()),
+            registered_by: owner.clone(),
+            expires_at: "2999-01-01T00:00:00+00:00".into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            delivery: happyview::spaces::types::NotifyDelivery::Webhook,
+        },
+    )
+    .await
+    .unwrap();
+
+    put_members(
+        &app,
+        &owner,
+        &space,
+        json!([{ "did": a, "read": true, "write": false }]),
+    )
+    .await;
+
+    let heard = |requests: Vec<wiremock::Request>| {
+        requests.into_iter().any(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap_or(json!(null));
+            r.url.path() == "/hooks/published"
+                && body["did"] == json!(row.authority_did)
+                && body["collection"] == json!(MEMBER)
+                && body["rkey"] == json!(a)
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if heard(
+            app.mock_server
+                .received_requests()
+                .await
+                .unwrap_or_default(),
+        ) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no webhook for the published member record"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
