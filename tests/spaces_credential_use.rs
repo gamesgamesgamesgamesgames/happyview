@@ -550,3 +550,53 @@ async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
     let as_owner = listed(CREATOR).await;
     assert!(as_owner["spaceRev"].is_string(), "{as_owner}");
 }
+
+/// A credential is accepted on space routes only, under either scheme: a
+/// presentation that a space route would take is refused anywhere else.
+#[tokio::test]
+#[serial]
+async fn a_credential_is_refused_off_the_space_routes_under_either_scheme() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    let presentations = [
+        (
+            "Atproto-Space-Credential",
+            http_signature::sign(
+                &key,
+                &format!("Atproto-Space-Credential {credential}"),
+                MEMBER,
+            ),
+        ),
+        (
+            "Atproto-Space",
+            http_signature::sign_legacy(&key, &format!("Atproto-Space {credential}"), Some(MEMBER)),
+        ),
+    ];
+    for (scheme, signed) in presentations {
+        let request = |path: &str| {
+            let mut req = Request::builder().uri(path);
+            for (name, value) in &signed {
+                req = req.header(name, value);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        // The presentation itself is good: a space route takes it.
+        let resp = call(&app, request(&latest_commit_path(&space, MEMBER))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{scheme} on a space route");
+
+        let resp = call(
+            &app,
+            request(&format!("/xrpc/app.bsky.actor.getProfile?actor={MEMBER}")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{scheme}");
+        let body = json_of(resp).await;
+        assert!(
+            body.to_string().contains("only accepted on space routes"),
+            "{scheme}: {body}"
+        );
+    }
+}

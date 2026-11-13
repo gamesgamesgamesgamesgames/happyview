@@ -672,6 +672,50 @@ mod tests {
         assert!(verify_legacy(&credential_headers(&key), Some(&did)).is_err());
     }
 
+    /// A simplespace presentation over `Authorization` and the audience,
+    /// signed by `key`, whose parameters name `keyid`.
+    fn legacy_presentation_naming(key: &SigningKey, keyid: &str) -> HeaderMap {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        let authorization = "Atproto-Space cred";
+        let params = format!("(\"authorization\" \"{AUDIENCE_HEADER}\");keyid=\"{keyid}\"");
+        let base = format!(
+            "\"authorization\": {authorization}\n\"{AUDIENCE_HEADER}\": {AUDIENCE}\n\"@signature-params\": {params}"
+        );
+        let signature: Signature = key.sign(base.as_bytes());
+        let mut headers = HeaderMap::new();
+        set(&mut headers, "authorization", authorization);
+        set(&mut headers, AUDIENCE_HEADER, AUDIENCE);
+        set(
+            &mut headers,
+            "signature-input",
+            &format!("{LEGACY_SIGNATURE_LABEL}={params}"),
+        );
+        set(
+            &mut headers,
+            "signature",
+            &format!(
+                "{LEGACY_SIGNATURE_LABEL}=:{}:",
+                base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_simplespace_presentation_naming_another_key_is_refused() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        // Naming the bound key is fine.
+        let named = legacy_presentation_naming(&key, &did);
+        assert_eq!(verify_legacy(&named, Some(&did)).unwrap(), did);
+        // A valid signature by the bound key, whose keyid names another key.
+        let other = did_key(self::key().verifying_key());
+        let mismatched = legacy_presentation_naming(&key, &other);
+        let err = verify_legacy(&mismatched, Some(&did)).unwrap_err();
+        assert!(err.0.contains("keyid"), "{err}");
+    }
+
     #[test]
     fn rejects_changed_covered_fields() {
         let key = key();
