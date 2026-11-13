@@ -1,0 +1,97 @@
+# Publishes HappyView's past releases as software.release records in
+# happyview.dev's repo, so running instances can find every line's newest
+# version. Run by hand, once, after the first publish has been reviewed.
+#
+# The `plan` job always runs, and only prints: every record the backfill
+# would write and every channel move, read against what the repo already
+# holds. `publish` runs only when the dispatch sets dry-run to false, in the
+# release-records environment that holds the app password.
+#
+# Re-running is safe. Records already there are skipped, a published version
+# is never changed, and no channel ever moves backwards.
+
+name: Backfill release records
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only print what would be written.
+        type: boolean
+        default: true
+      include-legacy:
+        description: Also publish 1.x and the 2.x -dev, -beta and -next prereleases.
+        type: boolean
+        default: false
+      pace:
+        description: Seconds between writes.
+        type: string
+        default: "2"
+
+permissions:
+  contents: read
+
+# Shares the publish job's group, so a backfill and a release never write at
+# the same time.
+concurrency:
+  group: publish-release-records
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: depot-ubuntu-24.04
+    env:
+      REGISTRY_LATEST_MAJOR: ${{ vars.REGISTRY_LATEST_MAJOR }}
+      LEGACY: ${{ inputs.include-legacy && '--include-legacy' || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: List the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2086 # LEGACY is one flag or nothing.
+          bash scripts/registry/backfill-list.sh $LEGACY > releases.json
+          jq -r '.[] | "\(.version)\t\(.channels | join(","))"' releases.json
+
+      - name: Upload the list
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-records-backfill
+          path: releases.json
+
+      - name: Plan
+        uses: happyproto/actions/release-publish@v1
+        with:
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          identifier: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          releases: releases.json
+          dry-run: "true"
+
+  # Writes only when the dispatch turns dry-run off and publishing is on for
+  # the repository, the same switch the release job's publish waits on.
+  publish:
+    if: ${{ !inputs.dry-run && vars.PUBLISH_RELEASE_RECORDS == 'true' }}
+    needs: plan
+    runs-on: depot-ubuntu-24.04
+    environment: release-records
+    steps:
+      - name: Download the list
+        uses: actions/download-artifact@v8
+        with:
+          name: release-records-backfill
+
+      - name: Publish
+        uses: happyproto/actions/release-publish@v1
+        with:
+          identifier: ${{ secrets.RELEASE_RECORDS_IDENTIFIER }}
+          password: ${{ secrets.RELEASE_RECORDS_APP_PASSWORD }}
+          publisher-did: did:plc:qneu5uamqs6cug7sjobbaexm
+          project: happyview
+          releases: releases.json
+          pace: ${{ inputs.pace }}
+          dry-run: "false"

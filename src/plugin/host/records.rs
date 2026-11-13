@@ -484,6 +484,11 @@ pub async fn table_query(
 /// network, and otherwise stores an empty one rather than NULL — the column is
 /// NOT NULL on both backends, and `cid_verify` already reads an empty CID as
 /// "nothing to check".
+///
+/// A supplied CID is verified against the record: it must be the CID of the
+/// record's own DAG-CBOR encoding, or the call is refused and nothing is
+/// written. A stored CID is what strongRefs are checked against, so one that
+/// doesn't describe the stored content would make those checks meaningless.
 pub async fn index_put(
     store: &crate::record_store::RecordStore,
     spec: IndexPut,
@@ -496,6 +501,14 @@ pub async fn index_put(
         cid,
     } = spec;
     let did = did.ok_or_else(|| invalid("index_put needs a did: pass the record's author"))?;
+    if let Some(claimed) = cid.as_deref().filter(|c| !c.is_empty()) {
+        use happyview_provider::cid::{CidCheck, verify_record_cid};
+        if verify_record_cid(claimed, &record) != CidCheck::Match {
+            return Err(invalid(format!(
+                "index_put: the cid {claimed} is not the CID of the record given"
+            )));
+        }
+    }
     let prepared = crate::record_store::PreparedRecord {
         did,
         collection,
@@ -1318,19 +1331,57 @@ mod tests {
     #[tokio::test]
     async fn index_put_records_a_supplied_cid_on_insert() {
         let pool = seeded_pool().await;
+        let record = json!({"n": "first"});
+        let cid = happyview_provider::cid::compute_record_cid(&record)
+            .unwrap()
+            .to_string();
         let inserted = index_put(
             &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "fresh".into(),
                 did: Some("did:plc:a".into()),
-                record: json!({"n": "first"}),
-                cid: Some("bafyfromthepds".into()),
+                record,
+                cid: Some(cid.clone()),
             },
         )
         .await
         .unwrap();
-        assert_eq!(inserted.cid, "bafyfromthepds");
+        assert_eq!(inserted.cid, cid);
+    }
+
+    /// A supplied CID must describe the record given; one that doesn't is
+    /// refused and nothing is written.
+    #[tokio::test]
+    async fn index_put_refuses_a_cid_that_is_not_the_records() {
+        let pool = seeded_pool().await;
+        let other = happyview_provider::cid::compute_record_cid(&json!({"n": "other"}))
+            .unwrap()
+            .to_string();
+        for claimed in [other.as_str(), "bafyfromthepds", "not a cid"] {
+            let err = index_put(
+                &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+                IndexPut {
+                    collection: "c".into(),
+                    rkey: "fresh".into(),
+                    did: Some("did:plc:a".into()),
+                    record: json!({"n": "first"}),
+                    cid: Some(claimed.into()),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, RecordsError::InvalidSpec(_)),
+                "{claimed}: {err}"
+            );
+        }
+        assert!(
+            records_get(&pool, Sqlite, "at://did:plc:a/c/fresh")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The row's CID describes the version a PDS holds. A later index write
@@ -1345,8 +1396,12 @@ mod tests {
                 collection: "c".into(),
                 rkey: "1".into(),
                 did: Some("did:plc:a".into()),
+                cid: Some(
+                    happyview_provider::cid::compute_record_cid(&json!({"n": "edited"}))
+                        .unwrap()
+                        .to_string(),
+                ),
                 record: json!({"n": "edited"}),
-                cid: Some("bafysomethingelse".into()),
             },
         )
         .await
