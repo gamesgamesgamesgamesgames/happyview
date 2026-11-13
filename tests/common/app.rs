@@ -214,6 +214,12 @@ impl TestApp {
                 happyview::plugin::official_registry::OfficialRegistryState::default(),
             )),
             official_registry_config: registry_config,
+            update_status: happyview::update_check::UpdateStatus::initial(
+                happyview::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 happyview::proxy_config::ProxyConfig::default(),
             ))),
