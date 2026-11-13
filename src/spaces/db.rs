@@ -647,7 +647,7 @@ pub async fn is_space_credential_jti_revoked(
 
 /// The `jti`s of a member's credentials that are neither revoked nor expired.
 pub async fn outstanding_credential_jtis(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -659,7 +659,7 @@ pub async fn outstanding_credential_jtis(
     .bind(space_id)
     .bind(did)
     .bind(now_rfc3339())
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
@@ -731,7 +731,7 @@ pub async fn purge_expired_credentials(
 /// Revoke all active space credentials issued to `did` within `space_id`.
 /// Returns the number of credentials revoked.
 pub async fn revoke_space_credentials_for_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -744,7 +744,7 @@ pub async fn revoke_space_credentials_for_member(
         .bind(now_rfc3339())
         .bind(space_id)
         .bind(did)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
     Ok(result.rows_affected())
