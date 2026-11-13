@@ -1,0 +1,215 @@
+# HappyView's known deviations from Proposal 0016, for the spaces conformance
+# suite (https://github.com/happyproto/spaces-conformance). The suite reads this
+# file at the commit each HappyView image was built from.
+#
+# Each entry states the exact failure it covers (`expect`): any other failure
+# on the same assertion fails the run, and so does a pass while the entry is
+# still listed. A PR that fixes a deviation removes its entry.
+#
+# Format: https://github.com/happyproto/spaces-conformance/blob/main/docs/catalogue.md#deviations
+# Check: node cli/validate.ts --deviations <this file>   (in the suite repo)
+#
+# Recorded against 3.0.0-beta.14 on 2026-11-13. Every entry covers only the
+# 2026-10-29 revision: this release predates 2026-11-12 support.
+
+
+# --- repo-host-pre-0016 ----------------------------------------------------
+- assertion: records.commit-fields
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: records.commit-bytes-encoding
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: records.commit-repo-space-match
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: digest.matches-record-set
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: digest.covers-overwrite-and-delete
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: mac.commit-header-present
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      status: "400"
+      header: "null"
+- assertion: mac.commit-valid
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "getLatestCommit answered 400"
+    evidence:
+      status: "400"
+- assertion: oplog.entry-shape
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "listRepoOps answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: oplog.since-exclusive
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "listRepoOps answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: oplog.pagination-complete
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "listRepoOps answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: oplog.stale-values-omitted
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "listRepoOps answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+- assertion: oplog.fold-matches-commit
+  cause: repo-host-pre-0016
+  reason: "getLatestCommit and listRepoOps take a required `did`, not the lexicon's `repo`, so the spec-shaped call is refused before any handler runs."
+  spec: "#xrpc-api"
+  tracking: HAP-388 (PR 6)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "listRepoOps answered 400"
+    evidence:
+      body: "\"Failed to deserialize query string: missing field `did`\""
+
+# --- apply-writes-shape ----------------------------------------------------
+- assertion: records.apply-writes-atomic
+  cause: apply-writes-shape
+  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
+  spec: "#xrpc-api"
+  tracking: HAP-414
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "applyWrites answered 422"
+    evidence:
+      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
+- assertion: digest.multi-batch
+  cause: apply-writes-shape
+  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
+  spec: "#xrpc-api"
+  tracking: HAP-414
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "applyWrites \\(20 writes\\) answered 422"
+    evidence:
+      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
+- assertion: oplog.pagination-batch-boundary
+  cause: apply-writes-shape
+  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
+  spec: "#xrpc-api"
+  tracking: HAP-414
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "applyWrites \\(3 writes\\) answered 422"
+    evidence:
+      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
+- assertion: records.crud-roundtrip
+  cause: apply-writes-shape
+  reason: "createRecord ignores the caller's `rkey` and assigns a TID."
+  spec: "#xrpc-api"
+  tracking: HAP-414
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "createRecord's uri at://did:plc:[a-z2-7]{24}/space/com\\.example\\.conformance\\.space/[0-9a-f]+/did:plc:[a-z2-7]{24}/com\\.example\\.conformance\\.note/[a-z2-7]{13} doesn't end in the chosen rkey"
+    evidence:
+      status: "201"
+
+# --- memberspace-under-simplespace -----------------------------------------
+- assertion: policy.member-methods
+  cause: memberspace-under-simplespace
+  reason: "The memberspace methods aren't routed in this release. Members are served only under com.atproto.simplespace.*, so com.atproto.memberspace.putMember falls through to the proxy and fails."
+  spec: "#memberspace"
+  tracking: HAP-388 (PR 5b)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "memberspace\\.putMember answered 502"
+- assertion: policy.put-member-upsert
+  cause: memberspace-under-simplespace
+  reason: "The memberspace methods aren't routed in this release. Members are served only under com.atproto.simplespace.*, so com.atproto.memberspace.putMember falls through to the proxy and fails."
+  spec: "#memberspace"
+  tracking: HAP-388 (PR 5b)
+  since: "2026-11-13"
+  revisions: ["2026-10-29"]
+  expect:
+    message: "memberspace\\.putMember \\(write: false\\) answered 502"

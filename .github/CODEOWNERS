@@ -1,0 +1,3 @@
+# The spaces conformance deviation list can silence a failing assertion, so
+# every change to it needs the maintainer's review.
+/interop/conformance-deviations.yaml @trezy
