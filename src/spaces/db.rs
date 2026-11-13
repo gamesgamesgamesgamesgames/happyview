@@ -545,6 +545,24 @@ pub async fn lock_space_for_members(
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<bool, sqlx::Error> {
+    Ok(lock_space(executor, backend, space_id)
+        .await?
+        .is_some_and(|space| {
+            !matches!(
+                crate::spaces::policy::SpacePolicy::of(&space),
+                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+            )
+        }))
+}
+
+/// Take a space's row for the rest of the caller's transaction, as
+/// [`lock_space_for_members`] does, and return the space as it stands under
+/// the lock.
+pub async fn lock_space(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Option<Space>, sqlx::Error> {
     let lock = match backend {
         DatabaseBackend::Postgres => " FOR UPDATE",
         DatabaseBackend::Sqlite => "",
@@ -559,14 +577,7 @@ pub async fn lock_space_for_members(
         .bind(space_id)
         .fetch_optional(executor)
         .await?;
-    Ok(row
-        .and_then(|r| parse_space_row(r).ok())
-        .is_some_and(|space| {
-            !matches!(
-                crate::spaces::policy::SpacePolicy::of(&space),
-                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
-            )
-        }))
+    Ok(row.and_then(|r| parse_space_row(r).ok()))
 }
 
 /// Delete every invite to a space, as migrating it to a policy that keeps no
@@ -857,6 +868,74 @@ pub async fn remove_writer(
     .execute(executor)
     .await
     .map(|r| r.rows_affected() > 0)
+}
+
+/// A space's direct members' access, by DID, in the caller's transaction.
+/// Rows naming another space (`is_delegation`) are left out. With `only`,
+/// just those DIDs.
+pub async fn direct_member_access(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    only: Option<&[String]>,
+) -> Result<Vec<(String, MemberAccess)>, AppError> {
+    let filter = match only {
+        Some([]) => return Ok(Vec::new()),
+        Some(dids) => format!(" AND member_did IN ({})", vec!["?"; dids.len()].join(", ")),
+        None => String::new(),
+    };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0{filter} ORDER BY member_did ASC"
+        ),
+        backend,
+    );
+    let mut query = crate::db::query_as::<MemberRow>(&sql).bind(space_id);
+    for did in only.unwrap_or_default() {
+        query = query.bind(did);
+    }
+    let rows = query
+        .fetch_all(executor)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
+    rows.into_iter()
+        .map(|r| parse_member_row(r).map(|m| (m.did, m.access)))
+        .collect()
+}
+
+/// One repo's records in one collection of a space, in the caller's
+/// transaction. With `rkeys`, just those records.
+pub async fn repo_collection_records(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+    collection: &str,
+    rkeys: Option<&[String]>,
+) -> Result<Vec<SpaceRecord>, AppError> {
+    let filter = match rkeys {
+        Some([]) => return Ok(Vec::new()),
+        Some(keys) => format!(" AND rkey IN ({})", vec!["?"; keys.len()].join(", ")),
+        None => String::new(),
+    };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND author_did = ? AND collection = ?{filter} ORDER BY rkey ASC"
+        ),
+        backend,
+    );
+    let mut query = crate::db::query_as::<RecordRow>(&sql)
+        .bind(space_id)
+        .bind(author_did)
+        .bind(collection);
+    for rkey in rkeys.unwrap_or_default() {
+        query = query.bind(rkey);
+    }
+    let rows = query
+        .fetch_all(executor)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))?;
+    rows.into_iter().map(parse_record_row).collect()
 }
 
 pub async fn list_spaces_for_member(

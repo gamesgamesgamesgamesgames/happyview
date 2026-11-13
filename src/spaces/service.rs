@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
+use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog, publish};
 use crate::tid::generate_tid;
 use sha2::{Digest, Sha256};
 
@@ -587,6 +587,7 @@ pub(crate) async fn create_record(
     collection: &str,
     record: serde_json::Value,
 ) -> Result<(String, String), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
 
@@ -681,6 +682,7 @@ pub(crate) async fn put_record(
     record: serde_json::Value,
     swap_cid: Option<String>,
 ) -> Result<(String, String), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
 
@@ -792,6 +794,7 @@ pub(crate) async fn delete_record(
     rkey: &str,
     swap_cid: Option<String>,
 ) -> Result<(), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, None).await?;
 
@@ -950,6 +953,8 @@ pub(crate) async fn create_space(
         created_at: now_rfc3339(),
     };
     db::add_member(&state.db, state.db_backend, &member).await?;
+    // A policy that asks for publishing has its records from the start.
+    publish::sync(state, &space.id, publish::Scope::All).await?;
     Ok(space)
 }
 
@@ -1037,6 +1042,7 @@ pub(crate) async fn put_member(
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
     }
+    publish_member(state, &space.id, member_did).await?;
     Ok(member)
 }
 
@@ -1060,7 +1066,7 @@ pub(crate) async fn add_member(
     }
     let member = SpaceMember {
         id: uuid::Uuid::new_v4().to_string(),
-        space_id: space.id,
+        space_id: space.id.clone(),
         did: member_did.to_string(),
         access: access.unwrap_or(MemberAccess::READ),
         is_delegation: is_delegation.unwrap_or(false),
@@ -1068,6 +1074,7 @@ pub(crate) async fn add_member(
         created_at: now_rfc3339(),
     };
     insert_member(state, &member).await?;
+    publish_member(state, &space.id, member_did).await?;
     Ok(member)
 }
 
@@ -1126,6 +1133,8 @@ pub(crate) async fn store_space(
     space: &Space,
     discard_members: bool,
 ) -> Result<(), AppError> {
+    let scope = publish::Scope::All;
+    let signing_key = publish_key(state, space, scope).await?;
     let mut tx = crate::db::begin_write(&state.db, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
@@ -1135,9 +1144,64 @@ pub(crate) async fn store_space(
         // An outstanding invite would add a member once accepted.
         db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
     }
+    // The published policy and member list follow the stored ones in the
+    // same commit.
+    let published = match &signing_key {
+        Some(key) => publish::sync_in(&mut tx, state.db_backend, space, scope, key).await?,
+        None => None,
+    };
     tx.commit()
         .await
-        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))
+        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))?;
+    after_publish(state, space, scope, signing_key.is_some(), published).await
+}
+
+/// The signing key a write needs to bring `space`'s published records into
+/// step, or `None` when it cannot touch them. Fetched before the write's
+/// transaction opens; see [`service_signing_key`].
+async fn publish_key(
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+) -> Result<Option<p256::ecdsa::SigningKey>, AppError> {
+    if publish::may_touch(state, space, scope).await? {
+        Ok(Some(service_signing_key(state).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// [`publish::sync_in`] inside a member transaction, when the write fetched a
+/// key for it.
+async fn publish_in(
+    conn: &mut sqlx::AnyConnection,
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+    signing_key: Option<&p256::ecdsa::SigningKey>,
+) -> Result<Option<publish::Published>, AppError> {
+    match signing_key {
+        Some(key) => publish::sync_in(conn, state.db_backend, space, scope, key).await,
+        None => Ok(None),
+    }
+}
+
+/// Announce what a write published. A write that fetched no key, because
+/// the space published nothing when it began, catches up afterwards in case
+/// a policy change raced it.
+async fn after_publish(
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+    had_key: bool,
+    published: Option<publish::Published>,
+) -> Result<(), AppError> {
+    if let Some(published) = published {
+        published.announce(state, space).await;
+    } else if !had_key {
+        publish::sync(state, &space.id, scope).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn delete_space(
@@ -1220,10 +1284,19 @@ pub(crate) async fn put_members(
         .filter_map(|did| latest.remove(&did))
         .collect();
 
+    let dids: Vec<String> = entries.iter().map(|e| e.did.clone()).collect();
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, space, scope).await?;
     let stored = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        if !db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await? {
-            return Ok(false);
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Ok(None));
+        };
+        if matches!(
+            crate::spaces::policy::SpacePolicy::of(&locked),
+            Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+        ) {
+            return Ok(Ok(None));
         }
         for entry in &entries {
             let member = SpaceMember {
@@ -1244,14 +1317,21 @@ pub(crate) async fn put_members(
                 db::remove_writer(&mut *tx, state.db_backend, &space.id, &entry.did).await?;
             }
         }
+        // A failure here drops the transaction, and the members with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
         tx.commit().await?;
-        Ok(true)
+        Ok(Ok(Some((locked, published))))
     })
     .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))?;
-    if !stored {
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))??;
+    let Some((locked, published)) = stored else {
         return Err(policy_mismatch());
-    }
+    };
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     for entry in entries.iter().filter(|e| !e.read) {
         revoke_member_credentials(state, space, &entry.did).await?;
     }
@@ -1271,8 +1351,13 @@ pub(crate) async fn remove_members(
 ) -> Result<Vec<String>, AppError> {
     require_memberspace(space)?;
     require_dids(dids.iter().map(String::as_str))?;
-    let removed = crate::db::retry_on_busy(|| async {
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, space, scope).await?;
+    let (locked, removed, published) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let locked = db::lock_space(&mut *tx, state.db_backend, &space.id)
+            .await?
+            .unwrap_or_else(|| space.clone());
         let mut removed = Vec::new();
         for did in &dids {
             if removed.contains(did) {
@@ -1283,11 +1368,18 @@ pub(crate) async fn remove_members(
                 removed.push(did.clone());
             }
         }
+        // A failure here drops the transaction, and the removals with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
         tx.commit().await?;
-        Ok(removed)
+        Ok(Ok((locked, removed, published)))
     })
     .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))?;
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     for did in &removed {
         revoke_member_credentials(state, space, did).await?;
     }
@@ -1307,7 +1399,14 @@ pub(crate) async fn remove_member(
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
-    Ok(())
+    publish_member(state, &space.id, member_did).await
+}
+
+/// Bring one member's published record into step after a single-member
+/// method changed their entry.
+async fn publish_member(state: &AppState, space_id: &str, did: &str) -> Result<(), AppError> {
+    let dids = [did.to_string()];
+    publish::sync(state, space_id, publish::Scope::Members(&dids)).await
 }
 
 /// An invite's `expiresAt` as given at creation, as the UTC timestamp it is
@@ -1437,6 +1536,7 @@ pub(crate) async fn accept_invite(
         }
         db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
+    publish_member(state, &invite.space_id, did).await?;
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))
