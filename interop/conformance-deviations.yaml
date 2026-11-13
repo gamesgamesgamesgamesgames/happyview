@@ -212,7 +212,7 @@
   cause: space-deleted-error
   reason: "After deleteSpace, getSpaceCredential answers SpaceNotFound rather than the SpaceDeleted error 0016 asks for."
   spec: "#space-deletion"
-  tracking: HAP-388
+  tracking: HAP-388 (PR 7)
   since: "2026-11-13"
   revisions: ["2026-10-29"]
   expect:
