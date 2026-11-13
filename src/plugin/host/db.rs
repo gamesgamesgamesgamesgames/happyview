@@ -869,6 +869,38 @@ mod tests {
         assert!(ready, "the plugin roles should be usable after setup");
     }
 
+    /// Role setup gives the migration lock back. A lock left held on one of
+    /// the pool's connections would stall every later migration, so another
+    /// session must be able to take it straight after.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_role_setup_releases_the_migration_lock() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
+            return;
+        };
+        let backend = DatabaseBackend::from_url(&url);
+        if backend != DatabaseBackend::Postgres {
+            return;
+        }
+        // Kept open for the whole test, so a leaked lock stays held on one of
+        // its connections rather than going when the pool closes.
+        let db = crate::db::connect(&url, backend).await;
+        assert!(ensure_plugin_roles(&db, backend).await);
+
+        let other = crate::db::open(&url, backend).await;
+        let mut conn = other.acquire().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::db::lock_migrations(&mut conn),
+        )
+        .await
+        .expect("the migration lock is still held after role setup")
+        .unwrap();
+        crate::db::unlock_migrations(&mut conn).await.unwrap();
+        drop(db);
+    }
+
     /// Reads of internal tables that plugin SQL may not reach.
     const INTERNAL_READS: &[&str] = &[
         "SELECT * FROM happyview_users",
