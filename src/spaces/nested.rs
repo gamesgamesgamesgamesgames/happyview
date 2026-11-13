@@ -192,13 +192,17 @@ pub(crate) async fn put_nested(
 ) -> Result<(), AppError> {
     require_memberspace(space)?;
     let target = local_target(state, nested).await?;
+    let previous = db::list_nested(&state.db, state.db_backend, &space.id)
+        .await?
+        .into_iter()
+        .find(|r| r.target_space_uri == target);
     let cascade = Cascade::before(state, space, true).await?;
     db::upsert_nested(
         &state.db,
         state.db_backend,
         &space.id,
         &db::NestedRef {
-            target_space_uri: target,
+            target_space_uri: target.clone(),
             read,
             write,
             added_by: Some(actor.to_string()),
@@ -206,6 +210,19 @@ pub(crate) async fn put_nested(
         },
     )
     .await?;
+    // A reference that would take this space, or one that reaches it, past
+    // what resolution reads is refused, and the previous state put back.
+    if let Err(e) = cascade.check(state).await {
+        match previous {
+            Some(previous) => {
+                db::upsert_nested(&state.db, state.db_backend, &space.id, &previous).await?
+            }
+            None => {
+                db::delete_nested(&state.db, state.db_backend, &space.id, &target).await?;
+            }
+        }
+        return Err(e);
+    }
     cascade.after(state).await
 }
 
@@ -250,10 +267,28 @@ impl Cascade {
         }
         let mut before = Vec::with_capacity(ids.len());
         for id in ids {
-            let resolution = members::resolve_on(&mut conn, state.db_backend, &id).await?;
-            before.push((id, resolution));
+            // A space already past the bound answers every access check with
+            // an error, so there is nothing to compare it against.
+            match members::resolve_on(&mut conn, state.db_backend, &id).await {
+                Ok(resolution) => before.push((id, resolution)),
+                Err(e) if is_too_large(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(Self { before })
+    }
+
+    /// Whether every snapshotted space still resolves within the bound.
+    pub(crate) async fn check(&self, state: &AppState) -> Result<(), AppError> {
+        let mut conn = state
+            .db
+            .acquire()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+        for (id, _) in &self.before {
+            members::resolve_on(&mut conn, state.db_backend, id).await?;
+        }
+        Ok(())
     }
 
     /// After the change: revoke the credentials of accounts that lost read
@@ -268,7 +303,20 @@ impl Cascade {
                 let mut conn = state.db.acquire().await.map_err(|e| {
                     AppError::Internal(format!("failed to acquire connection: {e}"))
                 })?;
-                members::resolve_on(&mut conn, state.db_backend, &id).await?
+                members::resolve_on(&mut conn, state.db_backend, &id).await
+            };
+            // The change took this space past the bound. Its access checks
+            // now fail closed; the change itself stands.
+            let after = match after {
+                Ok(after) => after,
+                Err(e) if is_too_large(&e) => {
+                    tracing::warn!(
+                        space_id = %id,
+                        "a membership change took a nesting space past the resolution bound"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             let mut changed: Vec<String> = Vec::new();
             for (did, was) in &before {
@@ -291,4 +339,14 @@ impl Cascade {
         }
         Ok(())
     }
+}
+
+fn is_too_large(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::XrpcError {
+            code: "MemberListTooLarge",
+            ..
+        }
+    )
 }
