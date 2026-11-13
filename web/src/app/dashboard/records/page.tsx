@@ -691,8 +691,7 @@ export default function RecordsPage() {
             <AlertDialogHeader>
               <AlertDialogTitle>Delete record?</AlertDialogTitle>
               <AlertDialogDescription>
-                This will permanently delete the record. This action cannot be
-                undone.
+                This action cannot be undone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             {deleteUri && (

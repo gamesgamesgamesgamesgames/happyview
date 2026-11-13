@@ -231,9 +231,6 @@ export default function AboutPage() {
         <Card>
           <CardHeader>
             <CardTitle>HappyView</CardTitle>
-            <CardDescription>
-              ATProto AppView instance information
-            </CardDescription>
           </CardHeader>
           <CardContent>
             {config ? (

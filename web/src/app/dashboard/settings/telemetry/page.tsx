@@ -184,10 +184,7 @@ export default function TelemetryPage() {
               <CardHeader>
                 <CardTitle>Contact (optional)</CardTitle>
                 <CardDescription>
-                  If you&apos;d like us to be able to reach you about what we
-                  see in your reports, leave a way to reach you below. This is
-                  separate from whether you send anything at all — you can
-                  report without ever filling this in.
+                  Leave a way to reach you about what we see in your reports.
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-2">
@@ -205,8 +202,7 @@ export default function TelemetryPage() {
                   }}
                 />
                 <p className="text-muted-foreground text-sm">
-                  Optional, up to {MAX_CONTACT_LEN} characters. Only included in
-                  a report if you provide it.
+                  Up to {MAX_CONTACT_LEN} characters.
                 </p>
               </CardContent>
             </Card>

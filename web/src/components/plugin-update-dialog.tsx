@@ -260,9 +260,7 @@ export function PluginUpdateDialog({
               </div>
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">
-              No release notes available.
-            </p>
+            <p className="text-sm text-muted-foreground">No release notes.</p>
           )}
 
           {newManifestPreview ? (

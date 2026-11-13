@@ -192,9 +192,6 @@ export default function DatabaseSettingsPage() {
         <Card>
           <CardHeader>
             <CardTitle>Storage</CardTitle>
-            <CardDescription>
-              Database size and available disk space.
-            </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-2 text-sm">
             <div className="flex justify-between">
@@ -275,12 +272,8 @@ export default function DatabaseSettingsPage() {
             </CardHeader>
             <CardContent className="flex flex-col gap-3 text-sm">
               <div className="text-muted-foreground">
-                <span className="text-foreground font-medium">
-                  This only needs doing once.
-                </span>{" "}
                 Run it if disk usage keeps climbing even as you delete records,
-                or if this database has never had a cleanup. Afterwards space is
-                released automatically and there is no reason to run it again.
+                or if this database has never had a cleanup.
               </div>
               <div className="text-muted-foreground">
                 The cleanup runs during startup, before this instance accepts

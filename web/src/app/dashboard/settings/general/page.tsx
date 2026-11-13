@@ -415,8 +415,8 @@ export default function GeneralSettingsPage() {
         <div>
           <h2 className="text-lg font-semibold">Instance Identity</h2>
           <p className="text-muted-foreground text-sm">
-            Configure your HappyView instance. These values are used in the
-            dashboard sidebar and on the OAuth consent screen.
+            These values are used in the dashboard sidebar and on the OAuth
+            consent screen.
           </p>
         </div>
 
@@ -442,7 +442,7 @@ export default function GeneralSettingsPage() {
         <div className="flex flex-col gap-2">
           <Label>Logo Upload</Label>
           <p className="text-muted-foreground text-xs">
-            Upload a logo (max 5MB). Overrides the Logo URI above when set.
+            Max 5MB. Overrides the Logo URI above when set.
           </p>
           <div className="flex items-center gap-2">
             <input
@@ -483,10 +483,6 @@ export default function GeneralSettingsPage() {
 
         <div>
           <h2 className="text-lg font-semibold">Data Retention</h2>
-          <p className="text-muted-foreground text-sm">
-            Configure how long HappyView retains detailed data from completed
-            backfill jobs.
-          </p>
         </div>
 
         <div className="flex flex-col gap-2">
@@ -629,9 +625,6 @@ export default function GeneralSettingsPage() {
 
         <div>
           <h2 className="text-lg font-semibold">Space Inspector</h2>
-          <p className="text-muted-foreground text-sm">
-            Let moderators read private space contents during an investigation.
-          </p>
         </div>
 
         <div className="flex items-center justify-between gap-4">
@@ -701,9 +694,6 @@ export default function GeneralSettingsPage() {
 
         <div>
           <h2 className="text-lg font-semibold">Event Logs</h2>
-          <p className="text-muted-foreground text-sm">
-            Configure event log verbosity and retention.
-          </p>
         </div>
 
         <div className="flex flex-col gap-2">

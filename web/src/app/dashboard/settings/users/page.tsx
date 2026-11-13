@@ -777,8 +777,8 @@ function TransferOwnershipDialog({
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Transfer Ownership</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Are you sure you want to transfer ownership to{" "}
-            <span className="font-mono text-sm">{user.did}</span>? You will lose
+            Ownership passes to{" "}
+            <span className="font-mono text-sm">{user.did}</span>. You will lose
             your owner privileges and cannot undo this action without their
             cooperation.
           </ResponsiveDialogDescription>

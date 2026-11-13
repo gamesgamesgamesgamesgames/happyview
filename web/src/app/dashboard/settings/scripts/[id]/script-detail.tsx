@@ -315,10 +315,7 @@ export default function ScriptDetail() {
                     <AlertDialogTitle>Delete script?</AlertDialogTitle>
                     <AlertDialogDescription asChild>
                       <div className="flex flex-col gap-3">
-                        <p>
-                          This will permanently remove the script. This action
-                          cannot be undone.
-                        </p>
+                        <p>This action cannot be undone.</p>
                         {script?.recreatable === false && (
                           <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
                             <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />

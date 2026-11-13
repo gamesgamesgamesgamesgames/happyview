@@ -54,9 +54,9 @@ export default function ExperimentsPage() {
               Experimental features
             </p>
             <p className="mt-1 text-muted-foreground">
-              These features are under active development. They may be
-              incomplete, change without notice, or be removed entirely.
-              Disabling a feature hides its routes and UI — no data is deleted.
+              These features may be incomplete, change without notice, or be
+              removed entirely. Disabling a feature hides its routes and UI — no
+              data is deleted.
             </p>
           </div>
         </div>

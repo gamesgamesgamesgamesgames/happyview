@@ -1762,11 +1762,6 @@ function JobDetail({
         </div>
       </div>
       <SheetFooter className="border-t flex-row items-center justify-end gap-2">
-        {restartsUnlessPaused && (pauseShown || (canCancel && resumable)) && (
-          <p className="mr-auto text-xs text-muted-foreground">
-            Paused backfills stay paused. Resume picks up where it left off.
-          </p>
-        )}
         {/* An executor's job keeps no per-repo detail to clear. */}
         {canFlush && flushable && !byExecutor && (
           <AlertDialog>
