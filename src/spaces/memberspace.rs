@@ -212,25 +212,28 @@ async fn list_members(
         return Err(service::policy_mismatch());
     }
 
-    let page = crate::spaces::db::list_member_page(
-        &state.db,
-        state.db_backend,
-        &space.id,
-        query.cursor.as_deref(),
-        limit,
-    )
-    .await?;
-    let cursor = (page.len() as i64 == limit)
-        .then(|| page.last().map(|m| m.did.clone()))
-        .flatten();
-    let members: Vec<MemberEntry> = page
+    // The effective list: nested spaces' members included, with the access
+    // they actually have.
+    let effective =
+        crate::spaces::members::resolve_members(&state.db, state.db_backend, &space.id).await?;
+    let members: Vec<MemberEntry> = effective
         .into_iter()
+        .filter(|m| {
+            query
+                .cursor
+                .as_deref()
+                .is_none_or(|after| m.did.as_str() > after)
+        })
+        .take(limit as usize)
         .map(|m| MemberEntry {
             did: m.did,
             read: m.access.read,
             write: m.access.write,
         })
         .collect();
+    let cursor = (members.len() as i64 == limit)
+        .then(|| members.last().map(|m| m.did.clone()))
+        .flatten();
     let mut body = serde_json::json!({ "members": members });
     if let Some(cursor) = cursor {
         body["cursor"] = cursor.into();

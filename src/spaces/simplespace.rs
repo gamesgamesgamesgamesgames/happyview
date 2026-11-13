@@ -525,6 +525,10 @@ async fn put_member(
         read_self: false,
     };
     let space = canonical_ref(&state, &input.space).await?;
+    // A space named as a member is a nested space (HAP-388 H5).
+    if input.is_delegation == Some(true) || input.did.starts_with("at://") {
+        return put_nested_member(&state, claims.did(), &space, &input.did, access).await;
+    }
     let member = service::put_member(
         &state,
         claims.did(),
@@ -566,6 +570,16 @@ async fn add_member(
         });
     }
     let space = canonical_ref(&state, &input.space).await?;
+    if input.is_delegation == Some(true) || input.did.starts_with("at://") {
+        return put_nested_member(
+            &state,
+            claims.did(),
+            &space,
+            &input.did,
+            access.unwrap_or(MemberAccess::READ),
+        )
+        .await;
+    }
     let member = service::add_member(
         &state,
         claims.did(),
@@ -587,6 +601,43 @@ async fn remove_member(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let space = canonical_ref(&state, &input.space).await?;
+    if input.did.starts_with("at://") {
+        let resolved = resolve_space(&state, &space).await?;
+        service::require_space_admin(&state, &resolved, claims.did()).await?;
+        // A space nested the new way, or else one named the simplespace way
+        // before nesting existed, whose row the member methods remove.
+        if crate::spaces::nested::remove_nested(&state, &resolved, &input.did)
+            .await
+            .is_ok()
+        {
+            return Ok(Json(serde_json::json!({ "success": true })));
+        }
+    }
     service::remove_member(&state, claims.did(), &space, &input.did).await?;
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// `putMember` or `addMember` naming a space: nest it, granting `access`.
+async fn put_nested_member(
+    state: &AppState,
+    actor: &str,
+    space_ref: &str,
+    nested: &str,
+    access: MemberAccess,
+) -> Result<Response, AppError> {
+    let space = resolve_space(state, space_ref).await?;
+    service::require_space_admin(state, &space, actor).await?;
+    crate::spaces::nested::put_nested(state, actor, &space, nested, access.read, access.write)
+        .await?;
+    let mut response = Json(serde_json::json!({
+        "member": {
+            "did": nested,
+            "read": access.read,
+            "write": access.write,
+            "isDelegation": true,
+        }
+    }))
+    .into_response();
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
 }

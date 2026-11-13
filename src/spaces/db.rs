@@ -801,38 +801,6 @@ pub async fn list_direct_members(
     rows.into_iter().map(parse_member_row).collect()
 }
 
-/// A page of a space's direct members, by DID, after `after`. Rows naming
-/// another space (`is_delegation`) are not members by DID and are left out.
-pub async fn list_member_page(
-    pool: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    space_id: &str,
-    after: Option<&str>,
-    limit: i64,
-) -> Result<Vec<SpaceMember>, AppError> {
-    let after_clause = if after.is_some() {
-        " AND member_did > ?"
-    } else {
-        ""
-    };
-    let sql = adapt_sql(
-        &format!(
-            "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0{after_clause} ORDER BY member_did ASC LIMIT ?"
-        ),
-        backend,
-    );
-    let mut query = crate::db::query_as::<MemberRow>(&sql).bind(space_id);
-    if let Some(after) = after {
-        query = query.bind(after);
-    }
-    let rows: Vec<MemberRow> = query
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
-    rows.into_iter().map(parse_member_row).collect()
-}
-
 /// Remove a member by DID in the caller's transaction, returning whether one
 /// was there. Rows naming another space are not touched.
 pub async fn remove_direct_member(
@@ -870,39 +838,6 @@ pub async fn remove_writer(
     .map(|r| r.rows_affected() > 0)
 }
 
-/// A space's direct members' access, by DID, in the caller's transaction.
-/// Rows naming another space (`is_delegation`) are left out. With `only`,
-/// just those DIDs.
-pub async fn direct_member_access(
-    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
-    backend: DatabaseBackend,
-    space_id: &str,
-    only: Option<&[String]>,
-) -> Result<Vec<(String, MemberAccess)>, AppError> {
-    let filter = match only {
-        Some([]) => return Ok(Vec::new()),
-        Some(dids) => format!(" AND member_did IN ({})", vec!["?"; dids.len()].join(", ")),
-        None => String::new(),
-    };
-    let sql = adapt_sql(
-        &format!(
-            "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0{filter} ORDER BY member_did ASC"
-        ),
-        backend,
-    );
-    let mut query = crate::db::query_as::<MemberRow>(&sql).bind(space_id);
-    for did in only.unwrap_or_default() {
-        query = query.bind(did);
-    }
-    let rows = query
-        .fetch_all(executor)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
-    rows.into_iter()
-        .map(|r| parse_member_row(r).map(|m| (m.did, m.access)))
-        .collect()
-}
-
 /// One repo's records in one collection of a space, in the caller's
 /// transaction. With `rkeys`, just those records.
 pub async fn repo_collection_records(
@@ -936,6 +871,92 @@ pub async fn repo_collection_records(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))?;
     rows.into_iter().map(parse_record_row).collect()
+}
+
+/// A space nested in another: its members are members of the nesting space,
+/// with at most `read` and `write`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedRef {
+    #[serde(rename = "space")]
+    pub target_space_uri: String,
+    pub read: bool,
+    pub write: bool,
+    pub added_by: Option<String>,
+    pub created_at: String,
+}
+
+/// Nest `target_space_uri` in a space, or replace the access an existing
+/// reference grants.
+pub async fn upsert_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    reference: &NestedRef,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_nested (id, space_id, target_space_uri, can_read, can_write, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, target_space_uri) DO UPDATE SET can_read = excluded.can_read, can_write = excluded.can_write, added_by = excluded.added_by",
+        backend,
+    ))
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(space_id)
+    .bind(&reference.target_space_uri)
+    .bind(i32::from(reference.read))
+    .bind(i32::from(reference.write))
+    .bind(&reference.added_by)
+    .bind(&reference.created_at)
+    .execute(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to nest space: {e}")))?;
+    Ok(())
+}
+
+/// Remove a nested space, returning whether it was there.
+pub async fn delete_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    target_space_uri: &str,
+) -> Result<bool, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE space_id = ? AND target_space_uri = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(target_space_uri)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected() > 0)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested space: {e}")))
+}
+
+/// The spaces nested in a space, by address.
+pub async fn list_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<NestedRef>, AppError> {
+    let rows: Vec<(String, i32, i32, Option<String>, String)> = crate::db::query_as(&adapt_sql(
+        "SELECT target_space_uri, can_read, can_write, added_by, created_at FROM happyview_space_nested WHERE space_id = ? ORDER BY target_space_uri ASC",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list nested spaces: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(target_space_uri, read, write, added_by, created_at)| NestedRef {
+                target_space_uri,
+                read: read != 0,
+                write: write != 0,
+                added_by,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 pub async fn list_spaces_for_member(

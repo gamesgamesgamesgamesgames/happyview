@@ -966,7 +966,7 @@ pub(crate) async fn create_space(
 /// replacing read/write access has not asked to lift an own-records-only
 /// restriction.
 /// Revoke a member's credentials, and tell the hosts that verify them.
-async fn revoke_member_credentials(
+pub(crate) async fn revoke_member_credentials(
     state: &AppState,
     space: &Space,
     member_did: &str,
@@ -1037,12 +1037,14 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
+    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     insert_member(state, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
     }
     publish_member(state, &space.id, member_did).await?;
+    cascade.after(state).await?;
     Ok(member)
 }
 
@@ -1073,8 +1075,10 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
+    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     insert_member(state, &member).await?;
     publish_member(state, &space.id, member_did).await?;
+    cascade.after(state).await?;
     Ok(member)
 }
 
@@ -1135,6 +1139,13 @@ pub(crate) async fn store_space(
 ) -> Result<(), AppError> {
     let scope = publish::Scope::All;
     let signing_key = publish_key(state, space, scope).await?;
+    // Discarding the member list takes those members from every space that
+    // nests this one.
+    let cascade = if discard_members {
+        Some(crate::spaces::nested::Cascade::before(state, space, false).await?)
+    } else {
+        None
+    };
     let mut tx = crate::db::begin_write(&state.db, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
@@ -1153,7 +1164,11 @@ pub(crate) async fn store_space(
     tx.commit()
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))?;
-    after_publish(state, space, scope, signing_key.is_some(), published).await
+    after_publish(state, space, scope, signing_key.is_some(), published).await?;
+    if let Some(cascade) = cascade {
+        cascade.after(state).await?;
+    }
+    Ok(())
 }
 
 /// The signing key a write needs to bring `space`'s published records into
@@ -1213,7 +1228,9 @@ pub(crate) async fn delete_space(
     require_space_admin(state, &space, actor_did).await?;
     let registrations =
         db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
+    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     db::delete_space(&state.db, state.db_backend, &space.id).await?;
+    cascade.after(state).await?;
     notifications::announce_space_deleted(state, &space, registrations);
     Ok(())
 }
@@ -1287,6 +1304,7 @@ pub(crate) async fn put_members(
     let dids: Vec<String> = entries.iter().map(|e| e.did.clone()).collect();
     let scope = publish::Scope::Members(&dids);
     let signing_key = publish_key(state, space, scope).await?;
+    let cascade = crate::spaces::nested::Cascade::before(state, space, false).await?;
     let stored = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
@@ -1335,6 +1353,7 @@ pub(crate) async fn put_members(
     for entry in entries.iter().filter(|e| !e.read) {
         revoke_member_credentials(state, space, &entry.did).await?;
     }
+    cascade.after(state).await?;
     Ok(())
 }
 
@@ -1351,8 +1370,34 @@ pub(crate) async fn remove_members(
 ) -> Result<Vec<String>, AppError> {
     require_memberspace(space)?;
     require_dids(dids.iter().map(String::as_str))?;
+    // A DID that is a member only through a nested space can't be removed
+    // here: the whole batch fails, naming where it comes from.
+    let effective = {
+        let mut conn = state
+            .db
+            .acquire()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+        members::resolve_on(&mut conn, state.db_backend, &space.id).await?
+    };
+    for did in &dids {
+        if let Some(entry) = effective.get(did)
+            && !entry.direct
+        {
+            return Err(AppError::XrpcError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "InvalidRequest",
+                message: format!(
+                    "{did} is a member through the nested space {}; remove it there, or \
+                     remove the nested space",
+                    entry.via.as_deref().unwrap_or("it nests")
+                ),
+            });
+        }
+    }
     let scope = publish::Scope::Members(&dids);
     let signing_key = publish_key(state, space, scope).await?;
+    let cascade = crate::spaces::nested::Cascade::before(state, space, false).await?;
     let (locked, removed, published) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         let locked = db::lock_space(&mut *tx, state.db_backend, &space.id)
@@ -1383,6 +1428,7 @@ pub(crate) async fn remove_members(
     for did in &removed {
         revoke_member_credentials(state, space, did).await?;
     }
+    cascade.after(state).await?;
     Ok(removed)
 }
 
@@ -1395,11 +1441,13 @@ pub(crate) async fn remove_member(
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
     revoke_member_credentials(state, &space, member_did).await?;
+    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     let removed = db::remove_member(&state.db, state.db_backend, &space.id, member_did).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
-    publish_member(state, &space.id, member_did).await
+    publish_member(state, &space.id, member_did).await?;
+    cascade.after(state).await
 }
 
 /// Bring one member's published record into step after a single-member
@@ -1522,6 +1570,10 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
+    let cascade = match db::get_space(&state.db, state.db_backend, &invite.space_id).await? {
+        Some(space) => Some(crate::spaces::nested::Cascade::before(state, &space, false).await?),
+        None => None,
+    };
     match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
         db::InviteClaim::Joined => {}
         db::InviteClaim::Unavailable => {
@@ -1537,6 +1589,9 @@ pub(crate) async fn accept_invite(
         db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
     publish_member(state, &invite.space_id, did).await?;
+    if let Some(cascade) = cascade {
+        cascade.after(state).await?;
+    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))

@@ -421,6 +421,10 @@ pub fn space_routes() -> Router<AppState> {
     for (nsid, handler) in protocol_method_table() {
         router = router.route(&format!("/xrpc/{nsid}"), handler);
     }
+    // Nested spaces: a HappyView extension, served but not advertised.
+    for (nsid, handler) in crate::spaces::nested::nested_method_table() {
+        router = router.route(&format!("/xrpc/{nsid}"), handler);
+    }
 
     router
         // Invites (HappyView extension, no com.atproto equivalent). Not in the

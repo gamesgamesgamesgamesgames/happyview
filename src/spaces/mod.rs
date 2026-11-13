@@ -16,6 +16,7 @@ pub mod members;
 pub mod memberspace;
 pub mod native_client;
 pub mod native_sync;
+pub mod nested;
 pub mod notifications;
 pub mod oplog;
 pub mod pds_support;
