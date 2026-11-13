@@ -8,10 +8,17 @@
 //! that key over the `Authorization` field and the `Atproto-Space-Audience`
 //! field naming the DID the request is for.
 //!
-//! Proposal 0016 fixes the signature's label and `tag` as
-//! `atproto-space-credential`, its covered components as exactly
-//! `("authorization" "atproto-space-audience")`, and its algorithm as
-//! `ecdsa-p256-sha256`, accepting high-S signatures.
+//! Proposal 0016 fixes the signature's `tag` as `atproto-space-credential`,
+//! its covered components as exactly `("authorization"
+//! "atproto-space-audience")`, and its algorithm as `ecdsa-p256-sha256`,
+//! accepting high-S signatures.
+//!
+//! Which signature is the credential's differs between revisions. The Oct 29
+//! text names it by its label, `atproto-space-credential`. The Nov 12 text
+//! (proposals #143) finds it by `tag`, whatever its label, because
+//! intermediaries may relabel signatures, and its reference signs under `sig`.
+//! [`verify`] accepts both: exactly one signature carrying the tag, or, when
+//! none does, the one under the Oct 29 label.
 
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
@@ -57,14 +64,7 @@ pub fn verify(headers: &HeaderMap, bound_key: &str) -> Result<(), SignatureError
     let authorization = exactly_one(headers, "authorization")?;
     let audience = exactly_one(headers, AUDIENCE_HEADER)?;
 
-    let input = labelled(headers, "signature-input")?;
-    let signature = labelled(headers, "signature")?;
-    let sfv::ListEntry::InnerList(input) = input else {
-        return Err(malformed());
-    };
-    let sfv::ListEntry::Item(signature) = signature else {
-        return Err(malformed());
-    };
+    let (input, signature) = select(headers)?;
     let signature = match signature.bare_item.as_byte_sequence() {
         Some(bytes) if signature.params.is_empty() => bytes.to_vec(),
         _ => return Err(malformed()),
@@ -81,12 +81,10 @@ pub fn verify(headers: &HeaderMap, bound_key: &str) -> Result<(), SignatureError
         )));
     }
 
-    if input
-        .params
-        .get("tag")
-        .and_then(|t| t.as_string())
-        .map(|s| s.as_str())
-        != Some(SIGNATURE_TAG)
+    // Selected by its label alone, an Oct 29 signature may omit the tag, but
+    // may not carry another one.
+    if let Some(tag) = input.params.get("tag")
+        && tag.as_string().map(|s| s.as_str()) != Some(SIGNATURE_TAG)
     {
         return Err(SignatureError(format!(
             "signature tag must be \"{SIGNATURE_TAG}\""
@@ -146,9 +144,9 @@ fn exactly_one<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Signat
     }
 }
 
-/// This protocol's member of a signature dictionary field, which may carry
-/// other labels, and may arrive split across several field lines.
-fn labelled(headers: &HeaderMap, name: &str) -> Result<sfv::ListEntry, SignatureError> {
+/// A signature dictionary field, which may carry other labels, and may
+/// arrive split across several field lines.
+fn dictionary(headers: &HeaderMap, name: &str) -> Result<sfv::Dictionary, SignatureError> {
     let joined = headers
         .get_all(name)
         .iter()
@@ -160,11 +158,51 @@ fn labelled(headers: &HeaderMap, name: &str) -> Result<sfv::ListEntry, Signature
             "missing or malformed signature headers".into(),
         ));
     }
-    let mut dictionary: sfv::Dictionary =
-        sfv::Parser::new(&joined).parse().map_err(|_| malformed())?;
-    dictionary
-        .shift_remove(SIGNATURE_LABEL)
-        .ok_or_else(malformed)
+    sfv::Parser::new(&joined).parse().map_err(|_| malformed())
+}
+
+/// The credential's signature among those present: the only one tagged
+/// [`SIGNATURE_TAG`], under any label (Nov 12), or, when none is tagged, the
+/// one labelled [`SIGNATURE_LABEL`] (Oct 29). Two tagged signatures are
+/// refused rather than guessed between.
+fn select(headers: &HeaderMap) -> Result<(sfv::InnerList, sfv::Item), SignatureError> {
+    let mut inputs = dictionary(headers, "signature-input")?;
+    let mut signatures = dictionary(headers, "signature")?;
+    let tagged: Vec<String> = inputs
+        .iter()
+        .filter_map(|(label, entry)| match entry {
+            sfv::ListEntry::InnerList(list)
+                if list
+                    .params
+                    .get("tag")
+                    .and_then(|t| t.as_string())
+                    .map(|s| s.as_str())
+                    == Some(SIGNATURE_TAG) =>
+            {
+                Some(label.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let label = match tagged.as_slice() {
+        [label] => label.clone(),
+        [] => SIGNATURE_LABEL.to_string(),
+        _ => {
+            return Err(SignatureError(format!(
+                "request carries more than one signature tagged \"{SIGNATURE_TAG}\""
+            )));
+        }
+    };
+    let input = inputs.shift_remove(label.as_str()).ok_or_else(malformed)?;
+    let signature = signatures
+        .shift_remove(label.as_str())
+        .ok_or_else(malformed)?;
+    match (input, signature) {
+        (sfv::ListEntry::InnerList(input), sfv::ListEntry::Item(signature)) => {
+            Ok((input, signature))
+        }
+        _ => Err(malformed()),
+    }
 }
 
 fn signature_base(authorization: &str, audience: &str, params: &str) -> String {
@@ -186,7 +224,7 @@ fn parse_did_key(did: &str) -> Result<VerifyingKey, SignatureError> {
 }
 
 fn malformed() -> SignatureError {
-    SignatureError(format!("missing or malformed {SIGNATURE_LABEL} signature"))
+    SignatureError("missing or malformed space credential signature".into())
 }
 
 fn not_p256() -> SignatureError {
@@ -383,11 +421,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_missing_or_wrong_tag() {
+    fn rejects_a_wrong_tag() {
         let key = key();
         let did = did_key(key.verifying_key());
         for input in [
-            r#"("authorization" "atproto-space-audience")"#,
             r#"("authorization" "atproto-space-audience");tag="atproto-space""#,
             r#"("authorization" "atproto-space-audience");tag=1"#,
         ] {
@@ -397,20 +434,72 @@ mod tests {
         verify(&signed_with_input(&key, TAGGED), &did).unwrap();
     }
 
+    /// Selected by the Oct 29 label, a signature may omit the tag.
     #[test]
-    fn rejects_the_earlier_label() {
+    fn accepts_an_untagged_signature_under_the_october_29_label() {
         let key = key();
         let did = did_key(key.verifying_key());
-        let mut headers = credential_headers(&key);
+        verify(
+            &signed_with_input(&key, r#"("authorization" "atproto-space-audience")"#),
+            &did,
+        )
+        .unwrap();
+    }
+
+    /// Relabel a signature's two members, as an intermediary may.
+    fn relabelled(mut headers: HeaderMap, label: &str) -> HeaderMap {
         for name in ["signature-input", "signature"] {
             let value = headers[name].to_str().unwrap().replacen(
                 "atproto-space-credential=",
-                "atproto-space=",
+                &format!("{label}="),
                 1,
             );
             set(&mut headers, name, &value);
         }
+        headers
+    }
+
+    /// Since Nov 12 the signature is found by its tag, whatever its label;
+    /// the reference signs under `sig`.
+    #[test]
+    fn finds_a_tagged_signature_under_any_label() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        for label in ["sig", "atproto-space", "sig1"] {
+            verify(&relabelled(credential_headers(&key), label), &did)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
+    }
+
+    /// Without the tag, only the Oct 29 label selects a signature.
+    #[test]
+    fn rejects_an_untagged_signature_under_another_label() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        let headers = relabelled(
+            signed_with_input(&key, r#"("authorization" "atproto-space-audience")"#),
+            "sig",
+        );
         assert!(verify(&headers, &did).is_err());
+    }
+
+    /// Two signatures carrying the tag are refused rather than chosen between.
+    #[test]
+    fn rejects_two_tagged_signatures() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        let headers = credential_headers(&key);
+        let mut doubled = HeaderMap::new();
+        for name in ["authorization", AUDIENCE_HEADER] {
+            doubled.insert(name, headers[name].clone());
+        }
+        for name in ["signature-input", "signature"] {
+            let value = headers[name].to_str().unwrap();
+            let copy = value.replacen("atproto-space-credential=", "sig=", 1);
+            set(&mut doubled, name, &format!("{value}, {copy}"));
+        }
+        let err = verify(&doubled, &did).unwrap_err();
+        assert!(err.0.contains("more than one"), "{err}");
     }
 
     #[test]

@@ -536,6 +536,83 @@ async fn a_member_space_refuses_a_request_without_a_delegation_token() {
     assert_eq!(json_of(resp).await["error"], json!("SpaceNotFound"));
 }
 
+/// The key to bind is named `credentialKey` since the Nov 12 revision and
+/// `credentialKid` before it; both are accepted. A request naming neither is
+/// the simplespace exchange, which is refused by name.
+#[tokio::test]
+#[serial]
+async fn the_key_to_bind_is_named_either_way() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "named", Policy::Public).await;
+    let key = happyview::spaces::http_signature::did_key(syncer_key().verifying_key());
+    let ask = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    for field in ["credentialKey", "credentialKid"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(ask(json!({ "space": space, field: key })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{field}");
+        assert!(json_of(resp).await["credential"].is_string(), "{field}");
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(
+            json!({ "space": space, "credentialKey": "did:key:nope" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_of(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("credentialKey"),
+        "the error names the field the request used"
+    );
+
+    // Naming two different keys is refused rather than resolved.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(json!({
+            "space": space,
+            "credentialKey": key,
+            "credentialKid": happyview::spaces::http_signature::did_key(syncer_key().verifying_key()),
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_of(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("different keys")
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(ask(json!({ "space": space })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_of(resp).await;
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(body["message"].as_str().unwrap().contains("simplespace"));
+}
+
 /// An account the space does not admit gets the same answer whichever app it
 /// comes through: the app is only weighed for an account the space admits.
 #[tokio::test]

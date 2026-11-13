@@ -221,7 +221,7 @@ async fn the_owner_replaces_the_policy() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], json!("NotSpaceOwner"));
+    assert_eq!(body["error"], json!("NotAuthorized"));
 
     let (status, body) = post(
         &app,
@@ -365,7 +365,7 @@ async fn the_owner_deletes_a_space() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], json!("NotSpaceOwner"));
+    assert_eq!(body["error"], json!("NotAuthorized"));
 
     let (status, _) = post(
         &app,
@@ -379,11 +379,13 @@ async fn the_owner_deletes_a_space() {
     assert_eq!(body["error"], json!("SpaceNotFound"));
 }
 
-/// The `simplespace` lifecycle methods are gone. A removed method answers as a
-/// method that never existed does.
+/// The `simplespace` lifecycle methods are served beside `space.*Space`, as
+/// are their `dev.happyview.space.*` aliases: HappyView answers every
+/// revision of Proposal 0016. Their behaviour is covered by
+/// `spaces_simplespace_lifecycle.rs`.
 #[tokio::test]
 #[serial]
-async fn the_simplespace_lifecycle_methods_are_gone() {
+async fn the_simplespace_lifecycle_methods_are_served() {
     common::require_db!();
     let (app, creator) = setup().await;
     let (never, _) = post(
@@ -400,7 +402,7 @@ async fn the_simplespace_lifecycle_methods_are_gone() {
         "dev.happyview.space.createSpace",
     ] {
         let (status, _) = post(&app, method, &creator, json!({})).await;
-        assert_eq!(status, never, "{method}");
+        assert_ne!(status, never, "{method}");
     }
 }
 

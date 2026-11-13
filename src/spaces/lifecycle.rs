@@ -54,18 +54,26 @@ struct SpaceInput {
     space: String,
 }
 
-fn require_identity(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
+pub(crate) fn require_identity(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
     claims
         .identity
         .as_ref()
         .ok_or_else(|| AppError::Auth("This endpoint requires authentication".into()))
 }
 
-fn space_uri(space: &Space) -> String {
+pub(crate) fn space_uri(space: &Space) -> String {
     format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     )
+}
+
+/// A space's reference under both names it has had: `uri` (Oct 29) and
+/// `space` (Nov 12). The lexicons' objects are open, so each generation's
+/// client reads its own and ignores the other.
+pub(crate) fn space_ref_body(space: &Space) -> serde_json::Value {
+    let uri = space_uri(space);
+    serde_json::json!({ "uri": uri, "space": uri })
 }
 
 async fn resolve(state: &AppState, space: &str) -> Result<Space, AppError> {
@@ -82,7 +90,7 @@ async fn resolve(state: &AppState, space: &str) -> Result<Space, AppError> {
 }
 
 /// The caller owns `space`, and their session may `op` it.
-async fn require_owner(
+pub(crate) async fn require_owner(
     state: &AppState,
     claims: &crate::auth::Claims,
     space: &Space,
@@ -91,9 +99,12 @@ async fn require_owner(
     service::require_space_admin(state, space, claims.did())
         .await
         .map_err(|e| match e {
+            // `NotSpaceOwner` until Oct 29, `NotAuthorized` since. Nothing in
+            // these requests tells the two apart, so the newer name is used
+            // (HAP-388 H4).
             AppError::Forbidden(message) => AppError::XrpcError {
                 status: StatusCode::FORBIDDEN,
-                code: "NotSpaceOwner",
+                code: "NotAuthorized",
                 message,
             },
             e => e,
@@ -153,7 +164,7 @@ async fn create_space(
         },
         e => e,
     })?;
-    Ok(Json(serde_json::json!({ "uri": space_uri(&space) })))
+    Ok(Json(space_ref_body(&space)))
 }
 
 /// Replace a space's policy wholesale. A policy of another `$type` migrates
@@ -188,14 +199,27 @@ async fn get_space(
     Query(query): Query<SpaceInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = resolve(&state, &query.space).await?;
+    authorize_reader(&state, &claims, &space).await?;
+    let policy = SpacePolicy::of(&space)?;
+    let mut body = space_ref_body(&space);
+    body["policy"] = serde_json::to_value(policy)
+        .map_err(|e| AppError::Internal(format!("failed to encode policy: {e}")))?;
+    Ok(Json(body))
+}
+
+/// Whether the caller may describe `space`: its owner, or a syncer holding a
+/// credential for it. Anyone else is told it does not exist.
+pub(crate) async fn authorize_reader(
+    state: &AppState,
+    claims: &XrpcClaims,
+    space: &Space,
+) -> Result<(), AppError> {
     let owner = match &claims.identity {
-        Some(identity) => {
-            match service::require_space_admin(&state, &space, identity.did()).await {
-                Ok(()) => true,
-                Err(AppError::Forbidden(_)) => false,
-                Err(e) => return Err(e),
-            }
-        }
+        Some(identity) => match service::require_space_admin(state, space, identity.did()).await {
+            Ok(()) => true,
+            Err(AppError::Forbidden(_)) => false,
+            Err(e) => return Err(e),
+        },
         None => false,
     };
     if !owner {
@@ -208,10 +232,10 @@ async fn get_space(
                         message: format!("request is not addressed to {}", space.authority_did),
                     });
                 }
-                service::verify_space_credential(&state, &space, token).await?;
+                service::verify_space_credential(state, space, token).await?;
             }
             None => {
-                require_identity(&claims)?;
+                require_identity(claims)?;
                 // Not disclosed to someone who may not read it.
                 return Err(AppError::XrpcError {
                     status: StatusCode::BAD_REQUEST,
@@ -221,11 +245,7 @@ async fn get_space(
             }
         }
     }
-    let policy = SpacePolicy::of(&space)?;
-    Ok(Json(serde_json::json!({
-        "uri": space_uri(&space),
-        "policy": policy,
-    })))
+    Ok(())
 }
 
 async fn delete_space(
@@ -280,7 +300,10 @@ mod tests {
             }),
         )
         .await
-        .map(|Json(body)| body["uri"].as_str().unwrap().to_string())
+        .map(|Json(body)| {
+            assert_eq!(body["uri"], body["space"], "both names carry the reference");
+            body["space"].as_str().unwrap().to_string()
+        })
     }
 
     /// A space's DID does not exist until it is created, so creating one
