@@ -301,10 +301,31 @@ pub async fn ensure_plugin_roles(
     // pre-provisioned role (operator-created) may already exist and already be
     // granted, so a failure here is not fatal — the SET ROLE probe below is the
     // real test of whether plugin SQL can use the roles.
-    for stmt in plugin_role_setup_statements() {
-        if let Err(e) = crate::db::query(&stmt).execute(pool).await {
-            tracing::debug!(error = %e, statement = %stmt, "plugin role setup statement did not apply");
-        }
+    //
+    // Under the migration lock: the grants change catalog rows of objects
+    // migrations replace (the records view, for one), and Postgres refuses two
+    // sessions changing one row at once. Without it, another instance's
+    // migration replacing a view while this one granted on it would fail.
+    match pool.acquire().await {
+        Ok(mut conn) => match crate::db::lock_migrations(&mut conn).await {
+            Ok(()) => {
+                for stmt in plugin_role_setup_statements() {
+                    if let Err(e) = crate::db::query(&stmt).execute(&mut *conn).await {
+                        tracing::debug!(error = %e, statement = %stmt, "plugin role setup statement did not apply");
+                    }
+                }
+                if let Err(e) = crate::db::unlock_migrations(&mut conn).await {
+                    // A session lock held on a pooled connection would stall
+                    // every later migration, so this one is closed, not reused.
+                    conn.close_on_drop();
+                    tracing::warn!(error = %e, "could not release the migration lock after plugin role setup");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not take the migration lock for plugin role setup");
+            }
+        },
+        Err(e) => tracing::warn!(error = %e, "no connection for plugin role setup"),
     }
 
     // Probe: can we actually assume each role? This is what a plugin statement
@@ -810,6 +831,42 @@ mod tests {
             "the test database role should be able to set up the plugin roles"
         );
         Some(db)
+    }
+
+    /// Role setup waits for the migration lock, so its grants never change a
+    /// view while a migration is replacing it (Postgres would refuse one of
+    /// the two with "tuple concurrently updated").
+    #[tokio::test]
+    #[serial]
+    async fn plugin_role_setup_waits_for_the_migration_lock() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            crate::test_support::unavailable(crate::test_support::NO_DATABASE);
+            return;
+        };
+        let backend = DatabaseBackend::from_url(&url);
+        if backend != DatabaseBackend::Postgres {
+            return;
+        }
+        let db = crate::db::connect(&url, backend).await;
+        let mut migrating = db.acquire().await.unwrap();
+        crate::db::lock_migrations(&mut migrating).await.unwrap();
+
+        let setup = tokio::spawn({
+            let db = db.clone();
+            async move { ensure_plugin_roles(&db, backend).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !setup.is_finished(),
+            "role setup ran while another session held the migration lock"
+        );
+
+        crate::db::unlock_migrations(&mut migrating).await.unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), setup)
+            .await
+            .expect("role setup should finish once the lock is released")
+            .unwrap();
+        assert!(ready, "the plugin roles should be usable after setup");
     }
 
     /// Reads of internal tables that plugin SQL may not reach.
