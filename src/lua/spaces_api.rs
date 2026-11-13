@@ -731,6 +731,12 @@ mod tests {
             )),
             official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
             ),
+            update_status: crate::update_check::UpdateStatus::initial(
+                crate::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 crate::proxy_config::ProxyConfig::default(),
             ))),
@@ -738,6 +744,7 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
+            plugin_sql: crate::PluginSqlAccess::Guard,
         }
     }
 
@@ -942,6 +949,12 @@ mod tests {
             )),
             official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
             ),
+            update_status: crate::update_check::UpdateStatus::initial(
+                crate::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 crate::proxy_config::ProxyConfig::default(),
             ))),
@@ -949,6 +962,7 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
+            plugin_sql: crate::PluginSqlAccess::Guard,
         };
 
         crate::test_support::provision_space_signing_key(&state).await;

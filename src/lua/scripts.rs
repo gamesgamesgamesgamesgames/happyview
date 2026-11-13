@@ -1017,6 +1017,12 @@ mod tests {
             )),
             official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
             ),
+            update_status: crate::update_check::UpdateStatus::initial(
+                crate::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
                 crate::proxy_config::ProxyConfig::default(),
             ))),
@@ -1024,6 +1030,7 @@ mod tests {
             verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+            plugin_sql: crate::PluginSqlAccess::Guard,
         }
     }
 

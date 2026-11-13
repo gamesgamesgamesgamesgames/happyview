@@ -214,6 +214,12 @@ impl TestApp {
                 happyview::plugin::official_registry::OfficialRegistryState::default(),
             )),
             official_registry_config: registry_config,
+            update_status: happyview::update_check::UpdateStatus::initial(
+                happyview::version::version(),
+                false,
+                false,
+            )
+            .into_shared(),
             proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 happyview::proxy_config::ProxyConfig::default(),
             ))),
@@ -222,6 +228,7 @@ impl TestApp {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
+            plugin_sql: happyview::PluginSqlAccess::Guard,
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {

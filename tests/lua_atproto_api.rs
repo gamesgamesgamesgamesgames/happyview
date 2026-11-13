@@ -128,6 +128,12 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         )),
         official_registry_config: happyview::plugin::official_registry::RegistryConfig::production(
         ),
+        update_status: happyview::update_check::UpdateStatus::initial(
+            happyview::version::version(),
+            false,
+            false,
+        )
+        .into_shared(),
         domain_cache: happyview::domain::DomainCache::new(),
         proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
             happyview::proxy_config::ProxyConfig::default(),
@@ -137,6 +143,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client_jwks: Vec::new(),
         telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
+        plugin_sql: happyview::PluginSqlAccess::Guard,
     }
 }
 

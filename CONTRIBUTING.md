@@ -4,23 +4,26 @@ Thanks for helping out! This guide covers what a pull request needs to get merge
 
 The docs aren't in this repo. v3 docs live in [happyproto/happyview-docs](https://github.com/happyproto/happyview-docs), and v2 docs in [happyproto/happyview-docs-legacy](https://github.com/happyproto/happyview-docs-legacy). A change to documented behaviour needs a companion PR there; link it from the Docs checkbox in the pull request's description.
 
-## Open pull requests against `beta`
+## This branch ships v2 fixes only
 
-Work lands on `beta` first, and `main` is updated from `beta` when a release is cut. `alpha` carries the next major line, so target it only when a change belongs to that line rather than to the current one.
-
-GitHub defaults new PRs to `main`, so change the **base** dropdown to `beta` when you open one. To start from the right place:
+`release/v2` publishes v2.17.x releases and takes fixes only. New work, and v3, goes to `beta`; see its CONTRIBUTING.md. A fix that v2 needs lands on `beta` first and is then cherry-picked here:
 
 ```bash
 git remote add upstream https://github.com/gamesgamesgamesgamesgames/happyview.git
 git fetch upstream
-git switch -c fix/my-change upstream/beta
+git switch -c fix/my-change-v2 upstream/release/v2
+git cherry-pick -x <the commit on beta>
 ```
 
-If your branch was started from `main`, rebase it onto `beta`:
+GitHub defaults new PRs to `beta`, so change the **base** dropdown to `release/v2` when you open one. The `v2-guard` check refuses:
 
-```bash
-git rebase --onto upstream/beta upstream/main fix/my-change
-```
+- a pull request whose head is `main`, `beta` or `alpha`;
+- a branch that carries v3 history;
+- a `feat` or breaking commit or title;
+- a change to a migration that shipped in 2.17.0;
+- a new migration that isn't listed in `migrations/v2-backports.txt` and on `beta` byte for byte.
+
+A fix that only v2 needs, because v3 removed the code it touches, says so in its description.
 
 ## Sign off your commits
 
@@ -39,7 +42,7 @@ Git has no setting to sign off automatically, but an alias saves typing: `git co
 Either sign off the existing commits and force-push:
 
 ```bash
-git rebase --signoff upstream/beta
+git rebase --signoff upstream/release/v2
 git push --force-with-lease
 ```
 

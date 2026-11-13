@@ -1,3 +1,5 @@
 # Migrations backported to release/v2 after v2.17.0, one path per line, for
 # example migrations/postgres/20261201000000_example.sql. Each must already be
 # on beta byte for byte; scripts/check-release-v2.sh refuses anything else.
+migrations/postgres/20261110000001_reset_unconfirmed_space_scopes.sql
+migrations/sqlite/20261110000001_reset_unconfirmed_space_scopes.sql
