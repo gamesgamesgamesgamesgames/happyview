@@ -182,8 +182,10 @@
     message: "applyWrites \\(3 writes\\) answered 422"
     evidence:
       body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
+
+# --- create-record-rkey ----------------------------------------------------
 - assertion: records.crud-roundtrip
-  cause: apply-writes-shape
+  cause: create-record-rkey
   reason: "createRecord ignores the caller's `rkey` and assigns a TID."
   spec: "#xrpc-api"
   tracking: HAP-414
