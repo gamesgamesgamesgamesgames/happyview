@@ -1557,10 +1557,42 @@ async fn notify_write_accepts_the_reference_pds_on_a_space_of_its_own() {
 #[tokio::test]
 #[serial]
 async fn a_managed_space_issues_only_on_the_answer_of_the_app_it_still_names() {
+    common::require_db!();
+    let (status, body) = mint_while_the_space_changes(|row| {
+        row.read_policy = Policy::ManagingApp {
+            managing_app: "did:plc:otherapp#forum".into(),
+        };
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+}
+
+/// The app access rules are checked again when the credential is stored, so
+/// rules that change while the managing app is asked apply to it.
+#[tokio::test]
+#[serial]
+async fn a_managed_space_applies_the_app_rules_it_has_when_it_issues() {
+    common::require_db!();
+    let (status, body) = mint_while_the_space_changes(|row| {
+        row.app_access = AppAccess::AllowList {
+            allowed: vec!["https://allowed.example/client-metadata.json".into()],
+        };
+    })
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("AppNotAuthorized"));
+}
+
+/// Ask a managed space for a credential with no user, and change the space
+/// with `change` while its managing app (which allows the read) is answering.
+/// Returns the answer, having checked no credential was stored.
+async fn mint_while_the_space_changes(
+    change: impl FnOnce(&mut Space),
+) -> (StatusCode, serde_json::Value) {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    common::require_db!();
     let app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     enable_spaces(&app).await;
@@ -1648,16 +1680,12 @@ async fn a_managed_space_issues_only_on_the_answer_of_the_app_it_still_names() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    row.read_policy = Policy::ManagingApp {
-        managing_app: "did:plc:otherapp#forum".into(),
-    };
+    change(&mut row);
     spaces_db::update_space(&app.state.db, app.state.db_backend, &row)
         .await
         .unwrap();
 
     let (status, body) = mint.await.unwrap();
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], json!("SpaceNotFound"));
     let issued: i64 = happyview::db::query_scalar(&happyview::db::adapt_sql(
         "SELECT count(*) FROM happyview_space_credentials WHERE space_id = ?",
         app.state.db_backend,
@@ -1667,4 +1695,5 @@ async fn a_managed_space_issues_only_on_the_answer_of_the_app_it_still_names() {
     .await
     .unwrap();
     assert_eq!(issued, 0);
+    (status, body)
 }
