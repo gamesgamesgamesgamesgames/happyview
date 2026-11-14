@@ -252,9 +252,9 @@
 # --- unregister-notify-auth ------------------------------------------------
 - assertion: writers.register-expiry
   cause: unregister-notify-auth
-  reason: "unregisterNotify accepts only the space creator's own session. Called with the space credential its lexicon names, it answers 403."
+  reason: "Called with a space credential, unregisterNotify is refused unless the caller is the space's admin: the credential isn't taken as the registered service."
   spec: "#write-notifications"
-  tracking: HAP-388
+  tracking: HAP-388 (PR 6)
   since: "2026-11-13"
   revisions: ["2026-10-29"]
   expect:
@@ -265,8 +265,9 @@
   cause: deletion-notice-retry
   reason: "After the registered syncer answers 503 to notifySpaceDeleted, the notice is not delivered again."
   spec: "#space-deletion"
-  tracking: HAP-388
+  tracking: HAP-388 (PR 7)
   since: "2026-11-13"
   revisions: ["2026-10-29"]
   expect:
-    message: "after the syncer answered 503, the deletion notice was not delivered again within (120|900) s"
+    # A run without --slow waits 120 s and pends; a --slow run waits 900 s.
+    message: "after the syncer answered 503, the deletion notice was not delivered again within 900 s"
