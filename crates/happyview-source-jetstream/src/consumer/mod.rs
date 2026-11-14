@@ -820,6 +820,7 @@ async fn run_session(
                     "stalls": session.stall_streak,
                     "cursor": resume,
                     "stall_timeout_secs": timeout.as_secs(),
+                    "stall_timeout_ms": timeout.as_millis() as u64,
                     "host": host,
                 }),
             })
@@ -1017,6 +1018,7 @@ async fn run_session(
                     subject: None,
                     detail: serde_json::json!({
                         "idle_secs": timeout.as_secs(),
+                        "idle_ms": timeout.as_millis() as u64,
                         "host": host,
                         "protocol": protocol.as_str(),
                         "delivered": delivered,

@@ -376,6 +376,53 @@ async fn a_silent_connection_is_reconnected_from_where_it_left_off() {
     drop(consumer);
 }
 
+/// A session that stalls again at the same cursor, delivering nothing,
+/// waits twice as long each time: a server scanning past events the filter
+/// drops sends nothing until it is through. The mock delivers three events,
+/// then stays silent on every connection.
+#[tokio::test]
+#[serial]
+async fn stalls_in_a_row_at_one_cursor_back_off_the_stall_timeout() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push((1..=3).map(|s| js::create(s, "did:plc:quiet", GAME, &format!("r{s}"), game("x"))));
+    let consumer = start(
+        &app,
+        Settings {
+            stall_timeout: Some(Duration::from_millis(400)),
+            ..settings(&mock)
+        },
+    );
+
+    wait_until!("seq 3 applied", applied_through(&app, 3).await);
+    wait_until!(
+        "four stalls",
+        events(&app, "jetstream.stalled").await.len() >= 4
+    );
+    // The first session delivered, so the second waits the base timeout too.
+    // The second delivered nothing at cursor 3: the third waits twice as
+    // long, the fourth four times.
+    let waits: Vec<Value> = events(&app, "jetstream.stalled")
+        .await
+        .iter()
+        .take(4)
+        .map(|e| e["idle_ms"].clone())
+        .collect();
+    assert_eq!(waits, [json!(400), json!(400), json!(800), json!(1600)]);
+    for connection in &mock.connections()[1..4] {
+        assert_eq!(connection.param("cursor").as_deref(), Some("3"));
+    }
+
+    let backoffs = events(&app, "jetstream.stall_backoff").await;
+    assert_eq!(backoffs[0]["stalls"], 1);
+    assert_eq!(backoffs[0]["stall_timeout_ms"], 800);
+    assert_eq!(backoffs[0]["cursor"], 3);
+    assert_eq!(backoffs[0]["host"], mock.host());
+    assert_eq!(backoffs[1]["stalls"], 2);
+    assert_eq!(backoffs[1]["stall_timeout_ms"], 1600);
+    drop(consumer);
+}
+
 /// With no stall timeout, a silent connection is left open.
 #[tokio::test]
 #[serial]
