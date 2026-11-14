@@ -22,6 +22,12 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// account and identity events whatever its collection filter, so a healthy
 /// connection carries frames every few seconds.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a stall timeout backs off to. A server replaying a filtered
+/// stream sends nothing while it scans past events the filter drops, which
+/// for a burst of millions from one repo takes longer than
+/// [`STALL_TIMEOUT`]; each stall in a row at the same cursor doubles the
+/// wait, up to this.
+pub const MAX_STALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) const V2_SUBSCRIBE_PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
 pub(crate) const V1_SUBSCRIBE_PATH: &str = "/subscribe";

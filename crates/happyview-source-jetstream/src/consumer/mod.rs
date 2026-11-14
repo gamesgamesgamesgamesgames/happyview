@@ -113,6 +113,12 @@ struct Session {
     /// Gaps logged by this `run()`, by reason and the cursor sent, so a
     /// retry that hits the same one does not log it again.
     logged_gaps: HashSet<(&'static str, Option<i64>)>,
+    /// Sessions in a row that stalled without delivering an event, all sent
+    /// `stall_cursor`. Each doubles the next session's stall timeout
+    /// (`stall_timeout`); an event delivered, or a different cursor, starts
+    /// the count again.
+    stall_streak: u32,
+    stall_cursor: Option<i64>,
 }
 
 /// The TLS a `wss://` endpoint is reached over: rustls with the Mozilla roots
@@ -178,8 +184,45 @@ impl Session {
             unexplained_400s: 0,
             save_barrier: None,
             logged_gaps: HashSet::new(),
+            stall_streak: 0,
+            stall_cursor: None,
         }
     }
+
+    /// The stall timeout for a session sending `sent_cursor`: `base`, backed
+    /// off by the stalls in a row at that same cursor. A silent socket is
+    /// either dead or a server scanning past events the filter drops; only
+    /// the second stalls again and again at one cursor, and only waiting
+    /// longer gets past it.
+    fn stall_timeout(&self, base: Option<Duration>) -> Option<Duration> {
+        let base = base?;
+        if self.stall_streak == 0 || self.sent_cursor != self.stall_cursor {
+            return Some(base);
+        }
+        Some(backed_off_stall_timeout(base, self.stall_streak))
+    }
+
+    /// Note how a session that sent `sent_cursor` ended.
+    fn record_session_end(&mut self, stalled: bool, delivered: bool) {
+        if delivered || !stalled {
+            self.stall_streak = 0;
+            self.stall_cursor = None;
+        } else if self.stall_streak > 0 && self.stall_cursor == self.sent_cursor {
+            self.stall_streak = self.stall_streak.saturating_add(1);
+        } else {
+            self.stall_streak = 1;
+            self.stall_cursor = self.sent_cursor;
+        }
+    }
+}
+
+/// `base` doubled `streak` times, capped at [`config::MAX_STALL_TIMEOUT`]
+/// (or `base`, if that is longer already).
+fn backed_off_stall_timeout(base: Duration, streak: u32) -> Duration {
+    let cap = config::MAX_STALL_TIMEOUT.max(base);
+    base.checked_mul(1u32.checked_shl(streak).unwrap_or(u32::MAX))
+        .unwrap_or(cap)
+        .min(cap)
 }
 
 enum SessionEnd {
@@ -754,7 +797,35 @@ async fn run_session(
     // ends the session here rather than waiting on the peer forever: TCP
     // alone may never notice a connection the far side has dropped. Pings
     // don't count, as a server can answer them while its stream is stuck.
-    let stall_timeout = settings.stall_timeout;
+    let stall_timeout = session.stall_timeout(settings.stall_timeout);
+    if let (Some(timeout), Some(base)) = (stall_timeout, settings.stall_timeout)
+        && timeout > base
+    {
+        tracing::warn!(
+            stalls = session.stall_streak,
+            cursor = ?resume,
+            stall_timeout_secs = timeout.as_secs(),
+            "jetstream stalled {} times in a row at this cursor; waiting up to {}s for a frame",
+            session.stall_streak,
+            timeout.as_secs()
+        );
+        state
+            .host
+            .log_event(ProviderEvent {
+                event_type: "jetstream.stall_backoff".to_string(),
+                severity: Severity::Warn,
+                actor_did: None,
+                subject: None,
+                detail: serde_json::json!({
+                    "stalls": session.stall_streak,
+                    "cursor": resume,
+                    "stall_timeout_secs": timeout.as_secs(),
+                    "stall_timeout_ms": timeout.as_millis() as u64,
+                    "host": host,
+                }),
+            })
+            .await;
+    }
     let mut stalled = std::pin::pin!(tokio::time::sleep(stall_timeout.unwrap_or_default()));
 
     let ended = loop {
@@ -921,6 +992,8 @@ async fn run_session(
     )
     .await;
 
+    session.record_session_end(matches!(ended, Ended::Stalled(_)), delivered);
+
     match ended {
         Ended::CollectionsChanged => {
             tracing::info!("collection filter changed, reconnecting to jetstream");
@@ -945,6 +1018,7 @@ async fn run_session(
                     subject: None,
                     detail: serde_json::json!({
                         "idle_secs": timeout.as_secs(),
+                        "idle_ms": timeout.as_millis() as u64,
                         "host": host,
                         "protocol": protocol.as_str(),
                         "delivered": delivered,
@@ -1080,6 +1154,88 @@ mod tests {
             "a 33 MiB message must be refused: {second:?}"
         );
         server.abort();
+    }
+
+    fn session_at(cursor: Option<i64>) -> Session {
+        let mut session = Session::new(&Settings::from_env("wss://jetstream.example"));
+        session.sent_cursor = cursor;
+        session
+    }
+
+    #[test]
+    fn the_stall_timeout_doubles_per_stall_and_stops_at_the_cap() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(
+            backed_off_stall_timeout(minute, 1),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            backed_off_stall_timeout(minute, 3),
+            Duration::from_secs(480)
+        );
+        assert_eq!(
+            backed_off_stall_timeout(minute, 4),
+            config::MAX_STALL_TIMEOUT
+        );
+        assert_eq!(
+            backed_off_stall_timeout(minute, 40),
+            config::MAX_STALL_TIMEOUT
+        );
+        assert_eq!(
+            backed_off_stall_timeout(minute, u32::MAX),
+            config::MAX_STALL_TIMEOUT
+        );
+        // A configured timeout past the cap is never shortened by it.
+        let hour = Duration::from_secs(3600);
+        assert_eq!(backed_off_stall_timeout(hour, 2), hour);
+    }
+
+    #[test]
+    fn stalls_in_a_row_at_one_cursor_back_off_the_stall_timeout() {
+        let base = Some(Duration::from_secs(60));
+        let mut session = session_at(Some(27_163_539_580));
+        assert_eq!(session.stall_timeout(base), base);
+
+        session.record_session_end(true, false);
+        assert_eq!(session.stall_timeout(base), Some(Duration::from_secs(120)));
+        session.record_session_end(true, false);
+        session.record_session_end(true, false);
+        assert_eq!(session.stall_timeout(base), Some(Duration::from_secs(480)));
+        for _ in 0..10 {
+            session.record_session_end(true, false);
+        }
+        assert_eq!(session.stall_timeout(base), Some(config::MAX_STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn a_delivered_event_or_a_new_cursor_resets_the_stall_backoff() {
+        let base = Some(Duration::from_secs(60));
+        let mut session = session_at(Some(42));
+        session.record_session_end(true, false);
+        session.record_session_end(true, false);
+
+        // Resuming somewhere else: the stalls were not about this cursor.
+        session.sent_cursor = Some(43);
+        assert_eq!(session.stall_timeout(base), base);
+        session.record_session_end(true, false);
+        assert_eq!(session.stall_streak, 1);
+        assert_eq!(session.stall_timeout(base), Some(Duration::from_secs(120)));
+
+        // A stall that still delivered events is a stream that moved.
+        session.record_session_end(true, true);
+        assert_eq!(session.stall_timeout(base), base);
+
+        // So is any other ending, such as a closed socket.
+        session.record_session_end(true, false);
+        session.record_session_end(false, false);
+        assert_eq!(session.stall_timeout(base), base);
+    }
+
+    #[test]
+    fn no_stall_timeout_stays_none_however_many_stalls() {
+        let mut session = session_at(Some(42));
+        session.record_session_end(true, false);
+        assert_eq!(session.stall_timeout(None), None);
     }
 
     #[test]
