@@ -197,19 +197,26 @@ pub(crate) async fn put_nested(
         .into_iter()
         .find(|r| r.target_space_uri == target);
     let cascade = Cascade::before(state, space, true).await?;
-    db::upsert_nested(
-        &state.db,
-        state.db_backend,
-        &space.id,
-        &db::NestedRef {
-            target_space_uri: target.clone(),
-            read,
-            write,
-            added_by: Some(actor.to_string()),
-            created_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    let reference = db::NestedRef {
+        target_space_uri: target.clone(),
+        read,
+        write,
+        added_by: Some(actor.to_string()),
+        created_at: now_rfc3339(),
+    };
+    // The reference changes under the space's row lock, as member changes
+    // do, so it is ordered with anything reading the effective list under it.
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        db::lock_space(&mut *tx, state.db_backend, &space.id).await?;
+        if let Err(e) = db::upsert_nested(&mut *tx, state.db_backend, &space.id, &reference).await {
+            return Ok(Err(e));
+        }
+        tx.commit().await?;
+        Ok(Ok(()))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to nest space: {e}")))??;
     // A reference that would take this space, or one that reaches it, past
     // what resolution reads is refused, and the previous state put back.
     if let Err(e) = cascade.check(state).await {
@@ -236,7 +243,22 @@ pub(crate) async fn remove_nested(
         .map_err(|_| invalid(format!("{nested:?} is not a space address")))?;
     let address = format!("at://{}/space/{}/{}", uri.did, uri.type_nsid, uri.skey);
     let cascade = Cascade::before(state, space, true).await?;
-    let removed = db::delete_nested(&state.db, state.db_backend, &space.id, &address).await?;
+    // Under the space's row lock, as in `put_nested`.
+    let removed = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        db::lock_space(&mut *tx, state.db_backend, &space.id).await?;
+        let removed = match db::delete_nested(&mut *tx, state.db_backend, &space.id, &address).await
+        {
+            Ok(removed) => removed,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok(removed))
+    })
+    .await
+    .map_err(|e: sqlx::Error| {
+        AppError::Internal(format!("failed to remove nested space: {e}"))
+    })??;
     // Run even when nothing was removed: a retry of a removal whose cascade
     // failed finishes it here.
     cascade.after(state).await?;

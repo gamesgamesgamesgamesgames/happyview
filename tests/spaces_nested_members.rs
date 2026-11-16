@@ -725,3 +725,90 @@ async fn a_retried_removal_revokes_what_the_first_attempt_left() {
         "revoked on the retry"
     );
 }
+
+/// A credential issued while a member's removal is committing in a space
+/// two levels down follows the removal: issue reads the effective list again
+/// under a share lock on every space it reads, so it waits for the removal
+/// and is refused, rather than stored after the cascade looked.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_a_removal_commits_two_levels_down_follows_it() {
+    common::require_db!();
+    let app = setup().await;
+    let backend = app.state.db_backend;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    let c = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &c,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    nest(&app, &owner, &b, &c, true, false).await;
+    let a_row = space_row(&app, &a).await;
+    let c_row = space_row(&app, &c).await;
+
+    // The member's removal from C, as `removeMembers` makes it, not yet
+    // committed.
+    let mut removal = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    happyview::spaces::db::lock_space(&mut *removal, backend, &c_row.id)
+        .await
+        .unwrap();
+    assert!(
+        happyview::spaces::db::remove_direct_member(&mut *removal, backend, &c_row.id, &member)
+            .await
+            .unwrap()
+    );
+
+    let state = app.state.clone();
+    let issued_to = member.clone();
+    let issue = tokio::spawn(async move {
+        let keyring = state.config.keyring().expect("a token encryption key");
+        happyview::spaces::auth::issue_credential(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            &keyring,
+            &state.config.public_url,
+            &state.config.plc_url,
+            &a_row,
+            &issued_to,
+            None,
+            &a_row.authority_did,
+            None,
+        )
+        .await
+        .map(|_| ())
+    });
+    if backend == happyview::db::DatabaseBackend::Postgres {
+        for _ in 0..100 {
+            let waiting: i64 = happyview::db::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&app.state.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    removal.commit().await.unwrap();
+
+    let result = issue.await.unwrap();
+    assert!(
+        matches!(result, Err(happyview::error::AppError::Forbidden(_))),
+        "{result:?}"
+    );
+    assert_eq!(outstanding(&app, &a, &member).await, 0);
+}
