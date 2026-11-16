@@ -341,7 +341,7 @@ impl Cascade {
                         continue;
                     }
                     if !after.get(&did).is_some_and(|e| e.access.read) {
-                        service::revoke_member_credentials(state, &space, &did).await?;
+                        service::revoke_member_credentials_after(state, &space, &did).await?;
                     }
                 }
             }

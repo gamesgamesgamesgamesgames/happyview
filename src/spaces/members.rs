@@ -69,6 +69,45 @@ pub async fn resolve_on(
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Resolution, AppError> {
+    resolve(conn, backend, space_id, false).await
+}
+
+/// [`resolve_on`], in the caller's write transaction, holding every space it
+/// reads members or references from until that transaction ends.
+///
+/// Member changes lock their space's row first (`db::lock_space_for_members`),
+/// and so do nesting changes. On Postgres each space visited here is
+/// share-locked before it is read, so a change to any of them either commits
+/// before this read or waits for the caller's transaction. On SQLite the
+/// caller's `BEGIN IMMEDIATE` already orders it with every other writer.
+pub async fn resolve_locked(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Resolution, AppError> {
+    resolve(conn, backend, space_id, true).await
+}
+
+/// The effective access a DID has to a space, read as [`resolve_locked`]
+/// reads it.
+pub async fn is_member_locked(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<Option<MemberAccess>, AppError> {
+    Ok(resolve_locked(conn, backend, space_id)
+        .await?
+        .remove(did)
+        .map(|e| e.access))
+}
+
+async fn resolve(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    lock: bool,
+) -> Result<Resolution, AppError> {
     let mut resolved = Resolution::new();
     // A space is visited once per access cap it is reached with, so a
     // restrictive path seen first doesn't hide a more permissive one. There
@@ -88,6 +127,13 @@ pub async fn resolve_on(
             continue;
         }
         seen.push(cap);
+        if lock && backend == DatabaseBackend::Postgres {
+            crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR SHARE")
+                .bind(&id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql_error)?;
+        }
         let rows: Vec<Row> = crate::db::query_as(&adapt_sql(
             "SELECT member_did, can_read, can_write, read_self, is_delegation FROM happyview_space_members WHERE space_id = ?",
             backend,
