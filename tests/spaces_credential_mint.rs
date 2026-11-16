@@ -1610,6 +1610,280 @@ async fn the_simplespace_exchange_takes_an_attestation_for_the_bare_space_did() 
     }
 }
 
+/// A credential issued while a member's removal is committing follows the
+/// removal: the credential is stored in a transaction that waits on the space
+/// row the removal holds and checks the member list again before the insert,
+/// so it is refused rather than left standing after the removal's revocation.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_a_removal_commits_follows_the_removal() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let backend = app.state.db_backend;
+    let token = setup_and_get_delegation_token(&app).await;
+    let space = spaces_db::get_space_by_address(
+        &app.state.db,
+        backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // A removal, as `removeMembers` makes it: the space row first, then the
+    // member and its outstanding credentials (none yet), not yet committed.
+    let mut removal = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    spaces_db::lock_space_for_members(&mut *removal, backend, &space.id)
+        .await
+        .unwrap();
+    assert!(
+        spaces_db::remove_member(&mut *removal, backend, &space.id, MEMBER)
+            .await
+            .unwrap()
+    );
+    spaces_db::revoke_space_credentials_for_member(&mut *removal, backend, &space.id, MEMBER)
+        .await
+        .unwrap();
+
+    // The request is admitted by the member list as committed, and reaches
+    // the insert while the removal is still open.
+    let router = app.router.clone();
+    let key = syncer_key();
+    let mint = tokio::spawn(async move {
+        let resp = router
+            .oneshot(credential_req(&token, Some(&key)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_of(resp).await)
+    });
+    until_waiting_on_a_lock(&app).await;
+    removal.commit().await.unwrap();
+
+    let (status, body) = mint.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+    let outstanding =
+        spaces_db::outstanding_credential_jtis(&app.state.db, backend, &space.id, MEMBER)
+            .await
+            .unwrap();
+    assert!(outstanding.is_empty(), "{outstanding:?}");
+}
+
+/// A simplespace exchange asking for a credential bound to a DPoP key
+/// thumbprint is told this host binds credentials to a did:key.
+#[tokio::test]
+#[serial]
+async fn a_simplespace_exchange_naming_a_dpop_key_is_told_the_binding_offered() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    enable_spaces(&app).await;
+    let space = seed_space(&app, "dpop", Policy::Public).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "space": space, "dpopJkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I" })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_of(resp).await;
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did:key"),
+        "{body}"
+    );
+}
+
+/// Wait until a request on another connection is waiting on a lock, on
+/// Postgres; on SQLite, give it time to reach its `BEGIN IMMEDIATE`.
+async fn until_waiting_on_a_lock(app: &TestApp) {
+    if app.state.db_backend != happyview::db::DatabaseBackend::Postgres {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        return;
+    }
+    for _ in 0..100 {
+        let waiting: i64 = happyview::db::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+}
+
+/// A credential issued while the space's read policy is being changed
+/// follows the new policy: the space is read again under its row lock before
+/// the credential is stored.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_the_policy_changes_follows_the_new_policy() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let backend = app.state.db_backend;
+    enable_spaces(&app).await;
+    let uri = seed_space(&app, "policy-change", Policy::Public).await;
+    let mut space = spaces_db::get_space_by_address(
+        &app.state.db,
+        backend,
+        AUTHORITY,
+        "com.example.mint",
+        "policy-change",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // The space becomes a member list, not yet committed.
+    let mut change = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    space.read_policy = Policy::MemberList;
+    spaces_db::update_space(&mut *change, backend, &space)
+        .await
+        .unwrap();
+
+    let router = app.router.clone();
+    let mint = tokio::spawn(async move {
+        let resp = router.oneshot(bare_credential_req(&uri)).await.unwrap();
+        let status = resp.status();
+        (status, json_of(resp).await)
+    });
+    until_waiting_on_a_lock(&app).await;
+    change.commit().await.unwrap();
+
+    let (status, body) = mint.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+}
+
+/// A space that takes another's members the simplespace way
+/// (`is_delegation`) reads those members again under a lock on that space's
+/// row too, so a removal committing there is seen before the credential is
+/// stored.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_a_removal_commits_in_a_delegated_space_follows_it() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let backend = app.state.db_backend;
+    // "main" holds MEMBER directly; "outer" takes main's members.
+    let token_for_main = setup_and_get_delegation_token(&app).await;
+    drop(token_for_main);
+    let main = spaces_db::get_space_by_address(
+        &app.state.db,
+        backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outer_uri = seed_space(&app, "outer", Policy::MemberList).await;
+    let outer = spaces_db::get_space_by_address(
+        &app.state.db,
+        backend,
+        AUTHORITY,
+        "com.example.mint",
+        "outer",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    spaces_db::add_member(
+        &app.state.db,
+        backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: outer.id.clone(),
+            did: space_uri(),
+            access: MemberAccess::READ,
+            is_delegation: true,
+            granted_by: Some(AUTHORITY.to_string()),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // MEMBER's delegation token for "outer".
+    let (name, value) = cookie_for(&app, MEMBER);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencoding::encode(&outer_uri)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "getDelegationToken failed");
+    let token = json_of(resp).await["token"].as_str().unwrap().to_string();
+
+    // MEMBER's removal from "main", not yet committed.
+    let mut removal = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    spaces_db::lock_space_for_members(&mut *removal, backend, &main.id)
+        .await
+        .unwrap();
+    assert!(
+        spaces_db::remove_member(&mut *removal, backend, &main.id, MEMBER)
+            .await
+            .unwrap()
+    );
+
+    let router = app.router.clone();
+    let mint = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.getSpaceCredential")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "space": outer_uri,
+                    "delegationToken": token,
+                    "credentialKid": happyview::spaces::http_signature::did_key(
+                        syncer_key().verifying_key()
+                    ),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, json_of(resp).await)
+    });
+    until_waiting_on_a_lock(&app).await;
+    removal.commit().await.unwrap();
+
+    let (status, body) = mint.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+    let outstanding =
+        spaces_db::outstanding_credential_jtis(&app.state.db, backend, &outer.id, MEMBER)
+            .await
+            .unwrap();
+    assert!(outstanding.is_empty(), "{outstanding:?}");
+}
+
 /// `authorizeSpaceSync`, the merged Nov 12 name of the exchange, as a
 /// `credentialKey` request.
 fn authorize_req(
