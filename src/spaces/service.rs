@@ -953,13 +953,6 @@ pub(crate) async fn create_space(
     Ok(space)
 }
 
-/// Add a member, or replace their read and write access if they already exist.
-///
-/// `putMember` semantics: a repeat call updates the member rather than
-/// conflicting. The upsert preserves `read_self` instead of resetting it.
-/// `read_self` is HappyView-local and never sent over the wire, so a caller
-/// replacing read/write access has not asked to lift an own-records-only
-/// restriction.
 /// Revoke a member's credentials in the caller's transaction, the one that
 /// changes their membership, so the two commit together. Returns the `jti`s
 /// of the credentials that were outstanding, for [`announce_revoked`] to send
