@@ -1351,20 +1351,43 @@ pub(crate) async fn remove_members(
 ) -> Result<Vec<String>, AppError> {
     require_memberspace(space)?;
     require_dids(dids.iter().map(String::as_str))?;
+    // The removals and their credential revocations commit together, so a
+    // request that fails after them can't leave a removed member's credentials
+    // standing for a retry to miss. Only telling the verifying hosts waits for
+    // the commit.
     let scope = publish::Scope::Members(&dids);
     let signing_key = publish_key(state, space, scope).await?;
-    let (locked, removed, published) = crate::db::retry_on_busy(|| async {
+    let (locked, removed, published, jtis) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         let locked = db::lock_space(&mut *tx, state.db_backend, &space.id)
             .await?
             .unwrap_or_else(|| space.clone());
         let mut removed = Vec::new();
+        let mut jtis = Vec::new();
         for did in &dids {
             if removed.contains(did) {
                 continue;
             }
             if db::remove_direct_member(&mut *tx, state.db_backend, &space.id, did).await? {
                 db::remove_writer(&mut *tx, state.db_backend, &space.id, did).await?;
+                let revoked = async {
+                    let outstanding =
+                        db::outstanding_credential_jtis(&mut *tx, state.db_backend, &space.id, did)
+                            .await?;
+                    db::revoke_space_credentials_for_member(
+                        &mut *tx,
+                        state.db_backend,
+                        &space.id,
+                        did,
+                    )
+                    .await?;
+                    Ok::<_, AppError>(outstanding)
+                }
+                .await;
+                match revoked {
+                    Ok(outstanding) => jtis.extend(outstanding),
+                    Err(e) => return Ok(Err(e)),
+                }
                 removed.push(did.clone());
             }
         }
@@ -1375,14 +1398,14 @@ pub(crate) async fn remove_members(
             Err(e) => return Ok(Err(e)),
         };
         tx.commit().await?;
-        Ok(Ok((locked, removed, published)))
+        Ok(Ok((locked, removed, published, jtis)))
     })
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
-    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
-    for did in &removed {
-        revoke_member_credentials(state, space, did).await?;
+    if !jtis.is_empty() {
+        notifications::announce_revoked_credentials(state, space, jtis);
     }
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(removed)
 }
 

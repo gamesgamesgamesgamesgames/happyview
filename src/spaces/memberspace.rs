@@ -237,3 +237,153 @@ async fn list_members(
     }
     Ok(Json(body))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spaces::scope::space_scope_gate_tests::{USER, session_with_scopes};
+    use crate::spaces::types::{AppAccess, Policy, SpaceConfig};
+
+    async fn state_with_space(read_policy: Policy, write_policy: Policy) -> (AppState, Space) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+        let space = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: "did:plc:spacespacespacespacespa".into(),
+            authority_did: "did:plc:spacespacespacespacespa".into(),
+            creator_did: USER.into(),
+            type_nsid: "com.example.forum".into(),
+            skey: "main".into(),
+            display_name: None,
+            description: None,
+            read_policy,
+            write_policy,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: crate::db::now_rfc3339(),
+            updated_at: crate::db::now_rfc3339(),
+        };
+        crate::spaces::db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .unwrap();
+        (state, space)
+    }
+
+    fn address(space: &Space) -> String {
+        format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        )
+    }
+
+    async fn claims(state: &AppState, scopes: &str) -> XrpcClaims {
+        XrpcClaims {
+            identity: Some(session_with_scopes(state, scopes).await),
+            space_credential: None,
+            space_audience: None,
+            service_auth: None,
+        }
+    }
+
+    async fn put_one(state: &AppState, scopes: &str, space: &Space) -> Result<(), AppError> {
+        put_members(
+            State(state.clone()),
+            claims(state, scopes).await,
+            Json(PutMembersInput {
+                space: address(space),
+                members: vec![MemberEntry {
+                    did: "did:plc:membermembermembermember".into(),
+                    read: true,
+                    write: false,
+                }],
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Listing members reads the space, so the owner's session needs a grant
+    /// for it.
+    #[tokio::test]
+    async fn listing_members_needs_a_grant_to_read_the_space() {
+        let (state, space) = state_with_space(Policy::MemberList, Policy::MemberList).await;
+        let list = |scopes: &'static str| {
+            let state = state.clone();
+            let space = space.clone();
+            async move {
+                list_members(
+                    State(state.clone()),
+                    claims(&state, scopes).await,
+                    Query(ListMembersQuery {
+                        space: address(&space),
+                        limit: None,
+                        cursor: None,
+                    }),
+                )
+                .await
+            }
+        };
+        assert!(matches!(
+            list("atproto repo:com.example.post").await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(
+            list("atproto space:com.example.forum?authority=*")
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Putting members updates the space: `manage=create` alone isn't enough.
+    #[tokio::test]
+    async fn putting_members_needs_manage_update() {
+        let (state, space) = state_with_space(Policy::MemberList, Policy::MemberList).await;
+        assert!(matches!(
+            put_one(
+                &state,
+                "atproto space:com.example.forum?authority=*&manage=create",
+                &space
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        put_one(
+            &state,
+            "atproto space:com.example.forum?authority=*&manage=update",
+            &space,
+        )
+        .await
+        .expect("manage=update puts members");
+    }
+
+    /// A space whose rules predate policies and match none has no member list
+    /// to put to.
+    #[tokio::test]
+    async fn putting_members_on_retired_rules_is_a_policy_mismatch() {
+        let (state, space) = state_with_space(
+            Policy::ManagingApp {
+                managing_app: "did:web:app.example".into(),
+            },
+            Policy::MemberList,
+        )
+        .await;
+        let err = put_one(
+            &state,
+            "atproto space:com.example.forum?authority=*&manage=update",
+            &space,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::XrpcError {
+                    code: "PolicyMismatch",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+}

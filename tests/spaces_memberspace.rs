@@ -426,3 +426,40 @@ async fn the_single_member_methods_act_on_the_same_list() {
     assert_eq!(status, StatusCode::OK);
     assert!(member(&members(&app, &owner, &space).await, &a).is_none());
 }
+
+/// A DID named twice in `removeMembers` is removed once, and the rest of the
+/// batch still applies.
+#[tokio::test]
+#[serial]
+async fn remove_members_takes_a_did_named_twice() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let (a, b) = (rand_did("a"), rand_did("b"));
+    let space = create(&app, &owner, memberspace()).await;
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.memberspace.putMembers",
+        json!({ "space": space, "members": [
+            { "did": a, "read": true, "write": false },
+            { "did": b, "read": true, "write": false },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.memberspace.removeMembers",
+        json!({ "space": space, "dids": [a, a, b] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = members(&app, &owner, &space).await;
+    assert!(
+        member(&list, &a).is_none() && member(&list, &b).is_none(),
+        "{list:?}"
+    );
+}
