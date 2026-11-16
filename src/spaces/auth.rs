@@ -11,7 +11,7 @@ use crate::plugin::encryption::encrypt;
 use crate::spaces::credential::{
     DEFAULT_CREDENTIAL_TTL_SECS, SpaceCredentialClaims, make_jti, sign_credential,
 };
-use crate::spaces::types::{AppAccess, Policy, Space};
+use crate::spaces::types::{AppAccess, MemberAccess, Policy, Space};
 
 pub struct IssuedCredential {
     pub token: String,
@@ -918,6 +918,13 @@ fn refused() -> AppError {
     AppError::Forbidden("managing app denied access to this space".into())
 }
 
+/// Whether a member list admits a member with `access` (as resolved, through
+/// delegation entries too) to a credential: whole-space read access. The
+/// creator is admitted apart from this.
+pub(crate) fn member_list_admits(access: Option<MemberAccess>) -> bool {
+    access.is_some_and(|m| m.can_read() && !m.restricted_to_own_records())
+}
+
 /// Whether `subject_did` is still admitted to read `current`, the space as
 /// read again under its row lock, having been admitted to `checked`.
 async fn still_admitted(
@@ -932,14 +939,15 @@ async fn still_admitted(
     let admitted = subject_did == current.creator_did
         || match &current.read_policy {
             Policy::Public => true,
-            Policy::MemberList => crate::spaces::members::is_member_locked(
-                &mut *tx,
-                backend,
-                &current.id,
-                subject_did,
-            )
-            .await?
-            .is_some_and(|m| m.can_read() && !m.restricted_to_own_records()),
+            Policy::MemberList => member_list_admits(
+                crate::spaces::members::is_member_locked(
+                    &mut *tx,
+                    backend,
+                    &current.id,
+                    subject_did,
+                )
+                .await?,
+            ),
             // The app's answer was about the app the space named then.
             Policy::ManagingApp { .. } => current.read_policy == checked.read_policy,
         };
