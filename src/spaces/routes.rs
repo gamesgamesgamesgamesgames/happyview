@@ -225,6 +225,10 @@ struct GetSpaceCredentialInput {
     credential_key: Option<String>,
     /// The same key under its Oct 29 name.
     credential_kid: Option<String>,
+    /// A DPoP key thumbprint, which some simplespace hosts bind credentials
+    /// to instead. This host doesn't, and says so (see
+    /// [`exchange_generation`]).
+    dpop_jkt: Option<String>,
     /// Establishes the user being acted for, for spaces that gate on users.
     delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
@@ -2321,6 +2325,14 @@ fn exchange_generation(
         }),
         (Some(key), _) => Ok((ExchangeGeneration::G2, key.clone())),
         (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid.clone())),
+        // A simplespace exchange asking for a DPoP-bound credential is told
+        // which binding this host offers, rather than failing on a signature
+        // it was never going to carry.
+        (None, None) if input.dpop_jkt.is_some() => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "this host binds credentials to a did:key; dpopJkt is not supported".into(),
+        }),
         (None, None) => {
             let key = crate::spaces::http_signature::verify_legacy(headers, None)?;
             Ok((ExchangeGeneration::G0, key))

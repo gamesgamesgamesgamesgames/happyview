@@ -19,17 +19,11 @@ pub async fn resolve_members(
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<ResolvedMember>, AppError> {
-    let mut resolved: HashMap<String, MemberAccess> = HashMap::new();
-    let mut visited: HashSet<String> = HashSet::new();
-
-    resolve_members_recursive(pool, backend, space_id, &mut resolved, &mut visited, 0).await?;
-
-    let mut members: Vec<ResolvedMember> = resolved
-        .into_iter()
-        .map(|(did, access)| ResolvedMember { did, access })
-        .collect();
-    members.sort_by(|a, b| a.did.cmp(&b.did));
-    Ok(members)
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to resolve members: {e}")))?;
+    resolve_on(&mut conn, backend, space_id, false).await
 }
 
 /// Check if a DID is a member of a space (resolving delegations).
@@ -43,10 +37,57 @@ pub async fn is_member(
     Ok(members.into_iter().find(|m| m.did == did).map(|m| m.access))
 }
 
+/// [`is_member`], read in the caller's write transaction, holding every space
+/// it reads members from until that transaction ends.
+///
+/// Member changes lock their space's row first (`db::lock_space_for_members`).
+/// On Postgres each space visited here is share-locked before its members are
+/// read, so a change to any of them either commits before this read or waits
+/// for the caller's transaction. On SQLite the caller's `BEGIN IMMEDIATE`
+/// already orders it with every other writer.
+pub async fn is_member_locked(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<Option<MemberAccess>, AppError> {
+    let members = resolve_on(conn, backend, space_id, true).await?;
+    Ok(members.into_iter().find(|m| m.did == did).map(|m| m.access))
+}
+
+async fn resolve_on(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    lock: bool,
+) -> Result<Vec<ResolvedMember>, AppError> {
+    let mut resolved: HashMap<String, MemberAccess> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    resolve_members_recursive(
+        conn,
+        backend,
+        space_id,
+        lock,
+        &mut resolved,
+        &mut visited,
+        0,
+    )
+    .await?;
+
+    let mut members: Vec<ResolvedMember> = resolved
+        .into_iter()
+        .map(|(did, access)| ResolvedMember { did, access })
+        .collect();
+    members.sort_by(|a, b| a.did.cmp(&b.did));
+    Ok(members)
+}
+
 fn resolve_members_recursive<'a>(
-    pool: &'a sqlx::AnyPool,
+    conn: &'a mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &'a str,
+    lock: bool,
     resolved: &'a mut HashMap<String, MemberAccess>,
     visited: &'a mut HashSet<String>,
     depth: usize,
@@ -60,16 +101,25 @@ fn resolve_members_recursive<'a>(
             return Ok(());
         }
 
-        let direct_members = db::list_direct_members(pool, backend, space_id).await?;
+        if lock && backend == DatabaseBackend::Postgres {
+            crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR SHARE")
+                .bind(space_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to lock space: {e}")))?;
+        }
+
+        let direct_members = db::list_direct_members(&mut *conn, backend, space_id).await?;
 
         for member in direct_members {
             if member.is_delegation {
-                let delegated_space_id = resolve_delegation_target(pool, backend, &member).await?;
+                let delegated_space_id = resolve_delegation_target(conn, backend, &member).await?;
                 if let Some(target_id) = delegated_space_id {
                     resolve_members_recursive(
-                        pool,
+                        conn,
                         backend,
                         &target_id,
+                        lock,
                         resolved,
                         visited,
                         depth + 1,
@@ -89,17 +139,18 @@ fn resolve_members_recursive<'a>(
 ///
 /// Delegation entries store either an at:// URI or a space ID directly.
 async fn resolve_delegation_target(
-    pool: &sqlx::AnyPool,
+    conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<Option<String>, AppError> {
     if member.did.starts_with("at://") || member.did.starts_with("ats://") {
         let uri = SpaceUri::parse(&member.did)?;
         let space =
-            db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await?;
+            db::get_space_by_address(&mut *conn, backend, &uri.did, &uri.type_nsid, &uri.skey)
+                .await?;
         Ok(space.map(|s| s.id))
     } else {
-        let space = db::get_space(pool, backend, &member.did).await?;
+        let space = db::get_space(&mut *conn, backend, &member.did).await?;
         Ok(space.map(|s| s.id))
     }
 }

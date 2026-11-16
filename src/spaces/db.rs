@@ -74,8 +74,30 @@ pub async fn get_space(
     row.map(parse_space_row).transpose()
 }
 
+/// A space, read under `lock` (`" FOR SHARE"`, `" FOR UPDATE"` or `""`),
+/// which holds its row until the transaction ends.
+pub async fn get_space_locked(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    id: &str,
+    lock: &str,
+) -> Result<Option<Space>, AppError> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?{lock}"
+        ),
+        backend,
+    );
+    let row: Option<SpaceRow> = crate::db::query_as(&sql)
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get space: {e}")))?;
+    row.map(parse_space_row).transpose()
+}
+
 pub async fn get_space_by_address(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     did: &str,
     type_nsid: &str,
@@ -90,7 +112,7 @@ pub async fn get_space_by_address(
         .bind(did)
         .bind(type_nsid)
         .bind(skey)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space: {e}")))?;
 
@@ -580,6 +602,43 @@ pub async fn lock_space(
     Ok(row.and_then(|r| parse_space_row(r).ok()))
 }
 
+/// Revoke the outstanding credentials of a space's direct members, as
+/// discarding its member list does. Returns the `jti`s that were
+/// outstanding, for the hosts that verify them to be told.
+pub async fn revoke_member_list_credentials(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let members =
+        "SELECT member_did FROM happyview_space_members WHERE space_id = ? AND is_delegation = 0";
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        &format!(
+            "SELECT jti FROM happyview_space_credentials WHERE space_id = ? AND issued_to IN ({members}) AND revoked_at IS NULL AND jti IS NOT NULL AND expires_at > ?"
+        ),
+        backend,
+    ))
+    .bind(space_id)
+    .bind(space_id)
+    .bind(now_rfc3339())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
+    crate::db::query(&adapt_sql(
+        &format!(
+            "UPDATE happyview_space_credentials SET revoked_at = ? WHERE space_id = ? AND issued_to IN ({members}) AND revoked_at IS NULL"
+        ),
+        backend,
+    ))
+    .bind(now_rfc3339())
+    .bind(space_id)
+    .bind(space_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
 /// Delete every invite to a space, as migrating it to a policy that keeps no
 /// member list does. Returns how many were deleted.
 pub async fn delete_invites(
@@ -599,7 +658,7 @@ pub async fn delete_invites(
 }
 
 pub async fn remove_member(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
@@ -612,7 +671,7 @@ pub async fn remove_member(
     let result = crate::db::query(&sql)
         .bind(space_id)
         .bind(did)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to remove member: {e}")))?;
 
@@ -783,7 +842,7 @@ pub async fn get_member(
 }
 
 pub async fn list_direct_members(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
@@ -794,7 +853,7 @@ pub async fn list_direct_members(
 
     let rows: Vec<MemberRow> = crate::db::query_as(&sql)
         .bind(space_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
 
