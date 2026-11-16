@@ -1168,3 +1168,31 @@ async fn a_revocation_through_a_delegation_entry_notifies_the_hosts_of_native_re
         .unwrap();
     app.assert_signed_as_space(authorization, authority).await;
 }
+
+/// A space's creator keeps its credential for it when it leaves a space
+/// that one delegates to: the creator is admitted apart from the member list.
+#[tokio::test]
+#[serial]
+async fn the_creator_keeps_its_credential_when_it_leaves_a_delegated_space() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (inner, outer, _) = setup_delegated(&mut app, &key).await;
+    space_admin(
+        &app,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": inner, "did": CREATOR, "read": true, "write": false }),
+    )
+    .await;
+    let credential = credential_for(&app, CREATOR, &outer, &key).await;
+
+    space_admin(
+        &app,
+        "com.atproto.memberspace.removeMembers",
+        json!({ "space": inner, "dids": [CREATOR, MEMBER] }),
+    )
+    .await;
+
+    let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
