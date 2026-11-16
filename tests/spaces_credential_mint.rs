@@ -1609,3 +1609,144 @@ async fn the_simplespace_exchange_takes_an_attestation_for_the_bare_space_did() 
         }
     }
 }
+
+/// `authorizeSpaceSync`, the merged Nov 12 name of the exchange, as a
+/// `credentialKey` request.
+fn authorize_req(
+    delegation_token: &str,
+    key: &p256::ecdsa::SigningKey,
+    extra: Value,
+) -> Request<Body> {
+    let mut body = json!({
+        "space": space_uri(),
+        "delegationToken": delegation_token,
+        "credentialKey": happyview::spaces::http_signature::did_key(key.verifying_key()),
+    });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// `authorizeSpaceSync` is the same exchange as `getSpaceCredential`. Before
+/// the space's first update there is no `spaceRev`.
+#[tokio::test]
+#[serial]
+async fn authorize_space_sync_mints_a_credential() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let key = syncer_key();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(authorize_req(&token, &key, json!({})))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = json_of(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claims = claims_of(body["credential"].as_str().unwrap());
+    assert_eq!(claims["sub"], json!(space_uri()));
+    assert_eq!(
+        claims["cnf"]["kid"],
+        json!(happyview::spaces::http_signature::did_key(
+            key.verifying_key()
+        ))
+    );
+    assert!(body.get("spaceRev").is_none(), "{body}");
+}
+
+/// Once the space has been updated, the response carries its revision.
+#[tokio::test]
+#[serial]
+async fn authorize_space_sync_returns_the_space_revision() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let space = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        AUTHORITY,
+        "com.example.mint",
+        "main",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let recorded = happyview::spaces::writers::record(
+        &mut conn,
+        app.state.db_backend,
+        &space.id,
+        MEMBER,
+        &happyview::tid::generate_tid(),
+        &[0u8; 32],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let happyview::spaces::writers::Recorded::Advanced { space_rev, .. } = recorded else {
+        panic!("the first write advances the space");
+    };
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(authorize_req(&token, &syncer_key(), json!({})))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = json_of(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spaceRev"], json!(space_rev));
+}
+
+/// A notification registration isn't taken through the exchange yet, so a
+/// request carrying one is refused by name, under either name of the method.
+#[tokio::test]
+#[serial]
+async fn a_registration_in_the_exchange_is_refused_by_name() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let notify = json!({ "notify": { "endpoint": "https://syncer.example", "token": "t" } });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(authorize_req(&token, &syncer_key(), notify.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_of(resp).await;
+    assert_eq!(body["error"], json!("InvalidRequest"));
+    assert!(
+        body["message"].as_str().unwrap().contains("notify"),
+        "{body}"
+    );
+
+    let mut req = credential_req(&token, Some(&syncer_key()));
+    let (parts, body) = req.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+    value["notify"] = notify["notify"].clone();
+    req = Request::from_parts(parts, Body::from(value.to_string()));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("InvalidRequest"));
+
+    // The token was not spent on a refused request.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(authorize_req(&token, &syncer_key(), json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
