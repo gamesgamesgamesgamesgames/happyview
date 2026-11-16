@@ -324,6 +324,17 @@ async fn a_nested_spaces_members_get_at_most_the_access_its_reference_grants() {
     let list = members(&app, &owner, &a).await;
     assert_eq!(entry(&list, &writer), Some(&(writer.clone(), true, false)));
     assert!(entry(&list, &other).is_none());
+
+    // A reference that withholds read withholds it from the members it
+    // brings in.
+    let d = create(&app, &owner, memberspace(json!({}))).await;
+    nest(&app, &owner, &d, &b, false, true).await;
+    let list = members(&app, &owner, &d).await;
+    assert_eq!(
+        entry(&list, &writer),
+        Some(&(writer.clone(), false, true)),
+        "{list:?}"
+    );
 }
 
 #[tokio::test]
