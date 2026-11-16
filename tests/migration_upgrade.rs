@@ -213,3 +213,216 @@ async fn sqlite_backfill_scope_marks_existing_single_did_jobs() {
     let _ = std::fs::remove_dir_all(&baseline_dir);
     let _ = std::fs::remove_file(&tmp_db);
 }
+
+// ---------------------------------------------------------------------------
+// The space host service entry is limited to space host methods
+// ---------------------------------------------------------------------------
+
+/// The last migration before the space host entry was limited.
+const PRE_SPACE_HOST_METHODS_CUTOFF: &str = "20261110000001";
+
+/// `(fragment_id, access_mode)` for every entry, and `(fragment_id,
+/// lexicon_id)` for every method an entry lists.
+async fn service_entries_after(pool: &AnyPool) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let entries: Vec<(String, String)> = sqlx::query_as(
+        "SELECT fragment_id, access_mode FROM happyview_service_entries ORDER BY fragment_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read service entries");
+    let xrpcs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.fragment_id, x.lexicon_id FROM happyview_service_entry_xrpcs x \
+         JOIN happyview_service_entries e ON e.id = x.service_entry_id \
+         ORDER BY e.fragment_id, x.lexicon_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read service entry xrpcs");
+    (entries, xrpcs)
+}
+
+/// Run the migrations before the change, seed `seed`, then run the rest.
+async fn migrate_around_space_host_change(
+    pool: &AnyPool,
+    migrations_dir: &str,
+    seed: &[&'static str],
+) {
+    let baseline_dir =
+        std::env::temp_dir().join(format!("hv-pre-space-host-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &baseline_dir, PRE_SPACE_HOST_METHODS_CUTOFF);
+    Migrator::new(baseline_dir.as_path())
+        .await
+        .expect("load earlier migrations")
+        .run(pool)
+        .await
+        .expect("earlier migrations apply");
+    for statement in seed {
+        sqlx::query(*statement)
+            .execute(pool)
+            .await
+            .expect("seed service entries");
+    }
+    Migrator::new(Path::new(migrations_dir))
+        .await
+        .expect("load current migrations")
+        .run(pool)
+        .await
+        .expect("current migrations apply");
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+}
+
+/// The created entry, still on `all`, is limited to the space host methods.
+/// An entry the operator added stays as it was.
+async fn assert_space_host_entry_is_limited(pool: &AnyPool, migrations_dir: &str) {
+    migrate_around_space_host_change(
+        pool,
+        migrations_dir,
+        &[
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#atproto_space_host', 'AtprotoSpaceHost', 'all', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#chess', 'ChessAppView', 'all', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+        ],
+    )
+    .await;
+
+    let (entries, xrpcs) = service_entries_after(pool).await;
+    assert_eq!(
+        entries,
+        vec![
+            ("#atproto_space_host".to_string(), "specific".to_string()),
+            ("#chess".to_string(), "all".to_string()),
+        ]
+    );
+    let mut expected: Vec<(String, String)> = happyview::service_entries::SPACE_HOST_XRPCS
+        .iter()
+        .map(|m| ("#atproto_space_host".to_string(), m.to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(xrpcs, expected);
+}
+
+/// An entry the operator already set to `specific` keeps its own methods.
+async fn assert_specific_space_host_entry_is_kept(pool: &AnyPool, migrations_dir: &str) {
+    migrate_around_space_host_change(
+        pool,
+        migrations_dir,
+        &[
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#atproto_space_host', 'AtprotoSpaceHost', 'specific', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+            "INSERT INTO happyview_service_entry_xrpcs (service_entry_id, lexicon_id) \
+             SELECT id, 'com.atproto.space.notifyWrite' FROM happyview_service_entries WHERE fragment_id = '#atproto_space_host'",
+        ],
+    )
+    .await;
+
+    let (entries, xrpcs) = service_entries_after(pool).await;
+    assert_eq!(
+        entries,
+        vec![("#atproto_space_host".to_string(), "specific".to_string())]
+    );
+    assert_eq!(
+        xrpcs,
+        vec![(
+            "#atproto_space_host".to_string(),
+            "com.atproto.space.notifyWrite".to_string()
+        )]
+    );
+}
+
+async fn fresh_sqlite(prefix: &str) -> (AnyPool, std::path::PathBuf) {
+    sqlx::any::install_default_drivers();
+    let tmp_db = std::env::temp_dir().join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()));
+    let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+        .await
+        .expect("connect to fresh sqlite database");
+    (pool, tmp_db)
+}
+
+#[tokio::test]
+async fn sqlite_space_host_entry_is_limited_to_space_host_methods() {
+    let (pool, tmp_db) = fresh_sqlite("hv-space-host").await;
+    assert_space_host_entry_is_limited(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+async fn sqlite_specific_space_host_entry_is_kept() {
+    let (pool, tmp_db) = fresh_sqlite("hv-space-host-kept").await;
+    assert_specific_space_host_entry_is_kept(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_space_host_entry_is_limited_to_space_host_methods() {
+    let ran = with_scratch_postgres("hv_space_host", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_space_host_entry_is_limited(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_specific_space_host_entry_is_kept() {
+    let ran = with_scratch_postgres("hv_space_host_kept", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_specific_space_host_entry_is_kept(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
+/// A throwaway database on the `TEST_DATABASE_URL` Postgres server, handed to
+/// `body` by URL and dropped afterwards even when `body` panics. `None` when
+/// the URL names no Postgres server, which the caller reports as a skip.
+async fn with_scratch_postgres<F, Fut>(prefix: &str, body: F) -> Option<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let base_url = std::env::var("TEST_DATABASE_URL").ok()?;
+    sqlx::any::install_default_drivers();
+    if happyview::db::DatabaseBackend::from_url(&base_url)
+        != happyview::db::DatabaseBackend::Postgres
+    {
+        return None;
+    }
+    let (server, _db) = base_url
+        .rsplit_once('/')
+        .expect("TEST_DATABASE_URL should have a database path");
+    let scratch_db = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+    let admin = AnyPool::connect(&base_url)
+        .await
+        .expect("connect to admin database");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {scratch_db}")))
+        .execute(&admin)
+        .await
+        .expect("create scratch database");
+
+    use futures::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(body(format!("{server}/{scratch_db}")))
+        .catch_unwind()
+        .await;
+
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {scratch_db} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
+    admin.close().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    Some(())
+}
