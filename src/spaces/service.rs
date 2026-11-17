@@ -1036,6 +1036,11 @@ type Revoked = Vec<(Space, Vec<String>)>;
 /// The delegating spaces are locked for update in id order and their members
 /// resolved again under the locks, so a change to one of them waits for this
 /// one, and the lookup is repeated until it finds no space not yet locked.
+///
+/// Issuing a credential locks top-down (the space, then the spaces it
+/// delegates to) and this locks bottom-up, so the two can deadlock on
+/// Postgres. Postgres then fails one of them, and `retry_on_busy` runs it
+/// again.
 async fn revoke_lost_readers(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
