@@ -47,9 +47,10 @@ const TICKET_VERSION: u64 = 1;
 /// and this instance's.
 const TICKET_LEEWAY_SECS: u64 = 30;
 
-/// The longest lifetime a ticket may claim. Issuers sign for 60 seconds; a
-/// ticket claiming more is refused rather than trusted for longer.
-const MAX_TICKET_LIFETIME_SECS: u64 = 120;
+/// The longest lifetime a ticket may claim: the 60 seconds issuers sign for.
+/// A ticket claiming more is refused rather than trusted for longer; clock
+/// differences are covered by [`TICKET_LEEWAY_SECS`], not by this.
+const MAX_TICKET_LIFETIME_SECS: u64 = 60;
 
 /// How far a proof's `iat` may be from this instance's clock. Loose on
 /// purpose: a proof is bound to its ticket through `ath`, so it can never
@@ -291,21 +292,58 @@ pub fn verify_head(
     facts: &RequestFacts<'_>,
     now: u64,
 ) -> Result<Head, Refusal> {
+    verify_ticket(trust, ticket, now)?.check_proof(ticket, proof, facts, now)
+}
+
+/// A ticket whose signature and claims verified, before its proof is checked.
+#[derive(Debug, Clone)]
+pub struct VerifiedTicket {
+    pub did: String,
+    pub jkt: String,
+    pub ticket_jti: String,
+    pub issuer: String,
+    exp: u64,
+}
+
+/// Verify the ticket alone: signature, issuer, audience, version and times.
+pub fn verify_ticket(
+    trust: &TicketTrust,
+    ticket: &str,
+    now: u64,
+) -> Result<VerifiedTicket, Refusal> {
     let t = ticket_claims(trust, ticket, now)?;
-    let jkt = t.cnf.jkt.clone();
-    let p = proof_claims(proof, &jkt, ticket, facts, now)?;
-    Ok(Head {
-        verified: Verified {
-            did: t.sub,
-            jkt,
-            ticket_jti: t.jti,
-            issuer: t.iss,
-            htu_origin: p.origin,
-        },
-        bh: p.bh,
-        proof_jti: p.jti,
-        forget_at: t.exp + TICKET_LEEWAY_SECS,
+    Ok(VerifiedTicket {
+        did: t.sub,
+        jkt: t.cnf.jkt,
+        ticket_jti: t.jti,
+        issuer: t.iss,
+        exp: t.exp,
     })
+}
+
+impl VerifiedTicket {
+    /// Check the request's proof against this ticket and the request's head.
+    pub fn check_proof(
+        &self,
+        ticket: &str,
+        proof: &str,
+        facts: &RequestFacts<'_>,
+        now: u64,
+    ) -> Result<Head, Refusal> {
+        let p = proof_claims(proof, &self.jkt, ticket, facts, now)?;
+        Ok(Head {
+            verified: Verified {
+                did: self.did.clone(),
+                jkt: self.jkt.clone(),
+                ticket_jti: self.ticket_jti.clone(),
+                issuer: self.issuer.clone(),
+                htu_origin: p.origin,
+            },
+            bh: p.bh,
+            proof_jti: p.jti,
+            forget_at: self.exp + TICKET_LEEWAY_SECS,
+        })
+    }
 }
 
 struct CheckedProof {
@@ -502,8 +540,8 @@ pub fn check_alone(headers: &HeaderMap) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Record a proof's `jti`, refusing one already recorded. Backed by the
-/// database, so every process serving this instance sees the same set.
+/// Record a proof's `jti`: `Ok(false)` when it was already recorded. Backed
+/// by the database, so every process serving this instance sees the same set.
 /// Expired rows are swept as new ones arrive.
 pub async fn record_jti(
     db: &sqlx::AnyPool,
@@ -511,7 +549,7 @@ pub async fn record_jti(
     key: &str,
     forget_at: u64,
     now: u64,
-) -> Result<(), crate::error::AppError> {
+) -> Result<bool, crate::error::AppError> {
     use crate::db::adapt_sql;
     crate::db::query(&adapt_sql(
         "DELETE FROM happyview_ticket_proofs WHERE forget_at < ?",
@@ -530,12 +568,12 @@ pub async fn record_jti(
     .execute(db)
     .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(e)
             if e.as_database_error()
                 .is_some_and(|d| d.is_unique_violation()) =>
         {
-            Err(Refusal::Replay.into_app_error())
+            Ok(false)
         }
         Err(e) => Err(crate::error::AppError::Internal(format!(
             "ticket replay record failed: {e}"
@@ -550,12 +588,88 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+tokio::task_local! {
+    /// The verified ticket behind the request being handled, while its
+    /// handler runs. Read by the event log, which stamps the ticket onto every
+    /// event the request writes, and by job creation, which refuses a job
+    /// that would act with a stored session.
+    static TICKET_REQUEST: Verified;
+}
+
+/// The verified ticket behind the request being handled, if it presented one.
+/// Set by [`gate`] for the handler's own task; work the handler spawns onto
+/// another task doesn't see it.
+pub fn current() -> Option<Verified> {
+    TICKET_REQUEST.try_with(Clone::clone).ok()
+}
+
+/// Run `f` as if within a request authenticated by `ticket`.
+pub async fn scope<F: std::future::Future>(ticket: Verified, f: F) -> F::Output {
+    TICKET_REQUEST.scope(ticket, f).await
+}
+
+/// Event-log detail for an event written while handling a ticket request:
+/// `detail` with `auth: "ticket"` and the ticket's `jti`, issuer and key
+/// thumbprint added. `None` outside a ticket request, where the detail is
+/// written as it is.
+pub fn event_detail(detail: &serde_json::Value) -> Option<serde_json::Value> {
+    current().map(|t| with_ticket_detail(detail, &t.ticket_jti, &t.issuer, &t.jkt))
+}
+
+fn with_ticket_detail(
+    detail: &serde_json::Value,
+    jti: &str,
+    issuer: &str,
+    jkt: &str,
+) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let mut out = match detail {
+        Value::Object(map) => Value::Object(map.clone()),
+        Value::Null => json!({}),
+        other => json!({ "value": other }),
+    };
+    out["auth"] = json!("ticket");
+    out["ticket"] = json!({ "jti": jti, "iss": issuer, "jkt": jkt });
+    out
+}
+
+/// Record a refused request whose ticket itself verified: one the trusted
+/// issuer signed for this instance, refused at a later step. Requests whose
+/// ticket doesn't verify are only traced, so they add nothing to the event
+/// log.
+pub async fn log_refusal(
+    state: &crate::AppState,
+    ticket: &VerifiedTicket,
+    step: &str,
+    method: &str,
+    path: &str,
+) {
+    let detail = with_ticket_detail(
+        &serde_json::json!({ "step": step, "method": method, "path": path }),
+        &ticket.ticket_jti,
+        &ticket.issuer,
+        &ticket.jkt,
+    );
+    crate::event_log::log_event(
+        &state.db,
+        crate::event_log::EventLog {
+            event_type: "ticket.refused".to_string(),
+            severity: crate::event_log::Severity::Warn,
+            actor_did: Some(ticket.did.clone()),
+            subject: None,
+            detail,
+        },
+        state.db_backend,
+    )
+    .await;
+}
+
 /// Verify a request that presents a management ticket, in an order that
 /// spends nothing on one that fails: the headers first, then the body (read
 /// only once the ticket and proof hold, and only up to the largest body an
 /// admin route accepts), then its hash, then replay. A request that passes
-/// carries [`Verified`] on to the admin extractor; other requests pass
-/// untouched.
+/// carries [`Verified`] on to the admin extractor, and runs with it as the
+/// current ticket ([`current`]); other requests pass untouched.
 pub async fn gate(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
     req: Request,
@@ -564,21 +678,23 @@ pub async fn gate(
     if !presents_ticket(req.headers()) {
         return next.run(req).await;
     }
-    let refuse = |r: Refusal, path: &str| {
-        tracing::warn!(step = r.step(), path, "refused a management ticket");
-        r.into_app_error().into_response()
-    };
-    let path = req
+    let uri = req
         .extensions()
         .get::<axum::extract::OriginalUri>()
         .map(|u| u.0.clone())
         .unwrap_or_else(|| req.uri().clone());
+    let path = uri.path();
+    let method = req.method().as_str().to_string();
+    let refuse = |r: Refusal| {
+        tracing::warn!(step = r.step(), path, "refused a management ticket");
+        r.into_app_error().into_response()
+    };
 
     let Some(trust) = state.config.management_tickets.as_ref() else {
-        return refuse(Refusal::Disabled, path.path());
+        return refuse(Refusal::Disabled);
     };
     if let Err(r) = check_alone(req.headers()) {
-        return refuse(r, path.path());
+        return refuse(r);
     }
     let headers = req.headers();
     let token = headers
@@ -593,25 +709,33 @@ pub async fn gate(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
     else {
-        return refuse(Refusal::MissingProof, path.path());
+        return refuse(Refusal::MissingProof);
     };
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let method = req.method().as_str().to_string();
     let facts = RequestFacts {
         method: &method,
-        path: path.path(),
-        query: path.query().unwrap_or(""),
+        path,
+        query: uri.query().unwrap_or(""),
         content_type: content_type.as_deref(),
     };
     let now = now_secs();
-    let head = match verify_head(trust, &token, &proof, &facts, now) {
-        Ok(h) => h,
-        Err(r) => return refuse(r, path.path()),
+    let ticket = match verify_ticket(trust, &token, now) {
+        Ok(t) => t,
+        Err(r) => return refuse(r),
     };
 
+    // From here on the ticket is the issuer's, so a refusal is also recorded
+    // in the event log.
+    let head = match ticket.check_proof(&token, &proof, &facts, now) {
+        Ok(h) => h,
+        Err(r) => {
+            log_refusal(&state, &ticket, r.step(), &method, path).await;
+            return refuse(r);
+        }
+    };
     let own_origin = url::Url::parse(&state.config.public_url)
         .map(|u| u.origin().ascii_serialization())
         .ok();
@@ -619,21 +743,26 @@ pub async fn gate(
     if own_origin.as_deref() != Some(origin.as_str())
         && !state.domain_cache.is_allowed_origin(origin).await
     {
-        return refuse(Refusal::Proof("origin"), path.path());
+        let r = Refusal::Proof("origin");
+        log_refusal(&state, &ticket, r.step(), &method, path).await;
+        return refuse(r);
     }
 
     let (mut parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => {
+            tracing::warn!(step = "body_size", path, "refused a management ticket");
+            log_refusal(&state, &ticket, "body_size", &method, path).await;
             return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
         }
     };
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if let Err(r) = head.check_body(&digest) {
-        return refuse(r, path.path());
+        log_refusal(&state, &ticket, r.step(), &method, path).await;
+        return refuse(r);
     }
-    if let Err(e) = record_jti(
+    match record_jti(
         &state.db,
         state.db_backend,
         &head.replay_key(),
@@ -642,17 +771,18 @@ pub async fn gate(
     )
     .await
     {
-        tracing::warn!(
-            step = "replay",
-            path = path.path(),
-            "refused a management ticket"
-        );
-        return e.into_response();
+        Ok(true) => {}
+        Ok(false) => {
+            log_refusal(&state, &ticket, Refusal::Replay.step(), &method, path).await;
+            return refuse(Refusal::Replay);
+        }
+        Err(e) => return e.into_response(),
     }
 
-    parts.extensions.insert(head.verified);
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    let verified = head.verified;
+    parts.extensions.insert(verified.clone());
+    let req = Request::from_parts(parts, Body::from(bytes));
+    TICKET_REQUEST.scope(verified, next.run(req)).await
 }
 
 #[cfg(test)]
@@ -838,13 +968,69 @@ pub(crate) mod tests {
             Refusal::Ticket("expired")
         );
 
+        for (exp, step) in [(f.now + 61, "lifetime"), (f.now + 3600, "lifetime")] {
+            let mut claims = f.ticket_claims();
+            claims["exp"] = json!(exp);
+            let ticket = f.ticket_with(claims);
+            let proof = f.proof_with(f.proof_claims(&ticket, &unique("long")));
+            assert_eq!(f.check(&ticket, &proof).unwrap_err(), Refusal::Ticket(step));
+        }
+
+        // Sixty seconds is the most a ticket may claim, and 30 seconds of
+        // leeway apply either side of it.
+        let ticket = f.ticket();
+        let proof = f.proof_with(f.proof_claims(&ticket, &unique("sixty")));
+        assert!(f.check(&ticket, &proof).is_ok());
+
         let mut claims = f.ticket_claims();
-        claims["exp"] = json!(f.now + 3600);
+        claims["iat"] = json!(f.now - 85);
+        claims["exp"] = json!(f.now - 25);
         let ticket = f.ticket_with(claims);
-        let proof = f.proof_with(f.proof_claims(&ticket, &unique("long")));
+        let proof = f.proof_with(f.proof_claims(&ticket, &unique("leeway")));
+        assert!(f.check(&ticket, &proof).is_ok());
+
+        let mut claims = f.ticket_claims();
+        claims["iat"] = json!(f.now + 31);
+        claims["exp"] = json!(f.now + 91);
+        let ticket = f.ticket_with(claims);
+        let proof = f.proof_with(f.proof_claims(&ticket, &unique("future")));
         assert_eq!(
             f.check(&ticket, &proof).unwrap_err(),
-            Refusal::Ticket("lifetime")
+            Refusal::Ticket("not_yet_valid")
+        );
+    }
+
+    #[tokio::test]
+    async fn events_written_for_a_ticket_request_name_the_ticket() {
+        let detail = json!({ "key": "app_name" });
+        assert!(event_detail(&detail).is_none());
+
+        let ticket = Verified {
+            did: DID.into(),
+            jkt: "jkt-1".into(),
+            ticket_jti: "ticket-1".into(),
+            issuer: ISS.into(),
+            htu_origin: "https://instance.example".into(),
+        };
+        let stamped = scope(ticket, async { event_detail(&detail) })
+            .await
+            .unwrap();
+        assert_eq!(
+            stamped,
+            json!({
+                "key": "app_name",
+                "auth": "ticket",
+                "ticket": { "jti": "ticket-1", "iss": ISS, "jkt": "jkt-1" },
+            })
+        );
+
+        assert_eq!(
+            with_ticket_detail(&Value::Null, "j", "i", "k")["auth"],
+            "ticket"
+        );
+        assert_eq!(
+            with_ticket_detail(&json!([1]), "j", "i", "k")["value"],
+            json!([1])
         );
     }
 

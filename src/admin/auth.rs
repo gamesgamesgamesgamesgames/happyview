@@ -339,7 +339,25 @@ impl UserAuth {
         .await
         .map_err(|e| AppError::Internal(format!("user auth query failed: {e}")))?;
         let Some((user_id, is_super_int)) = found else {
-            return Err(refuse(Refusal::NotAUser));
+            let r = Refusal::NotAUser;
+            // Within the ticket's request, so the event log adds the ticket.
+            crate::event_log::log_event(
+                &state.db,
+                crate::event_log::EventLog {
+                    event_type: "ticket.refused".to_string(),
+                    severity: crate::event_log::Severity::Warn,
+                    actor_did: Some(verified.did.clone()),
+                    subject: None,
+                    detail: serde_json::json!({
+                        "step": r.step(),
+                        "method": parts.method.as_str(),
+                        "path": uri.path(),
+                    }),
+                },
+                backend,
+            )
+            .await;
+            return Err(refuse(r));
         };
         let is_super = is_super_int != 0;
         let permissions = if is_super {
