@@ -7,6 +7,7 @@ pub mod oauth_store;
 pub mod routes;
 pub mod service_auth;
 pub mod state_gc;
+pub mod ticket;
 
 pub use client_registry::OAuthClientRegistry;
 pub use middleware::Claims;
