@@ -360,7 +360,7 @@ pub async fn update_space(
 }
 
 pub async fn delete_space(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     id: &str,
 ) -> Result<bool, AppError> {
@@ -368,7 +368,7 @@ pub async fn delete_space(
 
     let result = crate::db::query(&sql)
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete space: {e}")))?;
 
@@ -626,6 +626,60 @@ pub async fn revoke_member_list_credentials(
     .await
     .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+/// Revoke every outstanding credential for a space except those issued to
+/// `keep_did`, as discarding a member list does: the credentials issued from
+/// it may have been issued through a delegation entry as well as to a direct
+/// member. Returns the `jti`s that were outstanding, for the hosts that verify
+/// them to be told.
+pub async fn revoke_space_credentials_except(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    keep_did: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT jti FROM happyview_space_credentials WHERE space_id = ? AND issued_to <> ? AND revoked_at IS NULL AND jti IS NOT NULL AND expires_at > ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(keep_did)
+    .bind(now_rfc3339())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
+    crate::db::query(&adapt_sql(
+        "UPDATE happyview_space_credentials SET revoked_at = ? WHERE space_id = ? AND issued_to <> ? AND revoked_at IS NULL",
+        backend,
+    ))
+    .bind(now_rfc3339())
+    .bind(space_id)
+    .bind(keep_did)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to revoke space credentials: {e}")))?;
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+/// The delegation entries (`is_delegation`) that may name `space`, by its id
+/// or by an address on its DID. The address match is loose; the caller
+/// resolves each entry to confirm it names `space`.
+pub async fn delegation_entries_naming(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space: &Space,
+) -> Result<Vec<SpaceMember>, AppError> {
+    let rows: Vec<MemberRow> = crate::db::query_as(&adapt_sql(
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND (member_did = ? OR member_did LIKE ?) ORDER BY space_id",
+        backend,
+    ))
+    .bind(&space.id)
+    .bind(format!("%://{}/%", space.did))
+    .fetch_all(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list delegation entries: {e}")))?;
+    rows.into_iter().map(parse_member_row).collect()
 }
 
 /// Delete every invite to a space, as migrating it to a policy that keeps no
