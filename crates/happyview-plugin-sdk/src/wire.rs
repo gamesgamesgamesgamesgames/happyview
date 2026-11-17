@@ -2054,6 +2054,22 @@ pub struct PanicReport {
     pub column: u32,
 }
 
+/// What `host_caller_assertion` receives: the service the assertion is for.
+/// The host refuses an audience the instance doesn't allow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerAssertionRequest {
+    pub audience: String,
+}
+
+/// A signed statement of who called the running script, with which DPoP key
+/// and through which API client, for one service. `token` is a compact JWS;
+/// `expires_at` is Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerAssertion {
+    pub token: String,
+    pub expires_at: u64,
+}
+
 /// What `host_job_progress` receives: the value stored on the job row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobProgressRequest {

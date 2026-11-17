@@ -26,17 +26,17 @@ use serde_json::{Map, Value};
 use crate::abi::read_packed;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData, BlobInfo,
-    CallerAccount, CallerBlobUpload, CallerEmail, CallerRecordCreate, CallerRecordDelete,
-    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, JobCreate,
-    JobGet, JobListAny, JobProgressRequest, JobView, Label, LabelsGet, LinkedRepoBlobUpload,
-    LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
-    LinkedRepoRecordPut, PanicReport, PluginError, RecordRef, RecordsCount, RecordsPage,
-    RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest, SpaceDelete, SpaceInfo,
-    SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove,
-    SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate,
-    SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery,
-    StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite, TestReport, TestTrigger,
-    TestTriggerResult,
+    CallerAccount, CallerAssertion, CallerAssertionRequest, CallerBlobUpload, CallerEmail,
+    CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery,
+    IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest, JobView, Label,
+    LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate,
+    LinkedRepoRecordDelete, LinkedRepoRecordPut, PanicReport, PluginError, RecordRef, RecordsCount,
+    RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest, SpaceDelete,
+    SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
+    SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage,
+    SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers,
+    SpacesQuery, StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite, TestReport,
+    TestTrigger, TestTriggerResult,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{
@@ -111,6 +111,7 @@ extern "C" {
     fn host_script_log(req_ptr: i32, req_len: i32) -> i64;
     fn host_script_panic(req_ptr: i32, req_len: i32);
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_assertion(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_trigger(req_ptr: i32, req_len: i32) -> i64;
@@ -1276,6 +1277,23 @@ pub fn script_panic(report: &PanicReport) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = report;
+    }
+}
+
+/// Ask the host for an assertion about the running script's caller,
+/// addressed to `request.audience`: their DID, the thumbprint of the DPoP key
+/// they authenticated with, their API client and the script's method, signed
+/// by the instance. Only for an XRPC script whose caller authenticated with
+/// DPoP, and only for an audience the instance allows. Needs `script:host`.
+pub fn caller_assertion(request: &CallerAssertionRequest) -> Result<CallerAssertion, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_assertion, request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        Err(HostError::NotWasm.into())
     }
 }
 
