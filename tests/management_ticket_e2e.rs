@@ -253,19 +253,10 @@ async fn a_dpop_session_becomes_a_ticket_that_only_the_browser_key_can_use() {
             &auth,
         )
     };
-    // A pin made for another DPoP key is refused, and registers nothing.
-    let refused = hp
-        .router
-        .clone()
-        .oneshot(register(pin(&browser, "another-dpop-key")))
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let session = register(pin(&browser, &thumbprint_of(&dpop_key)));
-    assert_eq!(
-        hp.router.clone().oneshot(session).await.unwrap().status(),
-        StatusCode::CREATED
-    );
+    let resp = hp.router.clone().oneshot(session).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["ticket_pin"], "pinned");
 
     // The getManagementTicket request, authenticated as core does it.
     let path = format!("/xrpc/{METHOD}");
@@ -443,19 +434,38 @@ async fn a_sign_in_without_a_pinned_key_gets_no_key_bound_assertion() {
     let dpop_key = key_body["dpop_key"].clone();
     let access_token = "unpinned-token";
     hp.mock_session_verification(&owner, &owner).await;
+    // A pin that doesn't verify (made for another DPoP key) never blocks the
+    // sign-in: the session is registered, unpinned, and says so.
+    let wrong = new_key();
+    let bad_pin = sign(
+        &wrong,
+        &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(&wrong) }),
+        &json!({
+            "aud": issuer(&hp.state), "lxm": happyview::auth::caller_assertion::SESSION_PIN_LXM,
+            "dpop_jkt": "another-dpop-key", "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+        }),
+    );
     let session = post(
         "/oauth/sessions",
         &json!({
             "provision_id": key_body["provision_id"], "did": owner,
             "access_token": access_token, "scopes": "atproto",
             "pds_url": "https://pds.example.com",
+            "ticket_key_proof": bad_pin,
         }),
         &auth,
     );
-    assert_eq!(
-        hp.router.clone().oneshot(session).await.unwrap().status(),
-        StatusCode::CREATED
-    );
+    let resp = hp.router.clone().oneshot(session).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["ticket_pin"], "refused");
+    let (pins,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_keys WHERE ticket_jkt IS NOT NULL",
+        hp.state.db_backend,
+    ))
+    .fetch_one(&hp.state.db)
+    .await
+    .unwrap();
+    assert_eq!(pins, 0);
 
     let path = format!("/xrpc/{METHOD}");
     let dpop = generate_dpop_proof(

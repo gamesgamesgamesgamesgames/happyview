@@ -309,6 +309,10 @@ struct RegisterSessionResponse {
     session_id: String,
     did: String,
     scopes: Vec<String>,
+    /// `pinned` or `refused`, when the registration carried a
+    /// `ticket_key_proof`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_pin: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -646,11 +650,14 @@ async fn register_session(
                 .map(|k| k.kid.clone())
         });
 
-    // Checked before anything is stored.
-    let ticket_jkt = match body.ticket_key_proof.as_deref() {
+    // A pin never blocks a sign-in: a proof that doesn't verify, or that
+    // names a different key than one already pinned, leaves the session
+    // unpinned, and the response says so. Registration is the only place a
+    // pin is ever written.
+    let ticket_pin = match body.ticket_key_proof.as_deref() {
         None => None,
-        Some(proof) => Some(
-            crate::auth::caller_assertion::verify_key_proof(
+        Some(proof) => {
+            let verified = crate::auth::caller_assertion::verify_key_proof(
                 proof,
                 &crate::auth::caller_assertion::issuer(&state),
                 crate::auth::caller_assertion::SESSION_PIN_LXM,
@@ -659,16 +666,22 @@ async fn register_session(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
-            )
-            .map_err(|e| AppError::BadRequest(format!("ticket_key_proof: {e}")))?,
-        ),
+            );
+            let pinned = match verified {
+                Ok(jkt) => keys::pin_ticket_key(&state.db, state.db_backend, &dpop_key_id, &jkt)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            Some(match pinned {
+                Ok(()) => "pinned",
+                Err(reason) => {
+                    tracing::warn!(did = %body.did, reason, "registered a session without its ticket key pin");
+                    "refused"
+                }
+            })
+        }
     };
-
-    // On the provisioned key, which exists already; before the session, so a
-    // refused pin stores nothing.
-    if let Some(jkt) = ticket_jkt.as_deref() {
-        keys::pin_ticket_key(&state.db, state.db_backend, &dpop_key_id, jkt).await?;
-    }
 
     // Store the session
     let session_id = Uuid::new_v4().to_string();
@@ -835,6 +848,7 @@ async fn register_session(
             session_id,
             did: body.did,
             scopes,
+            ticket_pin,
         }),
     ))
 }
