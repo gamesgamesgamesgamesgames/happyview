@@ -538,7 +538,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         (await this.ticketKeyProver({
           did,
           dpopJkt: await jwkThumbprint(publicJwk),
-          audience: this.instanceUrl,
+          // The instance's issuer name: its URL without a trailing slash.
+          audience: this.instanceUrl.replace(/\/+$/, ""),
           lxm: SESSION_PIN_LXM,
         })) || undefined
       );

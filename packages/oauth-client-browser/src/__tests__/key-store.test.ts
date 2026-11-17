@@ -57,7 +57,10 @@ function fetchFor() {
     if (url.includes("/oauth/dpop-keys")) return json({ provision_id: "hvp_1", dpop_key: testJwk }, 201);
     if (url.includes("/oauth/par")) return json({ request_uri: "urn:x", expires_in: 60 }, 201);
     if (url.includes("/oauth/token")) return json({ access_token: "at", scope: "atproto", iss: "https://pds.example.com" });
-    if (url.includes("/oauth/sessions") && init?.method === "POST") return json({ session_id: "s", did: DID }, 201);
+    if (url.includes("/oauth/sessions") && init?.method === "POST") {
+      const sent = JSON.parse(String(init.body));
+      return json({ session_id: "s", did: DID, ...(sent.ticket_key_proof ? { ticket_pin: "refused" } : {}) }, 201);
+    }
     throw new Error(`unexpected fetch: ${url}`);
   });
 }
@@ -192,7 +195,9 @@ describe("sign-in with a key store", () => {
       },
     });
     const { state } = await c.prepareLogin(DID);
-    await c.callback(`?code=c&state=${state}`);
+    const session = await c.callback(`?code=c&state=${state}`);
+    // The instance's answer reaches the sign-in result.
+    expect(session.ticketPin).toBe("refused");
     expect(asked).toEqual([
       {
         did: DID,

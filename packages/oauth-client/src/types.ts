@@ -125,6 +125,8 @@ export interface RegisterSessionResponse {
   session_id: string;
   did: string;
   scopes: string[];
+  /** With a `ticketKeyProof`: whether the instance pinned the key. */
+  ticket_pin?: "pinned" | "refused";
 }
 
 export interface GetSessionResponse {
