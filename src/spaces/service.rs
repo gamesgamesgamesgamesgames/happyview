@@ -992,13 +992,22 @@ fn no_members_on_managedspace() -> AppError {
     }
 }
 
-/// Insert or update a member, refusing a space that takes none
-/// ([`db::insert_member_if_allowed`]).
-async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), AppError> {
-    if !db::insert_member_if_allowed(&state.db, state.db_backend, member).await? {
-        return Err(no_members_on_managedspace());
-    }
-    Ok(())
+/// The space, read under its row lock as [`db::lock_space_for_members`]
+/// takes it, or `None` when it takes no members: a managedspace, or a space
+/// that is gone.
+async fn lock_member_space(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Option<Space>, sqlx::Error> {
+    Ok(db::lock_space(&mut *conn, backend, space_id)
+        .await?
+        .filter(|space| {
+            !matches!(
+                crate::spaces::policy::SpacePolicy::of(space),
+                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+            )
+        }))
 }
 
 /// Upsert a member. `access` of `None` leaves an existing member's read and
@@ -1037,13 +1046,17 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    // The member and, when read access goes, their credentials change in one
-    // transaction under the space's row lock, as `putMembers` does.
-    let jtis = crate::db::retry_on_busy(|| async {
+    // The member, their credentials when read access goes, and the published
+    // member record change in one transaction under the space's row lock, as
+    // `putMembers` does.
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, published, jtis) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        if !db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await? {
+        let Some(locked) = lock_member_space(&mut tx, state.db_backend, &space.id).await? else {
             return Ok(Err(no_members_on_managedspace()));
-        }
+        };
         db::upsert_member(&mut *tx, state.db_backend, &member).await?;
         // A credential is the member's read access, so it goes when that does.
         let jtis = if member.access.read {
@@ -1055,13 +1068,19 @@ pub(crate) async fn put_member(
                 Err(e) => return Ok(Err(e)),
             }
         };
+        // A failure here drops the transaction, and the change with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
         tx.commit().await?;
-        Ok(Ok(jtis))
+        Ok(Ok((locked, published, jtis)))
     })
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
     announce_revoked(state, &space, jtis);
-    publish_member(state, &space.id, member_did).await?;
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(member)
 }
 
@@ -1092,8 +1111,28 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
-    publish_member(state, &space.id, member_did).await?;
+    // The member and its published record commit together, as in
+    // `put_member`.
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, published) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let Some(locked) = lock_member_space(&mut tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(no_members_on_managedspace()));
+        };
+        db::upsert_member(&mut *tx, state.db_backend, &member).await?;
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((locked, published)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(member)
 }
 
@@ -1394,9 +1433,11 @@ pub(crate) async fn remove_members(
     let signing_key = publish_key(state, space, scope).await?;
     let (locked, removed, published, jtis) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        let locked = db::lock_space(&mut *tx, state.db_backend, &space.id)
-            .await?
-            .unwrap_or_else(|| space.clone());
+        // A space deleted since it was resolved has nothing left to remove
+        // or publish.
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(AppError::NotFound("Space not found".into())));
+        };
         let mut removed = Vec::new();
         let mut jtis = Vec::new();
         for did in &dids {
@@ -1440,9 +1481,14 @@ pub(crate) async fn remove_member(
     // together, under the space's row lock, as in `remove_members`. The
     // credentials are revoked even when no member row is found, as they
     // always were.
-    let (removed, jtis) = crate::db::retry_on_busy(|| async {
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, removed, published, jtis) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        db::lock_space_for_members(&mut *tx, state.db_backend, &space.id).await?;
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(AppError::NotFound("Space not found".into())));
+        };
         let jtis = match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did)
             .await
         {
@@ -1454,16 +1500,23 @@ pub(crate) async fn remove_member(
                 Ok(removed) => removed,
                 Err(e) => return Ok(Err(e)),
             };
+        // A failure here drops the transaction, and the removal with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
         tx.commit().await?;
-        Ok(Ok((removed, jtis)))
+        Ok(Ok((locked, removed, published, jtis)))
     })
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove member: {e}")))??;
     announce_revoked(state, &space, jtis);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
-    publish_member(state, &space.id, member_did).await
+    Ok(())
 }
 
 /// Bring one member's published record into step after a single-member
@@ -1702,6 +1755,53 @@ mod tests {
             ),
         );
         config
+    }
+
+    /// A write that began while the space published nothing fetched no key
+    /// and published nothing; if the policy turned publishing on meanwhile,
+    /// `after_publish` catches the published list up. A write that had a key
+    /// published in its own transaction and has nothing to catch up.
+    #[tokio::test]
+    async fn after_publish_catches_up_a_write_that_began_with_nothing_to_publish() {
+        require_test_db!();
+        let (state, space_uri, member_did) = service_test_db().await;
+        let stale = resolve_space(&state, &space_uri).await.unwrap();
+        let mut current = stale.clone();
+        current
+            .config
+            .extra
+            .insert("publishMembers".into(), serde_json::Value::Bool(true));
+        db::update_space(&state.db, state.db_backend, &current)
+            .await
+            .unwrap();
+        let records = || async {
+            db::repo_collection_records(
+                &state.db,
+                state.db_backend,
+                &stale.id,
+                &stale.authority_did,
+                publish::MEMBER_COLLECTION,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+        let dids = [member_did.clone()];
+        let scope = publish::Scope::Members(&dids);
+
+        after_publish(&state, &stale, scope, true, None)
+            .await
+            .unwrap();
+        assert!(
+            records().await.is_empty(),
+            "a write with a key catches nothing up"
+        );
+
+        after_publish(&state, &stale, scope, false, None)
+            .await
+            .unwrap();
+        let published = records().await;
+        assert_eq!(published.len(), 1, "{published:?}");
     }
 
     #[tokio::test]
