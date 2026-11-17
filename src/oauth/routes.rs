@@ -296,6 +296,12 @@ struct RegisterSessionBody {
     #[serde(default, rename = "pds_url")]
     _pds_url: Option<String>,
     issuer: Option<String>,
+    /// A key proof (`hv-key-proof+jwt`, `lxm` "happyview.oauth.registerSession",
+    /// `dpop_jkt` the provisioned key's thumbprint) pinning a key the client
+    /// holds to this sign-in. Caller assertions for the sign-in can then name
+    /// that key, and only that key (`auth::caller_assertion`).
+    #[serde(default)]
+    ticket_key_proof: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -518,7 +524,7 @@ async fn register_session(
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Look up the DPoP key by provision_id
-    let (dpop_key_id, dpop_client_id, private_jwk, _thumbprint, pkce_challenge) =
+    let (dpop_key_id, dpop_client_id, private_jwk, dpop_thumbprint, pkce_challenge) =
         keys::get_dpop_key(
             &state.db,
             state.db_backend,
@@ -639,6 +645,30 @@ async fn register_session(
                 .find(|k| k.status == super::client_keys::KeyStatus::Current)
                 .map(|k| k.kid.clone())
         });
+
+    // Checked before anything is stored.
+    let ticket_jkt = match body.ticket_key_proof.as_deref() {
+        None => None,
+        Some(proof) => Some(
+            crate::auth::caller_assertion::verify_key_proof(
+                proof,
+                &crate::auth::caller_assertion::issuer(&state),
+                crate::auth::caller_assertion::SESSION_PIN_LXM,
+                &dpop_thumbprint,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            )
+            .map_err(|e| AppError::BadRequest(format!("ticket_key_proof: {e}")))?,
+        ),
+    };
+
+    // On the provisioned key, which exists already; before the session, so a
+    // refused pin stores nothing.
+    if let Some(jkt) = ticket_jkt.as_deref() {
+        keys::pin_ticket_key(&state.db, state.db_backend, &dpop_key_id, jkt).await?;
+    }
 
     // Store the session
     let session_id = Uuid::new_v4().to_string();
