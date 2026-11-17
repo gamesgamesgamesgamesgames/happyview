@@ -159,7 +159,7 @@ impl AssertionError {
             Self::NotDpop => "NO_SESSION",
             Self::NotXrpc => "UNSUPPORTED",
             Self::TestRun => "UNSUPPORTED",
-            Self::TooMany(_) => "BAD_INPUT",
+            Self::TooMany(_) => "RATE_LIMITED",
             Self::Database(_) => "HOST_ERROR",
         }
     }
