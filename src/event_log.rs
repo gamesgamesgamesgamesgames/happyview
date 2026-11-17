@@ -577,7 +577,11 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
     let severity = event.severity.to_string();
-    let detail_str = serde_json::to_string(&event.detail).unwrap_or_else(|_| "{}".to_string());
+    // An event written while handling a management-ticket request records
+    // the ticket too.
+    let stamped = crate::auth::ticket::event_detail(&event.detail);
+    let detail = stamped.as_ref().unwrap_or(&event.detail);
+    let detail_str = serde_json::to_string(detail).unwrap_or_else(|_| "{}".to_string());
     let id = Uuid::new_v4().to_string();
     let created_at = now_rfc3339();
 
