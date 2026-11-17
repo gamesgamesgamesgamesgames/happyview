@@ -15,7 +15,9 @@ import {
   TokenExchangeError,
   type Key,
   type KeyStore,
+  SESSION_PIN_LXM,
   type SessionEventHooks,
+  type TicketKeyProver,
   type StorageAdapter,
 } from "@happyview/oauth-client";
 import { IndexedDbKeyStore } from "./indexeddb-key-store";
@@ -45,6 +47,12 @@ export interface HappyViewBrowserClientOptions {
    * before.
    */
   keyStore?: KeyStore | null;
+  /**
+   * Called as a sign-in completes, to pin a key the app holds (a ticket key
+   * it made before sign-in) to the new session. Its proof goes with the
+   * session's registration.
+   */
+  ticketKeyProof?: TicketKeyProver;
   sessionHooks?: SessionEventHooks;
   fetch?: typeof globalThis.fetch;
 }
@@ -123,6 +131,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   private readonly clientId: string;
   private readonly redirectUri: string | undefined;
   private readonly scopes: string;
+  private readonly ticketKeyProver: TicketKeyProver | undefined;
   constructor(options: HappyViewBrowserClientOptions) {
     const fetchFn =
       options.fetch ??
@@ -147,6 +156,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     this.clientId = options.clientId;
     this.redirectUri = options.redirectUri;
     this.scopes = options.scopes ?? "atproto";
+    this.ticketKeyProver = options.ticketKeyProof;
     this.handleResolver = new AtprotoDohHandleResolver({
       dohEndpoint: "https://dns.google/resolve",
       fetch: fetchFn,
@@ -504,6 +514,12 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         issuer: tokens.iss ?? pending.issuer,
         dpopKey: pending.rawJwk ?? publicJwk,
         dpopKeyPair: pair,
+        ticketKeyProof: await this.ticketKeyProver?.({
+          did: pending.did,
+          dpopJkt: await jwkThumbprint(publicJwk),
+          audience: this.instanceUrl,
+          lxm: SESSION_PIN_LXM,
+        }),
       });
 
       await this.storage.delete(`pending-auth:${state}`);

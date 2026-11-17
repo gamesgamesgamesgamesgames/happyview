@@ -33,5 +33,8 @@ export type {
   SessionEventHooks,
   StorageAdapter,
   StoredSession,
+  TicketKeyProofRequest,
+  TicketKeyProver,
   TokenInfo,
 } from "./types";
+export { SESSION_PIN_LXM } from "./types";
