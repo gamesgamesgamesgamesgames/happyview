@@ -424,14 +424,32 @@ async fn the_single_member_methods_keep_the_published_list() {
             .contains(&(b.clone(), true, true))
     );
 
+    // Simplespace's addMember, which predates putMember.
+    let c = rand_did("c");
     let (status, body) = post(
         &app,
         &owner,
-        "com.atproto.simplespace.removeMember",
-        json!({ "space": space, "did": b }),
+        "com.atproto.simplespace.addMember",
+        json!({ "space": space, "did": c, "access": "read" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        member_records(&app, &space)
+            .await
+            .contains(&(c.clone(), true, false))
+    );
+
+    for did in [&b, &c] {
+        let (status, body) = post(
+            &app,
+            &owner,
+            "com.atproto.simplespace.removeMember",
+            json!({ "space": space, "did": did }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
     let (status, body) = post(
         &app,
         &owner,
