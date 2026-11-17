@@ -514,12 +514,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         issuer: tokens.iss ?? pending.issuer,
         dpopKey: pending.rawJwk ?? publicJwk,
         dpopKeyPair: pair,
-        ticketKeyProof: await this.ticketKeyProver?.({
-          did: pending.did,
-          dpopJkt: await jwkThumbprint(publicJwk),
-          audience: this.instanceUrl,
-          lxm: SESSION_PIN_LXM,
-        }),
+        ticketKeyProof: await this.proveTicketKey(pending.did, publicJwk),
       });
 
       await this.storage.delete(`pending-auth:${state}`);
@@ -528,6 +523,27 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       return session;
     } catch (err) {
       throw OAuthCallbackError.from(err, params, state);
+    }
+  }
+
+  /**
+   * The app's ticket key proof for a sign-in completing, or `undefined`: when
+   * there's no prover, it returns none, or it fails. A pin is a bonus the
+   * sign-in never waits on.
+   */
+  private async proveTicketKey(did: string, publicJwk: JsonWebKey): Promise<string | undefined> {
+    if (!this.ticketKeyProver) return undefined;
+    try {
+      return (
+        (await this.ticketKeyProver({
+          did,
+          dpopJkt: await jwkThumbprint(publicJwk),
+          audience: this.instanceUrl,
+          lxm: SESSION_PIN_LXM,
+        })) || undefined
+      );
+    } catch {
+      return undefined;
     }
   }
 

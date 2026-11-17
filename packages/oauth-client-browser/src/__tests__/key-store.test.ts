@@ -217,4 +217,27 @@ describe("sign-in with a key store", () => {
     );
     expect(JSON.parse(register[1].body)).not.toHaveProperty("ticket_key_proof");
   });
+
+  test("a prover that returns nothing, or fails, leaves the sign-in unpinned and completed", async () => {
+    for (const prover of [async () => undefined, async () => { throw new Error("no IndexedDB"); }]) {
+      localStorage.clear();
+      const fetchFn = fetchFor();
+      const c = new HappyViewBrowserClient({
+        instanceUrl: "https://happyview.example.com",
+        clientId: "https://example.com/client-metadata.json",
+        clientKey: "hvc_test",
+        storage: new LocalStorageAdapter(),
+        keyStore: new MemoryKeyStore(),
+        fetch: fetchFn as unknown as typeof fetch,
+        ticketKeyProof: prover,
+      });
+      const { state } = await c.prepareLogin(DID);
+      const session = await c.callback(`?code=c&state=${state}`);
+      expect(session.did).toBe(DID);
+      const register = (fetchFn as any).mock.calls.find(
+        (call: any[]) => String(call[0]).includes("/oauth/sessions") && call[1]?.method === "POST",
+      );
+      expect(JSON.parse(register[1].body)).not.toHaveProperty("ticket_key_proof");
+    }
+  });
 });
