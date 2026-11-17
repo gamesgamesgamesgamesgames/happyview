@@ -540,9 +540,6 @@ pub fn check_alone(headers: &HeaderMap) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Record a proof's `jti`: `Ok(false)` when it was already recorded. Backed
-/// by the database, so every process serving this instance sees the same set.
-/// Expired rows are swept as new ones arrive.
 /// Whether `key` is already recorded and not yet expired at `now`: a read
 /// only, so a replayed proof is refused before its body is buffered.
 /// [`record_jti`] stays the authority; this just saves the read.
@@ -565,6 +562,9 @@ pub async fn proof_seen(
     Ok(row.is_some())
 }
 
+/// Record a proof's `jti`: `Ok(false)` when it was already recorded. Backed
+/// by the database, so every process serving this instance sees the same set.
+/// Expired rows are swept as new ones arrive.
 pub async fn record_jti(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
@@ -660,7 +660,9 @@ fn with_ticket_detail(
 /// ticket doesn't verify are only traced, so they add nothing to the event
 /// log. At most one row per ticket and step: a client repeating the same
 /// refused request can't fill the log, while the trace line still records
-/// every attempt.
+/// every attempt. If the once-only marker can't be written, the refusal is
+/// logged anyway (fail open), so while the database is failing every refusal
+/// gets its own row again.
 pub async fn log_refusal(
     state: &crate::AppState,
     ticket: &VerifiedTicket,
