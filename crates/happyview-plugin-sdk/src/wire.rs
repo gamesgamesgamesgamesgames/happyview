@@ -2056,7 +2056,7 @@ pub struct PanicReport {
 
 /// What `host_caller_assertion` receives: the service the assertion is for.
 /// The host refuses an audience the instance doesn't allow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerAssertionRequest {
     pub audience: String,
 }
