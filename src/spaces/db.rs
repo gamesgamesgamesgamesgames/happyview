@@ -662,25 +662,6 @@ pub async fn revoke_space_credentials_except(
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
 }
 
-/// The DIDs a space has outstanding credentials for, neither revoked nor
-/// expired.
-pub async fn outstanding_credential_subjects(
-    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
-    backend: DatabaseBackend,
-    space_id: &str,
-) -> Result<Vec<String>, AppError> {
-    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT DISTINCT issued_to FROM happyview_space_credentials WHERE space_id = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY issued_to",
-        backend,
-    ))
-    .bind(space_id)
-    .bind(now_rfc3339())
-    .fetch_all(executor)
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
-    Ok(rows.into_iter().map(|(did,)| did).collect())
-}
-
 /// The delegation entries (`is_delegation`) that may name `space`, by its id
 /// or by an address on its DID. The address match is loose; the caller
 /// resolves each entry to confirm it names `space`.

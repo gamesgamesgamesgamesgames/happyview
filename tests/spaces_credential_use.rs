@@ -1184,6 +1184,14 @@ async fn the_creator_keeps_its_credential_when_it_leaves_a_delegated_space() {
         json!({ "space": inner, "did": CREATOR, "read": true, "write": false }),
     )
     .await;
+    // `createSpace` lists the creator as a member; without that row it reads
+    // the outer space only as its creator.
+    space_admin(
+        &app,
+        "com.atproto.memberspace.removeMembers",
+        json!({ "space": outer, "dids": [CREATOR] }),
+    )
+    .await;
     let credential = credential_for(&app, CREATOR, &outer, &key).await;
 
     space_admin(
