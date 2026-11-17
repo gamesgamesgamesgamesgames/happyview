@@ -1,5 +1,6 @@
 pub mod admin_scope;
 pub mod atrium_panic;
+pub mod caller_assertion;
 pub mod cli_client;
 pub mod client_registry;
 pub mod middleware;

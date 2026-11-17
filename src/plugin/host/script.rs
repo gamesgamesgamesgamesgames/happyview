@@ -89,6 +89,8 @@ pub enum ScriptHostError {
     BadSpecifier(String),
     #[error("{0}")]
     ModuleNotFound(String),
+    #[error("{0}")]
+    Assertion(#[from] crate::auth::caller_assertion::AssertionError),
 }
 
 impl ScriptHostError {
@@ -101,8 +103,28 @@ impl ScriptHostError {
             Self::NoProject(_) => "UNSUPPORTED",
             Self::BadSpecifier(_) => "BAD_INPUT",
             Self::ModuleNotFound(_) => "NOT_FOUND",
+            Self::Assertion(e) => e.code(),
         }
     }
+}
+
+/// Sign an assertion about the run's caller for `request.audience`: who they
+/// are, the DPoP key and API client they authenticated with, and the running
+/// script's method, all from the request rather than from the script.
+pub async fn caller_assertion(
+    state: &AppState,
+    run: &ScriptRun,
+    session: Option<&crate::plugin::caller::CallerSession>,
+    request: happyview_plugin_sdk::wire::CallerAssertionRequest,
+) -> Result<happyview_plugin_sdk::wire::CallerAssertion, ScriptHostError> {
+    use crate::auth::caller_assertion::{AssertionError, assert_caller};
+    let session = session.ok_or(AssertionError::NotDpop)?;
+    let assertion =
+        assert_caller(state, &session.claims, &run.trigger_id, &request.audience).await?;
+    Ok(happyview_plugin_sdk::wire::CallerAssertion {
+        token: assertion.token,
+        expires_at: assertion.expires_at,
+    })
 }
 
 fn job_of(run: &ScriptRun, control: &'static str) -> Result<String, ScriptHostError> {

@@ -257,6 +257,10 @@ pub struct Config {
     /// Hex SHA-256 of the managed-hosting platform key. `None` disables the
     /// platform principal entirely.
     pub platform_api_key_hash: Option<String>,
+    /// This instance's caller-assertion key and the audiences scripts may
+    /// address, from `CALLER_ASSERTION_*`. `None` turns caller assertions
+    /// off. See `auth::caller_assertion`.
+    pub caller_assertions: Option<crate::auth::caller_assertion::CallerAssertionConfig>,
     /// Number of background job workers. 1 unless `JOB_WORKER_CONCURRENCY` says
     /// otherwise.
     pub job_worker_concurrency: usize,
@@ -517,6 +521,16 @@ impl Config {
                     None
                 }
             },
+            caller_assertions: match crate::auth::caller_assertion::CallerAssertionConfig::parse(
+                var("CALLER_ASSERTION_KEY").as_deref(),
+                var("CALLER_ASSERTION_AUDIENCES").as_deref(),
+            ) {
+                Ok(config) => config,
+                Err(reason) => {
+                    tracing::error!("{reason}. Caller assertions are DISABLED until it is fixed.");
+                    None
+                }
+            },
             job_worker_concurrency: parse_job_worker_concurrency(
                 var("JOB_WORKER_CONCURRENCY").as_deref(),
             ),
@@ -619,6 +633,8 @@ mod tests {
             "POLICY_URI",
             "BASE_PATH",
             "PLATFORM_API_KEY_HASH",
+            "CALLER_ASSERTION_KEY",
+            "CALLER_ASSERTION_AUDIENCES",
             "JOB_WORKER_CONCURRENCY",
             "SUPERADMIN_DID",
             "TELEMETRY_MANAGED_BY",
@@ -806,6 +822,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
@@ -1261,6 +1278,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
@@ -1299,6 +1317,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
@@ -1337,6 +1356,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
@@ -1375,6 +1395,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
@@ -1443,6 +1464,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
             project_root: None,
