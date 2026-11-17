@@ -170,6 +170,10 @@ pub enum AssertionError {
     NotXrpc,
     #[error("the key proof was refused: {0}")]
     KeyProof(&'static str),
+    #[error("a test run's caller is forged, so it gets no caller assertion")]
+    TestRun,
+    #[error("a run may ask for at most {0} caller assertions")]
+    TooMany(u32),
     #[error("{0}")]
     Database(String),
 }
@@ -182,6 +186,8 @@ impl AssertionError {
             Self::NotDpop => "NO_SESSION",
             Self::NotXrpc => "UNSUPPORTED",
             Self::KeyProof(_) => "BAD_INPUT",
+            Self::TestRun => "UNSUPPORTED",
+            Self::TooMany(_) => "BAD_INPUT",
             Self::Database(_) => "HOST_ERROR",
         }
     }
@@ -802,6 +808,23 @@ mod tests {
                 .await
                 .unwrap_err(),
             AssertionError::NotDpop
+        );
+        // A test run's forged caller carries no DPoP key, so it gets none
+        // either, even where the run itself is let through.
+        let forged = crate::auth::Claims::internal(did.clone());
+        assert_eq!(
+            assert_caller(&state, &forged, trigger, AUD, None)
+                .await
+                .unwrap_err(),
+            AssertionError::NotDpop
+        );
+        // A job that inherited a DPoP caller isn't an XRPC call, so it has no
+        // method to name.
+        assert_eq!(
+            assert_caller(&state, &claims, "job:com.example.tick", AUD, None)
+                .await
+                .unwrap_err(),
+            AssertionError::NotXrpc
         );
         // Nor does a key this instance doesn't know.
         let unknown = crate::auth::Claims::for_test(&did, Some("hvc_unknown"), Some("nope"));
