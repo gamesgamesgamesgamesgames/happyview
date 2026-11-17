@@ -2056,9 +2056,15 @@ pub struct PanicReport {
 
 /// What `host_caller_assertion` receives: the service the assertion is for.
 /// The host refuses an audience the instance doesn't allow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerAssertionRequest {
     pub audience: String,
+    /// A proof, made by the caller, of a key they hold other than their DPoP
+    /// key: a compact JWS with `typ: hv-key-proof+jwt` and its public JWK in
+    /// the header. When present and valid, the assertion names that key
+    /// (`cnf.jkt`, with `cnf_src: "key_proof"`) instead of the DPoP key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_proof: Option<String>,
 }
 
 /// A signed statement of who called the running script, with which DPoP key

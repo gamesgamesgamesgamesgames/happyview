@@ -1282,8 +1282,8 @@ pub fn script_panic(report: &PanicReport) {
 
 /// Ask the host for an assertion about the running script's caller,
 /// addressed to `request.audience`: their DID, the thumbprint of the DPoP key
-/// they authenticated with, their API client and the script's method, signed
-/// by the instance. Only for an XRPC script whose caller authenticated with
+/// they authenticated with (or of the key `request.key_proof` proves), their
+/// API client and the script's method, signed by the instance. Only for an XRPC script whose caller authenticated with
 /// DPoP, and only for an audience the instance allows. Needs `script:host`.
 pub fn caller_assertion(request: &CallerAssertionRequest) -> Result<CallerAssertion, PluginError> {
     #[cfg(target_arch = "wasm32")]

@@ -109,8 +109,9 @@ impl ScriptHostError {
 }
 
 /// Sign an assertion about the run's caller for `request.audience`: who they
-/// are, the DPoP key and API client they authenticated with, and the running
-/// script's method, all from the request rather than from the script.
+/// are, the DPoP key and API client they authenticated with (or the key
+/// `request.key_proof` proves), and the running script's method, all from the
+/// request rather than from the script.
 pub async fn caller_assertion(
     state: &AppState,
     run: &ScriptRun,
@@ -119,8 +120,14 @@ pub async fn caller_assertion(
 ) -> Result<happyview_plugin_sdk::wire::CallerAssertion, ScriptHostError> {
     use crate::auth::caller_assertion::{AssertionError, assert_caller};
     let session = session.ok_or(AssertionError::NotDpop)?;
-    let assertion =
-        assert_caller(state, &session.claims, &run.trigger_id, &request.audience).await?;
+    let assertion = assert_caller(
+        state,
+        &session.claims,
+        &run.trigger_id,
+        &request.audience,
+        request.key_proof.as_deref(),
+    )
+    .await?;
     Ok(happyview_plugin_sdk::wire::CallerAssertion {
         token: assertion.token,
         expires_at: assertion.expires_at,
