@@ -6,14 +6,20 @@ import {
   HappyViewSession,
   LAST_ACTIVE_KEY,
   importJwk,
+  importKeyPair,
   jwkThumbprint,
+  keyFromPair,
+  publicJwkOf,
   InvalidStateError,
   OAuthCallbackError,
   ResolutionError,
   TokenExchangeError,
+  type Key,
+  type KeyStore,
   type SessionEventHooks,
   type StorageAdapter,
 } from "@happyview/oauth-client";
+import { IndexedDbKeyStore } from "./indexeddb-key-store";
 import { LocalStorageAdapter } from "./local-storage-adapter";
 
 const NAMESPACE = "@happyview/oauth-client-browser";
@@ -34,14 +40,26 @@ export interface HappyViewBrowserClientOptions {
   redirectUri?: string;
   scopes?: string;
   storage?: StorageAdapter;
+  /**
+   * Where DPoP keys are kept, non-extractable. Defaults to IndexedDB where
+   * the browser has it. Pass `null` to keep keys as JWKs in `storage`, as
+   * before.
+   */
+  keyStore?: KeyStore | null;
   sessionHooks?: SessionEventHooks;
   fetch?: typeof globalThis.fetch;
 }
 
+/** The key store id of the key for a sign-in still in progress. */
+const pendingKeyId = (state: string) => `pending:${state}`;
+
 interface PendingAuthState {
   did: string;
   provisionId: string;
-  rawJwk: JsonWebKey;
+  /** The provisioned key, when there's no key store. */
+  rawJwk?: JsonWebKey;
+  /** Its public half, when the private key waits in the key store. */
+  publicJwk?: JsonWebKey;
   provisionPkceVerifier: string;
   authPkceVerifier: string;
   pdsUrl: string;
@@ -106,10 +124,17 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       (((input: RequestInfo | URL, init?: RequestInit) =>
         fetch(input, init)) as typeof globalThis.fetch);
     const storageAdapter = options.storage ?? new LocalStorageAdapter();
+    const keyStore =
+      options.keyStore === undefined
+        ? IndexedDbKeyStore.isAvailable()
+          ? new IndexedDbKeyStore()
+          : undefined
+        : (options.keyStore ?? undefined);
     super({
       instanceUrl: options.instanceUrl,
       clientKey: options.clientKey,
       storage: storageAdapter,
+      keyStore,
       sessionHooks: options.sessionHooks,
       fetch: fetchFn,
     });
@@ -165,10 +190,24 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     const state = options?.state ?? randomHex(16);
 
+    // With a key store, the private key waits there, non-extractable, for the
+    // redirect back; storage only ever sees the public half.
+    let keyFields: Pick<PendingAuthState, "rawJwk" | "publicJwk">;
+    let signingKey: Key;
+    if (this.keyStore) {
+      const pair = await importKeyPair(rawJwk, { extractable: false });
+      await this.keyStore.set(pendingKeyId(state), pair);
+      signingKey = await keyFromPair(pair);
+      keyFields = { publicJwk: publicJwkOf(rawJwk) };
+    } else {
+      signingKey = await importJwk(rawJwk);
+      keyFields = { rawJwk };
+    }
+
     const pendingState: PendingAuthState = {
       did,
       provisionId,
-      rawJwk,
+      ...keyFields,
       provisionPkceVerifier: provisionPkceVerifier!,
       authPkceVerifier,
       pdsUrl,
@@ -238,7 +277,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     if (parEndpoint) {
       const signProof =
         authParams.get("dpop_jkt") === provisionedJkt
-          ? await buildProofSigner(rawJwk, parEndpoint)
+          ? buildProofSigner(signingKey, publicJwkOf(rawJwk), parEndpoint)
           : undefined;
 
       let dpopNonce: string | undefined;
@@ -322,6 +361,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     if (params.has("error")) {
       await this.storage.delete(`pending-auth:${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
       throw new OAuthCallbackError(params, undefined, state);
     }
 
@@ -332,10 +372,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const pending: PendingAuthState = JSON.parse(pendingJson);
 
     try {
-      const signProof = await buildProofSigner(
-        pending.rawJwk,
-        pending.tokenEndpoint,
-      );
+      const { key, publicJwk, pair } = await this.pendingKey(pending, state);
+      const signProof = buildProofSigner(key, publicJwk, pending.tokenEndpoint);
 
       const { clientId, redirectUri } = this.resolveOAuthEndpoints();
 
@@ -417,15 +455,37 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         scopes: tokens.scope ?? this.scopes,
         pdsUrl: pending.pdsUrl,
         issuer: tokens.iss ?? pending.issuer,
-        dpopKey: pending.rawJwk,
+        dpopKey: pending.rawJwk ?? publicJwk,
+        dpopKeyPair: pair,
       });
 
       await this.storage.delete(`pending-auth:${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
 
       return session;
     } catch (err) {
       throw OAuthCallbackError.from(err, params, state);
     }
+  }
+
+  /** The key a pending sign-in provisioned, from the key store or storage. */
+  private async pendingKey(
+    pending: PendingAuthState,
+    state: string,
+  ): Promise<{ key: Key; publicJwk: JsonWebKey; pair?: CryptoKeyPair }> {
+    if (pending.rawJwk) {
+      return {
+        key: await importJwk(pending.rawJwk),
+        publicJwk: publicJwkOf(pending.rawJwk),
+      };
+    }
+    const pair = await this.keyStore?.get(pendingKeyId(state));
+    if (!pair || !pending.publicJwk) {
+      throw new InvalidStateError(
+        "The key for this sign-in is gone; start the sign-in again.",
+      );
+    }
+    return { key: await keyFromPair(pair), publicJwk: pending.publicJwk, pair };
   }
 
   async logout(did: string): Promise<void> {
@@ -661,12 +721,11 @@ function extractPdsUrl(doc: DidDocument): string {
   );
 }
 
-async function buildProofSigner(
-  rawJwk: JsonWebKey,
+function buildProofSigner(
+  dpopKey: Key,
+  publicJwk: JsonWebKey,
   endpoint: string,
-): Promise<(nonce?: string) => Promise<string>> {
-  const dpopKey = await importJwk(rawJwk);
-  const { d: _, ...publicJwk } = rawJwk;
+): (nonce?: string) => Promise<string> {
   const htu = endpoint.split("?")[0];
 
   return (nonce?: string) =>

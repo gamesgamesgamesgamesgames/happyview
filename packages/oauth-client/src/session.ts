@@ -1,4 +1,5 @@
 import type { Key } from "@atproto/jwk";
+import { jwkThumbprint } from "./thumbprint";
 import type { TokenInfo } from "./types";
 
 export interface HappyViewSessionOptions {
@@ -62,6 +63,17 @@ export class HappyViewSession {
 
   get sub(): string {
     return this.did;
+  }
+
+  /**
+   * The RFC 7638 thumbprint of this session's DPoP key: the `jkt` the instance
+   * knows the session by. Safe to share; it says nothing about the private
+   * key.
+   */
+  async dpopKeyThumbprint(): Promise<string> {
+    const jwk = this.dpopKey.publicJwk;
+    if (!jwk) throw new Error("the session's DPoP key has no public JWK");
+    return jwkThumbprint(jwk as JsonWebKey);
   }
 
   getTokenInfo(): TokenInfo {

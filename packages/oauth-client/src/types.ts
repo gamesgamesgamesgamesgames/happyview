@@ -9,11 +9,29 @@ export interface SessionEventHooks {
   onSessionDelete?: (did: string, cause?: unknown) => void;
 }
 
+/**
+ * Where a client keeps its DPoP keys as Web Crypto key pairs rather than as
+ * JWKs. Keys kept here are imported non-extractable: a session can sign with
+ * its key, but nothing, not even this library, can read it back out. The
+ * browser client uses IndexedDB, which stores a `CryptoKey` as is.
+ */
+export interface KeyStore {
+  get(id: string): Promise<CryptoKeyPair | null>;
+  set(id: string, pair: CryptoKeyPair): Promise<void>;
+  delete(id: string): Promise<void>;
+}
+
 export interface HappyViewOAuthClientOptions {
   instanceUrl: string;
   clientKey: string;
   clientSecret?: string;
   storage?: StorageAdapter;
+  /**
+   * When set, DPoP keys are kept here, non-extractable, and sessions in
+   * `storage` hold only the public key. Sessions stored with a JWK before a
+   * key store was set move to it the next time they're restored.
+   */
+  keyStore?: KeyStore;
   sessionHooks?: SessionEventHooks;
 }
 
@@ -31,7 +49,10 @@ export interface RegisterSessionParams {
   scopes: string;
   pdsUrl?: string;
   issuer?: string;
+  /** The provisioned key: private, or public when `dpopKeyPair` is given. */
   dpopKey: JsonWebKey;
+  /** The provisioned key already imported, for a client with a key store. */
+  dpopKeyPair?: CryptoKeyPair;
 }
 
 /**
@@ -42,7 +63,10 @@ export interface RegisterSessionParams {
  */
 export interface StoredSession {
   did: string;
-  dpopKey: JsonWebKey;
+  /** The private DPoP key, for a client without a key store. */
+  dpopKey?: JsonWebKey;
+  /** The public DPoP key, when the private one is in the key store. */
+  dpopPublicKey?: JsonWebKey;
   accessToken: string;
   clientKey: string;
   instanceUrl: string;
