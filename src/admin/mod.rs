@@ -396,4 +396,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/verification-methods/{fragment_id}",
             delete(verification_methods::delete),
         )
+        // Outermost, so every route above, the record source's included, sees
+        // the body hash a management ticket's proof is checked against.
+        .layer(axum::middleware::from_fn(crate::auth::ticket::buffer_body))
 }

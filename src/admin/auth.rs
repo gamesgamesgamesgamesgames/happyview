@@ -33,6 +33,11 @@ pub struct UserAuth {
     /// The request was authenticated with the managed-hosting platform key
     /// (`PLATFORM_API_KEY_HASH`). Never true for a user or a user's API key.
     pub is_platform: bool,
+    /// Set when the request authenticated with a management ticket
+    /// (`auth::ticket`). Such a caller is an ordinary user of this instance
+    /// who never has `Claims`, so nothing reached through `UserAuth` can act
+    /// with a stored OAuth session on their behalf.
+    pub ticket: Option<TicketCaller>,
     pub permissions: HashSet<Permission>,
     pub db: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
@@ -167,6 +172,12 @@ impl UserAuth {
     /// whether the platform principal is acceptable; see `UserAuth`'s extractor
     /// and `AllowPlatform`.
     async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
+        // First, ahead of the cookie: a ticket request must not be decided by
+        // anything else it carries, and `check_alone` refuses one that carries
+        // more.
+        if crate::auth::ticket::presents_ticket(&parts.headers) {
+            return Self::ticket_auth(parts, state).await;
+        }
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -276,6 +287,141 @@ impl UserAuth {
             user_id,
             is_super,
             is_platform: false,
+            ticket: None,
+            permissions,
+            db: state.db.clone(),
+            db_backend: backend,
+        })
+    }
+}
+
+/// Who presented a management ticket, for the request's trace.
+#[derive(Clone, Debug)]
+pub struct TicketCaller {
+    pub issuer: String,
+    pub jkt: String,
+    pub ticket_jti: String,
+}
+
+impl UserAuth {
+    /// Authenticate a request presenting a management ticket. Never builds
+    /// `Claims`, and never bootstraps a first user: the ticket's DID must
+    /// already be a user here.
+    async fn ticket_auth(parts: &Parts, state: &AppState) -> Result<Self, AppError> {
+        use crate::auth::ticket::{self, Refusal};
+
+        let refuse = |r: Refusal| {
+            tracing::warn!(
+                step = r.step(),
+                path = parts.uri.path(),
+                "refused a management ticket"
+            );
+            r.into_app_error()
+        };
+
+        let trust = state
+            .config
+            .management_tickets
+            .as_ref()
+            .ok_or_else(|| refuse(Refusal::Disabled))?;
+        ticket::check_alone(&parts.headers).map_err(refuse)?;
+
+        let header = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let token = header
+            .strip_prefix(ticket::SCHEME)
+            .unwrap_or_default()
+            .trim();
+        let proof = parts
+            .headers
+            .get(ticket::PROOF_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| refuse(Refusal::MissingProof))?;
+
+        let body = parts
+            .extensions
+            .get::<ticket::BodySha256>()
+            .copied()
+            .ok_or_else(|| {
+                AppError::Internal("management ticket on a route without body hashing".into())
+            })?;
+        let uri = parts
+            .extensions
+            .get::<axum::extract::OriginalUri>()
+            .map(|u| u.0.clone())
+            .unwrap_or_else(|| parts.uri.clone());
+        let content_type = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        let facts = ticket::RequestFacts {
+            method: parts.method.as_str(),
+            path: uri.path(),
+            query: uri.query().unwrap_or(""),
+            content_type,
+            body_sha256: body.0,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let verified = ticket::verify(trust, token, proof, &facts, now).map_err(refuse)?;
+
+        let own_origin = url::Url::parse(&state.config.public_url)
+            .map(|u| u.origin().ascii_serialization())
+            .ok();
+        if own_origin.as_deref() != Some(verified.htu_origin.as_str())
+            && !state
+                .domain_cache
+                .is_allowed_origin(&verified.htu_origin)
+                .await
+        {
+            return Err(refuse(Refusal::Proof("origin")));
+        }
+
+        let backend = state.db_backend;
+        let found: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
+            "SELECT id, is_super FROM happyview_users WHERE did = ?",
+            backend,
+        ))
+        .bind(&verified.did)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("user auth query failed: {e}")))?;
+        let Some((user_id, is_super_int)) = found else {
+            return Err(refuse(Refusal::NotAUser));
+        };
+        let is_super = is_super_int != 0;
+        let permissions = if is_super {
+            HashSet::new()
+        } else {
+            Self::load_permissions(&state.db, &user_id, backend).await?
+        };
+
+        tracing::info!(
+            did = %verified.did,
+            issuer = %verified.issuer,
+            jkt = %verified.jkt,
+            ticket_jti = %verified.ticket_jti,
+            method = %parts.method,
+            path = uri.path(),
+            "admin request by management ticket"
+        );
+
+        Ok(UserAuth {
+            did: verified.did,
+            user_id,
+            is_super,
+            is_platform: false,
+            ticket: Some(TicketCaller {
+                issuer: verified.issuer,
+                jkt: verified.jkt,
+                ticket_jti: verified.ticket_jti,
+            }),
             permissions,
             db: state.db.clone(),
             db_backend: backend,
@@ -438,6 +584,7 @@ impl UserAuth {
                 user_id: String::new(),
                 is_super: false,
                 is_platform: true,
+                ticket: None,
                 permissions: PLATFORM_PERMISSIONS.iter().copied().collect(),
                 db: state.db.clone(),
                 db_backend: state.db_backend,
@@ -498,6 +645,7 @@ impl UserAuth {
             // management, transfer_super) stay unavailable via API keys.
             is_super: false,
             is_platform: false,
+            ticket: None,
             permissions,
             db: state.db.clone(),
             db_backend: backend,
