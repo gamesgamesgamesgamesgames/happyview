@@ -261,6 +261,7 @@ pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
         plugin_cache_dir: None,
         platform_api_key_hash: None,
         caller_assertions: None,
+        management_tickets: None,
         job_worker_concurrency: 1,
         superadmin_did: None,
         project_root: None,
