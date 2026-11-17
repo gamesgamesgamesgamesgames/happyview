@@ -465,6 +465,7 @@ mod tests {
             ),
             "{err}"
         );
+        assert_eq!(err.code(), "RATE_LIMITED");
         // Another run starts its own count.
         let next = ScriptRun {
             trigger_id: "xrpc.procedure:app.test.p".into(),
