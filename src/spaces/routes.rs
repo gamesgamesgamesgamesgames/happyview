@@ -2313,6 +2313,11 @@ impl ExchangeGeneration {
 /// `credentialKid` (Oct 29), or, when it names neither, the simplespace
 /// exchange, which binds the key named by an `atproto-space` signature over
 /// the request.
+///
+/// A body that names a did:key with `credentialKey` or `credentialKid` and
+/// also carries `dpopJkt` is taken as the Nov 12 or Oct 29 exchange, binding
+/// the did:key, and `dpopJkt` is ignored. The `dpopJkt` refusal is only for a
+/// simplespace exchange that names no did:key.
 fn exchange_generation(
     input: &GetSpaceCredentialInput,
     headers: &axum::http::HeaderMap,
