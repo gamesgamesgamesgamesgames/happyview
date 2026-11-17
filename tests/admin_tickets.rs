@@ -343,3 +343,60 @@ fn call_args(src: &str) -> Vec<String> {
     }
     args
 }
+
+#[tokio::test]
+#[serial]
+async fn a_proof_is_used_once() {
+    let issuer = Issuer::new();
+    let app = app_trusting(&issuer).await;
+    let first = issuer
+        .request(&app.admin_did, "GET", "/admin/stats", b"", b"", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let mut again = Request::builder().method("GET").uri("/admin/stats");
+    for (name, value) in first.headers() {
+        again = again.header(name, value);
+    }
+    assert_eq!(send(&app, first).await, StatusCode::OK);
+    assert_eq!(
+        send(&app, again.body(Body::empty()).unwrap()).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A request whose ticket fails is refused on its headers, before its body is
+/// read: an oversized body gets the ticket's 401, not the 413 that reading it
+/// would.
+#[tokio::test]
+#[serial]
+async fn a_failing_ticket_is_refused_before_its_body_is_read() {
+    let issuer = Issuer::new();
+    let app = app_trusting(&issuer).await;
+    let huge = vec![b' '; happyview::auth::ticket::MAX_BODY_BYTES + 1];
+    let req = issuer
+        .request(
+            &app.admin_did,
+            "PUT",
+            "/admin/settings/app_name",
+            b"{}",
+            b"{}",
+            "https://elsewhere.example",
+        )
+        .body(Body::from(huge.clone()))
+        .unwrap();
+    assert_eq!(send(&app, req).await, StatusCode::UNAUTHORIZED);
+
+    // With a valid ticket the same body is read, and is too large.
+    let req = issuer
+        .request(
+            &app.admin_did,
+            "PUT",
+            "/admin/settings/app_name",
+            b"{}",
+            b"{}",
+            ORIGIN,
+        )
+        .body(Body::from(huge))
+        .unwrap();
+    assert_eq!(send(&app, req).await, StatusCode::PAYLOAD_TOO_LARGE);
+}

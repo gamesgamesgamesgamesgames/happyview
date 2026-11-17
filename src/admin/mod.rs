@@ -397,6 +397,9 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             delete(verification_methods::delete),
         )
         // Outermost, so every route above, the record source's included, sees
-        // the body hash a management ticket's proof is checked against.
-        .layer(axum::middleware::from_fn(crate::auth::ticket::buffer_body))
+        // a management ticket only once it has been verified.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::ticket::gate,
+        ))
 }

@@ -21,7 +21,6 @@
 //! [`Claims`]: crate::auth::Claims
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -196,12 +195,10 @@ pub struct RequestFacts<'a> {
     /// The raw query string, without `?`; empty when there is none.
     pub query: &'a str,
     pub content_type: Option<&'a str>,
-    /// SHA-256 of the raw body, from [`buffer_body`].
-    pub body_sha256: [u8; 32],
 }
 
-/// A ticket and proof that verified. The caller still has to check that
-/// `htu_origin` is one of this instance's origins, and that `did` is a user.
+/// A ticket and proof that verified. [`gate`] leaves it in the request's
+/// extensions; the admin extractor then checks that `did` is a user.
 #[derive(Debug, Clone)]
 pub struct Verified {
     pub did: String,
@@ -209,6 +206,34 @@ pub struct Verified {
     pub ticket_jti: String,
     pub issuer: String,
     pub htu_origin: String,
+}
+
+/// What [`verify_head`] verified from the headers alone, and what is left to
+/// check once the body has been read.
+pub struct Head {
+    pub verified: Verified,
+    /// The proof's body hash, still to be compared with the body.
+    bh: String,
+    proof_jti: String,
+    /// When the proof's `jti` may be forgotten: the ticket's expiry plus
+    /// leeway, after which the ticket itself is refused.
+    pub forget_at: u64,
+}
+
+impl Head {
+    /// Compare the proof's body hash with the body's.
+    pub fn check_body(&self, body_sha256: &[u8; 32]) -> Result<(), Refusal> {
+        if self.bh == URL_SAFE_NO_PAD.encode(body_sha256) {
+            Ok(())
+        } else {
+            Err(Refusal::Proof("body"))
+        }
+    }
+
+    /// The key the proof's `jti` is recorded under.
+    pub fn replay_key(&self) -> String {
+        format!("{}:{}", self.verified.jkt, self.proof_jti)
+    }
 }
 
 #[derive(Deserialize)]
@@ -255,27 +280,38 @@ struct ProofClaims {
     jti: String,
 }
 
-/// Verify a ticket and its proof against `trust` and the request, at `now`
-/// (Unix seconds). Records the proof's `jti` only once everything else holds.
-pub fn verify(
+/// Verify a ticket and its proof against `trust` and the request's head, at
+/// `now` (Unix seconds): everything except the body hash and replay, which
+/// need the body and the database. Nothing here reads the body, so a request
+/// that fails costs no buffering.
+pub fn verify_head(
     trust: &TicketTrust,
     ticket: &str,
     proof: &str,
     facts: &RequestFacts<'_>,
     now: u64,
-) -> Result<Verified, Refusal> {
+) -> Result<Head, Refusal> {
     let t = ticket_claims(trust, ticket, now)?;
     let jkt = t.cnf.jkt.clone();
-    proof_claims(proof, &jkt, ticket, facts, now).and_then(|(origin, proof_jti)| {
-        record_jti(&jkt, &proof_jti, t.exp + TICKET_LEEWAY_SECS, now)?;
-        Ok(Verified {
+    let p = proof_claims(proof, &jkt, ticket, facts, now)?;
+    Ok(Head {
+        verified: Verified {
             did: t.sub,
             jkt,
             ticket_jti: t.jti,
             issuer: t.iss,
-            htu_origin: origin,
-        })
+            htu_origin: p.origin,
+        },
+        bh: p.bh,
+        proof_jti: p.jti,
+        forget_at: t.exp + TICKET_LEEWAY_SECS,
     })
+}
+
+struct CheckedProof {
+    origin: String,
+    bh: String,
+    jti: String,
 }
 
 fn ticket_claims(trust: &TicketTrust, ticket: &str, now: u64) -> Result<TicketClaims, Refusal> {
@@ -316,14 +352,14 @@ fn ticket_claims(trust: &TicketTrust, ticket: &str, now: u64) -> Result<TicketCl
     Ok(t)
 }
 
-/// Check the proof; answers the origin its `htu` names and its `jti`.
+/// Check the proof against the request's head.
 fn proof_claims(
     proof: &str,
     jkt: &str,
     ticket: &str,
     facts: &RequestFacts<'_>,
     now: u64,
-) -> Result<(String, String), Refusal> {
+) -> Result<CheckedProof, Refusal> {
     let bad = Refusal::Proof;
     let (header, claims, signing_input, sig) = split_jws(proof).ok_or(bad("format"))?;
     let header: ProofHeader = serde_json::from_slice(&header).map_err(|_| bad("header"))?;
@@ -355,8 +391,8 @@ fn proof_claims(
     if p.ct.as_deref() != facts.content_type {
         return Err(bad("content_type"));
     }
-    if p.bh != URL_SAFE_NO_PAD.encode(facts.body_sha256) {
-        return Err(bad("body"));
+    if URL_SAFE_NO_PAD.decode(&p.bh).map(|b| b.len()) != Ok(32) {
+        return Err(bad("claims"));
     }
     if p.ath != b64_sha256(ticket.as_bytes()) {
         return Err(bad("ticket_binding"));
@@ -367,7 +403,11 @@ fn proof_claims(
     if p.jti.is_empty() || p.jti.len() > 128 {
         return Err(bad("claims"));
     }
-    Ok((origin, p.jti))
+    Ok(CheckedProof {
+        origin,
+        bh: p.bh,
+        jti: p.jti,
+    })
 }
 
 /// `(origin, path)` of an absolute http(s) URL with no query or fragment.
@@ -436,25 +476,6 @@ fn b64_sha256(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
 }
 
-/// Seen proof `jti`s, keyed by the proof key, mapped to when they can be
-/// forgotten: the ticket's expiry plus leeway, after which the ticket itself
-/// is refused. In-memory and per-process, which covers a single-process
-/// instance.
-static SEEN: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn record_jti(jkt: &str, jti: &str, forget_at: u64, now: u64) -> Result<(), Refusal> {
-    let key = format!("{jkt}:{jti}");
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.get(&key).is_some_and(|&at| at > now) {
-        return Err(Refusal::Replay);
-    }
-    if seen.len() > 10_000 {
-        seen.retain(|_, &mut at| at > now);
-    }
-    seen.insert(key, forget_at);
-    Ok(())
-}
-
 /// Whether the request presents a ticket.
 pub fn presents_ticket(headers: &HeaderMap) -> bool {
     headers
@@ -481,16 +502,126 @@ pub fn check_alone(headers: &HeaderMap) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The body hash [`buffer_body`] leaves for the verifier.
-#[derive(Clone, Copy)]
-pub struct BodySha256(pub [u8; 32]);
+/// Record a proof's `jti`, refusing one already recorded. Backed by the
+/// database, so every process serving this instance sees the same set.
+/// Expired rows are swept as new ones arrive.
+pub async fn record_jti(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    key: &str,
+    forget_at: u64,
+    now: u64,
+) -> Result<(), crate::error::AppError> {
+    use crate::db::adapt_sql;
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_ticket_proofs WHERE forget_at < ?",
+        backend,
+    ))
+    .bind(now as i64)
+    .execute(db)
+    .await
+    .map_err(|e| crate::error::AppError::Internal(format!("ticket replay sweep failed: {e}")))?;
+    match crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_ticket_proofs (proof_key, forget_at) VALUES (?, ?)",
+        backend,
+    ))
+    .bind(key)
+    .bind(forget_at as i64)
+    .execute(db)
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation()) =>
+        {
+            Err(Refusal::Replay.into_app_error())
+        }
+        Err(e) => Err(crate::error::AppError::Internal(format!(
+            "ticket replay record failed: {e}"
+        ))),
+    }
+}
 
-/// Buffer and hash the body of a request that presents a ticket, so the
-/// verifier can check the proof's `bh`. Other requests pass untouched.
-pub async fn buffer_body(req: Request, next: Next) -> Response {
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify a request that presents a management ticket, in an order that
+/// spends nothing on one that fails: the headers first, then the body (read
+/// only once the ticket and proof hold, and only up to the largest body an
+/// admin route accepts), then its hash, then replay. A request that passes
+/// carries [`Verified`] on to the admin extractor; other requests pass
+/// untouched.
+pub async fn gate(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
     if !presents_ticket(req.headers()) {
         return next.run(req).await;
     }
+    let refuse = |r: Refusal, path: &str| {
+        tracing::warn!(step = r.step(), path, "refused a management ticket");
+        r.into_app_error().into_response()
+    };
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+
+    let Some(trust) = state.config.management_tickets.as_ref() else {
+        return refuse(Refusal::Disabled, path.path());
+    };
+    if let Err(r) = check_alone(req.headers()) {
+        return refuse(r, path.path());
+    }
+    let headers = req.headers();
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix(SCHEME))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let Some(proof) = headers
+        .get(PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
+        return refuse(Refusal::MissingProof, path.path());
+    };
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let method = req.method().as_str().to_string();
+    let facts = RequestFacts {
+        method: &method,
+        path: path.path(),
+        query: path.query().unwrap_or(""),
+        content_type: content_type.as_deref(),
+    };
+    let now = now_secs();
+    let head = match verify_head(trust, &token, &proof, &facts, now) {
+        Ok(h) => h,
+        Err(r) => return refuse(r, path.path()),
+    };
+
+    let own_origin = url::Url::parse(&state.config.public_url)
+        .map(|u| u.origin().ascii_serialization())
+        .ok();
+    let origin = &head.verified.htu_origin;
+    if own_origin.as_deref() != Some(origin.as_str())
+        && !state.domain_cache.is_allowed_origin(origin).await
+    {
+        return refuse(Refusal::Proof("origin"), path.path());
+    }
+
     let (mut parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
@@ -499,7 +630,27 @@ pub async fn buffer_body(req: Request, next: Next) -> Response {
         }
     };
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    parts.extensions.insert(BodySha256(digest));
+    if let Err(r) = head.check_body(&digest) {
+        return refuse(r, path.path());
+    }
+    if let Err(e) = record_jti(
+        &state.db,
+        state.db_backend,
+        &head.replay_key(),
+        head.forget_at,
+        now,
+    )
+    .await
+    {
+        tracing::warn!(
+            step = "replay",
+            path = path.path(),
+            "refused a management ticket"
+        );
+        return e.into_response();
+    }
+
+    parts.extensions.insert(head.verified);
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
 }
@@ -619,12 +770,13 @@ pub(crate) mod tests {
                 path: "/admin/settings/x",
                 query: "a=1",
                 content_type: Some("application/json"),
-                body_sha256: Sha256::digest(b"{}").into(),
             }
         }
 
         fn check(&self, ticket: &str, proof: &str) -> Result<Verified, Refusal> {
-            verify(&self.trust, ticket, proof, &self.facts(), self.now)
+            let head = verify_head(&self.trust, ticket, proof, &self.facts(), self.now)?;
+            head.check_body(&Sha256::digest(b"{}").into())?;
+            Ok(head.verified)
         }
     }
 
@@ -642,15 +794,6 @@ pub(crate) mod tests {
         assert_eq!(v.jkt, f.jkt());
         assert_eq!(v.ticket_jti, "ticket-1");
         assert_eq!(v.htu_origin, "https://instance.example");
-    }
-
-    #[test]
-    fn a_proof_is_used_once() {
-        let f = fixture();
-        let ticket = f.ticket();
-        let proof = f.proof_with(f.proof_claims(&ticket, &unique("once")));
-        f.check(&ticket, &proof).unwrap();
-        assert_eq!(f.check(&ticket, &proof).unwrap_err(), Refusal::Replay);
     }
 
     #[test]

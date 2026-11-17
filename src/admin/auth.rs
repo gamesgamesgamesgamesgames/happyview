@@ -308,80 +308,26 @@ impl UserAuth {
     /// `Claims`, and never bootstraps a first user: the ticket's DID must
     /// already be a user here.
     async fn ticket_auth(parts: &Parts, state: &AppState) -> Result<Self, AppError> {
-        use crate::auth::ticket::{self, Refusal};
+        use crate::auth::ticket::{Refusal, Verified};
 
-        let refuse = |r: Refusal| {
-            tracing::warn!(
-                step = r.step(),
-                path = parts.uri.path(),
-                "refused a management ticket"
-            );
-            r.into_app_error()
-        };
-
-        let trust = state
-            .config
-            .management_tickets
-            .as_ref()
-            .ok_or_else(|| refuse(Refusal::Disabled))?;
-        ticket::check_alone(&parts.headers).map_err(refuse)?;
-
-        let header = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let token = header
-            .strip_prefix(ticket::SCHEME)
-            .unwrap_or_default()
-            .trim();
-        let proof = parts
-            .headers
-            .get(ticket::PROOF_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| refuse(Refusal::MissingProof))?;
-
-        let body = parts
-            .extensions
-            .get::<ticket::BodySha256>()
-            .copied()
-            .ok_or_else(|| {
-                AppError::Internal("management ticket on a route without body hashing".into())
-            })?;
+        // `auth::ticket::gate` verified the ticket, its proof, the body and
+        // replay before the request got here, and left what it verified.
+        let verified = parts.extensions.get::<Verified>().cloned().ok_or_else(|| {
+            AppError::Internal("management ticket on a route without the ticket gate".into())
+        })?;
         let uri = parts
             .extensions
             .get::<axum::extract::OriginalUri>()
             .map(|u| u.0.clone())
             .unwrap_or_else(|| parts.uri.clone());
-        let content_type = parts
-            .headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
-        let facts = ticket::RequestFacts {
-            method: parts.method.as_str(),
-            path: uri.path(),
-            query: uri.query().unwrap_or(""),
-            content_type,
-            body_sha256: body.0,
+        let refuse = |r: Refusal| {
+            tracing::warn!(
+                step = r.step(),
+                path = uri.path(),
+                "refused a management ticket"
+            );
+            r.into_app_error()
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let verified = ticket::verify(trust, token, proof, &facts, now).map_err(refuse)?;
-
-        let own_origin = url::Url::parse(&state.config.public_url)
-            .map(|u| u.origin().ascii_serialization())
-            .ok();
-        if own_origin.as_deref() != Some(verified.htu_origin.as_str())
-            && !state
-                .domain_cache
-                .is_allowed_origin(&verified.htu_origin)
-                .await
-        {
-            return Err(refuse(Refusal::Proof("origin")));
-        }
 
         let backend = state.db_backend;
         let found: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
