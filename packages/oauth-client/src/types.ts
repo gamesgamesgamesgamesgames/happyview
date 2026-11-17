@@ -2,6 +2,8 @@ export interface StorageAdapter {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;
+  /** Every key held, when the adapter can list them; used to sweep stale entries. */
+  keys?(): Promise<string[]>;
 }
 
 export interface SessionEventHooks {
@@ -19,6 +21,11 @@ export interface KeyStore {
   get(id: string): Promise<CryptoKeyPair | null>;
   set(id: string, pair: CryptoKeyPair): Promise<void>;
   delete(id: string): Promise<void>;
+  /**
+   * Every id held and when it was set (milliseconds), when the store can
+   * list them; used to sweep keys left by sign-ins that never finished.
+   */
+  entries?(): Promise<Array<{ id: string; createdAt: number }>>;
 }
 
 export interface HappyViewOAuthClientOptions {

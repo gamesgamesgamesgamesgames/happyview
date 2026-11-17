@@ -80,9 +80,15 @@ export class HappyViewOAuthClient {
     return this.clientSecret !== undefined;
   }
 
+  /**
+   * With a key store, `dpopKey` is made from a non-extractable import, also
+   * returned as `dpopKeyPair`, so no extractable `CryptoKey` of it ever
+   * exists. `rawJwk` is the key as the instance sent it.
+   */
   async provisionDpopKey(): Promise<{
     provisionId: string;
     dpopKey: Key;
+    dpopKeyPair?: CryptoKeyPair;
     rawJwk: JsonWebKey;
     pkceVerifier?: string;
     confidential: boolean;
@@ -120,10 +126,16 @@ export class HappyViewOAuthClient {
     }
 
     const data: ProvisionKeyResponse = await resp.json();
-    const dpopKey = await importJwk(data.dpop_key);
+    const dpopKeyPair = this.keyStore
+      ? await importKeyPair(data.dpop_key, { extractable: false })
+      : undefined;
+    const dpopKey = dpopKeyPair
+      ? await keyFromPair(dpopKeyPair)
+      : await importJwk(data.dpop_key);
     return {
       provisionId: data.provision_id,
       dpopKey,
+      dpopKeyPair,
       rawJwk: data.dpop_key,
       pkceVerifier,
       confidential: data.confidential ?? false,

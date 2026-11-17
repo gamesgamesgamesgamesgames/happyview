@@ -1,18 +1,24 @@
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { jwkThumbprint, sessionKeyId, type KeyStore } from "@happyview/oauth-client";
-import { HappyViewBrowserClient } from "../browser-client";
+import { HappyViewBrowserClient, PENDING_SIGN_IN_TTL_MS } from "../browser-client";
 import { LocalStorageAdapter } from "../local-storage-adapter";
 
 class MemoryKeyStore implements KeyStore {
   readonly pairs = new Map<string, CryptoKeyPair>();
+  readonly times = new Map<string, number>();
   async get(id: string) {
     return this.pairs.get(id) ?? null;
   }
   async set(id: string, pair: CryptoKeyPair) {
     this.pairs.set(id, pair);
+    this.times.set(id, Date.now());
   }
   async delete(id: string) {
     this.pairs.delete(id);
+    this.times.delete(id);
+  }
+  async entries() {
+    return [...this.times].map(([id, createdAt]) => ({ id, createdAt }));
   }
 }
 
@@ -128,5 +134,45 @@ describe("sign-in with a key store", () => {
     expect(everythingStored()).toContain(testJwk.d!);
     await c.callback(`?code=c&state=${state}`);
     expect(everythingStored()).toContain(testJwk.d!);
+  });
+
+  test("provisioning never makes an extractable key", async () => {
+    const keys = new MemoryKeyStore();
+    const c = client(keys, fetchFor() as unknown as typeof fetch);
+    const provisioned = await c.provisionDpopKey();
+    expect(provisioned.dpopKeyPair!.privateKey.extractable).toBe(false);
+    const { state } = await c.prepareLogin(DID);
+    expect(keys.pairs.get(`pending:${state}`)!.privateKey.extractable).toBe(false);
+  });
+
+  test("sign-ins abandoned for over an hour are swept, and newer ones kept", async () => {
+    const keys = new MemoryKeyStore();
+    const fetchFn = fetchFor() as unknown as typeof fetch;
+    const c = client(keys, fetchFn);
+    const old = await c.prepareLogin(DID);
+    const fresh = await c.prepareLogin(DID);
+    const later = Date.now() + 30 * 60 * 1000;
+    keys.times.set(`pending:${old.state}`, later - PENDING_SIGN_IN_TTL_MS - 1);
+    const pendingKey = (state: string) => `@happyview/oauth(pending-auth:${state})`;
+    const aged = JSON.parse(localStorage.getItem(pendingKey(old.state))!);
+    localStorage.setItem(pendingKey(old.state), JSON.stringify({ ...aged, createdAt: later - PENDING_SIGN_IN_TTL_MS - 1 }));
+
+    await c.sweepPendingSignIns(later);
+    expect(keys.pairs.has(`pending:${old.state}`)).toBe(false);
+    expect(localStorage.getItem(pendingKey(old.state))).toBeNull();
+    expect(keys.pairs.has(`pending:${fresh.state}`)).toBe(true);
+    expect(localStorage.getItem(pendingKey(fresh.state))).not.toBeNull();
+    // The one left still completes.
+    expect((await c.callback(`?code=c&state=${fresh.state}`)).did).toBe(DID);
+  });
+
+  test("a pending sign-in from before timing starts its clock when swept", async () => {
+    const c = client(new MemoryKeyStore(), fetchFor() as unknown as typeof fetch);
+    const key = "@happyview/oauth(pending-auth:legacy)";
+    localStorage.setItem(key, JSON.stringify({ did: DID, state: "legacy" }));
+    await c.sweepPendingSignIns(1_000);
+    expect(JSON.parse(localStorage.getItem(key)!).createdAt).toBe(1_000);
+    await c.sweepPendingSignIns(1_000 + PENDING_SIGN_IN_TTL_MS + 1);
+    expect(localStorage.getItem(key)).toBeNull();
   });
 });

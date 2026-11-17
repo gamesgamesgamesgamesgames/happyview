@@ -3,6 +3,9 @@ import type { KeyStore } from "@happyview/oauth-client";
 const DEFAULT_DB = "@happyview/oauth-client-browser(keys)";
 const STORE = "keys";
 
+/** What a record holds: the pair, and when it was stored. */
+type Entry = { pair: CryptoKeyPair; createdAt: number };
+
 /**
  * A key store on IndexedDB, which keeps a `CryptoKey` as the object itself.
  * A non-extractable key stays non-extractable across page loads: the page can
@@ -48,12 +51,30 @@ export class IndexedDbKeyStore implements KeyStore {
   }
 
   async get(id: string): Promise<CryptoKeyPair | null> {
-    const pair = await this.run("readonly", (s) => s.get(id));
-    return (pair as CryptoKeyPair | undefined) ?? null;
+    const entry = (await this.run("readonly", (s) => s.get(id))) as Entry | undefined;
+    return entry?.pair ?? null;
   }
 
   async set(id: string, pair: CryptoKeyPair): Promise<void> {
-    await this.run("readwrite", (s) => s.put(pair, id));
+    const entry: Entry = { pair, createdAt: Date.now() };
+    await this.run("readwrite", (s) => s.put(entry, id));
+  }
+
+  async entries(): Promise<Array<{ id: string; createdAt: number }>> {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const out: Array<{ id: string; createdAt: number }> = [];
+      const tx = db.transaction(STORE, "readonly");
+      const cursor = tx.objectStore(STORE).openCursor();
+      cursor.onsuccess = () => {
+        const c = cursor.result;
+        if (!c) return;
+        out.push({ id: String(c.key), createdAt: (c.value as Entry).createdAt ?? 0 });
+        c.continue();
+      };
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => reject(tx.error);
+    });
   }
 
   async delete(id: string): Promise<void> {

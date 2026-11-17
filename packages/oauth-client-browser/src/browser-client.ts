@@ -6,7 +6,6 @@ import {
   HappyViewSession,
   LAST_ACTIVE_KEY,
   importJwk,
-  importKeyPair,
   jwkThumbprint,
   keyFromPair,
   publicJwkOf,
@@ -52,6 +51,10 @@ export interface HappyViewBrowserClientOptions {
 
 /** The key store id of the key for a sign-in still in progress. */
 const pendingKeyId = (state: string) => `pending:${state}`;
+const PENDING_AUTH_PREFIX = "pending-auth:";
+
+/** A sign-in not finished in this long is abandoned, and swept. */
+export const PENDING_SIGN_IN_TTL_MS = 60 * 60 * 1000;
 
 interface PendingAuthState {
   did: string;
@@ -60,6 +63,8 @@ interface PendingAuthState {
   rawJwk?: JsonWebKey;
   /** Its public half, when the private key waits in the key store. */
   publicJwk?: JsonWebKey;
+  /** When the sign-in started (milliseconds); older ones are swept. */
+  createdAt?: number;
   provisionPkceVerifier: string;
   authPkceVerifier: string;
   pdsUrl: string;
@@ -147,6 +152,47 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       fetch: fetchFn,
     });
     this.didResolver = new DidResolverCommon({ fetch: fetchFn });
+    // Best effort, in the background: nothing waits on it.
+    this.sweepPendingSignIns().catch(() => undefined);
+  }
+
+  /**
+   * Remove what sign-ins that never finished left behind: their keys in the
+   * key store and their pending state in storage, once older than
+   * `PENDING_SIGN_IN_TTL_MS`. Runs when the client is made; exposed so a
+   * caller can run it again.
+   */
+  async sweepPendingSignIns(now: number = Date.now()): Promise<void> {
+    const cutoff = now - PENDING_SIGN_IN_TTL_MS;
+    const stale = new Set<string>();
+    for (const { id, createdAt } of (await this.keyStore?.entries?.()) ?? []) {
+      if (id.startsWith("pending:") && createdAt < cutoff) {
+        stale.add(id.slice("pending:".length));
+      }
+    }
+    for (const key of (await this.storage.keys?.()) ?? []) {
+      if (!key.startsWith(PENDING_AUTH_PREFIX)) continue;
+      const state = key.slice(PENDING_AUTH_PREFIX.length);
+      const raw = await this.storage.get(key);
+      let pending: PendingAuthState | undefined;
+      try {
+        pending = raw ? (JSON.parse(raw) as PendingAuthState) : undefined;
+      } catch {
+        pending = undefined;
+      }
+      if (!pending) {
+        stale.add(state);
+      } else if (pending.createdAt === undefined) {
+        // From before sign-ins were timed: start its clock now.
+        await this.storage.set(key, JSON.stringify({ ...pending, createdAt: now }));
+      } else if (pending.createdAt < cutoff) {
+        stale.add(state);
+      }
+    }
+    for (const state of stale) {
+      await this.storage.delete(`${PENDING_AUTH_PREFIX}${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
+    }
   }
 
   async prepareLogin(
@@ -180,6 +226,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const {
       provisionId,
       rawJwk,
+      dpopKey: provisionedKey,
+      dpopKeyPair,
       pkceVerifier: provisionPkceVerifier,
       confidential,
     } = await this.provisionDpopKey();
@@ -192,21 +240,20 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     // With a key store, the private key waits there, non-extractable, for the
     // redirect back; storage only ever sees the public half.
+    // provisionDpopKey imported it non-extractable already.
     let keyFields: Pick<PendingAuthState, "rawJwk" | "publicJwk">;
-    let signingKey: Key;
-    if (this.keyStore) {
-      const pair = await importKeyPair(rawJwk, { extractable: false });
-      await this.keyStore.set(pendingKeyId(state), pair);
-      signingKey = await keyFromPair(pair);
+    const signingKey: Key = provisionedKey;
+    if (this.keyStore && dpopKeyPair) {
+      await this.keyStore.set(pendingKeyId(state), dpopKeyPair);
       keyFields = { publicJwk: publicJwkOf(rawJwk) };
     } else {
-      signingKey = await importJwk(rawJwk);
       keyFields = { rawJwk };
     }
 
     const pendingState: PendingAuthState = {
       did,
       provisionId,
+      createdAt: Date.now(),
       ...keyFields,
       provisionPkceVerifier: provisionPkceVerifier!,
       authPkceVerifier,

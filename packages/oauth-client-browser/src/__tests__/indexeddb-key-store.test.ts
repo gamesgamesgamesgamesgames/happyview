@@ -30,4 +30,14 @@ describe("IndexedDbKeyStore", () => {
     expect(await other.get("k")).toBeNull();
     expect(await other.get("never-set")).toBeNull();
   });
+
+  test("lists what it holds, with when each was stored", async () => {
+    const store = new IndexedDbKeyStore("keys", new IDBFactory());
+    const before = Date.now();
+    await store.set("pending:a", await pair());
+    await store.set("session:did:plc:b", await pair());
+    const entries = await store.entries();
+    expect(entries.map((e) => e.id).sort()).toEqual(["pending:a", "session:did:plc:b"]);
+    for (const e of entries) expect(e.createdAt).toBeGreaterThanOrEqual(before);
+  });
 });
