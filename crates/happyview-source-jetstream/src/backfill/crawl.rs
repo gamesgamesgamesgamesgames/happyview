@@ -1196,7 +1196,13 @@ pub(crate) async fn feed_pending_retries(
                 queue
                     .window
                     .settle(batch, i64::try_from(added).unwrap_or(i64::MAX));
+                let before = requeued;
                 requeued += added;
+                // A large backlog takes the whole run to feed; say how far
+                // it has got every 100,000 units.
+                if requeued / 100_000 > before / 100_000 {
+                    tracing::info!(job_id, requeued, "queuing pending fetch retries again");
+                }
                 match next {
                     Some(next) => after = Some(next),
                     None => return Ok(Some(requeued)),
