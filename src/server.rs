@@ -178,12 +178,12 @@ const CORS_ALLOW_METHODS: &str = "GET, POST, DELETE, OPTIONS";
 
 /// Headers a credentialed (first-party, cookie-bearing) request may send.
 const CORS_ALLOW_HEADERS_CREDENTIALED: &str = "content-type, authorization, cookie, x-client-key, x-client-secret, dpop, \
-     atproto-accept-labelers, atproto-proxy";
+     atproto-accept-labelers, atproto-proxy, hv-ticket-proof";
 
 /// Headers a credential-less (third-party, cookieless DPoP) request may send.
 /// Identical to the credentialed set minus `cookie`.
 const CORS_ALLOW_HEADERS_ANON: &str = "content-type, authorization, x-client-key, x-client-secret, dpop, \
-     atproto-accept-labelers, atproto-proxy";
+     atproto-accept-labelers, atproto-proxy, hv-ticket-proof";
 
 /// Cross-Origin Resource Sharing policy.
 ///

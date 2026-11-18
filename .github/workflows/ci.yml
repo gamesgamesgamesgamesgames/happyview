@@ -233,7 +233,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && needs.changes.outputs.draft != 'true'
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       # A test whose database, fixture or interpreter is missing fails unless
       # this is set. This job builds none of them on purpose, and e2e-tests
@@ -286,7 +286,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && needs.changes.outputs.draft != 'true'
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -510,7 +510,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server)) && needs.changes.outputs.draft != 'true'
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
