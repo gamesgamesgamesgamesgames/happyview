@@ -424,14 +424,32 @@ async fn the_single_member_methods_keep_the_published_list() {
             .contains(&(b.clone(), true, true))
     );
 
+    // Simplespace's addMember, which predates putMember.
+    let c = rand_did("c");
     let (status, body) = post(
         &app,
         &owner,
-        "com.atproto.simplespace.removeMember",
-        json!({ "space": space, "did": b }),
+        "com.atproto.simplespace.addMember",
+        json!({ "space": space, "did": c, "access": "read" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        member_records(&app, &space)
+            .await
+            .contains(&(c.clone(), true, false))
+    );
+
+    for did in [&b, &c] {
+        let (status, body) = post(
+            &app,
+            &owner,
+            "com.atproto.simplespace.removeMember",
+            json!({ "space": space, "did": did }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
     let (status, body) = post(
         &app,
         &owner,
@@ -695,4 +713,88 @@ async fn syncers_hear_about_a_published_member() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Wait until a request on another connection is waiting on a lock, on
+/// Postgres; on SQLite, give it time to reach its `BEGIN IMMEDIATE`.
+async fn until_waiting_on_a_lock(app: &TestApp) {
+    if app.state.db_backend != happyview::db::DatabaseBackend::Postgres {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        return;
+    }
+    for _ in 0..100 {
+        let waiting: i64 = happyview::db::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+}
+
+/// `putMembers` reads the space again under its row lock, so a migration to
+/// a managedspace that commits first is seen: the batch is refused with
+/// `PolicyMismatch` and adds no member.
+#[tokio::test]
+#[serial]
+async fn put_members_follows_a_migration_to_managedspace_that_commits_first() {
+    common::require_db!();
+    let app = setup().await;
+    let backend = app.state.db_backend;
+    let owner = rand_did("owner");
+    let joiner = rand_did("joiner");
+    let space = create(&app, &owner, memberspace(json!({}))).await;
+    let mut row = space_row(&app, &space).await;
+
+    // The migration, as `updateSpace` makes it, not yet committed.
+    let mut migration = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    happyview::spaces::db::lock_space(&mut *migration, backend, &row.id)
+        .await
+        .unwrap();
+    row.read_policy = happyview::spaces::types::Policy::ManagingApp {
+        managing_app: "did:plc:app".into(),
+    };
+    row.write_policy = row.read_policy.clone();
+    happyview::spaces::db::update_space(&mut *migration, backend, &row)
+        .await
+        .unwrap();
+    happyview::spaces::db::remove_all_members(&mut *migration, backend, &row.id)
+        .await
+        .unwrap();
+
+    let router = app.router.clone();
+    let (name, value) = common::auth::admin_cookie_header(&owner, &app.state.cookie_key);
+    let body =
+        json!({ "space": space, "members": [{ "did": joiner, "read": true, "write": false }] });
+    let put = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.memberspace.putMembers")
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, json_of(resp).await)
+    });
+    until_waiting_on_a_lock(&app).await;
+    migration.commit().await.unwrap();
+
+    let (status, body) = put.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("PolicyMismatch"));
+    assert!(
+        happyview::spaces::db::get_member(&app.state.db, backend, &row.id, &joiner)
+            .await
+            .unwrap()
+            .is_none(),
+        "no member row"
+    );
 }

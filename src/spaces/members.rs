@@ -102,6 +102,64 @@ pub async fn is_member_locked(
         .map(|e| e.access))
 }
 
+/// [`resolve_members`], read on the caller's connection, so inside its
+/// transaction.
+pub async fn resolve_members_on(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<ResolvedMember>, AppError> {
+    Ok(resolve_on(conn, backend, space_id)
+        .await?
+        .into_iter()
+        .map(|(did, e)| ResolvedMember {
+            did,
+            access: e.access,
+        })
+        .collect())
+}
+
+/// The spaces that take `space_id`'s members through delegation entries,
+/// directly or through other spaces, up to the depth the resolver follows.
+/// Each is listed once, in id order; `space_id` itself is not listed.
+///
+/// This is the reverse of [`resolve_members`]: a change to `space_id`'s
+/// members can change who reads each of these.
+pub async fn delegating_spaces(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut visited: HashSet<String> = HashSet::from([space_id.to_string()]);
+    let mut found: Vec<String> = Vec::new();
+    let mut frontier = vec![space_id.to_string()];
+    for _ in 1..MAX_DELEGATION_DEPTH {
+        let mut next = Vec::new();
+        for child_id in &frontier {
+            let Some(child) = db::get_space(&mut *conn, backend, child_id).await? else {
+                continue;
+            };
+            for entry in db::delegation_entries_naming(&mut *conn, backend, &child).await? {
+                if visited.contains(&entry.space_id) {
+                    continue;
+                }
+                let target = target_id(conn, backend, &entry.did).await;
+                if target.ok().flatten().as_deref() == Some(child_id.as_str()) {
+                    visited.insert(entry.space_id.clone());
+                    found.push(entry.space_id.clone());
+                    next.push(entry.space_id);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    found.sort();
+    Ok(found)
+}
+
 async fn resolve(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,

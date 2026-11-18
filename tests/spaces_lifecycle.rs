@@ -565,7 +565,8 @@ async fn the_creator_is_issued_a_credential_whatever_the_policy_says() {
     }
 }
 
-/// A managedspace has no member list, so none can be written to it.
+/// A managedspace has no member list, so none can be written to it, or
+/// removed from it.
 #[tokio::test]
 #[serial]
 async fn a_managedspace_takes_no_members() {
@@ -581,6 +582,7 @@ async fn a_managedspace_takes_no_members() {
     for method in [
         "com.atproto.simplespace.putMember",
         "com.atproto.simplespace.addMember",
+        "com.atproto.simplespace.removeMember",
     ] {
         let (status, body) = post(
             &app,
