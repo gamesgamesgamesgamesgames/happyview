@@ -540,6 +540,28 @@ pub fn check_alone(headers: &HeaderMap) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Whether `key` is already recorded and not yet expired at `now`: a read
+/// only, so a replayed proof is refused before its body is buffered.
+/// [`record_jti`] stays the authority; this just saves the read.
+pub async fn proof_seen(
+    db: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    key: &str,
+    now: u64,
+) -> Result<bool, crate::error::AppError> {
+    use crate::db::adapt_sql;
+    let row: Option<(i64,)> = crate::db::query_as(&adapt_sql(
+        "SELECT forget_at FROM happyview_ticket_proofs WHERE proof_key = ? AND forget_at >= ?",
+        backend,
+    ))
+    .bind(key)
+    .bind(now as i64)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| crate::error::AppError::Internal(format!("ticket replay lookup failed: {e}")))?;
+    Ok(row.is_some())
+}
+
 /// Record a proof's `jti`: `Ok(false)` when it was already recorded. Backed
 /// by the database, so every process serving this instance sees the same set.
 /// Expired rows are swept as new ones arrive.
@@ -636,7 +658,11 @@ fn with_ticket_detail(
 /// Record a refused request whose ticket itself verified: one the trusted
 /// issuer signed for this instance, refused at a later step. Requests whose
 /// ticket doesn't verify are only traced, so they add nothing to the event
-/// log.
+/// log. At most one row per ticket and step: a client repeating the same
+/// refused request can't fill the log, while the trace line still records
+/// every attempt. If the once-only marker can't be written, the refusal is
+/// logged anyway (fail open), so while the database is failing every refusal
+/// gets its own row again.
 pub async fn log_refusal(
     state: &crate::AppState,
     ticket: &VerifiedTicket,
@@ -644,6 +670,24 @@ pub async fn log_refusal(
     method: &str,
     path: &str,
 ) {
+    // The replay table's unique insert doubles as the once-only marker; the
+    // row goes when the ticket would have expired.
+    let marker = format!("refused:{}:{step}", ticket.ticket_jti);
+    match record_jti(
+        &state.db,
+        state.db_backend,
+        &marker,
+        ticket.exp + TICKET_LEEWAY_SECS,
+        now_secs(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not mark a ticket refusal; logging it anyway");
+        }
+    }
     let detail = with_ticket_detail(
         &serde_json::json!({ "step": step, "method": method, "path": path }),
         &ticket.ticket_jti,
@@ -746,6 +790,17 @@ pub async fn gate(
         let r = Refusal::Proof("origin");
         log_refusal(&state, &ticket, r.step(), &method, path).await;
         return refuse(r);
+    }
+
+    // A proof already used is refused before its body is read, so replaying
+    // one can't make the instance buffer large bodies for the ticket's life.
+    match proof_seen(&state.db, state.db_backend, &head.replay_key(), now).await {
+        Ok(false) => {}
+        Ok(true) => {
+            log_refusal(&state, &ticket, Refusal::Replay.step(), &method, path).await;
+            return refuse(Refusal::Replay);
+        }
+        Err(e) => return e.into_response(),
     }
 
     let (mut parts, body) = req.into_parts();
