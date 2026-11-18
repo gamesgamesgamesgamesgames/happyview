@@ -104,12 +104,18 @@ const EXCLUDED: [&str; 1] = ["bridge/job.controls.lua"];
 /// so the same script returns the rows. The plugin is the one that behaves,
 /// and this is a capability a script gains rather than loses.
 ///
+/// `bridge/query.ctx_fields.lua` lists the keys of `ctx`. The plugin adds
+/// `ctx.caller_assertion` when the run has a caller, through the
+/// `host_caller_assertion` import; the native runner has no such function and
+/// is not getting one. Every other key, and every value, still has to match.
+///
 /// Anything else failing this is a difference nobody decided on; a case
 /// leaving this list is one that has closed, and the count below fails then
 /// too so the list cannot rot.
-const KNOWN_DIFFERENCES: [&str; 4] = [
+const KNOWN_DIFFERENCES: [&str; 5] = [
     "bridge/query.builtins.lua",
     "bridge/query.coroutines.lua",
+    "bridge/query.ctx_fields.lua",
     "procedure.marker_input_read_at_file_scope.expected.lua",
     "query.marker_context_read_at_file_scope.expected.lua",
 ];
