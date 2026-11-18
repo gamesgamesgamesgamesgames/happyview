@@ -60,7 +60,31 @@ export interface RegisterSessionParams {
   dpopKey: JsonWebKey;
   /** The provisioned key already imported, for a client with a key store. */
   dpopKeyPair?: CryptoKeyPair;
+  /**
+   * A key proof pinning a key the client holds to this sign-in
+   * (`hv-key-proof+jwt` with `lxm` {@link SESSION_PIN_LXM} and `dpop_jkt` the
+   * provisioned key's thumbprint). The instance's caller assertions for the
+   * sign-in can then name that key, and only that one.
+   */
+  ticketKeyProof?: string;
 }
+
+/** The `lxm` of the key proof that pins a key to a sign-in. */
+export const SESSION_PIN_LXM = "happyview.oauth.registerSession";
+
+/** What a {@link TicketKeyProver} is asked to prove a key for. */
+export interface TicketKeyProofRequest {
+  did: string;
+  /** The RFC 7638 thumbprint of the sign-in's DPoP key: the proof's `dpop_jkt`. */
+  dpopJkt: string;
+  /** The instance: the proof's `aud`. */
+  audience: string;
+  /** The proof's `lxm`. */
+  lxm: string;
+}
+
+/** Signs a key proof for a sign-in; `undefined` pins nothing. */
+export type TicketKeyProver = (request: TicketKeyProofRequest) => Promise<string | undefined>;
 
 /**
  * Session data persisted to storage. Note: tokens and keys are stored as-is
@@ -101,6 +125,8 @@ export interface RegisterSessionResponse {
   session_id: string;
   did: string;
   scopes: string[];
+  /** With a `ticketKeyProof`: whether the instance pinned the key. */
+  ticket_pin?: "pinned" | "refused";
 }
 
 export interface GetSessionResponse {

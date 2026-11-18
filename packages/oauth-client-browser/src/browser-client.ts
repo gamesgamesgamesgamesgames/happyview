@@ -15,7 +15,9 @@ import {
   TokenExchangeError,
   type Key,
   type KeyStore,
+  SESSION_PIN_LXM,
   type SessionEventHooks,
+  type TicketKeyProver,
   type StorageAdapter,
 } from "@happyview/oauth-client";
 import { IndexedDbKeyStore } from "./indexeddb-key-store";
@@ -45,6 +47,12 @@ export interface HappyViewBrowserClientOptions {
    * before.
    */
   keyStore?: KeyStore | null;
+  /**
+   * Called as a sign-in completes, to pin a key the app holds (a ticket key
+   * it made before sign-in) to the new session. Its proof goes with the
+   * session's registration.
+   */
+  ticketKeyProof?: TicketKeyProver;
   sessionHooks?: SessionEventHooks;
   fetch?: typeof globalThis.fetch;
 }
@@ -123,6 +131,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   private readonly clientId: string;
   private readonly redirectUri: string | undefined;
   private readonly scopes: string;
+  private readonly ticketKeyProver: TicketKeyProver | undefined;
   constructor(options: HappyViewBrowserClientOptions) {
     const fetchFn =
       options.fetch ??
@@ -147,6 +156,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     this.clientId = options.clientId;
     this.redirectUri = options.redirectUri;
     this.scopes = options.scopes ?? "atproto";
+    this.ticketKeyProver = options.ticketKeyProof;
     this.handleResolver = new AtprotoDohHandleResolver({
       dohEndpoint: "https://dns.google/resolve",
       fetch: fetchFn,
@@ -504,6 +514,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         issuer: tokens.iss ?? pending.issuer,
         dpopKey: pending.rawJwk ?? publicJwk,
         dpopKeyPair: pair,
+        ticketKeyProof: await this.proveTicketKey(pending.did, publicJwk),
       });
 
       await this.storage.delete(`pending-auth:${state}`);
@@ -512,6 +523,28 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       return session;
     } catch (err) {
       throw OAuthCallbackError.from(err, params, state);
+    }
+  }
+
+  /**
+   * The app's ticket key proof for a sign-in completing, or `undefined`: when
+   * there's no prover, it returns none, or it fails. A pin is a bonus the
+   * sign-in never waits on.
+   */
+  private async proveTicketKey(did: string, publicJwk: JsonWebKey): Promise<string | undefined> {
+    if (!this.ticketKeyProver) return undefined;
+    try {
+      return (
+        (await this.ticketKeyProver({
+          did,
+          dpopJkt: await jwkThumbprint(publicJwk),
+          // The instance's issuer name: its URL without a trailing slash.
+          audience: this.instanceUrl.replace(/\/+$/, ""),
+          lxm: SESSION_PIN_LXM,
+        })) || undefined
+      );
+    } catch {
+      return undefined;
     }
   }
 

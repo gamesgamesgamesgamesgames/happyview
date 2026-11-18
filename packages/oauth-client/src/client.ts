@@ -213,6 +213,9 @@ export class HappyViewOAuthClient {
     if (!this.isConfidential && params.pkceVerifier) {
       body.pkce_verifier = params.pkceVerifier;
     }
+    if (params.ticketKeyProof) {
+      body.ticket_key_proof = params.ticketKeyProof;
+    }
 
     const resp = await this._fetch(`${this.instanceUrl}/oauth/sessions`, {
       method: "POST",
@@ -274,6 +277,7 @@ export class HappyViewOAuthClient {
       issuer: params.issuer,
       fetch: this._fetch,
       onSignOut: () => this.deleteSession(data.did),
+      ticketPin: params.ticketKeyProof ? data.ticket_pin : undefined,
     });
 
     this.sessionHooks.onSessionUpdate?.(data.did);

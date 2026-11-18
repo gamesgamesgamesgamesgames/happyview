@@ -13,6 +13,7 @@ export interface HappyViewSessionOptions {
   issuer?: string;
   fetch?: typeof globalThis.fetch;
   onSignOut?: () => Promise<void>;
+  ticketPin?: "pinned" | "refused";
 }
 
 function randomHex(byteLength: number): string {
@@ -35,6 +36,12 @@ function base64url(buffer: ArrayBuffer): string {
 export class HappyViewSession {
   readonly did: string;
   readonly scopes: string[];
+  /**
+   * For a session just registered with a ticket key proof: `pinned`, or
+   * `refused` when the instance registered it without the pin. Absent
+   * otherwise, including on a restored session.
+   */
+  readonly ticketPin: "pinned" | "refused" | undefined;
 
   private readonly dpopKey: Key;
   private readonly accessToken: string;
@@ -49,6 +56,7 @@ export class HappyViewSession {
 
   constructor(options: HappyViewSessionOptions) {
     this.did = options.did;
+    this.ticketPin = options.ticketPin;
     this.scopes = options.scopes ? options.scopes.split(" ") : [];
     this.dpopKey = options.dpopKey;
     this.accessToken = options.accessToken;
