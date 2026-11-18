@@ -1,5 +1,6 @@
 pub mod admin_scope;
 pub mod atrium_panic;
+pub mod caller_assertion;
 pub mod cli_client;
 pub mod client_registry;
 pub mod middleware;
@@ -7,6 +8,7 @@ pub mod oauth_store;
 pub mod routes;
 pub mod service_auth;
 pub mod state_gc;
+pub mod ticket;
 
 pub use client_registry::OAuthClientRegistry;
 pub use middleware::Claims;
