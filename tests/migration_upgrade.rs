@@ -1205,7 +1205,7 @@ async fn postgres_instances_booting_together_on_a_stable_database_all_boot() {
 // ---------------------------------------------------------------------------
 
 /// The last migration before the space host entry was limited.
-const PRE_SPACE_HOST_METHODS_CUTOFF: &str = "20261112000001";
+const PRE_SPACE_HOST_METHODS_CUTOFF: &str = "20261117000001";
 
 /// `(fragment_id, access_mode)` for every entry, and `(fragment_id,
 /// lexicon_id)` for every method an entry lists.
