@@ -418,9 +418,10 @@ pub async fn backfill_status(
         i32,
         Option<String>,
         Option<String>,
+        i64,
     )> =
         happyview_provider::db::query_as(&adapt_sql(
-            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed, note, hook_stats FROM happyview_backfill_jobs",
+            "SELECT id, source, replay_after_seq, replay_through_seq, replay_tip_seq, replay_bytes, replay_blocks_failed, note, hook_stats, rate_limited FROM happyview_backfill_jobs",
             backend,
         ))
         .fetch_all(&state.backfill_db)
@@ -438,14 +439,25 @@ pub async fn backfill_status(
             i32,
             Option<String>,
             Option<String>,
+            i64,
         ),
     > = replay_rows
         .into_iter()
         .map(
-            |(id, source, after, through, tip, bytes, failed, note, hook_stats)| {
+            |(id, source, after, through, tip, bytes, failed, note, hook_stats, rate_limited)| {
                 (
                     id,
-                    (source, after, through, tip, bytes, failed, note, hook_stats),
+                    (
+                        source,
+                        after,
+                        through,
+                        tip,
+                        bytes,
+                        failed,
+                        note,
+                        hook_stats,
+                        rate_limited,
+                    ),
                 )
             },
         )
@@ -490,9 +502,10 @@ pub async fn backfill_status(
                 queue_version,
                 discovery_complete,
             )| {
-                let (source, after, through, tip, bytes, failed, note, hook_stats) = replay
-                    .remove(&id)
-                    .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0, None, None));
+                let (source, after, through, tip, bytes, failed, note, hook_stats, rate_limited) =
+                    replay.remove(&id).unwrap_or_else(|| {
+                        ("crawl".to_string(), None, None, None, 0, 0, None, None, 0)
+                    });
                 let hooks = state.host.job_hook_stats(&id);
                 // An executor checkpoints in the same cursor table, always
                 // with `done = 0`; only a crawl's cursors are discovery.
@@ -539,6 +552,7 @@ pub async fn backfill_status(
                     replay,
                     hooks,
                     hook_stats,
+                    rate_limited,
                 }
             },
         )
@@ -872,13 +886,13 @@ pub async fn backfill_pds_summary(
 
     let bounded = job_queue_version(&state, &job_id).await? == Some(QueueVersion::Bounded);
     let sql = if bounded {
-        "SELECT pds_endpoint, repos, completed_repos, records FROM happyview_backfill_pds_stats \
+        "SELECT pds_endpoint, repos, completed_repos, records, rate_limited FROM happyview_backfill_pds_stats \
          WHERE job_id = ? ORDER BY repos DESC, pds_endpoint ASC"
     } else {
-        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC"
+        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records, CAST(0 AS BIGINT) as rate_limited FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC"
     };
     let sql = adapt_sql(sql, state.db_backend);
-    let rows: Vec<(String, i64, i64, i64)> = happyview_provider::db::query_as(&sql)
+    let rows: Vec<(String, i64, i64, i64, i64)> = happyview_provider::db::query_as(&sql)
         .bind(&job_id)
         .fetch_all(&state.backfill_db)
         .await
@@ -887,12 +901,13 @@ pub async fn backfill_pds_summary(
     let pds_endpoints = rows
         .into_iter()
         .map(
-            |(pds_endpoint, total_repos, completed_repos, total_records)| {
+            |(pds_endpoint, total_repos, completed_repos, total_records, rate_limited)| {
                 crate::backfill::types::PdsSummaryEntry {
                     pds_endpoint,
                     total_repos,
                     completed_repos,
                     total_records,
+                    rate_limited,
                 }
             },
         )

@@ -344,19 +344,58 @@ pub(crate) async fn mark_recovered(state: &JobState, job_id: &str, did: &str, co
     .await;
 }
 
-/// Queue a bounded job's pending fetch retries again, one unit per
-/// `(did, collection)`, so a job paused or restarted mid-retry fetches them
-/// on resume. Each unit added counts toward `total_repos`, as its completion
-/// counts toward `processed_repos`. Returns the units added.
-pub async fn requeue_pending_failures(state: &JobState, job_id: &str) -> Result<u64, sqlx::Error> {
+/// Where a requeue of pending failures got to: the last `(did, collection)`
+/// it read.
+pub type RequeueCursor = Option<(String, String)>;
+
+/// Queue up to `limit` of a bounded job's pending fetch retries again, one
+/// unit per `(did, collection)`, after `after` in `(did, collection)` order,
+/// so a job paused or restarted mid-retry fetches them on resume. A unit
+/// keeps the failure's attempt count, so a restart never starts it over.
+///
+/// Only rows with no unit queued are read, under their collection or under
+/// every collection (`''`, an account-targeted job's unit): a unit still
+/// queued is retried by its worker, and keeps its row pending until it is
+/// fetched or given up.
+/// Each unit added counts toward `total_repos`, as its completion counts
+/// toward `processed_repos`.
+///
+/// Returns the units added and the cursor to continue from, `None` once the
+/// pending rows are exhausted. The caller reserves `limit` window slots
+/// first, so requeued units count against the window like discovered ones.
+pub async fn requeue_pending_failures(
+    state: &JobState,
+    job_id: &str,
+    after: &RequeueCursor,
+    limit: i64,
+) -> Result<(u64, RequeueCursor), sqlx::Error> {
     let backend = state.db_backend;
-    let insert = adapt_sql(
-        "INSERT INTO happyview_backfill_queue (job_id, collection, did) \
-         SELECT job_id, collection, did FROM happyview_backfill_failures \
-         WHERE job_id = ? AND state = 'pending' AND phase = 'fetch' AND collection <> '' \
-         ON CONFLICT DO NOTHING",
+    let select = adapt_sql(
+        "SELECT f.did, f.collection, f.attempts FROM happyview_backfill_failures f \
+         WHERE f.job_id = ? AND f.state = 'pending' AND f.phase = 'fetch' AND f.collection <> '' \
+           AND (f.did > ? OR (f.did = ? AND f.collection > ?)) \
+           AND NOT EXISTS (SELECT 1 FROM happyview_backfill_queue q \
+                           WHERE q.job_id = f.job_id AND q.collection = f.collection AND q.did = f.did) \
+           AND NOT EXISTS (SELECT 1 FROM happyview_backfill_queue q \
+                           WHERE q.job_id = f.job_id AND q.collection = '' AND q.did = f.did) \
+         ORDER BY f.did, f.collection LIMIT ?",
         backend,
     );
+    let (after_did, after_collection) = after
+        .as_ref()
+        .map_or(("", ""), |(d, c)| (d.as_str(), c.as_str()));
+    let rows: Vec<(String, String, i32)> = happyview_provider::db::query_as(&select)
+        .bind(job_id)
+        .bind(after_did)
+        .bind(after_did)
+        .bind(after_collection)
+        .bind(limit.max(1))
+        .fetch_all(&state.backfill_db)
+        .await?;
+    let Some((last_did, last_collection, _)) = rows.last().cloned() else {
+        return Ok((0, None));
+    };
+
     let total = adapt_sql(
         &format!(
             "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
@@ -364,13 +403,29 @@ pub async fn requeue_pending_failures(state: &JobState, job_id: &str) -> Result<
         ),
         backend,
     );
-    happyview_provider::db::retry_on_busy(|| async {
+    let added = happyview_provider::db::retry_on_busy(|| async {
         let mut tx = state.backfill_db.begin().await?;
-        let added = happyview_provider::db::query(&insert)
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let mut added: u64 = 0;
+        // Four bound parameters a row, well under SQLite's oldest limit of 999.
+        for chunk in rows.chunks(200) {
+            let placeholders = vec!["(?, ?, ?, ?)"; chunk.len()].join(", ");
+            let sql = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_backfill_queue (job_id, collection, did, attempts) \
+                     VALUES {placeholders} ON CONFLICT DO NOTHING"
+                ),
+                backend,
+            );
+            let mut insert = happyview_provider::db::query(&sql);
+            for (did, collection, attempts) in chunk {
+                insert = insert
+                    .bind(job_id)
+                    .bind(collection.as_str())
+                    .bind(did.as_str())
+                    .bind(*attempts);
+            }
+            added += insert.execute(&mut *tx).await?.rows_affected();
+        }
         if added > 0 {
             happyview_provider::db::query(&total)
                 .bind(i32::try_from(added).unwrap_or(i32::MAX))
@@ -381,7 +436,8 @@ pub async fn requeue_pending_failures(state: &JobState, job_id: &str) -> Result<
         tx.commit().await?;
         Ok(added)
     })
-    .await
+    .await?;
+    Ok((added, Some((last_did, last_collection))))
 }
 
 #[cfg(test)]

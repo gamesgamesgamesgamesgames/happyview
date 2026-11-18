@@ -15,6 +15,7 @@ use happyview_provider::db::adapt_sql;
 use happyview_provider::http::{did_doc_host, host_of, parse_retry_after};
 use happyview_provider::{ProviderEvent, Severity};
 
+use super::pacer::{Gate, HostPacer};
 use super::retry::{DeferredItem, DeferredQueue, DrainStep, HostCooldowns, next_drain_step};
 use super::*;
 
@@ -120,19 +121,49 @@ impl QueueVersion {
 }
 
 /// One unit of fetch work: a repo, and the collection it was discovered under.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// A unit is identified by its DID and collection alone: equality and hashing
+/// ignore its retry state, which is what the queue row says about it now.
+#[derive(Clone, Debug)]
 pub struct WorkUnit {
     pub did: String,
     /// `ALL_COLLECTIONS` for every collection the job targets.
     pub collection: String,
+    /// Failed fetch attempts so far, from the queue row. A 429 is not one.
+    pub attempts: u32,
+    /// When the next attempt is due (Unix milliseconds), if it is waiting
+    /// out a backoff.
+    pub retry_at: Option<i64>,
+}
+
+impl PartialEq for WorkUnit {
+    fn eq(&self, other: &Self) -> bool {
+        self.did == other.did && self.collection == other.collection
+    }
+}
+
+impl Eq for WorkUnit {}
+
+impl std::hash::Hash for WorkUnit {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.did.hash(state);
+        self.collection.hash(state);
+    }
 }
 
 impl WorkUnit {
-    pub fn all_collections(did: String) -> Self {
+    /// A unit with no attempts yet.
+    pub fn new(did: impl Into<String>, collection: impl Into<String>) -> Self {
         Self {
-            did,
-            collection: ALL_COLLECTIONS.to_string(),
+            did: did.into(),
+            collection: collection.into(),
+            attempts: 0,
+            retry_at: None,
         }
+    }
+
+    pub fn all_collections(did: String) -> Self {
+        Self::new(did, ALL_COLLECTIONS)
     }
 
     /// The collections to fetch for this unit.
@@ -281,12 +312,12 @@ pub async fn unresolved_page(
                 (unit.collection.as_str(), unit.did.as_str())
             });
             let sql = adapt_sql(
-                "SELECT collection, did FROM happyview_backfill_queue \
+                "SELECT collection, did, attempts FROM happyview_backfill_queue \
                  WHERE job_id = ? AND pds_endpoint IS NULL AND (collection > ? OR (collection = ? AND did > ?)) \
                  ORDER BY collection, did LIMIT ?",
                 state.db_backend,
             );
-            let rows: Vec<(String, String)> = happyview_provider::db::query_as(&sql)
+            let rows: Vec<(String, String, i32)> = happyview_provider::db::query_as(&sql)
                 .bind(job_id)
                 .bind(after_collection)
                 .bind(after_collection)
@@ -296,7 +327,10 @@ pub async fn unresolved_page(
                 .await?;
             Ok(rows
                 .into_iter()
-                .map(|(collection, did)| WorkUnit { did, collection })
+                .map(|(collection, did, attempts)| WorkUnit {
+                    attempts: u32::try_from(attempts).unwrap_or(0),
+                    ..WorkUnit::new(did, collection)
+                })
                 .collect())
         }
     }
@@ -335,22 +369,31 @@ pub async fn resolved_page(
                 (unit.collection.as_str(), unit.did.as_str())
             });
             let sql = adapt_sql(
-                "SELECT collection, did, pds_endpoint FROM happyview_backfill_queue \
+                "SELECT collection, did, pds_endpoint, attempts, retry_at FROM happyview_backfill_queue \
                  WHERE job_id = ? AND pds_endpoint IS NOT NULL AND (collection > ? OR (collection = ? AND did > ?)) \
                  ORDER BY collection, did LIMIT ?",
                 state.db_backend,
             );
-            let rows: Vec<(String, String, String)> = happyview_provider::db::query_as(&sql)
-                .bind(job_id)
-                .bind(after_collection)
-                .bind(after_collection)
-                .bind(after_did)
-                .bind(RESOLVE_PAGE_SIZE)
-                .fetch_all(&state.backfill_db)
-                .await?;
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(String, String, String, i32, Option<i64>)> =
+                happyview_provider::db::query_as(&sql)
+                    .bind(job_id)
+                    .bind(after_collection)
+                    .bind(after_collection)
+                    .bind(after_did)
+                    .bind(RESOLVE_PAGE_SIZE)
+                    .fetch_all(&state.backfill_db)
+                    .await?;
             Ok(rows
                 .into_iter()
-                .map(|(collection, did, pds)| (WorkUnit { did, collection }, pds))
+                .map(|(collection, did, pds, attempts, retry_at)| {
+                    let unit = WorkUnit {
+                        attempts: u32::try_from(attempts).unwrap_or(0),
+                        retry_at,
+                        ..WorkUnit::new(did, collection)
+                    };
+                    (unit, pds)
+                })
                 .collect())
         }
     }
@@ -628,47 +671,6 @@ pub(crate) async fn count_pds_error(
         .execute(&state.backfill_db)
         .await
         .map(|_| ())
-}
-
-/// Count records a deferred retry fetched after its unit completed.
-pub async fn add_late_records(
-    state: &JobState,
-    queue: &JobQueue,
-    pds: &str,
-    records: i32,
-) -> Result<(), sqlx::Error> {
-    let backend = state.db_backend;
-    let job_id = queue.job_id.as_str();
-    let mut tx = state.backfill_db.begin().await?;
-    // The PDS's stats row before the job row, the order `mark_resolved` and
-    // `complete_unit` lock them in, so that none of them can deadlock another
-    // on Postgres.
-    if queue.version == QueueVersion::Bounded {
-        let stats = adapt_sql(
-            "INSERT INTO happyview_backfill_pds_stats (job_id, pds_endpoint, records) VALUES (?, ?, ?) \
-             ON CONFLICT (job_id, pds_endpoint) DO UPDATE SET records = happyview_backfill_pds_stats.records + excluded.records",
-            backend,
-        );
-        happyview_provider::db::query(&stats)
-            .bind(job_id)
-            .bind(pds)
-            .bind(i64::from(records))
-            .execute(&mut *tx)
-            .await?;
-    }
-    let counter = adapt_sql(
-        &format!(
-            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
-            saturating_counter("total_records", "?", backend)
-        ),
-        backend,
-    );
-    happyview_provider::db::query(&counter)
-        .bind(records)
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await
 }
 
 /// `(resolved, processed, records)` for a pipeline run to start from. A
@@ -1165,25 +1167,93 @@ pub(crate) async fn discover_collection(
     }
 }
 
-/// Discover a network job's repos through the relay while the resolver and
-/// fetchers work through them. At most the window's worth is queued at once:
-/// a full window pauses discovery until units complete.
+/// Queue a bounded job's pending fetch retries again, a window's room at a
+/// time, then report how many were queued. `Ok(None)` means the job is
+/// stopping.
 ///
-/// An `Err` means discovery could not read or write the queue, and the job
-/// must fail: it sets `cancelled` so the resolver and fetchers stop too,
-/// rather than draining what was queued and leaving the job looking complete.
-pub(crate) async fn run_discovery(
+/// Before, every pending retry was queued at once when the job started,
+/// past the window: 3,078,734 of them on one resume. Here each batch waits
+/// for room like a discovered relay page does, and the rows are read in key
+/// order a batch at a time, so neither the queue nor memory grows with the
+/// number pending.
+pub(crate) async fn feed_pending_retries(
+    state: &JobState,
+    queue: &JobQueue,
+    cancelled: &AtomicBool,
+) -> Result<Option<u64>, String> {
+    let job_id = queue.job_id.as_str();
+    let batch = queue.window.capacity().min(RESOLVE_PAGE_SIZE);
+    let mut after: crate::backfill::errors::RequeueCursor = None;
+    let mut requeued: u64 = 0;
+    loop {
+        if !wait_for_window(state, queue, batch, cancelled).await {
+            return Ok(None);
+        }
+        let result =
+            crate::backfill::errors::requeue_pending_failures(state, job_id, &after, batch).await;
+        match result {
+            Ok((added, next)) => {
+                queue
+                    .window
+                    .settle(batch, i64::try_from(added).unwrap_or(i64::MAX));
+                requeued += added;
+                match next {
+                    Some(next) => after = Some(next),
+                    None => return Ok(Some(requeued)),
+                }
+            }
+            Err(e) => {
+                queue.window.settle(batch, 0);
+                return Err(format!(
+                    "failed to queue the job's pending retries again: {e}"
+                ));
+            }
+        }
+    }
+}
+
+/// What feeds a bounded job's queue: its pending retries and, unless it
+/// already finished, discovery of its repos through the relay, side by side
+/// while the resolver and fetchers work through them. At most the window's
+/// worth is queued at once: a full window pauses both until units complete.
+///
+/// It sets `discovery_done` however it ends, panics included. An `Err`
+/// means the queue could not be read or written, and the job must fail: it
+/// sets `cancelled` so the resolver and fetchers stop too, rather than
+/// draining what was queued and leaving the job looking complete.
+pub(crate) async fn run_feeder(
     state: JobState,
     queue: JobQueue,
     collections: Vec<String>,
     cancelled: Arc<AtomicBool>,
+    discovery_complete: bool,
 ) -> Result<(), String> {
     let _done = MarkDiscoveryDone(Arc::clone(&queue.discovery_done));
-    let result = discover_all(&state, &queue, collections, &cancelled).await;
-    if result.is_err() {
-        cancelled.store(true, Ordering::Relaxed);
-    }
-    result
+    let retries = async {
+        let fed = feed_pending_retries(&state, &queue, &cancelled).await;
+        if fed.is_err() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        if let Ok(Some(requeued)) = fed
+            && requeued > 0
+        {
+            tracing::info!(job_id = %queue.job_id, requeued, "queued pending fetch retries again");
+        }
+        fed.map(|_| ())
+    };
+    let discovery = async {
+        if discovery_complete {
+            return Ok(());
+        }
+        let found = discover_all(&state, &queue, collections, &cancelled).await;
+        if found.is_err() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        found
+    };
+    let (fed, found) = tokio::join!(retries, discovery);
+    // Discovery's error first, as `run_queue` reports it.
+    found.and(fed)
 }
 
 pub(crate) async fn discover_all(
@@ -1423,8 +1493,18 @@ pub(crate) async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
     let mut after: Option<WorkUnit> = None;
     let mut pass_began_after_discovery = ctx.queue.discovery_done.load(Ordering::Acquire);
 
+    let deferred_cap = waiting_cap(&ctx.queue);
     'scan: loop {
         if ctx.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        // Resolutions waiting to retry are held in memory. A queue left over
+        // its window (or a legacy job's) could otherwise defer millions while
+        // the PLC directory rate-limits, so past the cap the scan stops to
+        // retry them first.
+        if run.deferred.len() >= deferred_cap
+            && !drain_deferred_below(&ctx, &mut run, deferred_cap).await
+        {
             break;
         }
         let page = match unresolved_page(&ctx.state, &ctx.queue, after.as_ref()).await {
@@ -1582,6 +1662,35 @@ pub(crate) async fn idle_drain(ctx: &ResolverContext, run: &mut ResolverRun) -> 
     if should_stop_worker(&ctx.state, &ctx.queue.job_id).await {
         ctx.cancelled.store(true, Ordering::Relaxed);
         return false;
+    }
+    true
+}
+
+/// Retry deferred resolutions as they come due until fewer than `cap` are
+/// left. Returns false if the job is stopping or the fetcher has gone away.
+pub(crate) async fn drain_deferred_below(
+    ctx: &ResolverContext,
+    run: &mut ResolverRun,
+    cap: usize,
+) -> bool {
+    while run.deferred.len() >= cap {
+        if ctx.cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        match next_drain_step(&mut run.deferred, &run.cooldowns, Duration::from_secs(2)).await {
+            DrainStep::Done => break,
+            DrainStep::Slept => {
+                if should_stop_worker(&ctx.state, &ctx.queue.job_id).await {
+                    ctx.cancelled.store(true, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            DrainStep::Retry(item) => {
+                if !retry_deferred_resolution(ctx, run, item).await {
+                    return false;
+                }
+            }
+        }
     }
     true
 }
@@ -1852,8 +1961,9 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
     };
     let mut pds_workers: HashMap<String, mpsc::Sender<WorkUnit>> = HashMap::new();
     let mut worker_handles = FuturesUnordered::new();
-    // Units a PDS worker had no room for yet, per PDS, in arrival order.
-    let mut waiting: HashMap<String, VecDeque<WorkUnit>> = HashMap::new();
+    // Units a PDS worker had no room for yet, per PDS, in arrival order. It
+    // is capped: once full, no more are received, and the resolver waits.
+    let mut waiting = WaitingUnits::new(waiting_cap(queue));
     let mut rx_open = true;
     // Retries the waiting units even when nothing new arrives: once the
     // window is full, the resolver sends nothing until units complete, and
@@ -1867,10 +1977,8 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
             break;
         }
         tokio::select! {
-            received = rx.recv(), if rx_open => match received {
-                Some((unit, pds_endpoint)) => {
-                    waiting.entry(pds_endpoint).or_default().push_back(unit);
-                }
+            received = rx.recv(), if rx_open && waiting.has_room() => match received {
+                Some((unit, pds_endpoint)) => waiting.push(pds_endpoint, unit),
                 None => rx_open = false,
             },
             _ = tick.tick() => {
@@ -1904,9 +2012,22 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
 
     // Drop all PDS senders so workers know no more units are coming.
     drop(pds_workers);
-    while let Some(result) = worker_handles.next().await {
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "PDS worker task panicked");
+    // Workers can still be waiting out a host's cooldown for minutes, so a
+    // pause or cancel is still watched for while they finish.
+    let mut stop_check = tokio::time::interval(Duration::from_millis(500));
+    stop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            joined = worker_handles.next() => match joined {
+                Some(Err(e)) => tracing::warn!(error = %e, "PDS worker task panicked"),
+                Some(Ok(())) => {}
+                None => break,
+            },
+            _ = stop_check.tick(), if !cancelled.load(Ordering::Relaxed) => {
+                if should_stop_worker(&state, &queue.job_id).await {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
     let resolved = match resolver_handle.await {
@@ -1938,6 +2059,58 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
     ))
 }
 
+/// The most units the dispatcher holds for busy PDS workers: the job's
+/// window, within bounds. A bounded job never has more than its window
+/// queued, so the cap only bites on a queue left over its window by an
+/// earlier version, or on a legacy job, whose resolved backlog would
+/// otherwise be read into memory whole.
+pub fn waiting_cap(queue: &JobQueue) -> usize {
+    usize::try_from(queue.window.capacity())
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_WAITING_UNITS, MAX_WAITING_UNITS)
+}
+
+/// See [`waiting_cap`].
+pub const MIN_WAITING_UNITS: usize = 1_000;
+pub const MAX_WAITING_UNITS: usize = 100_000;
+
+/// Units waiting for room in their PDS worker's channel, per PDS, in arrival
+/// order, with a cap on the total.
+#[derive(Debug)]
+pub struct WaitingUnits {
+    by_pds: HashMap<String, VecDeque<WorkUnit>>,
+    len: usize,
+    cap: usize,
+}
+
+impl WaitingUnits {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            by_pds: HashMap::new(),
+            len: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether another unit may be received.
+    pub fn has_room(&self) -> bool {
+        self.len < self.cap
+    }
+
+    pub fn push(&mut self, pds_endpoint: String, unit: WorkUnit) {
+        self.by_pds.entry(pds_endpoint).or_default().push_back(unit);
+        self.len += 1;
+    }
+}
+
 /// Hand each PDS's waiting units to its worker until the worker's channel is
 /// full, starting a worker for a PDS that has none (or whose worker exited).
 /// Only PDSes with units waiting are visited, so a long backlog for one host
@@ -1950,16 +2123,18 @@ pub(crate) fn dispatch_waiting(
     template: &FetchContext,
     workers: &mut HashMap<String, mpsc::Sender<WorkUnit>>,
     handles: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
-    waiting: &mut HashMap<String, VecDeque<WorkUnit>>,
+    waiting: &mut WaitingUnits,
 ) {
-    for (pds_endpoint, units) in waiting.iter_mut() {
+    let mut dispatched = 0;
+    for (pds_endpoint, units) in waiting.by_pds.iter_mut() {
         while let Some(unit) = units.pop_front() {
             let Some(pds_tx) = workers.get(pds_endpoint) else {
                 spawn_pds_worker(template, workers, handles, pds_endpoint.clone(), unit);
+                dispatched += 1;
                 continue;
             };
             match pds_tx.try_send(unit) {
-                Ok(()) => {}
+                Ok(()) => dispatched += 1,
                 Err(mpsc::error::TrySendError::Full(unit)) => {
                     units.push_front(unit);
                     break;
@@ -1968,11 +2143,13 @@ pub(crate) fn dispatch_waiting(
                     // The worker finished; replace it.
                     workers.remove(pds_endpoint);
                     spawn_pds_worker(template, workers, handles, pds_endpoint.clone(), unit);
+                    dispatched += 1;
                 }
             }
         }
     }
-    waiting.retain(|_, units| !units.is_empty());
+    waiting.by_pds.retain(|_, units| !units.is_empty());
+    waiting.len -= dispatched;
 }
 
 /// Start a PDS worker with `first` already queued, and register its sender.
@@ -2225,9 +2402,9 @@ pub(crate) async fn abandon_saturated_pds(
     }
 }
 
-/// The result of one unit's first attempt: records fetched, whether any
-/// collection succeeded (clears the host's cooldown), and the per-collection
-/// failures still needing a defer-or-give-up decision.
+/// A unit's fetch: the unit with its attempts so far, records fetched,
+/// whether any collection succeeded, and the collections given up on (or cut
+/// short by a stop).
 pub(crate) type UnitFetchResult = (WorkUnit, i32, bool, Vec<(String, FetchOutcome)>);
 
 /// What settling a unit needs from its worker.
@@ -2237,41 +2414,32 @@ pub(crate) struct WorkerScope<'a> {
     pub collections: &'a [String],
     pub queue: &'a JobQueue,
     pub pds_endpoint: &'a str,
-    pub pds_host: &'a str,
     pub recorder: &'a crate::backfill::errors::ErrorRecorder,
-    pub max_attempts: u32,
     pub processed_repos: &'a AtomicI32,
     pub total_records: &'a AtomicI32,
     pub cancelled: &'a AtomicBool,
 }
 
-/// A worker's retry bookkeeping. It is local to the worker and keyed to the
-/// one host that worker talks to.
-pub(crate) struct WorkerRetries {
-    pub cooldowns: HostCooldowns,
-    pub deferred: DeferredQueue<(String, String, Option<String>)>,
-    pub recorded: RecordedDids,
-}
+/// How often a PDS worker reports its host's rate limiting and retries.
+pub const HOST_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 
-/// Settle a unit's first attempt: defer or give up each collection that
-/// failed, then complete the unit in one transaction. A unit cut short by a
-/// pause or cancel stays queued so the resumed job fetches it again. Returns
-/// the job's processed and record counts, or `None` if the unit was left
-/// queued.
+/// Settle a unit whose fetch has finished: record each collection given up
+/// on, then complete the unit in one transaction. A unit is only settled
+/// once every collection was fetched or given up, so `processed_repos`
+/// counts exactly those. A unit cut short by a pause or cancel stays queued
+/// so the resumed job fetches it again. Returns the job's processed and
+/// record counts, or `None` if the unit was left queued.
 pub(crate) async fn finish_unit(
     scope: &WorkerScope<'_>,
-    retries: &mut WorkerRetries,
+    recorded: &mut RecordedDids,
     result: UnitFetchResult,
 ) -> Option<(i32, i32)> {
-    let (unit, records, any_success, mut failures) = result;
+    let (unit, records, _any_success, mut failures) = result;
     let records_now = saturating_fetch_add(scope.total_records, records);
     // A unit cut short stays queued: the resumed job fetches it again. A
     // `Cancelled` outcome only comes from this same flag.
     if scope.cancelled.load(Ordering::Relaxed) {
         return None;
-    }
-    if any_success {
-        retries.cooldowns.record_success(scope.pds_host);
     }
     retryable_give_ups_first(&mut failures);
     // Collections this attempt fetched whole. A unit queued again from a
@@ -2281,28 +2449,30 @@ pub(crate) async fn finish_unit(
         .into_iter()
         .filter(|c| !failures.iter().any(|(failed, _)| failed == c))
         .collect();
+    let attempts = unit.attempts.max(1);
     for (collection, outcome) in failures {
-        let FetchOutcome::Failed {
-            cursor, failure, ..
-        } = outcome
-        else {
+        let FetchOutcome::Failed { failure, .. } = outcome else {
             continue;
         };
-        defer_or_give_up_fetch(
+        tracing::warn!(
+            did = %unit.did,
+            collection,
+            pds = %scope.pds_endpoint,
+            kind = failure.kind.as_str(),
+            attempts,
+            "giving up fetching records from PDS: {}",
+            failure.message
+        );
+        record_fetch_give_up(
             scope.state,
             scope.queue,
             scope.pds_endpoint,
-            scope.pds_host,
             scope.recorder,
-            &mut retries.cooldowns,
-            &mut retries.deferred,
-            &mut retries.recorded,
-            scope.max_attempts,
-            unit.did.clone(),
-            collection,
-            cursor,
-            failure,
-            1,
+            recorded,
+            &unit.did,
+            &collection,
+            &failure,
+            attempts,
         )
         .await;
     }
@@ -2337,68 +2507,311 @@ pub(crate) async fn finish_unit(
     Some((repos, records_now))
 }
 
-/// Count records a deferred retry fetched after its unit completed.
-pub(crate) async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
-    if records == 0 {
-        return;
+/// Record that a unit will be retried: its attempts and when the retry is
+/// due on its queue row, and its collection as pending in the failure set.
+/// Both survive a pause or restart, so the resumed job neither loses the
+/// retry nor starts its attempts over.
+pub(crate) async fn record_retry(
+    state: &JobState,
+    queue: &JobQueue,
+    unit: &WorkUnit,
+    collection: &str,
+    failure: &crate::backfill::errors::BackfillFailure,
+    retry_at: Option<i64>,
+) {
+    if queue.version == QueueVersion::Bounded {
+        let sql = adapt_sql(
+            "UPDATE happyview_backfill_queue SET attempts = ?, retry_at = ? \
+             WHERE job_id = ? AND collection = ? AND did = ?",
+            state.db_backend,
+        );
+        job_write(state, &queue.job_id, "unit_retry", || {
+            happyview_provider::db::query(&sql)
+                .bind(i32::try_from(unit.attempts).unwrap_or(i32::MAX))
+                .bind(retry_at)
+                .bind(queue.job_id.as_str())
+                .bind(&unit.collection)
+                .bind(&unit.did)
+                .execute(&state.backfill_db)
+        })
+        .await;
     }
-    saturating_fetch_add(scope.total_records, records);
-    job_write(scope.state, &scope.queue.job_id, "late_records", || {
-        add_late_records(scope.state, scope.queue, scope.pds_endpoint, records)
-    })
+    crate::backfill::errors::mark_failure(
+        state,
+        &queue.job_id,
+        &unit.did,
+        collection,
+        "fetch",
+        failure.kind,
+        crate::backfill::errors::FailureState::Pending,
+        unit.attempts,
+    )
     .await;
 }
 
-/// One unit's first attempt: every collection it covers, each drained from
-/// the start.
+/// Add a PDS's 429 responses to its stats and to the job's count.
+pub(crate) async fn add_rate_limited(
+    state: &JobState,
+    queue: &JobQueue,
+    pds: &str,
+    responses: u64,
+) -> Result<(), sqlx::Error> {
+    let backend = state.db_backend;
+    let job_id = queue.job_id.as_str();
+    let responses = i64::try_from(responses).unwrap_or(i64::MAX);
+    let mut tx = state.backfill_db.begin().await?;
+    // The PDS's stats row before the job row, the order `complete_unit`
+    // locks them in.
+    if queue.version == QueueVersion::Bounded {
+        let stats = adapt_sql(
+            "INSERT INTO happyview_backfill_pds_stats (job_id, pds_endpoint, rate_limited) VALUES (?, ?, ?) \
+             ON CONFLICT (job_id, pds_endpoint) DO UPDATE SET \
+             rate_limited = happyview_backfill_pds_stats.rate_limited + excluded.rate_limited",
+            backend,
+        );
+        happyview_provider::db::query(&stats)
+            .bind(job_id)
+            .bind(pds)
+            .bind(responses)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let job = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET rate_limited = rate_limited + ? WHERE id = ?",
+        backend,
+    );
+    happyview_provider::db::query(&job)
+        .bind(responses)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// What a PDS worker settled since its last summary.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerPeriod {
+    pub completed: u64,
+    pub given_up: u64,
+}
+
+/// Log a host's rate limiting and retries since the last summary, when it
+/// had any, and add its 429s to the job's counts.
+pub(crate) async fn report_host(
+    scope: &WorkerScope<'_>,
+    pacer: &HostPacer,
+    period: &mut WorkerPeriod,
+    in_flight: usize,
+) {
+    let summary = pacer.take_summary(tokio::time::Instant::now());
+    let WorkerPeriod {
+        completed,
+        given_up,
+    } = std::mem::take(period);
+    if summary.rate_limited > 0 {
+        job_write(scope.state, &scope.queue.job_id, "rate_limited", || {
+            add_rate_limited(
+                scope.state,
+                scope.queue,
+                scope.pds_endpoint,
+                summary.rate_limited,
+            )
+        })
+        .await;
+    }
+    if summary.rate_limited == 0
+        && summary.failures == 0
+        && summary.cooling_for.is_none()
+        && !summary.down
+    {
+        return;
+    }
+    tracing::info!(
+        job_id = %scope.queue.job_id,
+        pds = %scope.pds_endpoint,
+        requests = summary.requests,
+        rate_limited = summary.rate_limited,
+        retried_failures = summary.failures,
+        cooling_secs = summary.cooling_for.map_or(0, |d| d.as_secs()),
+        concurrency = summary.concurrency,
+        down = summary.down,
+        in_flight,
+        completed,
+        given_up,
+        "backfill PDS pacing"
+    );
+}
+
+/// Everything one unit's fetch needs.
+pub(crate) struct UnitFetch {
+    pub state: Arc<JobState>,
+    pub queue: JobQueue,
+    pub pds_endpoint: String,
+    pub collections: Vec<String>,
+    pub unit: WorkUnit,
+    pub cancelled: Arc<AtomicBool>,
+    pub requests: Arc<tokio::sync::Semaphore>,
+    pub pacer: Arc<HostPacer>,
+    pub max_attempts: u32,
+}
+
+/// Unix milliseconds `at` falls on.
+fn unix_millis_at(at: tokio::time::Instant) -> i64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let ahead = at
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis();
+    i64::try_from(now_ms + ahead).unwrap_or(i64::MAX)
+}
+
+/// Wait until Unix millisecond `retry_at`, in slices so a stop is noticed.
+/// False once `cancelled` is set.
+async fn wait_until_unix_millis(retry_at: i64, cancelled: &AtomicBool) -> bool {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let left = u128::try_from(retry_at.max(0))
+            .unwrap_or(0)
+            .saturating_sub(now_ms);
+        if left == 0 {
+            return true;
+        }
+        let slice = u64::try_from(left).unwrap_or(u64::MAX).min(1000);
+        tokio::time::sleep(Duration::from_millis(slice)).await;
+    }
+}
+
+/// One unit's fetch: every collection it covers, each drained from the
+/// start and retried in place until it is fetched or given up.
+///
+/// Every request waits at the host's [`HostPacer`] first, so a rate-limited
+/// or failing host is backed off while this waits, without holding a
+/// job-wide request permit. A 429 is retried after the host's reset and
+/// does not use up an attempt. Any other retryable failure does: after
+/// `max_attempts`, or once the host is down, the collection is given up.
+/// Each retry is recorded on the queue row and in the failure set first.
 ///
 /// Workers spawn this as a task of its own rather than polling it inline.
 /// Settling a finished unit awaits database writes, and while it does, the
 /// worker polls nothing else. A fetch suspended inside a page's transaction
 /// would hold its connection (and on SQLite the write lock) until polled
 /// again, so the settle could wait on it forever.
-pub(crate) async fn fetch_unit(
-    state: Arc<JobState>,
-    job_id: Arc<String>,
-    pds_endpoint: String,
-    collections: Vec<String>,
-    unit: WorkUnit,
-    cancelled: Arc<AtomicBool>,
-    requests: Arc<tokio::sync::Semaphore>,
-) -> UnitFetchResult {
+pub(crate) async fn fetch_unit(fetch: UnitFetch) -> UnitFetchResult {
+    let UnitFetch {
+        state,
+        queue,
+        pds_endpoint,
+        collections,
+        mut unit,
+        cancelled,
+        requests,
+        pacer,
+        max_attempts,
+    } = fetch;
     let mut count: i32 = 0;
     let mut any_success = false;
     let mut failures: Vec<(String, FetchOutcome)> = Vec::new();
+    // A retry an earlier run scheduled waits out its backoff first.
+    if let Some(retry_at) = unit.retry_at
+        && !wait_until_unix_millis(retry_at, &cancelled).await
+    {
+        return (unit, count, any_success, failures);
+    }
+    let gate = FetchGate {
+        pacer: Some(&pacer),
+        requests: Some(&requests),
+    };
     for collection in &collections {
+        let mut cursor: Option<String> = None;
+        let mut retried = false;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let outcome = fetch_records_page_loop(
+                &state,
+                &queue.job_id,
+                &pds_endpoint,
+                &unit.did,
+                collection,
+                cursor.take(),
+                &cancelled,
+                &gate,
+            )
+            .await;
+            match outcome {
+                FetchOutcome::Complete { count: c } => {
+                    count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
+                    any_success = true;
+                    // A bounded unit's completion recovers its pending rows
+                    // in the same transaction; a legacy row has no such
+                    // step, so its retry is marked recovered here.
+                    if retried && queue.version == QueueVersion::Legacy {
+                        crate::backfill::errors::mark_recovered(
+                            &state,
+                            &queue.job_id,
+                            &unit.did,
+                            collection,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                FetchOutcome::Cancelled { count: c, .. } => {
+                    count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
+                    failures.push((collection.clone(), outcome));
+                    break;
+                }
+                FetchOutcome::Failed {
+                    count: c,
+                    cursor: reached,
+                    failure,
+                } => {
+                    count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
+                    unit.attempts = unit.attempts.saturating_add(1);
+                    let now = tokio::time::Instant::now();
+                    let retry = failure.kind.is_retryable()
+                        && unit.attempts < max_attempts
+                        && !pacer.is_down(now)
+                        && !cancelled.load(Ordering::Relaxed);
+                    if !retry {
+                        failures.push((
+                            collection.clone(),
+                            FetchOutcome::Failed {
+                                count: c,
+                                cursor: reached,
+                                failure,
+                            },
+                        ));
+                        break;
+                    }
+                    let retry_at = pacer.open_at().map(unix_millis_at);
+                    tracing::debug!(
+                        did = %unit.did,
+                        collection,
+                        pds = %pds_endpoint,
+                        kind = failure.kind.as_str(),
+                        attempts = unit.attempts,
+                        "retrying a fetch after the PDS's cooldown: {}",
+                        failure.message
+                    );
+                    record_retry(&state, &queue, &unit, collection, &failure, retry_at).await;
+                    retried = true;
+                    // Resume from the page that failed.
+                    cursor = reached;
+                }
+            }
+        }
         if cancelled.load(Ordering::Relaxed) {
             break;
-        }
-        // Per collection, not per unit: a unit spanning twenty lexicons must
-        // not pin one permit for all twenty sequential request streams.
-        let _permit = requests
-            .acquire()
-            .await
-            .expect("request semaphore is never closed");
-        match fetch_records_page_loop(
-            &state,
-            &job_id,
-            &pds_endpoint,
-            &unit.did,
-            collection,
-            None,
-            &cancelled,
-        )
-        .await
-        {
-            FetchOutcome::Complete { count: c } => {
-                count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
-                any_success = true;
-            }
-            outcome @ (FetchOutcome::Failed { count: c, .. }
-            | FetchOutcome::Cancelled { count: c, .. }) => {
-                count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
-                failures.push((collection.clone(), outcome));
-            }
         }
     }
     (unit, count, any_success, failures)
@@ -2439,28 +2852,32 @@ pub(crate) async fn run_pds_worker(
     } = ctx;
     let mut fetches = FuturesUnordered::new();
     let mut rx_open = true;
-    let pds_host = host_of(&pds_endpoint);
+    let max_attempts = load_max_attempts(&state).await;
     let scope = WorkerScope {
         state: &state,
         collections: &collections,
         queue: &queue,
         pds_endpoint: &pds_endpoint,
-        pds_host: &pds_host,
         recorder: &recorder,
-        max_attempts: load_max_attempts(&state).await,
         processed_repos: &processed_repos,
         total_records: &total_records,
         cancelled: &cancelled,
     };
-    // Local to this worker, not job-wide state: every PDS worker owns its own
-    // cooldown and queue, keyed to the one host it alone talks to.
-    let mut retries = WorkerRetries {
-        cooldowns: HostCooldowns::new(),
-        deferred: DeferredQueue::new(),
-        recorded: RecordedDids::new(),
-    };
+    // Shared by this worker's fetches, and local to it: every PDS worker
+    // paces the one host it alone talks to.
+    let pacer = Arc::new(HostPacer::new(dids_per_pds));
+    let mut recorded = RecordedDids::new();
+    let mut period = WorkerPeriod::default();
+    let mut summary = tokio::time::interval_at(
+        tokio::time::Instant::now() + HOST_SUMMARY_EVERY,
+        HOST_SUMMARY_EVERY,
+    );
+    summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        if !rx_open && fetches.is_empty() {
+            break;
+        }
         tokio::select! {
             biased;
 
@@ -2468,9 +2885,15 @@ pub(crate) async fn run_pds_worker(
                 let Some(result) = fetched_unit(&queue, joined) else {
                     continue;
                 };
-                let Some((repos, records)) = finish_unit(&scope, &mut retries, result).await else {
+                let gave_up = !result.3.is_empty();
+                let Some((repos, records)) = finish_unit(&scope, &mut recorded, result).await else {
                     break;
                 };
+                if gave_up {
+                    period.given_up += 1;
+                } else {
+                    period.completed += 1;
+                }
                 if cancelled.load(Ordering::Relaxed) || should_stop_worker(&state, &queue.job_id).await {
                     cancelled.store(true, Ordering::Relaxed);
                     break;
@@ -2484,20 +2907,24 @@ pub(crate) async fn run_pds_worker(
                 });
             }
 
-            unit = rx.recv(), if rx_open && fetches.len() < dids_per_pds => {
+            // The host's adaptive limit, not the worker's maximum: a host
+            // that rate-limits gets fewer units at once.
+            unit = rx.recv(), if rx_open && fetches.len() < pacer.concurrency() => {
                 match unit {
                     Some(unit) if !cancelled.load(Ordering::Relaxed) => {
                         // Its own task, not just a future in `fetches`: see
                         // `fetch_unit`.
-                        fetches.push(tokio::spawn(fetch_unit(
-                            Arc::clone(&state),
-                            Arc::clone(&queue.job_id),
-                            pds_endpoint.clone(),
-                            unit.collections(&collections),
+                        fetches.push(tokio::spawn(fetch_unit(UnitFetch {
+                            state: Arc::clone(&state),
+                            queue: queue.clone(),
+                            pds_endpoint: pds_endpoint.clone(),
+                            collections: unit.collections(&collections),
                             unit,
-                            Arc::clone(&cancelled),
-                            Arc::clone(&requests),
-                        )));
+                            cancelled: Arc::clone(&cancelled),
+                            requests: Arc::clone(&requests),
+                            pacer: Arc::clone(&pacer),
+                            max_attempts,
+                        })));
                     }
                     _ => {
                         rx_open = false;
@@ -2505,118 +2932,24 @@ pub(crate) async fn run_pds_worker(
                 }
             }
 
-            else => break,
-        }
-    }
-
-    // Settle whatever is still in flight.
-    while let Some(joined) = fetches.next().await {
-        if let Some(result) = fetched_unit(&queue, joined) {
-            finish_unit(&scope, &mut retries, result).await;
-        }
-    }
-
-    // Deferred pass. All primary fetches are exhausted, so anything still
-    // here is waiting on a clock rather than on work. These units are already
-    // complete in the queue; a retry only adds records.
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        match next_drain_step(
-            &mut retries.deferred,
-            &retries.cooldowns,
-            Duration::from_secs(2),
-        )
-        .await
-        {
-            DrainStep::Done => break,
-            DrainStep::Slept => {
+            _ = summary.tick() => {
+                report_host(&scope, &pacer, &mut period, fetches.len()).await;
                 if should_stop_worker(&state, &queue.job_id).await {
                     cancelled.store(true, Ordering::Relaxed);
                     break;
                 }
             }
-            DrainStep::Retry(item) => {
-                let (did, collection, cursor) = item.payload;
-                let attempts = item.attempts + 1;
-                // A retry is a request like any other and counts against the
-                // same budget, or a job full of retrying workers would ignore
-                // the cap entirely.
-                let permit = requests
-                    .acquire()
-                    .await
-                    .expect("request semaphore is never closed");
-                let outcome = fetch_records_page_loop(
-                    &state,
-                    &queue.job_id,
-                    &pds_endpoint,
-                    &did,
-                    &collection,
-                    cursor,
-                    &cancelled,
-                )
-                .await;
-                drop(permit);
-                match outcome {
-                    FetchOutcome::Complete { count } => {
-                        retries.cooldowns.record_success(&pds_host);
-                        record_late_records(&scope, count as i32).await;
-                        crate::backfill::errors::mark_recovered(
-                            &state,
-                            &queue.job_id,
-                            &did,
-                            &collection,
-                        )
-                        .await;
-                    }
-                    FetchOutcome::Cancelled { count, .. } => {
-                        // The pending row stays, so the resumed job fetches
-                        // the repo again.
-                        record_late_records(&scope, count as i32).await;
-                        break;
-                    }
-                    FetchOutcome::Failed {
-                        count,
-                        cursor,
-                        failure,
-                    } => {
-                        record_late_records(&scope, count as i32).await;
-                        let last_failure = failure.clone();
-                        defer_or_give_up_fetch(
-                            &state,
-                            &queue,
-                            &pds_endpoint,
-                            &pds_host,
-                            &recorder,
-                            &mut retries.cooldowns,
-                            &mut retries.deferred,
-                            &mut retries.recorded,
-                            scope.max_attempts,
-                            did,
-                            collection,
-                            cursor,
-                            failure,
-                            attempts,
-                        )
-                        .await;
-                        abandon_saturated_pds(
-                            &state,
-                            &queue,
-                            &pds_endpoint,
-                            &pds_host,
-                            &recorder,
-                            &retries.cooldowns,
-                            &mut retries.deferred,
-                            &mut retries.recorded,
-                            &last_failure,
-                        )
-                        .await;
-                    }
-                }
-            }
         }
     }
+
+    // Settle whatever is still in flight. After a stop these are left
+    // queued; `finish_unit` sees the flag.
+    while let Some(joined) = fetches.next().await {
+        if let Some(result) = fetched_unit(&queue, joined) {
+            finish_unit(&scope, &mut recorded, result).await;
+        }
+    }
+    report_host(&scope, &pacer, &mut period, 0).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2752,6 +3085,7 @@ pub(crate) async fn run_fetching_phase(
                                     collection,
                                     None,
                                     &cancelled,
+                                    &FetchGate::default(),
                                 )
                                 .await
                                 {
@@ -2964,6 +3298,7 @@ pub(crate) async fn run_fetching_phase(
                                 &collection,
                                 cursor,
                                 &cancelled,
+                                &FetchGate::default(),
                             )
                             .await
                             {
@@ -3068,12 +3403,28 @@ pub enum FetchOutcome {
     },
 }
 
+/// What a page request waits on before it is sent. The default waits on
+/// nothing, as the legacy fetching phase always has.
+#[derive(Clone, Copy, Default)]
+pub struct FetchGate<'a> {
+    /// The host's pacer. With one, a 429 is waited out and the page asked
+    /// for again; without, it fails the attempt like any other error.
+    pub pacer: Option<&'a HostPacer>,
+    /// The job-wide cap on requests in flight, held for one page at a time
+    /// and only once the host's gate has opened.
+    pub requests: Option<&'a tokio::sync::Semaphore>,
+}
+
 /// Fetch all records for a given DID and collection from a PDS via
 /// `com.atproto.repo.listRecords`, paginating from `start_cursor`.
 ///
-/// This is a single attempt at draining the collection: it never sleeps on a
-/// rate limit and never retries a transport or server error. It returns
-/// `Failed` with the cursor reached so far so the caller can defer and resume.
+/// This is a single attempt at draining the collection. It never retries a
+/// transport or server error: it returns `Failed` with the cursor reached so
+/// far so the caller can retry and resume. With a pacer in `gate`, every
+/// page waits at the host's gate first, every answer paces the host, and a
+/// 429 is waited out and the page asked for again; a host the pacer says is
+/// down fails the attempt without a request.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_records_page_loop(
     state: &JobState,
     job_id: &str,
@@ -3082,6 +3433,7 @@ pub async fn fetch_records_page_loop(
     collection: &str,
     start_cursor: Option<String>,
     cancelled: &AtomicBool,
+    gate: &FetchGate<'_>,
 ) -> FetchOutcome {
     let base = pds_endpoint.trim_end_matches('/');
     let mut cursor: Option<String> = start_cursor;
@@ -3090,6 +3442,28 @@ pub async fn fetch_records_page_loop(
         if cancelled.load(Ordering::Relaxed) {
             return FetchOutcome::Cancelled { count, cursor };
         }
+        if let Some(pacer) = gate.pacer {
+            match pacer.wait_turn(cancelled).await {
+                None => return FetchOutcome::Cancelled { count, cursor },
+                Some(Gate::Down(failure)) => {
+                    return FetchOutcome::Failed {
+                        count,
+                        cursor,
+                        failure,
+                    };
+                }
+                Some(Gate::Go { .. }) => {}
+            }
+        }
+        let _permit = match gate.requests {
+            Some(requests) => Some(
+                requests
+                    .acquire()
+                    .await
+                    .expect("request semaphore is never closed"),
+            ),
+            None => None,
+        };
 
         let mut url = format!(
             "{base}/xrpc/com.atproto.repo.listRecords?repo={did}&collection={collection}&limit=100"
@@ -3101,10 +3475,14 @@ pub async fn fetch_records_page_loop(
         let resp = match state.http.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
+                let failure = crate::backfill::errors::BackfillFailure::from_reqwest(&e);
+                if let Some(pacer) = gate.pacer {
+                    pacer.on_failure(&failure, tokio::time::Instant::now());
+                }
                 return FetchOutcome::Failed {
                     count,
                     cursor,
-                    failure: crate::backfill::errors::BackfillFailure::from_reqwest(&e),
+                    failure,
                 };
             }
         };
@@ -3118,13 +3496,33 @@ pub async fn fetch_records_page_loop(
             let status = resp.status();
             let headers = resp.headers().clone();
             let body = resp.text().await.unwrap_or_default();
+            let failure = crate::backfill::errors::BackfillFailure::from_pds_response(
+                status, &body, &headers,
+            );
+            if let Some(pacer) = gate.pacer {
+                let now = tokio::time::Instant::now();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    // Waited out at the gate, then the same page again. A
+                    // 429 says the host is pacing us, not that this repo
+                    // failed, so it is not an attempt.
+                    pacer.on_rate_limited(&failure, &headers, now);
+                    tracing::debug!(did, collection, pds = %pds_endpoint, "PDS rate-limited a fetch; waiting for its reset");
+                    continue;
+                }
+                if failure.kind.is_retryable() {
+                    pacer.on_failure(&failure, now);
+                } else {
+                    pacer.on_response(status, &headers, now);
+                }
+            }
             return FetchOutcome::Failed {
                 count,
                 cursor,
-                failure: crate::backfill::errors::BackfillFailure::from_pds_response(
-                    status, &body, &headers,
-                ),
+                failure,
             };
+        }
+        if let Some(pacer) = gate.pacer {
+            pacer.on_response(resp.status(), resp.headers(), tokio::time::Instant::now());
         }
 
         let body: ListRecordsResponse = match resp.json().await {
@@ -3220,14 +3618,6 @@ pub(crate) async fn run_queue(
     discovery_complete: bool,
     window: i64,
 ) -> Result<(i32, i32), String> {
-    if version == QueueVersion::Bounded {
-        let requeued = crate::backfill::errors::requeue_pending_failures(state, job_id)
-            .await
-            .map_err(|e| format!("failed to queue the job's pending retries again: {e}"))?;
-        if requeued > 0 {
-            tracing::info!(job_id, requeued, "queued pending fetch retries again");
-        }
-    }
     let queued = match version {
         QueueVersion::Legacy => 0,
         QueueVersion::Bounded => queued_units(state, job_id)
@@ -3238,18 +3628,27 @@ pub(crate) async fn run_queue(
         job_id: Arc::new(job_id.to_string()),
         version,
         window: Arc::new(QueueWindow::new(window, queued)),
-        discovery_done: Arc::new(AtomicBool::new(
-            version == QueueVersion::Legacy || discovery_complete,
-        )),
+        // A bounded job always has a feeder: its pending retries are queued
+        // again however far discovery got.
+        discovery_done: Arc::new(AtomicBool::new(version == QueueVersion::Legacy)),
         completion_failures: Arc::new(AtomicU32::new(0)),
     };
+    if queued > queue.window.capacity() {
+        tracing::warn!(
+            job_id,
+            queued,
+            window = queue.window.capacity(),
+            "the backfill queue holds more units than its window; nothing new is queued until it drains below the window"
+        );
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
-    let discovery = (!queue.discovery_done.load(Ordering::Acquire)).then(|| {
-        tokio::spawn(run_discovery(
+    let discovery = (version == QueueVersion::Bounded).then(|| {
+        tokio::spawn(run_feeder(
             state.clone(),
             queue.clone(),
             collections.to_vec(),
             Arc::clone(&cancelled),
+            discovery_complete,
         ))
     });
     let counts =
