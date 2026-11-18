@@ -69,6 +69,9 @@ pub struct ScriptRun {
     /// caps in total: a wait is host time, so a job that waits in a loop
     /// would otherwise never reach its deadline.
     pub waited_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Caller assertions this run has asked for, which it may do only
+    /// `MAX_ASSERTIONS_PER_RUN` times.
+    pub assertions: Arc<std::sync::atomic::AtomicU32>,
     /// Where this run's host imports are timed, when the run is measured.
     /// The run's own rather than the task's, because a library call runs on
     /// the caller's task and its imports are already inside the caller's.
@@ -89,6 +92,8 @@ pub enum ScriptHostError {
     BadSpecifier(String),
     #[error("{0}")]
     ModuleNotFound(String),
+    #[error("{0}")]
+    Assertion(#[from] crate::auth::caller_assertion::AssertionError),
 }
 
 impl ScriptHostError {
@@ -101,8 +106,43 @@ impl ScriptHostError {
             Self::NoProject(_) => "UNSUPPORTED",
             Self::BadSpecifier(_) => "BAD_INPUT",
             Self::ModuleNotFound(_) => "NOT_FOUND",
+            Self::Assertion(e) => e.code(),
         }
     }
+}
+
+/// How many caller assertions one run may ask for. A script needs one per
+/// service it calls on the caller's behalf; more than a few is a loop.
+pub const MAX_ASSERTIONS_PER_RUN: u32 = 4;
+
+/// Sign an assertion about the run's caller for `request.audience`: who they
+/// are, the DPoP key and API client they authenticated with, and the running
+/// script's method, all from the request rather than from the script.
+pub async fn caller_assertion(
+    state: &AppState,
+    run: &ScriptRun,
+    session: Option<&crate::plugin::caller::CallerSession>,
+    request: happyview_plugin_sdk::wire::CallerAssertionRequest,
+) -> Result<happyview_plugin_sdk::wire::CallerAssertion, ScriptHostError> {
+    use crate::auth::caller_assertion::{AssertionError, assert_caller};
+    // A test run's caller is forged, so nothing may be asserted about it.
+    if run.test {
+        return Err(AssertionError::TestRun.into());
+    }
+    if run
+        .assertions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        >= MAX_ASSERTIONS_PER_RUN
+    {
+        return Err(AssertionError::TooMany(MAX_ASSERTIONS_PER_RUN).into());
+    }
+    let session = session.ok_or(AssertionError::NotDpop)?;
+    let assertion =
+        assert_caller(state, &session.claims, &run.trigger_id, &request.audience).await?;
+    Ok(happyview_plugin_sdk::wire::CallerAssertion {
+        token: assertion.token,
+        expires_at: assertion.expires_at,
+    })
 }
 
 fn job_of(run: &ScriptRun, control: &'static str) -> Result<String, ScriptHostError> {
@@ -360,6 +400,75 @@ mod tests {
 
     async fn state() -> AppState {
         test_state_with_pool(migrated_memory_pool().await)
+    }
+
+    fn assertion_request() -> happyview_plugin_sdk::wire::CallerAssertionRequest {
+        happyview_plugin_sdk::wire::CallerAssertionRequest {
+            audience: "https://service.example".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_test_run_gets_no_caller_assertion() {
+        let state = state().await;
+        let test_run = ScriptRun {
+            trigger_id: "xrpc.procedure:app.test.p".into(),
+            test: true,
+            ..run(None)
+        };
+        let err = caller_assertion(&state, &test_run, None, assertion_request())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ScriptHostError::Assertion(crate::auth::caller_assertion::AssertionError::TestRun)
+            ),
+            "{err}"
+        );
+        assert_eq!(err.code(), "UNSUPPORTED");
+    }
+
+    #[tokio::test]
+    async fn a_run_may_ask_for_only_a_few_caller_assertions() {
+        use crate::auth::caller_assertion::AssertionError;
+        let state = state().await;
+        let serving = ScriptRun {
+            trigger_id: "xrpc.procedure:app.test.p".into(),
+            ..run(None)
+        };
+        // Without a session each ask is refused, but still counted.
+        for _ in 0..MAX_ASSERTIONS_PER_RUN {
+            let err = caller_assertion(&state, &serving, None, assertion_request())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ScriptHostError::Assertion(AssertionError::NotDpop)),
+                "{err}"
+            );
+        }
+        let err = caller_assertion(&state, &serving, None, assertion_request())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ScriptHostError::Assertion(AssertionError::TooMany(MAX_ASSERTIONS_PER_RUN))
+            ),
+            "{err}"
+        );
+        assert_eq!(err.code(), "RATE_LIMITED");
+        // Another run starts its own count.
+        let next = ScriptRun {
+            trigger_id: "xrpc.procedure:app.test.p".into(),
+            ..run(None)
+        };
+        assert!(matches!(
+            caller_assertion(&state, &next, None, assertion_request())
+                .await
+                .unwrap_err(),
+            ScriptHostError::Assertion(AssertionError::NotDpop)
+        ));
     }
 
     #[tokio::test]

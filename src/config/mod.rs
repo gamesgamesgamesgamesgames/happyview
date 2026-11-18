@@ -257,6 +257,10 @@ pub struct Config {
     /// Hex SHA-256 of the managed-hosting platform key. `None` disables the
     /// platform principal entirely.
     pub platform_api_key_hash: Option<String>,
+    /// This instance's caller-assertion key and the audiences scripts may
+    /// address, from `CALLER_ASSERTION_*`. `None` turns caller assertions
+    /// off. See `auth::caller_assertion`.
+    pub caller_assertions: Option<crate::auth::caller_assertion::CallerAssertionConfig>,
     /// The issuer whose management tickets this instance accepts, from
     /// `MANAGEMENT_TICKET_*`. `None` turns tickets off. See `auth::ticket`.
     pub management_tickets: Option<crate::auth::ticket::TicketTrust>,
@@ -520,6 +524,16 @@ impl Config {
                     None
                 }
             },
+            caller_assertions: match crate::auth::caller_assertion::CallerAssertionConfig::parse(
+                var("CALLER_ASSERTION_KEY").as_deref(),
+                var("CALLER_ASSERTION_AUDIENCES").as_deref(),
+            ) {
+                Ok(config) => config,
+                Err(reason) => {
+                    tracing::error!("{reason}. Caller assertions are DISABLED until it is fixed.");
+                    None
+                }
+            },
             management_tickets: match crate::auth::ticket::TicketTrust::parse(
                 var("MANAGEMENT_TICKET_ISSUER").as_deref(),
                 var("MANAGEMENT_TICKET_AUDIENCE").as_deref(),
@@ -633,6 +647,8 @@ mod tests {
             "POLICY_URI",
             "BASE_PATH",
             "PLATFORM_API_KEY_HASH",
+            "CALLER_ASSERTION_KEY",
+            "CALLER_ASSERTION_AUDIENCES",
             "MANAGEMENT_TICKET_ISSUER",
             "MANAGEMENT_TICKET_AUDIENCE",
             "MANAGEMENT_TICKET_JWKS",
@@ -823,6 +839,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
@@ -1279,6 +1296,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
@@ -1318,6 +1336,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
@@ -1357,6 +1376,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
@@ -1396,6 +1416,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
@@ -1465,6 +1486,7 @@ mod tests {
             telemetry_managed_by: None,
             plugin_cache_dir: None,
             platform_api_key_hash: None,
+            caller_assertions: None,
             management_tickets: None,
             job_worker_concurrency: 1,
             superadmin_did: None,
