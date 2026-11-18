@@ -57,7 +57,10 @@ function fetchFor() {
     if (url.includes("/oauth/dpop-keys")) return json({ provision_id: "hvp_1", dpop_key: testJwk }, 201);
     if (url.includes("/oauth/par")) return json({ request_uri: "urn:x", expires_in: 60 }, 201);
     if (url.includes("/oauth/token")) return json({ access_token: "at", scope: "atproto", iss: "https://pds.example.com" });
-    if (url.includes("/oauth/sessions") && init?.method === "POST") return json({ session_id: "s", did: DID }, 201);
+    if (url.includes("/oauth/sessions") && init?.method === "POST") {
+      const sent = JSON.parse(String(init.body));
+      return json({ session_id: "s", did: DID, ...(sent.ticket_key_proof ? { ticket_pin: "refused" } : {}) }, 201);
+    }
     throw new Error(`unexpected fetch: ${url}`);
   });
 }
@@ -174,5 +177,72 @@ describe("sign-in with a key store", () => {
     expect(JSON.parse(localStorage.getItem(key)!).createdAt).toBe(1_000);
     await c.sweepPendingSignIns(1_000 + PENDING_SIGN_IN_TTL_MS + 1);
     expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  test("a ticket key proof goes with the session's registration", async () => {
+    const fetchFn = fetchFor();
+    const asked: unknown[] = [];
+    const c = new HappyViewBrowserClient({
+      instanceUrl: "https://happyview.example.com",
+      clientId: "https://example.com/client-metadata.json",
+      clientKey: "hvc_test",
+      storage: new LocalStorageAdapter(),
+      keyStore: new MemoryKeyStore(),
+      fetch: fetchFn as unknown as typeof fetch,
+      ticketKeyProof: async (request) => {
+        asked.push(request);
+        return "the.ticket.proof";
+      },
+    });
+    const { state } = await c.prepareLogin(DID);
+    const session = await c.callback(`?code=c&state=${state}`);
+    // The instance's answer reaches the sign-in result.
+    expect(session.ticketPin).toBe("refused");
+    expect(asked).toEqual([
+      {
+        did: DID,
+        dpopJkt: await jwkThumbprint(testJwk),
+        audience: "https://happyview.example.com",
+        lxm: "happyview.oauth.registerSession",
+      },
+    ]);
+    const register = (fetchFn as any).mock.calls.find(
+      (call: any[]) => String(call[0]).includes("/oauth/sessions") && call[1]?.method === "POST",
+    );
+    expect(JSON.parse(register[1].body).ticket_key_proof).toBe("the.ticket.proof");
+  });
+
+  test("without a prover, registration carries no ticket key proof", async () => {
+    const fetchFn = fetchFor();
+    const c = client(new MemoryKeyStore(), fetchFn as unknown as typeof fetch);
+    const { state } = await c.prepareLogin(DID);
+    await c.callback(`?code=c&state=${state}`);
+    const register = (fetchFn as any).mock.calls.find(
+      (call: any[]) => String(call[0]).includes("/oauth/sessions") && call[1]?.method === "POST",
+    );
+    expect(JSON.parse(register[1].body)).not.toHaveProperty("ticket_key_proof");
+  });
+
+  test("a prover that returns nothing, or fails, leaves the sign-in unpinned and completed", async () => {
+    for (const prover of [async () => undefined, async () => { throw new Error("no IndexedDB"); }]) {
+      localStorage.clear();
+      const fetchFn = fetchFor();
+      const c = new HappyViewBrowserClient({
+        instanceUrl: "https://happyview.example.com",
+        clientId: "https://example.com/client-metadata.json",
+        clientKey: "hvc_test",
+        storage: new LocalStorageAdapter(),
+        keyStore: new MemoryKeyStore(),
+        fetch: fetchFn as unknown as typeof fetch,
+        ticketKeyProof: prover,
+      });
+      const { state } = await c.prepareLogin(DID);
+      const session = await c.callback(`?code=c&state=${state}`);
+      expect(session.did).toBe(DID);
+      const register = (fetchFn as any).mock.calls.find(
+        (call: any[]) => String(call[0]).includes("/oauth/sessions") && call[1]?.method === "POST",
+      );
+      expect(JSON.parse(register[1].body)).not.toHaveProperty("ticket_key_proof");
+    }
   });
 });

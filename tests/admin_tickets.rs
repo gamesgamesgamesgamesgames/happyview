@@ -643,3 +643,92 @@ async fn a_ticket_on_a_platform_route_is_its_user() {
         .unwrap();
     assert_eq!(send(&app, req).await, StatusCode::OK);
 }
+
+/// A proof already used is refused on its headers: replaying it with a large
+/// body gets the replay's 401, not the 413 that reading the body would.
+#[tokio::test]
+#[serial]
+async fn a_replayed_proof_is_refused_before_its_body_is_read() {
+    let issuer = Issuer::new();
+    let app = app_trusting(&issuer).await;
+    let body = serde_json::to_vec(&json!({ "value": "Once" })).unwrap();
+    let req = issuer
+        .request(
+            &app.admin_did,
+            "PUT",
+            "/admin/settings/app_name",
+            &body,
+            &body,
+            ORIGIN,
+        )
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let huge = vec![b' '; happyview::auth::ticket::MAX_BODY_BYTES + 1];
+    let again = resend_with(&req, &huge);
+    assert!(send(&app, req).await.is_success());
+    assert_eq!(send(&app, again).await, StatusCode::UNAUTHORIZED);
+    let refused = events(&app, "ticket.refused").await;
+    assert_eq!(refused.last().unwrap().0["step"], "replay");
+}
+
+/// Repeating a refused request adds one event row per ticket and step, not
+/// one per attempt.
+#[tokio::test]
+#[serial]
+async fn a_refusal_is_logged_once_per_ticket_and_step() {
+    let issuer = Issuer::new();
+    let app = app_trusting(&issuer).await;
+    let (ticket, jti) = issuer.ticket_and_jti(&app.admin_did);
+    let before = events(&app, "ticket.refused").await.len();
+    for _ in 0..3 {
+        let req = issuer
+            .request_with(
+                &ticket,
+                "GET",
+                "/admin/stats",
+                b"",
+                b"",
+                "https://elsewhere.example",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, req).await, StatusCode::UNAUTHORIZED);
+    }
+    let refused = events(&app, "ticket.refused").await;
+    assert_eq!(refused.len(), before + 1);
+    assert_eq!(refused.last().unwrap().0["ticket"]["jti"], jti.as_str());
+
+    // Another step for the same ticket is its own row.
+    let body = serde_json::to_vec(&json!({ "value": "x" })).unwrap();
+    let other = serde_json::to_vec(&json!({ "value": "y" })).unwrap();
+    for _ in 0..2 {
+        let req = issuer
+            .request_with(
+                &ticket,
+                "PUT",
+                "/admin/settings/app_name",
+                &other,
+                &body,
+                ORIGIN,
+            )
+            .body(Body::from(other.clone()))
+            .unwrap();
+        assert_eq!(send(&app, req).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(events(&app, "ticket.refused").await.len(), before + 2);
+
+    // A new ticket starts its own count.
+    let req = issuer
+        .request(
+            &app.admin_did,
+            "GET",
+            "/admin/stats",
+            b"",
+            b"",
+            "https://elsewhere.example",
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, req).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(events(&app, "ticket.refused").await.len(), before + 3);
+}
