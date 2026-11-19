@@ -1269,18 +1269,37 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
 }
 
 /// The tokens a refresh returned, for a caller that keeps its own session.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct RefreshedTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    pub token_type: Option<String>,
     pub expires_in: Option<i64>,
     pub scope: Option<String>,
     pub sub: Option<String>,
 }
 
+/// Leaves the tokens out of logs.
+impl std::fmt::Debug for RefreshedTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedTokens")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("sub", &self.sub)
+            .finish()
+    }
+}
+
 /// Refresh a token set at `issuer`'s token endpoint with a DPoP proof from
-/// `dpop_private_jwk`, as `client_id`, signing a client assertion with
-/// `assertion_key` (`(private_jwk, kid)`) when the client is confidential.
+/// `dpop_private_jwk`, as `client_id`. A confidential client passes
+/// `assertion_key` (`(private_jwk, kid)`), and each attempt, nonce retries
+/// included, carries its own freshly signed client assertion.
 ///
 /// A refusal is an error naming the status and body as atrium does
 /// (`http status: 400 Bad Request, body: …`), so
@@ -1294,26 +1313,22 @@ pub(crate) async fn refresh_token_set(
     assertion_key: Option<(&serde_json::Value, &str)>,
 ) -> Result<RefreshedTokens, AppError> {
     let token_endpoint = discover_token_endpoint(http, issuer).await?;
-    let assertion = assertion_key
-        .map(|(jwk, kid)| super::client_assertion::build(jwk, kid, client_id, issuer))
-        .transpose()?;
 
     let (buffered, _) = send_with_nonce_retry(
         NoncePolicy::AuthServer,
         None,
         "token refresh request",
         |nonce| {
+            let assertion = assertion_key
+                .map(|(jwk, kid)| super::client_assertion::build(jwk, kid, client_id, issuer))
+                .transpose()?;
             let proof =
                 generate_dpop_proof_no_ath(dpop_private_jwk, "POST", &token_endpoint, nonce)?;
             Ok(http
                 .post(&token_endpoint)
                 .header("DPoP", proof)
                 .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&build_refresh_form(
-                    refresh_token,
-                    client_id,
-                    assertion.clone(),
-                )))
+                .form(&build_refresh_form(refresh_token, client_id, assertion)))
         },
     )
     .await?;

@@ -24,6 +24,8 @@ pub enum RefreshOutcome {
     Refreshed,
     /// The grant has no account bound yet, so there is nothing to refresh.
     Unbound,
+    /// Another refresh holds the session; it settles the grant.
+    InProgress,
     /// The authorization server refused the grant; it now needs
     /// reauthorization.
     NeedsReauth,
@@ -54,7 +56,11 @@ pub async fn refresh_grant(
         Err(e) => Some((format!("{e}"), RefreshFailure::Local)),
         Ok(client) => {
             match super::session_refresh::refresh_session(state, &client, did_str).await {
-                Ok(()) => None,
+                Ok(super::session_refresh::Refreshed::Done) => None,
+                // Another refresh holds the session and settles the grant.
+                Ok(super::session_refresh::Refreshed::InProgress) => {
+                    return Ok(RefreshOutcome::InProgress);
+                }
                 Err(e) => Some((e.message, e.kind)),
             }
         }
