@@ -1199,3 +1199,172 @@ async fn postgres_instances_booting_together_on_a_stable_database_all_boot() {
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The space host service entry is limited to space host methods
+// ---------------------------------------------------------------------------
+
+/// The last migration before the space host entry was limited.
+const PRE_SPACE_HOST_METHODS_CUTOFF: &str = "20261117000001";
+
+/// `(fragment_id, access_mode)` for every entry, and `(fragment_id,
+/// lexicon_id)` for every method an entry lists.
+async fn service_entries_after(pool: &AnyPool) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let entries: Vec<(String, String)> = sqlx::query_as(
+        "SELECT fragment_id, access_mode FROM happyview_service_entries ORDER BY fragment_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read service entries");
+    let xrpcs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.fragment_id, x.lexicon_id FROM happyview_service_entry_xrpcs x \
+         JOIN happyview_service_entries e ON e.id = x.service_entry_id \
+         ORDER BY e.fragment_id, x.lexicon_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read service entry xrpcs");
+    (entries, xrpcs)
+}
+
+/// Run the migrations before the change, seed `seed`, then run the rest.
+async fn migrate_around_space_host_change(
+    pool: &AnyPool,
+    migrations_dir: &str,
+    seed: &[&'static str],
+) {
+    let baseline_dir =
+        std::env::temp_dir().join(format!("hv-pre-space-host-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &baseline_dir, PRE_SPACE_HOST_METHODS_CUTOFF);
+    Migrator::new(baseline_dir.as_path())
+        .await
+        .expect("load earlier migrations")
+        .run(pool)
+        .await
+        .expect("earlier migrations apply");
+    for statement in seed {
+        sqlx::query(*statement)
+            .execute(pool)
+            .await
+            .expect("seed service entries");
+    }
+    Migrator::new(Path::new(migrations_dir))
+        .await
+        .expect("load current migrations")
+        .run(pool)
+        .await
+        .expect("current migrations apply");
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+}
+
+/// The created entry, still on `all`, is limited to the space host methods.
+/// An entry the operator added stays as it was.
+async fn assert_space_host_entry_is_limited(pool: &AnyPool, migrations_dir: &str) {
+    migrate_around_space_host_change(
+        pool,
+        migrations_dir,
+        &[
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#atproto_space_host', 'AtprotoSpaceHost', 'all', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#chess', 'ChessAppView', 'all', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+        ],
+    )
+    .await;
+
+    let (entries, xrpcs) = service_entries_after(pool).await;
+    assert_eq!(
+        entries,
+        vec![
+            ("#atproto_space_host".to_string(), "specific".to_string()),
+            ("#chess".to_string(), "all".to_string()),
+        ]
+    );
+    let mut expected: Vec<(String, String)> = happyview::service_entries::SPACE_HOST_XRPCS
+        .iter()
+        .map(|m| ("#atproto_space_host".to_string(), m.to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(xrpcs, expected);
+}
+
+/// An entry the operator already set to `specific` keeps its own methods.
+async fn assert_specific_space_host_entry_is_kept(pool: &AnyPool, migrations_dir: &str) {
+    migrate_around_space_host_change(
+        pool,
+        migrations_dir,
+        &[
+            "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) \
+             VALUES ('#atproto_space_host', 'AtprotoSpaceHost', 'specific', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+            "INSERT INTO happyview_service_entry_xrpcs (service_entry_id, lexicon_id) \
+             SELECT id, 'com.atproto.space.notifyWrite' FROM happyview_service_entries WHERE fragment_id = '#atproto_space_host'",
+        ],
+    )
+    .await;
+
+    let (entries, xrpcs) = service_entries_after(pool).await;
+    assert_eq!(
+        entries,
+        vec![("#atproto_space_host".to_string(), "specific".to_string())]
+    );
+    assert_eq!(
+        xrpcs,
+        vec![(
+            "#atproto_space_host".to_string(),
+            "com.atproto.space.notifyWrite".to_string()
+        )]
+    );
+}
+
+async fn fresh_sqlite(prefix: &str) -> (AnyPool, std::path::PathBuf) {
+    happyview::db::install_drivers();
+    let tmp_db = std::env::temp_dir().join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()));
+    let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+        .await
+        .expect("connect to fresh sqlite database");
+    (pool, tmp_db)
+}
+
+#[tokio::test]
+async fn sqlite_space_host_entry_is_limited_to_space_host_methods() {
+    let (pool, tmp_db) = fresh_sqlite("hv-space-host").await;
+    assert_space_host_entry_is_limited(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+async fn sqlite_specific_space_host_entry_is_kept() {
+    let (pool, tmp_db) = fresh_sqlite("hv-space-host-kept").await;
+    assert_specific_space_host_entry_is_kept(&pool, "migrations/sqlite").await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_space_host_entry_is_limited_to_space_host_methods() {
+    let ran = with_scratch_postgres("hv_space_host", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_space_host_entry_is_limited(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_specific_space_host_entry_is_kept() {
+    let ran = with_scratch_postgres("hv_space_host_kept", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_specific_space_host_entry_is_kept(&pool, "migrations/postgres").await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
