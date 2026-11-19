@@ -1268,6 +1268,67 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
         .ok_or_else(|| AppError::Internal("auth server metadata missing token_endpoint".into()))
 }
 
+/// The tokens a refresh returned, for a caller that keeps its own session.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
+    pub scope: Option<String>,
+    pub sub: Option<String>,
+}
+
+/// Refresh a token set at `issuer`'s token endpoint with a DPoP proof from
+/// `dpop_private_jwk`, as `client_id`, signing a client assertion with
+/// `assertion_key` (`(private_jwk, kid)`) when the client is confidential.
+///
+/// A refusal is an error naming the status and body as atrium does
+/// (`http status: 400 Bad Request, body: …`), so
+/// `linked_repos::refresh::classify` reads both alike.
+pub(crate) async fn refresh_token_set(
+    http: &reqwest::Client,
+    issuer: &str,
+    refresh_token: &str,
+    client_id: &str,
+    dpop_private_jwk: &serde_json::Value,
+    assertion_key: Option<(&serde_json::Value, &str)>,
+) -> Result<RefreshedTokens, AppError> {
+    let token_endpoint = discover_token_endpoint(http, issuer).await?;
+    let assertion = assertion_key
+        .map(|(jwk, kid)| super::client_assertion::build(jwk, kid, client_id, issuer))
+        .transpose()?;
+
+    let (buffered, _) = send_with_nonce_retry(
+        NoncePolicy::AuthServer,
+        None,
+        "token refresh request",
+        |nonce| {
+            let proof =
+                generate_dpop_proof_no_ath(dpop_private_jwk, "POST", &token_endpoint, nonce)?;
+            Ok(http
+                .post(&token_endpoint)
+                .header("DPoP", proof)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&build_refresh_form(
+                    refresh_token,
+                    client_id,
+                    assertion.clone(),
+                )))
+        },
+    )
+    .await?;
+
+    let body = String::from_utf8_lossy(&buffered.body).to_string();
+    if !buffered.status.is_success() {
+        return Err(AppError::Auth(format!(
+            "token refresh failed: http status: {}, body: {body}",
+            buffered.status
+        )));
+    }
+    serde_json::from_str(&body)
+        .map_err(|e| AppError::Internal(format!("invalid token refresh response: {e}")))
+}
+
 /// Look up the client_id_url for an API client by its internal ID.
 pub(crate) async fn lookup_client_id_url(
     pool: &sqlx::AnyPool,

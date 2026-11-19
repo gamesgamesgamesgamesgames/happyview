@@ -10,15 +10,17 @@ use super::types::{LinkedRepo, STATUS_ACTIVE};
 
 /// How often the loop wakes.
 const TICK_SECS: u64 = 30 * 60;
-/// Only touch grants that have not been refreshed within this window.
-const STALE_AFTER_SECS: i64 = 60 * 60;
+/// Refresh a grant once this long has passed since its last refresh: well
+/// inside an authorization server's refresh-token lifetime, which runs to days
+/// or months, while the access tokens it replaces last minutes to hours.
+const STALE_AFTER_SECS: i64 = 6 * 60 * 60;
 /// The longest the keep-alive waits to retry a grant after transient failures.
 const MAX_BACKOFF_SECS: u64 = 8 * 60 * 60;
 
 /// What one keep-alive attempt did to a grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
-    /// The session restored; the grant's refresh time moved on.
+    /// The session's tokens were refreshed; the grant's refresh time moved on.
     Refreshed,
     /// The grant has no account bound yet, so there is nothing to refresh.
     Unbound,
@@ -31,7 +33,8 @@ pub enum RefreshOutcome {
     Transient,
 }
 
-/// Restore a grant's session, and settle what a failure means for it. See
+/// Refresh a grant's session at its authorization server, and settle what a
+/// failure means for it. See
 /// [`refresh::classify`] and [`refresh::GIVE_UP_AFTER`].
 pub async fn refresh_grant(
     state: &AppState,
@@ -41,7 +44,7 @@ pub async fn refresh_grant(
         return Ok(RefreshOutcome::Unbound);
     };
 
-    let did = Did::new(did_str.clone())
+    Did::new(did_str.clone())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
     let failure = match flow::client_for_grant(state, grant).await {
@@ -49,14 +52,12 @@ pub async fn refresh_grant(
         // no longer held; anything else is this instance failing to build it.
         Err(e @ AppError::Auth(_)) => Some((format!("{e}"), RefreshFailure::Refused)),
         Err(e) => Some((format!("{e}"), RefreshFailure::Local)),
-        Ok(client) => match client.restore(&did).await {
-            Ok(_session) => None,
-            Err(e) => {
-                let message = format!("{e}");
-                let kind = refresh::classify(&message);
-                Some((message, kind))
+        Ok(client) => {
+            match super::session_refresh::refresh_session(state, &client, did_str).await {
+                Ok(()) => None,
+                Err(e) => Some((e.message, e.kind)),
             }
-        },
+        }
     };
 
     let Some((message, kind)) = failure else {

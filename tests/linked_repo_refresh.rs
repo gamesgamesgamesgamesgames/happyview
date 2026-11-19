@@ -86,6 +86,7 @@ async fn a_502_then_success_keeps_the_grant_active() {
     let app = TestApp::new().await;
     let grant = active_grant(&app).await;
     metadata_failing(&app, 1).await;
+    token_endpoint(&app, rotated_tokens()).await;
 
     assert_eq!(
         refresh_grant(&app.state, &grant).await.unwrap(),
@@ -202,4 +203,165 @@ async fn using_a_grant_through_an_outage_keeps_it_active() {
     );
     let recovered = db::get(&app.state, &grant.id).await.unwrap().unwrap();
     assert_eq!(recovered.last_error, None);
+}
+
+/// A token endpoint that answers every refresh with `response`.
+async fn token_endpoint(app: &TestApp, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(response)
+        .mount(&app.mock_server)
+        .await;
+}
+
+fn rotated_tokens() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": "linked-access-token-2",
+        "refresh_token": "linked-refresh-token-2",
+        "token_type": "DPoP",
+        "expires_in": 3600,
+        "scope": "atproto",
+        "sub": ACCOUNT,
+    }))
+}
+
+async fn stored_tokens(app: &TestApp) -> (String, Option<String>) {
+    let session = happyview::auth::oauth_store::DbSessionStore::new_with_table(
+        app.state.db.clone(),
+        app.state.db_backend,
+        happyview::linked_repos::client::LINKED_SESSIONS_TABLE,
+        Some(common::db::TEST_ENCRYPTION_KEY.into()),
+    )
+    .get(&Did::new(ACCOUNT.to_string()).unwrap())
+    .await
+    .unwrap()
+    .expect("the session is still stored");
+    (
+        session.token_set.access_token,
+        session.token_set.refresh_token,
+    )
+}
+
+/// The keep-alive refreshes at the token endpoint, and stores the rotated
+/// tokens.
+#[tokio::test]
+#[serial]
+async fn a_refresh_stores_the_rotated_tokens() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(&app, rotated_tokens()).await;
+
+    assert_eq!(
+        refresh_grant(&app.state, &grant).await.unwrap(),
+        RefreshOutcome::Refreshed
+    );
+    assert_eq!(
+        stored_tokens(&app).await,
+        (
+            "linked-access-token-2".to_string(),
+            Some("linked-refresh-token-2".to_string())
+        )
+    );
+    let refreshed = db::get(&app.state, &grant.id).await.unwrap().unwrap();
+    assert_eq!(refreshed.status, types::STATUS_ACTIVE);
+    assert_eq!(refreshed.last_error, None);
+
+    let requests = app.mock_server.received_requests().await.unwrap();
+    let refresh = requests
+        .iter()
+        .find(|r| r.url.path() == "/oauth/token")
+        .expect("the keep-alive called the token endpoint");
+    let form = String::from_utf8_lossy(&refresh.body);
+    assert!(form.contains("grant_type=refresh_token"), "{form}");
+    assert!(
+        form.contains("refresh_token=linked-refresh-token"),
+        "{form}"
+    );
+    assert!(refresh.headers.get("dpop").is_some());
+}
+
+/// A refresh the authorization server refuses needs reauthorization.
+#[tokio::test]
+#[serial]
+async fn an_invalid_grant_on_refresh_needs_reauthorization() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(
+        &app,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": "invalid_grant",
+            "error_description": "refresh token revoked",
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        refresh_grant(&app.state, &grant).await.unwrap(),
+        RefreshOutcome::NeedsReauth
+    );
+    let flagged = db::get(&app.state, &grant.id).await.unwrap().unwrap();
+    assert_eq!(flagged.status, types::STATUS_NEEDS_REAUTH);
+    assert!(flagged.last_error.unwrap().contains("invalid_grant"));
+}
+
+/// A token endpoint outage leaves the grant active and the session as it was.
+#[tokio::test]
+#[serial]
+async fn a_token_endpoint_outage_keeps_the_grant_active() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(&app, ResponseTemplate::new(503)).await;
+
+    assert_eq!(
+        refresh_grant(&app.state, &grant).await.unwrap(),
+        RefreshOutcome::Transient
+    );
+    let kept = db::get(&app.state, &grant.id).await.unwrap().unwrap();
+    assert_eq!(kept.status, types::STATUS_ACTIVE);
+    assert!(kept.last_error.is_some());
+    assert_eq!(
+        stored_tokens(&app).await,
+        (
+            "linked-access-token".to_string(),
+            Some("linked-refresh-token".to_string())
+        )
+    );
+}
+
+/// A confidential client signs its refresh with the instance key.
+#[tokio::test]
+#[serial]
+async fn a_confidential_refresh_carries_a_client_assertion() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.public_url = "https://happyview.example".to_string();
+    happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.keyring().as_ref(),
+    )
+    .await
+    .unwrap();
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(&app, rotated_tokens()).await;
+
+    assert_eq!(
+        refresh_grant(&app.state, &grant).await.unwrap(),
+        RefreshOutcome::Refreshed
+    );
+    let requests = app.mock_server.received_requests().await.unwrap();
+    let refresh = requests
+        .iter()
+        .find(|r| r.url.path() == "/oauth/token")
+        .expect("the keep-alive called the token endpoint");
+    let form = String::from_utf8_lossy(&refresh.body);
+    assert!(form.contains("client_assertion_type="), "{form}");
+    assert!(form.contains("client_assertion=ey"), "{form}");
 }
