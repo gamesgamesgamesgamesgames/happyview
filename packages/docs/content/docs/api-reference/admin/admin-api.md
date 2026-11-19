@@ -6,11 +6,12 @@ The admin API lets you manage lexicons, monitor records, run backfill jobs, and 
 
 ## Auth
 
-The admin API supports three authentication methods:
+The admin API supports two authentication methods:
 
 1. **API keys** — read/write tokens starting with `hv_`, passed as `Authorization: Bearer hv_...`. See the [API Keys guide](../../guides/api-keys.md) for details.
-2. **Service auth JWT** — atproto inter-service authentication via signed JWTs.
-3. **Cookie-based session auth** — signed session cookies set during the dashboard OAuth login flow. The [web dashboard](../../getting-started/dashboard.md) uses this method.
+2. **Cookie-based session auth** — signed session cookies set during the dashboard OAuth login flow. The [web dashboard](../../getting-started/dashboard.md) uses this method.
+
+Service auth JWTs are not accepted on the admin API.
 
 In all cases the resolved DID is checked against the `happyview_users` table, and the user's permissions are loaded to authorize the request.
 
@@ -31,7 +32,7 @@ All error responses return JSON with an `error` field:
 | Status             | Meaning                                                                                |
 | ------------------ | -------------------------------------------------------------------------------------- |
 | `400 Bad Request`  | Invalid input (missing required fields, malformed lexicon JSON)                        |
-| `401 Unauthorized` | Missing or invalid API key or service auth JWT                                         |
+| `401 Unauthorized` | Missing or invalid API key or session                                                  |
 | `403 Forbidden`    | Authenticated DID is not in the users table, or user lacks the required permission     |
 | `404 Not Found`    | Lexicon, user, or backfill job not found                                               |
 

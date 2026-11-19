@@ -497,18 +497,21 @@ impl TestApp {
         .expect("failed to add entry xrpcs");
     }
 
+    /// A service-auth token bound to `lxm`, the method it will call.
     pub async fn service_auth_jwt(
         &self,
         plc_store: &crate::common::plc::PlcStore,
         issuer_did: &str,
         instance_did: &str,
         aud_fragment: &str,
+        lxm: &str,
     ) -> String {
-        self.service_auth_jwt_for(plc_store, issuer_did, instance_did, aud_fragment, None)
+        self.service_auth_jwt_for(plc_store, issuer_did, instance_did, aud_fragment, Some(lxm))
             .await
     }
 
-    /// A service-auth token bound to one XRPC method through `lxm`.
+    /// A service-auth token bound to one XRPC method through `lxm`, or to
+    /// none when `lxm` is `None`.
     pub async fn service_auth_jwt_for(
         &self,
         plc_store: &crate::common::plc::PlcStore,
@@ -701,6 +704,7 @@ impl TestApp {
         issuer_did: &str,
         instance_did: &str,
         aud_fragment: &str,
+        lxm: &str,
     ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use p256::ecdsa::signature::Signer;
@@ -710,6 +714,7 @@ impl TestApp {
             "iss": issuer_did,
             "aud": format!("{}{}", instance_did, aud_fragment),
             "exp": chrono::Utc::now().timestamp() as u64 + 60,
+            "lxm": lxm,
         });
 
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());

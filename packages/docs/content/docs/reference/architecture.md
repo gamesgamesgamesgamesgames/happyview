@@ -102,7 +102,7 @@ sequenceDiagram
     participant D as Database
 
     C->>A: Request + Bearer token
-    A->>A: Validate claims (API key or service auth JWT)
+    A->>A: Validate claims (API key or session)
     A->>U: DID lookup
     alt Users table empty
         U-->>A: Auto-bootstrap as super user
