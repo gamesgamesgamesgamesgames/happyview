@@ -495,17 +495,17 @@ pub(super) async fn sync_plc_submit(
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
+    let input: submit_plc_operation::Input = submit_plc_operation::InputData {
+        operation: sign_result.operation.clone(),
+    }
+    .into();
+    crate::setup::encode_input(&input)?;
     let submitted = agent
         .api
         .com
         .atproto
         .identity
-        .submit_plc_operation(
-            submit_plc_operation::InputData {
-                operation: sign_result.operation.clone(),
-            }
-            .into(),
-        )
+        .submit_plc_operation(input)
         .await;
     crate::setup::ignore_unexpected_output(submitted).map_err(|e| {
         if is_pds_session_expired(&e) {
