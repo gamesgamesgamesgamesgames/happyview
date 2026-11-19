@@ -28,6 +28,12 @@ use super::refresh::{self, RefreshFailure};
 
 /// How long a refresh holds the session.
 const LEASE: chrono::Duration = chrono::Duration::minutes(2);
+/// The longest the refresh's network part may take: well inside [`LEASE`], so
+/// a slow refresh can't outlast it and let atrium use the same refresh token.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the lease settles before the refresh is sent: time for a refresh
+/// atrium started before the lease to finish and show in the row.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 /// The field a held session carries, beside atrium's own.
 const LEASE_FIELD: &str = "refresh_lease_until";
 
@@ -138,6 +144,18 @@ pub async fn refresh_session(
         return Ok(Refreshed::InProgress);
     };
 
+    // A refresh atrium started from the row before the lease finishes by
+    // writing the row. If that happened, this one stands down.
+    tokio::time::sleep(SETTLE).await;
+    match store.read_json(did).await {
+        Ok(Some(now)) if now.same_row(&held) => {}
+        Ok(_) => return Ok(Refreshed::InProgress),
+        Err(e) => {
+            release(&store, did, &held, &original).await;
+            return Err(store_error(e));
+        }
+    }
+
     let outcome = refresh_and_store(
         state,
         &store,
@@ -150,16 +168,32 @@ pub async fn refresh_session(
         signing.as_ref(),
     )
     .await;
-    if outcome.is_err() {
-        // Put the session back as it was, so atrium can refresh it.
-        if let Err(e) = store
-            .compare_and_set_json(did, &held, original.json.clone())
-            .await
-        {
-            tracing::warn!(did, error = %e, "failed to release a linked repo session lease");
+    match outcome {
+        Ok(()) => Ok(Refreshed::Done),
+        Err(StoreFailure::BeforeTokens(e)) => {
+            // Nothing was spent: put the session back so atrium can refresh it.
+            release(&store, did, &held, &original).await;
+            Err(e)
         }
+        Err(StoreFailure::AfterTokens(e)) => Err(e),
     }
-    outcome.map(|()| Refreshed::Done)
+}
+
+/// Put a held session back as it was read.
+async fn release(store: &DbSessionStore, did: &str, held: &StoredJson, original: &StoredJson) {
+    if let Err(e) = store
+        .compare_and_set_json(did, held, original.json.clone())
+        .await
+    {
+        tracing::warn!(did, error = %e, "failed to release a linked repo session lease");
+    }
+}
+
+/// Where a refresh failed: before the authorization server issued new tokens,
+/// so the old refresh token is still good, or after, when it is spent.
+enum StoreFailure {
+    BeforeTokens(RefreshError),
+    AfterTokens(RefreshError),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -173,22 +207,45 @@ async fn refresh_and_store(
     refresh_token: &str,
     client_id: &str,
     signing: Option<&crate::oauth::client_keys::ClientKey>,
-) -> Result<(), RefreshError> {
+) -> Result<(), StoreFailure> {
     let dpop_jwk = &session["dpop_key"];
-    let tokens = crate::oauth::pds_write::refresh_token_set(
-        &state.http,
-        issuer,
-        refresh_token,
-        client_id,
-        dpop_jwk,
-        signing.map(|k| (&k.private_jwk, k.kid.as_str())),
+    let refreshed = tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        crate::oauth::pds_write::refresh_token_set(
+            &state.http,
+            issuer,
+            refresh_token,
+            client_id,
+            dpop_jwk,
+            signing.map(|k| (&k.private_jwk, k.kid.as_str())),
+        ),
     )
-    .await
-    .map_err(|e| RefreshError::classified(e.to_string()))?;
+    .await;
+    let tokens = match refreshed {
+        Ok(Ok(tokens)) => tokens,
+        Ok(Err(e)) => {
+            return Err(StoreFailure::BeforeTokens(RefreshError::classified(
+                e.to_string(),
+            )));
+        }
+        Err(_) => {
+            return Err(StoreFailure::BeforeTokens(RefreshError {
+                message: format!(
+                    "token refresh timed out after {}s",
+                    REFRESH_TIMEOUT.as_secs()
+                ),
+                kind: RefreshFailure::Upstream,
+            }));
+        }
+    };
 
-    let refused = |message: String| RefreshError {
-        message,
-        kind: RefreshFailure::Refused,
+    // The answer is checked before anything is stored. A refused answer still
+    // spent the refresh token, so the old one isn't put back either.
+    let refused = |message: String| {
+        StoreFailure::AfterTokens(RefreshError {
+            message,
+            kind: RefreshFailure::Refused,
+        })
     };
     match tokens.sub.as_deref() {
         Some(sub) if sub == did => {}
@@ -226,19 +283,33 @@ async fn refresh_and_store(
         Some(secs) => rfc3339(chrono::Utc::now() + chrono::Duration::seconds(secs)).into(),
         None => serde_json::Value::Null,
     };
-    // atrium has to read what's written back.
-    serde_json::from_value::<atrium_oauth::store::session::Session>(updated.clone())
-        .map_err(|e| RefreshError::local(format!("unusable refreshed session: {e}")))?;
+    // From here the new refresh token is the only good one, so it's kept
+    // even when this write can't be made as planned.
+    let json = updated.to_string();
+    let after = |message: String| StoreFailure::AfterTokens(RefreshError::local(message));
+    if let Err(e) = serde_json::from_value::<atrium_oauth::store::session::Session>(updated) {
+        persist_anyway(store, did, &json).await;
+        return Err(after(format!("refreshed session atrium can't read: {e}")));
+    }
+    match store.compare_and_set_json(did, held, json.clone()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            persist_anyway(store, did, &json).await;
+            Err(after(
+                "the session changed while its refresh held it".into(),
+            ))
+        }
+        Err(e) => {
+            persist_anyway(store, did, &json).await;
+            Err(after(format!("session store error: {e}")))
+        }
+    }
+}
 
-    match store
-        .compare_and_set_json(did, held, updated.to_string())
-        .await
-        .map_err(store_error)?
-    {
-        Some(_) => Ok(()),
-        None => Err(RefreshError::local(
-            "the session changed while its refresh held it".into(),
-        )),
+/// Store a refreshed session over whatever the row holds, logging a failure.
+async fn persist_anyway(store: &DbSessionStore, did: &str, json: &str) {
+    if let Err(e) = store.set_json(did, json).await {
+        tracing::error!(did, error = %e, "failed to store a linked repo's refreshed tokens");
     }
 }
 

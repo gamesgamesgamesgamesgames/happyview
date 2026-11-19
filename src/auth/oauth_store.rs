@@ -201,6 +201,24 @@ impl DbSessionStore {
             json,
         }))
     }
+    /// Write a session's JSON whatever its row holds now.
+    pub async fn set_json(&self, did: &str, json: &str) -> Result<(), StoreError> {
+        let sealed = seal(self.encryption_key.as_ref(), json).map_err(StoreError::Seal)?;
+        crate::db::query(&adapt_sql(
+            &format!(
+                "UPDATE {} SET session_data = ?, encrypted = ?, updated_at = datetime('now') \
+                 WHERE did = ?",
+                self.table
+            ),
+            self.backend,
+        ))
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .bind(did)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A session's JSON and the value its row stores, sealed or not.
@@ -208,6 +226,13 @@ impl DbSessionStore {
 pub struct StoredJson {
     stored: String,
     pub json: String,
+}
+
+impl StoredJson {
+    /// Whether `other` was read from the same stored value.
+    pub fn same_row(&self, other: &StoredJson) -> bool {
+        self.stored == other.stored
+    }
 }
 
 impl fmt::Debug for StoredJson {

@@ -74,6 +74,9 @@ fn metadata(base: &str) -> serde_json::Value {
         "token_endpoint": format!("{base}/oauth/token"),
         "scopes_supported": ["atproto"],
         "response_types_supported": ["code"],
+        "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+        "dpop_signing_alg_values_supported": ["ES256"],
     })
 }
 
@@ -614,4 +617,110 @@ async fn a_nonce_retry_signs_a_fresh_assertion() {
         jtis.push(claims["jti"].as_str().unwrap().to_string());
     }
     assert_ne!(jtis[0], jtis[1]);
+}
+
+/// Rewrite the stored session's `expires_at`, optionally marking it held.
+async fn set_expiry(app: &TestApp, expires_at: chrono::DateTime<chrono::Utc>, held: bool) {
+    let store = happyview::auth::oauth_store::DbSessionStore::new_with_table(
+        app.state.db.clone(),
+        app.state.db_backend,
+        happyview::linked_repos::client::LINKED_SESSIONS_TABLE,
+        Some(common::db::TEST_ENCRYPTION_KEY.into()),
+    );
+    let current = store.read_json(ACCOUNT).await.unwrap().unwrap();
+    let mut session: serde_json::Value = serde_json::from_str(&current.json).unwrap();
+    let at = expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    session["token_set"]["expires_at"] = at.clone().into();
+    if held {
+        session["refresh_lease_until"] = at.into();
+    }
+    store
+        .compare_and_set_json(ACCOUNT, &current, session.to_string())
+        .await
+        .unwrap()
+        .expect("the session didn't change under the test");
+}
+
+/// atrium's own path: restore the session, then make a request the PDS
+/// answers `invalid_token`, which is when atrium refreshes. Answers how many
+/// token requests it made.
+async fn atrium_request_with_a_stale_token(app: &TestApp, grant: &types::LinkedRepo) -> usize {
+    Mock::given(method("GET"))
+        .and(path("/pds/xrpc/com.atproto.server.getSession"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            r#"DPoP error="invalid_token", error_description="token expired""#,
+        ))
+        .mount(&app.mock_server)
+        .await;
+    // What atrium checks before it refreshes: the account's DID document names
+    // a PDS, and that PDS names this authorization server.
+    let base = app.mock_server.uri();
+    app.mock_session_verification(ACCOUNT, ACCOUNT).await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            // atrium requires the PDS's own URL here, as the DID document names it.
+            "resource": format!("{base}/pds/{ACCOUNT}"),
+            "authorization_servers": [base],
+            "scopes_supported": [],
+        })))
+        .mount(&app.mock_server)
+        .await;
+    let client = happyview::linked_repos::flow::client_for_grant(&app.state, grant)
+        .await
+        .unwrap();
+    let session = client
+        .restore(&Did::new(ACCOUNT.to_string()).unwrap())
+        .await
+        .unwrap();
+    let agent = atrium_api::agent::Agent::new(session);
+    let _ = agent.api.com.atproto.server.get_session().await;
+    app.mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/oauth/token")
+        .count()
+}
+
+/// The lease works because atrium doesn't refresh a token set that hasn't
+/// expired: during a held lease its own request path sends no token request.
+#[tokio::test]
+#[serial]
+async fn atrium_does_not_refresh_a_held_session() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(&app, rotated_tokens()).await;
+    set_expiry(
+        &app,
+        chrono::Utc::now() + chrono::Duration::minutes(2),
+        true,
+    )
+    .await;
+
+    assert_eq!(atrium_request_with_a_stale_token(&app, &grant).await, 0);
+}
+
+/// The control for the test above: with the token set expired and no lease,
+/// the same path does refresh.
+#[tokio::test]
+#[serial]
+async fn atrium_refreshes_an_expired_unheld_session() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let grant = active_grant(&app).await;
+    metadata_failing(&app, 0).await;
+    token_endpoint(&app, rotated_tokens()).await;
+    set_expiry(
+        &app,
+        chrono::Utc::now() - chrono::Duration::minutes(1),
+        false,
+    )
+    .await;
+
+    assert_eq!(atrium_request_with_a_stale_token(&app, &grant).await, 1);
 }
