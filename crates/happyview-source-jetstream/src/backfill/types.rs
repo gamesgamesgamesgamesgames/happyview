@@ -63,6 +63,9 @@ pub struct BackfillJob {
     pub hooks: Option<JobHookStats>,
     /// The hook stats kept with the job when it ended.
     pub hook_stats: Option<serde_json::Value>,
+    /// 429 responses the job's fetches got from PDSes, each waited out and
+    /// the request sent again. Counted a minute at a time per PDS.
+    pub rate_limited: i64,
 }
 
 /// One collection whose relay listing a crawl has not finished.
@@ -186,6 +189,9 @@ pub struct PdsSummaryEntry {
     pub total_repos: i64,
     pub completed_repos: i64,
     pub total_records: i64,
+    /// 429 responses from this PDS. Always 0 for a job from before the
+    /// bounded queue.
+    pub rate_limited: i64,
 }
 
 #[derive(Serialize)]
