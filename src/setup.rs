@@ -66,6 +66,7 @@ pub fn routes() -> Router<AppState> {
         .route("/plc/register", post(plc_register))
         .route("/plc/request", post(plc_request))
         .route("/plc/submit", post(plc_submit))
+        .route("/plc/check", post(plc_check))
         .route("/complete", post(complete))
         .route("/rotation-key", get(export_rotation_key))
         .route("/resolve", get(resolve_identity))
@@ -463,6 +464,66 @@ async fn plc_submit(
     })?;
 
     // Update service_identity with the account's DID
+    service_identity::upsert_identity(
+        &state.db,
+        state.db_backend,
+        &IdentityMode::AttachAccount,
+        Some(&account_did),
+        None,
+        None,
+        Some(&account_did),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether `services`, from a DID's current PLC operation, lists every service
+/// entry at `public_url`.
+fn lists_every_entry(
+    services: &serde_json::Value,
+    entries: &[crate::service_entries::ServiceEntry],
+    public_url: &str,
+) -> bool {
+    entries.iter().all(|entry| {
+        let service = &services[entry.fragment_id.trim_start_matches('#')];
+        service["type"] == entry.service_type.as_str() && service["endpoint"] == public_url
+    })
+}
+
+/// POST /api/setup/plc/check: finish an attached account's PLC step when its
+/// DID document already lists this instance.
+///
+/// A submit can fail after the PDS has applied the operation, for instance
+/// when its answer is lost. The DID document is the record of what applied:
+/// when it lists every service entry at this instance, the step is done, and
+/// setup continues as it would after a submit. With no service entries there
+/// is nothing for it to list, so the step is done too. Otherwise it answers
+/// 409, and the operator submits again.
+async fn plc_check(_auth: UserAuth, State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
+    let identity = service_identity::get_identity(&state.db, state.db_backend)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
+    if identity.mode != IdentityMode::AttachAccount {
+        return Err(AppError::BadRequest(
+            "PLC flow only supported for attach_account mode".into(),
+        ));
+    }
+    let account_did = identity
+        .attached_account_did
+        .ok_or_else(|| AppError::BadRequest("no attached account DID configured".into()))?;
+
+    let plc_url = state.config.plc_url.trim_end_matches('/');
+    let last_op = crate::plc::fetch_last_operation(&state.http, plc_url, &account_did).await?;
+    let entries = crate::service_entries::list_entries(&state.db, state.db_backend).await?;
+    if !lists_every_entry(&last_op["services"], &entries, &state.config.public_url) {
+        return Err(AppError::Conflict(
+            "The DID document doesn't list this instance yet. Submit the confirmation code again."
+                .into(),
+        ));
+    }
+
     service_identity::upsert_identity(
         &state.db,
         state.db_backend,
