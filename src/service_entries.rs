@@ -213,6 +213,9 @@ pub const SPACE_HOST_FRAGMENT: &str = "#atproto_space_host";
 /// to [`SPACE_HOST_FRAGMENT`]: a repo host reporting a write, and a space
 /// authority reporting a deleted space or revoked credentials. Every other
 /// space method takes the caller's own session or a space credential.
+///
+/// The space routes themselves never read service entries; this list governs
+/// what the entry opens through the general XRPC handler.
 pub const SPACE_HOST_XRPCS: &[&str] = &[
     "com.atproto.space.notifyWrite",
     "com.atproto.space.notifySpaceDeleted",
