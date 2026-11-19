@@ -495,7 +495,7 @@ pub(super) async fn sync_plc_submit(
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
-    agent
+    let submitted = agent
         .api
         .com
         .atproto
@@ -506,13 +506,13 @@ pub(super) async fn sync_plc_submit(
             }
             .into(),
         )
-        .await
-        .map_err(|e| {
-            if is_pds_session_expired(&e) {
-                return pds_reauth_error();
-            }
-            AppError::Internal(format!("submitPlcOperation failed: {e}"))
-        })?;
+        .await;
+    crate::setup::ignore_unexpected_output(submitted).map_err(|e| {
+        if is_pds_session_expired(&e) {
+            return pds_reauth_error();
+        }
+        AppError::Internal(format!("submitPlcOperation failed: {e}"))
+    })?;
 
     log_event(
         &state.db,

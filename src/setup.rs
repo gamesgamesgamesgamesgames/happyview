@@ -23,6 +23,26 @@ pub(crate) fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
     msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
 }
 
+/// The result of a call whose lexicon has no output, read as success when the
+/// PDS answered 2xx with a body anyway.
+///
+/// atrium decodes a 2xx `application/json` body against the method's output.
+/// With no output declared, `{}` or an empty body fails to decode, and a body
+/// that decodes is reported as an unexpected type. Both happen only after a
+/// 2xx, so the call succeeded. Errors the PDS returned are kept. (Encoding
+/// the request can also fail with a JSON error, but the input here is already a
+/// JSON value.)
+pub(crate) fn ignore_unexpected_output<E: std::fmt::Debug>(
+    result: Result<(), atrium_xrpc::Error<E>>,
+) -> Result<(), atrium_xrpc::Error<E>> {
+    match result {
+        Err(atrium_xrpc::Error::SerdeJson(_)) | Err(atrium_xrpc::Error::UnexpectedResponseType) => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 fn pds_reauth_error() -> AppError {
     AppError::Auth(
         "Your PDS session has expired or been revoked. \
@@ -423,7 +443,7 @@ async fn plc_submit(
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
-    agent
+    let submitted = agent
         .api
         .com
         .atproto
@@ -434,13 +454,13 @@ async fn plc_submit(
             }
             .into(),
         )
-        .await
-        .map_err(|e| {
-            if is_pds_session_expired(&e) {
-                return pds_reauth_error();
-            }
-            AppError::Internal(format!("submitPlcOperation failed: {e}"))
-        })?;
+        .await;
+    ignore_unexpected_output(submitted).map_err(|e| {
+        if is_pds_session_expired(&e) {
+            return pds_reauth_error();
+        }
+        AppError::Internal(format!("submitPlcOperation failed: {e}"))
+    })?;
 
     // Update service_identity with the account's DID
     service_identity::upsert_identity(
