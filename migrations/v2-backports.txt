@@ -3,3 +3,5 @@
 # on beta byte for byte; scripts/check-release-v2.sh refuses anything else.
 migrations/postgres/20261110000001_reset_unconfirmed_space_scopes.sql
 migrations/sqlite/20261110000001_reset_unconfirmed_space_scopes.sql
+migrations/postgres/20261118120000_space_host_entry_methods.sql
+migrations/sqlite/20261118120000_space_host_entry_methods.sql
