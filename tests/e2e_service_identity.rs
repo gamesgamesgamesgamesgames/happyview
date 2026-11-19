@@ -350,7 +350,13 @@ async fn service_auth_query_allowed() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:caller123", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:caller123",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -370,7 +376,7 @@ async fn service_auth_query_allowed() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-async fn list_games_with_lxm(lxm: &str) -> StatusCode {
+async fn list_games_with_lxm(lxm: Option<&str>) -> (StatusCode, Value) {
     let mut app = TestApp::new().await;
     let plc_store = plc::setup_mock_plc(&app.mock_server).await;
     let did = app.setup_did_web().await;
@@ -381,10 +387,11 @@ async fn list_games_with_lxm(lxm: &str) -> StatusCode {
         .await;
 
     let auth = app
-        .service_auth_jwt_for(&plc_store, "did:plc:caller123", &did, "#chess", Some(lxm))
+        .service_auth_jwt_for(&plc_store, "did:plc:caller123", &did, "#chess", lxm)
         .await;
 
-    app.router
+    let resp = app
+        .router
         .clone()
         .oneshot(
             Request::builder()
@@ -395,24 +402,77 @@ async fn list_games_with_lxm(lxm: &str) -> StatusCode {
                 .unwrap(),
         )
         .await
-        .unwrap()
-        .status()
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
 #[tokio::test]
 #[serial]
 async fn service_auth_accepts_lxm_naming_the_called_method() {
     common::require_db!();
-    let status = list_games_with_lxm("games.gamesgamesgamesgames.listGames").await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = list_games_with_lxm(Some("games.gamesgamesgamesgames.listGames")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
 #[serial]
 async fn service_auth_rejects_lxm_naming_another_method() {
     common::require_db!();
-    let status = list_games_with_lxm("com.atproto.space.notifyWrite").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = list_games_with_lxm(Some("com.atproto.space.notifyWrite")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "BadJwtLexiconMethod", "{body}");
+    assert_eq!(
+        body["message"],
+        "bad jwt lexicon method (\"lxm\"). must match: games.gamesgamesgamesgames.listGames"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn service_auth_rejects_a_token_naming_no_method() {
+    common::require_db!();
+    let (status, body) = list_games_with_lxm(None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "BadJwtLexiconMethod", "{body}");
+    assert_eq!(
+        body["message"],
+        "missing jwt lexicon method (\"lxm\"). must match: games.gamesgamesgamesgames.listGames"
+    );
+}
+
+/// Off `/xrpc` there is no method to bind a token to, so service auth is
+/// not accepted at all, whatever the token's `lxm`.
+#[tokio::test]
+#[serial]
+async fn service_auth_is_refused_outside_xrpc() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    for lxm in [None, Some("com.example.other")] {
+        let auth = app
+            .service_auth_jwt_for(&plc_store, "did:plc:caller123", &did, "#chess", lxm)
+            .await;
+        let resp = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/external-auth/accounts")
+                    .header("authorization", &auth)
+                    .header("host", "127.0.0.1:0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{lxm:?}");
+    }
 }
 
 #[tokio::test]
@@ -429,7 +489,13 @@ async fn service_auth_query_denied() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:caller456", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:caller456",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -468,7 +534,13 @@ async fn service_auth_specific_xrpc_allowed() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:caller789", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:caller789",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -510,7 +582,13 @@ async fn service_auth_procedure_allowed() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:procallowed", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:procallowed",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -549,7 +627,13 @@ async fn service_auth_procedure_denied() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:procdenied", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:procdenied",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -590,7 +674,13 @@ async fn call_with_space_host_entry(method: &str, uri: &str, aud_fragment: &str)
         .expect("create the space host entry");
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:anyaccount", &did, aud_fragment)
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:anyaccount",
+            &did,
+            aud_fragment,
+            uri.trim_start_matches("/xrpc/").split('?').next().unwrap(),
+        )
         .await;
 
     let mut req = Request::builder()
@@ -675,7 +765,13 @@ async fn token_scope_enforcement() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:scopecheck", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:scopecheck",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -731,7 +827,13 @@ async fn token_scope_is_checked_against_a_project_scripts_outbound_list() {
     app.add_entry_xrpcs(entry_id, &["games.gamesgamesgamesgames.createGame"])
         .await;
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:scopecheck", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:scopecheck",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -919,7 +1021,13 @@ async fn nonexistent_fragment_denies_access() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:nofragment", &did, "#doesNotExist")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:nofragment",
+            &did,
+            "#doesNotExist",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -982,7 +1090,13 @@ async fn multiple_entries_matched_by_fragment() {
         .await;
 
     let auth_chess = app
-        .service_auth_jwt(&plc_store, "did:plc:multi1", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:multi1",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -1002,7 +1116,13 @@ async fn multiple_entries_matched_by_fragment() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let auth_checkers = app
-        .service_auth_jwt(&plc_store, "did:plc:multi2", &did, "#checkers")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:multi2",
+            &did,
+            "#checkers",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -1040,7 +1160,13 @@ async fn scope_check_applies_with_access_mode_all() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:scopeall", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:scopeall",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -1676,7 +1802,13 @@ async fn did_web_issuer_resolved_via_https() {
 
     app.use_permissive_http_client();
 
-    let auth = app.did_web_service_auth_jwt(&issuer_key, &issuer_did, &instance_did, "#appview");
+    let auth = app.did_web_service_auth_jwt(
+        &issuer_key,
+        &issuer_did,
+        &instance_did,
+        "#appview",
+        "games.gamesgamesgamesgames.listGames",
+    );
 
     let resp = app
         .router
@@ -1714,7 +1846,13 @@ async fn service_auth_rejected_when_no_entries_exist() {
     seed_query_lexicon(&app).await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:noentries", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:noentries",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -1754,7 +1892,13 @@ async fn service_auth_works_with_did_plc_identity() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:plccaller", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:plccaller",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -1836,6 +1980,7 @@ async fn service_auth_es256k_query_allowed() {
         "iss": issuer_did,
         "aud": format!("{did}#chess"),
         "exp": chrono::Utc::now().timestamp() as u64 + 60,
+        "lxm": "games.gamesgamesgamesgames.listGames",
     });
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -2007,7 +2152,13 @@ async fn service_auth_non_scripted_procedure_fails_gracefully() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:noscript", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:noscript",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.createGame",
+        )
         .await;
 
     let resp = app
@@ -2197,7 +2348,13 @@ async fn post_to_query_endpoint_rejected() {
         .await;
 
     let auth = app
-        .service_auth_jwt(&plc_store, "did:plc:postquery", &did, "#chess")
+        .service_auth_jwt(
+            &plc_store,
+            "did:plc:postquery",
+            &did,
+            "#chess",
+            "games.gamesgamesgamesgames.listGames",
+        )
         .await;
 
     let resp = app
@@ -2396,6 +2553,7 @@ async fn jwt_with_allowed_typ_accepted() {
                 "iss": "did:plc:goodtyp",
                 "aud": format!("{}#chess", did),
                 "exp": chrono::Utc::now().timestamp() as u64 + 60,
+                "lxm": "games.gamesgamesgamesgames.listGames",
             }),
         )
         .await;

@@ -11,7 +11,7 @@ A query or procedure is served by the [Lua script](../guides/lua-scripting.md) a
 XRPC routes accept several authentication methods:
 
 - **DPoP auth** — `Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`
-- **Service auth JWTs** — `Authorization: Bearer <service_auth_jwt>` (inter-service calls). A token whose `lxm` names a different method than the one called is rejected.
+- **Service auth JWTs** — `Authorization: Bearer <service_auth_jwt>` (inter-service calls). The token's `lxm` must name the method being called; a token without one, or with a different one, is rejected with `BadJwtLexiconMethod`.
 - **Space credentials** — `Authorization: Atproto-Space <credential>` with an `Atproto-Space-Audience` header and an HTTP Message Signature (space routes only). See [Space credentials](../experimental/spaces/credentials.md#using-a-credential).
 - **Cookie-based session auth** — signed session cookies (used by the dashboard, falls back when no `Authorization` header is present)
 - **Anonymous** — no auth headers (identity is `nil` in Lua scripts)

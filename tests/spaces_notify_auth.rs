@@ -208,6 +208,24 @@ async fn notify_write_with(
     rev_field: &str,
     rev: &str,
 ) -> (StatusCode, serde_json::Value) {
+    notify_write_bound_to(
+        signer,
+        repo,
+        rev_field,
+        rev,
+        Some("com.atproto.space.notifyWrite"),
+    )
+    .await
+}
+
+/// `notify_write_with`, with service auth bound to `lxm`.
+async fn notify_write_bound_to(
+    signer: &str,
+    repo: &str,
+    rev_field: &str,
+    rev: &str,
+    lxm: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance_did = app.setup_did_web().await;
@@ -220,7 +238,7 @@ async fn notify_write_with(
             signer,
             &instance_did,
             "#atproto_space_host",
-            Some("com.atproto.space.notifyWrite"),
+            lxm,
         )
         .await;
 
@@ -761,6 +779,17 @@ async fn create_space_on_its_own_did_with(
 /// `aud_fragment` of that DID, on an instance that exposes no identity of its
 /// own.
 async fn notify_space_did(aud_fragment: &str) -> StatusCode {
+    notify_space_did_bound_to(aud_fragment, Some("com.atproto.space.notifyWrite"))
+        .await
+        .0
+}
+
+/// `notify_space_did`, with service auth bound to `lxm`, returning the status
+/// and body.
+async fn notify_space_did_bound_to(
+    aud_fragment: &str,
+    lxm: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     enable_spaces(&app).await;
@@ -769,13 +798,7 @@ async fn notify_space_did(aud_fragment: &str) -> StatusCode {
     let space_did = space.trim_start_matches("at://").split('/').next().unwrap();
 
     let auth = app
-        .service_auth_jwt_for(
-            &plc_store,
-            &writer,
-            space_did,
-            aud_fragment,
-            Some("com.atproto.space.notifyWrite"),
-        )
+        .service_auth_jwt_for(&plc_store, &writer, space_did, aud_fragment, lxm)
         .await;
     let req = Request::builder()
         .method("POST")
@@ -792,7 +815,51 @@ async fn notify_space_did(aud_fragment: &str) -> StatusCode {
             .to_string(),
         ))
         .unwrap();
-    app.router.clone().oneshot(req).await.unwrap().status()
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// A space route refuses service auth that names no method, or another one,
+/// whether the token is addressed to this instance's space host or to the
+/// space's own DID.
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_a_token_not_bound_to_it() {
+    common::require_db!();
+    for (lxm, message) in [
+        (
+            None,
+            "missing jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+        (
+            Some("com.atproto.space.notifySpaceDeleted"),
+            "bad jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+    ] {
+        let (status, body) = notify_write_bound_to(
+            "did:plc:writer",
+            "did:plc:writer",
+            "repoRev",
+            "3lzq2b3k4c22a",
+            lxm,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+        assert_eq!(body["error"], json!("BadJwtLexiconMethod"), "{lxm:?}");
+        assert_eq!(body["message"], json!(message), "{lxm:?}");
+
+        let (status, body) = notify_space_did_bound_to("#atproto_pds", lxm).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+        assert_eq!(body["error"], json!("BadJwtLexiconMethod"), "{lxm:?}");
+        assert_eq!(body["message"], json!(message), "{lxm:?}");
+    }
 }
 
 /// Proposal 0016 addresses a space host as its authority's `#atproto_pds`. A

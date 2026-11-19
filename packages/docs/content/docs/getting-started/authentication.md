@@ -5,7 +5,7 @@ title: "Authentication"
 HappyView has two distinct authentication surfaces:
 
 - **XRPC** (`/xrpc/*`) — client-level identification via an **API client key** on every request, plus optional user-level atproto OAuth for endpoints that need a specific user's identity (e.g. procedures that write to a PDS).
-- **Admin API** (`/admin/*`) — user-level authentication via admin API keys or service auth JWTs, gated by [permissions](../guides/permissions.md).
+- **Admin API** (`/admin/*`) — user-level authentication via admin API keys or app sessions, gated by [permissions](../guides/permissions.md).
 
 ## Which endpoints require what?
 
@@ -13,7 +13,7 @@ HappyView has two distinct authentication surfaces:
 | ---------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
 | Queries (`GET /xrpc/{method}`)     | `X-Client-Key` required | Optional — DPoP auth if the query needs to know who the user is                                     |
 | Procedures (`POST /xrpc/{method}`) | `X-Client-Key` required | Required — DPoP auth so HappyView can proxy writes to the user's PDS                                |
-| Admin API (`/admin/*`)             | —                       | Required — admin API key or service auth JWT with the right [permissions](../guides/permissions.md) |
+| Admin API (`/admin/*`)             | —                       | Required — admin API key or app session with the right [permissions](../guides/permissions.md)      |
 | Health check (`GET /health`)       | —                       | —                                                                                                   |
 
 ## XRPC: API client identification
@@ -133,7 +133,7 @@ Queries that don't care who is calling need nothing more than the client key. Pr
 XRPC routes accept several auth methods, resolved in this order:
 
 1. **DPoP auth** (`Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`) — used by third-party apps that went through the [DPoP key provisioning](#dpop-key-provisioning-for-third-party-apps) flow.
-2. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID. The token's `lxm`, when present, must name the method being called.
+2. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID. The token's `lxm` must name the method being called.
 3. **Space credential** (`Authorization: Atproto-Space <credential>`) — a signed JWT granting read access to a specific space, sent with an `Atproto-Space-Audience` header and an HTTP Message Signature by the key the credential is bound to; accepted on space routes. See [Space credentials](../experimental/spaces/credentials.md).
 4. **Cookie session** — when no `Authorization` header is present, HappyView falls back to the signed session cookie set after dashboard login.
 5. **Anonymous** — if none of the above is present, the request proceeds with no identity. The endpoint's Lua script determines whether that is acceptable.
@@ -230,8 +230,9 @@ For a service auth JWT to validate:
 - `typ` must not be `at+jwt`, `refresh+jwt`, or `dpop+jwt` (those are other token types, not inter-service JWTs).
 - `exp` must be in the future.
 - The signature must verify against the issuer DID's atproto signing key.
+- `lxm` must name the XRPC method being called. A token without `lxm`, or with a different one, is refused with `BadJwtLexiconMethod`.
 
-As with the other methods, the resolved DID still has to exist in the HappyView `happyview_users` table with the right permissions to hit admin endpoints — service auth gets you identified, not privileged.
+Service auth JWTs are accepted on XRPC routes only. The admin API and other non-XRPC routes refuse them.
 
 ### Admin access and the first user
 
