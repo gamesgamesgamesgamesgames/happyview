@@ -298,6 +298,8 @@ fn is_space_route(path: &str) -> bool {
 pub struct ServiceAuthClaims {
     pub did: String,
     pub aud_fragment: String,
+    /// The method the token is bound to, if it names one.
+    pub lxm: Option<String>,
 }
 
 impl FromRequestParts<AppState> for XrpcClaims {
@@ -331,15 +333,19 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     .headers
                     .get(axum::http::header::HOST)
                     .and_then(|v| v.to_str().ok());
-                if let Ok(service_claims) =
-                    try_parse_service_auth(token, state, host, parts.uri.path()).await
-                {
-                    return Ok(XrpcClaims {
-                        identity: None,
-                        space_credential: None,
-                        space_audience: None,
-                        service_auth: Some(service_claims),
-                    });
+                match try_parse_service_auth(token, state, host, parts.uri.path()).await {
+                    Ok(service_claims) => {
+                        return Ok(XrpcClaims {
+                            identity: None,
+                            space_credential: None,
+                            space_audience: None,
+                            service_auth: Some(service_claims),
+                        });
+                    }
+                    // A verified token bound to another method, or to none,
+                    // says so rather than reading as an unknown Bearer token.
+                    Err(e) if is_lxm_refusal(&e) => return Err(e),
+                    Err(_) => {}
                 }
 
                 match crate::spaces::credential::peek_jwt_typ(token) {
@@ -420,7 +426,34 @@ impl FromRequestParts<AppState> for XrpcClaims {
     }
 }
 
+/// Authenticates a service-auth token for the request to `path`, then
+/// requires it to be bound to the method called there.
+///
+/// The token's `lxm` must name that method, as Bluesky's `verifyJwt`
+/// requires: a token naming no method, or another one, is refused. A route
+/// outside `/xrpc` has no method to bind a token to, so service auth is not
+/// accepted there at all.
 async fn try_parse_service_auth(
+    token: &str,
+    state: &AppState,
+    host: Option<&str>,
+    path: &str,
+) -> Result<ServiceAuthClaims, AppError> {
+    let claims = verify_service_auth(token, state, host, path).await?;
+    let Some(method) = path.strip_prefix("/xrpc/") else {
+        return Err(AppError::Forbidden(
+            "service-auth tokens are accepted on XRPC methods only; use an admin API key or a \
+             signed-in session"
+                .into(),
+        ));
+    };
+    check_lxm(claims.lxm.as_deref(), method)?;
+    Ok(claims)
+}
+
+/// Verifies a service-auth token's signature, expiry and audience. Its
+/// method binding is [`try_parse_service_auth`]'s to check.
+async fn verify_service_auth(
     token: &str,
     state: &AppState,
     host: Option<&str>,
@@ -467,15 +500,6 @@ async fn try_parse_service_auth(
         )));
     }
 
-    // 5. A token bound to one method must not authorize another.
-    if let (Some(lxm), Some(method)) = (payload.lxm.as_deref(), path.strip_prefix("/xrpc/"))
-        && lxm != method
-    {
-        return Err(AppError::Auth(format!(
-            "JWT lxm '{lxm}' does not match the called method '{method}'"
-        )));
-    }
-
     let fragment = aud.strip_prefix(&*instance_did).unwrap_or("").to_string();
     // Space hosts are addressed as `#atproto_space_host` or as the bare
     // authority DID, so space routes accept both.
@@ -489,5 +513,68 @@ async fn try_parse_service_auth(
     Ok(ServiceAuthClaims {
         did: service_auth.did,
         aud_fragment: fragment,
+        lxm: payload.lxm,
     })
+}
+
+/// The error name Bluesky's `verifyJwt` answers with when a token's `lxm`
+/// does not bind it to the called method.
+pub const BAD_JWT_LEXICON_METHOD: &str = "BadJwtLexiconMethod";
+
+/// Refuses a service-auth token whose `lxm` is missing or names a method
+/// other than `method`, with the error and messages Bluesky's `verifyJwt`
+/// uses.
+fn check_lxm(lxm: Option<&str>, method: &str) -> Result<(), AppError> {
+    let message = match lxm {
+        Some(lxm) if lxm == method => return Ok(()),
+        Some(_) => format!("bad jwt lexicon method (\"lxm\"). must match: {method}"),
+        None => format!("missing jwt lexicon method (\"lxm\"). must match: {method}"),
+    };
+    Err(AppError::XrpcError {
+        status: axum::http::StatusCode::UNAUTHORIZED,
+        code: BAD_JWT_LEXICON_METHOD,
+        message,
+    })
+}
+
+/// Whether `err` is [`check_lxm`]'s refusal, which XRPC routes report as is
+/// rather than as a generic Bearer refusal.
+fn is_lxm_refusal(err: &AppError) -> bool {
+    matches!(err, AppError::XrpcError { code, .. } if *code == BAD_JWT_LEXICON_METHOD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BAD_JWT_LEXICON_METHOD, check_lxm};
+    use crate::error::AppError;
+
+    #[test]
+    fn a_token_must_name_the_called_method() {
+        const METHOD: &str = "com.example.getThing";
+
+        assert!(check_lxm(Some(METHOD), METHOD).is_ok());
+        for (lxm, message) in [
+            (
+                None,
+                "missing jwt lexicon method (\"lxm\"). must match: com.example.getThing",
+            ),
+            (
+                Some("com.example.other"),
+                "bad jwt lexicon method (\"lxm\"). must match: com.example.getThing",
+            ),
+        ] {
+            match check_lxm(lxm, METHOD) {
+                Err(AppError::XrpcError {
+                    status,
+                    code,
+                    message: got,
+                }) => {
+                    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{lxm:?}");
+                    assert_eq!(code, BAD_JWT_LEXICON_METHOD, "{lxm:?}");
+                    assert_eq!(got, message, "{lxm:?}");
+                }
+                other => panic!("{lxm:?}: {other:?}"),
+            }
+        }
+    }
 }
