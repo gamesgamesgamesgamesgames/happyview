@@ -2581,6 +2581,11 @@ async fn service_auth_correct_aud_refused_on_admin_route() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert!(
+        body.to_string().contains("admin API key"),
+        "the refusal names what to use instead: {body}"
+    );
 }
 
 /// A service-auth JWT the user minted for a DIFFERENT audience must NOT
