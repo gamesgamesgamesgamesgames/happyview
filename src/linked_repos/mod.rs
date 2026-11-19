@@ -4,5 +4,6 @@ pub mod flow;
 pub mod pds;
 pub mod refresh;
 pub mod scope;
+pub mod session_refresh;
 pub mod types;
 pub mod worker;
