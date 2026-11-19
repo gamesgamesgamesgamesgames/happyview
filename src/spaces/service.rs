@@ -2015,12 +2015,75 @@ mod tests {
         let entries = crate::service_entries::list_entries(&state.db, state.db_backend)
             .await
             .unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.fragment_id == "#atproto_space_host"),
-            "no #atproto_space_host service entry: {entries:?}"
+        let entry = entries
+            .iter()
+            .find(|e| e.fragment_id == "#atproto_space_host")
+            .unwrap_or_else(|| panic!("no #atproto_space_host service entry: {entries:?}"));
+        assert_eq!(entry.access_mode, "specific");
+        let xrpcs = crate::service_entries::list_entry_xrpcs(&state.db, state.db_backend, entry.id)
+            .await
+            .unwrap();
+        let mut expected: Vec<String> = crate::service_entries::SPACE_HOST_XRPCS
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(xrpcs, expected);
+    }
+
+    #[tokio::test]
+    async fn the_space_host_entry_opens_only_space_host_methods() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
         );
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+
+        for method in crate::service_entries::SPACE_HOST_XRPCS {
+            assert!(
+                crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+        for method in [
+            "com.example.listThings",
+            "dev.happyview.createApiClient",
+            "com.atproto.space.createRecord",
+        ] {
+            assert!(
+                !crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_space_host_method_is_served() {
+        let served: Vec<String> = crate::spaces::routes::protocol_method_table()
+            .into_iter()
+            .map(|(nsid, _)| nsid)
+            .collect();
+        for method in crate::service_entries::SPACE_HOST_XRPCS
+            .iter()
+            .filter(|m| **m != "com.atproto.space.notifyCredentialRevoked")
+        {
+            assert!(served.iter().any(|s| s == method), "{method} is not routed");
+        }
     }
 
     const INSTANCE_DID: &str = "did:plc:happyviewinstance";
