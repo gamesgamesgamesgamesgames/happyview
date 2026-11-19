@@ -2167,6 +2167,7 @@ async fn a_cache_hit_leaves_the_plc_cooldown_in_force() {
         ),
         concurrency: 1,
         tx,
+        plc: Arc::new(happyview_source_jetstream::backfill::pacer::HostPacer::shared(1)),
     };
     let mut run = ResolverRun {
         cooldowns: HostCooldowns::new(),
@@ -5665,4 +5666,284 @@ fn a_unit_is_identified_by_its_did_and_collection_alone() {
     assert_eq!(fresh, retried);
     let set: HashSet<WorkUnit> = [fresh, retried].into_iter().collect();
     assert_eq!(set.len(), 1);
+}
+
+/// A fixed-window rate limiter shared by several mock PDS hosts, as one
+/// operator's rate-limit store keyed by client IP would be: `budget`
+/// requests per `window_secs`, counted across every host, answering with
+/// the atproto PDS's headers.
+#[derive(Clone)]
+struct SharedLimiter {
+    budget: u64,
+    window_secs: u64,
+    state: Arc<std::sync::Mutex<(u64, u64)>>,
+    rate_limited: Arc<std::sync::atomic::AtomicU64>,
+    served: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SharedLimiter {
+    fn new(budget: u64, window_secs: u64) -> Self {
+        Self {
+            budget,
+            window_secs,
+            state: Arc::new(std::sync::Mutex::new((0, 0))),
+            rate_limited: Arc::default(),
+            served: Arc::default(),
+        }
+    }
+
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let window = now - now % self.window_secs;
+        let reset = window + self.window_secs;
+        let used = {
+            let mut st = self.state.lock().unwrap();
+            if st.0 != window {
+                *st = (window, 0);
+            }
+            st.1 += 1;
+            st.1
+        };
+        let remaining = self.budget.saturating_sub(used);
+        let headers = |t: ResponseTemplate| {
+            t.insert_header("ratelimit-limit", self.budget.to_string())
+                .insert_header("ratelimit-remaining", remaining.to_string())
+                .insert_header("ratelimit-reset", reset.to_string())
+        };
+        if used > self.budget {
+            self.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return headers(ResponseTemplate::new(429))
+                .insert_header("retry-after", (reset - now).to_string());
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let did = req
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "repo")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        let value = serde_json::json!({"$type": POST, "text": did});
+        let cid = crate::cid_verify::compute_record_cid(&value)
+            .expect("cid")
+            .to_string();
+        headers(ResponseTemplate::new(200)).set_body_json(serde_json::json!({
+            "records": [{"uri": format!("at://{did}/{POST}/r0"), "cid": cid, "value": value}]
+        }))
+    }
+}
+
+/// Every host of a rate-limit domain shares one budget, behind one limiter.
+/// Returns the job's 429s and the fetches the limiter served.
+async fn crawl_hosts_sharing_one_budget(domains: &str) -> (u64, u64) {
+    const HOSTS: usize = 6;
+    const UNITS_PER_HOST: usize = 6;
+    let mut servers = Vec::new();
+    for _ in 0..HOSTS {
+        servers.push(MockServer::start().await);
+    }
+    let state = pipeline_state(&servers[0], &[POST]).await;
+    set_setting(&state, "backfill_rate_limit_domains", domains).await;
+    set_setting(&state, "backfill_concurrent_pds", "6").await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "3").await;
+    let uris: Vec<String> = servers.iter().map(MockServer::uri).collect();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/did:plc:[a-z0-9]+$"))
+        .respond_with(move |req: &wiremock::Request| {
+            let did = req.url.path().trim_start_matches('/').to_string();
+            // did:plc:h{host}u{unit}
+            let host: usize = did["did:plc:h".len()..did.find('u').unwrap()]
+                .parse()
+                .unwrap();
+            ResponseTemplate::new(200).set_body_json(did_doc(&did, &uris[host]))
+        })
+        .mount(&servers[0])
+        .await;
+    let limiter = SharedLimiter::new(10, 2);
+    for server in &servers {
+        let limiter = limiter.clone();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(move |req: &wiremock::Request| limiter.respond(req))
+            .mount(server)
+            .await;
+    }
+    let dids: Vec<String> = (0..UNITS_PER_HOST)
+        .flat_map(|u| (0..HOSTS).map(move |h| format!("did:plc:h{h}u{u}")))
+        .collect();
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    let total = (HOSTS * UNITS_PER_HOST) as i32;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos, job.total_records),
+        ("completed", total, total)
+    );
+    assert!(failure_set(&state, &job_id).await.is_empty());
+    let rate_limited = limiter.rate_limited.load(Ordering::Relaxed);
+    assert_eq!(job_rate_limited(&state, &job_id).await, rate_limited as i64);
+    (rate_limited, limiter.served.load(Ordering::Relaxed))
+}
+
+/// Hosts sharing one budget are paced to it together: one gate for the
+/// domain, so the crawl converges with a handful of 429s at the start.
+/// Paced one host at a time, each spends the budget as its own.
+#[tokio::test]
+async fn hosts_sharing_one_budget_are_paced_together_without_a_429_storm() {
+    // Every mock host is 127.0.0.1, so this puts them all in one domain.
+    let (shared, served) = crawl_hosts_sharing_one_budget("127.0.0.1").await;
+    assert_eq!(served, 36);
+    let (separate, _) = crawl_hosts_sharing_one_budget("none").await;
+    assert!(
+        shared <= 3 && separate > shared * 2,
+        "one gate for the domain: {shared} 429s; a gate per host: {separate}"
+    );
+}
+
+/// DID lookups the mock PLC directory received.
+async fn plc_requests(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/did:plc:"))
+        .count()
+}
+
+/// A 429 from the PLC directory holds every lookup until its Retry-After,
+/// so a resolver re-resolving a large requeued backlog backs off instead of
+/// sending the rest of its lookups through the limit.
+#[tokio::test]
+async fn a_plc_rate_limit_holds_every_lookup_until_retry_after() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    set_setting(&state, "backfill_concurrent_resolution", "1").await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/did:plc:[a-z0-9]+$"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    mount_plc(&mock).await;
+    let dids: Vec<String> = (0..10).map(|i| format!("did:plc:lookup{i}")).collect();
+    for did in &dids {
+        mount_records(&mock, did, POST, 1).await;
+    }
+    forbid_other_record_fetches(&mock).await;
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    let run = {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        tokio::spawn(async move { run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await })
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        plc_requests(&mock).await,
+        1,
+        "no lookup is sent while the directory's Retry-After holds"
+    );
+    run.await.expect("job");
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos),
+        ("completed", 10)
+    );
+    assert_eq!(plc_requests(&mock).await, 11);
+}
+
+/// A pause lands while every request is waiting out a long rate limit, and
+/// the job stops within moments rather than at the limit's reset.
+#[tokio::test]
+async fn a_pause_during_a_long_cooldown_stops_the_job_promptly() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    fail_records(
+        &mock,
+        "did:plc:held",
+        POST,
+        ResponseTemplate::new(429).insert_header("retry-after", "300"),
+        1,
+    )
+    .await;
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:held".to_string()])
+        .await
+        .expect("create job");
+    let pauser = {
+        let (state, job_id, mock_uri) = (state.clone(), job_id.clone(), mock.uri());
+        let _ = mock_uri;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            request_pause(&jobs(&state), &job_id).await;
+        })
+    };
+    let started = std::time::Instant::now();
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+    pauser.await.expect("pauser");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the pause did not wait out the 300 s limit: {:?}",
+        started.elapsed()
+    );
+    let job = job_row(&state, &job_id).await;
+    assert_eq!((job.status.as_str(), job.processed_repos), ("paused", 0));
+    assert!(
+        failure_set(&state, &job_id).await.is_empty(),
+        "a 429 is not a failure"
+    );
+    assert_eq!(
+        count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+        1,
+        "the unit stays queued"
+    );
+}
+
+/// A PDS that keeps failing goes down: its units are given up without a
+/// request each, as retryable failures retry-failed can pick up, and the
+/// job finishes instead of backing off once per unit.
+#[tokio::test]
+async fn a_failing_pds_goes_down_and_gives_its_units_up_quickly() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "1").await;
+    mount_plc(&mock).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+    let dids: Vec<String> = (0..20).map(|i| format!("did:plc:dead{i:02}")).collect();
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos),
+        ("completed", 20)
+    );
+    let set = failure_set(&state, &job_id).await;
+    assert_eq!(set.len(), 20);
+    assert!(
+        set.iter()
+            .all(|r| r.3 == "pds_server_error" && r.4 == "failed"),
+        "{set:?}"
+    );
+    let requests = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/xrpc/com.atproto.repo.listRecords")
+        .count();
+    assert!(
+        requests < 20,
+        "once down, units are given up without a request each: {requests} requests"
+    );
 }

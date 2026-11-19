@@ -370,10 +370,12 @@ pub async fn requeue_pending_failures(
     limit: i64,
 ) -> Result<(u64, RequeueCursor), sqlx::Error> {
     let backend = state.db_backend;
+    // A row-value comparison, so the primary key `(job_id, did, collection)`
+    // serves the keyset as one range scan.
     let select = adapt_sql(
         "SELECT f.did, f.collection, f.attempts FROM happyview_backfill_failures f \
          WHERE f.job_id = ? AND f.state = 'pending' AND f.phase = 'fetch' AND f.collection <> '' \
-           AND (f.did > ? OR (f.did = ? AND f.collection > ?)) \
+           AND (f.did, f.collection) > (?, ?) \
            AND NOT EXISTS (SELECT 1 FROM happyview_backfill_queue q \
                            WHERE q.job_id = f.job_id AND q.collection = f.collection AND q.did = f.did) \
            AND NOT EXISTS (SELECT 1 FROM happyview_backfill_queue q \
@@ -386,7 +388,6 @@ pub async fn requeue_pending_failures(
         .map_or(("", ""), |(d, c)| (d.as_str(), c.as_str()));
     let rows: Vec<(String, String, i32)> = happyview_provider::db::query_as(&select)
         .bind(job_id)
-        .bind(after_did)
         .bind(after_did)
         .bind(after_collection)
         .bind(limit.max(1))

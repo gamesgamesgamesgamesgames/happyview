@@ -15,7 +15,10 @@ use happyview_provider::db::adapt_sql;
 use happyview_provider::http::{did_doc_host, host_of, parse_retry_after};
 use happyview_provider::{ProviderEvent, Severity};
 
-use super::pacer::{Gate, HostPacer};
+use super::pacer::{
+    Gate, HostObserved, HostPacer, InFlight, RateLimitDomains, RateLimitHeaders,
+    parse_rate_limit_headers, unix_now,
+};
 use super::retry::{DeferredItem, DeferredQueue, DrainStep, HostCooldowns, next_drain_step};
 use super::*;
 
@@ -1392,6 +1395,59 @@ pub struct ResolverContext {
     pub recorder: Arc<crate::backfill::errors::ErrorRecorder>,
     pub concurrency: usize,
     pub tx: mpsc::Sender<(WorkUnit, String)>,
+    /// The PLC directory's gate: every `did:plc` lookup waits at it, so a
+    /// resolver re-resolving millions of requeued DIDs backs off on the
+    /// directory's 429s instead of sending `concurrency` lookups through
+    /// them. Its in-flight cap starts at `concurrency` and adapts (AIMD).
+    pub plc: Arc<HostPacer>,
+}
+
+/// Resolve `did`'s PDS, waiting at the PLC directory's gate first for a
+/// `did:plc`. `None` once `cancelled` is set while waiting.
+///
+/// The lookup reports a 429 with its `Retry-After`, which holds the gate for
+/// every lookup; any other answer counts as the directory answering.
+/// Transport failures are left to the resolver's own retries, so the
+/// directory's gate is never marked down.
+pub async fn resolve_paced(
+    state: &JobState,
+    plc: &HostPacer,
+    did: &str,
+    cancelled: &AtomicBool,
+) -> Option<Result<String, crate::backfill::errors::BackfillFailure>> {
+    let paced = did.starts_with("did:plc:");
+    let _slot = if paced {
+        plc.wait_turn(cancelled).await?;
+        Some(InFlight(plc))
+    } else {
+        None
+    };
+    let result = state.host.resolve_pds(did).await.map_err(|e| e.0);
+    if paced {
+        let now = tokio::time::Instant::now();
+        match &result {
+            Ok(_) => plc.on_response(reqwest::StatusCode::OK, &RateLimitHeaders::default(), now),
+            Err(failure)
+                if failure.kind == crate::backfill::errors::BackfillErrorKind::RateLimited =>
+            {
+                plc.on_rate_limited(
+                    failure,
+                    &RateLimitHeaders {
+                        retry_after: failure.retry_after,
+                        ..Default::default()
+                    },
+                    now,
+                );
+            }
+            Err(failure) if !failure.kind.is_retryable() => plc.on_response(
+                reqwest::StatusCode::NOT_FOUND,
+                &RateLimitHeaders::default(),
+                now,
+            ),
+            Err(_) => {}
+        }
+    }
+    Some(result)
 }
 
 /// The resolver's retry bookkeeping. It is local to the one resolver task and
@@ -1566,15 +1622,17 @@ pub(crate) async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
 
         let stream_state = ctx.state.clone();
         let stream_cancelled = Arc::clone(&ctx.cancelled);
+        let stream_plc = Arc::clone(&ctx.plc);
         let mut results = stream::iter(lookups)
             .map(move |(did, units)| {
                 let state = stream_state.clone();
                 let cancelled = Arc::clone(&stream_cancelled);
+                let plc = Arc::clone(&stream_plc);
                 async move {
                     if cancelled.load(Ordering::Relaxed) {
                         return None;
                     }
-                    let result = state.host.resolve_pds(&did).await.map_err(|e| e.0);
+                    let result = resolve_paced(&state, &plc, &did, &cancelled).await?;
                     Some((units, result))
                 }
             })
@@ -1775,12 +1833,12 @@ pub async fn retry_deferred_resolution(
     let handed_on = match run.resolved_dids.get(&item.payload.did) {
         Some(pds) => on_cached(ctx, run, item.payload, pds).await,
         None => {
-            let result = ctx
-                .state
-                .host
-                .resolve_pds(&item.payload.did)
-                .await
-                .map_err(|e| e.0);
+            let Some(result) =
+                resolve_paced(&ctx.state, &ctx.plc, &item.payload.did, &ctx.cancelled).await
+            else {
+                // Stopping; the unit stays unresolved for the resumed job.
+                return true;
+            };
             handle_resolution(ctx, run, item.payload, result, attempts).await
         }
     };
@@ -1932,6 +1990,7 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
         recorder: Arc::clone(&recorder),
         concurrency: concurrency.resolution,
         tx,
+        plc: Arc::new(HostPacer::shared(concurrency.resolution)),
     }));
 
     // --- Fetcher: receive (unit, pds) pairs and dispatch to PDS workers ---
@@ -1964,6 +2023,14 @@ pub(crate) async fn run_pipelined_resolve_and_fetch(
         dids_per_pds: concurrency.dids_per_pds,
         recorder: Arc::clone(&recorder),
         requests: Arc::new(tokio::sync::Semaphore::new(request_limit)),
+        domains: Arc::new(RateLimitDomains::new(
+            state
+                .host
+                .setting("backfill_rate_limit_domains")
+                .await
+                .as_deref(),
+            request_limit,
+        )),
     };
     let mut pds_workers: HashMap<String, mpsc::Sender<WorkUnit>> = HashMap::new();
     let mut worker_handles = FuturesUnordered::new();
@@ -2199,6 +2266,8 @@ pub(crate) struct FetchContext {
     /// and the dispatcher then blocks forever trying to fill it. Every worker
     /// must be able to consume the moment its sender exists.
     pub requests: Arc<tokio::sync::Semaphore>,
+    /// Hosts that share one rate-limit budget, with each domain's pacer.
+    pub domains: Arc<RateLimitDomains>,
 }
 
 /// DIDs already recorded as a fetch-phase give-up, so a DID that fails on
@@ -2602,50 +2671,70 @@ pub(crate) struct WorkerPeriod {
 }
 
 /// Log a host's rate limiting and retries since the last summary, when it
-/// had any, and add its 429s to the job's counts.
+/// had any, and add its 429s to the job's counts. The line carries the
+/// rate-limit headers the host sent last, and its domain's state when it
+/// shares one, so the logs show whether hosts' budgets fall together.
 pub(crate) async fn report_host(
     scope: &WorkerScope<'_>,
-    pacer: &HostPacer,
+    pacers: &WorkerPacers,
     period: &mut WorkerPeriod,
     in_flight: usize,
 ) {
-    let summary = pacer.take_summary(tokio::time::Instant::now());
+    let now = tokio::time::Instant::now();
+    let host = pacers.host.summary(now);
+    let domain = pacers.domain.as_ref().map(|d| d.summary(now));
+    let observed = pacers.observed.take();
     let WorkerPeriod {
         completed,
         given_up,
     } = std::mem::take(period);
-    if summary.rate_limited > 0 {
+    if observed.rate_limited > 0 {
         job_write(scope.state, &scope.queue.job_id, "rate_limited", || {
             add_rate_limited(
                 scope.state,
                 scope.queue,
                 scope.pds_endpoint,
-                summary.rate_limited,
+                observed.rate_limited,
             )
         })
         .await;
     }
-    if summary.rate_limited == 0
-        && summary.failures == 0
-        && summary.cooling_for.is_none()
-        && !summary.down
-    {
+    let cooling_for = host
+        .cooling_for
+        .max(domain.as_ref().and_then(|d| d.cooling_for));
+    if observed.rate_limited == 0 && observed.failures == 0 && cooling_for.is_none() && !host.down {
         return;
     }
+    let last = observed.last.unwrap_or_default();
     tracing::info!(
         job_id = %scope.queue.job_id,
         pds = %scope.pds_endpoint,
-        requests = summary.requests,
-        rate_limited = summary.rate_limited,
-        retried_failures = summary.failures,
-        cooling_secs = summary.cooling_for.map_or(0, |d| d.as_secs()),
-        concurrency = summary.concurrency,
-        down = summary.down,
+        domain = pacers.domain_name.as_deref().unwrap_or(""),
+        requests = observed.requests,
+        rate_limited = observed.rate_limited,
+        retried_failures = observed.failures,
+        ratelimit_limit = last.limit,
+        ratelimit_remaining = last.remaining,
+        ratelimit_reset_secs = last.reset_in.map(|d| d.as_secs()),
+        cooling_secs = cooling_for.map_or(0, |d| d.as_secs()),
+        concurrency = host.concurrency,
+        domain_in_flight = domain.as_ref().map(|d| d.in_flight),
+        domain_concurrency = domain.as_ref().map(|d| d.concurrency),
+        down = host.down || domain.as_ref().is_some_and(|d| d.down),
         in_flight,
         completed,
         given_up,
         "backfill PDS pacing"
     );
+}
+
+/// A worker's pacing: its host's own pacer, the shared pacer of the host's
+/// rate-limit domain if it is in one, and what the host has answered.
+pub(crate) struct WorkerPacers {
+    pub host: Arc<HostPacer>,
+    pub domain: Option<Arc<HostPacer>>,
+    pub domain_name: Option<String>,
+    pub observed: Arc<HostObserved>,
 }
 
 /// Everything one unit's fetch needs.
@@ -2658,6 +2747,8 @@ pub(crate) struct UnitFetch {
     pub cancelled: Arc<AtomicBool>,
     pub requests: Arc<tokio::sync::Semaphore>,
     pub pacer: Arc<HostPacer>,
+    pub domain: Option<Arc<HostPacer>>,
+    pub observed: Arc<HostObserved>,
     pub max_attempts: u32,
 }
 
@@ -2720,6 +2811,8 @@ pub(crate) async fn fetch_unit(fetch: UnitFetch) -> UnitFetchResult {
         cancelled,
         requests,
         pacer,
+        domain,
+        observed,
         max_attempts,
     } = fetch;
     let mut count: i32 = 0;
@@ -2733,6 +2826,8 @@ pub(crate) async fn fetch_unit(fetch: UnitFetch) -> UnitFetchResult {
     }
     let gate = FetchGate {
         pacer: Some(&pacer),
+        domain: domain.as_deref(),
+        observed: Some(&observed),
         requests: Some(&requests),
     };
     for collection in &collections {
@@ -2787,6 +2882,7 @@ pub(crate) async fn fetch_unit(fetch: UnitFetch) -> UnitFetchResult {
                     let retry = failure.kind.is_retryable()
                         && unit.attempts < max_attempts
                         && !pacer.is_down(now)
+                        && !domain.as_ref().is_some_and(|d| d.is_down(now))
                         && !cancelled.load(Ordering::Relaxed);
                     if !retry {
                         failures.push((
@@ -2799,7 +2895,10 @@ pub(crate) async fn fetch_unit(fetch: UnitFetch) -> UnitFetchResult {
                         ));
                         break;
                     }
-                    let retry_at = pacer.open_at().map(unix_millis_at);
+                    let retry_at = pacer
+                        .open_at()
+                        .max(domain.as_ref().and_then(|d| d.open_at()))
+                        .map(unix_millis_at);
                     tracing::debug!(
                         did = %unit.did,
                         collection,
@@ -2855,6 +2954,7 @@ pub(crate) async fn run_pds_worker(
         dids_per_pds,
         recorder,
         requests,
+        domains,
     } = ctx;
     let mut fetches = FuturesUnordered::new();
     let mut rx_open = true;
@@ -2871,7 +2971,14 @@ pub(crate) async fn run_pds_worker(
     };
     // Shared by this worker's fetches, and local to it: every PDS worker
     // paces the one host it alone talks to.
-    let pacer = Arc::new(HostPacer::new(dids_per_pds));
+    let pds_host = happyview_provider::http::host_of(&pds_endpoint);
+    let pacers = WorkerPacers {
+        host: Arc::new(HostPacer::new(dids_per_pds)),
+        domain: domains.pacer_for(&pds_host),
+        domain_name: domains.domain_of(&pds_host).map(str::to_string),
+        observed: Arc::new(HostObserved::default()),
+    };
+    let pacer = &pacers.host;
     let mut recorded = RecordedDids::new();
     let mut period = WorkerPeriod::default();
     let mut summary = tokio::time::interval_at(
@@ -2928,7 +3035,9 @@ pub(crate) async fn run_pds_worker(
                             unit,
                             cancelled: Arc::clone(&cancelled),
                             requests: Arc::clone(&requests),
-                            pacer: Arc::clone(&pacer),
+                            pacer: Arc::clone(&pacers.host),
+                            domain: pacers.domain.clone(),
+                            observed: Arc::clone(&pacers.observed),
                             max_attempts,
                         })));
                     }
@@ -2939,7 +3048,7 @@ pub(crate) async fn run_pds_worker(
             }
 
             _ = summary.tick() => {
-                report_host(&scope, &pacer, &mut period, fetches.len()).await;
+                report_host(&scope, &pacers, &mut period, fetches.len()).await;
                 if should_stop_worker(&state, &queue.job_id).await {
                     cancelled.store(true, Ordering::Relaxed);
                     break;
@@ -2955,7 +3064,7 @@ pub(crate) async fn run_pds_worker(
             finish_unit(&scope, &mut recorded, result).await;
         }
     }
-    report_host(&scope, &pacer, &mut period, 0).await;
+    report_host(&scope, &pacers, &mut period, 0).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -3416,9 +3525,65 @@ pub struct FetchGate<'a> {
     /// The host's pacer. With one, a 429 is waited out and the page asked
     /// for again; without, it fails the attempt like any other error.
     pub pacer: Option<&'a HostPacer>,
+    /// The host's rate-limit domain's pacer, when it shares one budget with
+    /// other hosts (see [`RateLimitDomains`]). It then takes the host's
+    /// rate-limit pacing, 429 cooldowns and in-flight cap; the host's own
+    /// pacer keeps its failure backoff.
+    pub domain: Option<&'a HostPacer>,
+    /// What the host answered, for its summary.
+    pub observed: Option<&'a HostObserved>,
     /// The job-wide cap on requests in flight, held for one page at a time
     /// and only once the host's gate has opened.
     pub requests: Option<&'a tokio::sync::Semaphore>,
+}
+
+impl FetchGate<'_> {
+    /// The host answered, other than with a 429 or a 5xx.
+    fn answered(&self, status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+        let parsed = parse_rate_limit_headers(headers, unix_now());
+        let now = tokio::time::Instant::now();
+        if let Some(observed) = self.observed {
+            observed.answered(&parsed, false);
+        }
+        if let Some(host) = self.pacer {
+            // A domain's budget is the domain's to pace; the host only
+            // learns that it is up.
+            let own = if self.domain.is_some() {
+                RateLimitHeaders::default()
+            } else {
+                parsed.clone()
+            };
+            host.on_response(status, &own, now);
+        }
+        if let Some(domain) = self.domain {
+            domain.on_response(status, &parsed, now);
+        }
+    }
+
+    /// The host answered 429.
+    fn rate_limited(
+        &self,
+        failure: &crate::backfill::errors::BackfillFailure,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let parsed = parse_rate_limit_headers(headers, unix_now());
+        if let Some(observed) = self.observed {
+            observed.answered(&parsed, true);
+        }
+        if let Some(limiter) = self.domain.or(self.pacer) {
+            limiter.on_rate_limited(failure, &parsed, tokio::time::Instant::now());
+        }
+    }
+
+    /// The request failed retryably without a 429.
+    fn failed(&self, failure: &crate::backfill::errors::BackfillFailure) {
+        if let Some(observed) = self.observed {
+            observed.failed();
+        }
+        if let Some(host) = self.pacer {
+            host.on_failure(failure, tokio::time::Instant::now());
+        }
+    }
 }
 
 /// Fetch all records for a given DID and collection from a PDS via
@@ -3448,7 +3613,11 @@ pub async fn fetch_records_page_loop(
         if cancelled.load(Ordering::Relaxed) {
             return FetchOutcome::Cancelled { count, cursor };
         }
-        if let Some(pacer) = gate.pacer {
+        // The host's gate, then its domain's, which holds an in-flight slot
+        // until the answer is read.
+        let mut slot = None;
+        for (pacer, shared) in [(gate.pacer, false), (gate.domain, true)] {
+            let Some(pacer) = pacer else { continue };
             match pacer.wait_turn(cancelled).await {
                 None => return FetchOutcome::Cancelled { count, cursor },
                 Some(Gate::Down(failure)) => {
@@ -3458,7 +3627,11 @@ pub async fn fetch_records_page_loop(
                         failure,
                     };
                 }
-                Some(Gate::Go { .. }) => {}
+                Some(Gate::Go { .. }) => {
+                    if shared {
+                        slot = Some(InFlight(pacer));
+                    }
+                }
             }
         }
         let _permit = match gate.requests {
@@ -3482,9 +3655,8 @@ pub async fn fetch_records_page_loop(
             Ok(r) => r,
             Err(e) => {
                 let failure = crate::backfill::errors::BackfillFailure::from_reqwest(&e);
-                if let Some(pacer) = gate.pacer {
-                    pacer.on_failure(&failure, tokio::time::Instant::now());
-                }
+                drop(slot);
+                gate.failed(&failure);
                 return FetchOutcome::Failed {
                     count,
                     cursor,
@@ -3502,23 +3674,23 @@ pub async fn fetch_records_page_loop(
             let status = resp.status();
             let headers = resp.headers().clone();
             let body = resp.text().await.unwrap_or_default();
+            drop(slot);
             let failure = crate::backfill::errors::BackfillFailure::from_pds_response(
                 status, &body, &headers,
             );
-            if let Some(pacer) = gate.pacer {
-                let now = tokio::time::Instant::now();
+            if gate.pacer.is_some() || gate.domain.is_some() {
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     // Waited out at the gate, then the same page again. A
                     // 429 says the host is pacing us, not that this repo
                     // failed, so it is not an attempt.
-                    pacer.on_rate_limited(&failure, &headers, now);
+                    gate.rate_limited(&failure, &headers);
                     tracing::debug!(did, collection, pds = %pds_endpoint, "PDS rate-limited a fetch; waiting for its reset");
                     continue;
                 }
                 if failure.kind.is_retryable() {
-                    pacer.on_failure(&failure, now);
+                    gate.failed(&failure);
                 } else {
-                    pacer.on_response(status, &headers, now);
+                    gate.answered(status, &headers);
                 }
             }
             return FetchOutcome::Failed {
@@ -3527,11 +3699,11 @@ pub async fn fetch_records_page_loop(
                 failure,
             };
         }
-        if let Some(pacer) = gate.pacer {
-            pacer.on_response(resp.status(), resp.headers(), tokio::time::Instant::now());
-        }
+        gate.answered(resp.status(), resp.headers());
 
-        let body: ListRecordsResponse = match resp.json().await {
+        let body = resp.json::<ListRecordsResponse>().await;
+        drop(slot);
+        let body: ListRecordsResponse = match body {
             Ok(b) => b,
             Err(e) => {
                 return FetchOutcome::Failed {
