@@ -120,10 +120,20 @@ pub async fn session_for(state: &AppState, grant: &LinkedRepo) -> Result<LinkedS
         Ok(session) => Ok(LinkedSession::OAuth(Box::new(session))),
         Err(e) => {
             let message = format!("{e}");
-            super::db::mark_needs_reauth(state, &grant.id, &message).await?;
-            Err(AppError::Auth(format!(
-                "linked repo {did_str} needs reauthorization: {message}"
-            )))
+            match super::refresh::classify(&message) {
+                super::refresh::RefreshFailure::Refused => {
+                    super::db::mark_needs_reauth(state, &grant.id, &message).await?;
+                    Err(AppError::Auth(format!(
+                        "linked repo {did_str} needs reauthorization: {message}"
+                    )))
+                }
+                super::refresh::RefreshFailure::Transient => {
+                    super::db::record_error(state, &grant.id, &message).await?;
+                    Err(AppError::BadGateway(format!(
+                        "linked repo {did_str}'s authorization server is unavailable: {message}"
+                    )))
+                }
+            }
         }
     }
 }
