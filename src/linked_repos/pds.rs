@@ -117,20 +117,33 @@ pub async fn session_for(state: &AppState, grant: &LinkedRepo) -> Result<LinkedS
     let client = flow::client_for_grant(state, grant).await?;
 
     match client.restore(&did).await {
-        Ok(session) => Ok(LinkedSession::OAuth(Box::new(session))),
+        Ok(session) => {
+            // A restore that works again clears the error an outage left.
+            if grant.last_error.is_some() {
+                super::db::touch_refreshed(state, &grant.id).await?;
+            }
+            Ok(LinkedSession::OAuth(Box::new(session)))
+        }
         Err(e) => {
             let message = format!("{e}");
             match super::refresh::classify(&message) {
                 super::refresh::RefreshFailure::Refused => {
                     super::db::mark_needs_reauth(state, &grant.id, &message).await?;
                     Err(AppError::Auth(format!(
-                        "linked repo {did_str} needs reauthorization: {message}"
+                        "linked repo {did_str} needs reauthorization"
                     )))
                 }
-                super::refresh::RefreshFailure::Transient => {
+                super::refresh::RefreshFailure::Upstream => {
+                    tracing::warn!(grant_id = %grant.id, did = %did_str, error = %message, "linked repo session restore failed at its authorization server");
                     super::db::record_error(state, &grant.id, &message).await?;
                     Err(AppError::BadGateway(format!(
-                        "linked repo {did_str}'s authorization server is unavailable: {message}"
+                        "couldn't reach the authorization server for linked repo {did_str}"
+                    )))
+                }
+                super::refresh::RefreshFailure::Local => {
+                    tracing::error!(grant_id = %grant.id, did = %did_str, error = %message, "linked repo session restore failed in the session store");
+                    Err(AppError::Internal(format!(
+                        "couldn't restore the session for linked repo {did_str}"
                     )))
                 }
             }

@@ -25,13 +25,14 @@ pub enum RefreshOutcome {
     /// The authorization server refused the grant; it now needs
     /// reauthorization.
     NeedsReauth,
-    /// The server or the network failed. The grant stays active with the
-    /// error recorded, and the keep-alive retries later.
+    /// The server, the network or this instance's session store failed. The
+    /// grant stays active with the error recorded, and the keep-alive retries
+    /// later, until it has gone [`refresh::GIVE_UP_AFTER`] without a success.
     Transient,
 }
 
 /// Restore a grant's session, and settle what a failure means for it. See
-/// [`refresh::classify`].
+/// [`refresh::classify`] and [`refresh::GIVE_UP_AFTER`].
 pub async fn refresh_grant(
     state: &AppState,
     grant: &LinkedRepo,
@@ -47,7 +48,7 @@ pub async fn refresh_grant(
         // The client refuses only when the key the session was made with is
         // no longer held; anything else is this instance failing to build it.
         Err(e @ AppError::Auth(_)) => Some((format!("{e}"), RefreshFailure::Refused)),
-        Err(e) => Some((format!("{e}"), RefreshFailure::Transient)),
+        Err(e) => Some((format!("{e}"), RefreshFailure::Local)),
         Ok(client) => match client.restore(&did).await {
             Ok(_session) => None,
             Err(e) => {
@@ -63,28 +64,34 @@ pub async fn refresh_grant(
         return Ok(RefreshOutcome::Refreshed);
     };
 
-    match kind {
-        RefreshFailure::Refused => {
-            db::mark_needs_reauth(state, &grant.id, &message).await?;
-            tracing::warn!(
-                grant_id = %grant.id,
-                did = %did_str,
-                error = %message,
-                "linked repo session refused; it needs reauthorization"
-            );
-            Ok(RefreshOutcome::NeedsReauth)
-        }
-        RefreshFailure::Transient => {
-            db::record_error(state, &grant.id, &message).await?;
-            tracing::warn!(
-                grant_id = %grant.id,
-                did = %did_str,
-                error = %message,
-                "linked repo session refresh failed; retrying later"
-            );
-            Ok(RefreshOutcome::Transient)
-        }
+    let last_success = grant
+        .last_refreshed_at
+        .as_deref()
+        .or(grant.authorized_at.as_deref());
+    if kind == RefreshFailure::Refused || refresh::given_up(last_success, chrono::Utc::now()) {
+        let message = if kind == RefreshFailure::Refused {
+            message
+        } else {
+            format!("no successful refresh for over 7 days; last error: {message}")
+        };
+        db::mark_needs_reauth(state, &grant.id, &message).await?;
+        tracing::warn!(
+            grant_id = %grant.id,
+            did = %did_str,
+            error = %message,
+            "linked repo session needs reauthorization"
+        );
+        return Ok(RefreshOutcome::NeedsReauth);
     }
+
+    db::record_error(state, &grant.id, &message).await?;
+    tracing::warn!(
+        grant_id = %grant.id,
+        did = %did_str,
+        error = %message,
+        "linked repo session refresh failed; retrying later"
+    );
+    Ok(RefreshOutcome::Transient)
 }
 
 fn is_stale(last_refreshed_at: Option<&str>, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
