@@ -6,6 +6,7 @@ import { SetupIdentityMode } from "./setup-identity-mode";
 import { SetupConfigure } from "./setup-configure";
 import { SetupAttachAuth } from "./setup-attach-auth";
 import { SetupVerify } from "./setup-verify";
+import { resumeStep } from "@/lib/setup-resume";
 import { SetupTelemetry } from "./setup-telemetry";
 import { SetupComplete } from "./setup-complete";
 import { Button } from "@/components/ui/button";
@@ -45,34 +46,13 @@ export function SetupWizard() {
   useEffect(() => {
     getSetupStatus()
       .then((status) => {
-        if (status.setup_complete) {
-          setCurrentStep("complete");
-        } else if (status.plc_verified) {
-          setCurrentStep("complete");
-        } else if (status.identity_configured) {
-          setIdentityMode(status.identity_mode);
-          setCurrentStep("verify");
-        } else if (
-          status.identity_mode &&
-          status.identity_mode !== "not_exposed"
-        ) {
-          setIdentityMode(status.identity_mode);
-
-          const pendingAuth = localStorage.getItem("happyview_attach_auth");
-          if (status.identity_mode === "attach_account" && pendingAuth) {
-            try {
-              const payload = JSON.parse(pendingAuth) as {
-                attachedDid: string;
-              };
-              setAttachedDid(payload.attachedDid);
-              setCurrentStep("attach-auth");
-            } catch {
-              setCurrentStep("configure");
-            }
-          } else {
-            setCurrentStep("configure");
-          }
-        }
+        const { step, attachedDid } = resumeStep(
+          status,
+          localStorage.getItem("happyview_attach_auth"),
+        );
+        if (status.identity_mode) setIdentityMode(status.identity_mode);
+        if (attachedDid) setAttachedDid(attachedDid);
+        setCurrentStep(step);
       })
       .catch(() => {})
       .finally(() => setLoading(false));

@@ -66,9 +66,17 @@ type ServiceIdentityRow = (
 fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
     let mode = IdentityMode::parse(&r.0)
         .ok_or_else(|| AppError::Internal(format!("invalid identity mode: {}", r.0)))?;
+    // An attached account's DID is the instance's DID. Onboarding stores it in
+    // `did` as well, but only once the PLC operation is submitted, so a row
+    // whose submit failed, or one set from the dashboard, can hold only
+    // `attached_account_did`. Read that as the DID rather than as none.
+    let did = match mode {
+        IdentityMode::AttachAccount => r.1.or_else(|| r.3.clone()),
+        _ => r.1,
+    };
     Ok(ServiceIdentity {
         mode,
-        did: r.1,
+        did,
         signing_key_enc: r.2,
         attached_account_did: r.3,
         setup_complete: r.4 != 0,
@@ -258,6 +266,65 @@ mod tests {
             created_at: "2024-01-01".into(),
             updated_at: "2024-01-01".into(),
         }
+    }
+
+    /// An attached account with no `did` stored reads its attached DID as the
+    /// instance DID, and counts as configured.
+    #[tokio::test]
+    async fn an_attached_account_reports_its_did() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        upsert_identity(
+            &pool,
+            backend,
+            &IdentityMode::AttachAccount,
+            None,
+            None,
+            None,
+            Some("did:plc:attached"),
+        )
+        .await
+        .unwrap();
+
+        let identity = get_identity(&pool, backend).await.unwrap().unwrap();
+        assert_eq!(identity.did.as_deref(), Some("did:plc:attached"));
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap()["did"],
+            "did:plc:attached"
+        );
+        assert!(
+            get_setup_status(&pool, backend)
+                .await
+                .unwrap()
+                .identity_configured
+        );
+    }
+
+    /// Only an attached account borrows its attached DID.
+    #[tokio::test]
+    async fn other_modes_do_not_read_the_attached_did() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        upsert_identity(
+            &pool,
+            backend,
+            &IdentityMode::DidPlc,
+            None,
+            None,
+            None,
+            Some("did:plc:leftover"),
+        )
+        .await
+        .unwrap();
+
+        let identity = get_identity(&pool, backend).await.unwrap().unwrap();
+        assert_eq!(identity.did, None);
+        assert!(
+            !get_setup_status(&pool, backend)
+                .await
+                .unwrap()
+                .identity_configured
+        );
     }
 
     #[test]
