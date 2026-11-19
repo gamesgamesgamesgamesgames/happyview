@@ -463,12 +463,16 @@ async fn upsert_member(
         // rather than conflict. read_self is not overwritten: it is
         // HappyView-local and never supplied over the wire, so a putMember must
         // not lift an existing own-records-only restriction.
-        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        //
+        // A space-as-member entry stored this way brings in no members:
+        // `delegation_consented` is set only by [`insert_delegation_if_allowed`].
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at, delegation_consented) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0) \
          ON CONFLICT (space_id, member_did) DO UPDATE SET \
              can_read = excluded.can_read, \
              can_write = excluded.can_write, \
-             is_delegation = excluded.is_delegation",
+             is_delegation = excluded.is_delegation, \
+             delegation_consented = 0",
         backend,
     );
     crate::db::query(&sql)
@@ -508,6 +512,55 @@ pub async fn insert_member_if_allowed(
     })
     .await
     .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// [`insert_member_if_allowed`] for a space-as-member entry (`is_delegation`).
+/// With `consented`, the entry brings in the named space's members: the
+/// caller has checked that whoever adds it administers that space.
+pub async fn insert_delegation_if_allowed(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+    consented: bool,
+) -> Result<bool, AppError> {
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(false);
+        }
+        upsert_member(&mut *tx, backend, member).await?;
+        crate::db::query(&adapt_sql(
+            "UPDATE happyview_space_members SET delegation_consented = ? WHERE space_id = ? AND member_did = ?",
+            backend,
+        ))
+        .bind(consented as i32)
+        .bind(&member.space_id)
+        .bind(&member.did)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// The space-as-member entries of a space that bring in the named space's
+/// members, by the address or id they name.
+pub async fn consented_delegations(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT member_did FROM happyview_space_members WHERE space_id = ? AND is_delegation = 1 AND delegation_consented = 1",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
 /// Discard a space's member list, as migrating it to a policy that keeps none

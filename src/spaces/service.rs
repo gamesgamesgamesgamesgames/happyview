@@ -996,6 +996,36 @@ async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), App
     Ok(())
 }
 
+/// Store a member as `put_member` and `add_member` do. A space-as-member
+/// entry (`is_delegation`) brings in the named space's members, so adding one
+/// that names a space on this host requires administering that space too. An
+/// entry naming a space that isn't here is stored as it always was, and
+/// brings in no members.
+async fn store_member(
+    state: &AppState,
+    actor_did: &str,
+    member: &SpaceMember,
+) -> Result<(), AppError> {
+    if !member.is_delegation {
+        return insert_member(state, member).await;
+    }
+    let target =
+        crate::spaces::members::delegation_target(&state.db, state.db_backend, &member.did).await?;
+    if let Some(target) = &target {
+        require_space_admin(state, target, actor_did)
+            .await
+            .map_err(|_| {
+                AppError::Forbidden("delegating to a space requires administering it".into())
+            })?;
+    }
+    if !db::insert_delegation_if_allowed(&state.db, state.db_backend, member, target.is_some())
+        .await?
+    {
+        return Err(no_members_on_managedspace());
+    }
+    Ok(())
+}
+
 /// Upsert a member. `access` of `None` leaves an existing member's read and
 /// write untouched, and gives a new one read — so a caller who names only a
 /// DID, or only `is_delegation`, neither grants nor withdraws access.
@@ -1032,7 +1062,7 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
+    store_member(state, actor_did, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
@@ -1067,7 +1097,7 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
+    store_member(state, actor_did, &member).await?;
     Ok(member)
 }
 
