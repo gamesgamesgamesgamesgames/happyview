@@ -442,6 +442,52 @@ async fn service_auth_rejects_a_token_naming_no_method() {
     );
 }
 
+/// A dedicated route, not only the generic one, holds a token to the method
+/// it names.
+#[tokio::test]
+#[serial]
+async fn a_dedicated_route_refuses_a_token_bound_to_another_method() {
+    common::require_db!();
+    const METHOD: &str = "dev.happyview.delegation.listAccounts";
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    for (lxm, refused) in [
+        (Some("games.gamesgamesgamesgames.listGames"), true),
+        (None, true),
+        (Some(METHOD), false),
+    ] {
+        let auth = app
+            .service_auth_jwt_for(&plc_store, "did:plc:caller123", &did, "#chess", lxm)
+            .await;
+        let resp = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/xrpc/{METHOD}"))
+                    .header("authorization", &auth)
+                    .header("host", "127.0.0.1:0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if refused {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+            assert_eq!(body["error"], "BadJwtLexiconMethod", "{lxm:?}: {body}");
+        } else {
+            assert_ne!(body["error"], "BadJwtLexiconMethod", "{lxm:?}: {body}");
+        }
+    }
+}
+
 /// Off `/xrpc` there is no method to bind a token to, so service auth is
 /// not accepted at all, whatever the token's `lxm`.
 #[tokio::test]
