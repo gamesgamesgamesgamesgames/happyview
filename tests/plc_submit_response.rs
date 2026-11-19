@@ -272,3 +272,82 @@ async fn sync_plc_still_asks_to_reauthenticate_an_expired_session() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(plc_synced_events(&app).await, 0);
 }
+
+/// Onboarding for an attached account whose DID document lists `services`,
+/// with one service entry, `#chess`.
+async fn check_plc(services: serde_json::Value) -> (StatusCode, TestApp) {
+    let mut app = TestApp::new().await;
+    app.state.config.token_encryption_key = Some(common::db::TEST_ENCRYPTION_KEY);
+    app.rebuild_router();
+    happyview::service_identity::upsert_identity(
+        &app.state.db,
+        app.state.db_backend,
+        &happyview::service_identity::IdentityMode::AttachAccount,
+        None,
+        None,
+        None,
+        Some(ACCOUNT),
+    )
+    .await
+    .unwrap();
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{ACCOUNT}/log/last")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "plc_operation",
+            "rotationKeys": ["did:key:zQ3shRotation"],
+            "alsoKnownAs": [],
+            "services": services,
+            "verificationMethods": {},
+            "prev": null,
+        })))
+        .mount(&app.mock_server)
+        .await;
+    let status = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method("POST")
+                .uri("/api/setup/plc/check")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    (status, app)
+}
+
+/// A DID document that already lists the instance finishes the step, so
+/// setup can continue after a submit whose answer was lost.
+#[tokio::test]
+#[serial]
+async fn a_did_document_that_lists_the_instance_finishes_the_plc_step() {
+    common::require_db!();
+    let public_url = TestApp::new().await.state.config.public_url.clone();
+    let (status, app) = check_plc(json!({
+        "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example" },
+        "chess": { "type": "ChessAppView", "endpoint": public_url },
+    }))
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let identity = happyview::service_identity::get_identity(&app.state.db, app.state.db_backend)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.did.as_deref(), Some(ACCOUNT));
+}
+
+/// A DID document that doesn't list the instance yet leaves the step open.
+#[tokio::test]
+#[serial]
+async fn a_did_document_without_the_instance_leaves_the_plc_step_open() {
+    common::require_db!();
+    let (status, _app) = check_plc(json!({
+        "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example" },
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
