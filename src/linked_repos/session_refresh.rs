@@ -228,6 +228,10 @@ async fn refresh_and_store(
                 e.to_string(),
             )));
         }
+        // A response lost after the authorization server acted on the
+        // request leaves the old refresh token spent, and nothing here can
+        // tell. Before the new tokens is the optimistic reading: the old
+        // token is put back, and is good unless that happened.
         Err(_) => {
             return Err(StoreFailure::BeforeTokens(RefreshError {
                 message: format!(
@@ -288,27 +292,50 @@ async fn refresh_and_store(
     let json = updated.to_string();
     let after = |message: String| StoreFailure::AfterTokens(RefreshError::local(message));
     if let Err(e) = serde_json::from_value::<atrium_oauth::store::session::Session>(updated) {
-        persist_anyway(store, did, &json).await;
+        persist_anyway(store, did, refresh_token, &json).await;
         return Err(after(format!("refreshed session atrium can't read: {e}")));
     }
     match store.compare_and_set_json(did, held, json.clone()).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
-            persist_anyway(store, did, &json).await;
+            persist_anyway(store, did, refresh_token, &json).await;
             Err(after(
                 "the session changed while its refresh held it".into(),
             ))
         }
         Err(e) => {
-            persist_anyway(store, did, &json).await;
+            persist_anyway(store, did, refresh_token, &json).await;
             Err(after(format!("session store error: {e}")))
         }
     }
 }
 
-/// Store a refreshed session over whatever the row holds, logging a failure.
-async fn persist_anyway(store: &DbSessionStore, did: &str, json: &str) {
-    if let Err(e) = store.set_json(did, json).await {
+/// Store a refreshed session over the row, if the row still belongs to the
+/// grant whose refresh token `spent` was. A row with another refresh token
+/// came from something newer, such as a reauthorization during the lease, and
+/// is kept.
+async fn persist_anyway(store: &DbSessionStore, did: &str, spent: &str, json: &str) {
+    let current = match store.read_json(did).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(did, error = %e, "failed to read a linked repo session to store its refreshed tokens");
+            return;
+        }
+    };
+    let same_family = serde_json::from_str::<serde_json::Value>(&current.json)
+        .is_ok_and(|row| row["token_set"]["refresh_token"].as_str() == Some(spent));
+    if !same_family {
+        tracing::warn!(
+            did,
+            "a newer session replaced the one being refreshed; keeping it"
+        );
+        return;
+    }
+    if let Err(e) = store
+        .compare_and_set_json(did, &current, json.to_string())
+        .await
+    {
         tracing::error!(did, error = %e, "failed to store a linked repo's refreshed tokens");
     }
 }
