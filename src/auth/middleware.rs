@@ -442,7 +442,9 @@ async fn try_parse_service_auth(
     let claims = verify_service_auth(token, state, host, path).await?;
     let Some(method) = path.strip_prefix("/xrpc/") else {
         return Err(AppError::Forbidden(
-            "service-auth tokens are accepted on XRPC methods only".into(),
+            "service-auth tokens are accepted on XRPC methods only; the admin API takes an \
+             admin API key or a signed-in session"
+                .into(),
         ));
     };
     check_lxm(claims.lxm.as_deref(), method)?;
