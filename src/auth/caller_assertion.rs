@@ -46,6 +46,10 @@ use serde_json::{Value, json};
 /// The JWS `typ` of a caller assertion.
 pub const ASSERTION_TYP: &str = "hv-caller+jwt";
 
+/// The `lxm` of the key proof that pins a ticket key to a sign-in, sent when
+/// its session is registered.
+pub const SESSION_PIN_LXM: &str = "happyview.oauth.registerSession";
+
 /// The JWS `typ` of a key proof.
 pub const KEY_PROOF_TYP: &str = "hv-key-proof+jwt";
 
@@ -170,6 +174,8 @@ pub enum AssertionError {
     NotXrpc,
     #[error("the key proof was refused: {0}")]
     KeyProof(&'static str),
+    #[error("this sign-in pinned no ticket key; sign in again")]
+    NotPinned,
     #[error("a test run's caller is forged, so it gets no caller assertion")]
     TestRun,
     #[error("a run may ask for at most {0} caller assertions")]
@@ -186,6 +192,7 @@ impl AssertionError {
             Self::NotDpop => "NO_SESSION",
             Self::NotXrpc => "UNSUPPORTED",
             Self::KeyProof(_) => "BAD_INPUT",
+            Self::NotPinned => "NO_SESSION",
             Self::TestRun => "UNSUPPORTED",
             Self::TooMany(_) => "RATE_LIMITED",
             Self::Database(_) => "HOST_ERROR",
@@ -220,6 +227,8 @@ pub struct CallerFacts {
     pub cnf_src: KeySource,
     pub azp: String,
     pub lxm: String,
+    /// The ticket key the sign-in pinned at registration, if any.
+    pub pinned_jkt: Option<String>,
 }
 
 /// A signed assertion, and when it expires (Unix seconds).
@@ -293,8 +302,8 @@ pub async fn caller_facts(
     };
     let db = |e: sqlx::Error| AssertionError::Database(format!("caller assertion lookup: {e}"));
     let backend = state.db_backend;
-    let jkt: Option<(String,)> = crate::db::query_as(&crate::db::adapt_sql(
-        "SELECT jwk_thumbprint FROM happyview_dpop_keys WHERE id = ?",
+    let jkt: Option<(String, Option<String>)> = crate::db::query_as(&crate::db::adapt_sql(
+        "SELECT jwk_thumbprint, ticket_jkt FROM happyview_dpop_keys WHERE id = ?",
         backend,
     ))
     .bind(dpop_key_id)
@@ -309,7 +318,7 @@ pub async fn caller_facts(
     .fetch_optional(&state.db)
     .await
     .map_err(db)?;
-    let (Some((jkt,)), Some((azp,))) = (jkt, azp) else {
+    let (Some((jkt, pinned_jkt)), Some((azp,))) = (jkt, azp) else {
         return Err(AssertionError::NotDpop);
     };
     Ok(CallerFacts {
@@ -318,6 +327,7 @@ pub async fn caller_facts(
         cnf_src: KeySource::Dpop,
         azp,
         lxm: lxm.to_string(),
+        pinned_jkt,
     })
 }
 
@@ -430,7 +440,19 @@ pub async fn assert_caller(
     let mut caller = caller_facts(state, claims, trigger_id).await?;
     let now = now_secs();
     if let Some(proof) = key_proof {
-        caller.jkt = verify_key_proof(proof, &issuer(state), &caller.lxm, &caller.jkt, now)?;
+        let proven = verify_key_proof(proof, &issuer(state), &caller.lxm, &caller.jkt, now)?;
+        // Only the key this sign-in pinned when it was registered: someone
+        // holding the DPoP key alone can't bring a key of their own.
+        match caller.pinned_jkt.as_deref() {
+            None => return Err(AssertionError::NotPinned),
+            Some(pinned) if pinned != proven => {
+                return Err(AssertionError::KeyProof(
+                    "not the ticket key this sign-in pinned",
+                ));
+            }
+            Some(_) => {}
+        }
+        caller.jkt = proven;
         caller.cnf_src = KeySource::KeyProof;
     }
     let assertion = sign(config, &issuer(state), &caller, audience, now)?;
@@ -494,6 +516,7 @@ mod tests {
             cnf_src: KeySource::Dpop,
             azp: "https://app.example/client-metadata.json".into(),
             lxm: "com.example.getThing".into(),
+            pinned_jkt: None,
         }
     }
 
@@ -835,8 +858,46 @@ mod tests {
             AssertionError::NotDpop
         );
 
-        // With a key proof, the assertion names the proven key.
+        // With a key proof but nothing pinned at sign-in: refused.
         let own = new_key();
+        let own_jkt = crate::oauth::keys::compute_jwk_thumbprint(&public_jwk(&own)).unwrap();
+        let fresh_proof = |key: &SigningKey| {
+            let mut c = proof_claims(thumbprint);
+            c["aud"] = json!(issuer(&state));
+            c["iat"] = json!(now_secs());
+            jws(key, &proof_header(key), &c)
+        };
+        assert_eq!(
+            assert_caller(&state, &claims, trigger, AUD, Some(&fresh_proof(&own)))
+                .await
+                .unwrap_err(),
+            AssertionError::NotPinned
+        );
+        assert_eq!(AssertionError::NotPinned.code(), "NO_SESSION");
+        crate::db::query(&crate::db::adapt_sql(
+            "UPDATE happyview_dpop_keys SET ticket_jkt = ? WHERE jwk_thumbprint = ?",
+            state.db_backend,
+        ))
+        .bind(&own_jkt)
+        .bind(thumbprint)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        // A key other than the pinned one: refused.
+        assert_eq!(
+            assert_caller(
+                &state,
+                &claims,
+                trigger,
+                AUD,
+                Some(&fresh_proof(&new_key()))
+            )
+            .await
+            .unwrap_err(),
+            AssertionError::KeyProof("not the ticket key this sign-in pinned")
+        );
+
+        // The pinned key: the assertion names it.
         let mut c = proof_claims(thumbprint);
         c["aud"] = json!(issuer(&state));
         c["iat"] = json!(now_secs());
@@ -845,7 +906,6 @@ mod tests {
             .await
             .unwrap();
         let claims_out = decode(a.token.split('.').nth(1).unwrap());
-        let own_jkt = crate::oauth::keys::compute_jwk_thumbprint(&public_jwk(&own)).unwrap();
         assert_eq!(claims_out["cnf"]["jkt"], own_jkt.as_str());
         assert_eq!(claims_out["cnf_src"], "key_proof");
         assert_eq!(claims_out["sub"], did.as_str());

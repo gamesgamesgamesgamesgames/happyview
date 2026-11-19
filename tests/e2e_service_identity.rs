@@ -575,6 +575,84 @@ async fn service_auth_procedure_denied() {
     assert!(body["error"].as_str().unwrap().contains("not authorized"));
 }
 
+/// Service auth addressed to `aud_fragment`, sent to `uri` on an instance
+/// that has created the space host entry, the way creating a space does.
+async fn call_with_space_host_entry(method: &str, uri: &str, aud_fragment: &str) -> StatusCode {
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    happyview::service_entries::ensure_space_host_entry(&app.state.db, app.state.db_backend)
+        .await
+        .expect("create the space host entry");
+
+    let auth = app
+        .service_auth_jwt(&plc_store, "did:plc:anyaccount", &did, aud_fragment)
+        .await;
+
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", &auth)
+        .header("host", "127.0.0.1:0");
+    let body = if method == "POST" {
+        req = req.header("content-type", "application/json");
+        Body::from(serde_json::to_vec(&json!({"title": "test"})).unwrap())
+    } else {
+        Body::empty()
+    };
+    let resp = app
+        .router
+        .clone()
+        .oneshot(req.body(body).unwrap())
+        .await
+        .unwrap();
+    resp.status()
+}
+
+/// The space host entry opens the space host methods only, so a query is
+/// refused to service auth addressed to it.
+#[tokio::test]
+#[serial]
+async fn space_host_service_auth_is_refused_on_a_query() {
+    common::require_db!();
+    let status = call_with_space_host_entry(
+        "GET",
+        "/xrpc/games.gamesgamesgamesgames.listGames",
+        "#atproto_space_host",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// As above, for a procedure a script handles.
+#[tokio::test]
+#[serial]
+async fn space_host_service_auth_is_refused_on_a_procedure() {
+    common::require_db!();
+    let status = call_with_space_host_entry(
+        "POST",
+        "/xrpc/games.gamesgamesgamesgames.createGame",
+        "#atproto_space_host",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// As above, for a method HappyView itself serves through the XRPC handler.
+#[tokio::test]
+#[serial]
+async fn space_host_service_auth_is_refused_on_an_unlisted_method() {
+    common::require_db!();
+    let status =
+        call_with_space_host_entry("GET", "/xrpc/com.example.notListed", "#atproto_space_host")
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 #[serial]
 async fn token_scope_enforcement() {
