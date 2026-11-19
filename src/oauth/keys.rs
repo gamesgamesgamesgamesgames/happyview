@@ -137,6 +137,34 @@ pub async fn store_dpop_key(
 }
 
 /// Retrieve and decrypt a DPoP key by provision_id.
+/// Pin `jkt`, a ticket key the client proved, to the DPoP key `id`. Set once:
+/// a sign-in keeps the key it registered with, and a second, different pin is
+/// refused.
+pub async fn pin_ticket_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    id: &str,
+    jkt: &str,
+) -> Result<(), AppError> {
+    let updated = crate::db::query(&adapt_sql(
+        "UPDATE happyview_dpop_keys SET ticket_jkt = ? WHERE id = ? AND (ticket_jkt IS NULL OR ticket_jkt = ?)",
+        backend,
+    ))
+    .bind(jkt)
+    .bind(id)
+    .bind(jkt)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to pin the ticket key: {e}")))?
+    .rows_affected();
+    if updated == 0 {
+        return Err(AppError::Conflict(
+            "this sign-in already pinned a different ticket key".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn get_dpop_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

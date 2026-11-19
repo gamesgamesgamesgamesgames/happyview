@@ -296,6 +296,12 @@ struct RegisterSessionBody {
     #[serde(default, rename = "pds_url")]
     _pds_url: Option<String>,
     issuer: Option<String>,
+    /// A key proof (`hv-key-proof+jwt`, `lxm` "happyview.oauth.registerSession",
+    /// `dpop_jkt` the provisioned key's thumbprint) pinning a key the client
+    /// holds to this sign-in. Caller assertions for the sign-in can then name
+    /// that key, and only that key (`auth::caller_assertion`).
+    #[serde(default)]
+    ticket_key_proof: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -303,6 +309,10 @@ struct RegisterSessionResponse {
     session_id: String,
     did: String,
     scopes: Vec<String>,
+    /// `pinned` or `refused`, when the registration carried a
+    /// `ticket_key_proof`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_pin: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -518,7 +528,7 @@ async fn register_session(
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Look up the DPoP key by provision_id
-    let (dpop_key_id, dpop_client_id, private_jwk, _thumbprint, pkce_challenge) =
+    let (dpop_key_id, dpop_client_id, private_jwk, dpop_thumbprint, pkce_challenge) =
         keys::get_dpop_key(
             &state.db,
             state.db_backend,
@@ -639,6 +649,39 @@ async fn register_session(
                 .find(|k| k.status == super::client_keys::KeyStatus::Current)
                 .map(|k| k.kid.clone())
         });
+
+    // A pin never blocks a sign-in: a proof that doesn't verify, or that
+    // names a different key than one already pinned, leaves the session
+    // unpinned, and the response says so. Registration is the only place a
+    // pin is ever written.
+    let ticket_pin = match body.ticket_key_proof.as_deref() {
+        None => None,
+        Some(proof) => {
+            let verified = crate::auth::caller_assertion::verify_key_proof(
+                proof,
+                &crate::auth::caller_assertion::issuer(&state),
+                crate::auth::caller_assertion::SESSION_PIN_LXM,
+                &dpop_thumbprint,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            let pinned = match verified {
+                Ok(jkt) => keys::pin_ticket_key(&state.db, state.db_backend, &dpop_key_id, &jkt)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            Some(match pinned {
+                Ok(()) => "pinned",
+                Err(reason) => {
+                    tracing::warn!(did = %body.did, reason, "registered a session without its ticket key pin");
+                    "refused"
+                }
+            })
+        }
+    };
 
     // Store the session
     let session_id = Uuid::new_v4().to_string();
@@ -805,6 +848,7 @@ async fn register_session(
             session_id,
             did: body.did,
             scopes,
+            ticket_pin,
         }),
     ))
 }

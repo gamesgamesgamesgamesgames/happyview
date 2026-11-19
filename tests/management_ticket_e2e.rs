@@ -228,19 +228,35 @@ async fn a_dpop_session_becomes_a_ticket_that_only_the_browser_key_can_use() {
     let dpop_key = key_body["dpop_key"].clone();
     let access_token = "e2e-access-token";
     hp.mock_session_verification(&owner, &owner).await;
-    let session = post(
-        "/oauth/sessions",
-        &json!({
-            "provision_id": key_body["provision_id"], "did": owner,
-            "access_token": access_token, "scopes": "atproto",
-            "pds_url": "https://pds.example.com",
-        }),
-        &auth,
-    );
-    assert_eq!(
-        hp.router.clone().oneshot(session).await.unwrap().status(),
-        StatusCode::CREATED
-    );
+    // The browser made its ticket key before signing in, and pins it to the
+    // sign-in as the session is registered.
+    let browser = new_key();
+    let pin = |key: &SigningKey, dpop_jkt: &str| {
+        sign(
+            key,
+            &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(key) }),
+            &json!({
+                "aud": issuer(&hp.state), "lxm": happyview::auth::caller_assertion::SESSION_PIN_LXM,
+                "dpop_jkt": dpop_jkt, "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+            }),
+        )
+    };
+    let register = |proof: String| {
+        post(
+            "/oauth/sessions",
+            &json!({
+                "provision_id": key_body["provision_id"], "did": owner,
+                "access_token": access_token, "scopes": "atproto",
+                "pds_url": "https://pds.example.com",
+                "ticket_key_proof": proof,
+            }),
+            &auth,
+        )
+    };
+    let session = register(pin(&browser, &thumbprint_of(&dpop_key)));
+    let resp = hp.router.clone().oneshot(session).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["ticket_pin"], "pinned");
 
     // The getManagementTicket request, authenticated as core does it.
     let path = format!("/xrpc/{METHOD}");
@@ -266,8 +282,7 @@ async fn a_dpop_session_becomes_a_ticket_that_only_the_browser_key_can_use() {
         .await
         .expect("a DPoP session");
 
-    // The browser's ticket key proves itself for this session.
-    let browser = new_key();
+    // The browser's ticket key proves itself for this request.
     let key_proof = sign(
         &browser,
         &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(&browser) }),
@@ -330,4 +345,165 @@ async fn a_dpop_session_becomes_a_ticket_that_only_the_browser_key_can_use() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // A key the sign-in didn't pin gets no assertion, even with a valid proof.
+    let stranger = new_key();
+    let stranger_proof = sign(
+        &stranger,
+        &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(&stranger) }),
+        &json!({
+            "aud": issuer(&hp.state), "lxm": METHOD,
+            "dpop_jkt": thumbprint_of(&dpop_key),
+            "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+        }),
+    );
+    assert!(matches!(
+        assert_caller(
+            &hp.state,
+            &claims,
+            &trigger,
+            PROVISIONER,
+            Some(&stranger_proof)
+        )
+        .await,
+        Err(happyview::auth::caller_assertion::AssertionError::KeyProof(
+            _
+        ))
+    ));
+
+    // Signing out ends the session, and its pin with it.
+    let url = format!("http://127.0.0.1:0/oauth/sessions/{owner}");
+    let dpop = generate_dpop_proof(&dpop_key, "DELETE", &url, access_token, None).unwrap();
+    let delete = Request::builder()
+        .method("DELETE")
+        .uri(format!("/oauth/sessions/{owner}"))
+        .header("host", "127.0.0.1:0")
+        .header("x-client-key", &client_key)
+        .header("authorization", format!("DPoP {access_token}"))
+        .header("dpop", &dpop)
+        .body(Body::empty())
+        .unwrap();
+    assert!(
+        hp.router
+            .clone()
+            .oneshot(delete)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let (pins,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_keys WHERE ticket_jkt IS NOT NULL",
+        hp.state.db_backend,
+    ))
+    .fetch_one(&hp.state.db)
+    .await
+    .unwrap();
+    assert_eq!(pins, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_sign_in_without_a_pinned_key_gets_no_key_bound_assertion() {
+    common::require_db!();
+    let mut hp = TestApp::new_with_encryption().await;
+    let owner = hp.admin_did.clone();
+    let key = new_key();
+    let mut private = public_jwk(&key);
+    private["kid"] = json!("a1");
+    private["d"] = json!(URL_SAFE_NO_PAD.encode(key.to_bytes()));
+    hp.state.config.caller_assertions = Some(
+        CallerAssertionConfig::parse(Some(&private.to_string()), Some(PROVISIONER))
+            .unwrap()
+            .unwrap(),
+    );
+    hp.rebuild_router();
+
+    let (client_key, client_secret, _) = hp.create_api_client("confidential", None).await;
+    let auth = [
+        ("x-client-key", client_key.as_str()),
+        ("x-client-secret", client_secret.as_str()),
+    ];
+    let key_resp = hp
+        .router
+        .clone()
+        .oneshot(post("/oauth/dpop-keys", &json!({}), &auth))
+        .await
+        .unwrap();
+    let key_body = json_body(key_resp).await;
+    let dpop_key = key_body["dpop_key"].clone();
+    let access_token = "unpinned-token";
+    hp.mock_session_verification(&owner, &owner).await;
+    // A pin that doesn't verify (made for another DPoP key) never blocks the
+    // sign-in: the session is registered, unpinned, and says so.
+    let wrong = new_key();
+    let bad_pin = sign(
+        &wrong,
+        &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(&wrong) }),
+        &json!({
+            "aud": issuer(&hp.state), "lxm": happyview::auth::caller_assertion::SESSION_PIN_LXM,
+            "dpop_jkt": "another-dpop-key", "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+        }),
+    );
+    let session = post(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": key_body["provision_id"], "did": owner,
+            "access_token": access_token, "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+            "ticket_key_proof": bad_pin,
+        }),
+        &auth,
+    );
+    let resp = hp.router.clone().oneshot(session).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(json_body(resp).await["ticket_pin"], "refused");
+    let (pins,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_dpop_keys WHERE ticket_jkt IS NOT NULL",
+        hp.state.db_backend,
+    ))
+    .fetch_one(&hp.state.db)
+    .await
+    .unwrap();
+    assert_eq!(pins, 0);
+
+    let path = format!("/xrpc/{METHOD}");
+    let dpop = generate_dpop_proof(
+        &dpop_key,
+        "POST",
+        &format!("http://127.0.0.1:0{path}"),
+        access_token,
+        None,
+    )
+    .unwrap();
+    let (parts, _) = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("host", "127.0.0.1:0")
+        .header("x-client-key", &client_key)
+        .header("authorization", format!("DPoP {access_token}"))
+        .header("dpop", &dpop)
+        .body(())
+        .unwrap()
+        .into_parts();
+    let claims = happyview::auth::middleware::resolve_dpop_claims(&hp.state, &parts, access_token)
+        .await
+        .unwrap();
+    let browser = new_key();
+    let proof = sign(
+        &browser,
+        &json!({ "alg": "ES256", "typ": "hv-key-proof+jwt", "jwk": public_jwk(&browser) }),
+        &json!({
+            "aud": issuer(&hp.state), "lxm": METHOD,
+            "dpop_jkt": thumbprint_of(&dpop_key),
+            "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+        }),
+    );
+    let trigger = format!("xrpc.procedure:{METHOD}");
+    assert_eq!(
+        assert_caller(&hp.state, &claims, &trigger, PROVISIONER, Some(&proof))
+            .await
+            .unwrap_err(),
+        happyview::auth::caller_assertion::AssertionError::NotPinned
+    );
 }
