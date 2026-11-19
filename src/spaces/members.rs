@@ -119,9 +119,10 @@ pub async fn resolve_members_on(
         .collect())
 }
 
-/// The spaces that take `space_id`'s members through delegation entries,
-/// directly or through other spaces, up to the depth the resolver follows.
-/// Each is listed once, in id order; `space_id` itself is not listed.
+/// The spaces that take `space_id`'s members through delegation entries or
+/// nested references, directly or through other spaces, up to the depth the
+/// resolver follows. Each is listed once, in id order; `space_id` itself is
+/// not listed.
 ///
 /// This is the reverse of [`resolve_members`]: a change to `space_id`'s
 /// members can change who reads each of these.
@@ -139,15 +140,34 @@ pub async fn delegating_spaces(
             let Some(child) = db::get_space(&mut *conn, backend, child_id).await? else {
                 continue;
             };
+            let mut parents: Vec<String> = Vec::new();
             for entry in db::delegation_entries_naming(&mut *conn, backend, &child).await? {
                 if visited.contains(&entry.space_id) {
                     continue;
                 }
                 let target = target_id(conn, backend, &entry.did).await;
                 if target.ok().flatten().as_deref() == Some(child_id.as_str()) {
-                    visited.insert(entry.space_id.clone());
-                    found.push(entry.space_id.clone());
-                    next.push(entry.space_id);
+                    parents.push(entry.space_id);
+                }
+            }
+            // Nested references name a space by its canonical address.
+            let address = format!(
+                "at://{}/space/{}/{}",
+                child.did, child.type_nsid, child.skey
+            );
+            let nesting: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+                "SELECT space_id FROM happyview_space_nested WHERE target_space_uri = ?",
+                backend,
+            ))
+            .bind(&address)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql_error)?;
+            parents.extend(nesting.into_iter().map(|(id,)| id));
+            for parent in parents {
+                if visited.insert(parent.clone()) {
+                    found.push(parent.clone());
+                    next.push(parent);
                 }
             }
         }
