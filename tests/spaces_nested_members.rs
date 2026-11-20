@@ -1040,3 +1040,362 @@ async fn a_credential_issued_while_a_nested_space_is_removed_follows_the_removal
     assert_eq!(removal.await.unwrap(), StatusCode::OK);
     assert_eq!(outstanding(&app, &a, &member).await, 0);
 }
+
+async fn nested_list(app: &TestApp, owner: &str, space: &str) -> Vec<String> {
+    let (status, body) = get(
+        app,
+        owner,
+        &format!(
+            "/xrpc/dev.happyview.space.listNestedSpaces?space={}",
+            urlencoding::encode(space)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["nested"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["space"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Moving a space to a policy without a member list discards its nested
+/// spaces with its members: the spaces that nest it stop admitting their
+/// members, and moving back doesn't bring them back.
+#[tokio::test]
+#[serial]
+async fn discarding_a_member_list_discards_its_nested_spaces() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let p = create(&app, &owner, memberspace(json!({}))).await;
+    let y = create(&app, &owner, memberspace(json!({}))).await;
+    let q = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &y,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &p, &y, true, false).await;
+    nest(&app, &owner, &q, &p, true, false).await;
+    mint(&app, &q, &member).await;
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.space.updateSpace",
+        json!({ "space": p, "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:app",
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(entry(&members(&app, &owner, &q).await, &member).is_none());
+    assert_eq!(outstanding(&app, &q, &member).await, 0, "revoked in Q");
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.space.updateSpace",
+        json!({ "space": p, "policy": memberspace(json!({})) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(nested_list(&app, &owner, &p).await.is_empty());
+    assert!(entry(&members(&app, &owner, &q).await, &member).is_none());
+}
+
+/// A space past the bound whose nesting space still resolves, because the
+/// part past the bound sits deeper than the nesting space reads: a removal in
+/// it revokes the nesting space's credentials for the accounts it took away.
+#[tokio::test]
+#[serial]
+async fn a_removal_in_a_space_past_the_bound_revokes_above_it() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let q = create(&app, &owner, memberspace(json!({}))).await;
+    let p = create(&app, &owner, memberspace(json!({}))).await;
+    let e = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &e,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &q, &p, true, false).await;
+    nest(&app, &owner, &p, &e, true, false).await;
+    // P -> C1 -> ... -> C8 -> H: H is nine levels below P, ten below Q, so Q
+    // never reads it.
+    let mut above = p.clone();
+    for _ in 0..8 {
+        let c = create(&app, &owner, memberspace(json!({}))).await;
+        nest(&app, &owner, &above, &c, true, false).await;
+        above = c;
+    }
+    let h = create(&app, &owner, memberspace(json!({}))).await;
+    nest(&app, &owner, &above, &h, true, false).await;
+    mint(&app, &q, &member).await;
+    bulk_members(&app, &h, happyview::spaces::members::MAX_RESOLVED, "deep").await;
+    assert!(entry(&members(&app, &owner, &q).await, &member).is_some());
+
+    unnest(&app, &owner, &p, &e).await;
+    assert_eq!(outstanding(&app, &q, &member).await, 0, "revoked in Q");
+}
+
+/// Deleting a nested space removes the references to it, and revokes the
+/// credentials its members held for the spaces that nested it.
+#[tokio::test]
+#[serial]
+async fn deleting_a_nested_space_removes_it_from_the_spaces_that_nest_it() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    mint(&app, &a, &member).await;
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.space.deleteSpace",
+        json!({ "space": b }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(outstanding(&app, &a, &member).await, 0, "revoked in A");
+    assert!(nested_list(&app, &owner, &a).await.is_empty());
+}
+
+/// Revocation follows a cycle of nested spaces.
+#[tokio::test]
+#[serial]
+async fn a_removal_in_a_cycle_revokes_around_it() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    nest(&app, &owner, &b, &a, true, false).await;
+    mint(&app, &a, &member).await;
+    remove_members(&app, &owner, &b, json!([member])).await;
+    assert_eq!(outstanding(&app, &a, &member).await, 0, "revoked in A");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_space_cant_nest_itself() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let (status, body) = post(
+        &app,
+        &owner,
+        "dev.happyview.space.putNestedSpace",
+        json!({ "space": a, "nested": a, "read": true, "write": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("InvalidRequest"));
+}
+
+/// `simplespace` names a space as a member every way it always could: by
+/// space id, by address, by `ats://` address, or by a space elsewhere, and
+/// answers with the member as it always shaped it.
+#[tokio::test]
+#[serial]
+async fn simplespace_names_spaces_as_members_every_way_it_could() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": true }]),
+    )
+    .await;
+    let a_row = space_row(&app, &a).await;
+    let b_row = space_row(&app, &b).await;
+
+    // By space id: nested, with the member shaped as before.
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": a, "did": b_row.id, "read": true, "write": false, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let shaped = &body["member"];
+    for field in [
+        "id",
+        "space_id",
+        "did",
+        "access",
+        "is_delegation",
+        "created_at",
+    ] {
+        assert!(!shaped[field].is_null(), "{field}: {body}");
+    }
+    assert_eq!(shaped["space_id"], json!(a_row.id));
+    assert_eq!(shaped["did"], json!(b_row.id));
+    assert_eq!(shaped["is_delegation"], json!(true));
+    assert_eq!(nested_list(&app, &owner, &a).await, vec![b.clone()]);
+    assert_eq!(
+        entry(&members(&app, &owner, &a).await, &member),
+        Some(&(member.clone(), true, false))
+    );
+
+    // Adding it again is a conflict, by any name.
+    for name in [b.clone(), b_row.id.clone()] {
+        let (status, body) = post(
+            &app,
+            &owner,
+            "com.atproto.simplespace.addMember",
+            json!({ "space": a, "did": name, "isDelegation": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{name}: {body}");
+    }
+
+    // Removed by id.
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.removeMember",
+        json!({ "space": a, "did": b_row.id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(nested_list(&app, &owner, &a).await.is_empty());
+
+    // Added by address, removed by its ats:// form, along with a member row
+    // naming the same space from before nesting.
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.addMember",
+        json!({ "space": a, "did": b }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ats = b.replacen("at://", "ats://", 1).replacen("/space/", "/", 1);
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) VALUES (?, ?, ?, 1, 0, 0, 1, NULL, ?)",
+        app.state.db_backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&a_row.id)
+    .bind(&ats)
+    .bind("2026-11-01T00:00:00Z")
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.removeMember",
+        json!({ "space": a, "did": ats }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(nested_list(&app, &owner, &a).await.is_empty());
+    assert!(entry(&members(&app, &owner, &a).await, &member).is_none());
+    let rows: i64 = happyview::db::query_scalar(&happyview::db::adapt_sql(
+        "SELECT count(*) FROM happyview_space_members WHERE space_id = ? AND is_delegation = 1",
+        app.state.db_backend,
+    ))
+    .bind(&a_row.id)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "the member row went too");
+
+    // A space elsewhere is stored as a member naming it, and brings in no
+    // members.
+    let elsewhere = "at://did:plc:elsewhere/space/com.example.forum/x";
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": a, "did": elsewhere, "read": true, "write": false, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["member"]["did"], json!(elsewhere));
+    assert!(nested_list(&app, &owner, &a).await.is_empty());
+    assert_eq!(members(&app, &owner, &a).await.len(), 1, "only the owner");
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.removeMember",
+        json!({ "space": a, "did": elsewhere }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A reference brings in members only while its address names the space it
+/// was made to, so a space later found at that address isn't nested by it.
+#[tokio::test]
+#[serial]
+async fn a_reference_follows_the_space_it_was_made_to() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    assert!(entry(&members(&app, &owner, &a).await, &member).is_some());
+
+    // The reference now records another space than the one at its address.
+    let a_row = space_row(&app, &a).await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_space_nested SET target_space_id = ? WHERE space_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&a_row.id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    assert!(entry(&members(&app, &owner, &a).await, &member).is_none());
+}

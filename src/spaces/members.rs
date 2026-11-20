@@ -133,7 +133,8 @@ pub async fn resolve_members_on(
 /// The spaces that take `space_id`'s members through delegation entries or
 /// nested references, directly or through other spaces, up to the depth the
 /// resolver follows. Each is listed once, in id order; `space_id` itself is
-/// not listed.
+/// not listed. Past [`MAX_RESOLVED`] entries read, the lookup fails with
+/// `MemberListTooLarge`, as resolution does.
 ///
 /// This is the reverse of [`resolve_members`]: a change to `space_id`'s
 /// members can change who reads each of these.
@@ -145,6 +146,7 @@ pub async fn delegating_spaces(
     let mut visited: HashSet<String> = HashSet::from([space_id.to_string()]);
     let mut found: Vec<String> = Vec::new();
     let mut frontier = vec![space_id.to_string()];
+    let mut budget = MAX_RESOLVED;
     for _ in 1..MAX_DELEGATION_DEPTH {
         let mut next = Vec::new();
         for child_id in &frontier {
@@ -152,7 +154,9 @@ pub async fn delegating_spaces(
                 continue;
             };
             let mut parents: Vec<String> = Vec::new();
-            for entry in db::delegation_entries_naming(&mut *conn, backend, &child).await? {
+            let entries = db::delegation_entries_naming(&mut *conn, backend, &child).await?;
+            budget = budget.checked_sub(entries.len()).ok_or_else(too_large)?;
+            for entry in entries {
                 if visited.contains(&entry.space_id) {
                     continue;
                 }
@@ -161,19 +165,16 @@ pub async fn delegating_spaces(
                     parents.push(entry.space_id);
                 }
             }
-            // Nested references name a space by its canonical address.
-            let address = format!(
-                "at://{}/space/{}/{}",
-                child.did, child.type_nsid, child.skey
-            );
+            // Nested references keep the id of the space they name.
             let nesting: Vec<(String,)> = crate::db::query_as(&adapt_sql(
-                "SELECT space_id FROM happyview_space_nested WHERE target_space_uri = ?",
+                "SELECT space_id FROM happyview_space_nested WHERE target_space_id = ?",
                 backend,
             ))
-            .bind(&address)
+            .bind(child_id)
             .fetch_all(&mut *conn)
             .await
             .map_err(sql_error)?;
+            budget = budget.checked_sub(nesting.len()).ok_or_else(too_large)?;
             parents.extend(nesting.into_iter().map(|(id,)| id));
             for parent in parents {
                 if visited.insert(parent.clone()) {
@@ -231,8 +232,8 @@ async fn resolve(
         .fetch_all(&mut *conn)
         .await
         .map_err(sql_error)?;
-        let refs: Vec<(String, i32, i32)> = crate::db::query_as(&adapt_sql(
-            "SELECT target_space_uri, can_read, can_write FROM happyview_space_nested WHERE space_id = ?",
+        let refs: Vec<(String, i32, i32, Option<String>)> = crate::db::query_as(&adapt_sql(
+            "SELECT target_space_uri, can_read, can_write, target_space_id FROM happyview_space_nested WHERE space_id = ?",
             backend,
         ))
         .bind(&id)
@@ -275,13 +276,15 @@ async fn resolve(
             }
             entry.access = entry.access.union(access);
         }
-        for (uri, read, write) in refs {
+        for (uri, read, write, nested_id) in refs {
             let step = (read != 0, write != 0);
             let cap = Some(match cap {
                 Some((r, w)) => (r && step.0, w && step.1),
                 None => step,
             });
-            if let Some(target) = target_id(conn, backend, &uri).await? {
+            // Only while the address still names the space that was nested.
+            let target = target_id(conn, backend, &uri).await?;
+            if let Some(target) = target.filter(|t| nested_id.as_deref() == Some(t.as_str())) {
                 queue.push((target, cap, via.clone().or(Some(uri)), depth + 1));
             }
         }

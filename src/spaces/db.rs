@@ -1081,22 +1081,24 @@ pub struct NestedRef {
     pub created_at: String,
 }
 
-/// Nest `target_space_uri` in a space, or replace the access an existing
-/// reference grants.
+/// Nest `target_space_uri`, the address of the space `target_space_id`, in a
+/// space, or replace the access an existing reference grants.
 pub async fn upsert_nested(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
+    target_space_id: &str,
     reference: &NestedRef,
 ) -> Result<(), AppError> {
     crate::db::query(&adapt_sql(
-        "INSERT INTO happyview_space_nested (id, space_id, target_space_uri, can_read, can_write, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (space_id, target_space_uri) DO UPDATE SET can_read = excluded.can_read, can_write = excluded.can_write, added_by = excluded.added_by",
+        "INSERT INTO happyview_space_nested (id, space_id, target_space_uri, target_space_id, can_read, can_write, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, target_space_uri) DO UPDATE SET target_space_id = excluded.target_space_id, can_read = excluded.can_read, can_write = excluded.can_write, added_by = excluded.added_by",
         backend,
     ))
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(space_id)
     .bind(&reference.target_space_uri)
+    .bind(target_space_id)
     .bind(i32::from(reference.read))
     .bind(i32::from(reference.write))
     .bind(&reference.added_by)
@@ -1124,6 +1126,62 @@ pub async fn delete_nested(
     .await
     .map(|r| r.rows_affected() > 0)
     .map_err(|e| AppError::Internal(format!("failed to remove nested space: {e}")))
+}
+
+/// A nested reference's row id and creation time, if the space has one to
+/// `target_space_uri`.
+pub async fn nested_row(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    target_space_uri: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    crate::db::query_as(&adapt_sql(
+        "SELECT id, created_at FROM happyview_space_nested WHERE space_id = ? AND target_space_uri = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(target_space_uri)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read nested space: {e}")))
+}
+
+/// Remove every space nested in a space, as discarding its member list does.
+pub async fn delete_all_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(drop)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested spaces: {e}")))
+}
+
+/// Remove every reference that nests a space, by its id or its address, as
+/// deleting the space does.
+pub async fn delete_nested_naming(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    target_space_id: &str,
+    target_space_uri: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE target_space_id = ? OR target_space_uri = ?",
+        backend,
+    ))
+    .bind(target_space_id)
+    .bind(target_space_uri)
+    .execute(executor)
+    .await
+    .map(drop)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested spaces: {e}")))
 }
 
 /// The spaces nested in a space, by address.
