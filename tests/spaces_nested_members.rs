@@ -951,3 +951,89 @@ async fn a_credential_issued_while_a_removal_commits_two_levels_down_follows_it(
     );
     assert_eq!(outstanding(&app, &a, &member).await, 0);
 }
+
+/// A credential stored while a nested space's removal is waiting to start
+/// is revoked by it: issuing holds the nesting space's row share-locked from
+/// its membership check to the insert, and the removal takes that row's lock
+/// before it reads who reads the space.
+#[tokio::test]
+#[serial]
+async fn a_credential_issued_while_a_nested_space_is_removed_follows_the_removal() {
+    common::require_db!();
+    let app = setup().await;
+    let backend = app.state.db_backend;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    let a_row = space_row(&app, &a).await;
+
+    // An issue that has found the member admitted to A, and not yet stored
+    // the credential.
+    let mut issue = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    if backend == happyview::db::DatabaseBackend::Postgres {
+        happyview::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR SHARE")
+            .bind(&a_row.id)
+            .execute(&mut *issue)
+            .await
+            .unwrap();
+    }
+
+    let router = app.router.clone();
+    let (name, value) = common::auth::admin_cookie_header(&owner, &app.state.cookie_key);
+    let body = json!({ "space": a, "nested": b }).to_string();
+    let removal = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/dev.happyview.space.removeNestedSpace")
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        router.oneshot(req).await.unwrap().status()
+    });
+    if backend == happyview::db::DatabaseBackend::Postgres {
+        for _ in 0..100 {
+            let waiting: i64 = happyview::db::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&app.state.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&a_row.id)
+    .bind(&member)
+    .bind(format!("hash{}", Uuid::new_v4().simple()))
+    .bind(format!("jti{}", Uuid::new_v4().simple()))
+    .bind("9999-12-31T00:00:00+00:00")
+    .bind("2026-11-19T00:00:00+00:00")
+    .execute(&mut *issue)
+    .await
+    .unwrap();
+    issue.commit().await.unwrap();
+
+    assert_eq!(removal.await.unwrap(), StatusCode::OK);
+    assert_eq!(outstanding(&app, &a, &member).await, 0);
+}
