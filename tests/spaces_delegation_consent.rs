@@ -538,25 +538,24 @@ async fn keeping_consent_needs_it_at_write_time() {
             spaces_db::add_delegation(&db, backend, &member, spaces_db::DelegationConsent::Kept)
                 .await
                 .unwrap();
-            true
         }
     };
 
     // No entry: stored without consent.
-    assert!(keep(delegation(&x, &y_addr)).await);
+    keep(delegation(&x, &y_addr)).await;
     assert!(stored(&app, &x, &y_addr).await);
     assert!(!consented(&app, &x, &y_addr).await);
 
     // An entry without consent stays without.
-    assert!(keep(delegation(&x, &y_addr)).await);
+    keep(delegation(&x, &y_addr)).await;
     assert!(!consented(&app, &x, &y_addr).await);
 
     // A consented entry, unchanged, keeps it; with other access, loses it.
     add_consented(&app, &x, &y_addr, &y).await;
-    assert!(keep(delegation(&x, &y_addr)).await);
+    keep(delegation(&x, &y_addr)).await;
     assert!(consented(&app, &x, &y_addr).await);
     let mut changed = delegation(&x, &y_addr);
     changed.access = MemberAccess::WRITE;
-    assert!(keep(changed).await);
+    keep(changed).await;
     assert!(!consented(&app, &x, &y_addr).await);
 }
