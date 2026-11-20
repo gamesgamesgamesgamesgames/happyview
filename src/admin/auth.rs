@@ -312,8 +312,11 @@ impl UserAuth {
 
         // `auth::ticket::gate` verified the ticket, its proof, the body and
         // replay before the request got here, and left what it verified.
+        // A route outside the gated router never had its ticket checked, so
+        // the ticket isn't accepted there: a refusal, not a server error.
         let verified = parts.extensions.get::<Verified>().cloned().ok_or_else(|| {
-            AppError::Internal("management ticket on a route without the ticket gate".into())
+            tracing::warn!("a management ticket reached a route without the ticket gate");
+            AppError::Auth("management tickets aren't accepted here".into())
         })?;
         let uri = parts
             .extensions

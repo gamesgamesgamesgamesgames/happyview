@@ -5,9 +5,10 @@ export {
   HappyViewOAuthClient,
   LAST_ACTIVE_KEY,
   STORAGE_PREFIX,
+  sessionKeyId,
 } from "./client";
 export type { FetchMetadataOptions } from "./client";
-export { importJwk } from "./import-jwk";
+export { importJwk, importKeyPair, keyFromPair, publicJwkOf } from "./import-jwk";
 export { jwkThumbprint } from "./thumbprint";
 export {
   ApiError,
@@ -25,11 +26,15 @@ export type {
   DpopProvision,
   GetSessionResponse,
   HappyViewOAuthClientOptions,
+  KeyStore,
   ProvisionKeyResponse,
   RegisterSessionParams,
   RegisterSessionResponse,
   SessionEventHooks,
   StorageAdapter,
   StoredSession,
+  TicketKeyProofRequest,
+  TicketKeyProver,
   TokenInfo,
 } from "./types";
+export { SESSION_PIN_LXM } from "./types";

@@ -11,7 +11,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { completeSetup, plcRequest, plcSubmit, plcRegister } from "@/lib/api";
+import { completeSetup, plcRequest, plcRegister } from "@/lib/api";
+import { checkAttachedPlc, submitAttachedPlc } from "@/lib/attach-plc";
 import { docsUrl } from "@/lib/docs";
 import { HelpTip } from "./help-tip";
 
@@ -167,6 +168,7 @@ function VerifyAttachAccount({
   const [token, setToken] = useState("");
   const [codeSent, setCodeSent] = useState(false);
   const [sendingCode, setSendingCode] = useState(false);
+  const [canCheck, setCanCheck] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -209,23 +211,21 @@ function VerifyAttachAccount({
     }
   };
 
-  const handleSubmitToken = async () => {
+  const finish = async (attempt: () => ReturnType<typeof checkAttachedPlc>) => {
     setLoading(true);
     setError(null);
-    try {
-      await plcSubmit(token);
-      await completeSetup();
+    const outcome = await attempt();
+    setLoading(false);
+    if (outcome.done) {
       onComplete();
-    } catch (e) {
-      setError(
-        e instanceof Error
-          ? e.message
-          : "Verification failed. Check the code and try again.",
-      );
-    } finally {
-      setLoading(false);
+      return;
     }
+    setError(outcome.error);
+    setCanCheck(outcome.canCheck);
   };
+
+  const handleSubmitToken = () => finish(() => submitAttachedPlc(token));
+  const handleCheck = () => finish(checkAttachedPlc);
 
   return (
     <Card>
@@ -283,6 +283,24 @@ function VerifyAttachAccount({
               <p role="alert" className="text-destructive text-sm">
                 {error}
               </p>
+            )}
+            {canCheck && (
+              <div className="space-y-2 text-sm">
+                <p className="text-muted-foreground">
+                  The PDS may have applied the change anyway. If the
+                  account&apos;s DID document now lists this instance, setup can
+                  continue.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  onClick={handleCheck}
+                  disabled={loading}
+                >
+                  Check DID Document
+                </Button>
+              </div>
             )}
             <div className="flex justify-between">
               {onBack ? (

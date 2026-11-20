@@ -5,55 +5,100 @@ use crate::error::AppError;
 
 use super::db;
 use super::flow;
+use super::refresh::{self, RefreshFailure};
 use super::types::{LinkedRepo, STATUS_ACTIVE};
 
 /// How often the loop wakes.
 const TICK_SECS: u64 = 30 * 60;
-/// Only touch grants that have not been refreshed within this window.
-const STALE_AFTER_SECS: i64 = 60 * 60;
+/// Refresh a grant once this long has passed since its last refresh: well
+/// inside an authorization server's refresh-token lifetime, which runs to days
+/// or months, while the access tokens it replaces last minutes to hours.
+const STALE_AFTER_SECS: i64 = 6 * 60 * 60;
+/// The longest the keep-alive waits to retry a grant after transient failures.
+const MAX_BACKOFF_SECS: u64 = 8 * 60 * 60;
 
-pub async fn refresh_grant(state: &AppState, grant: &LinkedRepo) -> Result<(), AppError> {
+/// What one keep-alive attempt did to a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The session's tokens were refreshed; the grant's refresh time moved on.
+    Refreshed,
+    /// The grant has no account bound yet, so there is nothing to refresh.
+    Unbound,
+    /// Another refresh holds the session; it settles the grant.
+    InProgress,
+    /// The authorization server refused the grant; it now needs
+    /// reauthorization.
+    NeedsReauth,
+    /// The server, the network or this instance's session store failed. The
+    /// grant stays active with the error recorded, and the keep-alive retries
+    /// later, until it has gone [`refresh::GIVE_UP_AFTER`] without a success.
+    Transient,
+}
+
+/// Refresh a grant's session at its authorization server, and settle what a
+/// failure means for it. See
+/// [`refresh::classify`] and [`refresh::GIVE_UP_AFTER`].
+pub async fn refresh_grant(
+    state: &AppState,
+    grant: &LinkedRepo,
+) -> Result<RefreshOutcome, AppError> {
     let Some(ref did_str) = grant.did else {
-        return Ok(());
+        return Ok(RefreshOutcome::Unbound);
     };
 
-    let did = Did::new(did_str.clone())
+    Did::new(did_str.clone())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
-    let client = match flow::client_for_grant(state, grant).await {
-        Ok(client) => client,
-        Err(e) => {
-            let message = format!("{e}");
-            db::mark_needs_reauth(state, &grant.id, &message).await?;
-            tracing::warn!(
-                grant_id = %grant.id,
-                did = %did_str,
-                error = %message,
-                "linked repo client construction failed"
-            );
-            return Err(e);
+    let failure = match flow::client_for_grant(state, grant).await {
+        // The client refuses only when the key the session was made with is
+        // no longer held; anything else is this instance failing to build it.
+        Err(e @ AppError::Auth(_)) => Some((format!("{e}"), RefreshFailure::Refused)),
+        Err(e) => Some((format!("{e}"), RefreshFailure::Local)),
+        Ok(client) => {
+            match super::session_refresh::refresh_session(state, &client, did_str).await {
+                Ok(super::session_refresh::Refreshed::Done) => None,
+                // Another refresh holds the session and settles the grant.
+                Ok(super::session_refresh::Refreshed::InProgress) => {
+                    return Ok(RefreshOutcome::InProgress);
+                }
+                Err(e) => Some((e.message, e.kind)),
+            }
         }
     };
 
-    match client.restore(&did).await {
-        Ok(_session) => {
-            db::touch_refreshed(state, &grant.id).await?;
-            Ok(())
-        }
-        Err(e) => {
-            let message = format!("{e}");
-            db::mark_needs_reauth(state, &grant.id, &message).await?;
-            tracing::warn!(
-                grant_id = %grant.id,
-                did = %did_str,
-                error = %message,
-                "linked repo session refresh failed"
-            );
-            Err(AppError::Auth(format!(
-                "linked repo {did_str} needs reauthorization: {message}"
-            )))
-        }
+    let Some((message, kind)) = failure else {
+        db::touch_refreshed(state, &grant.id).await?;
+        return Ok(RefreshOutcome::Refreshed);
+    };
+
+    let last_success = grant
+        .last_refreshed_at
+        .as_deref()
+        .or(grant.authorized_at.as_deref());
+    if kind == RefreshFailure::Refused || refresh::given_up(last_success, chrono::Utc::now()) {
+        let message = if kind == RefreshFailure::Refused {
+            message
+        } else {
+            format!("no successful refresh for over 7 days; last error: {message}")
+        };
+        db::mark_needs_reauth(state, &grant.id, &message).await?;
+        tracing::warn!(
+            grant_id = %grant.id,
+            did = %did_str,
+            error = %message,
+            "linked repo session needs reauthorization"
+        );
+        return Ok(RefreshOutcome::NeedsReauth);
     }
+
+    db::record_error(state, &grant.id, &message).await?;
+    tracing::warn!(
+        grant_id = %grant.id,
+        did = %did_str,
+        error = %message,
+        "linked repo session refresh failed; retrying later"
+    );
+    Ok(RefreshOutcome::Transient)
 }
 
 fn is_stale(last_refreshed_at: Option<&str>, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
@@ -70,6 +115,11 @@ pub async fn run_keepalive(state: AppState) {
     let interval = tokio::time::Duration::from_secs(TICK_SECS);
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Grants whose last attempts failed transiently: how many in a row, and
+    // when to try again. Kept in memory: a restart retries them at once.
+    let mut retry: std::collections::HashMap<String, (u32, tokio::time::Instant)> =
+        std::collections::HashMap::new();
 
     loop {
         let grants = match db::list(&state).await {
@@ -92,7 +142,33 @@ pub async fn run_keepalive(state: AppState) {
                 continue;
             }
 
-            let _ = refresh_grant(&state, &grant).await;
+            if retry
+                .get(&grant.id)
+                .is_some_and(|(_, at)| tokio::time::Instant::now() < *at)
+            {
+                continue;
+            }
+
+            match refresh_grant(&state, &grant).await {
+                Ok(RefreshOutcome::Transient) => {
+                    let failures = retry.get(&grant.id).map_or(0, |(n, _)| *n) + 1;
+                    let wait = refresh::backoff(
+                        failures,
+                        interval,
+                        tokio::time::Duration::from_secs(MAX_BACKOFF_SECS),
+                    );
+                    retry.insert(
+                        grant.id.clone(),
+                        (failures, tokio::time::Instant::now() + wait),
+                    );
+                }
+                Ok(_) => {
+                    retry.remove(&grant.id);
+                }
+                Err(e) => {
+                    tracing::warn!(grant_id = %grant.id, error = %e, "linked repo keep-alive failed");
+                }
+            }
         }
 
         tokio::time::sleep(interval).await;

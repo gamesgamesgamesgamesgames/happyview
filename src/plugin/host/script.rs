@@ -116,8 +116,9 @@ impl ScriptHostError {
 pub const MAX_ASSERTIONS_PER_RUN: u32 = 4;
 
 /// Sign an assertion about the run's caller for `request.audience`: who they
-/// are, the DPoP key and API client they authenticated with, and the running
-/// script's method, all from the request rather than from the script.
+/// are, the DPoP key and API client they authenticated with (or the key
+/// `request.key_proof` proves), and the running script's method, all from the
+/// request rather than from the script.
 pub async fn caller_assertion(
     state: &AppState,
     run: &ScriptRun,
@@ -137,8 +138,14 @@ pub async fn caller_assertion(
         return Err(AssertionError::TooMany(MAX_ASSERTIONS_PER_RUN).into());
     }
     let session = session.ok_or(AssertionError::NotDpop)?;
-    let assertion =
-        assert_caller(state, &session.claims, &run.trigger_id, &request.audience).await?;
+    let assertion = assert_caller(
+        state,
+        &session.claims,
+        &run.trigger_id,
+        &request.audience,
+        request.key_proof.as_deref(),
+    )
+    .await?;
     Ok(happyview_plugin_sdk::wire::CallerAssertion {
         token: assertion.token,
         expires_at: assertion.expires_at,
@@ -405,6 +412,7 @@ mod tests {
     fn assertion_request() -> happyview_plugin_sdk::wire::CallerAssertionRequest {
         happyview_plugin_sdk::wire::CallerAssertionRequest {
             audience: "https://service.example".into(),
+            key_proof: None,
         }
     }
 

@@ -531,10 +531,7 @@ async fn the_resolver_reads_a_bounded_queue_in_collection_then_did_order() {
             )
             .await;
             if !resolved {
-                expected.push(WorkUnit {
-                    did,
-                    collection: collection.to_string(),
-                });
+                expected.push(WorkUnit::new(did, collection.to_string()));
             }
         }
     }
@@ -587,10 +584,7 @@ async fn the_backlog_of_resolved_units_is_read_a_page_at_a_time() {
         .await;
         if resolved {
             expected.push((
-                WorkUnit {
-                    did,
-                    collection: POST.to_string(),
-                },
+                WorkUnit::new(did, POST.to_string()),
                 "https://pds.test".to_string(),
             ));
         }
@@ -1390,10 +1384,11 @@ async fn failure_set(
     state: &AppState,
     job_id: &str,
 ) -> Vec<(String, String, String, String, String)> {
-    crate::db::query_as(
+    crate::db::query_as(&adapt_sql(
         "SELECT did, collection, phase, kind, state FROM happyview_backfill_failures \
          WHERE job_id = ? ORDER BY did, collection",
-    )
+        state.db_backend,
+    ))
     .bind(job_id)
     .fetch_all(&state.db)
     .await
@@ -1436,17 +1431,17 @@ fn repo_not_found() -> ResponseTemplate {
     }))
 }
 
-/// HAP-421: a fetch deferred for retry survives a pause. Before, the retry
-/// lived only in memory and its unit was completed, so the resumed job never
-/// fetched the repo again and nothing recorded the loss.
+/// HAP-421, HAP-476: a fetch waiting to retry survives a pause. The unit
+/// stays queued, uncounted, with its attempts and when its retry is due, and
+/// the resumed job fetches it and counts it once.
 #[tokio::test]
 async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_repo() {
     let mock = MockServer::start().await;
     let state = pipeline_state(&mock, &[POST]).await;
     mount_plc(&mock).await;
-    // The first attempt fails retryably. The retry waits out the host's
-    // cooldown (500 ms), and the pause lands meanwhile.
-    fail_records(&mock, "did:plc:slow", POST, ResponseTemplate::new(503), 1).await;
+    // Two attempts fail retryably. The second retry waits out the host's
+    // backoff (at least 750 ms in all), and the pause lands meanwhile.
+    fail_records(&mock, "did:plc:slow", POST, ResponseTemplate::new(503), 2).await;
     mount_records(&mock, "did:plc:slow", POST, 2).await;
     forbid_other_record_fetches(&mock).await;
 
@@ -1457,7 +1452,7 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
         let state = state.clone();
         let job_id = job_id.clone();
         tokio::spawn(async move {
-            // Wait for the first attempt to defer the repo.
+            // Wait for the first attempt to schedule its retry.
             for _ in 0..200 {
                 if !failure_set(&state, &job_id).await.is_empty() {
                     break;
@@ -1470,7 +1465,8 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
     run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
     pauser.await.expect("pauser");
 
-    assert_eq!(job_row(&state, &job_id).await.status, "paused");
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(job.status, "paused");
     assert_eq!(
         failure_set(&state, &job_id).await,
         vec![(
@@ -1480,12 +1476,21 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
             "pds_server_error".to_string(),
             "pending".to_string()
         )],
-        "the deferred retry is persisted as pending"
+        "the retry is persisted as pending"
     );
     assert_eq!(
-        count_for_job(&state, "happyview_backfill_queue", &job_id).await,
-        0,
-        "the unit itself completed"
+        job.processed_repos, 0,
+        "a unit waiting to retry is not processed"
+    );
+    let (attempts, retry_at) = queue_retry_state(&state, &job_id, "did:plc:slow").await;
+    assert!(
+        (1..=2).contains(&attempts),
+        "the unit keeps its attempts: {attempts}"
+    );
+    assert!(retry_at.is_some(), "and when its retry is due");
+    assert_eq!(
+        failure_attempts(&state, &job_id, "did:plc:slow").await,
+        attempts
     );
 
     crate::db::query("UPDATE happyview_backfill_jobs SET status = 'running' WHERE id = ?")
@@ -1497,13 +1502,14 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
 
     let job = job_row(&state, &job_id).await;
     assert_eq!(
-        (job.status.as_str(), job.total_records),
-        ("completed", 2),
-        "the resumed job refetches the repo"
-    );
-    assert_eq!(
-        job.processed_repos, job.total_repos,
-        "the requeued retry counts toward the total it completes against"
+        (
+            job.status.as_str(),
+            job.total_records,
+            job.processed_repos,
+            job.total_repos
+        ),
+        ("completed", 2, 1, 1),
+        "the resumed job fetches the repo and counts it once"
     );
     assert_eq!(
         failure_states(&state, &job_id).await,
@@ -1514,6 +1520,33 @@ async fn a_pause_mid_retry_keeps_the_retry_and_the_resumed_job_refetches_the_rep
         count_for_job(&state, "happyview_backfill_queue", &job_id).await,
         0
     );
+}
+
+/// A queued unit's `(attempts, retry_at)`.
+async fn queue_retry_state(state: &AppState, job_id: &str, did: &str) -> (i32, Option<i64>) {
+    crate::db::query_as(&adapt_sql(
+        "SELECT attempts, retry_at FROM happyview_backfill_queue WHERE job_id = ? AND did = ?",
+        state.db_backend,
+    ))
+    .bind(job_id)
+    .bind(did)
+    .fetch_one(&state.db)
+    .await
+    .expect("queued unit")
+}
+
+/// The attempts on `did`'s failure row.
+async fn failure_attempts(state: &AppState, job_id: &str, did: &str) -> i32 {
+    crate::db::query_as::<(i32,)>(&adapt_sql(
+        "SELECT attempts FROM happyview_backfill_failures WHERE job_id = ? AND did = ?",
+        state.db_backend,
+    ))
+    .bind(job_id)
+    .bind(did)
+    .fetch_one(&state.db)
+    .await
+    .expect("failure row")
+    .0
 }
 
 /// HAP-421: a retry that succeeds takes its repo out of the failure set.
@@ -1615,6 +1648,7 @@ async fn a_fetch_cut_short_by_a_stop_is_not_complete() {
         POST,
         Some("c7".to_string()),
         &AtomicBool::new(true),
+        &FetchGate::default(),
     )
     .await;
     match outcome {
@@ -2133,6 +2167,7 @@ async fn a_cache_hit_leaves_the_plc_cooldown_in_force() {
         ),
         concurrency: 1,
         tx,
+        plc: Arc::new(happyview_source_jetstream::backfill::pacer::HostPacer::shared(1)),
     };
     let mut run = ResolverRun {
         cooldowns: HostCooldowns::new(),
@@ -2149,10 +2184,7 @@ async fn a_cache_hit_leaves_the_plc_cooldown_in_force() {
 
     let limited =
         profile::resolve_pds_endpoint_once(&state.http, &state.config.plc_url, "did:plc:y").await;
-    let y = WorkUnit {
-        did: "did:plc:y".to_string(),
-        collection: POST.to_string(),
-    };
+    let y = WorkUnit::new("did:plc:y".to_string(), POST.to_string());
     assert!(handle_resolution(&ctx, &mut run, y, limited, 1).await);
     let gate = run
         .cooldowns
@@ -2161,16 +2193,10 @@ async fn a_cache_hit_leaves_the_plc_cooldown_in_force() {
     assert!(gate > std::time::Instant::now() + Duration::from_secs(30));
 
     // A cache hit while scanning a page...
-    let x_post = WorkUnit {
-        did: "did:plc:x".to_string(),
-        collection: POST.to_string(),
-    };
+    let x_post = WorkUnit::new("did:plc:x".to_string(), POST.to_string());
     assert!(on_cached(&ctx, &mut run, x_post, mock.uri()).await);
     // ...and one while draining deferred retries.
-    let x_like = WorkUnit {
-        did: "did:plc:x".to_string(),
-        collection: LIKE.to_string(),
-    };
+    let x_like = WorkUnit::new("did:plc:x".to_string(), LIKE.to_string());
     let item = DeferredItem {
         payload: x_like,
         host: host.clone(),
@@ -2499,10 +2525,7 @@ async fn assert_the_completion_log_is_trimmed(state: &AppState, job_id: &str) {
     let queue = bounded_queue(job_id);
     let total = RECENT_COMPLETIONS_PER_JOB + i64::from(COMPLETIONS_TRIM_EVERY) + 5;
     for i in 0..total {
-        let unit = WorkUnit {
-            did: format!("did:plc:{i:05}"),
-            collection: POST.to_string(),
-        };
+        let unit = WorkUnit::new(format!("did:plc:{i:05}"), POST.to_string());
         complete_unit(&jobs(state), &queue, &unit, "https://pds.test", 1)
             .await
             .expect("complete unit");
@@ -2578,10 +2601,7 @@ async fn assert_job_counters_saturate(state: &AppState, job_id: &str) {
         .await
         .expect("seed counters");
     let queue = bounded_queue(job_id);
-    let unit = WorkUnit {
-        did: format!("did:plc:sat{job_id}"),
-        collection: POST.to_string(),
-    };
+    let unit = WorkUnit::new(format!("did:plc:sat{job_id}"), POST.to_string());
     seed_unit(state, job_id, POST, &unit.did, None).await;
 
     enqueue_discovered_page(
@@ -2599,9 +2619,6 @@ async fn assert_job_counters_saturate(state: &AppState, job_id: &str) {
     complete_unit(&jobs(state), &queue, &unit, "https://pds.test", 10)
         .await
         .expect("complete unit");
-    add_late_records(&jobs(state), &queue, "https://pds.test", 10)
-        .await
-        .expect("late records");
 
     let job = job_row(state, job_id).await;
     assert_eq!(
@@ -4889,6 +4906,7 @@ async fn a_page_that_cannot_be_written_is_a_fetch_failure() {
         POST,
         None,
         &AtomicBool::new(false),
+        &FetchGate::default(),
     )
     .await;
 
@@ -5081,4 +5099,851 @@ async fn a_started_job_runs_for_backfill_running_before_start_returns() {
         .await;
     assert!(refused.is_err());
     assert!(!state.source.backfill_running(POST).await);
+}
+
+// ---------------------------------------------------------------------------
+// HAP-476: rate-limited PDS hosts are backed off, and a unit completes only
+// once it is fetched or given up
+// ---------------------------------------------------------------------------
+
+async fn set_setting(state: &AppState, key: &str, value: &str) {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        state.db_backend,
+    ))
+    .bind(key)
+    .bind(value)
+    .bind(now_rfc3339())
+    .execute(&state.db)
+    .await
+    .expect("set setting");
+}
+
+/// `listRecords` requests `mock` received for `did`.
+async fn record_requests(mock: &MockServer, did: &str) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.url.path() == "/xrpc/com.atproto.repo.listRecords"
+                && r.url.query_pairs().any(|(k, v)| k == "repo" && v == did)
+        })
+        .count()
+}
+
+async fn job_rate_limited(state: &AppState, job_id: &str) -> i64 {
+    crate::db::query_as::<(i64,)>(&adapt_sql(
+        "SELECT rate_limited FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    ))
+    .bind(job_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("job rate_limited")
+    .0
+}
+
+/// Insert a failure-set row, as an earlier run left it.
+#[allow(clippy::too_many_arguments)]
+async fn seed_failure(
+    state: &AppState,
+    job_id: &str,
+    did: &str,
+    collection: &str,
+    kind: &str,
+    failure_state: &str,
+    attempts: i32,
+) {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_backfill_failures \
+         (job_id, did, collection, phase, kind, state, attempts, last_at) \
+         VALUES (?, ?, ?, 'fetch', ?, ?, ?, ?)",
+        state.db_backend,
+    ))
+    .bind(job_id)
+    .bind(did)
+    .bind(collection)
+    .bind(kind)
+    .bind(failure_state)
+    .bind(attempts)
+    .bind(now_rfc3339())
+    .execute(&state.db)
+    .await
+    .expect("seed failure");
+}
+
+/// A PDS that answers 429 is waited out for as long as it says, the page is
+/// asked for again, and the repo is fetched. The 429s are counted, but are
+/// neither attempts nor failures.
+#[tokio::test]
+async fn a_rate_limited_pds_is_backed_off_as_its_headers_say_and_then_fetched() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    // As the atproto PDS answers once an IP's budget is spent.
+    let reset = chrono::Utc::now().timestamp() + 300;
+    fail_records(
+        &mock,
+        "did:plc:busy",
+        POST,
+        ResponseTemplate::new(429)
+            .insert_header("ratelimit-limit", "3000")
+            .insert_header("ratelimit-remaining", "0")
+            .insert_header("ratelimit-reset", reset.to_string())
+            .insert_header("ratelimit-policy", "3000;w=300")
+            .insert_header("retry-after", "1")
+            .set_body_json(serde_json::json!({
+                "error": "RateLimitExceeded",
+                "message": "Rate Limit Exceeded",
+            })),
+        2,
+    )
+    .await;
+    mount_records(&mock, "did:plc:busy", POST, 2).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:busy".to_string()])
+        .await
+        .expect("create job");
+    let started = std::time::Instant::now();
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+    let elapsed = started.elapsed();
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.processed_repos,
+            job.total_repos,
+            job.total_records
+        ),
+        ("completed", 1, 1, 2)
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "each 429's Retry-After is waited out: {elapsed:?}"
+    );
+    assert_eq!(
+        record_requests(&mock, "did:plc:busy").await,
+        3,
+        "two 429s and the fetch, nothing in between"
+    );
+    assert!(
+        failure_set(&state, &job_id).await.is_empty(),
+        "a 429 is not a failure"
+    );
+    assert_eq!(job_rate_limited(&state, &job_id).await, 2);
+    let (rate_limited,): (i64,) = crate::db::query_as(&adapt_sql(
+        "SELECT rate_limited FROM happyview_backfill_pds_stats WHERE job_id = ?",
+        state.db_backend,
+    ))
+    .bind(&job_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("pds stats");
+    assert_eq!(rate_limited, 2);
+}
+
+/// A PDS whose budget runs out on a successful answer holds the next request
+/// until its reset, instead of spending the next one on a 429.
+#[tokio::test]
+async fn a_spent_budget_holds_the_next_request_until_the_reset() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "1").await;
+    let value = serde_json::json!({"$type": POST, "text": "first"});
+    let cid = crate::cid_verify::compute_record_cid(&value)
+        .expect("cid")
+        .to_string();
+    let reset = chrono::Utc::now().timestamp() + 2;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .and(query_param("repo", "did:plc:first"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ratelimit-limit", "3000")
+                .insert_header("ratelimit-remaining", "0")
+                .insert_header("ratelimit-reset", reset.to_string())
+                .set_body_json(serde_json::json!({
+                    "records": [{"uri": format!("at://did:plc:first/{POST}/r0"), "cid": cid, "value": value}]
+                })),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_records(&mock, "did:plc:second", POST, 1).await;
+    forbid_other_record_fetches(&mock).await;
+
+    let job_id = create_backfill_job(
+        &jobs(&state),
+        Some(POST),
+        &["did:plc:first".to_string(), "did:plc:second".to_string()],
+    )
+    .await
+    .expect("create job");
+    let started = std::time::Instant::now();
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!((job.status.as_str(), job.processed_repos), ("completed", 2));
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the second request waited for the reset: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        job_rate_limited(&state, &job_id).await,
+        0,
+        "no 429 was spent"
+    );
+}
+
+/// While one PDS cools after a 429, every other PDS keeps fetching, even
+/// with a job-wide cap of one request in flight: a request waiting out a
+/// cooldown holds no permit.
+#[tokio::test]
+async fn other_pds_hosts_keep_flowing_while_one_cools() {
+    let slow = MockServer::start().await;
+    let fast = MockServer::start().await;
+    let state = pipeline_state(&slow, &[POST]).await;
+    set_setting(&state, "backfill_concurrent_pds", "1").await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "1").await;
+    let (slow_pds, fast_pds) = (slow.uri(), fast.uri());
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/did:plc:[a-z0-9]+$"))
+        .respond_with(move |req: &wiremock::Request| {
+            let did = req.url.path().trim_start_matches('/').to_string();
+            let pds = if did == "did:plc:slow" {
+                &slow_pds
+            } else {
+                &fast_pds
+            };
+            ResponseTemplate::new(200).set_body_json(did_doc(&did, pds))
+        })
+        .mount(&slow)
+        .await;
+    fail_records(
+        &slow,
+        "did:plc:slow",
+        POST,
+        ResponseTemplate::new(429).insert_header("retry-after", "4"),
+        1,
+    )
+    .await;
+    mount_records(&slow, "did:plc:slow", POST, 1).await;
+    forbid_other_record_fetches(&slow).await;
+    let fast_dids: Vec<String> = (0..20).map(|i| format!("did:plc:fast{i:02}")).collect();
+    for did in &fast_dids {
+        mount_records(&fast, did, POST, 1).await;
+    }
+    forbid_other_record_fetches(&fast).await;
+
+    let mut dids = vec!["did:plc:slow".to_string()];
+    dids.extend(fast_dids.iter().cloned());
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    let started = std::time::Instant::now();
+    let run = {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        tokio::spawn(async move { run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await })
+    };
+
+    // Wait for the slow host's 429, then for the fast host to finish.
+    let completed_on = |pds: String| {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        async move {
+            crate::db::query_as::<(i64,)>(&adapt_sql(
+                "SELECT COUNT(*) FROM happyview_backfill_completions WHERE job_id = ? AND pds_endpoint = ?",
+                state.db_backend,
+            ))
+            .bind(&job_id)
+            .bind(&pds)
+            .fetch_one(&state.db)
+            .await
+            .expect("completions")
+            .0
+        }
+    };
+    let mut fast_done_at = None;
+    while started.elapsed() < Duration::from_secs(4) {
+        if completed_on(fast.uri()).await == 20 {
+            fast_done_at = Some(started.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let fast_done_at = fast_done_at.expect("the fast PDS finished while the slow one cooled");
+    assert_eq!(
+        completed_on(slow.uri()).await,
+        0,
+        "the slow PDS is still cooling at {fast_done_at:?}"
+    );
+    assert_eq!(record_requests(&slow, "did:plc:slow").await, 1);
+
+    run.await.expect("job");
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos),
+        ("completed", 21)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert_eq!(record_requests(&slow, "did:plc:slow").await, 2);
+}
+
+/// What `assert_pending_retries_requeue` seeds and checks, so it runs on
+/// both backends with DIDs of its own.
+async fn assert_pending_retries_requeue(
+    state: &AppState,
+    mock: &MockServer,
+    tag: &str,
+) -> Vec<String> {
+    let job_id = format!("resumed-{tag}");
+    seed_job(
+        state,
+        &job_id,
+        Some(POST),
+        "network",
+        "resolving_and_fetching",
+        2,
+        true,
+    )
+    .await;
+    // Pending retries an earlier version left behind, their units already
+    // completed and gone from the queue: more than the window holds.
+    let mut dids = Vec::new();
+    for i in 0..30 {
+        let did = format!("did:plc:p{i:02}{tag}");
+        seed_failure(state, &job_id, &did, POST, "rate_limited", "pending", 1).await;
+        mount_records(mock, &did, POST, 1).await;
+        dids.push(did);
+    }
+    // One retry has already used two of its three attempts. If a restart
+    // started it over, it would be tried again; it is given up instead.
+    let worn = format!("did:plc:worn{tag}");
+    seed_failure(
+        state,
+        &job_id,
+        &worn,
+        POST,
+        "pds_server_error",
+        "pending",
+        2,
+    )
+    .await;
+    fail_records(mock, &worn, POST, ResponseTemplate::new(503), 100).await;
+    dids.push(worn.clone());
+    // A row nobody should touch: it is another collection's, and given up.
+    seed_failure(
+        state,
+        &job_id,
+        &format!("did:plc:done{tag}"),
+        POST,
+        "repo_not_found",
+        "failed",
+        1,
+    )
+    .await;
+    forbid_other_record_fetches(mock).await;
+
+    // Sample the queue's size throughout the run.
+    let done = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let sampler = {
+        let (state, job_id, done, peak) = (
+            state.clone(),
+            job_id.clone(),
+            Arc::clone(&done),
+            Arc::clone(&peak),
+        );
+        tokio::spawn(async move {
+            while !done.load(Ordering::Relaxed) {
+                let n = count_for_job(&state, "happyview_backfill_queue", &job_id).await;
+                peak.fetch_max(n, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    run_to_end(state, &job_id, 10).await;
+    done.store(true, Ordering::Relaxed);
+    sampler.await.expect("sampler");
+
+    assert!(
+        peak.load(Ordering::Relaxed) <= 10,
+        "requeued retries count against the window: peak {}",
+        peak.load(Ordering::Relaxed)
+    );
+    let job = job_row(state, &job_id).await;
+    assert_eq!(
+        (
+            job.status.as_str(),
+            job.total_repos,
+            job.processed_repos,
+            job.total_records
+        ),
+        ("completed", 31, 31, 30)
+    );
+    let set = failure_set(state, &job_id).await;
+    assert_eq!(
+        set.iter().filter(|r| r.4 == "recovered").count(),
+        30,
+        "{set:?}"
+    );
+    assert_eq!(
+        set.iter()
+            .find(|r| r.0 == worn)
+            .map(|r| (r.3.as_str(), r.4.as_str())),
+        Some(("pds_server_error", "failed"))
+    );
+    assert_eq!(failure_attempts(state, &job_id, &worn).await, 3);
+    assert_eq!(
+        record_requests(mock, &worn).await,
+        1,
+        "the third attempt was its last"
+    );
+    assert_eq!(
+        set.iter().filter(|r| r.4 == "failed").count(),
+        2,
+        "the given-up row stays as it was"
+    );
+    dids.push(job_id);
+    dids
+}
+
+/// HAP-476: on resume, pending retries are queued again a window's room at a
+/// time, and keep their attempts. Before, all of them were queued at once
+/// past the window (3,078,734 on one resume) with their attempts reset to 1.
+#[tokio::test]
+async fn pending_retries_are_queued_again_within_the_window_with_their_attempts() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    assert_pending_retries_requeue(&state, &mock, "s").await;
+}
+
+#[tokio::test]
+async fn pending_retries_are_queued_again_within_the_window_with_their_attempts_on_postgres() {
+    let mock = MockServer::start().await;
+    let Some(state) = postgres_pipeline_state(&mock).await else {
+        crate::test_support::unavailable(crate::test_support::NO_DATABASE);
+        return;
+    };
+    mount_plc(&mock).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let mut seeded = assert_pending_retries_requeue(&state, &mock, &tag).await;
+    let job_id = seeded.pop().expect("job id");
+    let dids: Vec<&str> = seeded.iter().map(String::as_str).collect();
+    delete_postgres_job(&state, &job_id, &dids).await;
+}
+
+/// A queue left larger than its window by an earlier version is worked
+/// through with a bounded number of units in memory, and nothing new is
+/// queued until it is below the window.
+#[tokio::test]
+async fn an_oversized_queue_drains_before_anything_new_is_queued() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    seed_job(
+        &state,
+        "oversized",
+        Some(POST),
+        "network",
+        "resolving_and_fetching",
+        2,
+        true,
+    )
+    .await;
+    let pds = mock.uri();
+    for i in 0..40 {
+        let did = format!("did:plc:q{i:02}");
+        seed_unit(&state, "oversized", POST, &did, Some(&pds)).await;
+        mount_records(&mock, &did, POST, 1).await;
+    }
+    crate::db::query("UPDATE happyview_backfill_jobs SET total_repos = 40 WHERE id = 'oversized'")
+        .execute(&state.db)
+        .await
+        .expect("seed total");
+    for i in 0..5 {
+        let did = format!("did:plc:r{i:02}");
+        seed_failure(
+            &state,
+            "oversized",
+            &did,
+            POST,
+            "rate_limited",
+            "pending",
+            1,
+        )
+        .await;
+        mount_records(&mock, &did, POST, 1).await;
+    }
+    forbid_other_record_fetches(&mock).await;
+
+    // Record the queue's size each time a requeued unit first appears.
+    let done = Arc::new(AtomicBool::new(false));
+    let first_requeue_at = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let sampler = {
+        let (state, done, seen) = (
+            state.clone(),
+            Arc::clone(&done),
+            Arc::clone(&first_requeue_at),
+        );
+        tokio::spawn(async move {
+            while !done.load(Ordering::Relaxed) && seen.load(Ordering::Relaxed) < 0 {
+                let (requeued, queued): (i64, i64) = crate::db::query_as(
+                    "SELECT (SELECT COUNT(*) FROM happyview_backfill_queue WHERE job_id = 'oversized' AND did LIKE 'did:plc:r%'), \
+                            (SELECT COUNT(*) FROM happyview_backfill_queue WHERE job_id = 'oversized')",
+                )
+                .fetch_one(&state.db)
+                .await
+                .expect("sample");
+                if requeued > 0 {
+                    seen.store(queued, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    run_to_end(&state, "oversized", 10).await;
+    done.store(true, Ordering::Relaxed);
+    sampler.await.expect("sampler");
+
+    let at = first_requeue_at.load(Ordering::Relaxed);
+    assert!(
+        (0..=10).contains(&at),
+        "retries were queued again only once the queue was within its window: {at}"
+    );
+    let job = job_row(&state, "oversized").await;
+    assert_eq!(
+        (job.status.as_str(), job.total_repos, job.processed_repos),
+        ("completed", 45, 45)
+    );
+}
+
+#[test]
+fn the_dispatcher_holds_a_bounded_number_of_units() {
+    let mut waiting = WaitingUnits::new(3);
+    for i in 0..3 {
+        assert!(waiting.has_room());
+        waiting.push(
+            "https://pds.test".to_string(),
+            WorkUnit::new(format!("did:plc:{i}"), POST),
+        );
+    }
+    assert!(!waiting.has_room(), "a full buffer receives nothing more");
+    assert_eq!(waiting.len(), 3);
+
+    assert_eq!(
+        waiting_cap(&bounded_queue("w")),
+        DEFAULT_DISCOVERY_WINDOW as usize
+    );
+    let tiny = JobQueue {
+        window: Arc::new(QueueWindow::new(5, 0)),
+        ..bounded_queue("w")
+    };
+    assert_eq!(waiting_cap(&tiny), MIN_WAITING_UNITS);
+    assert_eq!(
+        waiting_cap(&JobQueue::legacy("w")),
+        MAX_WAITING_UNITS,
+        "a legacy job's window is unbounded; the buffer is not"
+    );
+}
+
+#[test]
+fn a_unit_is_identified_by_its_did_and_collection_alone() {
+    let fresh = WorkUnit::new("did:plc:x", POST);
+    let retried = WorkUnit {
+        attempts: 2,
+        retry_at: Some(1),
+        ..WorkUnit::new("did:plc:x", POST)
+    };
+    assert_eq!(fresh, retried);
+    let set: HashSet<WorkUnit> = [fresh, retried].into_iter().collect();
+    assert_eq!(set.len(), 1);
+}
+
+/// A fixed-window rate limiter shared by several mock PDS hosts, as one
+/// operator's rate-limit store keyed by client IP would be: `budget`
+/// requests per `window_secs`, counted across every host, answering with
+/// the atproto PDS's headers.
+#[derive(Clone)]
+struct SharedLimiter {
+    budget: u64,
+    window_secs: u64,
+    state: Arc<std::sync::Mutex<(u64, u64)>>,
+    rate_limited: Arc<std::sync::atomic::AtomicU64>,
+    served: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SharedLimiter {
+    fn new(budget: u64, window_secs: u64) -> Self {
+        Self {
+            budget,
+            window_secs,
+            state: Arc::new(std::sync::Mutex::new((0, 0))),
+            rate_limited: Arc::default(),
+            served: Arc::default(),
+        }
+    }
+
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let window = now - now % self.window_secs;
+        let reset = window + self.window_secs;
+        let used = {
+            let mut st = self.state.lock().unwrap();
+            if st.0 != window {
+                *st = (window, 0);
+            }
+            st.1 += 1;
+            st.1
+        };
+        let remaining = self.budget.saturating_sub(used);
+        let headers = |t: ResponseTemplate| {
+            t.insert_header("ratelimit-limit", self.budget.to_string())
+                .insert_header("ratelimit-remaining", remaining.to_string())
+                .insert_header("ratelimit-reset", reset.to_string())
+        };
+        if used > self.budget {
+            self.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return headers(ResponseTemplate::new(429))
+                .insert_header("retry-after", (reset - now).to_string());
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let did = req
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "repo")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        let value = serde_json::json!({"$type": POST, "text": did});
+        let cid = crate::cid_verify::compute_record_cid(&value)
+            .expect("cid")
+            .to_string();
+        headers(ResponseTemplate::new(200)).set_body_json(serde_json::json!({
+            "records": [{"uri": format!("at://{did}/{POST}/r0"), "cid": cid, "value": value}]
+        }))
+    }
+}
+
+/// Every host of a rate-limit domain shares one budget, behind one limiter.
+/// Returns the job's 429s and the fetches the limiter served.
+async fn crawl_hosts_sharing_one_budget(domains: &str) -> (u64, u64) {
+    const HOSTS: usize = 6;
+    const UNITS_PER_HOST: usize = 6;
+    let mut servers = Vec::new();
+    for _ in 0..HOSTS {
+        servers.push(MockServer::start().await);
+    }
+    let state = pipeline_state(&servers[0], &[POST]).await;
+    set_setting(&state, "backfill_rate_limit_domains", domains).await;
+    set_setting(&state, "backfill_concurrent_pds", "6").await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "3").await;
+    let uris: Vec<String> = servers.iter().map(MockServer::uri).collect();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/did:plc:[a-z0-9]+$"))
+        .respond_with(move |req: &wiremock::Request| {
+            let did = req.url.path().trim_start_matches('/').to_string();
+            // did:plc:h{host}u{unit}
+            let host: usize = did["did:plc:h".len()..did.find('u').unwrap()]
+                .parse()
+                .unwrap();
+            ResponseTemplate::new(200).set_body_json(did_doc(&did, &uris[host]))
+        })
+        .mount(&servers[0])
+        .await;
+    let limiter = SharedLimiter::new(10, 2);
+    for server in &servers {
+        let limiter = limiter.clone();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(move |req: &wiremock::Request| limiter.respond(req))
+            .mount(server)
+            .await;
+    }
+    let dids: Vec<String> = (0..UNITS_PER_HOST)
+        .flat_map(|u| (0..HOSTS).map(move |h| format!("did:plc:h{h}u{u}")))
+        .collect();
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    let total = (HOSTS * UNITS_PER_HOST) as i32;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos, job.total_records),
+        ("completed", total, total)
+    );
+    assert!(failure_set(&state, &job_id).await.is_empty());
+    let rate_limited = limiter.rate_limited.load(Ordering::Relaxed);
+    assert_eq!(job_rate_limited(&state, &job_id).await, rate_limited as i64);
+    (rate_limited, limiter.served.load(Ordering::Relaxed))
+}
+
+/// Hosts sharing one budget are paced to it together: one gate for the
+/// domain, so the crawl converges with a handful of 429s at the start.
+/// Paced one host at a time, each spends the budget as its own.
+#[tokio::test]
+async fn hosts_sharing_one_budget_are_paced_together_without_a_429_storm() {
+    // Every mock host is 127.0.0.1, so this puts them all in one domain.
+    let (shared, served) = crawl_hosts_sharing_one_budget("127.0.0.1").await;
+    assert_eq!(served, 36);
+    let (separate, _) = crawl_hosts_sharing_one_budget("none").await;
+    assert!(
+        shared <= 3 && separate > shared * 2,
+        "one gate for the domain: {shared} 429s; a gate per host: {separate}"
+    );
+}
+
+/// DID lookups the mock PLC directory received.
+async fn plc_requests(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/did:plc:"))
+        .count()
+}
+
+/// A 429 from the PLC directory holds every lookup until its Retry-After,
+/// so a resolver re-resolving a large requeued backlog backs off instead of
+/// sending the rest of its lookups through the limit.
+#[tokio::test]
+async fn a_plc_rate_limit_holds_every_lookup_until_retry_after() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    set_setting(&state, "backfill_concurrent_resolution", "1").await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/did:plc:[a-z0-9]+$"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    mount_plc(&mock).await;
+    let dids: Vec<String> = (0..10).map(|i| format!("did:plc:lookup{i}")).collect();
+    for did in &dids {
+        mount_records(&mock, did, POST, 1).await;
+    }
+    forbid_other_record_fetches(&mock).await;
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    let run = {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        tokio::spawn(async move { run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await })
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        plc_requests(&mock).await,
+        1,
+        "no lookup is sent while the directory's Retry-After holds"
+    );
+    run.await.expect("job");
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos),
+        ("completed", 10)
+    );
+    assert_eq!(plc_requests(&mock).await, 11);
+}
+
+/// A pause lands while every request is waiting out a long rate limit, and
+/// the job stops within moments rather than at the limit's reset.
+#[tokio::test]
+async fn a_pause_during_a_long_cooldown_stops_the_job_promptly() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    mount_plc(&mock).await;
+    fail_records(
+        &mock,
+        "did:plc:held",
+        POST,
+        ResponseTemplate::new(429).insert_header("retry-after", "300"),
+        1,
+    )
+    .await;
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &["did:plc:held".to_string()])
+        .await
+        .expect("create job");
+    let pauser = {
+        let (state, job_id, mock_uri) = (state.clone(), job_id.clone(), mock.uri());
+        let _ = mock_uri;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            request_pause(&jobs(&state), &job_id).await;
+        })
+    };
+    let started = std::time::Instant::now();
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+    pauser.await.expect("pauser");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the pause did not wait out the 300 s limit: {:?}",
+        started.elapsed()
+    );
+    let job = job_row(&state, &job_id).await;
+    assert_eq!((job.status.as_str(), job.processed_repos), ("paused", 0));
+    assert!(
+        failure_set(&state, &job_id).await.is_empty(),
+        "a 429 is not a failure"
+    );
+    assert_eq!(
+        count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+        1,
+        "the unit stays queued"
+    );
+}
+
+/// A PDS that keeps failing goes down: its units are given up without a
+/// request each, as retryable failures retry-failed can pick up, and the
+/// job finishes instead of backing off once per unit.
+#[tokio::test]
+async fn a_failing_pds_goes_down_and_gives_its_units_up_quickly() {
+    let mock = MockServer::start().await;
+    let state = pipeline_state(&mock, &[POST]).await;
+    set_setting(&state, "backfill_concurrent_dids_per_pds", "1").await;
+    mount_plc(&mock).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+    let dids: Vec<String> = (0..20).map(|i| format!("did:plc:dead{i:02}")).collect();
+    let job_id = create_backfill_job(&jobs(&state), Some(POST), &dids)
+        .await
+        .expect("create job");
+    run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+    let job = job_row(&state, &job_id).await;
+    assert_eq!(
+        (job.status.as_str(), job.processed_repos),
+        ("completed", 20)
+    );
+    let set = failure_set(&state, &job_id).await;
+    assert_eq!(set.len(), 20);
+    assert!(
+        set.iter()
+            .all(|r| r.3 == "pds_server_error" && r.4 == "failed"),
+        "{set:?}"
+    );
+    let requests = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/xrpc/com.atproto.repo.listRecords")
+        .count();
+    assert!(
+        requests < 20,
+        "once down, units are given up without a request each: {requests} requests"
+    );
 }

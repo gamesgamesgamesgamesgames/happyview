@@ -13,5 +13,6 @@ export type {
   PrepareLoginResult,
   SignInOptions,
 } from "./browser-client";
+export { IndexedDbKeyStore } from "./indexeddb-key-store";
 export { LocalStorageAdapter } from "./local-storage-adapter";
 export { buildLoopbackClientId } from "./util";

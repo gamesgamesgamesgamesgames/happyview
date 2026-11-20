@@ -1,4 +1,5 @@
 import type { Key } from "@atproto/jwk";
+import { jwkThumbprint } from "./thumbprint";
 import type { TokenInfo } from "./types";
 
 export interface HappyViewSessionOptions {
@@ -12,6 +13,7 @@ export interface HappyViewSessionOptions {
   issuer?: string;
   fetch?: typeof globalThis.fetch;
   onSignOut?: () => Promise<void>;
+  ticketPin?: "pinned" | "refused";
 }
 
 function randomHex(byteLength: number): string {
@@ -34,6 +36,12 @@ function base64url(buffer: ArrayBuffer): string {
 export class HappyViewSession {
   readonly did: string;
   readonly scopes: string[];
+  /**
+   * For a session just registered with a ticket key proof: `pinned`, or
+   * `refused` when the instance registered it without the pin. Absent
+   * otherwise, including on a restored session.
+   */
+  readonly ticketPin: "pinned" | "refused" | undefined;
 
   private readonly dpopKey: Key;
   private readonly accessToken: string;
@@ -48,6 +56,7 @@ export class HappyViewSession {
 
   constructor(options: HappyViewSessionOptions) {
     this.did = options.did;
+    this.ticketPin = options.ticketPin;
     this.scopes = options.scopes ? options.scopes.split(" ") : [];
     this.dpopKey = options.dpopKey;
     this.accessToken = options.accessToken;
@@ -62,6 +71,17 @@ export class HappyViewSession {
 
   get sub(): string {
     return this.did;
+  }
+
+  /**
+   * The RFC 7638 thumbprint of this session's DPoP key: the `jkt` the instance
+   * knows the session by. Safe to share; it says nothing about the private
+   * key.
+   */
+  async dpopKeyThumbprint(): Promise<string> {
+    const jwk = this.dpopKey.publicJwk;
+    if (!jwk) throw new Error("the session's DPoP key has no public JWK");
+    return jwkThumbprint(jwk as JsonWebKey);
   }
 
   getTokenInfo(): TokenInfo {
