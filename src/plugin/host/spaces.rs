@@ -433,7 +433,8 @@ pub async fn remove_member(
     spec: SpaceMemberRemove,
 ) -> Result<(), SpacesError> {
     require_enabled(state).await?;
-    service::remove_member(state, caller_did, &spec.uri, &spec.did).await?;
+    // A space named as a member may be nested rather than listed.
+    crate::spaces::nested::remove_space_member(state, caller_did, &spec.uri, &spec.did).await?;
     Ok(())
 }
 
@@ -880,6 +881,73 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SpacesError::NotAuthorized(_)), "{err}");
         assert_eq!(err.code(), "NOT_AUTHORIZED");
+    }
+
+    /// A script removes a space nested in its space by naming it, as
+    /// `simplespace` `removeMember` does, by address or `ats://` form.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn remove_member_naming_a_nested_space_removes_it() {
+        for state in each_backend().await {
+            let (outer_uri, admin_did) = seed_space_in(&state).await;
+            let (inner_uri, _) = seed_space_in(&state).await;
+            let resolve = |uri: &str| {
+                let uri = crate::spaces::SpaceUri::parse(uri).unwrap();
+                let state = state.clone();
+                async move {
+                    crate::spaces::db::get_space_by_address(
+                        &state.db,
+                        state.db_backend,
+                        &uri.did,
+                        &uri.type_nsid,
+                        &uri.skey,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                }
+            };
+            let outer = resolve(&outer_uri).await;
+            let inner = resolve(&inner_uri).await;
+            let ats = inner_uri
+                .replacen("at://", "ats://", 1)
+                .replacen("/space/", "/", 1);
+            for name in [inner_uri.clone(), ats] {
+                crate::spaces::db::upsert_nested(
+                    &state.db,
+                    state.db_backend,
+                    &outer.id,
+                    &inner.id,
+                    &crate::spaces::db::NestedRef {
+                        target_space_uri: inner_uri.clone(),
+                        read: true,
+                        write: false,
+                        added_by: None,
+                        created_at: crate::db::now_rfc3339(),
+                    },
+                )
+                .await
+                .unwrap();
+                remove_member(
+                    &state,
+                    &admin_did,
+                    SpaceMemberRemove {
+                        uri: outer_uri.clone(),
+                        did: name.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}: {name}: {e:?}", backend_name(&state)));
+                let left = crate::spaces::db::list_nested(&state.db, state.db_backend, &outer.id)
+                    .await
+                    .unwrap();
+                assert!(
+                    left.is_empty(),
+                    "{}: {name}: {left:?}",
+                    backend_name(&state)
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -212,6 +212,8 @@ async fn list_members(
         return Err(service::policy_mismatch());
     }
 
+    // The space's own members. Nested spaces are listed by
+    // `dev.happyview.space.listNestedSpaces`, not expanded here.
     let page = crate::spaces::db::list_member_page(
         &state.db,
         state.db_backend,
