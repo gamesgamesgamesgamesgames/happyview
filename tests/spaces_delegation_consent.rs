@@ -242,7 +242,8 @@ async fn an_entry_naming_a_space_not_here_brings_in_nothing() {
     let app = setup().await;
     let owner = rand_did("o");
     let (x, x_addr) = create_space(&app, &owner).await;
-    let elsewhere = format!("at://{}/space/{TYPE}/elsewhere", rand_did("r"));
+    let (remote, remote_member) = (rand_did("r"), rand_did("rm"));
+    let elsewhere = format!("at://{remote}/space/{TYPE}/elsewhere");
     let (status, body) = post(
         &app,
         &owner,
@@ -258,6 +259,142 @@ async fn an_entry_naming_a_space_not_here_brings_in_nothing() {
             .unwrap()
             .is_empty()
     );
+
+    // The space appears here later, with a member.
+    let (later, later_addr) = create_space_at(&app, &remote, &remote, "elsewhere").await;
+    assert_eq!(later_addr, elsewhere);
+    add_row(&app, &later, &remote_member, false, &remote).await;
+    assert!(!is_member(&app, &x, &remote_member).await);
+}
+
+/// An entry the named space's administrator added, stored with its consent.
+async fn add_consented(app: &TestApp, space_id: &str, reference: &str, granted_by: &str) {
+    let member = SpaceMember {
+        id: Uuid::new_v4().to_string(),
+        space_id: space_id.to_string(),
+        did: reference.to_string(),
+        access: MemberAccess::READ,
+        is_delegation: true,
+        granted_by: Some(granted_by.to_string()),
+        created_at: now_rfc3339(),
+    };
+    assert!(
+        spaces_db::insert_delegation_if_allowed(&app.state.db, app.state.db_backend, &member, true)
+            .await
+            .unwrap()
+    );
+}
+
+async fn consented(app: &TestApp, space_id: &str, reference: &str) -> bool {
+    spaces_db::consented_delegations(&app.state.db, app.state.db_backend, space_id)
+        .await
+        .unwrap()
+        .contains(reference)
+}
+
+/// Putting an entry that already brings in members again, unchanged, keeps it
+/// without the named space's administrator: a client re-sending its whole
+/// member list goes on working. Changing its access, or naming another space,
+/// needs that administrator.
+#[tokio::test]
+#[serial]
+async fn putting_a_consented_entry_again_unchanged_keeps_it() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, y_member) = (rand_did("x"), rand_did("y"), rand_did("ym"));
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row(&app, &y, &y_member, false, &y_owner).await;
+    // Added by the instance's super admin, who administers both.
+    add_consented(&app, &x, &y_addr, &app.admin_did).await;
+    assert!(is_member(&app, &x, &y_member).await);
+
+    let put = |read: bool, write: bool, did: &str| json!({ "space": x_addr, "did": did, "read": read, "write": write, "isDelegation": true });
+    // Unchanged: kept, by X's creator alone.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(true, false, &y_addr),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(consented(&app, &x, &y_addr).await);
+    assert!(is_member(&app, &x, &y_member).await);
+
+    // A change of access needs Y's administrator; the entry is left as it was.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(true, true, &y_addr),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let row = spaces_db::get_member(&app.state.db, app.state.db_backend, &x, &y_addr)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.access, MemberAccess::READ);
+    assert!(consented(&app, &x, &y_addr).await);
+
+    // Naming Y by its id is another entry, and needs Y's administrator.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(true, false, &y),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!stored(&app, &x, &y).await);
+}
+
+/// Putting an entry stored without the named space's administrator again
+/// needs that administrator, and leaves it bringing in no members.
+#[tokio::test]
+#[serial]
+async fn putting_an_unconsented_entry_again_needs_the_named_spaces_admin() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, y_member) = (rand_did("x"), rand_did("y"), rand_did("ym"));
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row(&app, &y, &y_member, false, &y_owner).await;
+    add_row(&app, &x, &y_addr, true, &x_owner).await;
+
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": x_addr, "did": y_addr, "read": true, "write": false, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!consented(&app, &x, &y_addr).await);
+    assert!(!is_member(&app, &x, &y_member).await);
+}
+
+/// Consent is checked at every level: X brings in Y's members, but not those
+/// of a space Y names without its administrator.
+#[tokio::test]
+#[serial]
+async fn a_nested_entry_brings_in_members_only_when_consented() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, z_owner) = (rand_did("o"), rand_did("z"));
+    let (y_member, z_member) = (rand_did("ym"), rand_did("zm"));
+    let (x, _) = create_space(&app, &owner).await;
+    let (y, y_addr) = create_space(&app, &owner).await;
+    let (z, z_addr) = create_space(&app, &z_owner).await;
+    add_row(&app, &y, &y_member, false, &owner).await;
+    add_row(&app, &z, &z_member, false, &z_owner).await;
+    add_consented(&app, &x, &y_addr, &owner).await;
+    add_row(&app, &y, &z_addr, true, &owner).await;
+
+    assert!(is_member(&app, &x, &y_member).await);
+    assert!(!is_member(&app, &x, &z_member).await);
+    assert!(!is_member(&app, &y, &z_member).await);
 }
 
 /// The migration's backfill counts an entry already stored as added by the
@@ -285,9 +422,9 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
     let (by_super, _) = create_space(&app, &x_owner).await;
     add_row(&app, &by_super, &y_addr, true, &app.admin_did).await;
     // An address with a record path, naming a space Z whose creator is not
-    // X's. Z's address differs from W's only where W's skey has a `_`, and W
-    // has X's creator: the address names Z, not W, so the entry is not
-    // consented.
+    // the listing space's. Z's address differs from W's only where W's skey
+    // has a `_`, and W shares the listing space's creator (y_owner): the
+    // address names Z, not W, so the entry is not consented.
     let (host, z_owner, z_member) = (rand_did("h"), rand_did("z"), rand_did("zm"));
     let u = Uuid::new_v4().simple().to_string();
     create_space_at(&app, &y_owner, &host, &format!("w_{u}")).await;
@@ -303,8 +440,14 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
     )
     .await;
 
-    let migration =
-        include_str!("../migrations/postgres/20261120000001_space_delegation_consent.sql");
+    let migration = match app.state.db_backend {
+        happyview::db::DatabaseBackend::Postgres => {
+            include_str!("../migrations/postgres/20261120000001_space_delegation_consent.sql")
+        }
+        happyview::db::DatabaseBackend::Sqlite => {
+            include_str!("../migrations/sqlite/20261120000001_space_delegation_consent.sql")
+        }
+    };
     let backfill = &migration[migration.find("UPDATE").unwrap()..];
     happyview::db::query(backfill)
         .execute(&app.state.db)

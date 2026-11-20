@@ -1530,4 +1530,37 @@ mod tests {
             assert!(row.is_delegation, "is_delegation did change on {on}");
         }
     }
+
+    /// A script delegating to a space goes through the same check as the
+    /// XRPC methods: the caller must administer the named space too.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_script_delegating_to_a_space_must_administer_it() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (x_uri, x_admin) = seed_space_in(&state).await;
+            let (y_uri, _) = seed_space_in(&state).await;
+            let x = service::resolve_space(&state, &x_uri).await.unwrap();
+            let spec = || SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: None,
+                write: None,
+                is_delegation: Some(true),
+            };
+            assert!(
+                add_member(&state, &x_admin, spec()).await.is_err(),
+                "add_member on {on}"
+            );
+            assert!(
+                set_member(&state, &x_admin, spec()).await.is_err(),
+                "set_member on {on}"
+            );
+            let row = crate::spaces::db::get_member(&state.db, state.db_backend, &x.id, &y_uri)
+                .await
+                .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"));
+            assert!(row.is_none(), "nothing stored on {on}");
+        }
+    }
 }
