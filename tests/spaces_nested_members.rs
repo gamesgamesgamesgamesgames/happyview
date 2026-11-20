@@ -1,6 +1,6 @@
 //! Spaces nested in a memberspace (`dev.happyview.space.*NestedSpace`):
-//! resolution with access caps, cycles and bounds, the cascade that revokes
-//! credentials and updates published lists when membership changes, and the
+//! resolution with access caps, cycles and bounds, credential revocation when
+//! membership changes, direct-only listed and published members, and the
 //! simplespace mapping of space-members.
 
 mod common;
@@ -721,17 +721,19 @@ async fn an_access_check_on_a_wide_deep_graph_stays_cheap() {
     );
 }
 
-/// A removal whose cascade didn't finish is finished by a retry: the retry
-/// finds nothing left to remove, and still revokes what the first left.
+/// A space past the resolution bound admits no one, so a change below it
+/// revokes its credentials for the accounts that change touches, and a
+/// space's own nesting can still be undone once it is past the bound.
 #[tokio::test]
 #[serial]
-async fn a_retried_removal_revokes_what_the_first_attempt_left() {
+async fn spaces_past_the_bound_still_take_member_changes() {
     common::require_db!();
     let app = setup().await;
     let owner = rand_did("owner");
     let member = rand_did("member");
     let a = create(&app, &owner, memberspace(json!({}))).await;
     let b = create(&app, &owner, memberspace(json!({}))).await;
+    let wide = create(&app, &owner, memberspace(json!({}))).await;
     put_members(
         &app,
         &owner,
@@ -740,38 +742,72 @@ async fn a_retried_removal_revokes_what_the_first_attempt_left() {
     )
     .await;
     nest(&app, &owner, &a, &b, true, false).await;
+    nest(&app, &owner, &a, &wide, true, false).await;
     mint(&app, &a, &member).await;
+    // A nested space grows past the bound after the credential was issued.
+    bulk_members(
+        &app,
+        &wide,
+        happyview::spaces::members::MAX_RESOLVED,
+        "past",
+    )
+    .await;
 
-    // The first attempt removed the reference and stopped there.
+    // The member leaves B: A can't be resolved to see whether they still
+    // read it, and admits no one, so the credential goes.
+    remove_members(&app, &owner, &b, json!([member])).await;
+    assert_eq!(outstanding(&app, &a, &member).await, 0, "revoked in A");
+
+    // Removing the nesting that took A past the bound works, and revokes the
+    // credentials of accounts A no longer admits.
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    unnest(&app, &owner, &a, &wide).await;
+    mint(&app, &a, &member).await;
+    let grown = create(&app, &owner, memberspace(json!({}))).await;
+    nest(&app, &owner, &a, &grown, true, false).await;
+    bulk_members(
+        &app,
+        &grown,
+        happyview::spaces::members::MAX_RESOLVED,
+        "grown",
+    )
+    .await;
+    // An account A admitted once, still holding a credential for it.
+    let other = rand_did("other");
     let row = space_row(&app, &a).await;
-    happyview::db::query(&format!(
-        "DELETE FROM happyview_space_nested WHERE space_id = '{}'",
-        row.id
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        app.state.db_backend,
     ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&row.id)
+    .bind(&other)
+    .bind(format!("hash{}", Uuid::new_v4().simple()))
+    .bind(format!("jti{}", Uuid::new_v4().simple()))
+    .bind("9999-12-31T00:00:00+00:00")
+    .bind("2026-11-19T00:00:00+00:00")
     .execute(&app.state.db)
     .await
     .unwrap();
-    assert_eq!(outstanding(&app, &a, &member).await, 1);
-
-    let (status, body) = post(
-        &app,
-        &owner,
-        "dev.happyview.space.removeNestedSpace",
-        json!({ "space": a, "nested": b }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    unnest(&app, &owner, &a, &grown).await;
     assert_eq!(
         outstanding(&app, &a, &member).await,
-        0,
-        "revoked on the retry"
+        1,
+        "still reads A through B"
     );
+    assert_eq!(outstanding(&app, &a, &other).await, 0, "no longer admitted");
 }
 
 /// A credential issued while a member's removal is committing in a space
 /// two levels down follows the removal: issue reads the effective list again
 /// under a share lock on every space it reads, so it waits for the removal
-/// and is refused, rather than stored after the cascade looked.
+/// and is refused, rather than stored after the removal's revocation looked.
 #[tokio::test]
 #[serial]
 async fn a_credential_issued_while_a_removal_commits_two_levels_down_follows_it() {

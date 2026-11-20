@@ -49,6 +49,17 @@ fn too_large() -> AppError {
     }
 }
 
+/// Whether `e` is the refusal of a resolution past the bound.
+pub fn is_too_large(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::XrpcError {
+            code: "MemberListTooLarge",
+            ..
+        }
+    )
+}
+
 fn sql_error(e: sqlx::Error) -> AppError {
     AppError::Internal(format!("failed to resolve members: {e}"))
 }
@@ -327,62 +338,6 @@ async fn target_id(
         .map_err(sql_error)?;
         Ok(row.map(|r| r.0))
     }
-}
-
-/// The spaces that reach `space_id` through nested references or
-/// simplespace space-members, each once, up to [`MAX_DELEGATION_DEPTH`]
-/// levels up, not counting `space_id` itself.
-pub async fn reaching_on(
-    conn: &mut sqlx::AnyConnection,
-    backend: DatabaseBackend,
-    space_id: &str,
-) -> Result<Vec<String>, AppError> {
-    let mut found: Vec<String> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::from([space_id.to_string()]);
-    let mut frontier = vec![space_id.to_string()];
-    let mut budget = MAX_RESOLVED;
-    for _ in 0..MAX_DELEGATION_DEPTH {
-        let mut next = Vec::new();
-        for id in frontier {
-            let Some(space) = db::get_space(&mut *conn, backend, &id).await? else {
-                continue;
-            };
-            let address = format!(
-                "at://{}/space/{}/{}",
-                space.did, space.type_nsid, space.skey
-            );
-            let mut parents: Vec<(String,)> = crate::db::query_as(&adapt_sql(
-                "SELECT space_id FROM happyview_space_nested WHERE target_space_uri = ?",
-                backend,
-            ))
-            .bind(&address)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql_error)?;
-            let legacy: Vec<(String,)> = crate::db::query_as(&adapt_sql(
-                "SELECT space_id FROM happyview_space_members WHERE is_delegation = 1 AND (member_did = ? OR member_did = ?)",
-                backend,
-            ))
-            .bind(&address)
-            .bind(&id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql_error)?;
-            parents.extend(legacy);
-            budget = budget.checked_sub(parents.len()).ok_or_else(too_large)?;
-            for (parent,) in parents {
-                if visited.insert(parent.clone()) {
-                    found.push(parent.clone());
-                    next.push(parent);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    Ok(found)
 }
 
 async fn with_conn(

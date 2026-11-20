@@ -973,31 +973,6 @@ async fn revoke_member_credentials(
     Ok(jtis)
 }
 
-/// Revoke a member's credentials in a transaction of their own, and tell the
-/// hosts that verify them once it commits: for a change whose own
-/// transaction has already committed, as a nesting cascade's is.
-pub(crate) async fn revoke_member_credentials_after(
-    state: &AppState,
-    space: &Space,
-    member_did: &str,
-) -> Result<(), AppError> {
-    let jtis = crate::db::retry_on_busy(|| async {
-        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        let jtis = match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did)
-            .await
-        {
-            Ok(jtis) => jtis,
-            Err(e) => return Ok(Err(e)),
-        };
-        tx.commit().await?;
-        Ok(Ok(jtis))
-    })
-    .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to revoke credentials: {e}")))??;
-    announce_revoked(state, space, jtis);
-    Ok(())
-}
-
 /// Tell the hosts that verify a space's credentials which were revoked, once
 /// the revocation has committed.
 fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
@@ -1009,10 +984,11 @@ fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
 }
 
 /// Who read a space through its member list before a change to its members,
-/// and which spaces take its members through delegation entries, as read in
-/// the change's transaction, under the space's row lock, before the change.
-/// [`revoke_lost_readers`] takes it once the change is made.
-struct Readers {
+/// and which spaces take its members through delegation entries or nested
+/// references, as read in the change's transaction, under the space's row
+/// lock, before the change. [`revoke_lost_readers`] takes it once the change
+/// is made.
+pub(crate) struct Readers {
     space_id: String,
     readers: std::collections::HashSet<String>,
     delegating: Vec<String>,
@@ -1033,26 +1009,47 @@ async fn member_list_readers(
         .collect())
 }
 
-async fn readers_before(
+impl Readers {
+    /// The spaces that took the space's members before the change.
+    pub(crate) fn delegating(&self) -> &[String] {
+        &self.delegating
+    }
+}
+
+pub(crate) async fn readers_before(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Readers, AppError> {
+    let readers = match member_list_readers(conn, backend, space_id).await {
+        Ok(readers) => readers,
+        // A space past the resolution bound admits no one now, but anyone
+        // holding one of its credentials was admitted before it grew, so
+        // they count as its readers. Otherwise a change that brings the
+        // space back within the bound couldn't be made.
+        Err(e) if members::is_too_large(&e) => {
+            db::outstanding_credential_subjects(&mut *conn, backend, space_id)
+                .await?
+                .into_iter()
+                .collect()
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Readers {
         space_id: space_id.to_string(),
-        readers: member_list_readers(conn, backend, space_id).await?,
+        readers,
         delegating: members::delegating_spaces(conn, backend, space_id).await?,
     })
 }
 
 /// Credentials revoked in a space, for [`announce_all_revoked`] once the
 /// transaction commits.
-type Revoked = Vec<(Space, Vec<String>)>;
+pub(crate) type Revoked = Vec<(Space, Vec<String>)>;
 
 /// After a change to a space's members, revoke, in the caller's transaction,
 /// the credentials of every DID the space no longer admits, in the space and
-/// in every space that takes its members through delegation entries,
-/// directly or through others. A credential for one of those spaces may have
+/// in every space that takes its members through delegation entries or
+/// nested references, directly or through others. A credential for one of those spaces may have
 /// been issued because its subject was a member here.
 ///
 /// Only the DIDs that read the space before the change and no longer do are
@@ -1064,11 +1061,14 @@ type Revoked = Vec<(Space, Vec<String>)>;
 /// resolved again under the locks, so a change to one of them waits for this
 /// one, and the lookup is repeated until it finds no space not yet locked.
 ///
+/// A space past the resolution bound admits no one, so every DID in question
+/// loses its credentials there, as an access check would refuse them.
+///
 /// Issuing a credential locks top-down (the space, then the spaces it
 /// delegates to) and this locks bottom-up, so the two can deadlock on
 /// Postgres. Postgres then fails one of them, and `retry_on_busy` runs it
 /// again.
-async fn revoke_lost_readers(
+pub(crate) async fn revoke_lost_readers(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     before: Readers,
@@ -1085,7 +1085,7 @@ async fn revoke_lost_readers(
     }
     let now = app!(db::get_space(&mut *conn, backend, &before.space_id).await);
     let after = match &now {
-        Some(_) => app!(member_list_readers(conn, backend, &before.space_id).await),
+        Some(_) => app!(readers_or_none(conn, backend, &before.space_id).await),
         None => Default::default(),
     };
     let mut lost: Vec<String> = before.readers.difference(&after).cloned().collect();
@@ -1127,7 +1127,7 @@ async fn revoke_lost_readers(
         }
         let readers = match readers {
             Some(readers) => readers,
-            None => app!(member_list_readers(conn, backend, &space.id).await),
+            None => app!(readers_or_none(conn, backend, &space.id).await),
         };
         let mut jtis = Vec::new();
         for did in &lost {
@@ -1145,8 +1145,21 @@ async fn revoke_lost_readers(
     Ok(Ok(revoked))
 }
 
+/// [`member_list_readers`], with none for a space past the resolution bound:
+/// its access checks refuse everyone.
+async fn readers_or_none(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    match member_list_readers(conn, backend, space_id).await {
+        Err(e) if members::is_too_large(&e) => Ok(Default::default()),
+        result => result,
+    }
+}
+
 /// [`announce_revoked`] for each space in `revoked`.
-fn announce_all_revoked(state: &AppState, revoked: Revoked) {
+pub(crate) fn announce_all_revoked(state: &AppState, revoked: Revoked) {
     for (space, jtis) in revoked {
         announce_revoked(state, &space, jtis);
     }
@@ -1217,7 +1230,6 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     // The member, their credentials when read access goes, and the published
     // member record change in one transaction under the space's row lock, as
     // `putMembers` does.
@@ -1262,7 +1274,6 @@ pub(crate) async fn put_member(
     announce_revoked(state, &space, jtis);
     announce_all_revoked(state, delegated);
     after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
-    cascade.after(state).await?;
     Ok(member)
 }
 
@@ -1293,7 +1304,6 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     // The member and its published record commit together, as in
     // `put_member`.
     let dids = [member_did.to_string()];
@@ -1316,7 +1326,6 @@ pub(crate) async fn add_member(
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
     after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
-    cascade.after(state).await?;
     Ok(member)
 }
 
@@ -1384,13 +1393,6 @@ pub(crate) async fn store_space(
     let backend = state.db_backend;
     let scope = publish::Scope::All;
     let signing_key = publish_key(state, space, scope).await?;
-    // Discarding the member list takes those members from every space that
-    // nests this one.
-    let cascade = if discard_members {
-        Some(crate::spaces::nested::Cascade::before(state, space, false).await?)
-    } else {
-        None
-    };
     let (jtis, delegated, published) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, backend).await?;
         db::lock_space_for_members(&mut *tx, backend, &space.id).await?;
@@ -1447,9 +1449,6 @@ pub(crate) async fn store_space(
     announce_revoked(state, space, jtis);
     announce_all_revoked(state, delegated);
     after_publish(state, space, scope, signing_key.is_some(), published).await?;
-    if let Some(cascade) = cascade {
-        cascade.after(state).await?;
-    }
     Ok(())
 }
 
@@ -1517,7 +1516,6 @@ pub(crate) async fn delete_space(
     require_space_admin(state, &space, actor_did).await?;
     let registrations =
         db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
-    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     let backend = state.db_backend;
     let delegated = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, backend).await?;
@@ -1538,7 +1536,6 @@ pub(crate) async fn delete_space(
     })
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to delete space: {e}")))??;
-    cascade.after(state).await?;
     notifications::announce_space_deleted(state, &space, registrations);
     announce_all_revoked(state, delegated);
     Ok(())
@@ -1616,7 +1613,6 @@ pub(crate) async fn put_members(
     let dids: Vec<String> = entries.iter().map(|e| e.did.clone()).collect();
     let scope = publish::Scope::Members(&dids);
     let signing_key = publish_key(state, space, scope).await?;
-    let cascade = crate::spaces::nested::Cascade::before(state, space, false).await?;
     let stored = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
@@ -1681,7 +1677,6 @@ pub(crate) async fn put_members(
     announce_revoked(state, space, jtis);
     announce_all_revoked(state, delegated);
     after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
-    cascade.after(state).await?;
     Ok(())
 }
 
@@ -1725,7 +1720,6 @@ pub(crate) async fn remove_members(
     }
     let scope = publish::Scope::Members(&dids);
     let signing_key = publish_key(state, space, scope).await?;
-    let cascade = crate::spaces::nested::Cascade::before(state, space, false).await?;
     // The removals and their credential revocations commit together, so a
     // request that fails after them can't leave a removed member's credentials
     // standing for a retry to miss. Only telling the verifying hosts waits for
@@ -1774,7 +1768,6 @@ pub(crate) async fn remove_members(
     announce_revoked(state, space, jtis);
     announce_all_revoked(state, delegated);
     after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
-    cascade.after(state).await?;
     Ok(removed)
 }
 
@@ -1786,7 +1779,6 @@ pub(crate) async fn remove_member(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    let cascade = crate::spaces::nested::Cascade::before(state, &space, false).await?;
     // The removal and the revocation of the member's credentials commit
     // together, under the space's row lock, as in `remove_members`. The
     // credentials are revoked even when no member row is found, as they
@@ -1842,7 +1834,7 @@ pub(crate) async fn remove_member(
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
-    cascade.after(state).await
+    Ok(())
 }
 
 /// Bring one member's published record into step after a single-member
@@ -1965,10 +1957,6 @@ pub(crate) async fn accept_invite(
         granted_by: Some(invite.created_by.clone()),
         created_at: now_rfc3339(),
     };
-    let cascade = match db::get_space(&state.db, state.db_backend, &invite.space_id).await? {
-        Some(space) => Some(crate::spaces::nested::Cascade::before(state, &space, false).await?),
-        None => None,
-    };
     match db::claim_invite(&state.db, state.db_backend, &invite.id, &member).await? {
         db::InviteClaim::Joined => {}
         db::InviteClaim::Unavailable => {
@@ -1986,9 +1974,6 @@ pub(crate) async fn accept_invite(
     // Published after the claim commits: accepting only adds a member, so a
     // failed publish under-reports the list until the next sync corrects it.
     publish_member(state, &invite.space_id, did).await?;
-    if let Some(cascade) = cascade {
-        cascade.after(state).await?;
-    }
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))

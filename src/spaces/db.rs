@@ -791,7 +791,7 @@ pub async fn outstanding_credential_jtis(
 
 /// The accounts holding outstanding credentials for a space.
 pub async fn outstanding_credential_subjects(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<String>, AppError> {
@@ -801,7 +801,7 @@ pub async fn outstanding_credential_subjects(
     ))
     .bind(space_id)
     .bind(now_rfc3339())
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to list credential holders: {e}")))?;
     Ok(rows.into_iter().map(|(did,)| did).collect())

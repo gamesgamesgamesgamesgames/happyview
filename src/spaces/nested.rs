@@ -2,10 +2,8 @@
 //!
 //! Nesting a space makes its members members of the nesting space, with at
 //! most the access the reference grants. Membership is resolved when it is
-//! checked ([`crate::spaces::members`]); nothing is copied. When anything
-//! changes what a space's members are, [`Cascade`] brings every space that
-//! reaches it into step: credentials for accounts that lost read access are
-//! revoked, and published member lists are updated.
+//! checked ([`crate::spaces::members`]); nothing is copied. A space's
+//! `listMembers` and published member records hold its own members only.
 //!
 //! Only spaces on this host can be nested for now.
 
@@ -20,10 +18,10 @@ use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::now_rfc3339;
 use crate::error::AppError;
-use crate::spaces::members::{self, Resolution};
+use crate::spaces::members;
 use crate::spaces::policy::SpacePolicy;
 use crate::spaces::types::Space;
-use crate::spaces::{SpaceUri, db, lifecycle, publish, scope, service};
+use crate::spaces::{SpaceUri, db, lifecycle, scope, service};
 
 const NS: &str = "dev.happyview.space";
 
@@ -192,45 +190,15 @@ pub(crate) async fn put_nested(
 ) -> Result<(), AppError> {
     require_memberspace(space)?;
     let target = local_target(state, nested).await?;
-    let previous = db::list_nested(&state.db, state.db_backend, &space.id)
-        .await?
-        .into_iter()
-        .find(|r| r.target_space_uri == target);
-    let cascade = Cascade::before(state, space, true).await?;
     let reference = db::NestedRef {
-        target_space_uri: target.clone(),
+        target_space_uri: target,
         read,
         write,
         added_by: Some(actor.to_string()),
         created_at: now_rfc3339(),
     };
-    // The reference changes under the space's row lock, as member changes
-    // do, so it is ordered with anything reading the effective list under it.
-    crate::db::retry_on_busy(|| async {
-        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        db::lock_space(&mut *tx, state.db_backend, &space.id).await?;
-        if let Err(e) = db::upsert_nested(&mut *tx, state.db_backend, &space.id, &reference).await {
-            return Ok(Err(e));
-        }
-        tx.commit().await?;
-        Ok(Ok(()))
-    })
-    .await
-    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to nest space: {e}")))??;
-    // A reference that would take this space, or one that reaches it, past
-    // what resolution reads is refused, and the previous state put back.
-    if let Err(e) = cascade.check(state).await {
-        match previous {
-            Some(previous) => {
-                db::upsert_nested(&state.db, state.db_backend, &space.id, &previous).await?
-            }
-            None => {
-                db::delete_nested(&state.db, state.db_backend, &space.id, &target).await?;
-            }
-        }
-        return Err(e);
-    }
-    cascade.after(state).await
+    change_reference(state, space, Change::Put(&reference)).await?;
+    Ok(())
 }
 
 /// Remove a nested space. Removing one that isn't nested is `InvalidRequest`.
@@ -242,150 +210,86 @@ pub(crate) async fn remove_nested(
     let uri = SpaceUri::parse(nested)
         .map_err(|_| invalid(format!("{nested:?} is not a space address")))?;
     let address = format!("at://{}/space/{}/{}", uri.did, uri.type_nsid, uri.skey);
-    let cascade = Cascade::before(state, space, true).await?;
-    // Under the space's row lock, as in `put_nested`.
-    let removed = crate::db::retry_on_busy(|| async {
-        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
-        db::lock_space(&mut *tx, state.db_backend, &space.id).await?;
-        let removed = match db::delete_nested(&mut *tx, state.db_backend, &space.id, &address).await
-        {
-            Ok(removed) => removed,
-            Err(e) => return Ok(Err(e)),
-        };
-        tx.commit().await?;
-        Ok(Ok(removed))
-    })
-    .await
-    .map_err(|e: sqlx::Error| {
-        AppError::Internal(format!("failed to remove nested space: {e}"))
-    })??;
-    // Run even when nothing was removed: a retry of a removal whose cascade
-    // failed finishes it here.
-    cascade.after(state).await?;
-    if !removed {
+    if !change_reference(state, space, Change::Remove(&address)).await? {
         return Err(invalid(format!("{address} is not nested in this space")));
     }
     Ok(())
 }
 
-/// The effective lists of a changed space's dependents, taken before the
-/// change, to be compared with them after it.
-pub(crate) struct Cascade {
-    before: Vec<(String, Resolution)>,
+/// A change to one of a space's nested references.
+enum Change<'a> {
+    Put(&'a db::NestedRef),
+    Remove(&'a str),
 }
 
-impl Cascade {
-    /// Snapshot every space that reaches `space` (and `space` itself, with
-    /// `include_self`), before a change to what `space`'s members are.
-    pub(crate) async fn before(
-        state: &AppState,
-        space: &Space,
-        include_self: bool,
-    ) -> Result<Self, AppError> {
-        let mut conn = state
-            .db
-            .acquire()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-        let mut ids = members::reaching_on(&mut conn, state.db_backend, &space.id).await?;
-        if include_self {
-            ids.insert(0, space.id.clone());
+/// Make `change` to `space`'s references in one transaction, under the
+/// space's row lock as member changes take it, and return whether anything
+/// changed.
+///
+/// In the same transaction: a change that would take the space, or a space
+/// that takes its members, past what resolution reads is refused, unless
+/// that space was past it already; and the credentials of accounts that no
+/// longer read the space, or a space that takes its members, are revoked
+/// (`service::revoke_lost_readers`). The revocations are announced once the
+/// transaction commits.
+async fn change_reference(
+    state: &AppState,
+    space: &Space,
+    change: Change<'_>,
+) -> Result<bool, AppError> {
+    let backend = state.db_backend;
+    let (changed, revoked) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, backend).await?;
+        if db::lock_space(&mut *tx, backend, &space.id)
+            .await?
+            .is_none()
+        {
+            return Ok(Err(AppError::NotFound("Space not found".into())));
         }
-        let mut before = Vec::with_capacity(ids.len());
-        for id in ids {
-            // A space already past the bound answers every access check with
-            // an error, so there is nothing to compare it against.
-            match members::resolve_on(&mut conn, state.db_backend, &id).await {
-                Ok(resolution) => before.push((id, resolution)),
-                Err(e) if is_too_large(&e) => {}
-                Err(e) => return Err(e),
+        let before = match service::readers_before(&mut tx, backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        // The spaces whose effective lists this change can grow, that
+        // resolve within the bound now.
+        let mut bounded = Vec::new();
+        for id in std::iter::once(&space.id).chain(before.delegating()) {
+            match members::resolve_on(&mut tx, backend, id).await {
+                Ok(_) => bounded.push(id.clone()),
+                Err(e) if members::is_too_large(&e) => {}
+                Err(e) => return Ok(Err(e)),
             }
         }
-        Ok(Self { before })
-    }
-
-    /// Whether every snapshotted space still resolves within the bound.
-    pub(crate) async fn check(&self, state: &AppState) -> Result<(), AppError> {
-        let mut conn = state
-            .db
-            .acquire()
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-        for (id, _) in &self.before {
-            members::resolve_on(&mut conn, state.db_backend, id).await?;
+        let changed = match change {
+            Change::Put(reference) => db::upsert_nested(&mut *tx, backend, &space.id, reference)
+                .await
+                .map(|()| true),
+            Change::Remove(address) => {
+                db::delete_nested(&mut *tx, backend, &space.id, address).await
+            }
+        };
+        match changed {
+            Ok(true) => {}
+            Ok(false) => return Ok(Ok((false, Vec::new()))),
+            Err(e) => return Ok(Err(e)),
         }
-        Ok(())
-    }
-
-    /// After the change: revoke the credentials of accounts that lost read
-    /// access to each snapshotted space, and bring its published member list
-    /// into step.
-    pub(crate) async fn after(self, state: &AppState) -> Result<(), AppError> {
-        for (id, before) in self.before {
-            let Some(space) = db::get_space(&state.db, state.db_backend, &id).await? else {
-                continue;
-            };
-            let after = {
-                let mut conn = state.db.acquire().await.map_err(|e| {
-                    AppError::Internal(format!("failed to acquire connection: {e}"))
-                })?;
-                members::resolve_on(&mut conn, state.db_backend, &id).await
-            };
-            // The change took this space past the bound. Its access checks
-            // now fail closed; the change itself stands.
-            let after = match after {
-                Ok(after) => after,
-                Err(e) if is_too_large(&e) => {
-                    tracing::warn!(
-                        space_id = %id,
-                        "a membership change took a nesting space past the resolution bound"
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let mut changed: Vec<String> = Vec::new();
-            for (did, was) in &before {
-                let now = after.get(did);
-                if now.map(|e| e.access) != Some(was.access) {
-                    changed.push(did.clone());
-                }
-            }
-            // Every outstanding credential whose account no longer reads the
-            // space is revoked, not only those of accounts that changed just
-            // now, so a retry finishes what a failed request left undone.
-            if space.read_policy == crate::spaces::types::Policy::MemberList {
-                for did in
-                    db::outstanding_credential_subjects(&state.db, state.db_backend, &space.id)
-                        .await?
-                {
-                    if did.is_empty() || did == space.creator_did {
-                        continue;
-                    }
-                    if !after.get(&did).is_some_and(|e| e.access.read) {
-                        service::revoke_member_credentials_after(state, &space, &did).await?;
-                    }
-                }
-            }
-            for did in after.keys() {
-                if !before.contains_key(did) {
-                    changed.push(did.clone());
-                }
-            }
-            if !changed.is_empty() {
-                publish::sync(state, &space.id, publish::Scope::Members(&changed)).await?;
+        // Dropping the transaction on a refusal puts the reference back.
+        for id in &bounded {
+            if let Err(e) = members::resolve_on(&mut tx, backend, id).await {
+                return Ok(Err(e));
             }
         }
-        Ok(())
-    }
-}
-
-fn is_too_large(e: &AppError) -> bool {
-    matches!(
-        e,
-        AppError::XrpcError {
-            code: "MemberListTooLarge",
-            ..
-        }
-    )
+        let revoked = match service::revoke_lost_readers(&mut tx, backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((true, revoked)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| {
+        AppError::Internal(format!("failed to change nested spaces: {e}"))
+    })??;
+    service::announce_all_revoked(state, revoked);
+    Ok(changed)
 }
