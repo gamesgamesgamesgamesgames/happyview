@@ -1524,6 +1524,89 @@ mod tests {
         );
     }
 
+    /// A script delegating to a space goes through the same check as the
+    /// XRPC methods: the caller must administer the named space too.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn delegating_from_a_script_requires_administering_the_space() {
+        require_test_db!();
+        let (state, x_uri, x_admin) = db_seeded_space().await;
+        let (_, y_uri, _) = db_seeded_space().await;
+        // A space X's admin does administer.
+        let skey = format!("own{}", uuid::Uuid::new_v4().simple());
+        let own = crate::spaces::types::Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: x_admin.clone(),
+            authority_did: x_admin.clone(),
+            creator_did: x_admin.clone(),
+            type_nsid: "com.example.forum".to_string(),
+            skey: skey.clone(),
+            display_name: None,
+            description: None,
+            read_policy: crate::spaces::types::Policy::MemberList,
+            write_policy: crate::spaces::types::Policy::MemberList,
+            app_access: crate::spaces::types::AppAccess::default(),
+            config: crate::spaces::types::SpaceConfig::default(),
+            revision: None,
+            created_at: crate::db::now_rfc3339(),
+            updated_at: crate::db::now_rfc3339(),
+        };
+        crate::spaces::db::create_space(&state.db, state.db_backend, &own)
+            .await
+            .expect("failed to seed the admin's own space");
+        let own_uri = format!("at://{x_admin}/space/com.example.forum/{skey}");
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(&lua, state_arc.clone(), Some(&x_admin))
+            .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&x_admin)).unwrap();
+
+        let chunk = format!(
+            r#"
+                local space = atproto.spaces.get("{x_uri}")
+                local added_ok, added_err = pcall(function()
+                    return space:add_member{{ did = "{y_uri}", access = "read", is_delegation = true }}
+                end)
+                local put_ok, put_err = pcall(function()
+                    return space:put_member{{ did = "{y_uri}", read = true, write = false, is_delegation = true }}
+                end)
+                local own_ok, own_err = pcall(function()
+                    return space:add_member{{ did = "{own_uri}", access = "read", is_delegation = true }}
+                end)
+                return {{ added_ok, tostring(added_err), put_ok, tostring(put_err), own_ok, tostring(own_err) }}
+            "#
+        );
+        let t: mlua::Table = lua.load(&chunk).eval_async().await.unwrap();
+        let refusal = "delegating to a space requires administering it";
+        let (added_ok, added_err): (bool, String) = (t.get(1).unwrap(), t.get(2).unwrap());
+        let (put_ok, put_err): (bool, String) = (t.get(3).unwrap(), t.get(4).unwrap());
+        let (own_ok, own_err): (bool, String) = (t.get(5).unwrap(), t.get(6).unwrap());
+        assert!(
+            !added_ok && added_err.contains(refusal),
+            "add_member: {added_err}"
+        );
+        assert!(
+            !put_ok && put_err.contains(refusal),
+            "put_member: {put_err}"
+        );
+        assert!(own_ok, "delegating to the admin's own space: {own_err}");
+
+        let x = crate::spaces::service::resolve_space(&state_arc, &x_uri)
+            .await
+            .unwrap();
+        let refused =
+            crate::spaces::db::get_member(&state_arc.db, state_arc.db_backend, &x.id, &y_uri)
+                .await
+                .unwrap();
+        assert!(refused.is_none(), "nothing is stored for the refused space");
+        let consented =
+            crate::spaces::db::consented_delegations(&state_arc.db, state_arc.db_backend, &x.id)
+                .await
+                .unwrap();
+        assert_eq!(consented.get(&own_uri), Some(&own.id));
+    }
+
     /// A `read`-access member can perform read operations (`query`,
     /// `members`) but is rejected by `write_record`/`delete_record`, which
     /// both call `require_membership(..., write=true)`. `SpaceAccess::can_write()`
