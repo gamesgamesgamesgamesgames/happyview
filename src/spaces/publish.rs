@@ -187,14 +187,11 @@ pub(crate) async fn sync_in(
         ),
     };
     if publish_members {
-        // The published list is the effective one: nested spaces' members
-        // included, with the access they actually have.
-        let effective = crate::spaces::members::resolve_on(&mut *conn, backend, &space.id).await?;
-        let listed = effective
-            .into_iter()
-            .filter(|(did, _)| only_dids.is_none_or(|only| only.contains(did)))
-            .map(|(did, e)| (did, e.access));
-        for (did, access) in listed {
+        // The space's own members only; nested spaces' members are not
+        // published here.
+        for (did, access) in
+            db::direct_member_access(&mut *conn, backend, &space.id, only_dids).await?
+        {
             wanted.insert(
                 (MEMBER_COLLECTION, member_rkey(&did)),
                 serde_json::json!({

@@ -153,13 +153,24 @@ async fn unnest(app: &TestApp, owner: &str, space: &str, nested: &str) {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// The effective list, as `listMembers` gives it: (did, read, write).
-async fn members(app: &TestApp, owner: &str, space: &str) -> Vec<(String, bool, bool)> {
+/// The effective list, as access checks resolve it: (did, read, write).
+async fn members(app: &TestApp, _owner: &str, space: &str) -> Vec<(String, bool, bool)> {
+    let row = space_row(app, space).await;
+    happyview::spaces::members::resolve_members(&app.state.db, app.state.db_backend, &row.id)
+        .await
+        .expect("resolves")
+        .into_iter()
+        .map(|m| (m.did, m.access.read, m.access.write))
+        .collect()
+}
+
+/// The list `listMembers` gives: (did, read, write).
+async fn listed(app: &TestApp, owner: &str, space: &str) -> Vec<(String, bool, bool)> {
     let (status, body) = get(
         app,
         owner,
         &format!(
-            "/xrpc/com.atproto.memberspace.listMembers?space={}&limit=1000",
+            "/xrpc/com.atproto.memberspace.listMembers?space={}&limit=100",
             urlencoding::encode(space)
         ),
     )
@@ -177,6 +188,25 @@ async fn members(app: &TestApp, owner: &str, space: &str) -> Vec<(String, bool, 
             )
         })
         .collect()
+}
+
+/// The member records published in a space's authority repo: (rkey, read,
+/// write).
+async fn published(app: &TestApp, space: &str) -> Vec<(String, Value, Value)> {
+    let row = space_row(app, space).await;
+    happyview::spaces::db::repo_collection_records(
+        &app.state.db,
+        app.state.db_backend,
+        &row.id,
+        &row.authority_did,
+        MEMBER,
+        None,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.rkey, r.record["read"].clone(), r.record["write"].clone()))
+    .collect()
 }
 
 fn entry<'a>(list: &'a [(String, bool, bool)], did: &str) -> Option<&'a (String, bool, bool)> {
@@ -515,56 +545,51 @@ async fn losing_read_through_a_reference_two_levels_down_revokes_credentials() {
 
 #[tokio::test]
 #[serial]
-async fn the_published_list_follows_nested_members() {
+async fn listed_and_published_members_are_the_spaces_own() {
     common::require_db!();
     let app = setup().await;
     let owner = rand_did("owner");
-    let member = rand_did("member");
+    let (direct, nested) = (rand_did("direct"), rand_did("nested"));
     let a = create(&app, &owner, memberspace(json!({ "publishMembers": true }))).await;
     let b = create(&app, &owner, memberspace(json!({}))).await;
     let c = create(&app, &owner, memberspace(json!({}))).await;
     nest(&app, &owner, &a, &b, true, false).await;
     nest(&app, &owner, &b, &c, true, true).await;
-
-    // A change two levels down reaches A's published list.
+    put_members(
+        &app,
+        &owner,
+        &a,
+        json!([{ "did": direct, "read": true, "write": true }]),
+    )
+    .await;
+    // A change two levels down changes who reads A, but not A's own list.
     put_members(
         &app,
         &owner,
         &c,
-        json!([{ "did": member, "read": true, "write": true }]),
+        json!([{ "did": nested, "read": true, "write": true }]),
     )
     .await;
-    let row = space_row(&app, &a).await;
-    let record = |records: Vec<happyview::spaces::types::SpaceRecord>| {
+    assert_eq!(
+        entry(&members(&app, &owner, &a).await, &nested),
+        Some(&(nested.clone(), true, false)),
+        "reads A through the nested spaces"
+    );
+
+    let list = listed(&app, &owner, &a).await;
+    assert_eq!(entry(&list, &direct), Some(&(direct.clone(), true, true)));
+    assert!(entry(&list, &nested).is_none(), "{list:?}");
+    let records = published(&app, &a).await;
+    assert!(
         records
-            .into_iter()
-            .find(|r| r.rkey == member)
-            .map(|r| (r.record["read"].clone(), r.record["write"].clone()))
-    };
-    let published = happyview::spaces::db::repo_collection_records(
-        &app.state.db,
-        app.state.db_backend,
-        &row.id,
-        &row.authority_did,
-        MEMBER,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(record(published), Some((json!(true), json!(false))));
+            .iter()
+            .any(|r| *r == (direct.clone(), json!(true), json!(true))),
+        "{records:?}"
+    );
+    assert!(records.iter().all(|r| r.0 != nested), "{records:?}");
 
     unnest(&app, &owner, &a, &b).await;
-    let published = happyview::spaces::db::repo_collection_records(
-        &app.state.db,
-        app.state.db_backend,
-        &row.id,
-        &row.authority_did,
-        MEMBER,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(record(published), None);
+    assert!(published(&app, &a).await.iter().any(|r| r.0 == direct));
 }
 
 #[tokio::test]
@@ -631,21 +656,27 @@ async fn a_member_list_past_the_bound_is_refused_by_name() {
     assert_eq!(body["error"], json!("MemberListTooLarge"));
     assert_eq!(members(&app, &owner, &a).await.len(), 1, "only the owner");
 
-    // A nested space that grows past it makes the list unreadable, by name.
+    // A nested space that grows past it makes access checks fail, by name.
     let c = create(&app, &owner, memberspace(json!({}))).await;
     nest(&app, &owner, &a, &c, true, false).await;
     bulk_members(&app, &c, happyview::spaces::members::MAX_RESOLVED, "grown").await;
-    let (status, body) = get(
-        &app,
-        &owner,
-        &format!(
-            "/xrpc/com.atproto.memberspace.listMembers?space={}",
-            urlencoding::encode(&a)
+    let row = space_row(&app, &a).await;
+    let err =
+        happyview::spaces::members::is_member(&app.state.db, app.state.db_backend, &row.id, &owner)
+            .await
+            .expect_err("past the bound");
+    assert!(
+        matches!(
+            err,
+            happyview::error::AppError::XrpcError {
+                code: "MemberListTooLarge",
+                ..
+            }
         ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], json!("MemberListTooLarge"));
+        "{err:?}"
+    );
+    // The space's own member list still reads.
+    assert_eq!(listed(&app, &owner, &a).await.len(), 1, "only the owner");
 }
 
 /// The cost of one access check on a graph as deep as resolution goes, and
