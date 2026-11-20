@@ -1014,8 +1014,11 @@ async fn store_member(
     if let Some(target) = &target {
         require_space_admin(state, target, actor_did)
             .await
-            .map_err(|_| {
-                AppError::Forbidden("delegating to a space requires administering it".into())
+            .map_err(|e| match e {
+                AppError::Forbidden(_) => {
+                    AppError::Forbidden("delegating to a space requires administering it".into())
+                }
+                other => other,
             })?;
     }
     if !db::insert_delegation_if_allowed(&state.db, state.db_backend, member, target.is_some())

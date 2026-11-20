@@ -8,6 +8,8 @@ ALTER TABLE happyview_space_members ADD COLUMN delegation_consented INTEGER NOT 
 UPDATE happyview_space_members
 SET delegation_consented = 1
 WHERE is_delegation = 1
+  -- An address may carry a record path after the space. Prefixes are
+  -- compared exactly: LIKE would read _ and % in an address as wildcards.
   AND EXISTS (
     SELECT 1
     FROM happyview_spaces p, happyview_spaces t
@@ -15,9 +17,11 @@ WHERE is_delegation = 1
       AND (
            t.id = happyview_space_members.member_did
         OR happyview_space_members.member_did = 'at://' || t.did || '/space/' || t.type_nsid || '/' || t.skey
-        OR happyview_space_members.member_did LIKE 'at://' || t.did || '/space/' || t.type_nsid || '/' || t.skey || '/%'
+        OR substr(happyview_space_members.member_did, 1, length('at://' || t.did || '/space/' || t.type_nsid || '/' || t.skey) + 1)
+           = 'at://' || t.did || '/space/' || t.type_nsid || '/' || t.skey || '/'
         OR happyview_space_members.member_did = 'ats://' || t.did || '/' || t.type_nsid || '/' || t.skey
-        OR happyview_space_members.member_did LIKE 'ats://' || t.did || '/' || t.type_nsid || '/' || t.skey || '/%'
+        OR substr(happyview_space_members.member_did, 1, length('ats://' || t.did || '/' || t.type_nsid || '/' || t.skey) + 1)
+           = 'ats://' || t.did || '/' || t.type_nsid || '/' || t.skey || '/'
       )
       AND (
            (happyview_space_members.granted_by IS NOT NULL AND t.creator_did IS NOT NULL

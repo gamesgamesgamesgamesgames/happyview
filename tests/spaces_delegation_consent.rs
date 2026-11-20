@@ -48,12 +48,17 @@ async fn setup() -> TestApp {
 /// A member-list space created by `creator`, with `creator` as its only
 /// member. Returns (id, address).
 async fn create_space(app: &TestApp, creator: &str) -> (String, String) {
+    create_space_at(app, creator, creator, &Uuid::new_v4().simple().to_string()).await
+}
+
+/// [`create_space`] at the address `did` and `skey`.
+async fn create_space_at(app: &TestApp, creator: &str, did: &str, skey: &str) -> (String, String) {
     let now = now_rfc3339();
     let id = Uuid::new_v4().to_string();
-    let skey = Uuid::new_v4().simple().to_string();
+    let skey = skey.to_string();
     let space = Space {
         id: id.clone(),
-        did: creator.to_string(),
+        did: did.to_string(),
         authority_did: creator.to_string(),
         creator_did: creator.to_string(),
         type_nsid: TYPE.to_string(),
@@ -72,7 +77,7 @@ async fn create_space(app: &TestApp, creator: &str) -> (String, String) {
         .await
         .unwrap();
     add_row(app, &id, creator, false, creator).await;
-    (id, format!("at://{creator}/space/{TYPE}/{skey}"))
+    (id, format!("at://{did}/space/{TYPE}/{skey}"))
 }
 
 /// A member row stored directly, as an older version would have stored it.
@@ -279,6 +284,24 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
     // By the instance's super admin.
     let (by_super, _) = create_space(&app, &x_owner).await;
     add_row(&app, &by_super, &y_addr, true, &app.admin_did).await;
+    // An address with a record path, naming a space Z whose creator is not
+    // X's. Z's address differs from W's only where W's skey has a `_`, and W
+    // has X's creator: the address names Z, not W, so the entry is not
+    // consented.
+    let (host, z_owner, z_member) = (rand_did("h"), rand_did("z"), rand_did("zm"));
+    let u = Uuid::new_v4().simple().to_string();
+    create_space_at(&app, &y_owner, &host, &format!("w_{u}")).await;
+    let (z, z_addr) = create_space_at(&app, &z_owner, &host, &format!("wz{u}")).await;
+    add_row(&app, &z, &z_member, false, &z_owner).await;
+    let (wildcard, _) = create_space(&app, &y_owner).await;
+    add_row(
+        &app,
+        &wildcard,
+        &format!("{z_addr}/{z_member}/{TYPE}.post/abc"),
+        true,
+        &y_owner,
+    )
+    .await;
 
     let migration =
         include_str!("../migrations/postgres/20261120000001_space_delegation_consent.sql");
@@ -292,4 +315,5 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
     assert!(is_member(&app, &by_target, &y_member).await);
     assert!(is_member(&app, &same_creator, &y_member).await);
     assert!(is_member(&app, &by_super, &y_member).await);
+    assert!(!is_member(&app, &wildcard, &z_member).await);
 }
