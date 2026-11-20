@@ -461,8 +461,20 @@ async fn nesting_requires_administering_the_nested_space() {
     )
     .await;
 
-    // Every way of nesting Y's space in X's is refused.
+    // Every way of nesting Y's space in X's is refused, by any name.
+    let ys_id = space_row(&app, &ys).await.id;
+    let ys_ats = ys
+        .replacen("at://", "ats://", 1)
+        .replacen("/space/", "/", 1);
     for (nsid, body) in [
+        (
+            "com.atproto.simplespace.putMember",
+            json!({ "space": xs, "did": ys_id, "read": true, "write": false, "isDelegation": true }),
+        ),
+        (
+            "com.atproto.simplespace.addMember",
+            json!({ "space": xs, "did": ys_ats }),
+        ),
         (
             "dev.happyview.space.putNestedSpace",
             json!({ "space": xs, "nested": ys, "read": true, "write": false }),
@@ -1300,7 +1312,7 @@ async fn simplespace_names_spaces_as_members_every_way_it_could() {
     assert!(nested_list(&app, &owner, &a).await.is_empty());
 
     // Added by address, removed by its ats:// form, along with a member row
-    // naming the same space from before nesting.
+    // naming the same space by its id from before nesting.
     let (status, body) = post(
         &app,
         &owner,
@@ -1316,7 +1328,7 @@ async fn simplespace_names_spaces_as_members_every_way_it_could() {
     ))
     .bind(Uuid::new_v4().to_string())
     .bind(&a_row.id)
-    .bind(&ats)
+    .bind(&b_row.id)
     .bind("2026-11-01T00:00:00Z")
     .execute(&app.state.db)
     .await
@@ -1355,6 +1367,14 @@ async fn simplespace_names_spaces_as_members_every_way_it_could() {
     assert_eq!(body["member"]["did"], json!(elsewhere));
     assert!(nested_list(&app, &owner, &a).await.is_empty());
     assert_eq!(members(&app, &owner, &a).await.len(), 1, "only the owner");
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.addMember",
+        json!({ "space": a, "did": elsewhere }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = post(
         &app,
         &owner,
@@ -1398,4 +1418,120 @@ async fn a_reference_follows_the_space_it_was_made_to() {
     .await
     .unwrap();
     assert!(entry(&members(&app, &owner, &a).await, &member).is_none());
+}
+
+/// Delegation entries naming other addresses on a space's DID don't count
+/// against what a change to the space reads.
+#[tokio::test]
+#[serial]
+async fn entries_naming_other_addresses_dont_hold_up_a_change() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let member = rand_did("member");
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    let x = create(&app, &rand_did("other"), memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &owner,
+        &b,
+        json!([{ "did": member, "read": true, "write": false }]),
+    )
+    .await;
+    let b_row = space_row(&app, &b).await;
+    let x_row = space_row(&app, &x).await;
+    let rows: Vec<String> = (0..=happyview::spaces::members::MAX_RESOLVED)
+        .map(|i| {
+            format!(
+                "('{}', '{}', 'at://{}/space/com.example.other/n{i}', 1, 0, 0, 1, NULL, '2026-11-01T00:00:00Z')",
+                Uuid::new_v4(),
+                x_row.id,
+                b_row.did
+            )
+        })
+        .collect();
+    for chunk in rows.chunks(500) {
+        happyview::db::query(&format!(
+            "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) VALUES {}",
+            chunk.join(", ")
+        ))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    }
+    remove_members(&app, &owner, &b, json!([member])).await;
+}
+
+/// The migration that records nested spaces' ids fills them in for the
+/// references made before it, by address.
+#[tokio::test]
+#[serial]
+async fn the_target_id_backfill_finds_each_nested_space() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("owner");
+    let a = create(&app, &owner, memberspace(json!({}))).await;
+    let b = create(&app, &owner, memberspace(json!({}))).await;
+    nest(&app, &owner, &a, &b, true, false).await;
+    let a_row = space_row(&app, &a).await;
+    let b_row = space_row(&app, &b).await;
+    let gone = format!(
+        "at://did:plc:gone{}/space/com.example.forum/x",
+        Uuid::new_v4().simple()
+    );
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_nested (id, space_id, target_space_uri, can_read, can_write, created_at) VALUES (?, ?, ?, 1, 0, ?)",
+        app.state.db_backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&a_row.id)
+    .bind(&gone)
+    .bind("2026-11-01T00:00:00Z")
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_space_nested SET target_space_id = NULL WHERE space_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(&a_row.id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    let migration = match app.state.db_backend {
+        happyview::db::DatabaseBackend::Postgres => {
+            include_str!("../migrations/postgres/20261121000001_space_nested_target_id.sql")
+        }
+        happyview::db::DatabaseBackend::Sqlite => {
+            include_str!("../migrations/sqlite/20261121000001_space_nested_target_id.sql")
+        }
+    };
+    let backfill = migration
+        .split(';')
+        .map(|statement| {
+            statement
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .find(|statement| statement.trim_start().starts_with("UPDATE"))
+        .expect("the backfill");
+    happyview::db::query(&backfill)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let ids: Vec<(String, Option<String>)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT target_space_uri, target_space_id FROM happyview_space_nested WHERE space_id = ? ORDER BY target_space_uri",
+        app.state.db_backend,
+    ))
+    .bind(&a_row.id)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    let mut expected = vec![(b.clone(), Some(b_row.id.clone())), (gone, None)];
+    expected.sort();
+    assert_eq!(ids, expected);
 }

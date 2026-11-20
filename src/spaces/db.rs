@@ -673,20 +673,24 @@ pub async fn revoke_space_credentials_except(
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
 }
 
-/// The delegation entries (`is_delegation`) that may name `space`, by its id
-/// or by an address on its DID. The address match is loose; the caller
-/// resolves each entry to confirm it names `space`.
+/// The delegation entries (`is_delegation`) that name `space`: by its id, its
+/// `at://` address, or its legacy `ats://` address. The caller still resolves
+/// each entry to confirm it names `space`.
 pub async fn delegation_entries_naming(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space: &Space,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let rows: Vec<MemberRow> = crate::db::query_as(&adapt_sql(
-        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND (member_did = ? OR member_did LIKE ?) ORDER BY space_id",
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND member_did IN (?, ?, ?) ORDER BY space_id",
         backend,
     ))
     .bind(&space.id)
-    .bind(format!("%://{}/%", space.did))
+    .bind(format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    ))
+    .bind(format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey))
     .fetch_all(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to list delegation entries: {e}")))?;
@@ -1145,6 +1149,35 @@ pub async fn nested_row(
     .fetch_optional(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read nested space: {e}")))
+}
+
+/// Remove a space's delegation entries (`is_delegation`) stored under any of
+/// `names`, returning how many there were.
+pub async fn delete_delegation_entries(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    names: &[String],
+) -> Result<u64, AppError> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let sql = adapt_sql(
+        &format!(
+            "DELETE FROM happyview_space_members WHERE space_id = ? AND is_delegation = 1 AND member_did IN ({})",
+            vec!["?"; names.len()].join(", ")
+        ),
+        backend,
+    );
+    let mut query = crate::db::query(&sql).bind(space_id);
+    for name in names {
+        query = query.bind(name);
+    }
+    query
+        .execute(executor)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))
 }
 
 /// Remove every space nested in a space, as discarding its member list does.

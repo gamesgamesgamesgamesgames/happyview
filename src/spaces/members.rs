@@ -164,14 +164,13 @@ async fn delegating_spaces_within(
                 continue;
             };
             let mut parents: Vec<String> = Vec::new();
-            let entries = db::delegation_entries_naming(&mut *conn, backend, &child).await?;
-            budget = budget.checked_sub(entries.len()).ok_or_else(too_large)?;
-            for entry in entries {
+            for entry in db::delegation_entries_naming(&mut *conn, backend, &child).await? {
                 if visited.contains(&entry.space_id) {
                     continue;
                 }
                 let target = target_id(conn, backend, &entry.did).await;
                 if target.ok().flatten().as_deref() == Some(child_id.as_str()) {
+                    budget = budget.checked_sub(1).ok_or_else(too_large)?;
                     parents.push(entry.space_id);
                 }
             }

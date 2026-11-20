@@ -263,6 +263,16 @@ pub(crate) async fn put_space_member(
 ) -> Result<SpaceMember, AppError> {
     let space = service::resolve_space(state, space_ref).await?;
     service::require_space_admin(state, &space, actor).await?;
+    // As `addMember` always answered for a member row of that name.
+    if add
+        && db::get_member(&state.db, state.db_backend, &space.id, member)
+            .await?
+            .is_some()
+    {
+        return Err(AppError::Conflict(
+            "Member already exists in this space".into(),
+        ));
+    }
     if let Some(target) = named_space(state, member).await? {
         require_target_admin(state, &target, actor).await?;
         if target.id != space.id
@@ -276,15 +286,9 @@ pub(crate) async fn put_space_member(
             } else {
                 Change::Put(&reference, &target.id)
             };
-            change_reference(state, &space, change).await?;
-            let (id, created_at) = db::nested_row(
-                &state.db,
-                state.db_backend,
-                &space.id,
-                &reference.target_space_uri,
-            )
-            .await?
-            .ok_or_else(|| AppError::Internal("nested space vanished after nesting".into()))?;
+            let (_, row) = change_reference(state, &space, change).await?;
+            let (id, created_at) =
+                row.ok_or_else(|| AppError::Internal("nested space not stored".into()))?;
             return Ok(SpaceMember {
                 id,
                 space_id: space.id,
@@ -307,30 +311,41 @@ pub(crate) async fn put_space_member(
     }
 }
 
-/// `simplespace` `removeMember`, and the script API's: a space nested under
-/// the name given (an `at://` or `ats://` address, or a space id) is removed,
-/// and so is a member row of that name.
+/// `simplespace` `removeMember`, and the script API's: a space named as a
+/// member (by an `at://` or `ats://` address, or a space id) is removed
+/// whether it was nested or stored as a member row under any of those
+/// names, in one transaction. Anything else is removed as a member.
 pub(crate) async fn remove_space_member(
     state: &AppState,
     actor: &str,
     space_ref: &str,
     member: &str,
 ) -> Result<(), AppError> {
-    let address = match SpaceUri::parse(member) {
-        Ok(uri) => Some(format!(
-            "at://{}/space/{}/{}",
-            uri.did, uri.type_nsid, uri.skey
-        )),
-        Err(_) => named_space(state, member).await?.map(|t| address_of(&t)),
+    let target = named_space(state, member).await?;
+    let address = match (SpaceUri::parse(member), &target) {
+        (Ok(uri), _) => Some((uri.did, uri.type_nsid, uri.skey)),
+        (Err(_), Some(t)) => Some((t.did.clone(), t.type_nsid.clone(), t.skey.clone())),
+        (Err(_), None) => None,
     };
-    if let Some(address) = address {
+    if let Some((did, type_nsid, skey)) = address {
         let space = service::resolve_space(state, space_ref).await?;
         service::require_space_admin(state, &space, actor).await?;
-        if change_reference(state, &space, Change::Remove(&address)).await? {
-            return match service::remove_member(state, actor, space_ref, member).await {
-                Err(AppError::NotFound(_)) => Ok(()),
-                result => result,
-            };
+        let canonical = format!("at://{did}/space/{type_nsid}/{skey}");
+        // Every name a member row could have stored the space under.
+        let mut names = vec![
+            member.to_string(),
+            canonical.clone(),
+            format!("ats://{did}/{type_nsid}/{skey}"),
+        ];
+        if let Some(target) = &target {
+            names.push(target.id.clone());
+        }
+        names.sort();
+        names.dedup();
+        let (removed, _) =
+            change_reference(state, &space, Change::Remove(&canonical, &names)).await?;
+        if removed {
+            return Ok(());
         }
     }
     service::remove_member(state, actor, space_ref, member).await
@@ -345,7 +360,10 @@ pub(crate) async fn remove_nested(
     let uri = SpaceUri::parse(nested)
         .map_err(|_| invalid(format!("{nested:?} is not a space address")))?;
     let address = format!("at://{}/space/{}/{}", uri.did, uri.type_nsid, uri.skey);
-    if !change_reference(state, space, Change::Remove(&address)).await? {
+    if !change_reference(state, space, Change::Remove(&address, &[]))
+        .await?
+        .0
+    {
         return Err(invalid(format!("{address} is not nested in this space")));
     }
     Ok(())
@@ -358,12 +376,15 @@ enum Change<'a> {
     Put(&'a db::NestedRef, &'a str),
     /// A put that refuses a space already nested.
     Add(&'a db::NestedRef, &'a str),
-    Remove(&'a str),
+    /// Remove the reference to an address, and the space's member rows
+    /// naming that space under any of these names.
+    Remove(&'a str, &'a [String]),
 }
 
 /// Make `change` to `space`'s references in one transaction, under the
-/// space's row lock as member changes take it, and return whether anything
-/// changed. A put or an add needs the space, as locked, to be a memberspace.
+/// space's row lock as member changes take it. Returns whether anything
+/// changed, and for a put or an add, the reference's row id and creation
+/// time. A put or an add needs the space, as locked, to be a memberspace.
 ///
 /// In the same transaction: a put or an add that would take the space, or a
 /// space that takes its members, past what resolution reads is refused,
@@ -375,14 +396,14 @@ async fn change_reference(
     state: &AppState,
     space: &Space,
     change: Change<'_>,
-) -> Result<bool, AppError> {
+) -> Result<(bool, Option<(String, String)>), AppError> {
     let backend = state.db_backend;
-    let (changed, revoked) = crate::db::retry_on_busy(|| async {
+    let (changed, row, revoked) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, backend).await?;
         let Some(locked) = db::lock_space(&mut *tx, backend, &space.id).await? else {
             return Ok(Err(space_not_found()));
         };
-        let grows = !matches!(change, Change::Remove(_));
+        let grows = !matches!(change, Change::Remove(..));
         if grows && let Err(e) = require_memberspace(&locked) {
             return Ok(Err(e));
         }
@@ -419,15 +440,33 @@ async fn change_reference(
                     .await
                     .map(|()| true)
             }
-            Change::Remove(address) => {
-                db::delete_nested(&mut *tx, backend, &space.id, address).await
+            Change::Remove(address, names) => {
+                match db::delete_nested(&mut *tx, backend, &space.id, address).await {
+                    Ok(nested) => {
+                        db::delete_delegation_entries(&mut *tx, backend, &space.id, names)
+                            .await
+                            .map(|rows| nested || rows > 0)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         };
         match changed {
             Ok(true) => {}
-            Ok(false) => return Ok(Ok((false, Vec::new()))),
+            Ok(false) => return Ok(Ok((false, None, Vec::new()))),
             Err(e) => return Ok(Err(e)),
         }
+        let row = match change {
+            Change::Put(reference, _) | Change::Add(reference, _) => {
+                match db::nested_row(&mut *tx, backend, &space.id, &reference.target_space_uri)
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+            Change::Remove(..) => None,
+        };
         // Dropping the transaction on a refusal puts the reference back.
         for id in &bounded {
             if let Err(e) = members::resolve_on(&mut tx, backend, id).await {
@@ -439,12 +478,12 @@ async fn change_reference(
             Err(e) => return Ok(Err(e)),
         };
         tx.commit().await?;
-        Ok(Ok((true, revoked)))
+        Ok(Ok((true, row, revoked)))
     })
     .await
     .map_err(|e: sqlx::Error| {
         AppError::Internal(format!("failed to change nested spaces: {e}"))
     })??;
     service::announce_all_revoked(state, revoked);
-    Ok(changed)
+    Ok((changed, row))
 }
