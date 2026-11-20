@@ -1524,6 +1524,49 @@ mod tests {
         );
     }
 
+    /// A script delegating to a space goes through the same check as the
+    /// XRPC methods: the caller must administer the named space too.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn delegating_from_a_script_requires_administering_the_space() {
+        require_test_db!();
+        let (state, x_uri, x_admin) = db_seeded_space().await;
+        let (_, y_uri, _) = db_seeded_space().await;
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(&lua, state_arc.clone(), Some(&x_admin))
+            .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&x_admin)).unwrap();
+
+        let chunk = format!(
+            r#"
+                local space = atproto.spaces.get("{x_uri}")
+                local added = pcall(function()
+                    return space:add_member{{ did = "{y_uri}", access = "read", is_delegation = true }}
+                end)
+                local put = pcall(function()
+                    return space:put_member{{ did = "{y_uri}", read = true, write = false, is_delegation = true }}
+                end)
+                return {{ added, put }}
+            "#
+        );
+        let (added, put): (bool, bool) = {
+            let t: mlua::Table = lua.load(&chunk).eval_async().await.unwrap();
+            (t.get(1).unwrap(), t.get(2).unwrap())
+        };
+        assert!(!added, "add_member should be refused");
+        assert!(!put, "put_member should be refused");
+
+        let x = crate::spaces::service::resolve_space(&state_arc, &x_uri)
+            .await
+            .unwrap();
+        let row = crate::spaces::db::get_member(&state_arc.db, state_arc.db_backend, &x.id, &y_uri)
+            .await
+            .unwrap();
+        assert!(row.is_none(), "nothing is stored");
+    }
+
     /// A `read`-access member can perform read operations (`query`,
     /// `members`) but is rejected by `write_record`/`delete_record`, which
     /// both call `require_membership(..., write=true)`. `SpaceAccess::can_write()`

@@ -938,6 +938,59 @@ async fn revoke_member_credentials(
     Ok(())
 }
 
+/// Store a member as `put_member` and `add_member` do. A space-as-member
+/// entry (`is_delegation`) brings in the named space's members, so adding one
+/// that names a space on this host requires administering that space too. An
+/// entry naming a space that isn't here is stored as it always was, and
+/// brings in no members.
+///
+/// Putting an entry that already brings in members again, with the same
+/// access, keeps it as it is without asking again, so a client re-sending a
+/// space's whole member list goes on working. Any change to its access needs
+/// the named space's administrator, as a new entry does.
+async fn store_member(
+    state: &AppState,
+    actor_did: &str,
+    member: &SpaceMember,
+) -> Result<(), AppError> {
+    if !member.is_delegation {
+        return db::add_member(&state.db, state.db_backend, member).await;
+    }
+    if unchanged_consented_delegation(state, member).await? {
+        return db::add_delegation(&state.db, state.db_backend, member, true).await;
+    }
+    let target =
+        crate::spaces::members::delegation_target(&state.db, state.db_backend, &member.did).await?;
+    if let Some(target) = &target {
+        require_space_admin(state, target, actor_did)
+            .await
+            .map_err(|e| match e {
+                AppError::Forbidden(_) => {
+                    AppError::Forbidden("delegating to a space requires administering it".into())
+                }
+                other => other,
+            })?;
+    }
+    db::add_delegation(&state.db, state.db_backend, member, target.is_some()).await
+}
+
+/// Whether `member` is already stored, unchanged, as an entry that brings in
+/// the named space's members.
+async fn unchanged_consented_delegation(
+    state: &AppState,
+    member: &SpaceMember,
+) -> Result<bool, AppError> {
+    let stored = db::get_member(&state.db, state.db_backend, &member.space_id, &member.did).await?;
+    if !stored.is_some_and(|m| m.is_delegation && m.access == member.access) {
+        return Ok(false);
+    }
+    Ok(
+        db::consented_delegations(&state.db, state.db_backend, &member.space_id)
+            .await?
+            .contains(&member.did),
+    )
+}
+
 pub(crate) async fn put_member(
     state: &AppState,
     actor_did: &str,
@@ -965,7 +1018,7 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    store_member(state, actor_did, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
@@ -1000,7 +1053,7 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    db::add_member(&state.db, state.db_backend, &member).await?;
+    store_member(state, actor_did, &member).await?;
     Ok(member)
 }
 
