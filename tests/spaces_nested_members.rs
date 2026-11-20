@@ -446,6 +446,67 @@ async fn only_a_local_memberspace_can_be_nested() {
 
 #[tokio::test]
 #[serial]
+async fn nesting_requires_administering_the_nested_space() {
+    common::require_db!();
+    let app = setup().await;
+    let (x, y) = (rand_did("x"), rand_did("y"));
+    let member = rand_did("member");
+    let xs = create(&app, &x, memberspace(json!({ "publishMembers": true }))).await;
+    let ys = create(&app, &y, memberspace(json!({}))).await;
+    put_members(
+        &app,
+        &y,
+        &ys,
+        json!([{ "did": member, "read": true, "write": true }]),
+    )
+    .await;
+
+    // Every way of nesting Y's space in X's is refused.
+    for (nsid, body) in [
+        (
+            "dev.happyview.space.putNestedSpace",
+            json!({ "space": xs, "nested": ys, "read": true, "write": false }),
+        ),
+        (
+            "com.atproto.simplespace.putMember",
+            json!({ "space": xs, "did": ys, "read": true, "write": false }),
+        ),
+        (
+            "com.atproto.simplespace.addMember",
+            json!({ "space": xs, "did": ys }),
+        ),
+    ] {
+        let (status, body) = post(&app, &x, nsid, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{nsid}: {body}");
+    }
+    let (status, body) = get(
+        &app,
+        &x,
+        &format!(
+            "/xrpc/dev.happyview.space.listNestedSpaces?space={}",
+            urlencoding::encode(&xs)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["nested"], json!([]));
+    assert!(entry(&members(&app, &x, &xs).await, &member).is_none());
+    assert!(entry(&listed(&app, &x, &xs).await, &member).is_none());
+    assert!(published(&app, &xs).await.iter().all(|r| r.0 != member));
+
+    // Nor can Y, who administers the nested space but not X's.
+    let (status, body) = post(
+        &app,
+        &y,
+        "dev.happyview.space.putNestedSpace",
+        json!({ "space": xs, "nested": ys, "read": true, "write": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+#[serial]
 async fn removing_a_member_known_only_through_a_nested_space_fails_the_batch() {
     common::require_db!();
     let app = setup().await;

@@ -4,6 +4,7 @@
 //! most the access the reference grants. Membership is resolved when it is
 //! checked ([`crate::spaces::members`]); nothing is copied. A space's
 //! `listMembers` and published member records hold its own members only.
+//! Nesting a space requires administering it.
 //!
 //! Only spaces on this host can be nested for now.
 
@@ -149,8 +150,10 @@ fn require_memberspace(space: &Space) -> Result<(), AppError> {
 }
 
 /// The canonical address of a space to nest, which must be a memberspace on
-/// this host.
-async fn local_target(state: &AppState, nested: &str) -> Result<String, AppError> {
+/// this host that `actor` administers: nesting a space gives the nesting
+/// space's members-to-be the nested space's members, so it takes the nested
+/// space's administrator to allow it.
+async fn local_target(state: &AppState, actor: &str, nested: &str) -> Result<String, AppError> {
     let uri = SpaceUri::parse(nested)
         .map_err(|_| invalid(format!("{nested:?} is not a space address")))?;
     let target = db::get_space_by_address(
@@ -166,6 +169,16 @@ async fn local_target(state: &AppState, nested: &str) -> Result<String, AppError
             "{nested} is not a space on this host; only local spaces can be nested for now"
         ))
     })?;
+    service::require_space_admin(state, &target, actor)
+        .await
+        .map_err(|e| match e {
+            AppError::Forbidden(_) => AppError::XrpcError {
+                status: StatusCode::FORBIDDEN,
+                code: "NotAuthorized",
+                message: "nesting a space requires administering it".into(),
+            },
+            e => e,
+        })?;
     require_memberspace(&target).map_err(|_| AppError::XrpcError {
         status: StatusCode::BAD_REQUEST,
         code: "PolicyMismatch",
@@ -179,7 +192,8 @@ async fn local_target(state: &AppState, nested: &str) -> Result<String, AppError
 }
 
 /// Nest a space, or replace the access its reference grants. The caller has
-/// checked that `actor` may manage `space`.
+/// checked that `actor` may manage `space`; `actor` must administer the
+/// nested space too.
 pub(crate) async fn put_nested(
     state: &AppState,
     actor: &str,
@@ -189,7 +203,7 @@ pub(crate) async fn put_nested(
     write: bool,
 ) -> Result<(), AppError> {
     require_memberspace(space)?;
-    let target = local_target(state, nested).await?;
+    let target = local_target(state, actor, nested).await?;
     let reference = db::NestedRef {
         target_space_uri: target,
         read,
