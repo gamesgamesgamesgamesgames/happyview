@@ -945,9 +945,10 @@ async fn revoke_member_credentials(
 /// brings in no members.
 ///
 /// Putting an entry that already brings in members again, with the same
-/// access, keeps it as it is without asking again, so a client re-sending a
-/// space's whole member list goes on working. Any change to its access needs
-/// the named space's administrator, as a new entry does.
+/// access and naming the same space, keeps it as it is without asking again,
+/// so a client re-sending a space's whole member list goes on working. Any
+/// change to its access needs the named space's administrator, as a new
+/// entry does.
 async fn store_member(
     state: &AppState,
     actor_did: &str,
@@ -956,29 +957,34 @@ async fn store_member(
     if !member.is_delegation {
         return db::add_member(&state.db, state.db_backend, member).await;
     }
-    if unchanged_consented_delegation(state, member).await? {
-        return db::add_delegation(&state.db, state.db_backend, member, true).await;
-    }
     let target =
         crate::spaces::members::delegation_target(&state.db, state.db_backend, &member.did).await?;
-    if let Some(target) = &target {
-        require_space_admin(state, target, actor_did)
-            .await
-            .map_err(|e| match e {
-                AppError::Forbidden(_) => {
-                    AppError::Forbidden("delegating to a space requires administering it".into())
-                }
-                other => other,
-            })?;
-    }
-    db::add_delegation(&state.db, state.db_backend, member, target.is_some()).await
+    let consent = match &target {
+        None => db::DelegationConsent::None,
+        Some(target) => match require_space_admin(state, target, actor_did).await {
+            Ok(()) => db::DelegationConsent::Granted(&target.id),
+            Err(AppError::Forbidden(_))
+                if unchanged_consented_delegation(state, member, &target.id).await? =>
+            {
+                db::DelegationConsent::Kept
+            }
+            Err(AppError::Forbidden(_)) => {
+                return Err(AppError::Forbidden(
+                    "delegating to a space requires administering it".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    db::add_delegation(&state.db, state.db_backend, member, consent).await
 }
 
 /// Whether `member` is already stored, unchanged, as an entry that brings in
-/// the named space's members.
+/// the members of the space `target_id`.
 async fn unchanged_consented_delegation(
     state: &AppState,
     member: &SpaceMember,
+    target_id: &str,
 ) -> Result<bool, AppError> {
     let stored = db::get_member(&state.db, state.db_backend, &member.space_id, &member.did).await?;
     if !stored.is_some_and(|m| m.is_delegation && m.access == member.access) {
@@ -987,7 +993,8 @@ async fn unchanged_consented_delegation(
     Ok(
         db::consented_delegations(&state.db, state.db_backend, &member.space_id)
             .await?
-            .contains(&member.did),
+            .get(&member.did)
+            .is_some_and(|id| id == target_id),
     )
 }
 

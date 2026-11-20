@@ -267,27 +267,36 @@ async fn an_entry_naming_a_space_not_here_brings_in_nothing() {
     assert!(!is_member(&app, &x, &remote_member).await);
 }
 
-/// An entry the named space's administrator added, stored with its consent.
-async fn add_consented(app: &TestApp, space_id: &str, reference: &str, granted_by: &str) {
-    let member = SpaceMember {
+/// An entry stored with the consent of the space `target`, as one its
+/// administrator added.
+async fn add_consented(app: &TestApp, space_id: &str, reference: &str, target: &str) {
+    spaces_db::add_delegation(
+        &app.state.db,
+        app.state.db_backend,
+        &delegation(space_id, reference),
+        spaces_db::DelegationConsent::Granted(target),
+    )
+    .await
+    .unwrap();
+}
+
+fn delegation(space_id: &str, reference: &str) -> SpaceMember {
+    SpaceMember {
         id: Uuid::new_v4().to_string(),
         space_id: space_id.to_string(),
         did: reference.to_string(),
         access: MemberAccess::READ,
         is_delegation: true,
-        granted_by: Some(granted_by.to_string()),
+        granted_by: None,
         created_at: now_rfc3339(),
-    };
-    spaces_db::add_delegation(&app.state.db, app.state.db_backend, &member, true)
-        .await
-        .unwrap();
+    }
 }
 
 async fn consented(app: &TestApp, space_id: &str, reference: &str) -> bool {
     spaces_db::consented_delegations(&app.state.db, app.state.db_backend, space_id)
         .await
         .unwrap()
-        .contains(reference)
+        .contains_key(reference)
 }
 
 /// Putting an entry that already brings in members again, unchanged, keeps it
@@ -304,7 +313,7 @@ async fn putting_a_consented_entry_again_unchanged_keeps_it() {
     let (y, y_addr) = create_space(&app, &y_owner).await;
     add_row(&app, &y, &y_member, false, &y_owner).await;
     // Added by the instance's super admin, who administers both.
-    add_consented(&app, &x, &y_addr, &app.admin_did).await;
+    add_consented(&app, &x, &y_addr, &y).await;
     assert!(is_member(&app, &x, &y_member).await);
 
     let put = |read: bool, write: bool, did: &str| json!({ "space": x_addr, "did": did, "read": read, "write": write, "isDelegation": true });
@@ -387,7 +396,7 @@ async fn a_nested_entry_brings_in_members_only_when_consented() {
     let (z, z_addr) = create_space(&app, &z_owner).await;
     add_row(&app, &y, &y_member, false, &owner).await;
     add_row(&app, &z, &z_member, false, &z_owner).await;
-    add_consented(&app, &x, &y_addr, &owner).await;
+    add_consented(&app, &x, &y_addr, &y).await;
     add_row(&app, &y, &z_addr, true, &owner).await;
 
     assert!(is_member(&app, &x, &y_member).await);
@@ -447,14 +456,107 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
         }
     };
     let backfill = &migration[migration.find("UPDATE").unwrap()..];
-    happyview::db::query(backfill)
-        .execute(&app.state.db)
-        .await
-        .unwrap();
+    for statement in backfill.split(';').filter(|s| !s.trim().is_empty()) {
+        happyview::db::query(statement)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
 
     assert!(!is_member(&app, &unconsented, &y_member).await);
     assert!(is_member(&app, &by_target, &y_member).await);
     assert!(is_member(&app, &same_creator, &y_member).await);
     assert!(is_member(&app, &by_super, &y_member).await);
     assert!(!is_member(&app, &wildcard, &z_member).await);
+}
+
+/// An entry brings in the members of the space it was added for, not of
+/// whatever space takes that address after it is deleted.
+#[tokio::test]
+#[serial]
+async fn an_entry_stops_when_the_space_it_names_is_deleted() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, other) = (rand_did("o"), rand_did("other"));
+    let (y_member, other_member) = (rand_did("ym"), rand_did("om"));
+    let host = rand_did("h");
+    let (x, _) = create_space(&app, &owner).await;
+
+    // Deleted through deleteSpace, then taken by another user at the same
+    // address.
+    let skey = Uuid::new_v4().simple().to_string();
+    let (y, y_addr) = create_space_at(&app, &owner, &host, &skey).await;
+    add_row(&app, &y, &y_member, false, &owner).await;
+    add_consented(&app, &x, &y_addr, &y).await;
+    assert!(is_member(&app, &x, &y_member).await);
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.deleteSpace",
+        json!({ "space": y_addr }),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(!consented(&app, &x, &y_addr).await);
+    let (again, again_addr) = create_space_at(&app, &other, &host, &skey).await;
+    assert_eq!(again_addr, y_addr);
+    add_row(&app, &again, &other_member, false, &other).await;
+    assert!(!is_member(&app, &x, &other_member).await);
+
+    // Gone some other way: the entry is still stored as consented, but names
+    // a different space now.
+    let skey = Uuid::new_v4().simple().to_string();
+    let (w, w_addr) = create_space_at(&app, &owner, &host, &skey).await;
+    add_consented(&app, &x, &w_addr, &w).await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "DELETE FROM happyview_spaces WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(&w)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let (again, _) = create_space_at(&app, &other, &host, &skey).await;
+    add_row(&app, &again, &other_member, false, &other).await;
+    assert!(consented(&app, &x, &w_addr).await);
+    assert!(!is_member(&app, &x, &other_member).await);
+}
+
+/// Keeping an entry's consent is decided in the write: an entry that has none
+/// by then, or is gone, is stored with none.
+#[tokio::test]
+#[serial]
+async fn keeping_consent_needs_it_at_write_time() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("o");
+    let (x, _) = create_space(&app, &owner).await;
+    let (y, y_addr) = create_space(&app, &owner).await;
+    let keep = |member: SpaceMember| {
+        let (db, backend) = (app.state.db.clone(), app.state.db_backend);
+        async move {
+            spaces_db::add_delegation(&db, backend, &member, spaces_db::DelegationConsent::Kept)
+                .await
+                .unwrap();
+            true
+        }
+    };
+
+    // No entry: stored without consent.
+    assert!(keep(delegation(&x, &y_addr)).await);
+    assert!(stored(&app, &x, &y_addr).await);
+    assert!(!consented(&app, &x, &y_addr).await);
+
+    // An entry without consent stays without.
+    assert!(keep(delegation(&x, &y_addr)).await);
+    assert!(!consented(&app, &x, &y_addr).await);
+
+    // A consented entry, unchanged, keeps it; with other access, loses it.
+    add_consented(&app, &x, &y_addr, &y).await;
+    assert!(keep(delegation(&x, &y_addr)).await);
+    assert!(consented(&app, &x, &y_addr).await);
+    let mut changed = delegation(&x, &y_addr);
+    changed.access = MemberAccess::WRITE;
+    assert!(keep(changed).await);
+    assert!(!consented(&app, &x, &y_addr).await);
 }
