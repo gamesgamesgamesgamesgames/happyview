@@ -143,10 +143,20 @@ pub async fn delegating_spaces(
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<String>, AppError> {
+    delegating_spaces_within(conn, backend, space_id, MAX_RESOLVED).await
+}
+
+/// [`delegating_spaces`], reading at most `budget` entries.
+async fn delegating_spaces_within(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    budget: usize,
+) -> Result<Vec<String>, AppError> {
+    let mut budget = budget;
     let mut visited: HashSet<String> = HashSet::from([space_id.to_string()]);
     let mut found: Vec<String> = Vec::new();
     let mut frontier = vec![space_id.to_string()];
-    let mut budget = MAX_RESOLVED;
     for _ in 1..MAX_DELEGATION_DEPTH {
         let mut next = Vec::new();
         for child_id in &frontier {
@@ -386,6 +396,62 @@ pub async fn is_member(
 #[cfg(test)]
 mod tests {
     use super::covers;
+
+    /// The reverse lookup stops at its budget, by name, rather than answer
+    /// with part of the list.
+    #[tokio::test]
+    async fn the_reverse_lookup_is_bounded() {
+        use crate::spaces::db;
+        use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        let space = |n: usize| Space {
+            id: format!("space{n}"),
+            did: format!("did:plc:space{n}"),
+            authority_did: format!("did:plc:space{n}"),
+            creator_did: "did:plc:owner".into(),
+            type_nsid: "com.example.forum".into(),
+            skey: format!("s{n}"),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::default(),
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: crate::db::now_rfc3339(),
+            updated_at: crate::db::now_rfc3339(),
+        };
+        let nested = space(0);
+        db::create_space(&pool, backend, &nested).await.unwrap();
+        for n in 1..=4 {
+            db::create_space(&pool, backend, &space(n)).await.unwrap();
+            db::upsert_nested(
+                &pool,
+                backend,
+                &format!("space{n}"),
+                &nested.id,
+                &db::NestedRef {
+                    target_space_uri: "at://did:plc:space0/space/com.example.forum/s0".into(),
+                    read: true,
+                    write: false,
+                    added_by: None,
+                    created_at: crate::db::now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        let found = super::delegating_spaces_within(&mut conn, backend, &nested.id, 4)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 4);
+        let err = super::delegating_spaces_within(&mut conn, backend, &nested.id, 3)
+            .await
+            .expect_err("past the budget");
+        assert!(super::is_too_large(&err), "{err:?}");
+    }
 
     #[test]
     fn no_cap_covers_every_cap() {
