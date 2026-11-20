@@ -187,6 +187,8 @@ pub(crate) async fn sync_in(
         ),
     };
     if publish_members {
+        // The space's own members only; nested spaces' members are not
+        // published here.
         for (did, access) in
             db::direct_member_access(&mut *conn, backend, &space.id, only_dids).await?
         {

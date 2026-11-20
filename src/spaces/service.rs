@@ -984,10 +984,11 @@ fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
 }
 
 /// Who read a space through its member list before a change to its members,
-/// and which spaces take its members through delegation entries, as read in
-/// the change's transaction, under the space's row lock, before the change.
-/// [`revoke_lost_readers`] takes it once the change is made.
-struct Readers {
+/// and which spaces take its members through delegation entries or nested
+/// references, as read in the change's transaction, under the space's row
+/// lock, before the change. [`revoke_lost_readers`] takes it once the change
+/// is made.
+pub(crate) struct Readers {
     space_id: String,
     readers: std::collections::HashSet<String>,
     delegating: Vec<String>,
@@ -1008,27 +1009,60 @@ async fn member_list_readers(
         .collect())
 }
 
-async fn readers_before(
+impl Readers {
+    /// The spaces that took the space's members before the change.
+    pub(crate) fn delegating(&self) -> &[String] {
+        &self.delegating
+    }
+}
+
+pub(crate) async fn readers_before(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Readers, AppError> {
+    let delegating = members::delegating_spaces(conn, backend, space_id).await?;
+    let readers = match member_list_readers(conn, backend, space_id).await {
+        Ok(readers) => readers,
+        // A space past the resolution bound admits no one now, but anyone
+        // holding one of its credentials was admitted before it grew, so
+        // they count as its readers. Otherwise a change that brings the
+        // space back within the bound couldn't be made. A space that takes
+        // its members may still resolve, reading less of it than the bound
+        // stops at, so its readers count too.
+        Err(e) if members::is_too_large(&e) => {
+            let mut readers: std::collections::HashSet<String> =
+                db::outstanding_credential_subjects(&mut *conn, backend, space_id)
+                    .await?
+                    .into_iter()
+                    .collect();
+            for id in &delegating {
+                match member_list_readers(conn, backend, id).await {
+                    Ok(theirs) => readers.extend(theirs),
+                    Err(e) if members::is_too_large(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            readers
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Readers {
         space_id: space_id.to_string(),
-        readers: member_list_readers(conn, backend, space_id).await?,
-        delegating: members::delegating_spaces(conn, backend, space_id).await?,
+        readers,
+        delegating,
     })
 }
 
 /// Credentials revoked in a space, for [`announce_all_revoked`] once the
 /// transaction commits.
-type Revoked = Vec<(Space, Vec<String>)>;
+pub(crate) type Revoked = Vec<(Space, Vec<String>)>;
 
 /// After a change to a space's members, revoke, in the caller's transaction,
 /// the credentials of every DID the space no longer admits, in the space and
-/// in every space that takes its members through delegation entries,
-/// directly or through others. A credential for one of those spaces may have
-/// been issued because its subject was a member here.
+/// in every space that takes its members through delegation entries or
+/// nested references, directly or through others. A credential for one of
+/// those spaces may have been issued because its subject was a member here.
 ///
 /// Only the DIDs that read the space before the change and no longer do are
 /// looked at, and each keeps its credentials for a space that still admits
@@ -1039,11 +1073,14 @@ type Revoked = Vec<(Space, Vec<String>)>;
 /// resolved again under the locks, so a change to one of them waits for this
 /// one, and the lookup is repeated until it finds no space not yet locked.
 ///
+/// A space past the resolution bound admits no one, so every DID in question
+/// loses its credentials there, as an access check would refuse them.
+///
 /// Issuing a credential locks top-down (the space, then the spaces it
 /// delegates to) and this locks bottom-up, so the two can deadlock on
 /// Postgres. Postgres then fails one of them, and `retry_on_busy` runs it
 /// again.
-async fn revoke_lost_readers(
+pub(crate) async fn revoke_lost_readers(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     before: Readers,
@@ -1060,7 +1097,7 @@ async fn revoke_lost_readers(
     }
     let now = app!(db::get_space(&mut *conn, backend, &before.space_id).await);
     let after = match &now {
-        Some(_) => app!(member_list_readers(conn, backend, &before.space_id).await),
+        Some(_) => app!(readers_or_none(conn, backend, &before.space_id).await),
         None => Default::default(),
     };
     let mut lost: Vec<String> = before.readers.difference(&after).cloned().collect();
@@ -1102,7 +1139,7 @@ async fn revoke_lost_readers(
         }
         let readers = match readers {
             Some(readers) => readers,
-            None => app!(member_list_readers(conn, backend, &space.id).await),
+            None => app!(readers_or_none(conn, backend, &space.id).await),
         };
         let mut jtis = Vec::new();
         for did in &lost {
@@ -1120,8 +1157,21 @@ async fn revoke_lost_readers(
     Ok(Ok(revoked))
 }
 
+/// [`member_list_readers`], with none for a space past the resolution bound:
+/// its access checks refuse everyone.
+async fn readers_or_none(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    match member_list_readers(conn, backend, space_id).await {
+        Err(e) if members::is_too_large(&e) => Ok(Default::default()),
+        result => result,
+    }
+}
+
 /// [`announce_revoked`] for each space in `revoked`.
-fn announce_all_revoked(state: &AppState, revoked: Revoked) {
+pub(crate) fn announce_all_revoked(state: &AppState, revoked: Revoked) {
     for (space, jtis) in revoked {
         announce_revoked(state, &space, jtis);
     }
@@ -1386,6 +1436,10 @@ pub(crate) async fn store_space(
             if let Err(e) = db::remove_all_members(&mut *tx, backend, &space.id).await {
                 return Ok(Err(e));
             }
+            // Nested spaces are part of the list too.
+            if let Err(e) = db::delete_all_nested(&mut *tx, backend, &space.id).await {
+                return Ok(Err(e));
+            }
             // An outstanding invite would add a member once accepted.
             if let Err(e) = db::delete_invites(&mut *tx, backend, &space.id).await {
                 return Ok(Err(e));
@@ -1410,7 +1464,8 @@ pub(crate) async fn store_space(
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to store space: {e}")))??;
     announce_revoked(state, space, jtis);
     announce_all_revoked(state, delegated);
-    after_publish(state, space, scope, signing_key.is_some(), published).await
+    after_publish(state, space, scope, signing_key.is_some(), published).await?;
+    Ok(())
 }
 
 /// The signing key a write needs to bring `space`'s published records into
@@ -1486,6 +1541,14 @@ pub(crate) async fn delete_space(
             Err(e) => return Ok(Err(e)),
         };
         if let Err(e) = db::delete_space(&mut *tx, backend, &space.id).await {
+            return Ok(Err(e));
+        }
+        // Spaces that nested this one stop naming it.
+        let address = format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        );
+        if let Err(e) = db::delete_nested_naming(&mut *tx, backend, &space.id, &address).await {
             return Ok(Err(e));
         }
         let delegated = match revoke_lost_readers(&mut tx, backend, before).await? {
@@ -1654,12 +1717,37 @@ pub(crate) async fn remove_members(
 ) -> Result<Vec<String>, AppError> {
     require_memberspace(space)?;
     require_dids(dids.iter().map(String::as_str))?;
+    // A DID that is a member only through a nested space can't be removed
+    // here: the whole batch fails, naming where it comes from.
+    let effective = {
+        let mut conn = state
+            .db
+            .acquire()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+        members::resolve_on(&mut conn, state.db_backend, &space.id).await?
+    };
+    for did in &dids {
+        if let Some(entry) = effective.get(did)
+            && !entry.direct
+        {
+            return Err(AppError::XrpcError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "InvalidRequest",
+                message: format!(
+                    "{did} is a member through the nested space {}; remove it there, or \
+                     remove the nested space",
+                    entry.via.as_deref().unwrap_or("it nests")
+                ),
+            });
+        }
+    }
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, space, scope).await?;
     // The removals and their credential revocations commit together, so a
     // request that fails after them can't leave a removed member's credentials
     // standing for a retry to miss. Only telling the verifying hosts waits for
     // the commit.
-    let scope = publish::Scope::Members(&dids);
-    let signing_key = publish_key(state, space, scope).await?;
     let (locked, removed, published, jtis, delegated) = crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
         // A space deleted since it was resolved has nothing left to remove
@@ -2188,6 +2276,132 @@ mod tests {
                 "{name}: {announced:?}"
             );
         }
+    }
+
+    /// Removing a nested space announces the credentials it revokes in the
+    /// nesting space, once the removal commits.
+    #[tokio::test]
+    async fn removing_a_nested_space_announces_its_revocations() {
+        require_test_db!();
+        let (state, inner_uri, _admin) = service_test_db().await;
+        let inner = resolve_space(&state, &inner_uri).await.unwrap();
+        let reader = format!("did:plc:reader{}", uuid::Uuid::new_v4().simple());
+        db::add_member(
+            &state.db,
+            state.db_backend,
+            &SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: inner.id.clone(),
+                did: reader.clone(),
+                access: MemberAccess::READ,
+                is_delegation: false,
+                granted_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let outer = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: format!("did:plc:outer{unique}"),
+            authority_did: format!("did:plc:outer{unique}"),
+            creator_did: format!("did:plc:outer{unique}"),
+            skey: format!("outer{unique}"),
+            ..inner.clone()
+        };
+        db::create_space(&state.db, state.db_backend, &outer)
+            .await
+            .unwrap();
+        db::upsert_nested(
+            &state.db,
+            state.db_backend,
+            &outer.id,
+            &inner.id,
+            &db::NestedRef {
+                target_space_uri: inner_uri.clone(),
+                read: true,
+                write: false,
+                added_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let jti = format!("jti{unique}");
+        crate::db::query(&adapt_sql(
+            "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&outer.id)
+        .bind(&reader)
+        .bind(format!("hash{unique}"))
+        .bind(&jti)
+        .bind("9999-12-31T00:00:00+00:00")
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        ANNOUNCED_REVOKED.with(|a| a.borrow_mut().clear());
+        crate::spaces::nested::remove_nested(&state, &outer, &inner_uri)
+            .await
+            .unwrap();
+        let announced = ANNOUNCED_REVOKED.with(|a| a.borrow().clone());
+        assert_eq!(announced, vec![(outer.id.clone(), vec![jti])]);
+    }
+
+    /// Nesting checks the nesting space's policy as it stands under its row
+    /// lock, not as it was read before.
+    #[tokio::test]
+    async fn nesting_follows_a_policy_change_that_commits_first() {
+        require_test_db!();
+        let (state, inner_uri, admin) = service_test_db().await;
+        let inner = resolve_space(&state, &inner_uri).await.unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let outer = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: format!("did:plc:outer{unique}"),
+            skey: format!("outer{unique}"),
+            ..inner.clone()
+        };
+        db::create_space(&state.db, state.db_backend, &outer)
+            .await
+            .unwrap();
+        let managed = Space {
+            read_policy: Policy::ManagingApp {
+                managing_app: "did:plc:app".into(),
+            },
+            write_policy: Policy::ManagingApp {
+                managing_app: "did:plc:app".into(),
+            },
+            ..outer.clone()
+        };
+        db::update_space(&state.db, state.db_backend, &managed)
+            .await
+            .unwrap();
+
+        // `outer` as read before the change.
+        let result =
+            crate::spaces::nested::put_nested(&state, &admin, &outer, &inner_uri, true, false)
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(AppError::XrpcError {
+                    code: "PolicyMismatch",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            db::list_nested(&state.db, state.db_backend, &outer.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

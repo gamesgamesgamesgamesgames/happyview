@@ -673,20 +673,24 @@ pub async fn revoke_space_credentials_except(
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
 }
 
-/// The delegation entries (`is_delegation`) that may name `space`, by its id
-/// or by an address on its DID. The address match is loose; the caller
-/// resolves each entry to confirm it names `space`.
+/// The delegation entries (`is_delegation`) that name `space`: by its id, its
+/// `at://` address, or its legacy `ats://` address. The caller still resolves
+/// each entry to confirm it names `space`.
 pub async fn delegation_entries_naming(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space: &Space,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let rows: Vec<MemberRow> = crate::db::query_as(&adapt_sql(
-        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND (member_did = ? OR member_did LIKE ?) ORDER BY space_id",
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND member_did IN (?, ?, ?) ORDER BY space_id",
         backend,
     ))
     .bind(&space.id)
-    .bind(format!("%://{}/%", space.did))
+    .bind(format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    ))
+    .bind(format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey))
     .fetch_all(executor)
     .await
     .map_err(|e| AppError::Internal(format!("failed to list delegation entries: {e}")))?;
@@ -787,6 +791,24 @@ pub async fn outstanding_credential_jtis(
     .await
     .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+/// The accounts holding outstanding credentials for a space.
+pub async fn outstanding_credential_subjects(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT DISTINCT issued_to FROM happyview_space_credentials WHERE space_id = ? AND revoked_at IS NULL AND expires_at > ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(now_rfc3339())
+    .fetch_all(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list credential holders: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
 /// The members whose repos in a space are hosted on their own PDS.
@@ -1015,7 +1037,6 @@ pub async fn direct_member_access(
         .map(|r| parse_member_row(r).map(|m| (m.did, m.access)))
         .collect()
 }
-
 /// One repo's records in one collection of a space, in the caller's
 /// transaction. With `rkeys`, just those records.
 pub async fn repo_collection_records(
@@ -1049,6 +1070,179 @@ pub async fn repo_collection_records(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))?;
     rows.into_iter().map(parse_record_row).collect()
+}
+
+/// A space nested in another: its members are members of the nesting space,
+/// with at most `read` and `write`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedRef {
+    #[serde(rename = "space")]
+    pub target_space_uri: String,
+    pub read: bool,
+    pub write: bool,
+    pub added_by: Option<String>,
+    pub created_at: String,
+}
+
+/// Nest `target_space_uri`, the address of the space `target_space_id`, in a
+/// space, or replace the access an existing reference grants.
+pub async fn upsert_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    target_space_id: &str,
+    reference: &NestedRef,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_nested (id, space_id, target_space_uri, target_space_id, can_read, can_write, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, target_space_uri) DO UPDATE SET target_space_id = excluded.target_space_id, can_read = excluded.can_read, can_write = excluded.can_write, added_by = excluded.added_by",
+        backend,
+    ))
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(space_id)
+    .bind(&reference.target_space_uri)
+    .bind(target_space_id)
+    .bind(i32::from(reference.read))
+    .bind(i32::from(reference.write))
+    .bind(&reference.added_by)
+    .bind(&reference.created_at)
+    .execute(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to nest space: {e}")))?;
+    Ok(())
+}
+
+/// Remove a nested space, returning whether it was there.
+pub async fn delete_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    target_space_uri: &str,
+) -> Result<bool, AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE space_id = ? AND target_space_uri = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(target_space_uri)
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected() > 0)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested space: {e}")))
+}
+
+/// A nested reference's row id and creation time, if the space has one to
+/// `target_space_uri`.
+pub async fn nested_row(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    target_space_uri: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    crate::db::query_as(&adapt_sql(
+        "SELECT id, created_at FROM happyview_space_nested WHERE space_id = ? AND target_space_uri = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(target_space_uri)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read nested space: {e}")))
+}
+
+/// Remove a space's delegation entries (`is_delegation`) stored under any of
+/// `names`, returning how many there were.
+pub async fn delete_delegation_entries(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+    names: &[String],
+) -> Result<u64, AppError> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let sql = adapt_sql(
+        &format!(
+            "DELETE FROM happyview_space_members WHERE space_id = ? AND is_delegation = 1 AND member_did IN ({})",
+            vec!["?"; names.len()].join(", ")
+        ),
+        backend,
+    );
+    let mut query = crate::db::query(&sql).bind(space_id);
+    for name in names {
+        query = query.bind(name);
+    }
+    query
+        .execute(executor)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| AppError::Internal(format!("failed to remove members: {e}")))
+}
+
+/// Remove every space nested in a space, as discarding its member list does.
+pub async fn delete_all_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .execute(executor)
+    .await
+    .map(drop)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested spaces: {e}")))
+}
+
+/// Remove every reference that nests a space, by its id or its address, as
+/// deleting the space does.
+pub async fn delete_nested_naming(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    target_space_id: &str,
+    target_space_uri: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_nested WHERE target_space_id = ? OR target_space_uri = ?",
+        backend,
+    ))
+    .bind(target_space_id)
+    .bind(target_space_uri)
+    .execute(executor)
+    .await
+    .map(drop)
+    .map_err(|e| AppError::Internal(format!("failed to remove nested spaces: {e}")))
+}
+
+/// The spaces nested in a space, by address.
+pub async fn list_nested(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<NestedRef>, AppError> {
+    let rows: Vec<(String, i32, i32, Option<String>, String)> = crate::db::query_as(&adapt_sql(
+        "SELECT target_space_uri, can_read, can_write, added_by, created_at FROM happyview_space_nested WHERE space_id = ? ORDER BY target_space_uri ASC",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list nested spaces: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(target_space_uri, read, write, added_by, created_at)| NestedRef {
+                target_space_uri,
+                read: read != 0,
+                write: write != 0,
+                added_by,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 pub async fn list_spaces_for_member(
