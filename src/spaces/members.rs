@@ -64,18 +64,19 @@ fn resolve_members_recursive<'a>(
         let consented = if direct_members.iter().any(|m| m.is_delegation) {
             db::consented_delegations(pool, backend, space_id).await?
         } else {
-            HashSet::new()
+            HashMap::new()
         };
 
         for member in direct_members {
             if member.is_delegation {
                 // Only an entry added by someone who administers the named
-                // space brings its members in.
-                if !consented.contains(&member.did) {
+                // space brings its members in, and only while it names that
+                // same space.
+                let Some(consented_to) = consented.get(&member.did) else {
                     continue;
-                }
+                };
                 let delegated_space_id = resolve_delegation_target(pool, backend, &member).await?;
-                if let Some(target_id) = delegated_space_id {
+                if let Some(target_id) = delegated_space_id.filter(|id| id == consented_to) {
                     resolve_members_recursive(
                         pool,
                         backend,
