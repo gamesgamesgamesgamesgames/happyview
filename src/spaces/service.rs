@@ -976,6 +976,8 @@ async fn revoke_member_credentials(
 /// Tell the hosts that verify a space's credentials which were revoked, once
 /// the revocation has committed.
 fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
+    #[cfg(test)]
+    tests::ANNOUNCED_REVOKED.with(|a| a.borrow_mut().push((space.id.clone(), jtis.clone())));
     if !jtis.is_empty() {
         notifications::announce_revoked_credentials(state, space, jtis);
     }
@@ -1232,8 +1234,8 @@ pub(crate) async fn put_member(
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
     announce_revoked(state, &space, jtis);
-    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(member)
 }
 
@@ -1454,6 +1456,10 @@ async fn after_publish(
     if let Some(published) = published {
         published.announce(state, space).await;
     } else if !had_key {
+        #[cfg(test)]
+        if tests::FAIL_CATCH_UP.with(std::cell::Cell::get) {
+            return Err(AppError::Internal("catch-up failed".into()));
+        }
         publish::sync(state, &space.id, scope).await?;
     }
     Ok(())
@@ -1696,8 +1702,8 @@ pub(crate) async fn remove_members(
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
     announce_revoked(state, space, jtis);
-    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(removed)
 }
 
@@ -1759,8 +1765,8 @@ pub(crate) async fn remove_member(
     .await
     .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove member: {e}")))??;
     announce_revoked(state, &space, jtis);
-    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
@@ -1901,6 +1907,8 @@ pub(crate) async fn accept_invite(
         }
         db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
+    // Published after the claim commits: accepting only adds a member, so a
+    // failed publish under-reports the list until the next sync corrects it.
     publish_member(state, &invite.space_id, did).await?;
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
@@ -1913,6 +1921,15 @@ pub(crate) async fn accept_invite(
 mod tests {
     use super::*;
     use crate::db::DatabaseBackend;
+
+    thread_local! {
+        /// Every [`announce_revoked`] call on this thread, as (space id,
+        /// `jti`s).
+        pub(super) static ANNOUNCED_REVOKED: std::cell::RefCell<Vec<(String, Vec<String>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// Makes [`after_publish`]'s catch-up fail on this thread.
+        pub(super) static FAIL_CATCH_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     macro_rules! require_test_db {
         () => {
@@ -2050,6 +2067,127 @@ mod tests {
             .unwrap();
         let published = records().await;
         assert_eq!(published.len(), 1, "{published:?}");
+    }
+
+    /// A member change that revokes credentials in a space delegating to the
+    /// one changed still announces those revocations when catching the
+    /// published list up fails afterwards.
+    #[tokio::test]
+    async fn a_failed_catch_up_still_announces_revocations_in_delegating_spaces() {
+        require_test_db!();
+        type Change = fn(
+            &AppState,
+            String,
+            String,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), AppError>> + '_>,
+        >;
+        let changes: [(&str, Change); 3] = [
+            ("put_member", |state, admin, space, did| {
+                Box::pin(async move {
+                    put_member(
+                        state,
+                        &admin,
+                        &space,
+                        &did,
+                        Some(MemberAccess {
+                            read: false,
+                            write: true,
+                            read_self: false,
+                        }),
+                        None,
+                    )
+                    .await
+                    .map(drop)
+                })
+            }),
+            ("remove_member", |state, admin, space, did| {
+                Box::pin(async move { remove_member(state, &admin, &space, &did).await })
+            }),
+            ("remove_members", |state, _admin, space, did| {
+                Box::pin(async move {
+                    let space = resolve_space(state, &space).await?;
+                    remove_members(state, &space, vec![did]).await.map(drop)
+                })
+            }),
+        ];
+        for (name, change) in changes {
+            let (state, inner_uri, admin) = service_test_db().await;
+            let inner = resolve_space(&state, &inner_uri).await.unwrap();
+            let reader = format!("did:plc:reader{}", uuid::Uuid::new_v4().simple());
+            db::add_member(
+                &state.db,
+                state.db_backend,
+                &SpaceMember {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    space_id: inner.id.clone(),
+                    did: reader.clone(),
+                    access: MemberAccess::READ,
+                    is_delegation: false,
+                    granted_by: None,
+                    created_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+
+            // A space that takes the inner space's members through a
+            // delegation entry, and a credential for it issued to the reader.
+            let unique = uuid::Uuid::new_v4().simple().to_string();
+            let outer = Space {
+                id: uuid::Uuid::new_v4().to_string(),
+                did: format!("did:plc:outer{unique}"),
+                authority_did: format!("did:plc:outer{unique}"),
+                creator_did: format!("did:plc:outer{unique}"),
+                skey: format!("outer{unique}"),
+                ..inner.clone()
+            };
+            db::create_space(&state.db, state.db_backend, &outer)
+                .await
+                .unwrap();
+            db::add_member(
+                &state.db,
+                state.db_backend,
+                &SpaceMember {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    space_id: outer.id.clone(),
+                    did: inner.id.clone(),
+                    access: MemberAccess::READ,
+                    is_delegation: true,
+                    granted_by: None,
+                    created_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            let jti = format!("jti{unique}");
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                state.db_backend,
+            ))
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&outer.id)
+            .bind(&reader)
+            .bind(format!("hash{unique}"))
+            .bind(&jti)
+            .bind("9999-12-31T00:00:00+00:00")
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+            ANNOUNCED_REVOKED.with(|a| a.borrow_mut().clear());
+            FAIL_CATCH_UP.with(|f| f.set(true));
+            let result = change(&state, admin, inner_uri, reader).await;
+            FAIL_CATCH_UP.with(|f| f.set(false));
+            assert!(result.is_err(), "{name}: the catch-up failure is returned");
+            let announced = ANNOUNCED_REVOKED.with(|a| a.borrow().clone());
+            assert!(
+                announced.contains(&(outer.id.clone(), vec![jti])),
+                "{name}: {announced:?}"
+            );
+        }
     }
 
     #[tokio::test]
