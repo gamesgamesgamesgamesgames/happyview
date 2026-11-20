@@ -221,6 +221,11 @@ pub(crate) async fn put_nested(
             "{nested} is not a space on this host; only local spaces can be nested for now"
         ))
     })?;
+    // These checks on the nested space run before the transaction. That's
+    // safe: the reference pins the space's id, so a different space later at
+    // the address isn't nested by it; the nesting space's policy is checked
+    // again on its locked row; and discarding a member list or deleting a
+    // space removes the references.
     require_target_admin(state, &target, actor).await?;
     require_memberspace(&target).map_err(|_| AppError::XrpcError {
         status: StatusCode::BAD_REQUEST,
