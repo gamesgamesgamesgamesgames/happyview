@@ -809,6 +809,16 @@ async fn credential_for(app: &TestApp, did: &str, space: &str, key: &SigningKey)
 /// A new memberspace of `CREATOR`'s that takes `inner`'s members through a
 /// delegation entry, as simplespace's `isDelegation` adds one.
 async fn delegating_space(app: &TestApp, inner: &str) -> String {
+    delegating_space_with(
+        app,
+        inner,
+        json!({ "$type": "com.atproto.memberspace.policy" }),
+    )
+    .await
+}
+
+/// [`delegating_space`] with the given policy.
+async fn delegating_space_with(app: &TestApp, inner: &str, policy: Value) -> String {
     let created = call(
         app,
         post_as(
@@ -818,7 +828,7 @@ async fn delegating_space(app: &TestApp, inner: &str) -> String {
             json!({
                 "spaceType": "com.example.creduse",
                 "skey": format!("d{}", Uuid::new_v4().simple()),
-                "policy": { "$type": "com.atproto.memberspace.policy" },
+                "policy": policy,
             }),
         ),
     )
@@ -1200,6 +1210,123 @@ async fn the_creator_keeps_its_credential_when_it_leaves_a_delegated_space() {
         json!({ "space": inner, "dids": [CREATOR, MEMBER] }),
     )
     .await;
+
+    let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A space that reads publicly keeps the credential it issued to a member
+/// of a space it delegates to when that member leaves: its readers are not
+/// its member list.
+#[tokio::test]
+#[serial]
+async fn a_public_space_keeps_its_credential_when_a_delegated_member_leaves() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (inner, _) = setup(&mut app, &key).await;
+    let outer = delegating_space_with(
+        &app,
+        &inner,
+        json!({ "$type": "com.atproto.memberspace.policy", "publicRead": true }),
+    )
+    .await;
+    let credential = credential_for(&app, MEMBER, &outer, &key).await;
+
+    space_admin(
+        &app,
+        "com.atproto.memberspace.removeMembers",
+        json!({ "space": inner, "dids": [MEMBER] }),
+    )
+    .await;
+
+    let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Wait until a request on another connection is waiting on a lock, on
+/// Postgres; on SQLite, give it time to reach its `BEGIN IMMEDIATE`.
+async fn until_waiting_on_a_lock(app: &TestApp) {
+    if app.state.db_backend != happyview::db::DatabaseBackend::Postgres {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        return;
+    }
+    for _ in 0..100 {
+        let waiting: i64 = happyview::db::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+}
+
+/// A removal in a delegated space waits for a member change committing in
+/// the space that delegates to it, and reads that space's members after it:
+/// a member added there directly meanwhile keeps its credential.
+#[tokio::test]
+#[serial]
+async fn a_removal_below_waits_for_a_member_change_committing_above() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let backend = app.state.db_backend;
+    let key = key();
+    let (inner, outer, credential) = setup_delegated(&mut app, &key).await;
+    let uri = happyview::spaces::SpaceUri::parse(&outer).unwrap();
+    let outer_row = happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        backend,
+        &uri.did,
+        &uri.type_nsid,
+        &uri.skey,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // MEMBER added to the outer space directly, as `putMember` makes it:
+    // the space's row first, then the member row, not yet committed.
+    let mut change = happyview::db::begin_write(&app.state.db, backend)
+        .await
+        .unwrap();
+    assert!(
+        happyview::spaces::db::lock_space_for_members(&mut *change, backend, &outer_row.id)
+            .await
+            .unwrap()
+    );
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?)",
+        backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&outer_row.id)
+    .bind(MEMBER)
+    .bind(CREATOR)
+    .bind(happyview::db::now_rfc3339())
+    .execute(&mut *change)
+    .await
+    .unwrap();
+
+    let router = app.router.clone();
+    let (name, value) = cookie_for(&app, CREATOR);
+    let body = json!({ "space": inner, "dids": [MEMBER] });
+    let removal = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.memberspace.removeMembers")
+            .header(name, value)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router.oneshot(req).await.unwrap().status()
+    });
+    until_waiting_on_a_lock(&app).await;
+    change.commit().await.unwrap();
+    assert_eq!(removal.await.unwrap(), StatusCode::OK);
 
     let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
     assert_eq!(status, StatusCode::OK, "{body}");

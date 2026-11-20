@@ -20,6 +20,7 @@ pub mod notifications;
 pub mod oplog;
 pub mod pds_support;
 pub mod policy;
+pub mod publish;
 pub mod rebuild;
 pub mod retired;
 pub mod routes;
