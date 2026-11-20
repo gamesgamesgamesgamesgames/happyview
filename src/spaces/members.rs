@@ -18,7 +18,7 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::error::AppError;
 use crate::spaces::SpaceUri;
 use crate::spaces::db;
-use crate::spaces::types::{MemberAccess, ResolvedMember};
+use crate::spaces::types::{MemberAccess, ResolvedMember, Space};
 
 const MAX_DELEGATION_DEPTH: usize = 10;
 
@@ -64,7 +64,7 @@ fn sql_error(e: sqlx::Error) -> AppError {
     AppError::Internal(format!("failed to resolve members: {e}"))
 }
 
-type Row = (String, i32, i32, i32, i32);
+type Row = (String, i32, i32, i32, i32, i32, Option<String>);
 
 /// The read and write a path of references allows; `None` before any.
 type Cap = Option<(bool, bool)>;
@@ -234,7 +234,7 @@ async fn resolve(
                 .map_err(sql_error)?;
         }
         let rows: Vec<Row> = crate::db::query_as(&adapt_sql(
-            "SELECT member_did, can_read, can_write, read_self, is_delegation FROM happyview_space_members WHERE space_id = ?",
+            "SELECT member_did, can_read, can_write, read_self, is_delegation, delegation_consented, delegation_target_space_id FROM happyview_space_members WHERE space_id = ?",
             backend,
         ))
         .bind(&id)
@@ -253,11 +253,17 @@ async fn resolve(
             .checked_sub(rows.len() + refs.len())
             .ok_or_else(too_large)?;
 
-        for (did, read, write, read_self, is_delegation) in rows {
+        for (did, read, write, read_self, is_delegation, consented, consented_to) in rows {
             if is_delegation != 0 {
                 // Simplespace's space-as-member: its members keep their own
-                // access, as they always did.
-                if let Some(target) = target_id(conn, backend, &did).await? {
+                // access, as they always did. Only an entry added by someone
+                // who administers the named space brings its members in, and
+                // only while it names that same space.
+                let Some(consented_to) = consented_to.filter(|_| consented != 0) else {
+                    continue;
+                };
+                let target = target_id(conn, backend, &did).await?;
+                if let Some(target) = target.filter(|t| *t == consented_to) {
                     queue.push((target, cap, via.clone().or(Some(did)), depth + 1));
                 }
                 continue;
@@ -390,6 +396,21 @@ pub async fn is_member(
         .await?
         .remove(did)
         .map(|e| e.access))
+}
+
+/// The local space a space-as-member entry names: an `at://` (or legacy
+/// `ats://`) address, or a space id.
+pub async fn delegation_target(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    reference: &str,
+) -> Result<Option<Space>, AppError> {
+    if reference.starts_with("at://") || reference.starts_with("ats://") {
+        let uri = SpaceUri::parse(reference)?;
+        db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await
+    } else {
+        db::get_space(pool, backend, reference).await
+    }
 }
 
 #[cfg(test)]

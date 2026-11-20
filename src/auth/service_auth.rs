@@ -1,5 +1,3 @@
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256Key, signature::Verifier};
 use serde::Deserialize;
@@ -57,32 +55,12 @@ struct VerificationMethod {
 }
 
 impl ServiceAuth {
-    /// Validate a Bearer token as a service auth JWT.
-    pub async fn from_bearer(token: &str, state: &AppState) -> Result<Self, AppError> {
+    /// Checks a Bearer token's signature and expiry only. Its audience and
+    /// method binding are not checked here: authenticate a request through
+    /// `auth::middleware`, whose `try_parse_service_auth` checks all of them.
+    pub(crate) async fn from_bearer(token: &str, state: &AppState) -> Result<Self, AppError> {
         let payload = verify_service_jwt(token, state, false).await?;
         Ok(ServiceAuth { did: payload.iss })
-    }
-}
-
-// Axum extractor
-impl FromRequestParts<AppState> for ServiceAuth {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(AppError::Auth("missing Authorization header".into()))?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or(AppError::Auth("invalid Authorization scheme".into()))?;
-
-        Self::from_bearer(token, state).await
     }
 }
 

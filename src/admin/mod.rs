@@ -396,4 +396,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/verification-methods/{fragment_id}",
             delete(verification_methods::delete),
         )
+        // Outermost, so every route above, the record source's included, sees
+        // a management ticket only once it has been verified.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::ticket::gate,
+        ))
 }

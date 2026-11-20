@@ -145,10 +145,12 @@ async fn delete_space_removes_it() {
         .await
         .expect("create_space failed");
 
-    let deleted = spaces_db::delete_space(&pool, backend, &id)
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let deleted = spaces_db::delete_space(&mut conn, backend, &id)
         .await
         .expect("delete_space failed");
     assert!(deleted);
+    drop(conn);
 
     let after = spaces_db::get_space(&pool, backend, &id)
         .await

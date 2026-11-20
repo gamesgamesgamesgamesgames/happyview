@@ -47,6 +47,9 @@ export interface BackfillJob {
   hooks?: HookStats | null;
   // The same, kept with the job once it completed, failed or was cancelled.
   hook_stats?: HookStats | null;
+  // 429 responses the job's fetches got from PDSes, each waited out and the
+  // request sent again.
+  rate_limited?: number;
 }
 
 // A job's hook stats: `GET /admin/backfill/status` and the `hook_stats`
@@ -100,6 +103,8 @@ export interface PdsSummaryEntry {
   total_repos: number;
   completed_repos: number;
   total_records: number;
+  // 429 responses from this PDS.
+  rate_limited?: number;
 }
 
 export interface PdsSummaryResponse {

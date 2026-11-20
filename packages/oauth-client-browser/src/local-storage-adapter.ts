@@ -18,4 +18,15 @@ export class LocalStorageAdapter implements StorageAdapter {
   async delete(key: string): Promise<void> {
     localStorage.removeItem(this.prefixedKey(key));
   }
+
+  async keys(): Promise<string[]> {
+    const out: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const raw = localStorage.key(i);
+      if (raw?.startsWith(PREFIX) && raw.endsWith(")")) {
+        out.push(raw.slice(PREFIX.length, -1));
+      }
+    }
+    return out;
+  }
 }

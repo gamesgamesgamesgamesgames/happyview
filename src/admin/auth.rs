@@ -33,6 +33,11 @@ pub struct UserAuth {
     /// The request was authenticated with the managed-hosting platform key
     /// (`PLATFORM_API_KEY_HASH`). Never true for a user or a user's API key.
     pub is_platform: bool,
+    /// Set when the request authenticated with a management ticket
+    /// (`auth::ticket`). Such a caller is an ordinary user of this instance
+    /// who never has `Claims`, so nothing reached through `UserAuth` can act
+    /// with a stored OAuth session on their behalf.
+    pub ticket: Option<TicketCaller>,
     pub permissions: HashSet<Permission>,
     pub db: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
@@ -167,6 +172,12 @@ impl UserAuth {
     /// whether the platform principal is acceptable; see `UserAuth`'s extractor
     /// and `AllowPlatform`.
     async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
+        // First, ahead of the cookie: a ticket request must not be decided by
+        // anything else it carries, and `check_alone` refuses one that carries
+        // more.
+        if crate::auth::ticket::presents_ticket(&parts.headers) {
+            return Self::ticket_auth(parts, state).await;
+        }
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -276,6 +287,108 @@ impl UserAuth {
             user_id,
             is_super,
             is_platform: false,
+            ticket: None,
+            permissions,
+            db: state.db.clone(),
+            db_backend: backend,
+        })
+    }
+}
+
+/// Who presented a management ticket, for the request's trace.
+#[derive(Clone, Debug)]
+pub struct TicketCaller {
+    pub issuer: String,
+    pub jkt: String,
+    pub ticket_jti: String,
+}
+
+impl UserAuth {
+    /// Authenticate a request presenting a management ticket. Never builds
+    /// `Claims`, and never bootstraps a first user: the ticket's DID must
+    /// already be a user here.
+    async fn ticket_auth(parts: &Parts, state: &AppState) -> Result<Self, AppError> {
+        use crate::auth::ticket::{Refusal, Verified};
+
+        // `auth::ticket::gate` verified the ticket, its proof, the body and
+        // replay before the request got here, and left what it verified.
+        // A route outside the gated router never had its ticket checked, so
+        // the ticket isn't accepted there: a refusal, not a server error.
+        let verified = parts.extensions.get::<Verified>().cloned().ok_or_else(|| {
+            tracing::warn!("a management ticket reached a route without the ticket gate");
+            AppError::Auth("management tickets aren't accepted here".into())
+        })?;
+        let uri = parts
+            .extensions
+            .get::<axum::extract::OriginalUri>()
+            .map(|u| u.0.clone())
+            .unwrap_or_else(|| parts.uri.clone());
+        let refuse = |r: Refusal| {
+            tracing::warn!(
+                step = r.step(),
+                path = uri.path(),
+                "refused a management ticket"
+            );
+            r.into_app_error()
+        };
+
+        let backend = state.db_backend;
+        let found: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
+            "SELECT id, is_super FROM happyview_users WHERE did = ?",
+            backend,
+        ))
+        .bind(&verified.did)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("user auth query failed: {e}")))?;
+        let Some((user_id, is_super_int)) = found else {
+            let r = Refusal::NotAUser;
+            // Within the ticket's request, so the event log adds the ticket.
+            crate::event_log::log_event(
+                &state.db,
+                crate::event_log::EventLog {
+                    event_type: "ticket.refused".to_string(),
+                    severity: crate::event_log::Severity::Warn,
+                    actor_did: Some(verified.did.clone()),
+                    subject: None,
+                    detail: serde_json::json!({
+                        "step": r.step(),
+                        "method": parts.method.as_str(),
+                        "path": uri.path(),
+                    }),
+                },
+                backend,
+            )
+            .await;
+            return Err(refuse(r));
+        };
+        let is_super = is_super_int != 0;
+        let permissions = if is_super {
+            HashSet::new()
+        } else {
+            Self::load_permissions(&state.db, &user_id, backend).await?
+        };
+
+        tracing::info!(
+            did = %verified.did,
+            issuer = %verified.issuer,
+            jkt = %verified.jkt,
+            ticket_jti = %verified.ticket_jti,
+            method = %parts.method,
+            path = uri.path(),
+            "admin request by management ticket"
+        );
+
+        Ok(UserAuth {
+            did: verified.did,
+            user_id,
+            is_super,
+            is_platform: false,
+            ticket: Some(TicketCaller {
+                issuer: verified.issuer,
+                jkt: verified.jkt,
+                ticket_jti: verified.ticket_jti,
+            }),
             permissions,
             db: state.db.clone(),
             db_backend: backend,
@@ -438,6 +551,7 @@ impl UserAuth {
                 user_id: String::new(),
                 is_super: false,
                 is_platform: true,
+                ticket: None,
                 permissions: PLATFORM_PERMISSIONS.iter().copied().collect(),
                 db: state.db.clone(),
                 db_backend: state.db_backend,
@@ -498,6 +612,7 @@ impl UserAuth {
             // management, transfer_super) stay unavailable via API keys.
             is_super: false,
             is_platform: false,
+            ticket: None,
             permissions,
             db: state.db.clone(),
             db_backend: backend,

@@ -7,6 +7,7 @@
 
 pub mod crawl;
 pub mod errors;
+pub mod pacer;
 pub mod replay;
 pub mod replay_fold;
 pub mod replay_sweeps;
