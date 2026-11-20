@@ -281,7 +281,7 @@ async fn stored_entries_are_backfilled_by_who_added_them() {
     add_row(&app, &by_super, &y_addr, true, &app.admin_did).await;
 
     let migration =
-        include_str!("../migrations/postgres/20261118180000_space_delegation_consent.sql");
+        include_str!("../migrations/postgres/20261120000001_space_delegation_consent.sql");
     let backfill = &migration[migration.find("UPDATE").unwrap()..];
     happyview::db::query(backfill)
         .execute(&app.state.db)
