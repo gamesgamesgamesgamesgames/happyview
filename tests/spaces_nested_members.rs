@@ -818,6 +818,9 @@ async fn spaces_past_the_bound_still_take_member_changes() {
     // read it, and admits no one, so the credential goes.
     remove_members(&app, &owner, &b, json!([member])).await;
     assert_eq!(outstanding(&app, &a, &member).await, 0, "revoked in A");
+    // A's references still change while it stays past the bound.
+    let empty = create(&app, &owner, memberspace(json!({}))).await;
+    nest(&app, &owner, &a, &empty, true, false).await;
 
     // Removing the nesting that took A past the bound works, and revokes the
     // credentials of accounts A no longer admits.

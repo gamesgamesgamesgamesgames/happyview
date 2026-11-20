@@ -1049,8 +1049,8 @@ pub(crate) type Revoked = Vec<(Space, Vec<String>)>;
 /// After a change to a space's members, revoke, in the caller's transaction,
 /// the credentials of every DID the space no longer admits, in the space and
 /// in every space that takes its members through delegation entries or
-/// nested references, directly or through others. A credential for one of those spaces may have
-/// been issued because its subject was a member here.
+/// nested references, directly or through others. A credential for one of
+/// those spaces may have been issued because its subject was a member here.
 ///
 /// Only the DIDs that read the space before the change and no longer do are
 /// looked at, and each keeps its credentials for a space that still admits
@@ -2252,6 +2252,79 @@ mod tests {
                 "{name}: {announced:?}"
             );
         }
+    }
+
+    /// Removing a nested space announces the credentials it revokes in the
+    /// nesting space, once the removal commits.
+    #[tokio::test]
+    async fn removing_a_nested_space_announces_its_revocations() {
+        require_test_db!();
+        let (state, inner_uri, _admin) = service_test_db().await;
+        let inner = resolve_space(&state, &inner_uri).await.unwrap();
+        let reader = format!("did:plc:reader{}", uuid::Uuid::new_v4().simple());
+        db::add_member(
+            &state.db,
+            state.db_backend,
+            &SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: inner.id.clone(),
+                did: reader.clone(),
+                access: MemberAccess::READ,
+                is_delegation: false,
+                granted_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let outer = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: format!("did:plc:outer{unique}"),
+            authority_did: format!("did:plc:outer{unique}"),
+            creator_did: format!("did:plc:outer{unique}"),
+            skey: format!("outer{unique}"),
+            ..inner.clone()
+        };
+        db::create_space(&state.db, state.db_backend, &outer)
+            .await
+            .unwrap();
+        db::upsert_nested(
+            &state.db,
+            state.db_backend,
+            &outer.id,
+            &db::NestedRef {
+                target_space_uri: inner_uri.clone(),
+                read: true,
+                write: false,
+                added_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let jti = format!("jti{unique}");
+        crate::db::query(&adapt_sql(
+            "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&outer.id)
+        .bind(&reader)
+        .bind(format!("hash{unique}"))
+        .bind(&jti)
+        .bind("9999-12-31T00:00:00+00:00")
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        ANNOUNCED_REVOKED.with(|a| a.borrow_mut().clear());
+        crate::spaces::nested::remove_nested(&state, &outer, &inner_uri)
+            .await
+            .unwrap();
+        let announced = ANNOUNCED_REVOKED.with(|a| a.borrow().clone());
+        assert_eq!(announced, vec![(outer.id.clone(), vec![jti])]);
     }
 
     #[tokio::test]
