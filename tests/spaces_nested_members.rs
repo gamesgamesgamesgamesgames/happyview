@@ -1341,6 +1341,28 @@ async fn simplespace_names_spaces_as_members_every_way_it_could() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // A member row naming it by id, with nothing nested, goes when it's
+    // removed by address.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) VALUES (?, ?, ?, 1, 0, 0, 1, NULL, ?)",
+        app.state.db_backend,
+    ))
+    .bind(Uuid::new_v4().to_string())
+    .bind(&a_row.id)
+    .bind(&b_row.id)
+    .bind("2026-11-01T00:00:00Z")
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.removeMember",
+        json!({ "space": a, "did": b }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(entry(&members(&app, &owner, &a).await, &member).is_none());
 
     // Added by address, removed by its ats:// form, along with a member row
     // naming the same space by its id from before nesting.
