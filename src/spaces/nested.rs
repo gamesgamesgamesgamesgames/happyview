@@ -256,10 +256,13 @@ fn reference_to(actor: &str, target: &Space, read: bool, write: bool) -> db::Nes
 /// takes administering both; `addMember` on one already nested is a
 /// `Conflict`. Any other entry is stored as a member row naming the space, as
 /// `simplespace` always stored it, by [`service::put_member`] or
-/// [`service::add_member`]: one naming a space here takes administering that
-/// space too, and one naming a space elsewhere brings in no members. A member
-/// row that already brings in a memberspace's members, put again unchanged,
-/// stays as it is. The answer is the member as `simplespace` shaped it.
+/// [`service::add_member`], as a space-as-member entry unless `is_delegation`
+/// is `false`: one naming a space here takes administering that space too,
+/// and one naming a space elsewhere brings in no members. An entry
+/// already stored as a member row is put as that row, so its access changes
+/// in place, and putting it again unchanged keeps it without the named
+/// space's administrator. The answer is the member as `simplespace` shaped
+/// it.
 pub(crate) async fn put_space_member(
     state: &AppState,
     actor: &str,
@@ -281,12 +284,17 @@ pub(crate) async fn put_space_member(
             "Member already exists in this space".into(),
         ));
     }
+    // An entry stored as a member row, as `simplespace` always stored one,
+    // is put as that row: its access changes in place, as it always did.
+    let stored_entry = !add
+        && db::get_member(&state.db, state.db_backend, &space.id, member)
+            .await?
+            .is_some_and(|m| m.is_delegation);
     if let Some(target) = named_space(state, member).await?
+        && !stored_entry
         && target.id != space.id
         && require_memberspace(&space).is_ok()
         && require_memberspace(&target).is_ok()
-        // An entry stored before nesting, put again unchanged, stays one.
-        && (add || !keeps_entry(state, &space.id, member, access, &target.id).await?)
     {
         require_target_admin(state, &target, actor).await?;
         let access = access.unwrap_or(MemberAccess::READ);
@@ -313,38 +321,14 @@ pub(crate) async fn put_space_member(
             created_at,
         });
     }
+    // A member named by a space's address is a space, unless the caller
+    // says otherwise.
+    let is_delegation = is_delegation.or(Some(true));
     if add {
         service::add_member(state, actor, space_ref, member, access, is_delegation).await
     } else {
         service::put_member(state, actor, space_ref, member, access, is_delegation).await
     }
-}
-
-/// Whether `member` is stored in `space_id` as an entry that brings in the
-/// members of the space `target_id`, with the read and write asked for (or
-/// with none asked for). Putting such an entry again keeps it as it is, as
-/// [`service::put_member`] does, without the named space's administrator.
-async fn keeps_entry(
-    state: &AppState,
-    space_id: &str,
-    member: &str,
-    access: Option<MemberAccess>,
-    target_id: &str,
-) -> Result<bool, AppError> {
-    let Some(stored) = db::get_member(&state.db, state.db_backend, space_id, member).await? else {
-        return Ok(false);
-    };
-    if !stored.is_delegation
-        || access.is_some_and(|a| a.read != stored.access.read || a.write != stored.access.write)
-    {
-        return Ok(false);
-    }
-    Ok(
-        db::consented_delegations(&state.db, state.db_backend, space_id)
-            .await?
-            .get(member)
-            .is_some_and(|id| id == target_id),
-    )
 }
 
 /// `simplespace` `removeMember`, and the script API's: a space named as a

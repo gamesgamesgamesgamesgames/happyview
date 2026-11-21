@@ -594,22 +594,38 @@ async fn an_older_entry_put_again_unchanged_stays_an_entry() {
     add_row(&app, &y, &y_member, false, &y_owner).await;
     add_consented(&app, &x, &y_addr, &y).await;
 
-    for (nsid, expected) in [
-        ("com.atproto.simplespace.putMember", StatusCode::CREATED),
-        // addMember on an existing entry is a conflict, as it always was.
-        ("com.atproto.simplespace.addMember", StatusCode::CONFLICT),
-    ] {
-        let (status, body) = post(
-            &app,
-            &x_owner,
-            nsid,
+    for (nsid, body, expected) in [
+        (
+            "com.atproto.simplespace.putMember",
             json!({ "space": x_addr, "did": y_addr, "read": true, "write": false, "isDelegation": true }),
-        )
-        .await;
+            StatusCode::CREATED,
+        ),
+        // Naming no isDelegation leaves it an entry.
+        (
+            "com.atproto.simplespace.putMember",
+            json!({ "space": x_addr, "did": y_addr, "read": true, "write": false }),
+            StatusCode::CREATED,
+        ),
+        // addMember on an existing entry is a conflict, as it always was.
+        (
+            "com.atproto.simplespace.addMember",
+            json!({ "space": x_addr, "did": y_addr, "read": true, "write": false, "isDelegation": true }),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (status, body) = post(&app, &x_owner, nsid, body).await;
         assert_eq!(status, expected, "{nsid}: {body}");
         assert_eq!(nested_count(&app, &x).await, 0, "{nsid}");
         assert!(consented(&app, &x, &y_addr).await, "{nsid}");
         assert!(is_member(&app, &x, &y_member).await, "{nsid}");
+        assert!(
+            spaces_db::get_member(&app.state.db, app.state.db_backend, &x, &y_addr)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_delegation,
+            "{nsid}"
+        );
     }
 
     // Changing its access needs Y's administrator.
@@ -691,4 +707,75 @@ async fn a_space_with_older_rules_delegates_only_to_spaces_its_admin_administers
     assert_eq!(nested_count(&app, &x).await, 0);
     assert!(consented(&app, &x, &z_addr).await);
     assert!(is_member(&app, &x, &z_member).await);
+}
+
+/// An entry stored as a member row changes in place when the administrator
+/// of both spaces changes its access, as it always did, rather than gaining
+/// a nested space beside it.
+#[tokio::test]
+#[serial]
+async fn an_older_entry_changes_in_place() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, y_member) = (rand_did("o"), rand_did("ym"));
+    let (x, x_addr) = create_space(&app, &owner).await;
+    let (y, y_addr) = create_space(&app, &owner).await;
+    add_row(&app, &y, &y_member, false, &owner).await;
+    add_consented(&app, &x, &y_addr, &y).await;
+
+    let (status, body) = post(
+        &app,
+        &owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": x_addr, "did": y_addr, "read": true, "write": true, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(nested_count(&app, &x).await, 0);
+    let row = spaces_db::get_member(&app.state.db, app.state.db_backend, &x, &y_addr)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.access.read && row.access.write);
+    assert!(consented(&app, &x, &y_addr).await);
+
+    // The named space's members keep their own access, as they always did.
+    assert!(is_member(&app, &x, &y_member).await);
+}
+
+/// A member named by a space's address is a space-as-member entry unless the
+/// caller says it isn't, whether or not the space is here.
+#[tokio::test]
+#[serial]
+async fn a_space_address_named_without_is_delegation_is_an_entry() {
+    common::require_db!();
+    let app = setup().await;
+    let owner = rand_did("o");
+    let (x, x_addr) = create_space(&app, &owner).await;
+    for (nsid, explicit) in [
+        ("com.atproto.simplespace.putMember", None),
+        ("com.atproto.simplespace.addMember", None),
+        ("com.atproto.simplespace.putMember", Some(false)),
+    ] {
+        let elsewhere = format!("at://{}/space/{TYPE}/elsewhere", rand_did("r"));
+        let mut body = json!({ "space": x_addr, "did": elsewhere, "read": true, "write": false });
+        if let Some(explicit) = explicit {
+            body["isDelegation"] = json!(explicit);
+        }
+        let (status, body) = post(&app, &owner, nsid, body).await;
+        assert!(status.is_success(), "{nsid} {explicit:?}: {body}");
+        let row = spaces_db::get_member(&app.state.db, app.state.db_backend, &x, &elsewhere)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.is_delegation,
+            explicit.unwrap_or(true),
+            "{nsid} {explicit:?}"
+        );
+        assert!(
+            !consented(&app, &x, &elsewhere).await,
+            "{nsid} {explicit:?}"
+        );
+    }
 }

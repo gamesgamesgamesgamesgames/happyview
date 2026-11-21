@@ -162,7 +162,9 @@ async fn delegating_spaces_within(
         for child_id in &frontier {
             // Entries that bring in the child's members keep the id of the
             // space they were consented for, as nested references keep the
-            // id of the space they name.
+            // id of the space they name. Whether each still resolves there
+            // isn't checked: listing one that no longer does only re-checks
+            // a space whose readers can't have changed.
             let delegating: Vec<(String,)> = crate::db::query_as(&adapt_sql(
                 "SELECT space_id FROM happyview_space_members \
                  WHERE delegation_target_space_id = ? AND delegation_consented = 1 \

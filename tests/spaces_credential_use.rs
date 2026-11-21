@@ -993,6 +993,101 @@ async fn credentials_issued_through_a_delegation_entry_go_with_it() {
     }
 }
 
+/// The id of the space at `uri`.
+async fn space_id(app: &TestApp, uri: &str) -> String {
+    let uri = happyview::spaces::SpaceUri::parse(uri).unwrap();
+    happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &uri.did,
+        &uri.type_nsid,
+        &uri.skey,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .id
+}
+
+/// A new memberspace of `CREATOR`'s that takes `inner`'s members through a
+/// member row naming it, as `simplespace` stored an `isDelegation` entry
+/// before spaces nested, added by `inner`'s administrator.
+async fn older_delegating_space(app: &TestApp, inner: &str) -> String {
+    let created = call(
+        app,
+        post_as(
+            app,
+            CREATOR,
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": "com.example.creduse",
+                "skey": format!("o{}", Uuid::new_v4().simple()),
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        ),
+    )
+    .await;
+    assert!(created.status().is_success(), "createSpace failed");
+    let outer = json_of(created).await["uri"].as_str().unwrap().to_string();
+    let (outer_id, inner_id) = (space_id(app, &outer).await, space_id(app, inner).await);
+    assert!(
+        happyview::spaces::db::insert_delegation_if_allowed(
+            &app.state.db,
+            app.state.db_backend,
+            &happyview::spaces::types::SpaceMember {
+                id: Uuid::new_v4().to_string(),
+                space_id: outer_id,
+                did: inner.to_string(),
+                access: happyview::spaces::types::MemberAccess::READ,
+                is_delegation: true,
+                granted_by: Some(CREATOR.to_string()),
+                created_at: happyview::db::now_rfc3339(),
+            },
+            happyview::spaces::db::DelegationConsent::Granted(&inner_id),
+        )
+        .await
+        .unwrap()
+    );
+    outer
+}
+
+/// Credentials issued through a member row naming a space go when the
+/// member leaves that space, when the row goes, and when the space it names
+/// is deleted.
+#[tokio::test]
+#[serial]
+async fn credentials_issued_through_an_older_delegation_entry_go_with_it() {
+    common::require_db!();
+    for case in [
+        "remove the member",
+        "remove the entry",
+        "delete the inner space",
+    ] {
+        let mut app = TestApp::new_with_encryption().await;
+        let key = key();
+        let (inner, _) = setup(&mut app, &key).await;
+        let outer = older_delegating_space(&app, &inner).await;
+        let credential = credential_for(&app, MEMBER, &outer, &key).await;
+        let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
+        assert_eq!(status, StatusCode::OK, "{case}, before: {body}");
+
+        let (nsid, body) = match case {
+            "remove the member" => (
+                "com.atproto.simplespace.removeMember",
+                json!({ "space": inner, "did": MEMBER }),
+            ),
+            "remove the entry" => (
+                "com.atproto.simplespace.removeMember",
+                json!({ "space": outer, "did": inner }),
+            ),
+            _ => ("com.atproto.space.deleteSpace", json!({ "space": inner })),
+        };
+        space_admin(&app, nsid, body).await;
+
+        assert_revoked(&app, &outer, &credential, &key, case).await;
+    }
+}
+
 /// Discarding a member list keeps the creator's credentials.
 #[tokio::test]
 #[serial]

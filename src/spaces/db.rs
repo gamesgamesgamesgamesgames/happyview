@@ -773,30 +773,6 @@ pub async fn revoke_space_credentials_except(
     Ok(rows.into_iter().map(|(jti,)| jti).collect())
 }
 
-/// The delegation entries (`is_delegation`) that name `space`: by its id, its
-/// `at://` address, or its legacy `ats://` address. The caller still resolves
-/// each entry to confirm it names `space`.
-pub async fn delegation_entries_naming(
-    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
-    backend: DatabaseBackend,
-    space: &Space,
-) -> Result<Vec<SpaceMember>, AppError> {
-    let rows: Vec<MemberRow> = crate::db::query_as(&adapt_sql(
-        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE is_delegation = 1 AND member_did IN (?, ?, ?) ORDER BY space_id",
-        backend,
-    ))
-    .bind(&space.id)
-    .bind(format!(
-        "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
-    ))
-    .bind(format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey))
-    .fetch_all(executor)
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to list delegation entries: {e}")))?;
-    rows.into_iter().map(parse_member_row).collect()
-}
-
 /// Delete every invite to a space, as migrating it to a policy that keeps no
 /// member list does. Returns how many were deleted.
 pub async fn delete_invites(
