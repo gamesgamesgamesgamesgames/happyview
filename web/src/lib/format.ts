@@ -23,9 +23,7 @@ export function toastError(context: string, e: unknown) {
     lower.includes("duplicate") ||
     lower.includes("already exists")
   ) {
-    toast.error(`${context}: already exists`, {
-      description: "An entry with this identifier is already configured.",
-    });
+    toast.error(`${context}: already exists`);
     return;
   }
   if (
@@ -43,15 +41,12 @@ export function toastError(context: string, e: unknown) {
     lower.includes("403") ||
     lower.includes("forbidden")
   ) {
-    toast.error(`${context}: permission denied`, {
-      description: "You may not have the required permissions for this action.",
-    });
+    toast.error(`${context}: permission denied`);
     return;
   }
   if (lower.includes("timeout")) {
     toast.error(`${context}: request timed out`, {
-      description:
-        "The server took too long to respond. Try again in a moment.",
+      description: "Try again in a moment.",
     });
     return;
   }

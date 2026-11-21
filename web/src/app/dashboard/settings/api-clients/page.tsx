@@ -592,8 +592,7 @@ function CreateApiClientDialog({
                 Redirect URIs
               </legend>
               <p className="text-muted-foreground text-xs">
-                URLs that the authorization server may redirect to after
-                authentication. The AppView callback is always included.
+                The AppView callback is always included.
               </p>
               <MultiInput
                 id="redirect-uris"
@@ -608,8 +607,8 @@ function CreateApiClientDialog({
                   Allowed Origins
                 </legend>
                 <p className="text-muted-foreground text-xs">
-                  Origins permitted to use this client. Requests from unlisted
-                  origins will be rejected. Leave empty to allow any origin.
+                  Requests from unlisted origins will be rejected. Leave empty
+                  to allow any origin.
                 </p>
                 <MultiInput
                   id="allowed-origins"
@@ -866,8 +865,7 @@ function EditApiClientDialog({
           <fieldset className="flex flex-col gap-3 rounded-lg border p-4">
             <legend className="text-sm font-medium px-1">Redirect URIs</legend>
             <p className="text-muted-foreground text-xs">
-              URLs that the authorization server may redirect to after
-              authentication. The AppView callback is always included.
+              The AppView callback is always included.
             </p>
             <MultiInput
               id="edit-redirect-uris"
@@ -882,8 +880,8 @@ function EditApiClientDialog({
                 Allowed Origins
               </legend>
               <p className="text-muted-foreground text-xs">
-                Origins permitted to use this client. Requests from unlisted
-                origins will be rejected. Leave empty to allow any origin.
+                Requests from unlisted origins will be rejected. Leave empty to
+                allow any origin.
               </p>
               <MultiInput
                 id="edit-allowed-origins"
@@ -921,8 +919,8 @@ function EditApiClientDialog({
                     className="underline"
                   >
                     permission sets
-                  </a>{" "}
-                  to follow the principle of least privilege.
+                  </a>
+                  .
                 </p>
               </div>
             )}
