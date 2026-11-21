@@ -2316,21 +2316,25 @@ mod tests {
             db::create_space(&state.db, state.db_backend, &outer)
                 .await
                 .unwrap();
-            db::add_member(
-                &state.db,
-                state.db_backend,
-                &SpaceMember {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    space_id: outer.id.clone(),
-                    did: inner.id.clone(),
-                    access: MemberAccess::READ,
-                    is_delegation: true,
-                    granted_by: None,
-                    created_at: now_rfc3339(),
-                },
-            )
-            .await
-            .unwrap();
+            // An entry added by the inner space's administrator.
+            assert!(
+                db::insert_delegation_if_allowed(
+                    &state.db,
+                    state.db_backend,
+                    &SpaceMember {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        space_id: outer.id.clone(),
+                        did: inner.id.clone(),
+                        access: MemberAccess::READ,
+                        is_delegation: true,
+                        granted_by: Some(admin.clone()),
+                        created_at: now_rfc3339(),
+                    },
+                    db::DelegationConsent::Granted(&inner.id),
+                )
+                .await
+                .unwrap()
+            );
             let jti = format!("jti{unique}");
             crate::db::query(&adapt_sql(
                 "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

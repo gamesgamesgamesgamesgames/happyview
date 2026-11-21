@@ -566,3 +566,129 @@ async fn keeping_consent_needs_it_at_write_time() {
     assert!(keep(changed).await);
     assert!(!consented(&app, &x, &y_addr).await);
 }
+
+/// How many spaces `space_id` nests.
+async fn nested_count(app: &TestApp, space_id: &str) -> i64 {
+    let (count,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_space_nested WHERE space_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(space_id)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    count
+}
+
+/// An entry naming a memberspace, stored before memberspaces nested one
+/// another, put again unchanged by the nesting space's administrator alone
+/// stays the entry it was, rather than becoming a nested space.
+#[tokio::test]
+#[serial]
+async fn an_older_entry_put_again_unchanged_stays_an_entry() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, y_member) = (rand_did("x"), rand_did("y"), rand_did("ym"));
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row(&app, &y, &y_member, false, &y_owner).await;
+    add_consented(&app, &x, &y_addr, &y).await;
+
+    for (nsid, expected) in [
+        ("com.atproto.simplespace.putMember", StatusCode::CREATED),
+        // addMember on an existing entry is a conflict, as it always was.
+        ("com.atproto.simplespace.addMember", StatusCode::CONFLICT),
+    ] {
+        let (status, body) = post(
+            &app,
+            &x_owner,
+            nsid,
+            json!({ "space": x_addr, "did": y_addr, "read": true, "write": false, "isDelegation": true }),
+        )
+        .await;
+        assert_eq!(status, expected, "{nsid}: {body}");
+        assert_eq!(nested_count(&app, &x).await, 0, "{nsid}");
+        assert!(consented(&app, &x, &y_addr).await, "{nsid}");
+        assert!(is_member(&app, &x, &y_member).await, "{nsid}");
+    }
+
+    // Changing its access needs Y's administrator.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": x_addr, "did": y_addr, "read": true, "write": true, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(nested_count(&app, &x).await, 0);
+    assert_eq!(
+        spaces_db::get_member(&app.state.db, app.state.db_backend, &x, &y_addr)
+            .await
+            .unwrap()
+            .unwrap()
+            .access,
+        MemberAccess::READ
+    );
+}
+
+/// A space whose access rules predate space policies can't nest, so an entry
+/// naming a space is stored as a member row, as it always was. Storing one
+/// still needs the named space's administrator, whether it names the space
+/// by address or by id.
+#[tokio::test]
+#[serial]
+async fn a_space_with_older_rules_delegates_only_to_spaces_its_admin_administers() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, y_member, z_member) =
+        (rand_did("x"), rand_did("y"), rand_did("ym"), rand_did("zm"));
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    // Read by a managing app, written by members: rules no policy matches.
+    let older = Policy::ManagingApp {
+        managing_app: "did:web:app.example".into(),
+    };
+    happyview::db::query(&happyview::db::adapt_sql(
+        "UPDATE happyview_spaces SET read_policy = ? WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(serde_json::to_string(&older).unwrap())
+    .bind(&x)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row(&app, &y, &y_member, false, &y_owner).await;
+    let (z, z_addr) = create_space(&app, &x_owner).await;
+    add_row(&app, &z, &z_member, false, &x_owner).await;
+
+    for nsid in [
+        "com.atproto.simplespace.putMember",
+        "com.atproto.simplespace.addMember",
+    ] {
+        for named in [&y_addr, &y] {
+            let (status, body) = post(
+                &app,
+                &x_owner,
+                nsid,
+                json!({ "space": x_addr, "did": named, "read": true, "write": false, "isDelegation": true }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{nsid} {named}: {body}");
+            assert!(!stored(&app, &x, named).await, "{nsid} {named}");
+        }
+    }
+    assert!(!is_member(&app, &x, &y_member).await);
+
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": x_addr, "did": z_addr, "read": true, "write": false, "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(nested_count(&app, &x).await, 0);
+    assert!(consented(&app, &x, &z_addr).await);
+    assert!(is_member(&app, &x, &z_member).await);
+}

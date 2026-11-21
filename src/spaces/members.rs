@@ -160,21 +160,21 @@ async fn delegating_spaces_within(
     for _ in 1..MAX_DELEGATION_DEPTH {
         let mut next = Vec::new();
         for child_id in &frontier {
-            let Some(child) = db::get_space(&mut *conn, backend, child_id).await? else {
-                continue;
-            };
-            let mut parents: Vec<String> = Vec::new();
-            for entry in db::delegation_entries_naming(&mut *conn, backend, &child).await? {
-                if visited.contains(&entry.space_id) {
-                    continue;
-                }
-                let target = target_id(conn, backend, &entry.did).await;
-                if target.ok().flatten().as_deref() == Some(child_id.as_str()) {
-                    budget = budget.checked_sub(1).ok_or_else(too_large)?;
-                    parents.push(entry.space_id);
-                }
-            }
-            // Nested references keep the id of the space they name.
+            // Entries that bring in the child's members keep the id of the
+            // space they were consented for, as nested references keep the
+            // id of the space they name.
+            let delegating: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+                "SELECT space_id FROM happyview_space_members \
+                 WHERE delegation_target_space_id = ? AND delegation_consented = 1 \
+                 AND is_delegation = 1",
+                backend,
+            ))
+            .bind(child_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql_error)?;
+            budget = budget.checked_sub(delegating.len()).ok_or_else(too_large)?;
+            let mut parents: Vec<String> = delegating.into_iter().map(|(id,)| id).collect();
             let nesting: Vec<(String,)> = crate::db::query_as(&adapt_sql(
                 "SELECT space_id FROM happyview_space_nested WHERE target_space_id = ?",
                 backend,
@@ -471,6 +471,86 @@ mod tests {
             .await
             .expect_err("past the budget");
         assert!(super::is_too_large(&err), "{err:?}");
+    }
+
+    /// The spaces that take a space's members through entries naming it
+    /// are the ones whose entries were consented for that space, whichever
+    /// name the entry uses; an entry stored without consent, or consented for
+    /// another space, takes none.
+    #[tokio::test]
+    async fn the_reverse_lookup_follows_consented_entries_by_id() {
+        use crate::spaces::db;
+        use crate::spaces::types::{
+            AppAccess, MemberAccess, Policy, Space, SpaceConfig, SpaceMember,
+        };
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        let space = |n: usize| Space {
+            id: format!("space{n}"),
+            did: format!("did:plc:space{n}"),
+            authority_did: format!("did:plc:space{n}"),
+            creator_did: "did:plc:owner".into(),
+            type_nsid: "com.example.forum".into(),
+            skey: format!("s{n}"),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::default(),
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: crate::db::now_rfc3339(),
+            updated_at: crate::db::now_rfc3339(),
+        };
+        for n in 0..=5 {
+            db::create_space(&pool, backend, &space(n)).await.unwrap();
+        }
+        let entry = |space_id: &str, reference: &str| SpaceMember {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space_id.to_string(),
+            did: reference.to_string(),
+            access: MemberAccess::READ,
+            is_delegation: true,
+            granted_by: None,
+            created_at: crate::db::now_rfc3339(),
+        };
+        let consented = [
+            ("space1", "at://did:plc:space0/space/com.example.forum/s0"),
+            ("space2", "ats://did:plc:space0/com.example.forum/s0"),
+            ("space3", "space0"),
+        ];
+        for (parent, reference) in consented {
+            assert!(
+                db::insert_delegation_if_allowed(
+                    &pool,
+                    backend,
+                    &entry(parent, reference),
+                    db::DelegationConsent::Granted("space0"),
+                )
+                .await
+                .unwrap()
+            );
+        }
+        // Names space0, stored without consent.
+        db::add_member(&pool, backend, &entry("space4", "space0"))
+            .await
+            .unwrap();
+        // Names space0, consented for another space.
+        assert!(
+            db::insert_delegation_if_allowed(
+                &pool,
+                backend,
+                &entry("space5", "space0"),
+                db::DelegationConsent::Granted("space4"),
+            )
+            .await
+            .unwrap()
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        let found = super::delegating_spaces(&mut conn, backend, "space0")
+            .await
+            .unwrap();
+        assert_eq!(found, vec!["space1", "space2", "space3"]);
     }
 
     #[test]

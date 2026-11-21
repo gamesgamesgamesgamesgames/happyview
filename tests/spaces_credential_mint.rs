@@ -1806,21 +1806,25 @@ async fn a_credential_issued_while_a_removal_commits_in_a_delegated_space_follow
     .await
     .unwrap()
     .unwrap();
-    spaces_db::add_member(
-        &app.state.db,
-        backend,
-        &SpaceMember {
-            id: Uuid::new_v4().to_string(),
-            space_id: outer.id.clone(),
-            did: space_uri(),
-            access: MemberAccess::READ,
-            is_delegation: true,
-            granted_by: Some(AUTHORITY.to_string()),
-            created_at: now_rfc3339(),
-        },
-    )
-    .await
-    .unwrap();
+    // An entry added by main's administrator.
+    assert!(
+        spaces_db::insert_delegation_if_allowed(
+            &app.state.db,
+            backend,
+            &SpaceMember {
+                id: Uuid::new_v4().to_string(),
+                space_id: outer.id.clone(),
+                did: space_uri(),
+                access: MemberAccess::READ,
+                is_delegation: true,
+                granted_by: Some(AUTHORITY.to_string()),
+                created_at: now_rfc3339(),
+            },
+            spaces_db::DelegationConsent::Granted(&main.id),
+        )
+        .await
+        .unwrap()
+    );
 
     // MEMBER's delegation token for "outer".
     let (name, value) = cookie_for(&app, MEMBER);
