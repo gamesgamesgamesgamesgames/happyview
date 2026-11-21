@@ -465,19 +465,24 @@ pub(super) async fn list(
     Ok(Json(entries))
 }
 
-/// The retention settings are a number of days to keep something, `0`
-/// meaning forever. Their sweeps read anything else as their default, so a
-/// stored value that isn't one would silently mean something the operator
-/// didn't set; it is refused here instead.
+/// The retention settings are a whole number of days to keep something, up
+/// to 100 years, `0` meaning forever. Their sweeps read anything else as their
+/// default (or, past the maximum, overflow their date arithmetic), so a value
+/// that isn't one is refused here. Padding is refused too: the value is
+/// stored as sent, and not every reader trims it.
 pub fn validate_retention(key: &str, value: &str) -> Result<(), String> {
+    use happyview_source_jetstream::backfill::MAX_RETENTION_DAYS;
     let is_retention = crate::limits::CEILED_RETENTION_SETTINGS.contains(&key)
         || key == crate::event_log::SPACE_ACCESS_RETENTION_SETTING;
-    if is_retention && value.trim().parse::<u32>().is_err() {
-        return Err(format!(
-            "{key} must be a whole number of days, or 0 to keep forever"
-        ));
+    if !is_retention {
+        return Ok(());
     }
-    Ok(())
+    match value.parse::<u32>() {
+        Ok(days) if days <= MAX_RETENTION_DAYS => Ok(()),
+        _ => Err(format!(
+            "{key} must be a whole number of days up to {MAX_RETENTION_DAYS}, or 0 to keep forever"
+        )),
+    }
 }
 
 /// PUT /admin/settings/{key} — create or update a setting.

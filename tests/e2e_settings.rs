@@ -234,20 +234,7 @@ async fn a_retention_must_be_a_whole_number_of_days() {
         "backfill_retention_days",
         "space_access_log_retention_days",
     ] {
-        for bad in ["-1", "a month", "1.5", ""] {
-            let resp = app
-                .router
-                .clone()
-                .oneshot(admin_put(
-                    &format!("/admin/settings/{key}"),
-                    app.admin_cookie(),
-                    &json!({ "value": bad }),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
-        }
-        for good in ["0", "7", "90"] {
+        for good in ["0", "90", "36500", "7"] {
             let resp = app
                 .router
                 .clone()
@@ -264,6 +251,34 @@ async fn a_retention_must_be_a_whole_number_of_days() {
                 resp.status()
             );
         }
+        for bad in ["-1", "a month", "1.5", "", " 7", "36501", "100000000"] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+        }
+        // A refused value leaves the last accepted one stored.
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        let entry = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == key)
+            .unwrap_or_else(|| panic!("{key} not listed"));
+        assert_eq!(entry["value"], "7", "{key}");
     }
 }
 
