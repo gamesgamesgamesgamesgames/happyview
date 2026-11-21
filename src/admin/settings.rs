@@ -465,14 +465,14 @@ pub(super) async fn list(
     Ok(Json(entries))
 }
 
-/// Settings that are a number of days to keep something, `0` meaning
-/// forever. Their sweeps read anything else as their default, so a stored
-/// value that isn't one would silently mean something the operator didn't
-/// set; it is refused here instead.
-const RETENTION_KEYS: [&str; 2] = ["event_log_retention_days", "backfill_retention_days"];
-
+/// The retention settings are a number of days to keep something, `0`
+/// meaning forever. Their sweeps read anything else as their default, so a
+/// stored value that isn't one would silently mean something the operator
+/// didn't set; it is refused here instead.
 pub fn validate_retention(key: &str, value: &str) -> Result<(), String> {
-    if RETENTION_KEYS.contains(&key) && value.trim().parse::<u32>().is_err() {
+    if crate::limits::CEILED_RETENTION_SETTINGS.contains(&key)
+        && value.trim().parse::<u32>().is_err()
+    {
         return Err(format!(
             "{key} must be a whole number of days, or 0 to keep forever"
         ));
