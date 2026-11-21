@@ -184,7 +184,8 @@ export default function TelemetryPage() {
               <CardHeader>
                 <CardTitle>Contact (optional)</CardTitle>
                 <CardDescription>
-                  Leave a way to reach you about what we see in your reports.
+                  If you&apos;d like us to be able to reach you about what we
+                  see in your reports, leave a way to reach you below.
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-2">
