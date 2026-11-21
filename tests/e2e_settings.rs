@@ -229,7 +229,11 @@ async fn settings_crud() {
 async fn a_retention_must_be_a_whole_number_of_days() {
     common::require_db!();
     let app = TestApp::new().await;
-    for key in ["event_log_retention_days", "backfill_retention_days"] {
+    for key in [
+        "event_log_retention_days",
+        "backfill_retention_days",
+        "space_access_log_retention_days",
+    ] {
         for bad in ["-1", "a month", "1.5", ""] {
             let resp = app
                 .router

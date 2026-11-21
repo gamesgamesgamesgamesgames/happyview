@@ -470,9 +470,9 @@ pub(super) async fn list(
 /// stored value that isn't one would silently mean something the operator
 /// didn't set; it is refused here instead.
 pub fn validate_retention(key: &str, value: &str) -> Result<(), String> {
-    if crate::limits::CEILED_RETENTION_SETTINGS.contains(&key)
-        && value.trim().parse::<u32>().is_err()
-    {
+    let is_retention = crate::limits::CEILED_RETENTION_SETTINGS.contains(&key)
+        || key == crate::event_log::SPACE_ACCESS_RETENTION_SETTING;
+    if is_retention && value.trim().parse::<u32>().is_err() {
         return Err(format!(
             "{key} must be a whole number of days, or 0 to keep forever"
         ));
