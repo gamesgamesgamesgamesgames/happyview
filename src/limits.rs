@@ -275,7 +275,8 @@ pub const CEILED_RETENTION_SETTINGS: &[&str] =
 
 /// What the Jetstream source keeps backfill history for when nothing is set
 /// (`happyview-source-jetstream`'s retention sweep).
-pub const BACKFILL_RETENTION_DEFAULT_DAYS: u32 = 28;
+pub const BACKFILL_RETENTION_DEFAULT_DAYS: u32 =
+    happyview_source_jetstream::backfill::DEFAULT_BACKFILL_RETENTION_DAYS;
 
 /// `Err` when a write would set a ceiled retention setting above the
 /// ceiling, or to `0` (forever). A value that isn't a whole number is left to
