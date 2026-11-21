@@ -85,10 +85,23 @@ async fn new_account() -> (String, String) {
 /// Which spaces alpha the ZDS under test speaks. The October 29 alpha replaced
 /// `simplespace`'s read policy, write policy and app access with one `policy`
 /// union under `space.*`, moved members to `memberspace.*`, and kept no alias.
+/// The November 12 revision (ZDS 0.9.0) made the member methods plural
+/// batches and renamed `uri` to `space` in `createSpace` and `getSpace`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Generation {
     Oct22,
     Oct29,
+    Nov12,
+}
+
+/// A space reference from a `createSpace` or `getSpace` answer: `space` since
+/// November 12, `uri` before.
+fn space_ref(body: &Value) -> String {
+    body["space"]
+        .as_str()
+        .or_else(|| body["uri"].as_str())
+        .unwrap_or_else(|| panic!("no space reference in {body}"))
+        .to_string()
 }
 
 /// Read from ZDS's own method descriptor, so each test asks the host rather
@@ -107,7 +120,9 @@ async fn generation() -> Generation {
             .iter()
             .any(|m| m["value"].as_str() == Some(nsid))
     };
-    if has("com.atproto.space.createSpace") {
+    if has("com.atproto.memberspace.putMembers") {
+        Generation::Nov12
+    } else if has("com.atproto.space.createSpace") {
         Generation::Oct29
     } else {
         Generation::Oct22
@@ -128,7 +143,7 @@ async fn create_space_with_policy(token: &str, policy: Value) -> String {
     )
     .await;
     assert!(status < 300, "createSpace failed ({status}): {body}");
-    body["uri"].as_str().expect("space uri").to_string()
+    space_ref(&body)
 }
 
 /// A space created with HappyView's own policy and app-access types, so ZDS
@@ -165,7 +180,7 @@ async fn default_space(token: &str) -> String {
             )
             .await
         }
-        Generation::Oct29 => {
+        Generation::Oct29 | Generation::Nov12 => {
             create_space_with_policy(token, json!({ "$type": MEMBERSPACE_POLICY })).await
         }
     }
@@ -177,7 +192,7 @@ const MEMBERSPACE_POLICY: &str = "com.atproto.memberspace.policy";
 async fn members_ns() -> &'static str {
     match generation().await {
         Generation::Oct22 => "com.atproto.simplespace",
-        Generation::Oct29 => "com.atproto.memberspace",
+        Generation::Oct29 | Generation::Nov12 => "com.atproto.memberspace",
     }
 }
 
@@ -216,7 +231,8 @@ async fn detection_reports_the_same_build_with_spaces_off_as_unsupported() {
 async fn zds_advertises_put_member_under_its_current_name() {
     // Detection still accepts addMember for pds.js, but ZDS should satisfy the
     // required list with canonical spellings alone: `simplespace.putMember` on
-    // the October 22 alpha, `memberspace.putMember` from October 29.
+    // the October 22 alpha, `memberspace.putMember` on October 29, and
+    // `memberspace.putMembers` from November 12.
     let (status, body) = get_json(
         &format!("{ZDS}/xrpc/community.lexicon.service.describe"),
         None,
@@ -231,7 +247,10 @@ async fn zds_advertises_put_member_under_its_current_name() {
         .map(|m| m["value"].as_str().unwrap())
         .collect();
 
-    let put_member = format!("{}.putMember", members_ns().await);
+    let put_member = match generation().await {
+        Generation::Nov12 => "com.atproto.memberspace.putMembers".to_string(),
+        _ => format!("{}.putMember", members_ns().await),
+    };
     assert!(
         methods.contains(&put_member.as_str()),
         "{put_member} missing from {methods:?}"
@@ -246,7 +265,7 @@ async fn zds_advertises_put_member_under_its_current_name() {
 #[ignore]
 async fn our_policy_and_app_access_unions_round_trip_through_zds() {
     let (_, token) = new_account().await;
-    if generation().await == Generation::Oct29 {
+    if generation().await != Generation::Oct22 {
         // HappyView has no October 29 policy types yet, so the policy is
         // checked as JSON: what ZDS stores is what `getSpace` gives back.
         let policy = json!({
@@ -264,7 +283,7 @@ async fn our_policy_and_app_access_unions_round_trip_through_zds() {
         )
         .await;
         assert_eq!(status, 200, "getSpace failed: {body}");
-        assert_eq!(body["uri"], json!(space));
+        assert_eq!(space_ref(&body), space);
         for (field, value) in policy.as_object().unwrap() {
             assert_eq!(&body["policy"][field], value, "policy.{field}: {body}");
         }
@@ -308,14 +327,20 @@ async fn our_member_shape_round_trips_through_put_member_and_list_members() {
     let put = |access: MemberAccess| {
         let (space, token, other) = (space.clone(), token.clone(), other.clone());
         async move {
-            let mut body = serde_json::to_value(ResolvedMember { did: other, access }).unwrap();
-            body["space"] = json!(space);
-            post_json(
-                &format!("{ZDS}/xrpc/{}.putMember", members_ns().await),
-                Some(&token),
-                body,
-            )
-            .await
+            let member = serde_json::to_value(ResolvedMember { did: other, access }).unwrap();
+            // From November 12 members are put in batches of up to 100.
+            let (method, body) = match generation().await {
+                Generation::Nov12 => (
+                    "com.atproto.memberspace.putMembers".to_string(),
+                    json!({ "space": space, "members": [member] }),
+                ),
+                _ => {
+                    let mut body = member;
+                    body["space"] = json!(space);
+                    (format!("{}.putMember", members_ns().await), body)
+                }
+            };
+            post_json(&format!("{ZDS}/xrpc/{method}"), Some(&token), body).await
         }
     };
 

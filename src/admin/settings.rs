@@ -31,6 +31,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
         "backfill_concurrent_resolution",
         "BACKFILL_CONCURRENT_RESOLUTION",
     ),
+    ("backfill_rate_limit_domains", "BACKFILL_RATE_LIMIT_DOMAINS"),
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),

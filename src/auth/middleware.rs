@@ -326,7 +326,7 @@ pub async fn resolve_dpop_claims(
 /// XRPC-specific claims extractor.
 ///
 /// Accepts DPoP auth (`Authorization: DPoP <token>`), space credentials
-/// (`Authorization: Atproto-Space <credential>` with an HTTP Message Signature
+/// (`Authorization: Atproto-Space-Credential <credential>` with an HTTP Message Signature
 /// by the credential's bound key), or Bearer service auth JWTs
 /// (`Authorization: Bearer <service_jwt>`). Bearer API keys are rejected on
 /// XRPC routes. With no `Authorization` header, the session cookie is the
@@ -364,6 +364,9 @@ fn is_space_route(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct ServiceAuthClaims {
     pub did: String,
+    /// The space DID the token is addressed to, when it is addressed to one
+    /// this instance holds rather than to the instance itself.
+    pub space_audience: Option<String>,
     pub aud_fragment: String,
     /// The method the token is bound to, if it names one.
     pub lxm: Option<String>,
@@ -415,21 +418,25 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     .headers
                     .get(axum::http::header::HOST)
                     .and_then(|v| v.to_str().ok());
-                if let Ok(service_claims) =
-                    try_parse_service_auth(token, state, host, parts.uri.path()).await
-                {
-                    return Ok(XrpcClaims {
-                        identity: None,
-                        space_credential: None,
-                        space_audience: None,
-                        service_auth: Some(service_claims),
-                    });
+                match try_parse_service_auth(token, state, host, parts.uri.path()).await {
+                    Ok(service_claims) => {
+                        return Ok(XrpcClaims {
+                            identity: None,
+                            space_credential: None,
+                            space_audience: None,
+                            service_auth: Some(service_claims),
+                        });
+                    }
+                    // A verified token bound to another method, or to none,
+                    // says so rather than reading as an unknown Bearer token.
+                    Err(e) if is_lxm_refusal(&e) => return Err(e),
+                    Err(_) => {}
                 }
 
                 match crate::spaces::credential::peek_jwt_typ(token) {
                     Some(typ) if typ == crate::spaces::credential::SPACE_CREDENTIAL_TYP => {
                         Err(AppError::Auth(
-                            "space credentials use the Atproto-Space authorization scheme".into(),
+                            "space credentials use the Atproto-Space-Credential authorization scheme".into(),
                         ))
                     }
                     _ => Err(AppError::Auth(
@@ -437,8 +444,8 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     )),
                 }
             }
-            Some(h) if h.starts_with("Atproto-Space ") => {
-                let token = &h["Atproto-Space ".len()..];
+            Some(h) if space_credential_token(h).is_some() => {
+                let token = space_credential_token(h).unwrap_or_default();
                 if !is_space_route(parts.uri.path()) {
                     return Err(AppError::Auth(
                         "space credentials are only accepted on space routes".into(),
@@ -448,7 +455,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     crate::spaces::credential::peek_bound_key(token).ok_or_else(|| {
                         AppError::Auth("space credential is not bound to a key".into())
                     })?;
-                crate::spaces::http_signature::verify(&parts.headers, Some(&bound_key))?;
+                crate::spaces::http_signature::verify(&parts.headers, &bound_key)?;
                 let audience = parts
                     .headers
                     .get(crate::spaces::http_signature::AUDIENCE_HEADER)
@@ -461,6 +468,15 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     service_auth: None,
                 })
             }
+            // The simplespace generation's scheme. Its credentials are signed
+            // by the authority's `#atproto_space` key, which a space DID here
+            // does not publish yet (HAP-388 H1–H3), so it is refused by name
+            // rather than as an unknown scheme. Accepting it slots in here.
+            Some(h) if legacy_space_credential_token(h).is_some() => Err(AppError::Auth(
+                "the Atproto-Space credential scheme (simplespace) is not supported by this \
+                 host yet; present the credential with Atproto-Space-Credential"
+                    .into(),
+            )),
             Some(_) => Err(AppError::Auth("invalid Authorization scheme".into())),
             None => {
                 // No auth header — try cookie auth, fall back to anonymous
@@ -507,59 +523,123 @@ impl FromRequestParts<AppState> for XrpcClaims {
     }
 }
 
+/// The space credential in an `Authorization` value using the
+/// `Atproto-Space-Credential` scheme. Like any HTTP authentication scheme it
+/// is recognised regardless of case; the signature covers the value as
+/// received.
+fn space_credential_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start();
+    (scheme.eq_ignore_ascii_case("Atproto-Space-Credential") && !token.is_empty()).then_some(token)
+}
+
+/// The token in an `Authorization` value using the simplespace generation's
+/// `Atproto-Space` scheme.
+fn legacy_space_credential_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim_start();
+    (scheme.eq_ignore_ascii_case("Atproto-Space") && !token.is_empty()).then_some(token)
+}
+
+/// Authenticates a service-auth token for the request to `path`, then
+/// requires it to be bound to the method called there.
+///
+/// The token's `lxm` must name that method, as Bluesky's `verifyJwt`
+/// requires: a token naming no method, or another one, is refused. A route
+/// outside `/xrpc` has no method to bind a token to, so service auth is not
+/// accepted there at all.
 async fn try_parse_service_auth(
     token: &str,
     state: &AppState,
     host: Option<&str>,
     path: &str,
 ) -> Result<ServiceAuthClaims, AppError> {
-    // 1. Check if service identity is configured and not "not_exposed"
+    let claims = verify_service_auth(token, state, host, path).await?;
+    let Some(method) = path.strip_prefix("/xrpc/") else {
+        return Err(AppError::Forbidden(
+            "service-auth tokens are accepted on XRPC methods only; use an admin API key or a \
+             signed-in session"
+                .into(),
+        ));
+    };
+    check_lxm(claims.lxm.as_deref(), method)?;
+    Ok(claims)
+}
+
+/// Verifies a service-auth token's signature, expiry and audience. Its
+/// method binding is [`try_parse_service_auth`]'s to check.
+async fn verify_service_auth(
+    token: &str,
+    state: &AppState,
+    host: Option<&str>,
+    path: &str,
+) -> Result<ServiceAuthClaims, AppError> {
+    // 1. The instance's own DID, when it exposes one. A space's own DID is an
+    // audience whatever the instance's identity mode, so a missing instance
+    // identity refuses only tokens that are not addressed to a space DID.
     let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
-    let identity =
-        identity.ok_or_else(|| AppError::Auth("no service identity configured".into()))?;
-
-    if identity.mode == crate::service_identity::IdentityMode::NotExposed {
-        return Err(AppError::Auth("service auth disabled".into()));
-    }
-
-    let instance_did = match &identity.mode {
-        crate::service_identity::IdentityMode::DidWeb => {
-            let h = host.ok_or_else(|| AppError::Auth("missing Host header for did:web".into()))?;
-            format!("did:web:{}", h.replace(':', "%3A"))
+    let instance_did = match identity {
+        None => Err(AppError::Auth("no service identity configured".into())),
+        Some(identity) if identity.mode == crate::service_identity::IdentityMode::NotExposed => {
+            Err(AppError::Auth("service auth disabled".into()))
         }
-        _ => identity
-            .did
-            .clone()
-            .ok_or_else(|| AppError::Auth("no DID configured".into()))?,
+        Some(identity) => match &identity.mode {
+            crate::service_identity::IdentityMode::DidWeb => host
+                .map(|h| format!("did:web:{}", h.replace(':', "%3A")))
+                .ok_or_else(|| AppError::Auth("missing Host header for did:web".into())),
+            _ => identity
+                .did
+                .clone()
+                .ok_or_else(|| AppError::Auth("no DID configured".into())),
+        },
     };
 
-    // 2. Verify the JWT (this resolves the issuer's DID doc and checks signature)
+    // 2. Decode the payload to read aud, and settle whether it names a space
+    // DID this instance holds before any network resolution.
+    let payload = crate::auth::service_auth::decode_jwt_payload(token)
+        .map_err(|_| AppError::Auth("failed to decode JWT".into()))?;
+    let aud = payload
+        .aud
+        .clone()
+        .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
+    let (aud_did, aud_fragment) = match aud.split_once('#') {
+        Some((did, fragment)) => (did, format!("#{fragment}")),
+        None => (aud.as_str(), String::new()),
+    };
+    let space_did_audience = is_space_route(path)
+        && crate::spaces::authority::holds(&state.db, state.db_backend, aud_did).await?;
+    let instance_did = if space_did_audience {
+        None
+    } else {
+        Some(instance_did?)
+    };
+
+    // 3. Verify the JWT (this resolves the issuer's DID doc and checks signature)
     let service_auth = crate::auth::service_auth::ServiceAuth::from_bearer(token, state)
         .await
         .map_err(|_| AppError::Auth("invalid service auth token".into()))?;
 
-    // 3. Decode payload to extract aud
-    let payload = crate::auth::service_auth::decode_jwt_payload(token)
-        .map_err(|_| AppError::Auth("failed to decode JWT".into()))?;
+    // 4. A space's DID is addressed bare or as its `#atproto_pds`, the service
+    // Proposal 0016 names as the space host.
+    let Some(instance_did) = instance_did else {
+        if !aud_fragment.is_empty() && aud_fragment != "#atproto_pds" {
+            return Err(AppError::Auth(format!(
+                "JWT aud '{aud}' names a space DID's service other than #atproto_pds"
+            )));
+        }
+        return Ok(ServiceAuthClaims {
+            did: service_auth.did,
+            space_audience: Some(aud_did.to_string()),
+            aud_fragment,
+            lxm: payload.lxm,
+        });
+    };
 
-    let aud = payload
-        .aud
-        .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
-
-    // 4. Verify aud starts with instance DID and extract fragment
+    // 5. Verify aud starts with instance DID and extract fragment
     if !aud.starts_with(&*instance_did) {
         return Err(AppError::Auth(format!(
             "JWT aud '{}' does not match instance DID '{}'",
             aud, instance_did
-        )));
-    }
-
-    // 5. A token bound to one method must not authorize another.
-    if let (Some(lxm), Some(method)) = (payload.lxm.as_deref(), path.strip_prefix("/xrpc/"))
-        && lxm != method
-    {
-        return Err(AppError::Auth(format!(
-            "JWT lxm '{lxm}' does not match the called method '{method}'"
         )));
     }
 
@@ -575,14 +655,73 @@ async fn try_parse_service_auth(
 
     Ok(ServiceAuthClaims {
         did: service_auth.did,
+        space_audience: None,
         aud_fragment: fragment,
         lxm: payload.lxm,
     })
 }
 
+/// The error name Bluesky's `verifyJwt` answers with when a token's `lxm`
+/// does not bind it to the called method.
+pub const BAD_JWT_LEXICON_METHOD: &str = "BadJwtLexiconMethod";
+
+/// Refuses a service-auth token whose `lxm` is missing or names a method
+/// other than `method`, with the error and messages Bluesky's `verifyJwt`
+/// uses.
+fn check_lxm(lxm: Option<&str>, method: &str) -> Result<(), AppError> {
+    let message = match lxm {
+        Some(lxm) if lxm == method => return Ok(()),
+        Some(_) => format!("bad jwt lexicon method (\"lxm\"). must match: {method}"),
+        None => format!("missing jwt lexicon method (\"lxm\"). must match: {method}"),
+    };
+    Err(AppError::XrpcError {
+        status: axum::http::StatusCode::UNAUTHORIZED,
+        code: BAD_JWT_LEXICON_METHOD,
+        message,
+    })
+}
+
+/// Whether `err` is [`check_lxm`]'s refusal, which XRPC routes report as is
+/// rather than as a generic Bearer refusal.
+fn is_lxm_refusal(err: &AppError) -> bool {
+    matches!(err, AppError::XrpcError { code, .. } if *code == BAD_JWT_LEXICON_METHOD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_space_route;
+
+    #[test]
+    fn a_token_must_name_the_called_method() {
+        use super::{BAD_JWT_LEXICON_METHOD, check_lxm};
+        use crate::error::AppError;
+        const METHOD: &str = "com.example.getThing";
+
+        assert!(check_lxm(Some(METHOD), METHOD).is_ok());
+        for (lxm, message) in [
+            (
+                None,
+                "missing jwt lexicon method (\"lxm\"). must match: com.example.getThing",
+            ),
+            (
+                Some("com.example.other"),
+                "bad jwt lexicon method (\"lxm\"). must match: com.example.getThing",
+            ),
+        ] {
+            match check_lxm(lxm, METHOD) {
+                Err(AppError::XrpcError {
+                    status,
+                    code,
+                    message: got,
+                }) => {
+                    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{lxm:?}");
+                    assert_eq!(code, BAD_JWT_LEXICON_METHOD, "{lxm:?}");
+                    assert_eq!(got, message, "{lxm:?}");
+                }
+                other => panic!("{lxm:?}: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn a_space_route_is_an_xrpc_method_in_a_space_namespace() {
@@ -593,6 +732,43 @@ mod tests {
             "/xrpc/com.atproto.space.notARealMethod",
         ] {
             assert!(is_space_route(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_credential_scheme_is_recognised_regardless_of_case() {
+        use super::space_credential_token;
+        for value in [
+            "Atproto-Space-Credential tok",
+            "atproto-space-credential tok",
+            "ATPROTO-SPACE-CREDENTIAL tok",
+        ] {
+            assert_eq!(space_credential_token(value), Some("tok"), "{value}");
+        }
+        for value in [
+            "Atproto-Space tok",
+            "Bearer tok",
+            "Atproto-Space-Credential",
+            "Atproto-Space-Credential ",
+            "Atproto-Space-Credentials tok",
+        ] {
+            assert_eq!(space_credential_token(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_simplespace_scheme_is_told_apart_from_the_current_one() {
+        use super::{legacy_space_credential_token, space_credential_token};
+        for value in ["Atproto-Space tok", "atproto-space tok"] {
+            assert_eq!(legacy_space_credential_token(value), Some("tok"), "{value}");
+            assert_eq!(space_credential_token(value), None, "{value}");
+        }
+        for value in [
+            "Atproto-Space-Credential tok",
+            "Atproto-Space",
+            "Bearer tok",
+        ] {
+            assert_eq!(legacy_space_credential_token(value), None, "{value}");
         }
     }
 

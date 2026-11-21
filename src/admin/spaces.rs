@@ -132,6 +132,93 @@ pub(super) async fn list_spaces(
     Ok(Json(body))
 }
 
+/// GET /admin/spaces/retired-policies — spaces whose rules predate policies
+/// and match none (`spaces::retired`), for their owners to convert.
+///
+/// The count is always answered, so an operator learns there is something to
+/// do. Which spaces they are is space metadata, so like every space
+/// moderation route it needs the inspector on; the boot log names them too.
+pub(super) async fn retired_policies(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SpacesRead).await?;
+    let spaces = crate::spaces::retired::find(&state.db, state.db_backend).await?;
+    let mut body = serde_json::json!({ "count": spaces.len() });
+    if space_access::require_enabled(&state).await.is_ok() {
+        body["spaces"] = serde_json::to_value(&spaces)
+            .map_err(|e| AppError::Internal(format!("failed to serialize spaces: {e}")))?;
+    }
+    Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConvertInput {
+    to: crate::spaces::retired::ConvertTo,
+    /// Needed only when the space's rules name two different managing apps.
+    managing_app: Option<String>,
+}
+
+/// POST /admin/spaces/{id}/convert — give a space in a retired shape a
+/// policy. To a memberspace, the member list governs and members and invites
+/// stay; to a managedspace, the managing app governs, and members, invites and
+/// any app allow list are discarded (the response names a discarded list). A space that already has a policy is changed with
+/// `updateSpace` instead.
+pub(super) async fn convert_space(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+    Json(input): Json<ConvertInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::spaces::policy::SpacePolicy;
+    auth.require(Permission::SpacesUpdate).await?;
+    space_access::require_enabled(&state).await?;
+    let mut space = load_space(&state, &id).await?;
+    if SpacePolicy::of(&space).is_ok() {
+        return Err(AppError::Conflict(
+            "This space already has a policy; change it with com.atproto.space.updateSpace".into(),
+        ));
+    }
+    let before = serde_json::json!({
+        "read_policy": space.read_policy,
+        "write_policy": space.write_policy,
+        "app_access": space.app_access,
+    });
+    let policy =
+        crate::spaces::retired::conversion(&space, input.to, input.managing_app.as_deref())?;
+    let dropped_allowed_apps = crate::spaces::retired::dropped_allow_list(&space, input.to);
+    policy.apply(&mut space);
+    let managed = matches!(policy, SpacePolicy::Managed(_));
+    service::store_space(&state, &space, managed).await?;
+
+    let uri = space_uri(&space);
+    crate::event_log::log_event(
+        &state.db,
+        EventLog {
+            event_type: "space.policy_converted".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(uri.clone()),
+            detail: serde_json::json!({
+                "user_id": auth.user_id,
+                "from": before,
+                "to": policy,
+                "members_discarded": managed,
+                "dropped_allowed_apps": dropped_allowed_apps,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+    let mut body = serde_json::json!({ "uri": uri, "policy": policy });
+    if let Some(dropped) = dropped_allowed_apps {
+        // A managedspace has no app allow list; say what went.
+        body["droppedAllowedApps"] = dropped.into();
+    }
+    Ok(Json(body))
+}
+
 /// GET /admin/spaces/{id} — a space's metadata, members, and collections.
 pub(super) async fn get_space(
     State(state): State<AppState>,

@@ -1,12 +1,7 @@
-//! HTTP-level coverage for the `com.atproto.simplespace.*` management surface.
-//!
-//! The authoritative method list is the lexicon directory on
-//! `bluesky-social/atproto @ permissioned-data-alpha`:
-//! `checkUserAccess, createSpace, defs, deleteSpace, getSpace, listMembers,
-//! putMember, removeMember, updateSpace`. Anything outside that set is either a
-//! legacy alias or does not belong.
-//!
-//! Harness mirrors `spaces_records.rs`.
+//! HTTP-level coverage for the `com.atproto.simplespace.*` member methods
+//! that remain (`putMember`, `removeMember`, `listMembers`), the protocol's
+//! notification and blob methods, and the capability descriptor. Space
+//! lifecycle is `com.atproto.space.*Space`, covered by `spaces_lifecycle.rs`.
 
 mod common;
 
@@ -89,21 +84,19 @@ async fn get(app: &TestApp, uri: &str, did: &str) -> axum::http::Response<Body> 
 }
 
 fn member_list_policy() -> Value {
-    json!({ "$type": "com.atproto.simplespace.defs#memberListPolicy" })
+    json!({ "$type": "com.atproto.memberspace.policy" })
 }
 
 /// Create a space over HTTP and return its `at://` URI.
 async fn create_space(app: &TestApp, authority: &str, skey: &str) -> String {
     let resp = post(
         app,
-        "com.atproto.simplespace.createSpace",
+        "com.atproto.space.createSpace",
         authority,
         json!({
-            "type": "com.example.forum",
+            "spaceType": "com.example.forum",
             "skey": skey,
-            "readPolicy": member_list_policy(),
-            "writePolicy": member_list_policy(),
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+            "policy": member_list_policy(),
         }),
     )
     .await;
@@ -279,261 +272,6 @@ async fn add_member_still_adds_a_member() {
 // Method placement
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-#[serial]
-async fn get_space_is_served_under_simplespace_not_space() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let space = create_space(&app, &authority, &rand_skey("s")).await;
-    let encoded = urlencoding::encode(&space);
-
-    let ok = get(
-        &app,
-        &format!("/xrpc/com.atproto.simplespace.getSpace?space={encoded}"),
-        &authority,
-    )
-    .await;
-    assert!(
-        ok.status().is_success(),
-        "simplespace.getSpace should serve: {}",
-        ok.status()
-    );
-
-    // The lexicons define no getSpace in the protocol namespace.
-    let gone = get(
-        &app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={encoded}"),
-        &authority,
-    )
-    .await;
-    let control = get(
-        &app,
-        &format!("/xrpc/com.atproto.space.zzzNeverExisted?space={encoded}"),
-        &authority,
-    )
-    .await;
-    assert_eq!(
-        gone.status(),
-        control.status(),
-        "space.getSpace should behave like a method that was never served"
-    );
-    assert!(!gone.status().is_success());
-}
-
-#[tokio::test]
-#[serial]
-async fn config_endpoints_are_gone() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let space = create_space(&app, &authority, &rand_skey("s")).await;
-
-    // The lexicons define no such methods; config is surfaced by getSpace and
-    // set by updateSpace.
-    let encoded = urlencoding::encode(&space);
-    let control = get(
-        &app,
-        &format!("/xrpc/{CONTROL_METHOD}?space={encoded}"),
-        &authority,
-    )
-    .await;
-    let control_status = control.status();
-
-    let get_config = get(
-        &app,
-        &format!("/xrpc/com.atproto.simplespace.getConfig?space={encoded}"),
-        &authority,
-    )
-    .await;
-    assert_eq!(get_config.status(), control_status);
-
-    let update_config = post(
-        &app,
-        "com.atproto.simplespace.updateConfig",
-        &authority,
-        json!({ "space": space }),
-    )
-    .await;
-    assert!(!update_config.status().is_success());
-}
-
-// ---------------------------------------------------------------------------
-// Policy validation
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn create_space_rejects_an_unimplemented_policy_variant() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let resp = post(
-        &app,
-        "com.atproto.simplespace.createSpace",
-        &authority,
-        json!({
-            "type": "com.example.forum",
-            "skey": rand_skey("s"),
-            "readPolicy": { "$type": "com.example.defs#bespokePolicy" },
-            "writePolicy": member_list_policy(),
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = json_of(resp).await;
-    assert_eq!(body["error"], "UnsupportedPolicy");
-}
-
-#[tokio::test]
-#[serial]
-async fn create_space_rejects_an_unimplemented_app_access_variant() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let resp = post(
-        &app,
-        "com.atproto.simplespace.createSpace",
-        &authority,
-        json!({
-            "type": "com.example.forum",
-            "skey": rand_skey("s"),
-            "readPolicy": member_list_policy(),
-            "writePolicy": member_list_policy(),
-            "appAccess": { "$type": "com.example.defs#bespokeAccess" },
-        }),
-    )
-    .await;
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = json_of(resp).await;
-    assert_eq!(body["error"], "UnsupportedAppAccess");
-}
-
-#[tokio::test]
-#[serial]
-async fn a_managing_app_policy_round_trips_through_get_space() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let skey = rand_skey("s");
-    let resp = post(
-        &app,
-        "com.atproto.simplespace.createSpace",
-        &authority,
-        json!({
-            "type": "com.example.forum",
-            "skey": skey,
-            "readPolicy": {
-                "$type": "com.atproto.simplespace.defs#managingAppPolicy",
-                "managingApp": "did:web:app.example.com#forum",
-            },
-            "writePolicy": member_list_policy(),
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    assert!(
-        resp.status().is_success(),
-        "createSpace failed: {}",
-        resp.status()
-    );
-    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
-
-    let got = json_of(
-        get(
-            &app,
-            &format!(
-                "/xrpc/com.atproto.simplespace.getSpace?space={}",
-                urlencoding::encode(&space)
-            ),
-            &authority,
-        )
-        .await,
-    )
-    .await;
-
-    // The app must survive inside the policy value, not alongside it.
-    let read_policy = &got["config"]["readPolicy"];
-    assert_eq!(
-        read_policy["$type"],
-        "com.atproto.simplespace.defs#managingAppPolicy"
-    );
-    assert_eq!(read_policy["managingApp"], "did:web:app.example.com#forum");
-}
-
-/// Create a space from a raw body and read back its config.
-async fn created_config(app: &TestApp, body: Value) -> Value {
-    let authority = rand_did("auth");
-    let mut body = body;
-    body["type"] = json!("com.example.forum");
-    body["skey"] = json!(rand_skey("s"));
-    let resp = post(app, "com.atproto.simplespace.createSpace", &authority, body).await;
-    assert!(
-        resp.status().is_success(),
-        "createSpace failed: {}",
-        resp.status()
-    );
-    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
-    json_of(
-        get(
-            app,
-            &format!(
-                "/xrpc/com.atproto.simplespace.getSpace?space={}",
-                urlencoding::encode(&space)
-            ),
-            &authority,
-        )
-        .await,
-    )
-    .await["config"]
-        .clone()
-}
-
-/// The lexicon names the space type `spaceType`; `type` is the earlier name,
-/// accepted until v3.
-#[tokio::test]
-#[serial]
-async fn create_space_takes_the_type_as_space_type() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let authority = rand_did("auth");
-    let resp = post(
-        &app,
-        "com.atproto.simplespace.createSpace",
-        &authority,
-        json!({
-            "spaceType": "com.example.forum",
-            "skey": rand_skey("s"),
-            "readPolicy": member_list_policy(),
-            "writePolicy": member_list_policy(),
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    assert!(
-        resp.status().is_success(),
-        "createSpace failed: {}",
-        resp.status()
-    );
-    let uri = json_of(resp).await["uri"].as_str().unwrap().to_string();
-    assert!(uri.contains("/space/com.example.forum/"), "{uri}");
-}
-
 /// `listSpaces` narrows to one space type, named `spaceType` or, before the
 /// rename, `type`.
 #[tokio::test]
@@ -547,14 +285,12 @@ async fn list_spaces_filters_by_space_type() {
     for space_type in ["com.example.forum", "com.example.chat"] {
         let resp = post(
             &app,
-            "com.atproto.simplespace.createSpace",
+            "com.atproto.space.createSpace",
             &authority,
             json!({
                 "spaceType": space_type,
                 "skey": rand_skey("s"),
-                "readPolicy": member_list_policy(),
-                "writePolicy": member_list_policy(),
-                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+                "policy": member_list_policy(),
             }),
         )
         .await;
@@ -583,67 +319,6 @@ async fn list_spaces_filters_by_space_type() {
             "{param}: {uris:?}"
         );
     }
-}
-
-/// Clients written before the read/write split send one policy, which governed
-/// both, and HappyView's own earlier fields. Until v3 they keep working.
-#[tokio::test]
-#[serial]
-async fn a_single_legacy_policy_governs_reads_and_writes() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let config = created_config(
-        &app,
-        json!({ "mintPolicy": "public", "appAccess": { "type": "open" } }),
-    )
-    .await;
-    assert_eq!(
-        config["readPolicy"]["$type"],
-        "com.atproto.simplespace.defs#publicPolicy"
-    );
-    assert_eq!(
-        config["writePolicy"]["$type"],
-        "com.atproto.simplespace.defs#publicPolicy"
-    );
-
-    let config = created_config(
-        &app,
-        json!({ "policy": "managing-app", "managingApp": "did:web:app.example.com#forum" }),
-    )
-    .await;
-    assert_eq!(
-        config["readPolicy"]["managingApp"],
-        "did:web:app.example.com#forum"
-    );
-    assert_eq!(
-        config["writePolicy"]["managingApp"],
-        "did:web:app.example.com#forum"
-    );
-}
-
-/// The lexicon's own fields win over a legacy one sent alongside them.
-#[tokio::test]
-#[serial]
-async fn split_policies_take_precedence_over_a_legacy_policy() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-
-    let config = created_config(
-        &app,
-        json!({ "policy": "public", "writePolicy": member_list_policy() }),
-    )
-    .await;
-    assert_eq!(
-        config["readPolicy"]["$type"],
-        "com.atproto.simplespace.defs#publicPolicy"
-    );
-    assert_eq!(
-        config["writePolicy"]["$type"],
-        "com.atproto.simplespace.defs#memberListPolicy"
-    );
 }
 
 /// Make `did` a read member of `space`, as its authority.

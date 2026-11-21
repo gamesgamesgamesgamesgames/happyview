@@ -162,7 +162,16 @@ async fn create_info_write_and_query_round_trip_the_record() {
     )
     .await
     .expect("info should succeed");
-    assert_eq!(info["did"], creator);
+    // The space has its own DID, which its uri names; the creator is recorded
+    // beside it.
+    let space_did = space_uri
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap();
+    assert_eq!(info["did"], space_did);
+    assert_ne!(info["did"], creator);
+    assert_eq!(info["creator_did"], creator);
 
     let written = call(
         &app,
@@ -641,4 +650,101 @@ async fn the_fixture_installs_through_the_loader() {
          tests/fixtures/sdk_spaces/Cargo.toml --target wasm32-unknown-unknown --release",
     );
     app.state.plugin_registry.install(plugin).await.unwrap();
+}
+
+/// Managing-app rules set through the library's `update` make a managedspace,
+/// which keeps no member list: the members and the outstanding invites go,
+/// and a former member's write is refused.
+#[tokio::test]
+#[serial(spaces_feature_flag)]
+async fn managing_app_rules_set_through_update_discard_members_and_invites() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let creator = rand_did("creator");
+    let space_uri = seeded_space(&app, &creator).await;
+    let member = rand_did("member");
+    call(
+        &app,
+        "sdk_spaces",
+        "add_member",
+        &[json!({ "uri": space_uri, "did": member, "access": "write" })],
+        &ctx_for(&creator),
+    )
+    .await
+    .expect("add_member should succeed");
+    let invite = call(
+        &app,
+        "sdk_spaces",
+        "create_invite",
+        &[json!({ "uri": space_uri })],
+        &ctx_for(&creator),
+    )
+    .await
+    .expect("create_invite should succeed");
+    let token = invite["token"].as_str().unwrap().to_string();
+
+    let managing_app = json!({
+        "$type": "com.atproto.simplespace.defs#managingAppPolicy",
+        "managingApp": "did:plc:app",
+    });
+    call(
+        &app,
+        "sdk_spaces",
+        "update",
+        &[json!({
+            "uri": space_uri,
+            "read_policy": managing_app,
+            "write_policy": managing_app,
+        })],
+        &ctx_for(&creator),
+    )
+    .await
+    .expect("update should succeed");
+
+    let mut parts = space_uri.trim_start_matches("at://").split('/');
+    let (did, _, space_type, skey) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    let space = happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        did,
+        space_type,
+        skey,
+    )
+    .await
+    .unwrap()
+    .expect("space");
+    let members =
+        happyview::spaces::members::resolve_members(&app.state.db, app.state.db_backend, &space.id)
+            .await
+            .unwrap();
+    assert!(members.is_empty(), "{members:?}");
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+    assert!(
+        happyview::spaces::db::get_invite_by_token_hash(&app.state.db, app.state.db_backend, &hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "the invite outlived the update"
+    );
+
+    let err = call(
+        &app,
+        "sdk_spaces",
+        "write_record",
+        &[json!({
+            "uri": space_uri,
+            "collection": "com.example.item",
+            "record": {"text": "hi"},
+        })],
+        &ctx_for(&member),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("NOT_AUTHORIZED"), "{err}");
 }

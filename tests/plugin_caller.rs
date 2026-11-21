@@ -1068,7 +1068,8 @@ async fn a_put_record_replaces_the_mirrored_cid_and_clears_indexed_at() {
             rkey: "abc".into(),
             did: Some(DID.into()),
             record: json!({ "text": "first" }),
-            cid: Some("bafyold".into()),
+            cid: happyview_provider::cid::compute_record_cid(&json!({ "text": "first" }))
+                .map(|c| c.to_string()),
         },
     )
     .await
@@ -1131,7 +1132,10 @@ async fn a_deleted_record_leaves_the_index_with_its_refs() {
             rkey: "abc".into(),
             did: Some(DID.into()),
             record: json!({ "text": "bye", "subject": "at://did:plc:other/com.example.post/parent" }),
-            cid: Some("bafyold".into()),
+            cid: happyview_provider::cid::compute_record_cid(
+                &json!({ "text": "bye", "subject": "at://did:plc:other/com.example.post/parent" }),
+            )
+            .map(|c| c.to_string()),
         },
     )
     .await

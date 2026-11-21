@@ -410,7 +410,8 @@ async fn retry_after_refresh(
             );
             creds.session = fresh_session;
         } else if let Err(e) =
-            refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+            refresh_and_record_grant(http, pool, backend, encryption_key, oauth_registry, creds)
+                .await
         {
             if !is_invalid_grant_error(&e) {
                 return Err(e);
@@ -894,6 +895,20 @@ pub async fn verified_granted_scope(
     let slot = refresh_lock(api_client_id, user_did, dpop_key_id);
     let _guard = slot.lock().await;
 
+    // A live cached answer needs neither the tokens nor the network.
+    if let Some((Some(scope), expires_at)) = super::sessions::get_granted_scope_and_expiry(
+        pool,
+        backend,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?
+        && !token_expired(expires_at.as_deref())
+    {
+        return Ok(scope);
+    }
+
     let mut creds = resolve_credentials(
         http,
         pool,
@@ -905,13 +920,6 @@ pub async fn verified_granted_scope(
         dpop_key_id,
     )
     .await?;
-
-    if !token_expired(creds.session.token_expires_at.as_deref())
-        && let Some(scope) =
-            super::sessions::get_granted_scope(pool, backend, &creds.session.id).await?
-    {
-        return Ok(scope);
-    }
 
     verify_issuer(http, plc_url, user_did, creds.session.issuer.as_deref()).await?;
 
@@ -939,6 +947,34 @@ pub async fn verified_granted_scope(
     )
     .await?;
     Ok(granted)
+}
+
+/// How long a refreshed access token is assumed to live when the token
+/// response omits `expires_in`.
+const UNKNOWN_TOKEN_LIFETIME_SECS: i64 = 300;
+
+/// [`refresh_access_token`], recording the grant the response reports for the
+/// session, so a later scope check reuses what the server said rather than
+/// refreshing again. A response that reports none leaves no grant on record.
+async fn refresh_and_record_grant(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    creds: &mut DpopCredentials,
+) -> Result<(), AppError> {
+    let granted =
+        refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await?;
+    super::sessions::set_granted_scope(
+        pool,
+        backend,
+        &creds.session.api_client_id,
+        &creds.session.dpop_key_id,
+        &creds.session.user_did,
+        granted.as_deref(),
+    )
+    .await
 }
 
 /// An unknown expiry counts as expired: it is the case that re-checks.
@@ -1035,8 +1071,15 @@ async fn apply_refresh_response(
     let new_refresh_token = token_resp["refresh_token"].as_str();
 
     let expires_in = token_resp["expires_in"].as_u64();
-    let new_expires_at = expires_in
-        .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
+    // A response that omits `expires_in` says nothing about how long the new
+    // token lives, and the expiry the app registered with described the token
+    // it replaced. Assume a short lifetime, which bounds how long the grant
+    // this refresh reports is reused.
+    let new_expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(
+            expires_in.map_or(UNKNOWN_TOKEN_LIFETIME_SECS, |secs| secs as i64),
+        ))
+    .to_rfc3339();
 
     super::sessions::store_dpop_session(
         pool,
@@ -1048,9 +1091,7 @@ async fn apply_refresh_response(
         &creds.session.user_did,
         new_access_token,
         new_refresh_token.or(creds.session.refresh_token.as_deref()),
-        new_expires_at
-            .as_deref()
-            .or(creds.session.token_expires_at.as_deref()),
+        Some(new_expires_at.as_str()),
         &creds.session.scopes,
         creds.session.pds_url.as_deref(),
         creds.session.issuer.as_deref(),
@@ -1063,9 +1104,7 @@ async fn apply_refresh_response(
     if let Some(rt) = new_refresh_token {
         creds.session.refresh_token = Some(rt.to_string());
     }
-    if let Some(ref exp) = new_expires_at {
-        creds.session.token_expires_at = Some(exp.clone());
-    }
+    creds.session.token_expires_at = Some(new_expires_at);
 
     tracing::info!(
         user_did = %creds.session.user_did,
@@ -1227,6 +1266,82 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Internal("auth server metadata missing token_endpoint".into()))
+}
+
+/// The tokens a refresh returned, for a caller that keeps its own session.
+#[derive(Clone, serde::Deserialize)]
+pub(crate) struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: Option<String>,
+    pub expires_in: Option<i64>,
+    pub scope: Option<String>,
+    pub sub: Option<String>,
+}
+
+/// Leaves the tokens out of logs.
+impl std::fmt::Debug for RefreshedTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedTokens")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("sub", &self.sub)
+            .finish()
+    }
+}
+
+/// Refresh a token set at `issuer`'s token endpoint with a DPoP proof from
+/// `dpop_private_jwk`, as `client_id`. A confidential client passes
+/// `assertion_key` (`(private_jwk, kid)`), and each attempt, nonce retries
+/// included, carries its own freshly signed client assertion.
+///
+/// A refusal is an error naming the status and body as atrium does
+/// (`http status: 400 Bad Request, body: …`), so
+/// `linked_repos::refresh::classify` reads both alike.
+pub(crate) async fn refresh_token_set(
+    http: &reqwest::Client,
+    issuer: &str,
+    refresh_token: &str,
+    client_id: &str,
+    dpop_private_jwk: &serde_json::Value,
+    assertion_key: Option<(&serde_json::Value, &str)>,
+) -> Result<RefreshedTokens, AppError> {
+    let token_endpoint = discover_token_endpoint(http, issuer).await?;
+
+    let (buffered, _) = send_with_nonce_retry(
+        NoncePolicy::AuthServer,
+        None,
+        "token refresh request",
+        |nonce| {
+            let assertion = assertion_key
+                .map(|(jwk, kid)| super::client_assertion::build(jwk, kid, client_id, issuer))
+                .transpose()?;
+            let proof =
+                generate_dpop_proof_no_ath(dpop_private_jwk, "POST", &token_endpoint, nonce)?;
+            Ok(http
+                .post(&token_endpoint)
+                .header("DPoP", proof)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&build_refresh_form(refresh_token, client_id, assertion)))
+        },
+    )
+    .await?;
+
+    let body = String::from_utf8_lossy(&buffered.body).to_string();
+    if !buffered.status.is_success() {
+        return Err(AppError::Auth(format!(
+            "token refresh failed: http status: {}, body: {body}",
+            buffered.status
+        )));
+    }
+    serde_json::from_str(&body)
+        .map_err(|e| AppError::Internal(format!("invalid token refresh response: {e}")))
 }
 
 /// Look up the client_id_url for an API client by its internal ID.

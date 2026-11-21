@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
@@ -140,7 +140,12 @@ pub(crate) struct SpaceUriQuery {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListSpacesQuery {
+    /// Whose spaces to list: the caller's own unless a super admin asks for
+    /// another account's. HappyView's meaning, not the Oct 29 lexicon's, which
+    /// used `did` to filter by authority.
     did: Option<String>,
+    /// Lists only spaces under this authority DID (Nov 12).
+    space_did: Option<String>,
     /// Lists only spaces of this type. `type` is the earlier name, accepted
     /// until v3.
     #[serde(rename = "spaceType", alias = "type")]
@@ -215,6 +220,13 @@ struct RevokeInviteInput {
 #[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
     space: String,
+    /// The P-256 did:key the credential is bound to, as the Nov 12 text names
+    /// it. Every request using the credential is signed by it.
+    credential_key: Option<String>,
+    /// The same key under its Oct 29 name.
+    credential_kid: Option<String>,
+    /// Establishes the user being acted for, for spaces that gate on users.
+    delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
     client_attestation: Option<String>,
 }
@@ -344,7 +356,8 @@ const LEGACY_NS: &str = "dev.happyview";
 /// does. Legacy `dev.happyview.*` aliases are absent: they are not
 /// protocol methods and must not be advertised.
 pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
-    vec![
+    let mut table = crate::spaces::lifecycle::lifecycle_method_table();
+    table.extend(vec![
         (format!("{PROTO_NS}.space.listSpaces"), get(list_spaces)),
         (format!("{PROTO_NS}.space.getRecord"), get(get_record)),
         (format!("{PROTO_NS}.space.listRecords"), get(list_records)),
@@ -393,8 +406,13 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
             format!("{PROTO_NS}.space.notifySpaceDeleted"),
             post(notify_space_deleted),
         ),
+        (
+            format!("{PROTO_NS}.space.notifyCredentialRevoked"),
+            post(notify_credential_revoked),
+        ),
         (format!("{PROTO_NS}.space.getBlob"), get(get_space_blob)),
-    ]
+    ]);
+    table
 }
 
 pub fn space_routes() -> Router<AppState> {
@@ -424,7 +442,6 @@ pub fn space_routes() -> Router<AppState> {
             get(list_invites),
         )
         // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
-        .route(&format!("/xrpc/{LEGACY_NS}.space.getSpace"), get(get_space))
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.listSpaces"),
             get(list_spaces),
@@ -550,6 +567,24 @@ async fn require_auth_or_credential(
 /// notify routes: a DPoP/cookie identity or a verified service-auth JWT. (Space
 /// credentials are not accepted here — their subject is a space, not the
 /// authority DID these routes gate on.)
+/// Refuse service auth addressed to another space's DID. A token addressed to
+/// the instance, as a space created before space DIDs existed is addressed,
+/// is not bound to one space.
+fn require_service_audience(claims: &XrpcClaims, space: &Space) -> Result<(), AppError> {
+    match claims
+        .service_auth
+        .as_ref()
+        .and_then(|sa| sa.space_audience.as_deref())
+    {
+        Some(audience) if audience != space.authority_did => Err(AppError::XrpcError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "BadServiceAudience",
+            message: format!("service auth is addressed to {audience}, not this space"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
     if let Some(identity) = &claims.identity {
         return Ok(identity.did().to_string());
@@ -565,54 +600,6 @@ fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
 // ---------------------------------------------------------------------------
 // Space read handlers
 // ---------------------------------------------------------------------------
-
-/// Served under `com.atproto.simplespace.getSpace`: the lexicons place it in the
-/// management namespace, not the protocol one. The `dev.happyview.*` alias below
-/// is the legacy path.
-pub(crate) async fn get_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Query(query): Query<SpaceUriQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let space = service::resolve_space(&state, &query.space).await?;
-
-    // Only a space admin or a holder of a space credential may read the space.
-    let is_admin = match &xrpc_claims.identity {
-        Some(identity) => {
-            match service::require_space_admin(&state, &space, identity.did()).await {
-                Ok(()) => true,
-                Err(AppError::Forbidden(_)) => false,
-                Err(e) => return Err(e),
-            }
-        }
-        None => false,
-    };
-    if !is_admin {
-        if let Some(token) = &xrpc_claims.space_credential {
-            require_audience(&xrpc_claims, &space.authority_did)?;
-            service::verify_space_credential(&state, &space, token).await?;
-        } else {
-            require_auth(&xrpc_claims)?;
-            return Err(AppError::NotFound("Space not found".into()));
-        }
-    }
-
-    let space_uri = format!(
-        "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
-    );
-    let simplespace_config = serde_json::json!({
-        "$type": "com.atproto.simplespace.defs#spaceConfig",
-        "readPolicy": space.read_policy,
-        "writePolicy": space.write_policy,
-        "appAccess": space.app_access,
-    });
-    Ok(Json(serde_json::json!({
-        "uri": space_uri,
-        "space": space,
-        "config": simplespace_config,
-    })))
-}
 
 async fn list_spaces(
     State(state): State<AppState>,
@@ -636,18 +623,34 @@ async fn list_spaces(
         state.db_backend,
         &did,
         query.space_type.as_deref(),
+        query.space_did.as_deref(),
         limit,
         query.cursor.as_deref(),
     )
     .await?;
 
+    // Each view carries its reference under both names: `uri` (Oct 29) and
+    // `space` (Nov 12), and the Nov 12 repo and space revisions.
     let spaces_json: Vec<serde_json::Value> = views
         .into_iter()
         .map(|v| {
-            serde_json::json!({
+            let mut view = serde_json::json!({
                 "uri": v.uri,
+                "space": v.uri,
                 "isOwner": v.is_owner,
-            })
+            });
+            if let Some(rev) = v.repo_rev {
+                view["repoRev"] = rev.into();
+            }
+            if let Some(data) = v.repo_data {
+                view["data"] = crate::spaces::commit::encode_lex_bytes(&data);
+            }
+            if v.is_owner
+                && let Some(rev) = v.space_rev
+            {
+                view["spaceRev"] = rev.into();
+            }
+            view
         })
         .collect();
 
@@ -819,15 +822,6 @@ async fn apply_writes(
         }
     }
 
-    // The single writes check the collection before they forward; a batch
-    // checks every op before it does, so it cannot carry a collection the
-    // space does not allow.
-    for write in &input.writes {
-        if let WriteOp::Create { collection, .. } | WriteOp::Update { collection, .. } = write {
-            service::check_collection_allowed(&space, collection)?;
-        }
-    }
-
     // A repo hosted on its author's PDS takes the batch there, as the single
     // writes do; writing only HappyView's copy would fork the two, and the
     // next sync would drop what was written here.
@@ -882,7 +876,6 @@ async fn apply_writes(
                 rkey,
                 value,
             } => {
-                service::check_collection_allowed(&space, &collection)?;
                 let rkey = rkey.unwrap_or_else(generate_tid);
                 let cid = service::content_cid(&value)?;
                 let record_uri = format!(
@@ -918,7 +911,6 @@ async fn apply_writes(
                 value,
                 swap_record,
             } => {
-                service::check_collection_allowed(&space, &collection)?;
                 let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
@@ -1278,7 +1270,10 @@ async fn get_delegation_token(
     let did = claims.did().to_string();
     let space = service::resolve_space(&state, &params.space).await?;
 
-    let membership = service::require_membership(&state, &space, &did, false, None).await?;
+    // Membership alone, not `require_membership`: a delegation token reads no
+    // space data, and is how a member asks the managing app, if any, for a
+    // credential.
+    let membership = service::require_on_member_list(&state, &space, &did).await?;
     check_delegation_token_access(membership, false)?;
 
     // A delegation token is exchanged for a credential granting whole-space
@@ -1310,7 +1305,9 @@ async fn get_delegation_token(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let space_host = format!("{}#atproto_space_host", space.did);
+    // Proposal 0016 addresses a delegation token to the space host as the
+    // authority's `#atproto_pds`.
+    let space_host = format!("{}#atproto_pds", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
         sub: space_uri,
@@ -1885,6 +1882,7 @@ async fn notify_write(
             },
             e => e,
         })?;
+    require_service_audience(&claims, &space)?;
     if caller != writer {
         service::require_space_admin(&state, &space, &caller).await?;
     }
@@ -1991,6 +1989,7 @@ async fn notify_space_deleted(
     // "space deleted" events (which may cause consumers to purge cached data).
     let did = require_notify_caller(&claims)?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_service_audience(&claims, &space)?;
     service::require_space_admin(&state, &space, &did).await?;
 
     let registrations =
@@ -2000,114 +1999,189 @@ async fn notify_space_deleted(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// Exchange a delegation token for a space credential bound to the caller's key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyCredentialRevokedInput {
+    space: String,
+    credentials: Vec<String>,
+}
+
+/// The most `jti`s one `notifyCredentialRevoked` call may name.
+const MAX_REVOKED_PER_NOTIFICATION: usize = 100;
+
+/// A space authority revoking credentials before they expire.
 ///
-/// The delegation token is the request's authorization token, and an
-/// `atproto-space` HTTP Message Signature over it proves possession of the key
-/// the credential is bound to. No account session is involved: the delegation
-/// token is the account's consent, and the credential goes to whoever holds the
-/// key.
+/// This instance accepts only credentials it issued, so a revocation marks its
+/// own records, which every credential check reads. Service auth from the
+/// space's authority is required. Repeating a revocation changes nothing.
+async fn notify_credential_revoked(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Json(input): Json<NotifyCredentialRevokedInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let caller = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.did.clone())
+        .ok_or_else(|| {
+            AppError::Auth("service auth from the space authority is required".into())
+        })?;
+    if input.credentials.is_empty()
+        || input.credentials.len() > MAX_REVOKED_PER_NOTIFICATION
+        || input.credentials.iter().any(|jti| jti.is_empty())
+    {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: format!(
+                "credentials must name 1 to {MAX_REVOKED_PER_NOTIFICATION} non-empty jtis"
+            ),
+        });
+    }
+    let space = service::resolve_space(&state, &input.space)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "SpaceNotFound",
+                message: "space not found".into(),
+            },
+            e => e,
+        })?;
+    require_service_audience(&claims, &space)?;
+    if caller != space.authority_did {
+        return Err(AppError::Forbidden(
+            "only the space's authority may revoke its credentials".into(),
+        ));
+    }
+    db::revoke_space_credentials_by_jti(&state.db, state.db_backend, &space.id, &input.credentials)
+        .await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Issue a space credential bound to the key the request names.
+///
+/// The request carries whichever assertions the space requires: a delegation
+/// token from the user's PDS for a space that gates on users, and a client
+/// attestation for one that gates on apps. Neither is an authorization header,
+/// and an assertion the space does not require is still verified, never held
+/// against the request.
 async fn get_space_credential(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(input): Json<GetSpaceCredentialInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::Auth("a delegation token is required".into()))?
-        .to_string();
-    let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
+    let refused = |code: &'static str, message: String| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        message,
+    };
+    // Charged before anything in the request is parsed or verified. A
+    // credential request needs no session, every credential minted is a
+    // stored row, and verifying a delegation token resolves its issuer's DID
+    // before its signature is checked. Space routes are mounted beside the
+    // XRPC routes, not behind their limiter, so this is their limit.
+    let key = crate::xrpc::ANONYMOUS_CLIENT_KEY;
+    let cost = state.rate_limiter.default_cost_for_type(key, "procedure");
+    if let crate::rate_limit::CheckResult::Limited {
+        retry_after,
+        limit,
+        reset,
+    } = state.rate_limiter.check(key, cost)
+    {
+        return Err(AppError::RateLimited {
+            retry_after,
+            limit,
+            reset,
+        });
+    }
+    let (generation, credential_key) = exchange_generation(&input)?;
+    if !crate::spaces::http_signature::is_p256_did_key(credential_key) {
+        return Err(refused(
+            "InvalidRequest",
+            format!("{} must be a P-256 did:key", generation.key_field()),
+        ));
+    }
 
     let encryption_key = &state.config.keyring().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let space = service::resolve_space(&state, &input.space).await?;
-    // An authority that publishes no #atproto_space_host is reached at its
-    // #atproto_pds endpoint, so a token may name either.
-    let space_host_aud = format!("{}#atproto_space_host", space.did);
-    let pds_aud = format!("{}#atproto_pds", space.did);
-    let accepted_aud = [space_host_aud.as_str(), pds_aud.as_str()];
-
-    // A PDS that serves spaces mints delegation tokens with the account's own
-    // key. For accounts on one that does not, HappyView mints them with its own
-    // delegation key.
-    // A key that cannot be read leaves only the account's own key to try, as
-    // a token this instance signed cannot be verified without it anyway.
-    let local_key =
-        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "delegation key unreadable");
-                None
-            });
-    let local_claims = local_key.as_ref().map(|key| {
-        crate::spaces::credential::verify_delegation_token(
-            &token,
-            key.verifying_key(),
-            &accepted_aud,
-        )
-    });
-    let delegation_claims = match local_claims {
-        Some(Ok(claims)) => claims,
-        _ => crate::spaces::credential::verify_account_delegation_token(
-            &token,
-            &state.http,
-            &state.config.plc_url,
-            &accepted_aud,
-        )
-        .await
-        .map_err(|e| AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: e.to_string(),
-        })?,
-    };
+    // Everything the assertions are checked against comes from the address,
+    // so they are verified before the space is looked up, and a request
+    // carrying bad ones is answered the same whether the space exists or not.
+    let address = crate::spaces::SpaceUri::parse(&input.space)?;
     let space_uri = format!(
         "at://{}/space/{}/{}",
-        space.did, space.type_nsid, space.skey
+        address.did, address.type_nsid, address.skey
     );
-    if delegation_claims.sub != space_uri {
-        return Err(AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: "delegation token is for a different space".into(),
-        });
-    }
-    if !db::consume_delegation_token(
-        &state.db,
-        state.db_backend,
-        &delegation_claims.iss,
-        &delegation_claims.jti,
-        delegation_claims.exp,
-    )
-    .await?
-    {
-        return Err(AppError::XrpcError {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidDelegationToken",
-            message: "delegation token has already been used".into(),
-        });
-    }
+    // Proposal 0016 addresses both assertions to the space host, the
+    // authority's `#atproto_pds`.
+    let host_aud = format!("{}#atproto_pds", address.did);
+
+    let subject = match &input.delegation_token {
+        Some(token) => {
+            Some(verify_delegation(&state, encryption_key, token, &space_uri, &host_aud).await?)
+        }
+        None => None,
+    };
 
     let client_id = match &input.client_attestation {
-        Some(attestation) => Some(
-            crate::spaces::client_attestation::verify_client_attestation(
+        Some(attestation) => {
+            let verified = crate::spaces::client_attestation::verify_client_attestation(
                 attestation,
-                &space.authority_did,
+                &host_aud,
                 &state.http,
             )
             .await
-            .map_err(|e| AppError::XrpcError {
-                status: StatusCode::BAD_REQUEST,
-                code: "InvalidClientAttestation",
-                message: e.to_string(),
-            })?
-            .client_id,
-        ),
+            .map_err(|e| refused("InvalidClientAttestation", e.to_string()))?;
+            if !db::consume_delegation_token(
+                &state.db,
+                state.db_backend,
+                &verified.client_id,
+                &verified.jti,
+                verified.exp,
+            )
+            .await?
+            {
+                return Err(refused(
+                    "InvalidClientAttestation",
+                    "client attestation has already been used".into(),
+                ));
+            }
+            Some(verified.client_id)
+        }
         None => None,
+    };
+
+    let space = service::resolve_space(&state, &space_uri)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => refused("SpaceNotFound", "space not found".into()),
+            e => e,
+        })?;
+
+    // The account is settled before the app: an account the space does not
+    // admit is answered `SpaceNotFound` (`refused_user`), whichever app it
+    // came through. The app is checked in `issue_credential`, after the
+    // space's policy admits the account.
+
+    // A space that anyone may read needs no user. A managing app may decide
+    // a read with no user, so its space asks it, with no `repo`: only an app
+    // on the Nov 12 revision (`checkAccess`) can be asked that, and one on an
+    // earlier revision is taken to refuse, as those revisions did. Any other
+    // space has to know who it is issuing to.
+    let subject = match subject {
+        Some(subject) => subject,
+        None if matches!(
+            space.read_policy,
+            crate::spaces::types::Policy::Public | crate::spaces::types::Policy::ManagingApp { .. }
+        ) =>
+        {
+            String::new()
+        }
+        None => {
+            return Err(generation.refused_user());
+        }
     };
 
     let issued = crate::spaces::auth::issue_credential(
@@ -2118,17 +2192,142 @@ async fn get_space_credential(
         &state.config.public_url,
         &state.config.plc_url,
         &space,
-        &delegation_claims.iss,
+        &subject,
         client_id.as_deref(),
         &space.authority_did,
-        Some(&bound_key),
+        Some(credential_key),
     )
-    .await?;
+    .await
+    .map_err(|e| match e {
+        AppError::Forbidden(_) => generation.refused_user(),
+        e => e,
+    })?;
 
     Ok(Json(serde_json::json!({
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
+}
+
+/// Which revision of Proposal 0016 a `getSpaceCredential` request follows,
+/// told by the field naming the key to bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeGeneration {
+    /// Oct 29: `credentialKid`.
+    G1,
+    /// Nov 12 (proposals #143): `credentialKey`.
+    G2,
+}
+
+impl ExchangeGeneration {
+    fn key_field(self) -> &'static str {
+        match self {
+            Self::G1 => "credentialKid",
+            Self::G2 => "credentialKey",
+        }
+    }
+
+    /// The error for a user the space does not admit: `SpaceNotFound`, so a
+    /// refusal discloses nothing about the space. The Nov 12 text says so; the
+    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
+    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
+    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
+    fn refused_user(self) -> AppError {
+        AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "SpaceNotFound",
+            message: "space not found".into(),
+        }
+    }
+}
+
+/// The request's generation and the key it names. A request naming neither
+/// field is the simplespace exchange, which binds the key by a signature over
+/// the request and is issued under the authority's `#atproto_space` key. It
+/// needs that key published on each space DID (HAP-388 H1–H3, a follow-up
+/// PR), so until then it is refused by name; supporting it slots in here.
+fn exchange_generation(
+    input: &GetSpaceCredentialInput,
+) -> Result<(ExchangeGeneration, &str), AppError> {
+    match (&input.credential_key, &input.credential_kid) {
+        (Some(key), Some(kid)) if key != kid => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "credentialKey and credentialKid name different keys".into(),
+        }),
+        (Some(key), _) => Ok((ExchangeGeneration::G2, key)),
+        (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid)),
+        (None, None) => Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: "credentialKey is required. The simplespace credential exchange, which \
+                      names no key, is not supported by this host yet"
+                .into(),
+        }),
+    }
+}
+
+/// Verify a delegation token for `space_uri` and record it as used, returning
+/// the user it was issued by.
+async fn verify_delegation(
+    state: &AppState,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    token: &str,
+    space_uri: &str,
+    host_aud: &str,
+) -> Result<String, AppError> {
+    let invalid = |message: String| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "InvalidDelegationToken",
+        message,
+    };
+    let accepted_aud = [host_aud];
+
+    // A PDS that serves spaces mints delegation tokens with the account's own
+    // key. For accounts on one that does not, HappyView mints them with its own
+    // delegation key. A key that cannot be read leaves only the account's own
+    // key to try, as a token this instance signed cannot be verified without it
+    // anyway.
+    let local_key =
+        crate::spaces::delegation_key::load(&state.db, state.db_backend, encryption_key)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "delegation key unreadable");
+                None
+            });
+    let local_claims = local_key.as_ref().map(|key| {
+        crate::spaces::credential::verify_delegation_token(
+            token,
+            key.verifying_key(),
+            &accepted_aud,
+        )
+    });
+    let claims = match local_claims {
+        Some(Ok(claims)) => claims,
+        _ => crate::spaces::credential::verify_account_delegation_token(
+            token,
+            &state.http,
+            &state.config.plc_url,
+            &accepted_aud,
+        )
+        .await
+        .map_err(|e| invalid(e.to_string()))?,
+    };
+    if claims.sub != space_uri {
+        return Err(invalid("delegation token is for a different space".into()));
+    }
+    if !db::consume_delegation_token(
+        &state.db,
+        state.db_backend,
+        &claims.iss,
+        &claims.jti,
+        claims.exp,
+    )
+    .await?
+    {
+        return Err(invalid("delegation token has already been used".into()));
+    }
+    Ok(claims.iss)
 }
 
 #[cfg(test)]

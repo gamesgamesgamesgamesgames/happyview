@@ -4,7 +4,7 @@ use crate::db::DatabaseBackend;
 use crate::error::AppError;
 use crate::spaces::SpaceUri;
 use crate::spaces::db;
-use crate::spaces::types::{MemberAccess, ResolvedMember, SpaceMember};
+use crate::spaces::types::{MemberAccess, ResolvedMember, Space, SpaceMember};
 
 const MAX_DELEGATION_DEPTH: usize = 10;
 
@@ -61,11 +61,22 @@ fn resolve_members_recursive<'a>(
         }
 
         let direct_members = db::list_direct_members(pool, backend, space_id).await?;
+        let consented = if direct_members.iter().any(|m| m.is_delegation) {
+            db::consented_delegations(pool, backend, space_id).await?
+        } else {
+            HashMap::new()
+        };
 
         for member in direct_members {
             if member.is_delegation {
+                // Only an entry added by someone who administers the named
+                // space brings its members in, and only while it names that
+                // same space.
+                let Some(consented_to) = consented.get(&member.did) else {
+                    continue;
+                };
                 let delegated_space_id = resolve_delegation_target(pool, backend, &member).await?;
-                if let Some(target_id) = delegated_space_id {
+                if let Some(target_id) = delegated_space_id.filter(|id| id == consented_to) {
                     resolve_members_recursive(
                         pool,
                         backend,
@@ -93,14 +104,23 @@ async fn resolve_delegation_target(
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<Option<String>, AppError> {
-    if member.did.starts_with("at://") || member.did.starts_with("ats://") {
-        let uri = SpaceUri::parse(&member.did)?;
-        let space =
-            db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await?;
-        Ok(space.map(|s| s.id))
+    Ok(delegation_target(pool, backend, &member.did)
+        .await?
+        .map(|s| s.id))
+}
+
+/// The local space a space-as-member entry names: an `at://` (or legacy
+/// `ats://`) address, or a space id.
+pub async fn delegation_target(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    reference: &str,
+) -> Result<Option<Space>, AppError> {
+    if reference.starts_with("at://") || reference.starts_with("ats://") {
+        let uri = SpaceUri::parse(reference)?;
+        db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await
     } else {
-        let space = db::get_space(pool, backend, &member.did).await?;
-        Ok(space.map(|s| s.id))
+        db::get_space(pool, backend, reference).await
     }
 }
 

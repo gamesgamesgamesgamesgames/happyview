@@ -21,10 +21,8 @@ async function enableSpacesFeature(): Promise<void> {
   }
 }
 
-const MEMBER_LIST_POLICY = {
-  $type: "com.atproto.simplespace.defs#memberListPolicy",
-};
-const PUBLIC_POLICY = { $type: "com.atproto.simplespace.defs#publicPolicy" };
+const MEMBERSPACE = "com.atproto.memberspace.policy";
+const MEMBER_POLICY = { $type: MEMBERSPACE };
 
 test.describe("Spaces API", () => {
   // `page.request` runs outside the browser and sends no fetch metadata, and
@@ -41,7 +39,7 @@ test.describe("Spaces API", () => {
 
   test.afterEach(async ({ page }) => {
     if (!createdSpaceUri) return;
-    await page.request.post("/xrpc/com.atproto.simplespace.deleteSpace", {
+    await page.request.post("/xrpc/com.atproto.space.deleteSpace", {
       data: { space: createdSpaceUri },
     });
     createdSpaceUri = null;
@@ -52,8 +50,8 @@ test.describe("Spaces API", () => {
     data: Record<string, unknown>,
   ): Promise<string> {
     const resp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      { data: { spaceType: TEST_TYPE_NSID, ...data } },
+      "/xrpc/com.atproto.space.createSpace",
+      { data: { spaceType: TEST_TYPE_NSID, policy: MEMBER_POLICY, ...data } },
     );
     if (!resp.ok()) {
       throw new Error(
@@ -64,7 +62,7 @@ test.describe("Spaces API", () => {
   }
 
   async function getSpace(page: Page, uri: string) {
-    return page.request.get("/xrpc/com.atproto.simplespace.getSpace", {
+    return page.request.get("/xrpc/com.atproto.space.getSpace", {
       params: { space: uri },
     });
   }
@@ -72,9 +70,6 @@ test.describe("Spaces API", () => {
   test("create space and verify it appears in listSpaces", async ({ page }) => {
     const uri = await createSpace(page, {
       skey: TEST_SKEY,
-      displayName: "E2E Test Space",
-      readPolicy: MEMBER_LIST_POLICY,
-      writePolicy: MEMBER_LIST_POLICY,
     });
     expect(uri).toMatch(/^at:\/\/.+\/space\//);
     createdSpaceUri = uri;
@@ -92,63 +87,70 @@ test.describe("Spaces API", () => {
     expect(found).toBe(true);
   });
 
-  test("getSpace returns the created space", async ({ page }) => {
-    const uri = await createSpace(page, {
-      skey: TEST_SKEY + "-get",
-      displayName: "GetSpace Test",
-      readPolicy: MEMBER_LIST_POLICY,
-    });
+  test("getSpace returns the created space and its policy", async ({
+    page,
+  }) => {
+    const uri = await createSpace(page, { skey: TEST_SKEY + "-get" });
     createdSpaceUri = uri;
 
     const getResp = await getSpace(page, uri);
     expect(getResp.ok()).toBe(true);
     const getBody = await getResp.json();
-    expect(getBody.space.display_name).toBe("GetSpace Test");
-    expect(getBody.config.readPolicy).toEqual(MEMBER_LIST_POLICY);
+    expect(getBody.uri).toBe(uri);
+    expect(getBody.policy).toMatchObject({
+      $type: MEMBERSPACE,
+      publicRead: false,
+    });
   });
 
   test("create duplicate space returns conflict", async ({ page }) => {
     createdSpaceUri = await createSpace(page, { skey: TEST_SKEY + "-dup" });
 
     const dupResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
+      "/xrpc/com.atproto.space.createSpace",
       {
         data: {
           spaceType: TEST_TYPE_NSID,
           skey: TEST_SKEY + "-dup",
+          policy: MEMBER_POLICY,
         },
       },
     );
     expect(dupResp.status()).toBe(409);
+    expect((await dupResp.json()).error).toBe("SpaceAlreadyExists");
   });
 
-  test("updateSpace changes display name", async ({ page }) => {
+  test("updateSpace replaces the policy", async ({ page }) => {
     const uri = await createSpace(page, {
       skey: TEST_SKEY + "-update",
-      displayName: "Before Update",
+      policy: { $type: MEMBERSPACE, publicRead: true },
     });
     createdSpaceUri = uri;
 
     const updateResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.updateSpace",
-      { data: { space: uri, displayName: "After Update" } },
+      "/xrpc/com.atproto.space.updateSpace",
+      {
+        data: { space: uri, policy: { $type: MEMBERSPACE, publicWrite: true } },
+      },
     );
     expect(updateResp.ok()).toBe(true);
-    const updateBody = await updateResp.json();
-    expect(updateBody.space.display_name).toBe("After Update");
+
+    const { policy } = await (await getSpace(page, uri)).json();
+    expect(policy).toMatchObject({ publicRead: false, publicWrite: true });
   });
 
   test("deleteSpace removes the space", async ({ page }) => {
     const uri = await createSpace(page, { skey: TEST_SKEY + "-delete" });
 
     const deleteResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.deleteSpace",
+      "/xrpc/com.atproto.space.deleteSpace",
       { data: { space: uri } },
     );
     expect(deleteResp.ok()).toBe(true);
 
     const getResp = await getSpace(page, uri);
-    expect(getResp.status()).toBe(404);
+    expect(getResp.status()).toBe(400);
+    expect((await getResp.json()).error).toBe("SpaceNotFound");
   });
 
   test("putMember returns 201", async ({ page }) => {
@@ -225,40 +227,21 @@ test.describe("Spaces API", () => {
     expect(member).toMatchObject({ read: true, write: true });
   });
 
-  test("getSpace returns the read and write policies", async ({ page }) => {
+  test("a managed space round-trips its managing app", async ({ page }) => {
+    const policy = {
+      $type: "com.atproto.managedspace.policy",
+      managingApp: "did:web:app.example#forum",
+      publishPolicy: false,
+    };
     const uri = await createSpace(page, {
-      skey: TEST_SKEY + "-policies",
-      readPolicy: PUBLIC_POLICY,
-      writePolicy: MEMBER_LIST_POLICY,
+      skey: TEST_SKEY + "-managed",
+      policy,
     });
     createdSpaceUri = uri;
 
     const getResp = await getSpace(page, uri);
     expect(getResp.ok()).toBe(true);
-    const { config } = await getResp.json();
-    expect(config.readPolicy).toEqual(PUBLIC_POLICY);
-    expect(config.writePolicy).toEqual(MEMBER_LIST_POLICY);
-  });
-
-  test("updateSpace changes the read policy", async ({ page }) => {
-    const uri = await createSpace(page, {
-      skey: TEST_SKEY + "-update-policy",
-      readPolicy: MEMBER_LIST_POLICY,
-      writePolicy: MEMBER_LIST_POLICY,
-    });
-    createdSpaceUri = uri;
-
-    const updateResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.updateSpace",
-      { data: { space: uri, readPolicy: PUBLIC_POLICY } },
-    );
-    expect(updateResp.ok()).toBe(true);
-
-    const getResp = await getSpace(page, uri);
-    expect(getResp.ok()).toBe(true);
-    const { config } = await getResp.json();
-    expect(config.readPolicy).toEqual(PUBLIC_POLICY);
-    expect(config.writePolicy).toEqual(MEMBER_LIST_POLICY);
+    expect((await getResp.json()).policy).toEqual(policy);
   });
 });
 
@@ -287,11 +270,12 @@ test.describe("Spaces Feature Flag", () => {
     page,
   }) => {
     const resp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
+      "/xrpc/com.atproto.space.createSpace",
       {
         data: {
-          type: "com.example.test",
+          spaceType: "com.example.test",
           skey: "flag-test",
+          policy: MEMBER_POLICY,
         },
       },
     );

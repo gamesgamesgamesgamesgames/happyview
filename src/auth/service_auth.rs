@@ -1,5 +1,3 @@
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256Key, signature::Verifier};
 use serde::Deserialize;
@@ -57,32 +55,12 @@ struct VerificationMethod {
 }
 
 impl ServiceAuth {
-    /// Validate a Bearer token as a service auth JWT.
-    pub async fn from_bearer(token: &str, state: &AppState) -> Result<Self, AppError> {
+    /// Checks a Bearer token's signature and expiry only. Its audience and
+    /// method binding are not checked here: authenticate a request through
+    /// `auth::middleware`, whose `try_parse_service_auth` checks all of them.
+    pub(crate) async fn from_bearer(token: &str, state: &AppState) -> Result<Self, AppError> {
         let payload = verify_service_jwt(token, state, false).await?;
         Ok(ServiceAuth { did: payload.iss })
-    }
-}
-
-// Axum extractor
-impl FromRequestParts<AppState> for ServiceAuth {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(AppError::Auth("missing Authorization header".into()))?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or(AppError::Auth("invalid Authorization scheme".into()))?;
-
-        Self::from_bearer(token, state).await
     }
 }
 
@@ -351,7 +329,7 @@ pub async fn mint_service_auth(
     aud: &str,
     lxm: &str,
 ) -> Result<String, AppError> {
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use p256::ecdsa::SigningKey;
 
     let iss = instance_did(pool, backend, public_url).await?;
 
@@ -369,6 +347,18 @@ pub async fn mint_service_auth(
         .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
     let signing_key = SigningKey::from_slice(&private_bytes)
         .map_err(|e| AppError::Internal(format!("invalid service signing key: {e}")))?;
+
+    sign_service_auth(&signing_key, &iss, aud, lxm)
+}
+
+/// Sign a service auth token as `iss` with its `#atproto` key.
+pub fn sign_service_auth(
+    signing_key: &p256::ecdsa::SigningKey,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+) -> Result<String, AppError> {
+    use p256::ecdsa::{Signature, signature::Signer};
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -608,7 +598,7 @@ mod outbound_tests {
             &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app.example.com#forum",
-            "com.atproto.simplespace.checkUserAccess",
+            "com.atproto.managedspace.checkUserAccess",
         )
         .await
         .expect("mint");
@@ -623,7 +613,7 @@ mod outbound_tests {
         let payload = decode_part(parts[1]);
         assert_eq!(payload["iss"], "did:plc:instance");
         assert_eq!(payload["aud"], "did:web:app.example.com#forum");
-        assert_eq!(payload["lxm"], "com.atproto.simplespace.checkUserAccess");
+        assert_eq!(payload["lxm"], "com.atproto.managedspace.checkUserAccess");
         assert!(payload["exp"].as_u64().unwrap() > payload["iat"].as_u64().unwrap());
         assert!(!payload["jti"].as_str().unwrap().is_empty());
     }
@@ -666,7 +656,7 @@ mod outbound_tests {
             &crate::plugin::encryption::Keyring::from(key),
             "https://hv.example",
             "did:web:app#f",
-            "com.atproto.simplespace.checkUserAccess",
+            "com.atproto.managedspace.checkUserAccess",
         )
         .await
         .expect("mint");

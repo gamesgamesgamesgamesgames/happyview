@@ -1,4 +1,4 @@
-//! Reading a space with a credential: `Authorization: Atproto-Space`, signed by
+//! Reading a space with a credential: `Authorization: Atproto-Space-Credential`, signed by
 //! the credential's bound key and addressed to the DID being read.
 
 mod common;
@@ -69,13 +69,11 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
         post_as(
             app,
             CREATOR,
-            "com.atproto.simplespace.createSpace",
+            "com.atproto.space.createSpace",
             json!({
-                "type": "com.example.creduse",
+                "spaceType": "com.example.creduse",
                 "skey": format!("s{}", Uuid::new_v4().simple()),
-                "readPolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "writePolicy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+                "policy": { "$type": "com.atproto.memberspace.policy" },
             }),
         ),
     )
@@ -130,20 +128,21 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
         .unwrap()
         .to_string();
 
-    let authorization = format!("Bearer {token}");
-    let signed = http_signature::sign(key, &authorization, None);
-    let mut req = Request::builder()
+    let req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.getSpaceCredential")
-        .header("content-type", "application/json")
-        .header("authorization", &authorization);
-    for name in ["signature-input", "signature"] {
-        req = req.header(name, signed[name].clone());
-    }
+        .header("content-type", "application/json");
     let minted = call(
         app,
-        req.body(Body::from(json!({ "space": space }).to_string()))
-            .unwrap(),
+        req.body(Body::from(
+            json!({
+                "space": space,
+                "credentialKid": http_signature::did_key(key.verifying_key()),
+                "delegationToken": token,
+            })
+            .to_string(),
+        ))
+        .unwrap(),
     )
     .await;
     assert_eq!(minted.status(), StatusCode::OK);
@@ -156,7 +155,11 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
 
 /// A credential-authenticated GET, signed by `key` for `audience`.
 fn read(path: &str, credential: &str, key: &SigningKey, audience: &str) -> Request<Body> {
-    let signed = http_signature::sign(key, &format!("Atproto-Space {credential}"), Some(audience));
+    let signed = http_signature::sign(
+        key,
+        &format!("Atproto-Space-Credential {credential}"),
+        audience,
+    );
     let mut req = Request::builder().uri(path);
     for (name, value) in &signed {
         req = req.header(name, value);
@@ -279,7 +282,7 @@ async fn gets_a_space_with_a_credential_addressed_to_its_authority() {
         .to_string();
 
     let path = format!(
-        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        "/xrpc/com.atproto.space.getSpace?space={}",
         urlencoding::encode(&space)
     );
     let resp = call(&app, read(&path, &credential, &key, &authority)).await;
@@ -447,11 +450,103 @@ async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
     };
     assert_eq!(body["space"], json!(space));
     assert_eq!(body["credentials"], json!([jti]));
+    // The space has a DID of its own, and revokes as it.
+    assert!(authority.starts_with("did:plc:"), "{authority}");
+    let authorization = received[0]
+        .headers
+        .get("authorization")
+        .expect("revocations carry service auth from the authority")
+        .to_str()
+        .unwrap();
+    app.assert_signed_as_space(authorization, authority).await;
+}
+
+fn get_as(app: &TestApp, did: &str, path: &str) -> Request<Body> {
+    let (name, value) = cookie_for(app, did);
+    Request::builder()
+        .uri(path)
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `simplespace.getSpace`, and its `dev.happyview` alias, give a space the
+/// caller may not read the answer they give a space that does not exist.
+#[tokio::test]
+#[serial]
+async fn simplespace_get_space_answers_a_refusal_as_not_found() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+    let space_did = space
+        .trim_start_matches("at://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let missing = format!("at://{space_did}/space/com.example.creduse/nothing-here");
+
+    for nsid in [
+        "com.atproto.simplespace.getSpace",
+        "dev.happyview.space.getSpace",
+    ] {
+        let path = |space: &str| format!("/xrpc/{nsid}?space={}", urlencoding::encode(space));
+
+        let resp = call(&app, get_as(&app, CREATOR, &path(&missing))).await;
+        let status = resp.status();
+        let absent = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{nsid}: {absent}");
+        assert_eq!(absent["error"], json!("SpaceNotFound"), "{nsid}");
+
+        let stranger = format!("did:plc:stranger{}", Uuid::new_v4().simple());
+        let resp = call(&app, get_as(&app, &stranger, &path(&space))).await;
+        assert_eq!(resp.status(), status, "{nsid}: a non-owner");
+        assert_eq!(json_of(resp).await, absent, "{nsid}: a non-owner");
+
+        let resp = call(&app, read(&path(&space), &credential, &key, MEMBER)).await;
+        assert_eq!(resp.status(), status, "{nsid}: another audience");
+        assert_eq!(json_of(resp).await, absent, "{nsid}: another audience");
+
+        let resp = call(&app, read(&path(&space), &credential, &key, &space_did)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{nsid}: addressed to the space"
+        );
+        let resp = call(&app, get_as(&app, CREATOR, &path(&space))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{nsid}: the owner");
+    }
+}
+
+/// `listSpaces` gives the space's revision to its owner, not to a member.
+#[tokio::test]
+#[serial]
+async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let (space, _) = setup(&mut app, &key()).await;
+    let listed = |did: &'static str| {
+        let app = &app;
+        let space = space.clone();
+        async move {
+            let resp = call(app, get_as(app, did, "/xrpc/com.atproto.space.listSpaces")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            json_of(resp).await["spaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["space"] == json!(space))
+                .cloned()
+                .expect("listed")
+        }
+    };
+    let as_member = listed(MEMBER).await;
+    assert!(as_member["spaceRev"].is_null(), "{as_member}");
     assert!(
-        received[0]
-            .headers
-            .get("authorization")
-            .is_some_and(|v| v.to_str().unwrap().starts_with("Bearer ")),
-        "revocations carry service auth from the authority"
+        as_member["repoRev"].is_string(),
+        "the member wrote: {as_member}"
     );
+    let as_owner = listed(CREATOR).await;
+    assert!(as_owner["spaceRev"].is_string(), "{as_owner}");
 }

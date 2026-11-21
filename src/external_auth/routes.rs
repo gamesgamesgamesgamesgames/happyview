@@ -130,7 +130,8 @@ async fn authorize(
         app_state.db_backend,
         app_state.http.clone(),
         Arc::new(app_state.lexicons.clone()),
-    );
+    )
+    .with_app_state(app_state.clone());
 
     let mut instance = executor
         .instantiate(&plugin_id, &state_param, secrets, config.clone())
@@ -244,7 +245,8 @@ async fn callback_inner(
         app_state.db_backend,
         app_state.http.clone(),
         Arc::new(app_state.lexicons.clone()),
-    );
+    )
+    .with_app_state(app_state.clone());
 
     let mut instance = executor
         .instantiate(
@@ -321,7 +323,8 @@ async fn connect_with_config(
         app_state.db_backend,
         app_state.http.clone(),
         Arc::new(app_state.lexicons.clone()),
-    );
+    )
+    .with_app_state(app_state.clone());
 
     // For API key auth, we pass the user's config to handle_callback
     // The params are empty since there's no OAuth flow

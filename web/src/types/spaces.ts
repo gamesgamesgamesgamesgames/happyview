@@ -84,3 +84,30 @@ export interface AdminAccountRecord extends AdminSpaceRecord {
   space_id: string;
   space_uri: string;
 }
+
+/** A stored read or write rule, as `/admin/spaces/retired-policies` sends it. */
+export type SpaceRule =
+  | { $type: "com.atproto.simplespace.defs#publicPolicy" }
+  | { $type: "com.atproto.simplespace.defs#memberListPolicy" }
+  | {
+      $type: "com.atproto.simplespace.defs#managingAppPolicy";
+      managingApp: string;
+    };
+
+/** A space whose rules predate policies and match none. */
+export interface RetiredSpace {
+  id: string;
+  uri: string;
+  spaceType: string;
+  skey: string;
+  creatorDid: string;
+  readPolicy: SpaceRule;
+  writePolicy: SpaceRule;
+  appAccess: { $type: string; allowed?: string[] };
+}
+
+/** `spaces` is present only while the space inspector is on. */
+export interface RetiredSpacesResponse {
+  count: number;
+  spaces?: RetiredSpace[];
+}

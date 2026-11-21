@@ -41,10 +41,11 @@
   "devDependencies": {
     "@happy-dom/global-registrator": "^16.0.0",
     "@semantic-release/commit-analyzer": "^13.0.1",
-    "@semantic-release/github": "^12.0.6",
     "@semantic-release/exec": "^7.0.0",
+    "@semantic-release/github": "^12.0.6",
     "@semantic-release/release-notes-generator": "^14.1.0",
     "@types/bun": "^1.3.12",
+    "fake-indexeddb": "6.0.0",
     "semantic-release": "^25.0.3",
     "semantic-release-monorepo": "^8.0.2",
     "tsup": "^8.0.0",

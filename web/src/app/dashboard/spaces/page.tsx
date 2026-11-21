@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { RetiredPolicyNotice } from "@/components/spaces/retired-policy-notice";
 import { AccountName } from "@/components/account-name";
 import { useConfig } from "@/lib/config-context";
 
@@ -142,6 +143,7 @@ function SpacesList() {
     <>
       <SiteHeader title="Spaces" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        <RetiredPolicyNotice />
         <DataTable
           table={table}
           showPagination={false}
@@ -215,6 +217,11 @@ function SpacesList() {
 
 export default function SpacesPage() {
   const { features } = useConfig();
-  if (!features.space_inspector) return <InspectorDisabled title="Spaces" />;
+  if (!features.space_inspector)
+    return (
+      <InspectorDisabled title="Spaces">
+        <RetiredPolicyNotice />
+      </InspectorDisabled>
+    );
   return <SpacesList />;
 }

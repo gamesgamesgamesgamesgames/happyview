@@ -72,6 +72,7 @@ pub mod testing;
 pub mod testkit;
 pub mod tid;
 pub mod tombstones;
+pub mod update_check;
 pub mod verification_methods;
 pub mod version;
 pub mod xrpc;
@@ -139,6 +140,8 @@ pub struct AppState {
     pub attestation_signer: Option<Arc<plugin::attestation::AttestationSigner>>,
     pub official_registry: SharedRegistry,
     pub official_registry_config: RegistryConfig,
+    /// What the last check for a newer HappyView found.
+    pub update_status: update_check::SharedUpdateStatus,
     pub proxy_config: Arc<arc_swap::ArcSwap<proxy_config::ProxyConfig>>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Ignored keep-on-delete reports, rate-limited per collection.
@@ -156,6 +159,29 @@ pub struct AppState {
     /// callers, mocks, single-attempt record scripts — is keyed on this, and
     /// no other code path constructs one, so a serving binary never has it.
     pub test: Option<Arc<testing::TestHarness>>,
+
+    /// How plugin raw SQL is isolated on Postgres, decided once at boot. See
+    /// [`PluginSqlAccess`].
+    pub plugin_sql: PluginSqlAccess,
+}
+
+/// How plugin raw SQL runs on Postgres (the mode reported at
+/// `/admin/database/status`). Decided at boot and fixed for the process.
+#[derive(Clone)]
+pub enum PluginSqlAccess {
+    /// Its own pool, logged in as the unprivileged `happyview_plugin` role —
+    /// `session_user` has no access to the protected tables.
+    LoginPool(sqlx::AnyPool),
+    /// The main pool, restricted per statement with `SET LOCAL ROLE`.
+    Role,
+    /// The main pool, no role change; the parser is the whole boundary. SQLite
+    /// also uses this (the value is ignored there).
+    ParserOnly,
+    /// Plugin raw SQL is refused on Postgres: `PLUGIN_SQL_DATABASE_URL` was set
+    /// but the login pool could not be opened or verified, or the plugin schema
+    /// holds code from an earlier login-pool session. HappyView still boots;
+    /// only plugin raw SQL is refused.
+    Refused,
 }
 
 impl AppState {

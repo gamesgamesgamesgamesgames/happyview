@@ -134,6 +134,18 @@ const STORES: &[Store] = &[
         flag: None,
     },
     Store {
+        name: "space_authorities",
+        table: "happyview_space_authorities",
+        key: "did",
+        key_kind: Key::Text,
+        columns: &[
+            col("signing_key_enc", Encoding::Raw),
+            col("kem_key_enc", Encoding::Raw),
+            col("rotation_key_enc", Encoding::Raw),
+        ],
+        flag: None,
+    },
+    Store {
         name: "attestation_key",
         table: "happyview_attestation_key",
         key: "id",

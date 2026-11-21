@@ -93,7 +93,7 @@ fn cookie_for(app: &TestApp, did: &str) -> (HeaderName, HeaderValue) {
 
 fn get_space_req(skey: &str, cookie: Option<(HeaderName, HeaderValue)>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri(format!(
-        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        "/xrpc/com.atproto.space.getSpace?space={}",
         urlencoding::encode(&space_uri(skey))
     ));
     if let Some((name, value)) = cookie {
@@ -136,7 +136,8 @@ async fn get_space_rejects_non_owner_member() {
         .oneshot(get_space_req("member", Some(cookie_for(&app, MEMBER))))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Not disclosed to someone who may not read it.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Outsiders cannot read the space even when membership is public on it.

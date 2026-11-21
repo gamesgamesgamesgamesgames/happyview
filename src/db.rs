@@ -485,27 +485,7 @@ const CONCURRENTLY_BUILT_INDEXES: &[&str] = &["idx_records_collection_created_at
 /// for the copy as it waits for a migration.
 async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), MigrateFailure> {
     let mut conn = pool.acquire().await?;
-
-    let started = std::time::Instant::now();
-    let mut last_report: Option<std::time::Instant> = None;
-    loop {
-        let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
-        let (locked,): (bool,) = crate::db::query_as(&sql)
-            .bind(PG_MIGRATION_LOCK_KEY)
-            .fetch_one(&mut *conn)
-            .await?;
-        if locked {
-            break;
-        }
-        if last_report.is_none_or(|at| at.elapsed() >= PG_MIGRATION_LOCK_REPORT) {
-            tracing::info!(
-                waited_secs = started.elapsed().as_secs(),
-                "another instance is running migrations; waiting for it to finish"
-            );
-            last_report = Some(std::time::Instant::now());
-        }
-        tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
-    }
+    lock_migrations(&mut conn).await?;
 
     let outcome = async {
         for index in CONCURRENTLY_BUILT_INDEXES {
@@ -542,13 +522,51 @@ async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), Mig
     }
     .await;
 
-    let sql = adapt_sql("SELECT pg_advisory_unlock(?)", DatabaseBackend::Postgres);
-    let unlocked = crate::db::query(&sql)
-        .bind(PG_MIGRATION_LOCK_KEY)
-        .execute(&mut *conn)
-        .await;
+    let unlocked = unlock_migrations(&mut conn).await;
     outcome?;
     unlocked?;
+    Ok(())
+}
+
+/// Take [`PG_MIGRATION_LOCK_KEY`] on `conn`, a Postgres connection, waiting
+/// for whoever holds it. It is tried between short sleeps rather than waited
+/// on inside a statement, for the reason the key's own comment gives.
+///
+/// Anything else that changes the schema objects migrations create, such as
+/// the grants plugin SQL's roles get on them, takes it too: Postgres refuses
+/// two sessions changing one catalog row at once ("tuple concurrently
+/// updated"), so a migration replacing a view would fail while another
+/// instance granted on it.
+pub(crate) async fn lock_migrations(conn: &mut sqlx::AnyConnection) -> Result<(), sqlx::Error> {
+    let started = std::time::Instant::now();
+    let mut last_report: Option<std::time::Instant> = None;
+    loop {
+        let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
+        let (locked,): (bool,) = crate::db::query_as(&sql)
+            .bind(PG_MIGRATION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?;
+        if locked {
+            return Ok(());
+        }
+        if last_report.is_none_or(|at| at.elapsed() >= PG_MIGRATION_LOCK_REPORT) {
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "another instance is running migrations; waiting for it to finish"
+            );
+            last_report = Some(std::time::Instant::now());
+        }
+        tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
+    }
+}
+
+/// Release what [`lock_migrations`] took on `conn`.
+pub(crate) async fn unlock_migrations(conn: &mut sqlx::AnyConnection) -> Result<(), sqlx::Error> {
+    let sql = adapt_sql("SELECT pg_advisory_unlock(?)", DatabaseBackend::Postgres);
+    crate::db::query(&sql)
+        .bind(PG_MIGRATION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 

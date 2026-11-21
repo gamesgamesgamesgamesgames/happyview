@@ -39,25 +39,27 @@ const CONTROL_METHOD: &str = "com.atproto.space.zzzProbeControlDoesNotExist";
 
 /// Methods a repo host must serve for migration to be worth attempting.
 ///
-/// Each entry is a set of accepted spellings, and one match is enough.
-/// Implementations lag renames: `getRepoState` predates `getLatestCommit`, and
-/// pds.js still offers `addMember` rather than `putMember`. The October 29
-/// spaces alpha moved space management to `space.*` and members to
-/// `memberspace.*`, and removed `simplespace` without an alias, so a host on
-/// either generation qualifies.
+/// Each entry is a set of accepted spellings, newest first, and one match is
+/// enough; the first is the name reported as missing. Implementations lag
+/// renames, and HappyView speaks every revision of Proposal 0016 (see
+/// [`Generation`]), so a host on any of them qualifies: `simplespace` before
+/// Oct 29, `space.*`/`memberspace.putMember` on Oct 29, and the plural
+/// `memberspace.putMembers` since Nov 12. `getRepoState` predates
+/// `getLatestCommit`, and pds.js still offers `addMember`.
 const REQUIRED_METHODS: &[&[&str]] = &[
     &[
-        "com.atproto.simplespace.createSpace",
         "com.atproto.space.createSpace",
+        "com.atproto.simplespace.createSpace",
     ],
     &[
+        "com.atproto.memberspace.putMembers",
+        "com.atproto.memberspace.putMember",
         "com.atproto.simplespace.putMember",
         "com.atproto.simplespace.addMember",
-        "com.atproto.memberspace.putMember",
     ],
     &[
-        "com.atproto.simplespace.getSpace",
         "com.atproto.space.getSpace",
+        "com.atproto.simplespace.getSpace",
     ],
     &["com.atproto.space.createRecord"],
     &["com.atproto.space.applyWrites"],
@@ -69,6 +71,73 @@ const REQUIRED_METHODS: &[&[&str]] = &[
     ],
     &["com.atproto.space.getDelegationToken"],
 ];
+
+/// A revision of Proposal 0016, as a host's method list shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Generation {
+    /// `com.atproto.simplespace.*`, before the Oct 29 text.
+    G0,
+    /// The Oct 29 text: `space.*Space`, singular `memberspace.putMember`,
+    /// `managedspace.checkUserAccess`, `notifyWrite`, `listRepos`.
+    G1,
+    /// The Nov 12 text (proposals #143): `memberspace.putMembers`,
+    /// `managedspace.checkAccess`, `notifyRepoUpdate`, `listWriters`.
+    G2,
+}
+
+impl Generation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::G0 => "g0",
+            Self::G1 => "g1",
+            Self::G2 => "g2",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "g0" => Some(Self::G0),
+            "g1" => Some(Self::G1),
+            "g2" => Some(Self::G2),
+            _ => None,
+        }
+    }
+
+    /// The methods only a host on this revision or a later one offers.
+    fn markers(self) -> &'static [&'static str] {
+        match self {
+            Self::G2 => &[
+                "com.atproto.memberspace.putMembers",
+                "com.atproto.memberspace.removeMembers",
+                "com.atproto.managedspace.checkAccess",
+                "com.atproto.space.listWriters",
+                "com.atproto.space.notifyRepoUpdate",
+                "com.atproto.space.notifySpaceStatus",
+            ],
+            Self::G1 => &[
+                "com.atproto.space.createSpace",
+                "com.atproto.memberspace.putMember",
+            ],
+            Self::G0 => &[
+                "com.atproto.simplespace.createSpace",
+                "com.atproto.simplespace.putMember",
+                "com.atproto.simplespace.addMember",
+            ],
+        }
+    }
+
+    /// The newest revision a method list shows, if any.
+    pub fn newest_in(methods: &[String]) -> Option<Self> {
+        [Self::G2, Self::G1, Self::G0]
+            .into_iter()
+            .find(|generation| {
+                generation
+                    .markers()
+                    .iter()
+                    .any(|marker| methods.iter().any(|m| m == marker))
+            })
+    }
+}
 
 /// How long an answer is trusted.
 ///
@@ -120,6 +189,9 @@ pub struct SpaceSupport {
     /// which are missing; an unsupported answer from any other tier lists every
     /// required method.
     pub missing: Vec<String>,
+    /// The newest revision the server's method list shows. Only the descriptor
+    /// tier knows it; a probe shows that spaces are served, not which revision.
+    pub generation: Option<Generation>,
     pub checked_at: String,
 }
 
@@ -130,16 +202,18 @@ impl SpaceSupport {
             pds: pds.to_string(),
             tier,
             missing,
+            generation: None,
             checked_at: now_rfc3339(),
         }
     }
 
-    fn supported(pds: &str, tier: DetectionTier) -> Self {
+    fn supported(pds: &str, tier: DetectionTier, generation: Option<Generation>) -> Self {
         Self {
             supported: true,
             pds: pds.to_string(),
             tier,
             missing: Vec::new(),
+            generation,
             checked_at: now_rfc3339(),
         }
     }
@@ -206,7 +280,11 @@ pub async fn probe(http: &reqwest::Client, pds: &str) -> SpaceSupport {
             .collect();
 
         return if missing.is_empty() {
-            SpaceSupport::supported(pds, DetectionTier::Descriptor)
+            SpaceSupport::supported(
+                pds,
+                DetectionTier::Descriptor,
+                Generation::newest_in(&methods),
+            )
         } else {
             SpaceSupport::unsupported(pds, DetectionTier::Descriptor, missing)
         };
@@ -229,7 +307,7 @@ pub async fn probe(http: &reqwest::Client, pds: &str) -> SpaceSupport {
     let supported = conclusive && real == 401;
 
     if supported {
-        SpaceSupport::supported(pds, DetectionTier::Probe)
+        SpaceSupport::supported(pds, DetectionTier::Probe, None)
     } else {
         SpaceSupport::unsupported(pds, DetectionTier::Probe, all_required_names())
     }
@@ -257,24 +335,25 @@ async fn read_cache(
     pds: &str,
 ) -> Result<Option<SpaceSupport>, AppError> {
     let sql = adapt_sql(
-        "SELECT supported, tier, missing, checked_at FROM happyview_space_pds_support WHERE pds_endpoint = ?",
+        "SELECT supported, tier, missing, generation, checked_at FROM happyview_space_pds_support WHERE pds_endpoint = ?",
         backend,
     );
-    let row: Option<(i32, String, String, String)> = crate::db::query_as(&sql)
+    let row: Option<(i32, String, String, Option<String>, String)> = crate::db::query_as(&sql)
         .bind(pds)
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to read pds support cache: {e}")))?;
 
-    Ok(
-        row.map(|(supported, tier, missing, checked_at)| SpaceSupport {
+    Ok(row.map(
+        |(supported, tier, missing, generation, checked_at)| SpaceSupport {
             supported: supported != 0,
             pds: pds.to_string(),
             tier: DetectionTier::parse(&tier).unwrap_or(DetectionTier::Probe),
             missing: serde_json::from_str(&missing).unwrap_or_default(),
+            generation: generation.as_deref().and_then(Generation::parse),
             checked_at,
-        }),
-    )
+        },
+    ))
 }
 
 async fn write_cache(
@@ -284,12 +363,13 @@ async fn write_cache(
 ) -> Result<(), AppError> {
     let missing = serde_json::to_string(&support.missing).unwrap_or_else(|_| "[]".into());
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_pds_support (pds_endpoint, supported, tier, missing, checked_at) \
-         VALUES (?, ?, ?, ?, ?) \
+        "INSERT INTO happyview_space_pds_support (pds_endpoint, supported, tier, missing, generation, checked_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
          ON CONFLICT (pds_endpoint) DO UPDATE SET \
              supported = excluded.supported, \
              tier = excluded.tier, \
              missing = excluded.missing, \
+             generation = excluded.generation, \
              checked_at = excluded.checked_at",
         backend,
     );
@@ -298,6 +378,7 @@ async fn write_cache(
         .bind(support.supported as i32)
         .bind(support.tier.as_str())
         .bind(&missing)
+        .bind(support.generation.map(Generation::as_str))
         .bind(&support.checked_at)
         .execute(pool)
         .await
@@ -369,6 +450,7 @@ mod tests {
         assert!(got.supported);
         assert_eq!(got.tier, DetectionTier::Descriptor);
         assert!(got.missing.is_empty());
+        assert_eq!(got.generation, Some(Generation::G2));
     }
 
     #[tokio::test]
@@ -399,7 +481,7 @@ mod tests {
         let server = MockServer::start().await;
         let mut methods: Vec<&str> = full_method_list();
         methods.retain(|m| {
-            *m != "com.atproto.space.getLatestCommit" && *m != "com.atproto.simplespace.putMember"
+            *m != "com.atproto.space.getLatestCommit" && *m != "com.atproto.memberspace.putMembers"
         });
         methods.push("com.atproto.space.getRepoState");
         methods.push("com.atproto.simplespace.addMember");
@@ -455,6 +537,88 @@ mod tests {
 
         let got = probe(&reqwest::Client::new(), &server.uri()).await;
         assert!(got.supported, "missing: {:?}", got.missing);
+        assert_eq!(got.generation, Some(Generation::G1));
+    }
+
+    /// The space methods ZDS 0.9.0 routes, from its `src/http/router.zig`:
+    /// the Nov 12 revision, with plural member methods and no singular ones.
+    #[tokio::test]
+    async fn a_host_on_the_november_12_revision_is_supported() {
+        let server = MockServer::start().await;
+        let methods = [
+            "com.atproto.managedspace.checkAccess",
+            "com.atproto.memberspace.listMembers",
+            "com.atproto.memberspace.putMembers",
+            "com.atproto.memberspace.removeMembers",
+            "com.atproto.space.applyWrites",
+            "com.atproto.space.createRecord",
+            "com.atproto.space.createSpace",
+            "com.atproto.space.getDelegationToken",
+            "com.atproto.space.getLatestCommit",
+            "com.atproto.space.getSpace",
+            "com.atproto.space.listRecords",
+            "com.atproto.space.listRepoOps",
+            "com.atproto.space.listWriters",
+            "com.atproto.space.notifyRepoUpdate",
+        ];
+        Mock::given(method("GET"))
+            .and(path(format!("/xrpc/{DESCRIBE_NSID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(descriptor(&methods)))
+            .mount(&server)
+            .await;
+
+        let got = probe(&reqwest::Client::new(), &server.uri()).await;
+        assert!(got.supported, "missing: {:?}", got.missing);
+        assert_eq!(got.generation, Some(Generation::G2));
+    }
+
+    /// pds.js offers the simplespace management methods and the `space.*`
+    /// record methods.
+    #[tokio::test]
+    async fn a_simplespace_host_is_supported() {
+        let server = MockServer::start().await;
+        let methods = [
+            "com.atproto.simplespace.createSpace",
+            "com.atproto.simplespace.addMember",
+            "com.atproto.simplespace.getSpace",
+            "com.atproto.space.applyWrites",
+            "com.atproto.space.createRecord",
+            "com.atproto.space.getDelegationToken",
+            "com.atproto.space.getRepoState",
+            "com.atproto.space.listRecords",
+            "com.atproto.space.listRepoOps",
+        ];
+        Mock::given(method("GET"))
+            .and(path(format!("/xrpc/{DESCRIBE_NSID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(descriptor(&methods)))
+            .mount(&server)
+            .await;
+
+        let got = probe(&reqwest::Client::new(), &server.uri()).await;
+        assert!(got.supported, "missing: {:?}", got.missing);
+        assert_eq!(got.generation, Some(Generation::G0));
+    }
+
+    #[test]
+    fn the_newest_revision_shown_wins() {
+        let list = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            Generation::newest_in(&list(&[
+                "com.atproto.simplespace.createSpace",
+                "com.atproto.space.createSpace",
+                "com.atproto.memberspace.putMembers",
+            ])),
+            Some(Generation::G2)
+        );
+        assert_eq!(
+            Generation::newest_in(&list(&["com.atproto.space.createRecord"])),
+            None,
+            "a record method is in every revision"
+        );
+        for generation in [Generation::G0, Generation::G1, Generation::G2] {
+            assert_eq!(Generation::parse(generation.as_str()), Some(generation));
+        }
+        assert_eq!(Generation::parse("g3"), None);
     }
 
     #[tokio::test]
@@ -471,6 +635,7 @@ mod tests {
             "401 on an auth-gated method means the route exists"
         );
         assert_eq!(got.tier, DetectionTier::Probe);
+        assert_eq!(got.generation, None, "a probe does not show the revision");
     }
 
     #[tokio::test]
@@ -566,6 +731,7 @@ mod tests {
                 pds: pds.clone(),
                 tier,
                 missing: Vec::new(),
+                generation: supported.then_some(Generation::G1),
                 checked_at,
             },
         )
@@ -589,6 +755,11 @@ mod tests {
         let got = get_support(&state, &pds, false).await.unwrap();
         assert!(got.supported);
         assert_eq!(got.tier, DetectionTier::Descriptor);
+        assert_eq!(
+            got.generation,
+            Some(Generation::G1),
+            "the cache keeps the revision"
+        );
     }
 
     #[tokio::test]

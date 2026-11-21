@@ -56,17 +56,13 @@ async function setSetting(key: string, value: string | null) {
 async function createSpace(
   page: Page,
 ): Promise<{ uri: string; id: string; creatorDid: string }> {
-  const resp = await page.request.post(
-    "/xrpc/com.atproto.simplespace.createSpace",
-    {
-      data: {
-        spaceType: "com.example.inspector",
-        skey: `inspector-${Date.now()}`,
-        readPolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
-        writePolicy: { $type: "com.atproto.simplespace.defs#memberListPolicy" },
-      },
+  const resp = await page.request.post("/xrpc/com.atproto.space.createSpace", {
+    data: {
+      spaceType: "com.example.inspector",
+      skey: `inspector-${Date.now()}`,
+      policy: { $type: "com.atproto.memberspace.policy" },
     },
-  );
+  });
   expect(resp.ok()).toBe(true);
   const { uri } = await resp.json();
   return { uri, ...(await spaceRowFor(uri)) };
@@ -122,7 +118,7 @@ test.describe("Space inspector", () => {
     await setSetting("feature.space_inspector_enabled", null);
     await revokeOpenGrants();
     if (spaceUri) {
-      await page.request.post("/xrpc/com.atproto.simplespace.deleteSpace", {
+      await page.request.post("/xrpc/com.atproto.space.deleteSpace", {
         data: { space: spaceUri },
       });
       spaceUri = null;

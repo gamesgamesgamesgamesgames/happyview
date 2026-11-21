@@ -32,6 +32,10 @@ export interface BackfillJob {
   // False while a network job is still listing repos from the relay; until
   // then `total_repos` counts the repos discovered so far.
   discovery_complete?: boolean;
+  // A crawl's collections whose relay listing has a saved cursor short of its
+  // end. On a completed crawl these stopped early; a new backfill with
+  // `relay_cursor` continues from the cursor. Absent when there are none.
+  discovery_unfinished?: { collection: string; relay_cursor: string | null }[];
   // Set for jobs on the bounded queue: how many recent completions the
   // `fetched` repo list keeps. Null for jobs created before it.
   recent_completions_limit?: number | null;
@@ -43,6 +47,9 @@ export interface BackfillJob {
   hooks?: HookStats | null;
   // The same, kept with the job once it completed, failed or was cancelled.
   hook_stats?: HookStats | null;
+  // 429 responses the job's fetches got from PDSes, each waited out and the
+  // request sent again.
+  rate_limited?: number;
 }
 
 // A job's hook stats: `GET /admin/backfill/status` and the `hook_stats`
@@ -96,6 +103,8 @@ export interface PdsSummaryEntry {
   total_repos: number;
   completed_repos: number;
   total_records: number;
+  // 429 responses from this PDS.
+  rate_limited?: number;
 }
 
 export interface PdsSummaryResponse {

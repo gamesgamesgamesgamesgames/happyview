@@ -11,6 +11,13 @@ FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /app
 
+# libclang is needed at build time: `pg_query` (the Postgres parser used to guard
+# plugin raw SQL) runs `bindgen` over libpg_query's C headers. clang/cc and cmake
+# build the vendored C itself.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang libclang-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 # Build dependencies first (cached until Cargo.toml/Cargo.lock change)
 # Every workspace member needs its manifest and a stub source here, or cargo
 # cannot resolve the workspace and the dependency-cache layer fails outright.

@@ -328,7 +328,7 @@ pub(crate) async fn proxy_to_authority(
 }
 
 /// The rate key of a request that names no client.
-const ANONYMOUS_CLIENT_KEY: &str = "anonymous";
+pub(crate) const ANONYMOUS_CLIENT_KEY: &str = "anonymous";
 
 /// Find the client key from claims, headers, or query params.
 ///

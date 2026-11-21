@@ -296,6 +296,12 @@ struct RegisterSessionBody {
     #[serde(default, rename = "pds_url")]
     _pds_url: Option<String>,
     issuer: Option<String>,
+    /// A key proof (`hv-key-proof+jwt`, `lxm` "happyview.oauth.registerSession",
+    /// `dpop_jkt` the provisioned key's thumbprint) pinning a key the client
+    /// holds to this sign-in. Caller assertions for the sign-in can then name
+    /// that key, and only that key (`auth::caller_assertion`).
+    #[serde(default)]
+    ticket_key_proof: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -303,6 +309,10 @@ struct RegisterSessionResponse {
     session_id: String,
     did: String,
     scopes: Vec<String>,
+    /// `pinned` or `refused`, when the registration carried a
+    /// `ticket_key_proof`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_pin: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -449,6 +459,44 @@ async fn provision_dpop_key(
     ))
 }
 
+/// Refuse a registration whose scopes go beyond what the session's
+/// authorization server granted. The grant is read from a refresh HappyView
+/// makes itself, at the issuer the user's PDS names (see
+/// [`super::pds_write::verified_granted_scope`]): the scope in the app's own
+/// token response is relayed by the app, so it cannot vouch for itself. The
+/// refresh rotates the tokens the app handed over; from here HappyView holds
+/// the session's only live ones.
+async fn check_registered_scopes_against_grant(
+    state: &AppState,
+    encryption_key: &crate::plugin::encryption::Keyring,
+    api_client_id: &str,
+    did: &str,
+    dpop_key_id: &str,
+    registered: &str,
+) -> Result<String, AppError> {
+    let granted = super::pds_write::verified_granted_scope(
+        &state.http,
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.oauth,
+        &state.config.plc_url,
+        api_client_id,
+        did,
+        dpop_key_id,
+    )
+    .await?;
+    let missing = client_auth::scopes_beyond_grant(registered, &granted, &state.lexicons).await;
+    if missing.is_empty() {
+        return Ok(granted);
+    }
+    Err(AppError::BadRequest(format!(
+        "the authorization server did not grant these scopes: {}. Register the session with \
+         the scope the authorization server granted.",
+        missing.join(" ")
+    )))
+}
+
 /// POST /oauth/sessions — register a token set after OAuth callback.
 ///
 /// Client credentials come from `X-Client-Key` and `X-Client-Secret` headers.
@@ -480,7 +528,7 @@ async fn register_session(
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
     // Look up the DPoP key by provision_id
-    let (dpop_key_id, dpop_client_id, private_jwk, _thumbprint, pkce_challenge) =
+    let (dpop_key_id, dpop_client_id, private_jwk, dpop_thumbprint, pkce_challenge) =
         keys::get_dpop_key(
             &state.db,
             state.db_backend,
@@ -529,6 +577,21 @@ async fn register_session(
             "session registration scope validation failed"
         );
         return Err(e);
+    }
+
+    // Anything beyond `atproto` is checked against what the authorization
+    // server granted, which HappyView learns from a refresh of its own. With
+    // no refresh token there is nothing to ask it with.
+    let needs_grant = happyview_scopes::parse_scope_list(&body.scopes)
+        .iter()
+        .any(|scope| scope != "atproto");
+    if needs_grant && body.refresh_token.is_none() {
+        return Err(AppError::BadRequest(
+            "a session registered without a refresh token may hold only the 'atproto' scope: \
+             HappyView confirms any other scope with the authorization server by refreshing \
+             the session's token"
+                .into(),
+        ));
     }
 
     // Verify the access token actually belongs to the claimed DID. The `did` in
@@ -587,6 +650,39 @@ async fn register_session(
                 .map(|k| k.kid.clone())
         });
 
+    // A pin never blocks a sign-in: a proof that doesn't verify, or that
+    // names a different key than one already pinned, leaves the session
+    // unpinned, and the response says so. Registration is the only place a
+    // pin is ever written.
+    let ticket_pin = match body.ticket_key_proof.as_deref() {
+        None => None,
+        Some(proof) => {
+            let verified = crate::auth::caller_assertion::verify_key_proof(
+                proof,
+                &crate::auth::caller_assertion::issuer(&state),
+                crate::auth::caller_assertion::SESSION_PIN_LXM,
+                &dpop_thumbprint,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            let pinned = match verified {
+                Ok(jkt) => keys::pin_ticket_key(&state.db, state.db_backend, &dpop_key_id, &jkt)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            Some(match pinned {
+                Ok(()) => "pinned",
+                Err(reason) => {
+                    tracing::warn!(did = %body.did, reason, "registered a session without its ticket key pin");
+                    "refused"
+                }
+            })
+        }
+    };
+
     // Store the session
     let session_id = Uuid::new_v4().to_string();
     sessions::store_dpop_session(
@@ -600,7 +696,8 @@ async fn register_session(
         &body.access_token,
         body.refresh_token.as_deref(),
         body.expires_at.as_deref(),
-        &body.scopes,
+        // Held at `atproto` until the grant below covers the rest.
+        if needs_grant { "atproto" } else { &body.scopes },
         Some(pds_url.as_str()),
         body.issuer.as_deref(),
         signing_kid.as_deref(),
@@ -637,18 +734,69 @@ async fn register_session(
         );
     }
 
-    // A re-registration replaces the tokens and the issuer with the app's, so
-    // a scope verified for the previous ones no longer describes this session.
-    // Not best-effort: a stale grant left behind would reach the admin API.
-    sessions::set_granted_scope(
-        &state.db,
-        state.db_backend,
-        &client.id,
-        &dpop_key_id,
-        &body.did,
-        None,
-    )
-    .await?;
+    if needs_grant {
+        let checked = check_registered_scopes_against_grant(
+            &state,
+            encryption_key,
+            &client.id,
+            &body.did,
+            &dpop_key_id,
+            &body.scopes,
+        )
+        .await;
+        let widened = match &checked {
+            Ok(granted) => {
+                sessions::set_dpop_session_scopes(
+                    &state.db,
+                    state.db_backend,
+                    &client.id,
+                    &body.did,
+                    &dpop_key_id,
+                    &body.scopes,
+                    granted,
+                )
+                .await
+            }
+            Err(_) => Ok(false),
+        };
+        // A refused check removes the session it held at `atproto`. A lost race
+        // leaves the row alone: it is the other registration's now.
+        let (refusal, remove) = match (checked, widened) {
+            (Err(e), _) => (Some(e), true),
+            (Ok(_), Err(e)) => (Some(e), false),
+            (Ok(_), Ok(false)) => (
+                Some(AppError::Conflict(
+                    "the session was registered again while its scopes were being checked; \
+                     register it again"
+                        .into(),
+                )),
+                false,
+            ),
+            (Ok(_), Ok(true)) => (None, false),
+        };
+        if let Some(e) = refusal {
+            tracing::warn!(
+                client_key = %client_key,
+                did = %body.did,
+                registered_scopes = %body.scopes,
+                error = %e,
+                "session registration refused: scopes not confirmed by the authorization server"
+            );
+            if remove
+                && let Err(del) = sessions::delete_dpop_session(
+                    &state.db,
+                    state.db_backend,
+                    &client.id,
+                    &body.did,
+                    &dpop_key_id,
+                )
+                .await
+            {
+                tracing::error!(error = %del, "failed to remove a refused session registration");
+            }
+            return Err(e);
+        }
+    }
 
     // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT
     // USED TO REGISTER IN COMPLETE SILENCE. Everything works until the access
@@ -700,6 +848,7 @@ async fn register_session(
             session_id,
             did: body.did,
             scopes,
+            ticket_pin,
         }),
     ))
 }

@@ -107,6 +107,7 @@ fn settings(mock: &MockJetstream) -> Settings {
         workers: 2,
         invalid_request_retry: Duration::from_millis(100),
         drain_timeout: DRAIN_TIMEOUT,
+        stall_timeout: None,
     }
 }
 
@@ -750,7 +751,7 @@ async fn an_executor_job_lists_in_the_admin_json() {
             r#""started_at":"2026-10-16T00:00:00Z","completed_at":null,"#,
             r#""created_at":"2026-10-16T00:00:00Z","discovery_complete":true,"#,
             r#""recent_completions_limit":1000,"source":"store-pass","note":null,"replay":null,"#,
-            r#""hooks":null,"hook_stats":null}"#,
+            r#""hooks":null,"hook_stats":null,"rate_limited":0}"#,
             "]",
         )
     );

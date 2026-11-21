@@ -209,27 +209,45 @@ pub async fn update_entry(
 /// The fragment spec peers resolve to find a space authority's space host.
 pub const SPACE_HOST_FRAGMENT: &str = "#atproto_space_host";
 
+/// The methods other hosts call on this instance with service auth addressed
+/// to [`SPACE_HOST_FRAGMENT`]: a repo host reporting a write, and a space
+/// authority reporting a deleted space or revoked credentials. Every other
+/// space method takes the caller's own session or a space credential.
+///
+/// The space routes themselves never read service entries; this list governs
+/// what the entry opens through the general XRPC handler.
+pub const SPACE_HOST_XRPCS: &[&str] = &[
+    "com.atproto.space.notifyWrite",
+    "com.atproto.space.notifySpaceDeleted",
+    "com.atproto.space.notifyCredentialRevoked",
+];
+
 /// Publish `#atproto_space_host`, so peers resolving this instance as a space
-/// authority reach it. Leaves an existing entry alone, including one an
-/// operator has edited.
+/// authority reach it. The entry opens only [`SPACE_HOST_XRPCS`]. Leaves an
+/// existing entry alone, including one an operator has edited.
 pub async fn ensure_space_host_entry(
     db: &AnyPool,
     backend: DatabaseBackend,
 ) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) VALUES (?, 'AtprotoSpaceHost', 'all', ?, ?) \
-         ON CONFLICT (fragment_id) DO NOTHING",
+        "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) VALUES (?, 'AtprotoSpaceHost', 'specific', ?, ?) \
+         ON CONFLICT (fragment_id) DO NOTHING RETURNING id",
         backend,
     );
 
-    crate::db::query(&sql)
+    let created: Option<(i64,)> = crate::db::query_as(&sql)
         .bind(SPACE_HOST_FRAGMENT)
         .bind(&now)
         .bind(&now)
-        .execute(db)
+        .fetch_optional(db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create space host entry: {e}")))?;
+
+    if let Some((entry_id,)) = created {
+        let xrpcs: Vec<String> = SPACE_HOST_XRPCS.iter().map(|m| m.to_string()).collect();
+        add_entry_xrpcs(db, backend, entry_id, &xrpcs).await?;
+    }
 
     Ok(())
 }

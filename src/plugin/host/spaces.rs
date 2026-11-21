@@ -306,6 +306,7 @@ pub async fn create(
         write_policy,
         app_access,
         config,
+        None,
     )
     .await?;
     Ok(space_info(&space))
@@ -693,7 +694,14 @@ mod tests {
     #[serial(spaces_feature_flag)]
     async fn create_then_info_round_trips_every_field() {
         require_test_db!();
-        let state = db_test_state().await;
+        let mut state = db_test_state().await;
+        // Creating a space publishes its own did:plc.
+        let plc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&plc)
+            .await;
+        state.config.plc_url = plc.uri();
         enable_spaces_feature(&state).await;
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let did = format!("did:plc:creator{unique}");
@@ -716,8 +724,9 @@ mod tests {
         .expect("create should succeed");
         assert_eq!(created.display_name.as_deref(), Some("Main forum"));
         assert_eq!(created.description.as_deref(), Some("The default forum"));
-        assert_eq!(created.did, did);
-        assert_eq!(created.authority_did, did);
+        assert!(created.did.starts_with("did:plc:"));
+        assert_ne!(created.did, did);
+        assert_eq!(created.authority_did, created.did);
         assert_eq!(created.creator_did, did);
 
         let fetched = info(
@@ -1519,6 +1528,39 @@ mod tests {
                     .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"))
                     .unwrap_or_else(|| panic!("the member exists on {on}"));
             assert!(row.is_delegation, "is_delegation did change on {on}");
+        }
+    }
+
+    /// A script delegating to a space goes through the same check as the
+    /// XRPC methods: the caller must administer the named space too.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_script_delegating_to_a_space_must_administer_it() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (x_uri, x_admin) = seed_space_in(&state).await;
+            let (y_uri, _) = seed_space_in(&state).await;
+            let x = service::resolve_space(&state, &x_uri).await.unwrap();
+            let spec = || SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: None,
+                write: None,
+                is_delegation: Some(true),
+            };
+            assert!(
+                add_member(&state, &x_admin, spec()).await.is_err(),
+                "add_member on {on}"
+            );
+            assert!(
+                set_member(&state, &x_admin, spec()).await.is_err(),
+                "set_member on {on}"
+            );
+            let row = crate::spaces::db::get_member(&state.db, state.db_backend, &x.id, &y_uri)
+                .await
+                .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"));
+            assert!(row.is_none(), "nothing stored on {on}");
         }
     }
 }
