@@ -237,7 +237,7 @@ function UpsertVariableDialog({
           <ResponsiveDialogDescription>
             {isEdit
               ? "Update the value for this script variable."
-              : "Add a new script variable accessible via env.KEY in Lua scripts."}
+              : "Add a new script variable."}
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
