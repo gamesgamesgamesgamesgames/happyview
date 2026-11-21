@@ -150,6 +150,95 @@ impl DbSessionStore {
         self.signing_kid = kid;
         self
     }
+
+    /// A stored session's JSON, with the stored value it came from for a
+    /// later [`Self::compare_and_set_json`]. `None` when there's no row or it
+    /// won't open under this store's key.
+    pub async fn read_json(&self, did: &str) -> Result<Option<StoredJson>, StoreError> {
+        let row: Option<(String, i64)> = crate::db::query_as(&adapt_sql(
+            &format!(
+                "SELECT session_data, CAST(encrypted AS BIGINT) FROM {} WHERE did = ?",
+                self.table
+            ),
+            self.backend,
+        ))
+        .bind(did)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(stored, encrypted)| {
+            open(self.encryption_key.as_ref(), &stored, encrypted != 0)
+                .map(|json| StoredJson { stored, json })
+        }))
+    }
+
+    /// Replace a session's JSON only if its row still holds `expected`, the
+    /// stored value [`Self::read_json`] returned. Answers the new
+    /// [`StoredJson`] when it was written, and `None` when the row changed or
+    /// went away meanwhile.
+    pub async fn compare_and_set_json(
+        &self,
+        did: &str,
+        expected: &StoredJson,
+        json: String,
+    ) -> Result<Option<StoredJson>, StoreError> {
+        let sealed = seal(self.encryption_key.as_ref(), &json).map_err(StoreError::Seal)?;
+        let result = crate::db::query(&adapt_sql(
+            &format!(
+                "UPDATE {} SET session_data = ?, encrypted = ?, updated_at = datetime('now') \
+                 WHERE did = ? AND session_data = ?",
+                self.table
+            ),
+            self.backend,
+        ))
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .bind(did)
+        .bind(&expected.stored)
+        .execute(&self.pool)
+        .await?;
+        Ok((result.rows_affected() == 1).then_some(StoredJson {
+            stored: sealed.value,
+            json,
+        }))
+    }
+    /// Write a session's JSON whatever its row holds now.
+    pub async fn set_json(&self, did: &str, json: &str) -> Result<(), StoreError> {
+        let sealed = seal(self.encryption_key.as_ref(), json).map_err(StoreError::Seal)?;
+        crate::db::query(&adapt_sql(
+            &format!(
+                "UPDATE {} SET session_data = ?, encrypted = ?, updated_at = datetime('now') \
+                 WHERE did = ?",
+                self.table
+            ),
+            self.backend,
+        ))
+        .bind(&sealed.value)
+        .bind(sealed.encrypted)
+        .bind(did)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// A session's JSON and the value its row stores, sealed or not.
+#[derive(Clone)]
+pub struct StoredJson {
+    stored: String,
+    pub json: String,
+}
+
+impl StoredJson {
+    /// Whether `other` was read from the same stored value.
+    pub fn same_row(&self, other: &StoredJson) -> bool {
+        self.stored == other.stored
+    }
+}
+
+impl fmt::Debug for StoredJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StoredJson(..)")
+    }
 }
 
 impl Store<Did, Session> for DbSessionStore {

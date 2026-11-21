@@ -7,13 +7,20 @@ import {
   LAST_ACTIVE_KEY,
   importJwk,
   jwkThumbprint,
+  keyFromPair,
+  publicJwkOf,
   InvalidStateError,
   OAuthCallbackError,
   ResolutionError,
   TokenExchangeError,
+  type Key,
+  type KeyStore,
+  SESSION_PIN_LXM,
   type SessionEventHooks,
+  type TicketKeyProver,
   type StorageAdapter,
 } from "@happyview/oauth-client";
+import { IndexedDbKeyStore } from "./indexeddb-key-store";
 import { LocalStorageAdapter } from "./local-storage-adapter";
 
 const NAMESPACE = "@happyview/oauth-client-browser";
@@ -34,14 +41,38 @@ export interface HappyViewBrowserClientOptions {
   redirectUri?: string;
   scopes?: string;
   storage?: StorageAdapter;
+  /**
+   * Where DPoP keys are kept, non-extractable. Defaults to IndexedDB where
+   * the browser has it. Pass `null` to keep keys as JWKs in `storage`, as
+   * before.
+   */
+  keyStore?: KeyStore | null;
+  /**
+   * Called as a sign-in completes, to pin a key the app holds (a ticket key
+   * it made before sign-in) to the new session. Its proof goes with the
+   * session's registration.
+   */
+  ticketKeyProof?: TicketKeyProver;
   sessionHooks?: SessionEventHooks;
   fetch?: typeof globalThis.fetch;
 }
 
+/** The key store id of the key for a sign-in still in progress. */
+const pendingKeyId = (state: string) => `pending:${state}`;
+const PENDING_AUTH_PREFIX = "pending-auth:";
+
+/** A sign-in not finished in this long is abandoned, and swept. */
+export const PENDING_SIGN_IN_TTL_MS = 60 * 60 * 1000;
+
 interface PendingAuthState {
   did: string;
   provisionId: string;
-  rawJwk: JsonWebKey;
+  /** The provisioned key, when there's no key store. */
+  rawJwk?: JsonWebKey;
+  /** Its public half, when the private key waits in the key store. */
+  publicJwk?: JsonWebKey;
+  /** When the sign-in started (milliseconds); older ones are swept. */
+  createdAt?: number;
   provisionPkceVerifier: string;
   authPkceVerifier: string;
   pdsUrl: string;
@@ -100,16 +131,24 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   private readonly clientId: string;
   private readonly redirectUri: string | undefined;
   private readonly scopes: string;
+  private readonly ticketKeyProver: TicketKeyProver | undefined;
   constructor(options: HappyViewBrowserClientOptions) {
     const fetchFn =
       options.fetch ??
       (((input: RequestInfo | URL, init?: RequestInit) =>
         fetch(input, init)) as typeof globalThis.fetch);
     const storageAdapter = options.storage ?? new LocalStorageAdapter();
+    const keyStore =
+      options.keyStore === undefined
+        ? IndexedDbKeyStore.isAvailable()
+          ? new IndexedDbKeyStore()
+          : undefined
+        : (options.keyStore ?? undefined);
     super({
       instanceUrl: options.instanceUrl,
       clientKey: options.clientKey,
       storage: storageAdapter,
+      keyStore,
       sessionHooks: options.sessionHooks,
       fetch: fetchFn,
     });
@@ -117,11 +156,53 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     this.clientId = options.clientId;
     this.redirectUri = options.redirectUri;
     this.scopes = options.scopes ?? "atproto";
+    this.ticketKeyProver = options.ticketKeyProof;
     this.handleResolver = new AtprotoDohHandleResolver({
       dohEndpoint: "https://dns.google/resolve",
       fetch: fetchFn,
     });
     this.didResolver = new DidResolverCommon({ fetch: fetchFn });
+    // Best effort, in the background: nothing waits on it.
+    this.sweepPendingSignIns().catch(() => undefined);
+  }
+
+  /**
+   * Remove what sign-ins that never finished left behind: their keys in the
+   * key store and their pending state in storage, once older than
+   * `PENDING_SIGN_IN_TTL_MS`. Runs when the client is made; exposed so a
+   * caller can run it again.
+   */
+  async sweepPendingSignIns(now: number = Date.now()): Promise<void> {
+    const cutoff = now - PENDING_SIGN_IN_TTL_MS;
+    const stale = new Set<string>();
+    for (const { id, createdAt } of (await this.keyStore?.entries?.()) ?? []) {
+      if (id.startsWith("pending:") && createdAt < cutoff) {
+        stale.add(id.slice("pending:".length));
+      }
+    }
+    for (const key of (await this.storage.keys?.()) ?? []) {
+      if (!key.startsWith(PENDING_AUTH_PREFIX)) continue;
+      const state = key.slice(PENDING_AUTH_PREFIX.length);
+      const raw = await this.storage.get(key);
+      let pending: PendingAuthState | undefined;
+      try {
+        pending = raw ? (JSON.parse(raw) as PendingAuthState) : undefined;
+      } catch {
+        pending = undefined;
+      }
+      if (!pending) {
+        stale.add(state);
+      } else if (pending.createdAt === undefined) {
+        // From before sign-ins were timed: start its clock now.
+        await this.storage.set(key, JSON.stringify({ ...pending, createdAt: now }));
+      } else if (pending.createdAt < cutoff) {
+        stale.add(state);
+      }
+    }
+    for (const state of stale) {
+      await this.storage.delete(`${PENDING_AUTH_PREFIX}${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
+    }
   }
 
   async prepareLogin(
@@ -155,6 +236,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const {
       provisionId,
       rawJwk,
+      dpopKey: provisionedKey,
+      dpopKeyPair,
       pkceVerifier: provisionPkceVerifier,
       confidential,
     } = await this.provisionDpopKey();
@@ -165,10 +248,23 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     const state = options?.state ?? randomHex(16);
 
+    // With a key store, the private key waits there, non-extractable, for the
+    // redirect back; storage only ever sees the public half.
+    // provisionDpopKey imported it non-extractable already.
+    let keyFields: Pick<PendingAuthState, "rawJwk" | "publicJwk">;
+    const signingKey: Key = provisionedKey;
+    if (this.keyStore && dpopKeyPair) {
+      await this.keyStore.set(pendingKeyId(state), dpopKeyPair);
+      keyFields = { publicJwk: publicJwkOf(rawJwk) };
+    } else {
+      keyFields = { rawJwk };
+    }
+
     const pendingState: PendingAuthState = {
       did,
       provisionId,
-      rawJwk,
+      createdAt: Date.now(),
+      ...keyFields,
       provisionPkceVerifier: provisionPkceVerifier!,
       authPkceVerifier,
       pdsUrl,
@@ -238,7 +334,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     if (parEndpoint) {
       const signProof =
         authParams.get("dpop_jkt") === provisionedJkt
-          ? await buildProofSigner(rawJwk, parEndpoint)
+          ? buildProofSigner(signingKey, publicJwkOf(rawJwk), parEndpoint)
           : undefined;
 
       let dpopNonce: string | undefined;
@@ -322,6 +418,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     if (params.has("error")) {
       await this.storage.delete(`pending-auth:${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
       throw new OAuthCallbackError(params, undefined, state);
     }
 
@@ -332,10 +429,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const pending: PendingAuthState = JSON.parse(pendingJson);
 
     try {
-      const signProof = await buildProofSigner(
-        pending.rawJwk,
-        pending.tokenEndpoint,
-      );
+      const { key, publicJwk, pair } = await this.pendingKey(pending, state);
+      const signProof = buildProofSigner(key, publicJwk, pending.tokenEndpoint);
 
       const { clientId, redirectUri } = this.resolveOAuthEndpoints();
 
@@ -417,15 +512,60 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         scopes: tokens.scope ?? this.scopes,
         pdsUrl: pending.pdsUrl,
         issuer: tokens.iss ?? pending.issuer,
-        dpopKey: pending.rawJwk,
+        dpopKey: pending.rawJwk ?? publicJwk,
+        dpopKeyPair: pair,
+        ticketKeyProof: await this.proveTicketKey(pending.did, publicJwk),
       });
 
       await this.storage.delete(`pending-auth:${state}`);
+      await this.keyStore?.delete(pendingKeyId(state));
 
       return session;
     } catch (err) {
       throw OAuthCallbackError.from(err, params, state);
     }
+  }
+
+  /**
+   * The app's ticket key proof for a sign-in completing, or `undefined`: when
+   * there's no prover, it returns none, or it fails. A pin is a bonus the
+   * sign-in never waits on.
+   */
+  private async proveTicketKey(did: string, publicJwk: JsonWebKey): Promise<string | undefined> {
+    if (!this.ticketKeyProver) return undefined;
+    try {
+      return (
+        (await this.ticketKeyProver({
+          did,
+          dpopJkt: await jwkThumbprint(publicJwk),
+          // The instance's issuer name: its URL without a trailing slash.
+          audience: this.instanceUrl.replace(/\/+$/, ""),
+          lxm: SESSION_PIN_LXM,
+        })) || undefined
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The key a pending sign-in provisioned, from the key store or storage. */
+  private async pendingKey(
+    pending: PendingAuthState,
+    state: string,
+  ): Promise<{ key: Key; publicJwk: JsonWebKey; pair?: CryptoKeyPair }> {
+    if (pending.rawJwk) {
+      return {
+        key: await importJwk(pending.rawJwk),
+        publicJwk: publicJwkOf(pending.rawJwk),
+      };
+    }
+    const pair = await this.keyStore?.get(pendingKeyId(state));
+    if (!pair || !pending.publicJwk) {
+      throw new InvalidStateError(
+        "The key for this sign-in is gone; start the sign-in again.",
+      );
+    }
+    return { key: await keyFromPair(pair), publicJwk: pending.publicJwk, pair };
   }
 
   async logout(did: string): Promise<void> {
@@ -661,12 +801,11 @@ function extractPdsUrl(doc: DidDocument): string {
   );
 }
 
-async function buildProofSigner(
-  rawJwk: JsonWebKey,
+function buildProofSigner(
+  dpopKey: Key,
+  publicJwk: JsonWebKey,
   endpoint: string,
-): Promise<(nonce?: string) => Promise<string>> {
-  const dpopKey = await importJwk(rawJwk);
-  const { d: _, ...publicJwk } = rawJwk;
+): (nonce?: string) => Promise<string> {
   const htu = endpoint.split("?")[0];
 
   return (nonce?: string) =>

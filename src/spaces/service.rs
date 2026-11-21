@@ -996,6 +996,69 @@ async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), App
     Ok(())
 }
 
+/// Store a member as `put_member` and `add_member` do. A space-as-member
+/// entry (`is_delegation`) brings in the named space's members, so adding one
+/// that names a space on this host requires administering that space too. An
+/// entry naming a space that isn't here is stored as it always was, and
+/// brings in no members.
+///
+/// Putting an entry that already brings in members again, with the same
+/// access and naming the same space, keeps it as it is without asking again,
+/// so a client re-sending a space's whole member list goes on working. Any
+/// change to its access needs the named space's administrator, as a new
+/// entry does.
+async fn store_member(
+    state: &AppState,
+    actor_did: &str,
+    member: &SpaceMember,
+) -> Result<(), AppError> {
+    if !member.is_delegation {
+        return insert_member(state, member).await;
+    }
+    let target =
+        crate::spaces::members::delegation_target(&state.db, state.db_backend, &member.did).await?;
+    let consent = match &target {
+        None => db::DelegationConsent::None,
+        Some(target) => match require_space_admin(state, target, actor_did).await {
+            Ok(()) => db::DelegationConsent::Granted(&target.id),
+            Err(AppError::Forbidden(_))
+                if unchanged_consented_delegation(state, member, &target.id).await? =>
+            {
+                db::DelegationConsent::Kept
+            }
+            Err(AppError::Forbidden(_)) => {
+                return Err(AppError::Forbidden(
+                    "delegating to a space requires administering it".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    if !db::insert_delegation_if_allowed(&state.db, state.db_backend, member, consent).await? {
+        return Err(no_members_on_managedspace());
+    }
+    Ok(())
+}
+
+/// Whether `member` is already stored, unchanged, as an entry that brings in
+/// the members of the space `target_id`.
+async fn unchanged_consented_delegation(
+    state: &AppState,
+    member: &SpaceMember,
+    target_id: &str,
+) -> Result<bool, AppError> {
+    let stored = db::get_member(&state.db, state.db_backend, &member.space_id, &member.did).await?;
+    if !stored.is_some_and(|m| m.is_delegation && m.access == member.access) {
+        return Ok(false);
+    }
+    Ok(
+        db::consented_delegations(&state.db, state.db_backend, &member.space_id)
+            .await?
+            .get(&member.did)
+            .is_some_and(|id| id == target_id),
+    )
+}
+
 /// Upsert a member. `access` of `None` leaves an existing member's read and
 /// write untouched, and gives a new one read — so a caller who names only a
 /// DID, or only `is_delegation`, neither grants nor withdraws access.
@@ -1032,7 +1095,7 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
+    store_member(state, actor_did, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
         revoke_member_credentials(state, &space, member_did).await?;
@@ -1067,7 +1130,7 @@ pub(crate) async fn add_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
+    store_member(state, actor_did, &member).await?;
     Ok(member)
 }
 
@@ -2181,12 +2244,70 @@ mod tests {
         let entries = crate::service_entries::list_entries(&state.db, state.db_backend)
             .await
             .unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.fragment_id == "#atproto_space_host"),
-            "no #atproto_space_host service entry: {entries:?}"
-        );
+        let entry = entries
+            .iter()
+            .find(|e| e.fragment_id == "#atproto_space_host")
+            .unwrap_or_else(|| panic!("no #atproto_space_host service entry: {entries:?}"));
+        assert_eq!(entry.access_mode, "specific");
+        let xrpcs = crate::service_entries::list_entry_xrpcs(&state.db, state.db_backend, entry.id)
+            .await
+            .unwrap();
+        let mut expected: Vec<String> = crate::service_entries::SPACE_HOST_XRPCS
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(xrpcs, expected);
+    }
+
+    #[tokio::test]
+    async fn the_space_host_entry_opens_only_space_host_methods() {
+        let (state, _plc) = memory_state_with_plc().await;
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+
+        for method in crate::service_entries::SPACE_HOST_XRPCS {
+            assert!(
+                crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+        for method in [
+            "com.example.listThings",
+            "dev.happyview.createApiClient",
+            "com.atproto.space.createRecord",
+        ] {
+            assert!(
+                !crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_space_host_method_is_served() {
+        let served: Vec<String> = crate::spaces::routes::protocol_method_table()
+            .into_iter()
+            .map(|(nsid, _)| nsid)
+            .collect();
+        for method in crate::service_entries::SPACE_HOST_XRPCS {
+            assert!(served.iter().any(|s| s == method), "{method} is not routed");
+        }
     }
 
     const INSTANCE_DID: &str = "did:plc:happyviewinstance";

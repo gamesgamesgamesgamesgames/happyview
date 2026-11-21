@@ -342,6 +342,18 @@ pub async fn delete_space(
     backend: DatabaseBackend,
     id: &str,
 ) -> Result<bool, AppError> {
+    // Entries in other spaces that bring this one's members in stop doing so,
+    // whatever later takes its address.
+    crate::db::query(&adapt_sql(
+        "UPDATE happyview_space_members SET delegation_consented = 0, delegation_target_space_id = NULL \
+         WHERE delegation_target_space_id = ?",
+        backend,
+    ))
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to delete space: {e}")))?;
+
     let sql = adapt_sql("DELETE FROM happyview_spaces WHERE id = ?", backend);
 
     let result = crate::db::query(&sql)
@@ -447,31 +459,75 @@ pub async fn add_member(
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<(), AppError> {
-    upsert_member(executor, backend, member)
+    upsert_member(executor, backend, member, DelegationConsent::None)
         .await
         .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// Whether a stored space-as-member entry (`is_delegation`) brings in the
+/// members of the space it names.
+#[derive(Debug, Clone, Copy)]
+pub enum DelegationConsent<'a> {
+    /// It brings in none.
+    None,
+    /// It brings in the members of the space with this id, whose
+    /// administrator the caller has checked is adding it.
+    Granted(&'a str),
+    /// It stays as stored, if the stored entry already brings in members
+    /// and its access is unchanged; otherwise it brings in none. Decided in
+    /// the write itself, so a concurrent change cannot be overwritten with
+    /// consent.
+    Kept,
 }
 
 async fn upsert_member(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     member: &SpaceMember,
+    consent: DelegationConsent<'_>,
 ) -> Result<(), sqlx::Error> {
+    // The stored entry, unchanged: already consented, still an entry, and
+    // the same read and write.
+    const KEEP: &str = "happyview_space_members.delegation_consented = 1 \
+         AND happyview_space_members.is_delegation = 1 AND excluded.is_delegation = 1 \
+         AND happyview_space_members.can_read = excluded.can_read \
+         AND happyview_space_members.can_write = excluded.can_write";
+    let (values, on_conflict) = match consent {
+        DelegationConsent::None => (
+            "0, NULL".to_string(),
+            "delegation_consented = 0, delegation_target_space_id = NULL".to_string(),
+        ),
+        DelegationConsent::Granted(_) => (
+            "1, ?".to_string(),
+            "delegation_consented = 1, delegation_target_space_id = excluded.delegation_target_space_id"
+                .to_string(),
+        ),
+        DelegationConsent::Kept => (
+            "0, NULL".to_string(),
+            format!(
+                "delegation_consented = CASE WHEN {KEEP} THEN 1 ELSE 0 END, \
+                 delegation_target_space_id = CASE WHEN {KEEP} THEN happyview_space_members.delegation_target_space_id ELSE NULL END"
+            ),
+        ),
+    };
     let sql = adapt_sql(
         // Upsert: putMember is defined as "add a member or replace their read
         // and write access", so a second call for the same DID must update
         // rather than conflict. read_self is not overwritten: it is
         // HappyView-local and never supplied over the wire, so a putMember must
         // not lift an existing own-records-only restriction.
-        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (space_id, member_did) DO UPDATE SET \
-             can_read = excluded.can_read, \
-             can_write = excluded.can_write, \
-             is_delegation = excluded.is_delegation",
+        &format!(
+            "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at, delegation_consented, delegation_target_space_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {values}) \
+             ON CONFLICT (space_id, member_did) DO UPDATE SET \
+                 can_read = excluded.can_read, \
+                 can_write = excluded.can_write, \
+                 is_delegation = excluded.is_delegation, \
+                 {on_conflict}"
+        ),
         backend,
     );
-    crate::db::query(&sql)
+    let mut query = crate::db::query(&sql)
         .bind(&member.id)
         .bind(&member.space_id)
         .bind(&member.did)
@@ -480,9 +536,11 @@ async fn upsert_member(
         .bind(member.access.read_self as i32)
         .bind(member.is_delegation as i32)
         .bind(&member.granted_by)
-        .bind(now_rfc3339())
-        .execute(executor)
-        .await?;
+        .bind(now_rfc3339());
+    if let DelegationConsent::Granted(target) = consent {
+        query = query.bind(target.to_string());
+    }
+    query.execute(executor).await?;
     Ok(())
 }
 
@@ -502,12 +560,54 @@ pub async fn insert_member_if_allowed(
         if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
             return Ok(false);
         }
-        upsert_member(&mut *tx, backend, member).await?;
+        upsert_member(&mut *tx, backend, member, DelegationConsent::None).await?;
         tx.commit().await?;
         Ok(true)
     })
     .await
     .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// [`insert_member_if_allowed`] for a space-as-member entry (`is_delegation`),
+/// stored with `consent`.
+pub async fn insert_delegation_if_allowed(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    member: &SpaceMember,
+    consent: DelegationConsent<'_>,
+) -> Result<bool, AppError> {
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        if !lock_space_for_members(&mut *tx, backend, &member.space_id).await? {
+            return Ok(false);
+        }
+        upsert_member(&mut *tx, backend, member, consent).await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to add member: {e}")))
+}
+
+/// The space-as-member entries of a space that bring in a named space's
+/// members: the address or id each names, and the id of the space it was
+/// added for.
+pub async fn consented_delegations(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let rows: Vec<(String, String)> = crate::db::query_as(&adapt_sql(
+        "SELECT member_did, delegation_target_space_id FROM happyview_space_members \
+         WHERE space_id = ? AND is_delegation = 1 AND delegation_consented = 1 \
+         AND delegation_target_space_id IS NOT NULL",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list members: {e}")))?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Discard a space's member list, as migrating it to a policy that keeps none

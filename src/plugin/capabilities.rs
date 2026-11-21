@@ -560,6 +560,10 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         any_of: &[PluginCapability::ScriptHost],
     },
     Requirement {
+        import: "host_caller_assertion",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
         import: "host_module_resolve",
         any_of: &[PluginCapability::ScriptHost],
     },
@@ -892,6 +896,7 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_caller_assertion",
             "host_script_panic",
             "host_module_resolve",
             "host_test_trigger",

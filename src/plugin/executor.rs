@@ -1241,6 +1241,7 @@ impl PluginExecutor {
             stamp,
             modules,
             waited_ms: Default::default(),
+            assertions: Default::default(),
             metrics: crate::metrics::run::current(),
         });
         Ok((inst, cache_hit, link))

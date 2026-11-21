@@ -1,12 +1,13 @@
 import type { Key } from "@atproto/jwk";
 import { ApiError } from "./errors";
-import { importJwk } from "./import-jwk";
+import { importJwk, importKeyPair, keyFromPair, publicJwkOf } from "./import-jwk";
 import { HappyViewSession } from "./session";
 import { MemoryStorage } from "./storage";
 import type {
   ClientAssertionResponse,
   GetSessionResponse,
   HappyViewOAuthClientOptions,
+  KeyStore,
   ProvisionKeyResponse,
   RegisterSessionParams,
   RegisterSessionResponse,
@@ -20,6 +21,9 @@ import type {
 /// which silently breaks the day they are renamed.
 export const STORAGE_PREFIX = "happyview:session:";
 export const LAST_ACTIVE_KEY = "happyview:last-active-did";
+
+/** The key store id of the session for `did`. */
+export const sessionKeyId = (did: string): string => `session:${did}`;
 
 export interface FetchMetadataOptions {
   clientId: string;
@@ -50,6 +54,7 @@ export class HappyViewOAuthClient {
   protected readonly instanceUrl: string;
   protected readonly clientKey: string;
   protected readonly storage: StorageAdapter;
+  protected readonly keyStore: KeyStore | undefined;
   private readonly clientSecret: string | undefined;
   protected readonly _fetch: typeof globalThis.fetch;
   private readonly sessionHooks: SessionEventHooks;
@@ -63,6 +68,7 @@ export class HappyViewOAuthClient {
     this.clientKey = options.clientKey;
     this.clientSecret = options.clientSecret;
     this.storage = options.storage ?? new MemoryStorage();
+    this.keyStore = options.keyStore;
     this._fetch =
       options.fetch ??
       (((input: RequestInfo | URL, init?: RequestInit) =>
@@ -74,9 +80,15 @@ export class HappyViewOAuthClient {
     return this.clientSecret !== undefined;
   }
 
+  /**
+   * With a key store, `dpopKey` is made from a non-extractable import, also
+   * returned as `dpopKeyPair`, so no extractable `CryptoKey` of it ever
+   * exists. `rawJwk` is the key as the instance sent it.
+   */
   async provisionDpopKey(): Promise<{
     provisionId: string;
     dpopKey: Key;
+    dpopKeyPair?: CryptoKeyPair;
     rawJwk: JsonWebKey;
     pkceVerifier?: string;
     confidential: boolean;
@@ -114,10 +126,16 @@ export class HappyViewOAuthClient {
     }
 
     const data: ProvisionKeyResponse = await resp.json();
-    const dpopKey = await importJwk(data.dpop_key);
+    const dpopKeyPair = this.keyStore
+      ? await importKeyPair(data.dpop_key, { extractable: false })
+      : undefined;
+    const dpopKey = dpopKeyPair
+      ? await keyFromPair(dpopKeyPair)
+      : await importJwk(data.dpop_key);
     return {
       provisionId: data.provision_id,
       dpopKey,
+      dpopKeyPair,
       rawJwk: data.dpop_key,
       pkceVerifier,
       confidential: data.confidential ?? false,
@@ -195,6 +213,9 @@ export class HappyViewOAuthClient {
     if (!this.isConfidential && params.pkceVerifier) {
       body.pkce_verifier = params.pkceVerifier;
     }
+    if (params.ticketKeyProof) {
+      body.ticket_key_proof = params.ticketKeyProof;
+    }
 
     const resp = await this._fetch(`${this.instanceUrl}/oauth/sessions`, {
       method: "POST",
@@ -215,11 +236,23 @@ export class HappyViewOAuthClient {
 
     await this.retirePreviousSession(data.did, params.dpopKey);
 
-    const dpopKey = await importJwk(params.dpopKey);
+    let dpopKey: Key;
+    let keyFields: Pick<StoredSession, "dpopKey" | "dpopPublicKey">;
+    if (this.keyStore) {
+      const pair =
+        params.dpopKeyPair ??
+        (await importKeyPair(params.dpopKey, { extractable: false }));
+      await this.keyStore.set(sessionKeyId(data.did), pair);
+      dpopKey = await keyFromPair(pair);
+      keyFields = { dpopPublicKey: publicJwkOf(params.dpopKey) };
+    } else {
+      dpopKey = await importJwk(params.dpopKey);
+      keyFields = { dpopKey: params.dpopKey };
+    }
 
     const storedSession: StoredSession = {
       did: data.did,
-      dpopKey: params.dpopKey,
+      ...keyFields,
       accessToken: params.accessToken,
       clientKey: this.clientKey,
       instanceUrl: this.instanceUrl,
@@ -244,6 +277,7 @@ export class HappyViewOAuthClient {
       issuer: params.issuer,
       fetch: this._fetch,
       onSignOut: () => this.deleteSession(data.did),
+      ticketPin: params.ticketKeyProof ? data.ticket_pin : undefined,
     });
 
     this.sessionHooks.onSessionUpdate?.(data.did);
@@ -264,11 +298,12 @@ export class HappyViewOAuthClient {
       if (!raw) return;
 
       const previous = JSON.parse(raw) as StoredSession;
+      const previousKey = previous.dpopKey ?? previous.dpopPublicKey;
 
       if (
         typeof newDpopKey.x === "string" &&
-        previous.dpopKey?.x === newDpopKey.x &&
-        previous.dpopKey?.y === newDpopKey.y
+        previousKey?.x === newDpopKey.x &&
+        previousKey?.y === newDpopKey.y
       ) {
         return;
       }
@@ -334,6 +369,7 @@ export class HappyViewOAuthClient {
    */
   async forgetSession(did: string): Promise<void> {
     await this.storage.delete(`${STORAGE_PREFIX}${did}`);
+    await this.keyStore?.delete(sessionKeyId(did));
 
     const lastActive = await this.storage.get(LAST_ACTIVE_KEY);
     if (lastActive === did) {
@@ -348,7 +384,8 @@ export class HappyViewOAuthClient {
     if (!stored) return null;
 
     const data: StoredSession = JSON.parse(stored);
-    const dpopKey = await importJwk(data.dpopKey);
+    const dpopKey = await this.sessionKey(data);
+    if (!dpopKey) return null;
     return new HappyViewSession({
       did: data.did,
       dpopKey,
@@ -361,6 +398,29 @@ export class HappyViewOAuthClient {
       fetch: this._fetch,
       onSignOut: () => this.deleteSession(data.did),
     });
+  }
+
+  /**
+   * The signing key of a stored session. With a key store, a session stored
+   * with its JWK (before the store was in use) moves its key there and is
+   * rewritten without it. Null when the key is gone, as after a browser
+   * cleared site data for IndexedDB but not for storage.
+   */
+  private async sessionKey(data: StoredSession): Promise<Key | null> {
+    if (!this.keyStore) {
+      return data.dpopKey ? importJwk(data.dpopKey) : null;
+    }
+    const id = sessionKeyId(data.did);
+    const pair = await this.keyStore.get(id);
+    if (pair) return keyFromPair(pair);
+    if (!data.dpopKey) return null;
+
+    const migrated = await importKeyPair(data.dpopKey, { extractable: false });
+    await this.keyStore.set(id, migrated);
+    const { dpopKey, ...rest } = data;
+    const rewritten: StoredSession = { ...rest, dpopPublicKey: publicJwkOf(dpopKey) };
+    await this.storage.set(`${STORAGE_PREFIX}${data.did}`, JSON.stringify(rewritten));
+    return keyFromPair(migrated);
   }
 
   async getSession(did: string): Promise<GetSessionResponse> {

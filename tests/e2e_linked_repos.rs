@@ -1577,8 +1577,12 @@ async fn refresh_marks_needs_reauth_when_no_session_exists() {
         .unwrap();
     let grant = db::get(&app.state, &grant.id).await.unwrap().unwrap();
 
-    // No session row exists for did:plc:ghost, so restore must fail.
-    assert!(worker::refresh_grant(&app.state, &grant).await.is_err());
+    // No session row exists for did:plc:ghost, so the grant needs
+    // reauthorization.
+    assert_eq!(
+        worker::refresh_grant(&app.state, &grant).await.unwrap(),
+        worker::RefreshOutcome::NeedsReauth
+    );
 
     let reloaded = db::get(&app.state, &grant.id).await.unwrap().unwrap();
     assert_eq!(reloaded.status, types::STATUS_NEEDS_REAUTH);
