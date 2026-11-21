@@ -481,9 +481,7 @@ export default function GeneralSettingsPage() {
           </div>
         </div>
 
-        <div>
-          <h2 className="text-lg font-semibold">Data Retention</h2>
-        </div>
+        <h2 className="text-lg font-semibold">Data Retention</h2>
 
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
@@ -623,9 +621,7 @@ export default function GeneralSettingsPage() {
           </div>
         ))}
 
-        <div>
-          <h2 className="text-lg font-semibold">Space Inspector</h2>
-        </div>
+        <h2 className="text-lg font-semibold">Space Inspector</h2>
 
         <div className="flex items-center justify-between gap-4">
           <div className="flex flex-col gap-1">
@@ -692,9 +688,7 @@ export default function GeneralSettingsPage() {
           </p>
         </div>
 
-        <div>
-          <h2 className="text-lg font-semibold">Event Logs</h2>
-        </div>
+        <h2 className="text-lg font-semibold">Event Logs</h2>
 
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">

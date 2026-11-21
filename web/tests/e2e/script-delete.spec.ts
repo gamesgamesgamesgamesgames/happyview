@@ -79,7 +79,7 @@ test.describe("Script Delete", () => {
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible({ timeout: 3000 });
     await expect(dialog.getByText("Delete script?")).toBeVisible();
-    await expect(dialog.getByText(/permanently remove/i)).toBeVisible();
+    await expect(dialog.getByText(/cannot be undone/i)).toBeVisible();
 
     await dialog.getByRole("button", { name: "Cancel" }).click();
     await expect(dialog).not.toBeVisible();
