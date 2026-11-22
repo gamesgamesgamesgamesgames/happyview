@@ -739,8 +739,12 @@ async fn an_older_entry_changes_in_place() {
     assert!(row.access.read && row.access.write);
     assert!(consented(&app, &x, &y_addr).await);
 
-    // The named space's members keep their own access, as they always did.
-    assert!(is_member(&app, &x, &y_member).await);
+    // The named space's member reads there, and gains no write: the entry
+    // grants at most what the member has in the named space.
+    assert_eq!(
+        access_of(&app, &x, &y_member).await,
+        Some(MemberAccess::READ)
+    );
 }
 
 /// A member named by a space's address is a space-as-member entry unless the
@@ -778,4 +782,170 @@ async fn a_space_address_named_without_is_delegation_is_an_entry() {
             "{nsid} {explicit:?}"
         );
     }
+}
+
+/// A member row stored directly with `access`.
+async fn add_row_with(app: &TestApp, space_id: &str, did: &str, access: MemberAccess) {
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            access,
+            is_delegation: false,
+            ..delegation(space_id, did)
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// [`add_consented`] with the entry granting `access`.
+async fn add_consented_with(
+    app: &TestApp,
+    space_id: &str,
+    reference: &str,
+    target: &str,
+    access: MemberAccess,
+) {
+    assert!(
+        spaces_db::insert_delegation_if_allowed(
+            &app.state.db,
+            app.state.db_backend,
+            &SpaceMember {
+                access,
+                ..delegation(space_id, reference)
+            },
+            spaces_db::DelegationConsent::Granted(target),
+        )
+        .await
+        .unwrap()
+    );
+}
+
+/// The access `did` has to the space, as access checks resolve it.
+async fn access_of(app: &TestApp, space_id: &str, did: &str) -> Option<MemberAccess> {
+    happyview::spaces::members::is_member(&app.state.db, app.state.db_backend, space_id, did)
+        .await
+        .unwrap()
+}
+
+/// `did`'s read and write as `listMembers` answers them.
+async fn listed_access(app: &TestApp, actor: &str, address: &str, did: &str) -> (Value, Value) {
+    let (name, value) = common::auth::admin_cookie_header(actor, &app.state.cookie_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}",
+            urlencoding::encode(address)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let member = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["did"] == json!(did))
+        .unwrap_or_else(|| panic!("{did} listed"))
+        .clone();
+    (member["read"].clone(), member["write"].clone())
+}
+
+const READ_ONLY: MemberAccess = MemberAccess::READ;
+const READ_WRITE: MemberAccess = MemberAccess::WRITE;
+const WRITE_ONLY: MemberAccess = MemberAccess {
+    read: false,
+    write: true,
+    read_self: false,
+};
+
+/// A member brought in through an entry gets the lesser of their own access
+/// in the named space and the entry's: a read-only entry grants a member who
+/// reads and writes there only read, and a write-only entry grants no read.
+#[tokio::test]
+#[serial]
+async fn an_entry_grants_its_members_no_more_than_its_own_access() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+
+    for (entry, expected) in [
+        (READ_ONLY, READ_ONLY),
+        (WRITE_ONLY, WRITE_ONLY),
+        (READ_WRITE, READ_WRITE),
+    ] {
+        let (x, x_addr) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, entry).await;
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "{entry:?}"
+        );
+        assert_eq!(
+            listed_access(&app, &owner, &x_addr, &member).await,
+            (json!(expected.read), json!(expected.write)),
+            "{entry:?}"
+        );
+    }
+
+    // A member who only reads the named space gains no write from an entry
+    // that grants it.
+    let reader = rand_did("r");
+    add_row_with(&app, &y, &reader, READ_ONLY).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_WRITE).await;
+    assert_eq!(access_of(&app, &x, &reader).await, Some(READ_ONLY));
+}
+
+/// The cap applies at every entry on the way: X naming Y naming Z gives Z's
+/// members at most what both entries grant.
+#[tokio::test]
+#[serial]
+async fn entries_cap_their_members_at_every_level() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (z, z_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &z, &member, READ_WRITE).await;
+
+    for (x_to_y, y_to_z, expected) in [
+        (READ_ONLY, READ_WRITE, READ_ONLY),
+        (READ_WRITE, READ_ONLY, READ_ONLY),
+        (READ_WRITE, WRITE_ONLY, WRITE_ONLY),
+        (
+            WRITE_ONLY,
+            READ_ONLY,
+            MemberAccess {
+                read: false,
+                write: false,
+                read_self: false,
+            },
+        ),
+        (READ_WRITE, READ_WRITE, READ_WRITE),
+    ] {
+        let (y, y_addr) = create_space(&app, &owner).await;
+        add_consented_with(&app, &y, &z_addr, &z, y_to_z).await;
+        let (x, _) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, x_to_y).await;
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "{x_to_y:?} then {y_to_z:?}"
+        );
+    }
+
+    // Reached through two entries, the member gets the most either grants.
+    let (y1, y1_addr) = create_space(&app, &owner).await;
+    add_consented_with(&app, &y1, &z_addr, &z, READ_ONLY).await;
+    let (y2, y2_addr) = create_space(&app, &owner).await;
+    add_consented_with(&app, &y2, &z_addr, &z, WRITE_ONLY).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_consented_with(&app, &x, &y1_addr, &y1, READ_WRITE).await;
+    add_consented_with(&app, &x, &y2_addr, &y2, READ_WRITE).await;
+    assert_eq!(access_of(&app, &x, &member).await, Some(READ_WRITE));
 }

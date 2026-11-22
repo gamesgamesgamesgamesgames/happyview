@@ -3,9 +3,10 @@
 //! A memberspace's members are its direct members, plus the members of every
 //! space it nests (`happyview_space_nested`), resolved when access is checked
 //! rather than copied into the member table (HAP-388 §11). A nested space's
-//! member gets at most the access the reference grants. Spaces named as
-//! members the simplespace way (`is_delegation` rows) still resolve as they
-//! always did, granting their members' access unchanged.
+//! member gets at most the access the reference grants. So does a member of a
+//! space named as a member the simplespace way (an `is_delegation` row): at
+//! most the read and write the row gives, at every level it is reached
+//! through.
 //!
 //! Resolution is bounded: at most [`MAX_DELEGATION_DEPTH`] levels, each space
 //! visited once, and at most [`MAX_RESOLVED`] rows read in all. Past that the
@@ -257,15 +258,17 @@ async fn resolve(
 
         for (did, read, write, read_self, is_delegation, consented, consented_to) in rows {
             if is_delegation != 0 {
-                // Simplespace's space-as-member: its members keep their own
-                // access, as they always did. Only an entry added by someone
-                // who administers the named space brings its members in, and
-                // only while it names that same space.
+                // Simplespace's space-as-member: its members get at most the
+                // entry's read and write, as a nested space's do. Only an
+                // entry added by someone who administers the named space
+                // brings its members in, and only while it names that same
+                // space.
                 let Some(consented_to) = consented_to.filter(|_| consented != 0) else {
                     continue;
                 };
                 let target = target_id(conn, backend, &did).await?;
                 if let Some(target) = target.filter(|t| *t == consented_to) {
+                    let cap = narrow(cap, (read != 0, write != 0));
                     queue.push((target, cap, via.clone().or(Some(did)), depth + 1));
                 }
                 continue;
@@ -294,11 +297,7 @@ async fn resolve(
             entry.access = entry.access.union(access);
         }
         for (uri, read, write, nested_id) in refs {
-            let step = (read != 0, write != 0);
-            let cap = Some(match cap {
-                Some((r, w)) => (r && step.0, w && step.1),
-                None => step,
-            });
+            let cap = narrow(cap, (read != 0, write != 0));
             // Only while the address still names the space that was nested.
             let target = target_id(conn, backend, &uri).await?;
             if let Some(target) = target.filter(|t| nested_id.as_deref() == Some(t.as_str())) {
@@ -314,6 +313,15 @@ async fn resolve(
         }
     }
     Ok(resolved)
+}
+
+/// The cap of a path that goes on through a reference or entry granting
+/// `step`.
+fn narrow(cap: Cap, step: (bool, bool)) -> Cap {
+    Some(match cap {
+        Some((r, w)) => (r && step.0, w && step.1),
+        None => step,
+    })
 }
 
 /// Whether an earlier visit's cap grants everything `cap` does.
@@ -417,7 +425,24 @@ pub async fn delegation_target(
 
 #[cfg(test)]
 mod tests {
-    use super::covers;
+    use super::{covers, narrow};
+
+    #[test]
+    fn a_step_narrows_the_cap_to_what_both_grant() {
+        assert_eq!(narrow(None, (true, false)), Some((true, false)));
+        assert_eq!(
+            narrow(Some((true, true)), (false, true)),
+            Some((false, true))
+        );
+        assert_eq!(
+            narrow(Some((true, false)), (true, true)),
+            Some((true, false))
+        );
+        assert_eq!(
+            narrow(Some((false, true)), (true, false)),
+            Some((false, false))
+        );
+    }
 
     /// The reverse lookup stops at its budget, by name, rather than answer
     /// with part of the list.

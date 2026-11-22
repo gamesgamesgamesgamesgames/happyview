@@ -757,6 +757,22 @@ async fn a_credential_is_refused_off_the_space_routes_under_either_scheme() {
 
 /// `did`'s credential for `space`, bound to `key`.
 async fn credential_for(app: &TestApp, did: &str, space: &str, key: &SigningKey) -> String {
+    let (status, body) = try_credential(app, did, space, key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{did}: credential for {space}: {body}"
+    );
+    body["credential"].as_str().unwrap().to_string()
+}
+
+/// Ask for `did`'s credential for `space`, bound to `key`.
+async fn try_credential(
+    app: &TestApp,
+    did: &str,
+    space: &str,
+    key: &SigningKey,
+) -> (StatusCode, Value) {
     let (name, value) = cookie_for(app, did);
     let delegation = call(
         app,
@@ -770,11 +786,11 @@ async fn credential_for(app: &TestApp, did: &str, space: &str, key: &SigningKey)
             .unwrap(),
     )
     .await;
-    assert_eq!(
-        delegation.status(),
-        StatusCode::OK,
-        "{did}: delegation token"
-    );
+    // Refused a delegation token, the member is refused a credential.
+    if delegation.status() != StatusCode::OK {
+        let status = delegation.status();
+        return (status, json_of(delegation).await);
+    }
     let token = json_of(delegation).await["token"]
         .as_str()
         .unwrap()
@@ -797,13 +813,7 @@ async fn credential_for(app: &TestApp, did: &str, space: &str, key: &SigningKey)
     )
     .await;
     let status = minted.status();
-    let body = json_of(minted).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{did}: credential for {space}: {body}"
-    );
-    body["credential"].as_str().unwrap().to_string()
+    (status, json_of(minted).await)
 }
 
 /// A new memberspace of `CREATOR`'s that takes `inner`'s members through a
@@ -1086,6 +1096,65 @@ async fn credentials_issued_through_an_older_delegation_entry_go_with_it() {
 
         assert_revoked(&app, &outer, &credential, &key, case).await;
     }
+}
+
+/// Put the entry in `outer` naming `inner` with `read` and `write`, as the
+/// administrator of both.
+async fn put_entry(app: &TestApp, outer: &str, inner: &str, read: bool, write: bool) {
+    space_admin(
+        app,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": outer, "did": inner, "read": read, "write": write, "isDelegation": true }),
+    )
+    .await;
+}
+
+/// A member row naming a space grants that space's members no more than its
+/// own access, so withdrawing its read revokes the credentials issued
+/// through it, here and in the spaces that take this one's members; and a
+/// member it no longer lets read is issued none.
+#[tokio::test]
+#[serial]
+async fn withdrawing_an_older_entrys_read_revokes_the_credentials_issued_through_it() {
+    common::require_db!();
+    for case in ["here", "a level up"] {
+        let mut app = TestApp::new_with_encryption().await;
+        let key = key();
+        let (inner, _) = setup(&mut app, &key).await;
+        let outer = older_delegating_space(&app, &inner).await;
+        let checked = match case {
+            "here" => outer.clone(),
+            _ => older_delegating_space(&app, &outer).await,
+        };
+        let credential = credential_for(&app, MEMBER, &checked, &key).await;
+        let (status, body) = get_space_with(&app, &checked, &credential, &key).await;
+        assert_eq!(status, StatusCode::OK, "{case}, before: {body}");
+
+        put_entry(&app, &outer, &inner, false, true).await;
+
+        assert_revoked(&app, &checked, &credential, &key, case).await;
+        let (status, body) = try_credential(&app, MEMBER, &checked, &key).await;
+        assert_ne!(status, StatusCode::OK, "{case}, after: {body}");
+    }
+}
+
+/// Withdrawing only an older entry's write leaves its members reading, and
+/// their credentials working.
+#[tokio::test]
+#[serial]
+async fn withdrawing_an_older_entrys_write_keeps_its_members_credentials() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (inner, _) = setup(&mut app, &key).await;
+    let outer = older_delegating_space(&app, &inner).await;
+    put_entry(&app, &outer, &inner, true, true).await;
+    let credential = credential_for(&app, MEMBER, &outer, &key).await;
+
+    put_entry(&app, &outer, &inner, true, false).await;
+
+    let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// Discarding a member list keeps the creator's credentials.
