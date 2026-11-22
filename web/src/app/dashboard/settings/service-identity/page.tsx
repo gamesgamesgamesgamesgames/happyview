@@ -1214,7 +1214,6 @@ export default function ServiceIdentityPage() {
                         handleSyncPlcSubmit();
                       }
                     }}
-                    placeholder="Enter the code from your email"
                   />
                 </div>
                 <div className="flex items-center gap-2">

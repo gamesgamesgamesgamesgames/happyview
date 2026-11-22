@@ -118,12 +118,7 @@ export default function LabelersPage() {
       <SiteHeader title="Labelers" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-lg font-semibold">Labeler Subscriptions</h2>
-            <p className="text-muted-foreground text-sm">
-              Manage external labeler services that provide content labels.
-            </p>
-          </div>
+          <h2 className="text-lg font-semibold">Labeler Subscriptions</h2>
           {hasPermission("labelers:create") && (
             <AddLabelerDialog onSuccess={load} />
           )}
