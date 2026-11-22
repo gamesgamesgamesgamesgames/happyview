@@ -573,6 +573,29 @@ async fn keeping_consent_needs_it_at_write_time() {
     changed.access = MemberAccess::WRITE;
     assert!(keep(changed).await);
     assert!(!consented(&app, &x, &y_addr).await);
+
+    // Raising one flag alone loses it too.
+    for (stored, raised) in [
+        (MemberAccess::READ, MemberAccess::WRITE),
+        (
+            MemberAccess {
+                read: false,
+                write: true,
+                read_self: false,
+            },
+            MemberAccess::WRITE,
+        ),
+    ] {
+        let (x, _) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, stored).await;
+        let mut changed = delegation(&x, &y_addr);
+        changed.access = raised;
+        assert!(keep(changed).await);
+        assert!(
+            !consented(&app, &x, &y_addr).await,
+            "{stored:?} to {raised:?}"
+        );
+    }
 }
 
 /// How many spaces `space_id` nests.
