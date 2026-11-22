@@ -303,7 +303,7 @@ async fn consented(app: &TestApp, space_id: &str, reference: &str) -> bool {
 
 /// Putting an entry that already brings in members again, unchanged, keeps it
 /// without the named space's administrator: a client re-sending its whole
-/// member list goes on working. Changing its access, or naming another space,
+/// member list goes on working. Raising its access, or naming another space,
 /// needs that administrator.
 #[tokio::test]
 #[serial]
@@ -331,7 +331,7 @@ async fn putting_a_consented_entry_again_unchanged_keeps_it() {
     assert!(consented(&app, &x, &y_addr).await);
     assert!(is_member(&app, &x, &y_member).await);
 
-    // A change of access needs Y's administrator; the entry is left as it was.
+    // Raising its access needs Y's administrator; the entry is left as it was.
     let (status, body) = post(
         &app,
         &x_owner,
@@ -557,11 +557,19 @@ async fn keeping_consent_needs_it_at_write_time() {
     assert!(keep(delegation(&x, &y_addr)).await);
     assert!(!consented(&app, &x, &y_addr).await);
 
-    // A consented entry, unchanged, keeps it; with other access, loses it.
+    // A consented entry, unchanged or lowered, keeps it; raised, loses it.
     add_consented(&app, &x, &y_addr, &y).await;
     assert!(keep(delegation(&x, &y_addr)).await);
     assert!(consented(&app, &x, &y_addr).await);
-    let mut changed = delegation(&x, &y_addr);
+    let mut lowered = delegation(&x, &y_addr);
+    lowered.access = MemberAccess {
+        read: false,
+        write: false,
+        read_self: false,
+    };
+    assert!(keep(lowered.clone()).await);
+    assert!(consented(&app, &x, &y_addr).await);
+    let mut changed = lowered;
     changed.access = MemberAccess::WRITE;
     assert!(keep(changed).await);
     assert!(!consented(&app, &x, &y_addr).await);
@@ -1037,4 +1045,79 @@ async fn entries_and_nested_spaces_cap_each_other() {
             "nested first: {nested_first}, {outer:?} then {inner:?}"
         );
     }
+}
+
+/// The delegating space's administrator may lower what a consented entry
+/// grants, to no access at all, without the named space's administrator, and
+/// the entry keeps its consent. Raising either flag needs the named space's
+/// administrator, even alongside lowering the other.
+#[tokio::test]
+#[serial]
+async fn the_delegating_admin_alone_may_lower_an_entry_but_not_raise_it() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, member) = (rand_did("x"), rand_did("y"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+    let none = MemberAccess {
+        read: false,
+        write: false,
+        read_self: false,
+    };
+    let put = |space: &str, read: bool, write: bool| json!({ "space": space, "did": y_addr, "read": read, "write": write, "isDelegation": true });
+    let entry = |app: &TestApp, x: String| {
+        let (db, backend, y_addr) = (app.state.db.clone(), app.state.db_backend, y_addr.clone());
+        async move {
+            spaces_db::get_member(&db, backend, &x, &y_addr)
+                .await
+                .unwrap()
+                .unwrap()
+                .access
+        }
+    };
+
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_WRITE).await;
+    for (read, write, expected) in [(true, false, READ_ONLY), (false, false, none)] {
+        let (status, body) = post(
+            &app,
+            &x_owner,
+            "com.atproto.simplespace.putMember",
+            put(&x_addr, read, write),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "lower to {read}/{write}: {body}"
+        );
+        assert!(consented(&app, &x, &y_addr).await, "{read}/{write}");
+        assert_eq!(access_of(&app, &x, &member).await, Some(expected));
+    }
+    // Raising it back needs Y's administrator.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(&x_addr, true, false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "raise: {body}");
+    assert_eq!(entry(&app, x.clone()).await, none);
+    assert!(consented(&app, &x, &y_addr).await);
+
+    // Lowering read while raising write is a raise.
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_ONLY).await;
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(&x_addr, false, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "mixed: {body}");
+    assert_eq!(entry(&app, x.clone()).await, READ_ONLY);
+    assert!(consented(&app, &x, &y_addr).await);
+    assert_eq!(access_of(&app, &x, &member).await, Some(READ_ONLY));
 }

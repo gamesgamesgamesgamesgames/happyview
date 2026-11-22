@@ -1599,32 +1599,24 @@ mod tests {
         }
     }
 
-    /// A script lowering a space-as-member entry's access caps the named
-    /// space's members at once, and revokes the credentials it no longer
-    /// allows, as `putMember` does.
+    /// A script run by the delegating space's administrator alone may lower
+    /// a consented space-as-member entry, which caps the named space's
+    /// members at once and revokes the credentials it no longer allows, as
+    /// `putMember` does. Raising either flag needs the named space's
+    /// administrator, even alongside lowering the other.
     #[tokio::test]
     #[serial(spaces_feature_flag)]
-    async fn a_script_lowering_an_entry_revokes_what_it_no_longer_allows() {
+    async fn a_script_may_lower_an_entry_but_not_raise_it() {
         for state in each_backend().await {
             let on = backend_name(&state);
             let (x_uri, admin) = seed_space_in(&state).await;
-            let (y_uri, _) = seed_space_in(&state).await;
+            let (y_uri, y_admin) = seed_space_in(&state).await;
             let x = service::resolve_space(&state, &x_uri).await.unwrap();
             let y = service::resolve_space(&state, &y_uri).await.unwrap();
-            crate::db::query(&crate::db::adapt_sql(
-                "UPDATE happyview_spaces SET creator_did = ?, authority_did = ? WHERE id = ?",
-                state.db_backend,
-            ))
-            .bind(&admin)
-            .bind(&admin)
-            .bind(&y.id)
-            .execute(&state.db)
-            .await
-            .unwrap();
             let member = format!("did:plc:m{}", uuid::Uuid::new_v4().simple());
             service::put_member(
                 &state,
-                &admin,
+                &y_admin,
                 &y_uri,
                 &member,
                 Some(MemberAccess::WRITE),
@@ -1632,17 +1624,25 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("member of Y on {on}: {e}"));
-            let entry = |read: bool, write: bool| SpaceMemberAdd {
-                uri: x_uri.clone(),
-                did: y_uri.clone(),
-                access: None,
-                read: Some(read),
-                write: Some(write),
-                is_delegation: Some(true),
-            };
-            set_member(&state, &admin, entry(true, true))
+            // Consented as Y's administrator would.
+            assert!(
+                crate::spaces::db::insert_delegation_if_allowed(
+                    &state.db,
+                    state.db_backend,
+                    &crate::spaces::types::SpaceMember {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        space_id: x.id.clone(),
+                        did: y_uri.clone(),
+                        access: MemberAccess::WRITE,
+                        is_delegation: true,
+                        granted_by: Some(y_admin.clone()),
+                        created_at: crate::db::now_rfc3339(),
+                    },
+                    crate::spaces::db::DelegationConsent::Granted(&y.id),
+                )
                 .await
-                .unwrap_or_else(|e| panic!("entry on {on}: {e}"));
+                .unwrap()
+            );
             let jti = uuid::Uuid::new_v4().to_string();
             crate::db::query(&crate::db::adapt_sql(
                 "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1658,26 +1658,62 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-
-            set_member(&state, &admin, entry(false, true))
-                .await
-                .unwrap_or_else(|e| panic!("lower the entry on {on}: {e}"));
-
-            let access =
+            let entry = |read: bool, write: bool| SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: Some(read),
+                write: Some(write),
+                is_delegation: Some(true),
+            };
+            let access = || async {
                 crate::spaces::members::is_member(&state.db, state.db_backend, &x.id, &member)
                     .await
                     .unwrap()
-                    .unwrap_or_else(|| panic!("still a member on {on}"));
-            assert!(!access.read && access.write, "{access:?} on {on}");
-            let outstanding = crate::spaces::db::outstanding_credential_jtis(
-                &state.db,
-                state.db_backend,
-                &x.id,
-                &member,
-            )
-            .await
-            .unwrap();
-            assert!(outstanding.is_empty(), "{outstanding:?} on {on}");
+                    .unwrap_or_else(|| panic!("still a member on {on}"))
+            };
+            let outstanding = || async {
+                crate::spaces::db::outstanding_credential_jtis(
+                    &state.db,
+                    state.db_backend,
+                    &x.id,
+                    &member,
+                )
+                .await
+                .unwrap()
+            };
+
+            // Withdrawing write keeps the credential.
+            set_member(&state, &admin, entry(true, false))
+                .await
+                .unwrap_or_else(|e| panic!("lower write on {on}: {e}"));
+            assert_eq!(access().await, MemberAccess::READ, "on {on}");
+            assert_eq!(outstanding().await, vec![jti.clone()], "on {on}");
+
+            for (read, write) in [(false, true), (true, true)] {
+                assert!(
+                    set_member(&state, &admin, entry(read, write))
+                        .await
+                        .is_err(),
+                    "raise to {read}/{write} on {on}"
+                );
+                assert_eq!(access().await, MemberAccess::READ, "on {on}");
+            }
+
+            // Withdrawing read revokes it.
+            set_member(&state, &admin, entry(false, false))
+                .await
+                .unwrap_or_else(|e| panic!("lower read on {on}: {e}"));
+            let now = access().await;
+            assert!(!now.read && !now.write, "{now:?} on {on}");
+            assert!(outstanding().await.is_empty(), "on {on}");
+            assert!(
+                crate::spaces::db::consented_delegations(&state.db, state.db_backend, &x.id)
+                    .await
+                    .unwrap()
+                    .contains_key(&y_uri),
+                "consent kept on {on}"
+            );
         }
     }
 

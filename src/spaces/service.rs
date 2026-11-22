@@ -1212,11 +1212,12 @@ async fn lock_member_space(
 /// administering that space too. An entry naming a space that isn't here is
 /// stored as it always was, and brings in no members.
 ///
-/// Putting an entry that already brings in members again, with the same
-/// access and naming the same space, keeps it as it is without asking again,
-/// so a client re-sending a space's whole member list goes on working. Any
-/// change to its access needs the named space's administrator, as a new
-/// entry does.
+/// Putting an entry that already brings in members again, naming the same
+/// space with the same access or less, keeps its consent without asking
+/// again: a client re-sending a space's whole member list goes on working,
+/// and this space's administrator can lower what the entry grants (to no
+/// access at all), as they can remove it. Raising either flag needs the
+/// named space's administrator, as a new entry does.
 async fn delegation_consent(
     state: &AppState,
     actor_did: &str,
@@ -1233,7 +1234,7 @@ async fn delegation_consent(
     match require_space_admin(state, &target, actor_did).await {
         Ok(()) => Ok(Consent::Granted(target.id)),
         Err(AppError::Forbidden(_))
-            if unchanged_consented_delegation(state, member, &target.id).await? =>
+            if consented_delegation_not_raised(state, member, &target.id).await? =>
         {
             Ok(Consent::Kept)
         }
@@ -1261,15 +1262,19 @@ impl Consent {
     }
 }
 
-/// Whether `member` is already stored, unchanged, as an entry that brings in
-/// the members of the space `target_id`.
-async fn unchanged_consented_delegation(
+/// Whether `member` is already stored as an entry that brings in the
+/// members of the space `target_id`, granting at least the read and write
+/// `member` asks for.
+async fn consented_delegation_not_raised(
     state: &AppState,
     member: &SpaceMember,
     target_id: &str,
 ) -> Result<bool, AppError> {
     let stored = db::get_member(&state.db, state.db_backend, &member.space_id, &member.did).await?;
-    if !stored.is_some_and(|m| m.is_delegation && m.access == member.access) {
+    let not_raised = |stored: MemberAccess| {
+        (stored.read || !member.access.read) && (stored.write || !member.access.write)
+    };
+    if !stored.is_some_and(|m| m.is_delegation && not_raised(m.access)) {
         return Ok(false);
     }
     Ok(

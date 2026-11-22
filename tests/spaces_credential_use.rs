@@ -1023,11 +1023,17 @@ async fn space_id(app: &TestApp, uri: &str) -> String {
 /// member row naming it, as `simplespace` stored an `isDelegation` entry
 /// before spaces nested, added by `inner`'s administrator.
 async fn older_delegating_space(app: &TestApp, inner: &str) -> String {
+    older_delegating_space_by(app, inner, CREATOR).await
+}
+
+/// [`older_delegating_space`], created by `owner`, with the entry consented
+/// as `inner`'s administrator would have.
+async fn older_delegating_space_by(app: &TestApp, inner: &str, owner: &str) -> String {
     let created = call(
         app,
         post_as(
             app,
-            CREATOR,
+            owner,
             "com.atproto.space.createSpace",
             json!({
                 "spaceType": "com.example.creduse",
@@ -1159,6 +1165,49 @@ async fn withdrawing_an_older_entrys_read_revokes_the_credentials_issued_through
         let (status, body) = try_credential(&app, MEMBER, &checked, &key).await;
         assert_ne!(status, StatusCode::OK, "{case}, after: {body}");
     }
+}
+
+/// The delegating space's administrator alone, who doesn't administer the
+/// named space, may withdraw an older entry's read, and that revokes the
+/// credentials issued through it. Raising it back is refused.
+#[tokio::test]
+#[serial]
+async fn the_delegating_admin_alone_lowering_an_entry_revokes_its_credentials() {
+    common::require_db!();
+    const OWNER: &str = "did:plc:creduse-outer-owner";
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (inner, _) = setup(&mut app, &key).await;
+    let outer = older_delegating_space_by(&app, &inner, OWNER).await;
+    let credential = credential_for(&app, MEMBER, &outer, &key).await;
+    let entry = |read: bool, write: bool| json!({ "space": outer, "did": inner, "read": read, "write": write, "isDelegation": true });
+
+    let lowered = call(
+        &app,
+        post_as(
+            &app,
+            OWNER,
+            "com.atproto.simplespace.putMember",
+            entry(false, false),
+        ),
+    )
+    .await;
+    assert!(lowered.status().is_success(), "lower: {}", lowered.status());
+    assert_revoked(&app, &outer, &credential, &key, "lowered").await;
+
+    let raised = call(
+        &app,
+        post_as(
+            &app,
+            OWNER,
+            "com.atproto.simplespace.putMember",
+            entry(true, false),
+        ),
+    )
+    .await;
+    assert_eq!(raised.status(), StatusCode::FORBIDDEN, "raise");
+    let (status, body) = try_credential(&app, MEMBER, &outer, &key).await;
+    assert_ne!(status, StatusCode::OK, "after the refused raise: {body}");
 }
 
 /// Withdrawing only an older entry's write leaves its members reading, and

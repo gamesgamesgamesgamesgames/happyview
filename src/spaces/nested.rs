@@ -260,8 +260,8 @@ fn reference_to(actor: &str, target: &Space, read: bool, write: bool) -> db::Nes
 /// is `false`: one naming a space here takes administering that space too,
 /// and one naming a space elsewhere brings in no members. An entry
 /// already stored as a member row is put as that row, so its access changes
-/// in place, and putting it again unchanged keeps it without the named
-/// space's administrator. The answer is the member as `simplespace` shaped
+/// in place. Putting it again with the same access or less keeps its
+/// consent without the named space's administrator; raising it needs them. The answer is the member as `simplespace` shaped
 /// it.
 pub(crate) async fn put_space_member(
     state: &AppState,
