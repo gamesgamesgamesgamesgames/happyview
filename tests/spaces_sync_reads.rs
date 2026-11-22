@@ -689,3 +689,68 @@ async fn clear_records_empties_the_callers_repo_in_one_commit() {
     .await;
     assert_eq!(again["commit"]["rev"], after["commit"]["rev"]);
 }
+
+#[tokio::test]
+#[serial]
+async fn clear_records_keeps_the_configuration_a_space_publishes_in_its_own_repo() {
+    common::require_db!();
+    // The space is on the authority's DID here, so the authority's repo is the
+    // space's own.
+    let (app, space, authority, _author) = setup("clearkeep").await;
+    write(&app, &space, &authority, COLLECTION, "mine").await;
+    let skey = space.rsplit('/').next().unwrap();
+    let row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &authority,
+        TYPE_NSID,
+        skey,
+    )
+    .await
+    .unwrap()
+    .expect("the space");
+    let policy_uri = format!("{space}/{authority}/com.atproto.space.policy/self");
+    let policy = json!({ "$type": "com.atproto.space.policy", "policy": { "$type": "com.atproto.memberspace.policy" } });
+    spaces_db::insert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceRecord {
+            uri: policy_uri.clone(),
+            space_id: row.id.clone(),
+            author_did: authority.clone(),
+            collection: "com.atproto.space.policy".into(),
+            rkey: "self".into(),
+            cid: happyview::cid_verify::compute_record_cid(&policy)
+                .unwrap()
+                .to_string(),
+            record: policy,
+            indexed_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post(
+        &app,
+        &authority,
+        "clearRecords",
+        json!({ "space": space, "repo": authority }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, listed) = get(
+        &app,
+        &authority,
+        "listRecords",
+        &q(&space, "repo", &authority),
+    )
+    .await;
+    let collections: Vec<&str> = listed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["collection"].as_str().unwrap())
+        .collect();
+    assert_eq!(collections, ["com.atproto.space.policy"], "{listed}");
+}
