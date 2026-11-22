@@ -1599,6 +1599,88 @@ mod tests {
         }
     }
 
+    /// A script lowering a space-as-member entry's access caps the named
+    /// space's members at once, and revokes the credentials it no longer
+    /// allows, as `putMember` does.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_script_lowering_an_entry_revokes_what_it_no_longer_allows() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (x_uri, admin) = seed_space_in(&state).await;
+            let (y_uri, _) = seed_space_in(&state).await;
+            let x = service::resolve_space(&state, &x_uri).await.unwrap();
+            let y = service::resolve_space(&state, &y_uri).await.unwrap();
+            crate::db::query(&crate::db::adapt_sql(
+                "UPDATE happyview_spaces SET creator_did = ?, authority_did = ? WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind(&admin)
+            .bind(&admin)
+            .bind(&y.id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            let member = format!("did:plc:m{}", uuid::Uuid::new_v4().simple());
+            service::put_member(
+                &state,
+                &admin,
+                &y_uri,
+                &member,
+                Some(MemberAccess::WRITE),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("member of Y on {on}: {e}"));
+            let entry = |read: bool, write: bool| SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: Some(read),
+                write: Some(write),
+                is_delegation: Some(true),
+            };
+            set_member(&state, &admin, entry(true, true))
+                .await
+                .unwrap_or_else(|e| panic!("entry on {on}: {e}"));
+            let jti = uuid::Uuid::new_v4().to_string();
+            crate::db::query(&crate::db::adapt_sql(
+                "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                state.db_backend,
+            ))
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&x.id)
+            .bind(&member)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&jti)
+            .bind((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339())
+            .bind(crate::db::now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+            set_member(&state, &admin, entry(false, true))
+                .await
+                .unwrap_or_else(|e| panic!("lower the entry on {on}: {e}"));
+
+            let access =
+                crate::spaces::members::is_member(&state.db, state.db_backend, &x.id, &member)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("still a member on {on}"));
+            assert!(!access.read && access.write, "{access:?} on {on}");
+            let outstanding = crate::spaces::db::outstanding_credential_jtis(
+                &state.db,
+                state.db_backend,
+                &x.id,
+                &member,
+            )
+            .await
+            .unwrap();
+            assert!(outstanding.is_empty(), "{outstanding:?} on {on}");
+        }
+    }
+
     /// A script delegating to a space goes through the same check as the
     /// XRPC methods: the caller must administer the named space too.
     #[tokio::test]

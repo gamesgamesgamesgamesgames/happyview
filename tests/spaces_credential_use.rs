@@ -1111,20 +1111,43 @@ async fn put_entry(app: &TestApp, outer: &str, inner: &str, read: bool, write: b
 
 /// A member row naming a space grants that space's members no more than its
 /// own access, so withdrawing its read revokes the credentials issued
-/// through it, here and in the spaces that take this one's members; and a
-/// member it no longer lets read is issued none.
+/// through it, here and in the spaces that take this one's members, through
+/// entries or nesting; and a member it no longer lets read is issued none.
 #[tokio::test]
 #[serial]
 async fn withdrawing_an_older_entrys_read_revokes_the_credentials_issued_through_it() {
     common::require_db!();
-    for case in ["here", "a level up"] {
+    for case in [
+        "here",
+        "a level up",
+        "in a space nesting it",
+        "above a nested space",
+    ] {
         let mut app = TestApp::new_with_encryption().await;
         let key = key();
         let (inner, _) = setup(&mut app, &key).await;
-        let outer = older_delegating_space(&app, &inner).await;
-        let checked = match case {
-            "here" => outer.clone(),
-            _ => older_delegating_space(&app, &outer).await,
+        // The entry lowered is `outer`'s, naming `inner`; `checked` holds
+        // the credential.
+        let (outer, inner, checked) = match case {
+            "here" => {
+                let outer = older_delegating_space(&app, &inner).await;
+                (outer.clone(), inner, outer)
+            }
+            "a level up" => {
+                let outer = older_delegating_space(&app, &inner).await;
+                let up = older_delegating_space(&app, &outer).await;
+                (outer, inner, up)
+            }
+            "in a space nesting it" => {
+                let outer = older_delegating_space(&app, &inner).await;
+                let nesting = delegating_space(&app, &outer).await;
+                (outer, inner, nesting)
+            }
+            _ => {
+                let nested = delegating_space(&app, &inner).await;
+                let outer = older_delegating_space(&app, &nested).await;
+                (outer.clone(), nested, outer)
+            }
         };
         let credential = credential_for(&app, MEMBER, &checked, &key).await;
         let (status, body) = get_space_with(&app, &checked, &credential, &key).await;

@@ -32,7 +32,7 @@ pub struct Effective {
     pub access: MemberAccess,
     /// Whether the space lists the DID itself.
     pub direct: bool,
-    /// The first nested space the DID was found through, if any.
+    /// The first nested or listed space the DID was found through, if any.
     pub via: Option<String>,
 }
 
@@ -70,8 +70,8 @@ type Row = (String, i32, i32, i32, i32, i32, Option<String>);
 /// The read and write a path of references allows; `None` before any.
 type Cap = Option<(bool, bool)>;
 
-/// A space to visit: its id, the cap of the path to it, the first nested
-/// space on that path, and its depth.
+/// A space to visit: its id, the cap of the path to it, the first nested or
+/// listed space on that path, and its depth.
 type Visit = (String, Cap, Option<String>, usize);
 
 /// Resolve a space's effective member list on `conn`, which may be inside a
@@ -213,12 +213,12 @@ async fn resolve(
     let mut resolved = Resolution::new();
     // A space is visited once per access cap it is reached with, so a
     // restrictive path seen first doesn't hide a more permissive one. There
-    // are four caps, so each space is read at most four times (and once when
-    // nothing restricts it).
+    // are four caps and the root's none, so each space is read at most five
+    // times, and once when its first path is unrestricted.
     let mut visited: std::collections::HashMap<String, Vec<Cap>> = std::collections::HashMap::new();
     let mut budget = MAX_RESOLVED;
-    // (space id, access cap from the references so far, the first nested
-    // space on the path, depth). The root has no cap and no source.
+    // (space id, access cap from the references and entries so far, the
+    // first nested or listed space on the path, depth). The root has no cap and no source.
     let mut queue: Vec<Visit> = vec![(space_id.to_string(), None, None, 0)];
     while let Some((id, cap, via, depth)) = queue.pop() {
         if depth >= MAX_DELEGATION_DEPTH {

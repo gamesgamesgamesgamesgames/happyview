@@ -949,3 +949,92 @@ async fn entries_cap_their_members_at_every_level() {
     add_consented_with(&app, &x, &y2_addr, &y2, READ_WRITE).await;
     assert_eq!(access_of(&app, &x, &member).await, Some(READ_WRITE));
 }
+
+/// A path that grants no read doesn't lift an own-records-only restriction
+/// another path sets: a member who reads only their own records here
+/// directly, and reaches the space again through a write-only entry, writes
+/// and still reads only their own records.
+#[tokio::test]
+#[serial]
+async fn a_write_only_entry_keeps_a_direct_members_own_records_restriction() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_row_with(&app, &x, &member, MemberAccess::READ_SELF).await;
+    add_consented_with(&app, &x, &y_addr, &y, WRITE_ONLY).await;
+    assert_eq!(
+        access_of(&app, &x, &member).await,
+        Some(MemberAccess {
+            read: true,
+            write: true,
+            read_self: true,
+        })
+    );
+}
+
+/// A nested reference stored straight into the store, in `space_id`,
+/// naming the space `target` at `address`.
+async fn add_nested(
+    app: &TestApp,
+    space_id: &str,
+    target: &str,
+    address: &str,
+    access: MemberAccess,
+) {
+    spaces_db::upsert_nested(
+        &app.state.db,
+        app.state.db_backend,
+        space_id,
+        target,
+        &spaces_db::NestedRef {
+            target_space_uri: address.to_string(),
+            read: access.read,
+            write: access.write,
+            added_by: None,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Entries and nested references cap each other along a path, whichever
+/// comes first.
+#[tokio::test]
+#[serial]
+async fn entries_and_nested_spaces_cap_each_other() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (z, z_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &z, &member, READ_WRITE).await;
+
+    for (nested_first, outer, inner, expected) in [
+        (true, READ_WRITE, READ_ONLY, READ_ONLY),
+        (true, READ_ONLY, READ_WRITE, READ_ONLY),
+        (true, READ_WRITE, WRITE_ONLY, WRITE_ONLY),
+        (false, READ_WRITE, READ_ONLY, READ_ONLY),
+        (false, READ_ONLY, READ_WRITE, READ_ONLY),
+        (false, WRITE_ONLY, READ_WRITE, WRITE_ONLY),
+    ] {
+        let (y, y_addr) = create_space(&app, &owner).await;
+        let (x, _) = create_space(&app, &owner).await;
+        if nested_first {
+            // X nests Y, which lists Z.
+            add_consented_with(&app, &y, &z_addr, &z, inner).await;
+            add_nested(&app, &x, &y, &y_addr, outer).await;
+        } else {
+            // X lists Y, which nests Z.
+            add_nested(&app, &y, &z, &z_addr, inner).await;
+            add_consented_with(&app, &x, &y_addr, &y, outer).await;
+        }
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "nested first: {nested_first}, {outer:?} then {inner:?}"
+        );
+    }
+}
