@@ -280,11 +280,6 @@ mod tests {
             .expect("idle")
             .expect("join");
     }
-}
-
-#[cfg(test)]
-mod generic_tests {
-    use super::*;
 
     /// Any copyable position works, as another consumer's would.
     #[test]

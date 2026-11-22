@@ -111,7 +111,7 @@ pub struct WorkerPool<E = Event, P = CursorPoint> {
     watermark: Arc<WatermarkHandle<P>>,
     tasks: Vec<JoinHandle<()>>,
     /// Names the stream in the pool's logs.
-    source: &'static str,
+    source: Arc<str>,
 }
 
 /// Dropping the pool stops its workers, so a stopped consumer leaves nothing
@@ -133,21 +133,21 @@ impl<E, P> Drop for WorkerPool<E, P> {
 }
 
 /// The worker that owns `did`'s events.
-pub fn worker_for(did: &str, workers: usize) -> usize {
+pub(crate) fn worker_for(did: &str, workers: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     did.hash(&mut hasher);
     (hasher.finish() % workers.max(1) as u64) as usize
 }
 
-impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
+impl WorkerPool<Event, CursorPoint> {
     /// A pool for Jetstream's events (its logs say `source = "jetstream"`).
     pub fn spawn(
         workers: usize,
         capacity: usize,
-        apply: ApplyFn<E>,
-        watermark: Arc<WatermarkHandle<P>>,
+        apply: ApplyFn,
+        watermark: Arc<WatermarkHandle>,
         retry: RetryPolicy,
-        on_give_up: GiveUpFn<E>,
+        on_give_up: GiveUpFn,
     ) -> Self {
         Self::spawn_for(
             "jetstream",
@@ -159,10 +159,12 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
             on_give_up,
         )
     }
+}
 
-    /// [`WorkerPool::spawn`], naming the stream `source` in the logs.
+impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
+    /// A pool for any stream's events, named `source` in its logs.
     pub fn spawn_for(
-        source: &'static str,
+        source: impl Into<Arc<str>>,
         workers: usize,
         capacity: usize,
         apply: ApplyFn<E>,
@@ -170,6 +172,7 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
         retry: RetryPolicy,
         on_give_up: GiveUpFn<E>,
     ) -> Self {
+        let source: Arc<str> = source.into();
         let workers = workers.max(1);
         let depths: Arc<Vec<AtomicUsize>> =
             Arc::new((0..workers).map(|_| AtomicUsize::new(0)).collect());
@@ -179,7 +182,7 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
             .map(|index| {
                 let (tx, rx) = mpsc::channel(capacity.max(1));
                 let task = tokio::spawn(run_worker(Worker {
-                    source,
+                    source: Arc::clone(&source),
                     index,
                     rx,
                     apply: Arc::clone(&apply),
@@ -212,7 +215,7 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
             // than hold the watermark back for good.
             self.watermark.complete(job.ticket);
             tracing::error!(
-                source = self.source,
+                source = &*self.source,
                 worker = index,
                 did = %job.event.did(),
                 "a stream worker has stopped; dropping an event it was sent"
@@ -259,7 +262,7 @@ pub(crate) fn busy_since_values(busy_since: &[AtomicI64]) -> Vec<Option<i64>> {
 }
 
 struct Worker<E, P> {
-    source: &'static str,
+    source: Arc<str>,
     index: usize,
     rx: mpsc::Receiver<Job<E>>,
     apply: ApplyFn<E>,
@@ -297,7 +300,7 @@ async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) 
             Ok(ApplyOutcome::Applied) => {
                 if unavailable_retries > 0 {
                     tracing::info!(
-                        source = worker.source,
+                        source = &*worker.source,
                         worker = worker.index,
                         did = %event.did(),
                         unavailable_retries,
@@ -310,7 +313,7 @@ async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) 
                 let delay = worker.retry.unavailable_delay(unavailable_retries);
                 if unavailable_retries % 10 == 0 {
                     tracing::warn!(
-                        source = worker.source,
+                        source = &*worker.source,
                         worker = worker.index,
                         did = %event.did(),
                         %error,
@@ -330,7 +333,7 @@ async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) 
             break error;
         };
         tracing::warn!(
-            source = worker.source,
+            source = &*worker.source,
             worker = worker.index,
             did = %event.did(),
             %error,
@@ -340,7 +343,7 @@ async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) 
         tokio::time::sleep(*delay).await;
     };
     tracing::error!(
-        source = worker.source,
+        source = &*worker.source,
         worker = worker.index,
         did = %event.did(),
         %error,
@@ -352,7 +355,7 @@ async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) 
         .is_err()
     {
         tracing::error!(
-            source = worker.source,
+            source = &*worker.source,
             worker = worker.index,
             "giving up on a stream event panicked"
         );
@@ -856,7 +859,7 @@ mod tests {
             busy_since: Arc::new(vec![AtomicI64::new(IDLE)]),
             watermark: Arc::clone(&watermark),
             tasks: Vec::new(),
-            source: "jetstream",
+            source: "jetstream".into(),
         };
         send(&pool, &watermark, event("did:plc:same", 1)).await;
         assert_eq!(watermark.in_flight(), 0);
@@ -951,11 +954,6 @@ mod tests {
         assert_eq!(busy_since_values(&busy), vec![None]);
         assert_eq!(depths[0].load(Ordering::Relaxed), 0);
     }
-}
-
-#[cfg(test)]
-mod generic_tests {
-    use super::*;
 
     /// Another consumer's event and position: the pool orders by DID and
     /// moves the watermark over them just as it does Jetstream's.
@@ -974,13 +972,25 @@ mod generic_tests {
     #[tokio::test]
     async fn the_pool_runs_any_stream_event() {
         let watermark: Arc<WatermarkHandle<u64>> = Arc::new(WatermarkHandle::new());
-        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Each DID's seqs as applied; seq 5 fails once, so it's retried.
+        let applied: Arc<Mutex<HashMap<String, Vec<u64>>>> = Arc::default();
+        let failed_once = Arc::new(AtomicBool::new(false));
         let apply: ApplyFn<Other> = {
             let applied = Arc::clone(&applied);
+            let failed_once = Arc::clone(&failed_once);
             Arc::new(move |event: Other| {
                 let applied = Arc::clone(&applied);
+                let failed_once = Arc::clone(&failed_once);
                 async move {
-                    applied.lock().unwrap().push(event.seq);
+                    if event.seq == 5 && !failed_once.swap(true, Ordering::SeqCst) {
+                        return ApplyOutcome::Failed("once".into());
+                    }
+                    applied
+                        .lock()
+                        .unwrap()
+                        .entry(event.did.clone())
+                        .or_default()
+                        .push(event.seq);
                     ApplyOutcome::Applied
                 }
                 .boxed()
@@ -988,12 +998,12 @@ mod generic_tests {
         };
         let give_up: GiveUpFn<Other> = Arc::new(|_, _| async {}.boxed());
         let pool = WorkerPool::spawn_for(
-            "test",
+            format!("test-{}", 1),
             4,
             8,
             apply,
             Arc::clone(&watermark),
-            RetryPolicy::default(),
+            fast_retry(2),
             give_up,
         );
         for seq in 1..=20 {
@@ -1011,6 +1021,11 @@ mod generic_tests {
             .await
             .expect("idle");
         assert_eq!(watermark.applied(), Some(20));
-        assert_eq!(applied.lock().unwrap().len(), 20);
+        let applied = applied.lock().unwrap();
+        assert_eq!(applied.values().map(Vec::len).sum::<usize>(), 20);
+        for (did, seqs) in applied.iter() {
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{did}: {seqs:?}");
+        }
+        assert!(failed_once.load(Ordering::SeqCst), "seq 5 was retried");
     }
 }
