@@ -33,6 +33,42 @@ pub fn encode_cursor(rev: &str, idx: i32) -> String {
     format!("{rev}:{idx}")
 }
 
+/// Whether `value` is a TID: 13 base32-sortable characters whose top bit is 0.
+pub fn is_tid(value: &str) -> bool {
+    value.len() == 13
+        && happyview_plugin_sdk::tid::tid_to_number(value).is_some()
+        && matches!(value.as_bytes()[0], b'2'..=b'7' | b'a'..=b'j')
+}
+
+/// Whether `cursor` is one this host issues: `{rev}:{idx}`, or a bare rev.
+///
+/// [`parse_cursor`] reads anything, so the routes that predate the lexicons'
+/// `InvalidCursor` keep reading what they always did; requests in the
+/// lexicons' shape check with this first.
+pub fn is_valid_cursor(cursor: &str) -> bool {
+    match cursor.rsplit_once(':') {
+        Some((rev, idx)) => is_tid(rev) && idx.parse::<u32>().is_ok(),
+        None => is_tid(cursor),
+    }
+}
+
+/// Where a listing starts: after `cursor` or after every op of `since`,
+/// whichever is later. `since` is exclusive, as a bare-rev cursor is.
+pub fn start_after(cursor: Option<&str>, since: Option<&str>) -> Option<String> {
+    match (cursor, since) {
+        (Some(cursor), Some(since)) => {
+            let (rev, idx) = parse_cursor(cursor);
+            if (rev, idx) >= (since, i32::MAX) {
+                Some(cursor.to_string())
+            } else {
+                Some(since.to_string())
+            }
+        }
+        (Some(cursor), None) => Some(cursor.to_string()),
+        (None, since) => since.map(str::to_string),
+    }
+}
+
 fn parse_cursor(cursor: &str) -> (&str, i32) {
     match cursor.rsplit_once(':') {
         Some((rev, idx)) => match idx.parse::<i32>() {
@@ -242,6 +278,52 @@ mod tests {
         assert_eq!(
             parse_cursor("3k2rev1:notanint"),
             ("3k2rev1:notanint", i32::MAX)
+        );
+    }
+
+    #[test]
+    fn a_cursor_this_host_issues_is_valid() {
+        assert!(is_valid_cursor(&encode_cursor("3mwcj3b6uak2f", 4)));
+        assert!(is_valid_cursor("3mwcj3b6uak2f"));
+        for bad in [
+            "",
+            "garbage",
+            "3mwcj3b6uak2f:",
+            "3mwcj3b6uak2f:-1",
+            "3mwcj3b6uak2f:x",
+            "3mwcj3b6uak2:1",
+            "zmwcj3b6uak2f:1",
+            "3mwcj3b6uak2f1:1",
+        ] {
+            assert!(!is_valid_cursor(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_listing_starts_after_the_later_of_cursor_and_since() {
+        let early = "3mwcj3b6uak2a";
+        let late = "3mwcj3b6uak2f";
+        assert_eq!(start_after(None, None), None);
+        assert_eq!(start_after(None, Some(late)).as_deref(), Some(late));
+        assert_eq!(
+            start_after(Some(&encode_cursor(early, 1)), None).as_deref(),
+            Some("3mwcj3b6uak2a:1")
+        );
+        // since is past the cursor: start after every op of since.
+        assert_eq!(
+            start_after(Some(&encode_cursor(early, 1)), Some(late)).as_deref(),
+            Some(late)
+        );
+        // the cursor is past since: keep paging from the cursor.
+        assert_eq!(
+            start_after(Some(&encode_cursor(late, 2)), Some(early)).as_deref(),
+            Some("3mwcj3b6uak2f:2")
+        );
+        // a cursor inside since's own rev is not past it: since excludes that
+        // whole rev.
+        assert_eq!(
+            start_after(Some(&encode_cursor(late, 2)), Some(late)).as_deref(),
+            Some(late)
         );
     }
 

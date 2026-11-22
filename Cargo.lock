@@ -1951,6 +1951,7 @@ dependencies = [
  "happyview-provider",
  "happyview-scopes",
  "happyview-source-jetstream",
+ "happyview-star",
  "hex",
  "hickory-resolver",
  "hkdf 0.13.0",

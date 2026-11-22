@@ -1721,6 +1721,26 @@ pub async fn upsert_space_record_with_swap(
     Ok(())
 }
 
+/// One repo's records as `(uri, collection, rkey, cid)`, read on `conn` so a
+/// write transaction sees the records it holds the space's lock over.
+pub async fn list_space_record_keys(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<Vec<(String, String, String, String)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT uri, collection, rkey, cid FROM happyview_space_records WHERE space_id = ? AND author_did = ? ORDER BY collection, rkey",
+        backend,
+    );
+    crate::db::query_as(&sql)
+        .bind(space_id)
+        .bind(author_did)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))
+}
+
 pub async fn delete_space_record(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,

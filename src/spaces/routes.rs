@@ -19,25 +19,33 @@ use crate::tid::generate_tid;
 // Request / response types
 // ---------------------------------------------------------------------------
 
+/// The repo a sync read is about. The lexicons name it `repo`; HappyView's
+/// earliest routes named it `did`, and both are accepted. Which one a request
+/// used decides the response's shape (see [`RepoParam`]).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LatestCommitQuery {
     space: String,
-    did: String,
+    repo: Option<String>,
+    did: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetRepoQuery {
     space: String,
-    did: String,
+    repo: Option<String>,
+    did: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListRepoOpsQuery {
     space: String,
-    did: String,
+    repo: Option<String>,
+    did: Option<String>,
+    /// A rev: list only the ops after it.
+    since: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
     exclude_values: Option<bool>,
@@ -191,7 +199,9 @@ struct ListRecordsQuery {
     limit: Option<i64>,
     cursor: Option<String>,
     reverse: Option<bool>,
+    /// HappyView's own earlier flag; `excludeValues` is the lexicon's.
     include_values: Option<bool>,
+    exclude_values: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -251,7 +261,17 @@ struct CreateRecordInput {
 #[serde(rename_all = "camelCase")]
 struct GetSpaceBlobQuery {
     space: String,
+    /// The repo whose records reference the blob. Optional, as HappyView's
+    /// earlier routes took none; when named, the blob must be that repo's.
+    repo: Option<String>,
     cid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearRecordsInput {
+    space: String,
+    repo: String,
 }
 
 #[derive(Deserialize)]
@@ -407,6 +427,10 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         ),
         (format!("{PROTO_NS}.space.applyWrites"), post(apply_writes)),
         (
+            format!("{PROTO_NS}.space.clearRecords"),
+            post(clear_records),
+        ),
+        (
             format!("{PROTO_NS}.space.registerNotify"),
             post(register_notify),
         ),
@@ -501,6 +525,91 @@ pub fn space_routes() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// How a sync read named its repo.
+///
+/// The lexicons have named it `repo` since the Oct 29 text; HappyView's routes
+/// before that took `did`. A request's choice says which shape it expects
+/// back, so a `did` request keeps getting what it always did: a commit in the
+/// model the repo's state holds, `null` for a repo never written, and a CAR
+/// from `getRepo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoParam {
+    Repo,
+    Did,
+}
+
+/// The repo a sync read names, and how it named it.
+fn named_repo(repo: Option<&str>, did: Option<&str>) -> Result<(String, RepoParam), AppError> {
+    match (repo, did) {
+        (Some(repo), Some(did)) if repo != did => Err(bad_request(
+            "InvalidRequest",
+            "repo and did name different repos; send repo".into(),
+        )),
+        (Some(repo), _) => Ok((repo.to_string(), RepoParam::Repo)),
+        (None, Some(did)) => Ok((did.to_string(), RepoParam::Did)),
+        (None, None) => Err(bad_request(
+            "InvalidRequest",
+            "missing required parameter: repo".into(),
+        )),
+    }
+}
+
+fn bad_request(code: &'static str, message: String) -> AppError {
+    AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        message,
+    }
+}
+
+fn repo_not_found(repo: &str) -> AppError {
+    bad_request(
+        "RepoNotFound",
+        format!("this host holds no repo for {repo} in the space"),
+    )
+}
+
+fn invalid_cursor() -> AppError {
+    bad_request("InvalidCursor", "malformed cursor".into())
+}
+
+/// A repo's commit in the lexicons' shape (`com.atproto.space.defs#commit`),
+/// whichever model its state holds: a repo with a signed commit has the same
+/// `rev` and set hash, and `data` is that hash. `None` for a repo never
+/// written.
+fn lexicon_commit(
+    repo_state: Option<&RepoState>,
+    repo: &str,
+    space: &str,
+) -> Result<Option<crate::spaces::space_mac::Commit>, AppError> {
+    let Some(state) = repo_state else {
+        return Ok(None);
+    };
+    let (Some(hash), Some(rev)) = (state.hash.as_deref(), state.rev.as_ref()) else {
+        return Ok(None);
+    };
+    let data: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
+    Ok(Some(crate::spaces::space_mac::Commit {
+        ver: 1,
+        repo: repo.to_string(),
+        space: space.to_string(),
+        rev: rev.clone(),
+        data,
+    }))
+}
+
+fn lexicon_commit_json(commit: &crate::spaces::space_mac::Commit) -> serde_json::Value {
+    serde_json::json!({
+        "ver": commit.ver,
+        "repo": commit.repo,
+        "space": commit.space,
+        "rev": commit.rev,
+        "data": crate::spaces::commit::encode_lex_bytes(&commit.data),
+    })
+}
 
 /// Both gates on a space read: the member list, then the app's `space:` grant.
 ///
@@ -1051,6 +1160,117 @@ async fn apply_writes(
     })))
 }
 
+/// `clearRecords`: delete every record in the caller's own repo in a space, in
+/// one commit. In the space's own repo, the records published from its
+/// configuration stay, as the lexicon says.
+async fn clear_records(
+    State(state): State<AppState>,
+    xrpc_claims: XrpcClaims,
+    Json(input): Json<ClearRecordsInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let did = require_auth_or_credential(&state, &xrpc_claims).await?;
+    if input.repo != did {
+        return Err(AppError::Forbidden(
+            "repo must be the authenticated account".into(),
+        ));
+    }
+    let space = service::resolve_space(&state, &input.space).await?;
+    service::require_membership(
+        &state,
+        &space,
+        &did,
+        true,
+        xrpc_claims.space_credential.as_deref(),
+    )
+    .await?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = service::forward_write_if_native(
+        &state,
+        &space,
+        &did,
+        "com.atproto.space.clearRecords",
+        serde_json::json!({ "space": space_uri, "repo": did }),
+    )
+    .await?
+    {
+        return Ok(Json(forwarded));
+    }
+
+    let keep: &[&str] = if did == space.did {
+        &[
+            crate::spaces::publish::POLICY_COLLECTION,
+            crate::spaces::publish::MEMBER_COLLECTION,
+        ]
+    } else {
+        &[]
+    };
+
+    let signing_key = service::service_signing_key(&state).await?;
+    let mut tx = service::begin_space_write(&state, &space.id).await?;
+    let records: Vec<_> = db::list_space_record_keys(&mut tx, state.db_backend, &space.id, &did)
+        .await?
+        .into_iter()
+        .filter(|(_, collection, _, _)| !keep.contains(&collection.as_str()))
+        .collect();
+
+    // Every collection held must be covered, as a delete of each record
+    // would need.
+    if let Some(identity) = xrpc_claims.identity.as_ref() {
+        let mut collections: Vec<&str> = records.iter().map(|r| r.1.as_str()).collect();
+        collections.dedup();
+        for collection in collections {
+            crate::spaces::scope::require_space_scope(
+                &state,
+                identity,
+                &space,
+                happyview_scopes::SpaceTarget::Write {
+                    action: happyview_scopes::SpaceAction::Delete,
+                    collection,
+                },
+            )
+            .await?;
+        }
+    }
+
+    if records.is_empty() {
+        return Ok(Json(serde_json::json!({})));
+    }
+
+    let mut ops = Vec::with_capacity(records.len());
+    for (uri, collection, rkey, cid) in records {
+        db::delete_space_record(&mut *tx, state.db_backend, &uri).await?;
+        ops.push(service::AppliedOp {
+            action: OplogAction::Delete,
+            collection,
+            rkey,
+            new_cid: None,
+            old_cid: Some(cid),
+        });
+    }
+    let rev = generate_tid();
+    let committed = service::commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        &did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    service::notify_ops(&state, &space, &did, &ops, &rev, committed).await;
+
+    Ok(Json(serde_json::json!({})))
+}
+
 async fn get_record(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
@@ -1110,6 +1330,13 @@ async fn list_records(
     xrpc_claims: XrpcClaims,
     Query(query): Query<ListRecordsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // A cursor this host could not have issued would otherwise read as none,
+    // and the listing would silently start over.
+    if let Some(cursor) = query.cursor.as_deref()
+        && crate::db::decode_cursor(cursor).is_none()
+    {
+        return Err(invalid_cursor());
+    }
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
     let space = service::resolve_space(&state, &query.space).await?;
     let has_credential = xrpc_claims.space_credential.is_some();
@@ -1162,7 +1389,11 @@ async fn list_records(
     )
     .await?;
 
-    let include_values = query.include_values.unwrap_or(false);
+    // Values are inlined unless the caller opts out, as the lexicons have it
+    // (`excludeValues`). HappyView's earlier `includeValues=false` still opts
+    // out; a caller that sent neither now gets values it can ignore.
+    let include_values =
+        !(query.exclude_values == Some(true) || query.include_values == Some(false));
     let records_json: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
@@ -1408,6 +1639,7 @@ async fn get_latest_commit(
     claims: XrpcClaims,
     Query(params): Query<LatestCommitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let (repo, named) = named_repo(params.repo.as_deref(), params.did.as_deref())?;
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
@@ -1424,7 +1656,7 @@ async fn get_latest_commit(
         &state,
         &claims,
         &did,
-        &params.did,
+        &repo,
         &space,
         membership,
         has_credential,
@@ -1437,9 +1669,18 @@ async fn get_latest_commit(
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
     // An author who has never written here has no state, so no rev and no
-    // commit: what an unwritten state would hold.
-    let repo_state =
-        db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    // commit: what an unwritten state would hold. The lexicons call that
+    // RepoNotFound, since their commit is required.
+    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
+    if named == RepoParam::Repo {
+        let commit = lexicon_commit(repo_state.as_ref(), &repo, &params.space)?
+            .ok_or_else(|| repo_not_found(&repo))?;
+        return Ok(Json(serde_json::json!({
+            "commit": lexicon_commit_json(&commit),
+            // HappyView's earlier field, the same as commit.rev.
+            "rev": commit.rev,
+        })));
+    }
     let commit = match &repo_state {
         Some(repo_state) => repo_state_commit_json(repo_state, &params.space)?,
         None => None,
@@ -1456,6 +1697,7 @@ async fn get_repo(
     claims: XrpcClaims,
     Query(params): Query<GetRepoQuery>,
 ) -> Result<Response, AppError> {
+    let (repo, named) = named_repo(params.repo.as_deref(), params.did.as_deref())?;
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
@@ -1472,7 +1714,7 @@ async fn get_repo(
         &state,
         &claims,
         &did,
-        &params.did,
+        &repo,
         &space,
         membership,
         has_credential,
@@ -1484,13 +1726,32 @@ async fn get_repo(
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    if named == RepoParam::Repo {
+        // The lexicons' archive: STAR, with the commit as its metadata.
+        let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
+        drop(conn);
+        let commit = lexicon_commit(repo_state.as_ref(), &repo, &params.space)?
+            .ok_or_else(|| repo_not_found(&repo))?;
+        let records =
+            db::list_all_space_records(&state.db, state.db_backend, &space.id, &repo).await?;
+        let star = crate::spaces::star_repo::serialize_repo(&commit, &records)?;
+        return Ok((
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                crate::spaces::star_repo::MEDIA_TYPE,
+            )],
+            star,
+        )
+            .into_response());
+    }
+
     let no_commit = || AppError::NotFound("no commit exists for this repo".into());
-    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did)
+    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo)
         .await?
         .ok_or_else(no_commit)?;
     drop(conn);
-    let records =
-        db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
+    let records = db::list_all_space_records(&state.db, state.db_backend, &space.id, &repo).await?;
 
     let hash = repo_state.hash.as_deref().ok_or_else(no_commit)?;
     let hash: [u8; 32] = hash
@@ -1512,7 +1773,7 @@ async fn get_repo(
         if repo_state.ikm.is_none() && repo_state.sig.is_none() && repo_state.mac.is_none() {
             let commit = crate::spaces::space_mac::Commit {
                 ver: 1,
-                repo: params.did.clone(),
+                repo: repo.clone(),
                 space: params.space.clone(),
                 rev,
                 data: hash,
@@ -1545,6 +1806,24 @@ async fn list_repo_ops(
     claims: XrpcClaims,
     Query(params): Query<ListRepoOpsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let (repo, named) = named_repo(params.repo.as_deref(), params.did.as_deref())?;
+    if let Some(since) = params.since.as_deref()
+        && !oplog::is_tid(since)
+    {
+        return Err(bad_request(
+            "InvalidRequest",
+            "since must be a rev (TID)".into(),
+        ));
+    }
+    // A `did` request reads any cursor as it always has; the lexicons' shape
+    // refuses one this host could not have issued.
+    if named == RepoParam::Repo
+        && let Some(cursor) = params.cursor.as_deref()
+        && !oplog::is_valid_cursor(cursor)
+    {
+        return Err(invalid_cursor());
+    }
+
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
@@ -1561,7 +1840,7 @@ async fn list_repo_ops(
         &state,
         &claims,
         &did,
-        &params.did,
+        &repo,
         &space,
         membership,
         has_credential,
@@ -1570,14 +1849,15 @@ async fn list_repo_ops(
 
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let exclude_values = params.exclude_values.unwrap_or(false);
+    let start = oplog::start_after(params.cursor.as_deref(), params.since.as_deref());
 
     let (ops, cursor) = if exclude_values {
         oplog::list_ops(
             &state.db,
             state.db_backend,
             &space.id,
-            &params.did,
-            params.cursor.as_deref(),
+            &repo,
+            start.as_deref(),
             limit,
         )
         .await?
@@ -1586,23 +1866,32 @@ async fn list_repo_ops(
             &state.db,
             state.db_backend,
             &space.id,
-            &params.did,
-            params.cursor.as_deref(),
+            &repo,
+            start.as_deref(),
             limit,
         )
         .await?
     };
 
+    // Read after the ops, as before: the commit is at least as new as them.
     let mut conn = state
         .db
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
-    let commit =
-        match db::read_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await? {
-            Some(repo_state) => repo_state_commit_json(&repo_state, &params.space)?,
+    let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
+    drop(conn);
+    let commit = match named {
+        // The lexicons require the commit, so a repo never written is not found.
+        RepoParam::Repo => Some(lexicon_commit_json(
+            &lexicon_commit(repo_state.as_ref(), &repo, &params.space)?
+                .ok_or_else(|| repo_not_found(&repo))?,
+        )),
+        RepoParam::Did => match &repo_state {
+            Some(repo_state) => repo_state_commit_json(repo_state, &params.space)?,
             None => None,
-        };
+        },
+    };
 
     Ok(Json(serde_json::json!({
         "ops": ops,
@@ -1696,9 +1985,25 @@ async fn get_space_blob(
     )
     .await?;
 
-    let author_did = db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
+    let author_did = match params.repo.as_deref() {
+        // The lexicons name the repo: the blob must be one its records
+        // reference.
+        Some(repo) => {
+            let authors =
+                db::find_blob_authors(&state.db, state.db_backend, &space.id, &params.cid).await?;
+            if !authors.iter().any(|a| a == repo) {
+                return Err(AppError::XrpcError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "BlobNotFound",
+                    message: "no record in this repo references the blob".into(),
+                });
+            }
+            repo.to_string()
+        }
+        None => db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?,
+    };
 
     authorize_space_read(
         &state,
