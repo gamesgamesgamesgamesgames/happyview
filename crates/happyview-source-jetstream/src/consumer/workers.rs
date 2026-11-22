@@ -12,6 +12,11 @@
 //! An event that failed only because the infrastructure is unavailable is
 //! retried until it applies: its ticket stays open, the watermark holds, and
 //! the full queue backpressures the reader until the outage ends.
+//!
+//! The pool is generic over the event (`E`, which only has to name its DID:
+//! [`StreamEvent`]) and the watermark's position (`P`), so another consumer
+//! can reuse it. Jetstream's are [`Event`] and [`CursorPoint`], the
+//! defaults.
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -25,8 +30,20 @@ use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::event::Event;
+use super::event::{CursorPoint, Event};
 use super::watermark::WatermarkHandle;
+
+/// An event a [`WorkerPool`] can order: it names the DID whose worker owns
+/// it.
+pub trait StreamEvent: Clone + Send + 'static {
+    fn did(&self) -> &str;
+}
+
+impl StreamEvent for Event {
+    fn did(&self) -> &str {
+        &self.did
+    }
+}
 
 /// What applying one event came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,12 +57,12 @@ pub enum ApplyOutcome {
 }
 
 /// What a worker does with each event.
-pub(crate) type ApplyFn = Arc<dyn Fn(Event) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
+pub type ApplyFn<E = Event> = Arc<dyn Fn(E) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
 
 /// Called once for an event that still failed after every retry, with the
 /// last error. It runs inline before the event's ticket completes, so it
 /// must not hang: a hang stops that worker and the watermark for good.
-pub(crate) type GiveUpFn = Arc<dyn Fn(Event, String) -> BoxFuture<'static, ()> + Send + Sync>;
+pub type GiveUpFn<E = Event> = Arc<dyn Fn(E, String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The longest wait between retries of an `Unavailable` event.
 pub(crate) const MAX_UNAVAILABLE_DELAY: Duration = Duration::from_secs(30);
@@ -82,22 +99,24 @@ impl Default for RetryPolicy {
     }
 }
 
-pub struct Job {
+pub struct Job<E = Event> {
     pub ticket: u64,
-    pub event: Event,
+    pub event: E,
 }
 
-pub struct WorkerPool {
-    senders: Vec<mpsc::Sender<Job>>,
+pub struct WorkerPool<E = Event, P = CursorPoint> {
+    senders: Vec<mpsc::Sender<Job<E>>>,
     depths: Arc<Vec<AtomicUsize>>,
     busy_since: Arc<Vec<AtomicI64>>,
-    watermark: Arc<WatermarkHandle>,
+    watermark: Arc<WatermarkHandle<P>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Names the stream in the pool's logs.
+    source: &'static str,
 }
 
 /// Dropping the pool stops its workers, so a stopped consumer leaves nothing
 /// writing in the background. An apply cut off mid-transaction rolls back.
-impl Drop for WorkerPool {
+impl<E, P> Drop for WorkerPool<E, P> {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
@@ -114,20 +133,42 @@ impl Drop for WorkerPool {
 }
 
 /// The worker that owns `did`'s events.
-pub(crate) fn worker_for(did: &str, workers: usize) -> usize {
+pub fn worker_for(did: &str, workers: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     did.hash(&mut hasher);
     (hasher.finish() % workers.max(1) as u64) as usize
 }
 
-impl WorkerPool {
+impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
+    /// A pool for Jetstream's events (its logs say `source = "jetstream"`).
     pub fn spawn(
         workers: usize,
         capacity: usize,
-        apply: ApplyFn,
-        watermark: Arc<WatermarkHandle>,
+        apply: ApplyFn<E>,
+        watermark: Arc<WatermarkHandle<P>>,
         retry: RetryPolicy,
-        on_give_up: GiveUpFn,
+        on_give_up: GiveUpFn<E>,
+    ) -> Self {
+        Self::spawn_for(
+            "jetstream",
+            workers,
+            capacity,
+            apply,
+            watermark,
+            retry,
+            on_give_up,
+        )
+    }
+
+    /// [`WorkerPool::spawn`], naming the stream `source` in the logs.
+    pub fn spawn_for(
+        source: &'static str,
+        workers: usize,
+        capacity: usize,
+        apply: ApplyFn<E>,
+        watermark: Arc<WatermarkHandle<P>>,
+        retry: RetryPolicy,
+        on_give_up: GiveUpFn<E>,
     ) -> Self {
         let workers = workers.max(1);
         let depths: Arc<Vec<AtomicUsize>> =
@@ -138,6 +179,7 @@ impl WorkerPool {
             .map(|index| {
                 let (tx, rx) = mpsc::channel(capacity.max(1));
                 let task = tokio::spawn(run_worker(Worker {
+                    source,
                     index,
                     rx,
                     apply: Arc::clone(&apply),
@@ -156,12 +198,13 @@ impl WorkerPool {
             busy_since,
             watermark,
             tasks,
+            source,
         }
     }
 
     /// Queue `job` on its DID's worker, waiting while that queue is full.
-    pub async fn dispatch(&self, job: Job) {
-        let index = worker_for(&job.event.did, self.senders.len());
+    pub async fn dispatch(&self, job: Job<E>) {
+        let index = worker_for(job.event.did(), self.senders.len());
         self.depths[index].fetch_add(1, Ordering::Relaxed);
         if let Err(mpsc::error::SendError(job)) = self.senders[index].send(job).await {
             self.depths[index].fetch_sub(1, Ordering::Relaxed);
@@ -169,9 +212,10 @@ impl WorkerPool {
             // than hold the watermark back for good.
             self.watermark.complete(job.ticket);
             tracing::error!(
+                source = self.source,
                 worker = index,
-                did = %job.event.did,
-                "a jetstream worker has stopped; dropping an event it was sent"
+                did = %job.event.did(),
+                "a stream worker has stopped; dropping an event it was sent"
             );
         }
     }
@@ -214,18 +258,19 @@ pub(crate) fn busy_since_values(busy_since: &[AtomicI64]) -> Vec<Option<i64>> {
         .collect()
 }
 
-struct Worker {
+struct Worker<E, P> {
+    source: &'static str,
     index: usize,
-    rx: mpsc::Receiver<Job>,
-    apply: ApplyFn,
-    watermark: Arc<WatermarkHandle>,
+    rx: mpsc::Receiver<Job<E>>,
+    apply: ApplyFn<E>,
+    watermark: Arc<WatermarkHandle<P>>,
     depths: Arc<Vec<AtomicUsize>>,
     busy_since: Arc<Vec<AtomicI64>>,
     retry: RetryPolicy,
-    on_give_up: GiveUpFn,
+    on_give_up: GiveUpFn<E>,
 }
 
-async fn run_worker(mut worker: Worker) {
+async fn run_worker<E: StreamEvent, P: Copy>(mut worker: Worker<E, P>) {
     while let Some(Job { ticket, event }) = worker.rx.recv().await {
         worker.depths[worker.index].fetch_sub(1, Ordering::Relaxed);
         worker.busy_since[worker.index]
@@ -241,7 +286,7 @@ async fn run_worker(mut worker: Worker) {
 /// are retried until the event applies. A panic counts as a failure: it must
 /// not kill the worker, or its tickets would never complete and the saved
 /// cursor would stop for good.
-async fn apply_with_retries(worker: &Worker, event: Event) {
+async fn apply_with_retries<E: StreamEvent, P>(worker: &Worker<E, P>, event: E) {
     let mut delays = worker.retry.delays.iter();
     let mut unavailable_retries = 0;
     let error = loop {
@@ -252,10 +297,11 @@ async fn apply_with_retries(worker: &Worker, event: Event) {
             Ok(ApplyOutcome::Applied) => {
                 if unavailable_retries > 0 {
                     tracing::info!(
+                        source = worker.source,
                         worker = worker.index,
-                        did = %event.did,
+                        did = %event.did(),
                         unavailable_retries,
-                        "applied a jetstream event once it became available"
+                        "applied a stream event once it became available"
                     );
                 }
                 return;
@@ -264,12 +310,13 @@ async fn apply_with_retries(worker: &Worker, event: Event) {
                 let delay = worker.retry.unavailable_delay(unavailable_retries);
                 if unavailable_retries % 10 == 0 {
                     tracing::warn!(
+                        source = worker.source,
                         worker = worker.index,
-                        did = %event.did,
+                        did = %event.did(),
                         %error,
                         unavailable_retries,
                         retry_in_ms = delay.as_millis() as u64,
-                        "a jetstream event cannot be applied while unavailable; retrying until it can"
+                        "a stream event cannot be applied while unavailable; retrying until it can"
                     );
                 }
                 unavailable_retries += 1;
@@ -283,19 +330,21 @@ async fn apply_with_retries(worker: &Worker, event: Event) {
             break error;
         };
         tracing::warn!(
+            source = worker.source,
             worker = worker.index,
-            did = %event.did,
+            did = %event.did(),
             %error,
             retry_in_ms = delay.as_millis() as u64,
-            "applying a jetstream event failed; retrying"
+            "applying a stream event failed; retrying"
         );
         tokio::time::sleep(*delay).await;
     };
     tracing::error!(
+        source = worker.source,
         worker = worker.index,
-        did = %event.did,
+        did = %event.did(),
         %error,
-        "applying a jetstream event kept failing; giving up on it"
+        "applying a stream event kept failing; giving up on it"
     );
     if AssertUnwindSafe((worker.on_give_up)(event, error))
         .catch_unwind()
@@ -303,8 +352,9 @@ async fn apply_with_retries(worker: &Worker, event: Event) {
         .is_err()
     {
         tracing::error!(
+            source = worker.source,
             worker = worker.index,
-            "giving up on a jetstream event panicked"
+            "giving up on a stream event panicked"
         );
     }
 }
@@ -806,6 +856,7 @@ mod tests {
             busy_since: Arc::new(vec![AtomicI64::new(IDLE)]),
             watermark: Arc::clone(&watermark),
             tasks: Vec::new(),
+            source: "jetstream",
         };
         send(&pool, &watermark, event("did:plc:same", 1)).await;
         assert_eq!(watermark.in_flight(), 0);
@@ -899,5 +950,67 @@ mod tests {
         drop(pool);
         assert_eq!(busy_since_values(&busy), vec![None]);
         assert_eq!(depths[0].load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+
+    /// Another consumer's event and position: the pool orders by DID and
+    /// moves the watermark over them just as it does Jetstream's.
+    #[derive(Clone)]
+    struct Other {
+        did: String,
+        seq: u64,
+    }
+
+    impl StreamEvent for Other {
+        fn did(&self) -> &str {
+            &self.did
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pool_runs_any_stream_event() {
+        let watermark: Arc<WatermarkHandle<u64>> = Arc::new(WatermarkHandle::new());
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let apply: ApplyFn<Other> = {
+            let applied = Arc::clone(&applied);
+            Arc::new(move |event: Other| {
+                let applied = Arc::clone(&applied);
+                async move {
+                    applied.lock().unwrap().push(event.seq);
+                    ApplyOutcome::Applied
+                }
+                .boxed()
+            })
+        };
+        let give_up: GiveUpFn<Other> = Arc::new(|_, _| async {}.boxed());
+        let pool = WorkerPool::spawn_for(
+            "test",
+            4,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            RetryPolicy::default(),
+            give_up,
+        );
+        for seq in 1..=20 {
+            let ticket = watermark.begin(seq);
+            pool.dispatch(Job {
+                ticket,
+                event: Other {
+                    did: format!("did:plc:{}", seq % 3),
+                    seq,
+                },
+            })
+            .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("idle");
+        assert_eq!(watermark.applied(), Some(20));
+        assert_eq!(applied.lock().unwrap().len(), 20);
     }
 }

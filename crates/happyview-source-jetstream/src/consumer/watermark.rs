@@ -6,6 +6,9 @@
 //! worker has finished. Saving the read position would let a crash skip the
 //! unfinished ones. This hands out tickets in read order and only advances
 //! over a contiguous run of finished tickets.
+//!
+//! It is generic over the stream's position type, `P`, so any consumer that
+//! dispatches events to workers can use it; Jetstream's is [`CursorPoint`].
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
@@ -14,18 +17,28 @@ use tokio::sync::Notify;
 
 use super::event::CursorPoint;
 
-#[derive(Debug, Default)]
-pub(crate) struct Watermark {
+#[derive(Debug)]
+pub(crate) struct Watermark<P = CursorPoint> {
     /// The ticket of `pending[0]`.
     front: u64,
     /// Every ticket from `front` on, in read order, and whether it finished.
-    pending: VecDeque<(CursorPoint, bool)>,
-    applied: Option<CursorPoint>,
+    pending: VecDeque<(P, bool)>,
+    applied: Option<P>,
 }
 
-impl Watermark {
+impl<P> Default for Watermark<P> {
+    fn default() -> Self {
+        Self {
+            front: 0,
+            pending: VecDeque::new(),
+            applied: None,
+        }
+    }
+}
+
+impl<P: Copy> Watermark<P> {
     /// Track an event about to be dispatched; returns its ticket.
-    pub fn begin(&mut self, point: CursorPoint) -> u64 {
+    pub fn begin(&mut self, point: P) -> u64 {
         let ticket = self.front + self.pending.len() as u64;
         self.pending.push_back((point, false));
         ticket
@@ -48,7 +61,7 @@ impl Watermark {
         }
     }
 
-    pub fn applied(&self) -> Option<CursorPoint> {
+    pub fn applied(&self) -> Option<P> {
         self.applied
     }
 
@@ -69,22 +82,30 @@ impl Watermark {
 }
 
 /// A `Watermark` shared between the reader and the workers.
-#[derive(Default)]
-pub struct WatermarkHandle {
-    inner: Mutex<Watermark>,
+pub struct WatermarkHandle<P = CursorPoint> {
+    inner: Mutex<Watermark<P>>,
     idle: Notify,
 }
 
-impl WatermarkHandle {
+impl<P> Default for WatermarkHandle<P> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Watermark::default()),
+            idle: Notify::new(),
+        }
+    }
+}
+
+impl<P: Copy> WatermarkHandle<P> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, Watermark> {
+    fn lock(&self) -> MutexGuard<'_, Watermark<P>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn begin(&self, point: CursorPoint) -> u64 {
+    pub fn begin(&self, point: P) -> u64 {
         self.lock().begin(point)
     }
 
@@ -99,7 +120,7 @@ impl WatermarkHandle {
         }
     }
 
-    pub fn applied(&self) -> Option<CursorPoint> {
+    pub fn applied(&self) -> Option<P> {
         self.lock().applied()
     }
 
@@ -113,7 +134,7 @@ impl WatermarkHandle {
 
     /// `applied`, if `ticket` has retired; read together, so a ticket
     /// retiring in between cannot pair an old point with a passed check.
-    pub fn applied_if_retired(&self, ticket: u64) -> Option<CursorPoint> {
+    pub fn applied_if_retired(&self, ticket: u64) -> Option<P> {
         let watermark = self.lock();
         watermark
             .has_retired(ticket)
@@ -152,7 +173,7 @@ mod tests {
 
     #[test]
     fn a_ticket_retires_once_everything_up_to_it_is_applied() {
-        let mut w = Watermark::default();
+        let mut w: Watermark = Watermark::default();
         let old = w.begin(p(12));
         let barrier = w.next_ticket();
         let new = w.begin(p(1));
@@ -167,7 +188,7 @@ mod tests {
 
     #[test]
     fn the_applied_point_is_withheld_until_the_ticket_retires() {
-        let w = WatermarkHandle::new();
+        let w: WatermarkHandle = WatermarkHandle::new();
         assert_eq!(w.applied_if_retired(0), None, "nothing applied yet");
         let old = w.begin(p(12));
         let barrier = w.next_ticket();
@@ -185,7 +206,7 @@ mod tests {
 
     #[test]
     fn the_watermark_waits_for_the_oldest_unfinished_event() {
-        let mut w = Watermark::default();
+        let mut w: Watermark = Watermark::default();
         let t: Vec<u64> = (1..=5).map(|s| w.begin(p(s))).collect();
         w.complete(t[1]);
         w.complete(t[2]);
@@ -206,7 +227,7 @@ mod tests {
 
     #[test]
     fn stale_and_unknown_tickets_are_ignored() {
-        let mut w = Watermark::default();
+        let mut w: Watermark = Watermark::default();
         let t = w.begin(p(1));
         w.complete(t);
         w.complete(t);
@@ -219,7 +240,7 @@ mod tests {
     /// event before the first unfinished one: never past it.
     #[test]
     fn the_watermark_never_passes_an_unfinished_event() {
-        let mut w = Watermark::default();
+        let mut w: Watermark = Watermark::default();
         let tickets: Vec<u64> = (1..=200).map(|s| w.begin(p(s))).collect();
         let mut order: Vec<usize> = (0..200).collect();
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
@@ -244,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_idle_returns_once_everything_completes() {
-        let handle = Arc::new(WatermarkHandle::new());
+        let handle: Arc<WatermarkHandle> = Arc::new(WatermarkHandle::new());
         handle.wait_idle().await;
         let ticket = handle.begin(p(1));
         let waiter = {
@@ -258,5 +279,22 @@ mod tests {
             .await
             .expect("idle")
             .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+
+    /// Any copyable position works, as another consumer's would.
+    #[test]
+    fn the_watermark_tracks_any_position_type() {
+        let w: WatermarkHandle<(u64, i64)> = WatermarkHandle::new();
+        let a = w.begin((1, 10));
+        let b = w.begin((2, 20));
+        w.complete(b);
+        assert_eq!(w.applied(), None);
+        w.complete(a);
+        assert_eq!(w.applied(), Some((2, 20)));
     }
 }
