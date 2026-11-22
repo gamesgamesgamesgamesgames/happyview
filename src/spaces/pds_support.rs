@@ -80,8 +80,10 @@ pub enum Generation {
     /// The Oct 29 text: `space.*Space`, singular `memberspace.putMember`,
     /// `managedspace.checkUserAccess`, `notifyWrite`, `listRepos`.
     G1,
-    /// The Nov 12 text (proposals #143): `memberspace.putMembers`,
-    /// `managedspace.checkAccess`, `notifyRepoUpdate`, `listWriters`.
+    /// The Nov 12 text: `memberspace.putMembers`, `managedspace.checkAccess`,
+    /// `listWriters`, and, as merged (proposals 2755e73a),
+    /// `authorizeSpaceSync` and `notifySpaceUpdate`. Hosts built against the
+    /// text before it merged (`notifySpaceStatus`, ZDS 0.9.0) count too.
     G2,
 }
 
@@ -113,6 +115,9 @@ impl Generation {
                 "com.atproto.space.listWriters",
                 "com.atproto.space.notifyRepoUpdate",
                 "com.atproto.space.notifySpaceStatus",
+                "com.atproto.space.authorizeSpaceSync",
+                "com.atproto.space.notifySpaceUpdate",
+                "com.atproto.space.confirmRegistration",
             ],
             Self::G1 => &[
                 "com.atproto.space.createSpace",
@@ -560,6 +565,34 @@ mod tests {
             "com.atproto.space.listRepoOps",
             "com.atproto.space.listWriters",
             "com.atproto.space.notifyRepoUpdate",
+        ];
+        Mock::given(method("GET"))
+            .and(path(format!("/xrpc/{DESCRIBE_NSID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(descriptor(&methods)))
+            .mount(&server)
+            .await;
+
+        let got = probe(&reqwest::Client::new(), &server.uri()).await;
+        assert!(got.supported, "missing: {:?}", got.missing);
+        assert_eq!(got.generation, Some(Generation::G2));
+    }
+
+    /// A host on the merged Nov 12 text, recognised by `authorizeSpaceSync`
+    /// even when it lists none of the methods named before the text merged.
+    #[tokio::test]
+    async fn a_host_on_the_merged_november_12_text_is_g2() {
+        let server = MockServer::start().await;
+        let methods = [
+            "com.atproto.memberspace.putMember",
+            "com.atproto.space.applyWrites",
+            "com.atproto.space.authorizeSpaceSync",
+            "com.atproto.space.createRecord",
+            "com.atproto.space.createSpace",
+            "com.atproto.space.getDelegationToken",
+            "com.atproto.space.getLatestCommit",
+            "com.atproto.space.getSpace",
+            "com.atproto.space.listRecords",
+            "com.atproto.space.listRepoOps",
         ];
         Mock::given(method("GET"))
             .and(path(format!("/xrpc/{DESCRIBE_NSID}")))
