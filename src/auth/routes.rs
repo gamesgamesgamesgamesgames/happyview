@@ -812,6 +812,10 @@ mod space_scope_gate_tests {
         assert!(is_space_scope(&Scope::Unknown(
             "space:com.example.forum?action=read".into()
         )));
+        // The named form, by the Nov 12 parameter name.
+        assert!(is_space_scope(&Scope::Unknown(
+            "space?spaceType=com.example.forum&authority=*".into()
+        )));
         // `spaces:` is HappyView's internal admin permission prefix, not an
         // OAuth scope.
         assert!(!is_space_scope(&Scope::Unknown("spaces:manage".into())));

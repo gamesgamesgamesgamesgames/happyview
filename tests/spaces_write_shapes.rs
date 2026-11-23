@@ -488,6 +488,10 @@ async fn the_earlier_shape_keeps_its_answers() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.is_null(),
+        "the extractor's plain-text refusal, as before: {body}"
+    );
 
     // Record keys are read as they were: no record-key check on this shape.
     let (status, body) = post(
@@ -505,15 +509,23 @@ async fn the_earlier_shape_keeps_its_answers() {
 async fn the_lexicons_writes_take_no_swap_and_build_on_each_other() {
     common::require_db!();
     let (app, space, author) = setup("swapless").await;
-    let (status, body) = post(
-        &app,
-        &author,
-        "applyWrites",
-        json!({ "space": space, "writes": [{ "$type": DELETE, "collection": COLLECTION, "rkey": "a", "swapRecord": "bafyreihje4zjrs24gnxiciokziubf2bcsnwivwl5k3lhbvhyrhjuh7vcgi" }] }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "InvalidRequest", "{body}");
+    // The lexicons' writes take no swapRecord, so one sent is ignored, and a
+    // missing record is RecordNotFound as without it.
+    let swap = "bafyreihje4zjrs24gnxiciokziubf2bcsnwivwl5k3lhbvhyrhjuh7vcgi";
+    for write in [
+        json!({ "$type": DELETE, "collection": COLLECTION, "rkey": "a", "swapRecord": swap }),
+        json!({ "$type": UPDATE, "collection": COLLECTION, "rkey": "a", "value": record("x"), "swapRecord": swap }),
+    ] {
+        let (status, body) = post(
+            &app,
+            &author,
+            "applyWrites",
+            json!({ "space": space, "writes": [write] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "RecordNotFound", "{body}");
+    }
 
     // A create, then an update of the same key, in one batch.
     let (status, body) = post(
@@ -558,4 +570,24 @@ async fn an_oversized_batch_is_refused_whatever_it_holds() {
             .contains("too many writes"),
         "the cap is checked first: {body}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_oversized_batch_is_refused_before_the_space_is_looked_up() {
+    common::require_db!();
+    let (app, _space, author) = setup("capearly").await;
+    let writes: Vec<Value> = (0..201)
+        .map(|i| json!({ "action": "create", "collection": COLLECTION, "rkey": format!("k{i}"), "value": record("x") }))
+        .collect();
+    let missing = format!("at://did:plc:nobody/space/{TYPE_NSID}/none");
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": missing, "writes": writes }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "InvalidRequest", "{body}");
 }

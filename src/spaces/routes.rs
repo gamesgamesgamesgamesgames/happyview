@@ -271,6 +271,70 @@ struct ApplyWritesInput {
     writes: Vec<serde_json::Value>,
 }
 
+/// `applyWrites`'s body in HappyView's earlier shape, read as it always was.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionApplyWritesInput {
+    space: String,
+    swap_commit: Option<String>,
+    writes: Vec<WriteOp>,
+}
+
+/// An `applyWrites` batch, read in the shape its writes are tagged in.
+struct ApplyWritesBatch {
+    space: String,
+    repo: Option<String>,
+    swap_commit: Option<String>,
+    writes: Vec<WriteOp>,
+    shape: WritesShape,
+}
+
+/// Whether a write is tagged by the lexicons' `$type` union.
+fn is_lexicon_write(write: &serde_json::Value) -> bool {
+    write
+        .get("$type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.starts_with(LEXICON_WRITE_PREFIX))
+}
+
+/// Read an `applyWrites` body. A batch none of whose writes names a lexicon
+/// write type is HappyView's earlier shape, and is read exactly as before:
+/// through axum's JSON extractor, so its refusals are the ones it always gave.
+/// Otherwise every write must be the lexicons'. The `Ok(Err(_))` case is the
+/// earlier shape's own refusal, answered as it is.
+fn read_apply_writes(
+    body: serde_json::Value,
+) -> Result<Result<ApplyWritesBatch, Response>, AppError> {
+    let invalid = |message: String| bad_request("InvalidRequest", message);
+    let writes = body.get("writes").and_then(|w| w.as_array());
+    if writes.is_some_and(|w| w.len() > MAX_WRITES) {
+        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
+    }
+    if !writes.is_some_and(|w| w.iter().any(is_lexicon_write)) {
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|e| AppError::Internal(format!("failed to re-encode a body: {e}")))?;
+        return Ok(match Json::<ActionApplyWritesInput>::from_bytes(&bytes) {
+            Ok(Json(input)) => Ok(ApplyWritesBatch {
+                space: input.space,
+                repo: None,
+                swap_commit: input.swap_commit,
+                writes: input.writes,
+                shape: WritesShape::Action,
+            }),
+            Err(rejection) => Err(rejection.into_response()),
+        });
+    }
+    let input: ApplyWritesInput =
+        serde_json::from_value(body).map_err(|e| invalid(format!("invalid applyWrites: {e}")))?;
+    Ok(Ok(ApplyWritesBatch {
+        space: input.space,
+        repo: input.repo,
+        swap_commit: input.swap_commit,
+        writes: parse_writes(input.writes)?,
+        shape: WritesShape::Lexicon,
+    }))
+}
+
 /// How an `applyWrites` request tags its writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WritesShape {
@@ -288,61 +352,39 @@ const LEXICON_WRITE_PREFIX: &str = "com.atproto.space.applyWrites#";
 /// The most writes one `applyWrites` takes, in either shape, as the reference.
 const MAX_WRITES: usize = 200;
 
-/// Read a batch's writes, in either shape. A batch is one shape throughout.
-///
-/// A write is in the lexicons' shape when its `$type` names one of
-/// `com.atproto.space.applyWrites`'s write types; any other write is read as
-/// HappyView's earlier `action`-tagged shape, as before (a stray `$type` there
-/// is ignored). The earlier shape's malformed writes stay a 422.
-fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesShape), AppError> {
+/// Read a lexicon-shaped batch's writes: each tagged by `$type` as one of
+/// `com.atproto.space.applyWrites`'s write types. The lexicons' writes take
+/// no `swapRecord`, so one sent is ignored.
+fn parse_writes(writes: Vec<serde_json::Value>) -> Result<Vec<WriteOp>, AppError> {
     let invalid = |message: String| bad_request("InvalidRequest", message);
-    if writes.len() > MAX_WRITES {
-        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
-    }
-    let mut shape = None;
     let mut ops = Vec::with_capacity(writes.len());
     for (i, mut write) in writes.into_iter().enumerate() {
-        let lexicon_type = write
-            .get("$type")
-            .and_then(|t| t.as_str())
-            .and_then(|t| t.strip_prefix(LEXICON_WRITE_PREFIX))
-            .map(str::to_string);
-        let this = match lexicon_type {
-            Some(action) => {
-                if !matches!(action.as_str(), "create" | "update" | "delete") {
-                    return Err(invalid(format!(
-                        "writes[{i}]: unknown write type {LEXICON_WRITE_PREFIX}{action}"
-                    )));
-                }
-                if write.get("swapRecord").is_some() {
-                    return Err(invalid(format!(
-                        "writes[{i}]: the lexicons' writes take no swapRecord"
-                    )));
-                }
-                if let Some(obj) = write.as_object_mut() {
-                    obj.remove("$type");
-                    obj.insert("action".into(), action.into());
-                }
-                WritesShape::Lexicon
-            }
-            None => WritesShape::Action,
-        };
-        if *shape.get_or_insert(this) != this {
+        if !is_lexicon_write(&write) {
             return Err(invalid(
                 "writes are tagged two ways; tag them all by $type, or all by action".into(),
             ));
         }
-        let op = serde_json::from_value::<WriteOp>(write).map_err(|e| match this {
-            WritesShape::Lexicon => invalid(format!("writes[{i}]: {e}")),
-            WritesShape::Action => AppError::XrpcError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "InvalidRequest",
-                message: format!("writes[{i}]: {e}"),
-            },
-        })?;
-        ops.push(op);
+        let action = write["$type"]
+            .as_str()
+            .and_then(|t| t.strip_prefix(LEXICON_WRITE_PREFIX))
+            .unwrap_or_default()
+            .to_string();
+        if !matches!(action.as_str(), "create" | "update" | "delete") {
+            return Err(invalid(format!(
+                "writes[{i}]: unknown write type {LEXICON_WRITE_PREFIX}{action}"
+            )));
+        }
+        if let Some(obj) = write.as_object_mut() {
+            obj.remove("$type");
+            obj.remove("swapRecord");
+            obj.insert("action".into(), action.into());
+        }
+        ops.push(
+            serde_json::from_value::<WriteOp>(write)
+                .map_err(|e| invalid(format!("writes[{i}]: {e}")))?,
+        );
     }
-    Ok((ops, shape.unwrap_or(WritesShape::Action)))
+    Ok(ops)
 }
 
 /// A record key the caller chose, checked as the lexicons' `record-key`.
@@ -927,9 +969,13 @@ async fn delete_record(
 async fn apply_writes(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
-    Json(input): Json<ApplyWritesInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let (writes, shape) = parse_writes(input.writes)?;
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
+    let input = match read_apply_writes(body)? {
+        Ok(input) => input,
+        Err(refusal) => return Ok(refusal),
+    };
+    let (writes, shape) = (input.writes, input.shape);
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
     if input.repo.as_deref().is_some_and(|repo| repo != did) {
         return Err(AppError::Forbidden(
@@ -1008,7 +1054,7 @@ async fn apply_writes(
     )
     .await?
     {
-        return Ok(Json(forwarded));
+        return Ok(Json(forwarded).into_response());
     }
 
     if let Some(ref expected_rev) = input.swap_commit {
@@ -1219,7 +1265,8 @@ async fn apply_writes(
 
     Ok(Json(serde_json::json!({
         "results": results,
-    })))
+    }))
+    .into_response())
 }
 
 async fn get_record(
