@@ -302,23 +302,25 @@ async fn a_create_on_a_taken_key_is_record_already_exists() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "RecordAlreadyExists", "{body}");
 
-    for tag in [json!({ "$type": CREATE }), json!({ "action": "create" })] {
-        let mut write =
-            json!({ "collection": COLLECTION, "rkey": "self", "value": record("three") });
-        write
-            .as_object_mut()
-            .unwrap()
-            .extend(tag.as_object().unwrap().clone());
-        let (status, body) = post(
-            &app,
-            &author,
-            "applyWrites",
-            json!({ "space": space, "writes": [write] }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{tag}: {body}");
-        assert_eq!(body["error"], "RecordAlreadyExists", "{tag}: {body}");
-    }
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "$type": CREATE, "collection": COLLECTION, "rkey": "self", "value": record("three") }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "RecordAlreadyExists", "{body}");
+
+    // The earlier shape keeps its answer: a 409.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "action": "create", "collection": COLLECTION, "rkey": "self", "value": record("three") }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // Two creates of one key in one batch: the second is refused, and the
     // batch with it.
@@ -458,4 +460,102 @@ async fn the_repo_named_must_be_the_callers() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {answer}");
     }
     assert!(rkeys(&app, &author, &space).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn the_earlier_shape_keeps_its_answers() {
+    common::require_db!();
+    let (app, space, author) = setup("earlier").await;
+    // A `$type` that isn't one of applyWrites' write types is ignored, as it
+    // always was, and the write is read by its `action`.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "$type": "com.atproto.repo.applyWrites#create", "action": "create", "collection": COLLECTION, "rkey": "a", "value": record("a") }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"][0].get("$type").is_none(), "{body}");
+
+    // A malformed write is a 422, as before.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "action": "create", "collection": COLLECTION }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Record keys are read as they were: no record-key check on this shape.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "action": "delete", "collection": COLLECTION, "rkey": "not a key" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn the_lexicons_writes_take_no_swap_and_build_on_each_other() {
+    common::require_db!();
+    let (app, space, author) = setup("swapless").await;
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "$type": DELETE, "collection": COLLECTION, "rkey": "a", "swapRecord": "bafyreihje4zjrs24gnxiciokziubf2bcsnwivwl5k3lhbvhyrhjuh7vcgi" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "InvalidRequest", "{body}");
+
+    // A create, then an update of the same key, in one batch.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [
+            { "$type": CREATE, "collection": COLLECTION, "rkey": "a", "value": record("1") },
+            { "$type": UPDATE, "collection": COLLECTION, "rkey": "a", "value": record("2") },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"][1]["$type"],
+        "com.atproto.space.applyWrites#updateResult"
+    );
+    assert_eq!(rkeys(&app, &author, &space).await, ["a"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_oversized_batch_is_refused_whatever_it_holds() {
+    common::require_db!();
+    let (app, space, author) = setup("capfirst").await;
+    let mut writes: Vec<Value> = (0..201)
+        .map(|i| json!({ "$type": CREATE, "collection": COLLECTION, "rkey": format!("k{i}"), "value": record("x") }))
+        .collect();
+    writes[3] = json!({ "$type": "com.atproto.space.applyWrites#upsert" });
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": writes }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("too many writes"),
+        "the cap is checked first: {body}"
+    );
 }

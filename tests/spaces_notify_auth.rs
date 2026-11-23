@@ -1805,3 +1805,20 @@ async fn mint_while_the_space_changes(
     assert_eq!(issued, 0);
     (status, body)
 }
+
+/// A credential request to a managed space whose app can't answer fails as
+/// an upstream failure too, and issues nothing.
+#[tokio::test]
+#[serial]
+async fn a_credential_request_meets_an_unanswering_app_as_an_upstream_failure() {
+    common::require_db!();
+    for (label, answer) in [
+        ("no decision", answers(200, json!({}))),
+        ("a closed port", ManagingAppAnswer::Unreachable),
+    ] {
+        let (status, _, body) = through_managing_app(answer, Ask::CredentialWithoutUser).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}: {body}");
+        assert_eq!(body["error"], json!("UpstreamFailure"), "{label}: {body}");
+        assert!(body.get("credential").is_none(), "{label}: {body}");
+    }
+}

@@ -211,8 +211,6 @@ impl CheckMethod {
         Some(params)
     }
 
-    /// The app's decision, from its answer: `{read, write}` from
-    /// `checkAccess`, `{authorized}` from the older methods.
     /// The decision an answer gives, or `None` for an answer not in the
     /// method's shape: `checkAccess` answers both `read` and `write` as
     /// booleans, the older methods `authorized`.

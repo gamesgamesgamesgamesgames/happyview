@@ -289,17 +289,36 @@ const LEXICON_WRITE_PREFIX: &str = "com.atproto.space.applyWrites#";
 const MAX_WRITES: usize = 200;
 
 /// Read a batch's writes, in either shape. A batch is one shape throughout.
+///
+/// A write is in the lexicons' shape when its `$type` names one of
+/// `com.atproto.space.applyWrites`'s write types; any other write is read as
+/// HappyView's earlier `action`-tagged shape, as before (a stray `$type` there
+/// is ignored). The earlier shape's malformed writes stay a 422.
 fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesShape), AppError> {
     let invalid = |message: String| bad_request("InvalidRequest", message);
+    if writes.len() > MAX_WRITES {
+        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
+    }
     let mut shape = None;
     let mut ops = Vec::with_capacity(writes.len());
     for (i, mut write) in writes.into_iter().enumerate() {
-        let this = match write.get("$type").and_then(|t| t.as_str()) {
-            Some(type_) => {
-                let action = match type_.strip_prefix(LEXICON_WRITE_PREFIX) {
-                    Some(action @ ("create" | "update" | "delete")) => action.to_string(),
-                    _ => return Err(invalid(format!("writes[{i}]: unknown write type {type_}"))),
-                };
+        let lexicon_type = write
+            .get("$type")
+            .and_then(|t| t.as_str())
+            .and_then(|t| t.strip_prefix(LEXICON_WRITE_PREFIX))
+            .map(str::to_string);
+        let this = match lexicon_type {
+            Some(action) => {
+                if !matches!(action.as_str(), "create" | "update" | "delete") {
+                    return Err(invalid(format!(
+                        "writes[{i}]: unknown write type {LEXICON_WRITE_PREFIX}{action}"
+                    )));
+                }
+                if write.get("swapRecord").is_some() {
+                    return Err(invalid(format!(
+                        "writes[{i}]: the lexicons' writes take no swapRecord"
+                    )));
+                }
                 if let Some(obj) = write.as_object_mut() {
                     obj.remove("$type");
                     obj.insert("action".into(), action.into());
@@ -313,16 +332,17 @@ fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesS
                 "writes are tagged two ways; tag them all by $type, or all by action".into(),
             ));
         }
-        ops.push(
-            serde_json::from_value::<WriteOp>(write)
-                .map_err(|e| invalid(format!("writes[{i}]: {e}")))?,
-        );
+        let op = serde_json::from_value::<WriteOp>(write).map_err(|e| match this {
+            WritesShape::Lexicon => invalid(format!("writes[{i}]: {e}")),
+            WritesShape::Action => AppError::XrpcError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "InvalidRequest",
+                message: format!("writes[{i}]: {e}"),
+            },
+        })?;
+        ops.push(op);
     }
-    let shape = shape.unwrap_or(WritesShape::Action);
-    if ops.len() > MAX_WRITES {
-        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
-    }
-    Ok((ops, shape))
+    Ok((ops, shape.unwrap_or(WritesShape::Action)))
 }
 
 /// A record key the caller chose, checked as the lexicons' `record-key`.
@@ -916,14 +936,18 @@ async fn apply_writes(
             "repo must be the authenticated account".into(),
         ));
     }
-    for write in &writes {
-        if let WriteOp::Create {
-            rkey: Some(rkey), ..
-        }
-        | WriteOp::Update { rkey, .. }
-        | WriteOp::Delete { rkey, .. } = write
-        {
-            check_rkey(rkey)?;
+    // The lexicons' writes name record keys; the earlier shape's are read as
+    // they always were.
+    if shape == WritesShape::Lexicon {
+        for write in &writes {
+            if let WriteOp::Create {
+                rkey: Some(rkey), ..
+            }
+            | WriteOp::Update { rkey, .. }
+            | WriteOp::Delete { rkey, .. } = write
+            {
+                check_rkey(rkey)?;
+            }
         }
     }
     for write in &writes {
@@ -1024,10 +1048,12 @@ async fn apply_writes(
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
                 // Read inside the batch, so a create after a create of the
-                // same key is refused too.
-                if db::get_space_record(&mut *tx, state.db_backend, &record_uri)
-                    .await?
-                    .is_some()
+                // same key is refused too. The earlier shape keeps the 409 its
+                // insert gives.
+                if shape == WritesShape::Lexicon
+                    && db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+                        .await?
+                        .is_some()
                 {
                     return Err(record_already_exists(&collection, &rkey));
                 }
