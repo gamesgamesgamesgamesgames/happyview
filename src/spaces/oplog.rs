@@ -47,7 +47,14 @@ pub fn is_tid(value: &str) -> bool {
 /// lexicons' shape check with this first.
 pub fn is_valid_cursor(cursor: &str) -> bool {
     match cursor.rsplit_once(':') {
-        Some((rev, idx)) => is_tid(rev) && idx.parse::<u32>().is_ok(),
+        // `parse_cursor` reads the index as an i32; one it can't read would
+        // fall back to skipping the whole rev.
+        Some((rev, idx)) => {
+            is_tid(rev)
+                && !idx.is_empty()
+                && idx.bytes().all(|b| b.is_ascii_digit())
+                && idx.parse::<i32>().is_ok()
+        }
         None => is_tid(cursor),
     }
 }
@@ -294,6 +301,8 @@ mod tests {
             "3mwcj3b6uak2:1",
             "zmwcj3b6uak2f:1",
             "3mwcj3b6uak2f1:1",
+            "3mwcj3b6uak2f:3000000000",
+            "3mwcj3b6uak2f:+1",
         ] {
             assert!(!is_valid_cursor(bad), "{bad:?} should be refused");
         }

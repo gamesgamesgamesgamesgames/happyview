@@ -8,8 +8,8 @@
 //! collection's name is a prefix of another's (`.` sorts before `/`), so the
 //! records are sorted here.
 //!
-//! The commit's MAC is not part of the archive; it travels in the response's
-//! HTTP signature.
+//! The commit's MAC is not part of the archive: Proposal 0016 carries it in
+//! the response's HTTP message signature, which this host does not add yet.
 
 use std::collections::BTreeMap;
 

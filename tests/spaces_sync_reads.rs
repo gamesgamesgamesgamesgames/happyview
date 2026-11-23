@@ -836,3 +836,190 @@ async fn clear_records_notifies_registered_syncers() {
     );
     assert!(after["commit"]["rev"].is_string());
 }
+
+#[tokio::test]
+#[serial]
+async fn an_empty_cursor_is_no_cursor() {
+    common::require_db!();
+    let (app, space, authority, author) = setup("emptycursor").await;
+    write(&app, &space, &author, COLLECTION, "one").await;
+    for method in ["listRecords", "listRepoOps"] {
+        let (status, body) = get(
+            &app,
+            &authority,
+            method,
+            &format!("{}&cursor=", q(&space, "repo", &author)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{method}: {body}");
+        let items = if method == "listRecords" {
+            &body["records"]
+        } else {
+            &body["ops"]
+        };
+        assert_eq!(items.as_array().unwrap().len(), 1, "{method}: {body}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn list_records_pages_through_its_own_cursors_both_ways() {
+    common::require_db!();
+    let (app, space, authority, author) = setup("recpages").await;
+    for text in ["one", "two", "three"] {
+        write(&app, &space, &author, COLLECTION, text).await;
+    }
+    for order in ["", "&reverse=true"] {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut query = format!("{}&limit=1{order}", q(&space, "repo", &author));
+            if let Some(c) = &cursor {
+                query.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+            }
+            let (status, body) = get(&app, &authority, "listRecords", &query).await;
+            assert_eq!(status, StatusCode::OK, "{order}: {body}");
+            for r in body["records"].as_array().unwrap() {
+                seen.push(r["rkey"].as_str().unwrap().to_string());
+            }
+            match body["cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "{order}: every record once: {seen:?}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_commit_names_the_space_in_its_canonical_form() {
+    common::require_db!();
+    let (app, space, authority, author) = setup("canonical").await;
+    write(&app, &space, &author, COLLECTION, "one").await;
+    // The pre-0016 `ats://did/type/skey` form names the same space.
+    let legacy = space
+        .replacen("at://", "ats://", 1)
+        .replacen("/space/", "/", 1);
+    let (status, body) = get(
+        &app,
+        &authority,
+        "getLatestCommit",
+        &q(&legacy, "repo", &author),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commit"]["space"], space.as_str(), "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn clear_records_removes_configuration_collections_from_a_members_repo() {
+    common::require_db!();
+    // Only the authority's repo keeps them: in a member's repo they are
+    // ordinary records.
+    let (app, space, authority, author) = setup("clearmember").await;
+    let skey = space.rsplit('/').next().unwrap();
+    let row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &authority,
+        TYPE_NSID,
+        skey,
+    )
+    .await
+    .unwrap()
+    .expect("the space");
+    for collection in ["com.atproto.space.policy", "com.atproto.memberspace.member"] {
+        let value = json!({ "$type": collection });
+        spaces_db::insert_space_record(
+            &app.state.db,
+            app.state.db_backend,
+            &SpaceRecord {
+                uri: format!("{space}/{author}/{collection}/self"),
+                space_id: row.id.clone(),
+                author_did: author.clone(),
+                collection: collection.into(),
+                rkey: "self".into(),
+                cid: happyview::cid_verify::compute_record_cid(&value)
+                    .unwrap()
+                    .to_string(),
+                record: value,
+                indexed_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let (status, body) = post(
+        &app,
+        &author,
+        "clearRecords",
+        json!({ "space": space, "repo": author }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, listed) = get(&app, &authority, "listRecords", &q(&space, "repo", &author)).await;
+    assert_eq!(listed["records"], json!([]), "{listed}");
+}
+
+#[tokio::test]
+#[serial]
+async fn only_a_writing_member_can_clear() {
+    common::require_db!();
+    let (app, space, _authority, _author) = setup("clearoutsider").await;
+    let outsider = rand_did("clearoutsider");
+    let (status, body) = post(
+        &app,
+        &outsider,
+        "clearRecords",
+        json!({ "space": space, "repo": outsider }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status} {body}");
+    assert_ne!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_blob_by_repo_answers_an_outsider_the_same_whatever_the_blob() {
+    common::require_db!();
+    let (app, space, _authority, author) = setup("blobauth").await;
+    let cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let other = "bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq";
+    let (status, body) = post(
+        &app,
+        &author,
+        "createRecord",
+        json!({
+            "space": space,
+            "collection": COLLECTION,
+            "record": {
+                "$type": COLLECTION,
+                "image": { "$type": "blob", "ref": { "$link": cid }, "mimeType": "image/png", "size": 1 },
+            },
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    let outsider = rand_did("blobauth");
+    let (referenced, a) = get(
+        &app,
+        &outsider,
+        "getBlob",
+        &format!("{}&cid={cid}", q(&space, "repo", &author)),
+    )
+    .await;
+    let (unreferenced, b) = get(
+        &app,
+        &outsider,
+        "getBlob",
+        &format!("{}&cid={other}", q(&space, "repo", &author)),
+    )
+    .await;
+    assert!(referenced.is_client_error(), "{referenced} {a}");
+    assert_eq!(referenced, unreferenced, "{a} / {b}");
+    assert_eq!(a, b);
+}

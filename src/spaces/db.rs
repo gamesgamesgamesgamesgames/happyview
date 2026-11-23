@@ -1741,6 +1741,35 @@ pub async fn list_space_record_keys(
         .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))
 }
 
+/// Delete every record `author_did` holds in a space except those in `keep`,
+/// in one statement.
+pub async fn delete_space_records_except(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+    keep: &[&str],
+) -> Result<u64, AppError> {
+    let mut sql =
+        "DELETE FROM happyview_space_records WHERE space_id = ? AND author_did = ?".to_string();
+    if !keep.is_empty() {
+        sql.push_str(&format!(
+            " AND collection NOT IN ({})",
+            vec!["?"; keep.len()].join(", ")
+        ));
+    }
+    let sql = adapt_sql(&sql, backend);
+    let mut query = crate::db::query(&sql).bind(space_id).bind(author_did);
+    for collection in keep {
+        query = query.bind(*collection);
+    }
+    query
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| AppError::Internal(format!("failed to clear space records: {e}")))
+}
+
 pub async fn delete_space_record(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
