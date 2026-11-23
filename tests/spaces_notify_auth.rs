@@ -208,6 +208,24 @@ async fn notify_write_with(
     rev_field: &str,
     rev: &str,
 ) -> (StatusCode, serde_json::Value) {
+    notify_write_bound_to(
+        signer,
+        repo,
+        rev_field,
+        rev,
+        Some("com.atproto.space.notifyWrite"),
+    )
+    .await
+}
+
+/// `notify_write_with`, with service auth bound to `lxm`.
+async fn notify_write_bound_to(
+    signer: &str,
+    repo: &str,
+    rev_field: &str,
+    rev: &str,
+    lxm: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance_did = app.setup_did_web().await;
@@ -220,7 +238,7 @@ async fn notify_write_with(
             signer,
             &instance_did,
             "#atproto_space_host",
-            Some("com.atproto.space.notifyWrite"),
+            lxm,
         )
         .await;
 
@@ -249,6 +267,35 @@ async fn notify_write_with(
         status,
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
     )
+}
+
+/// A space route refuses service auth that names no method, or another one.
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_a_token_not_bound_to_it() {
+    common::require_db!();
+    for (lxm, message) in [
+        (
+            None,
+            "missing jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+        (
+            Some("com.atproto.space.notifySpaceDeleted"),
+            "bad jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+    ] {
+        let (status, body) = notify_write_bound_to(
+            "did:plc:writer",
+            "did:plc:writer",
+            "repoRev",
+            "3lzq2b3k4c22a",
+            lxm,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+        assert_eq!(body["error"], json!("BadJwtLexiconMethod"), "{lxm:?}");
+        assert_eq!(body["message"], json!(message), "{lxm:?}");
+    }
 }
 
 /// Repo hosts on the alpha lexicon name the repo revision `rev`. Accepted
@@ -286,6 +333,39 @@ async fn notify_write_accepts_the_writers_repo_host() {
     common::require_db!();
     let status = notify_write_as("did:plc:writer", "did:plc:writer").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The space host entry HappyView creates with a space lists notifyWrite, so a
+/// repo host's notification is still accepted once the entry exists.
+#[tokio::test]
+#[serial]
+async fn notify_write_is_accepted_with_the_space_host_entry() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    happyview::service_entries::ensure_space_host_entry(&app.state.db, app.state.db_backend)
+        .await
+        .expect("create the space host entry");
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// The space tracks only writers its write policy admits.

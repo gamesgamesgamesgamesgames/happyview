@@ -12,4 +12,12 @@ ignore = [
     # is on a fixed release; the 0.5 copy comes from atrium-oauth 0.1 (via
     # elliptic-curve 0.13) and leaves only with the move to atrium-oauth 0.2.
     "RUSTSEC-2026-0387",
+    # wasmtime: no fix on wasmtime 36.x; guest-triggered crash/memory growth,
+    # no sandbox escape; v2 runs only admin-installed plugins; accepted
+    # 2026-11-19 by Trezy.
+    "RUSTSEC-2026-0567",
+    # wasmtime: no fix on wasmtime 36.x; guest-triggered crash/memory growth,
+    # no sandbox escape; v2 runs only admin-installed plugins; accepted
+    # 2026-11-19 by Trezy.
+    "RUSTSEC-2026-0573",
 ]
