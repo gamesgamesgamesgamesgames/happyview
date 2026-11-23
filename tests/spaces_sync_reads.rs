@@ -772,3 +772,67 @@ async fn clear_records_keeps_the_configuration_a_space_publishes_in_its_own_repo
         .collect();
     assert_eq!(collections, ["com.atproto.space.policy"], "{listed}");
 }
+
+#[tokio::test]
+#[serial]
+async fn clear_records_notifies_registered_syncers() {
+    common::require_db!();
+    let (app, space, _authority, author) = setup("clearnotify").await;
+    write(&app, &space, &author, COLLECTION, "one").await;
+    let skey = space.rsplit('/').next().unwrap();
+    let authority = space.trim_start_matches("at://").split('/').next().unwrap();
+    let row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        authority,
+        TYPE_NSID,
+        skey,
+    )
+    .await
+    .unwrap()
+    .expect("the space");
+
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Webhook,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post(
+        &app,
+        &author,
+        "clearRecords",
+        json!({ "space": space, "repo": author }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, after) = get(
+        &app,
+        authority,
+        "getLatestCommit",
+        &q(&space, "repo", &author),
+    )
+    .await;
+
+    // The webhook payload: one post per write. The earlier create may arrive
+    // too, since it was queued before the registration was read.
+    let received = common::syncer::received(&syncer, 2).await;
+    let deletes: Vec<Value> = received
+        .iter()
+        .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+        .filter(|b| b["did"] == author.as_str() && b["cid"].is_null())
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "the clear is announced as the record's delete: {received:?}"
+    );
+    assert!(after["commit"]["rev"].is_string());
+}
