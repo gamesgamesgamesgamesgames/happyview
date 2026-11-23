@@ -122,6 +122,151 @@ pub fn verify(headers: &HeaderMap, bound_key: &str) -> Result<(), SignatureError
         .map_err(|_| invalid())
 }
 
+/// The label of the signature the simplespace revision read. It names no
+/// `tag`.
+pub const LEGACY_SIGNATURE_LABEL: &str = "atproto-space";
+
+/// Verify a request's simplespace `atproto-space` signature, returning the
+/// `did:key` that made it.
+///
+/// With `bound_key`, the request presents a credential bound to that key
+/// under the `Atproto-Space` scheme: the signature covers `Authorization` and
+/// `Atproto-Space-Audience`. Without it, the request exchanges a delegation
+/// token for a credential: the signature covers `Authorization` alone, and its
+/// `keyid` names the key the credential is to be bound to.
+pub fn verify_legacy(
+    headers: &HeaderMap,
+    bound_key: Option<&str>,
+) -> Result<String, SignatureError> {
+    let authorization = exactly_one(headers, "authorization")?;
+    let audience = match bound_key {
+        Some(_) => Some(exactly_one(headers, AUDIENCE_HEADER)?),
+        None => None,
+    };
+    let mut inputs = dictionary(headers, "signature-input")?;
+    let mut signatures = dictionary(headers, "signature")?;
+    let (Some(sfv::ListEntry::InnerList(input)), Some(sfv::ListEntry::Item(signature))) = (
+        inputs.shift_remove(LEGACY_SIGNATURE_LABEL),
+        signatures.shift_remove(LEGACY_SIGNATURE_LABEL),
+    ) else {
+        return Err(SignatureError(format!(
+            "missing or malformed {LEGACY_SIGNATURE_LABEL} signature"
+        )));
+    };
+    let signature = match signature.bare_item.as_byte_sequence() {
+        Some(bytes) if signature.params.is_empty() => bytes.to_vec(),
+        _ => return Err(malformed()),
+    };
+
+    let expected: &[&str] = match bound_key {
+        Some(_) => &["authorization", AUDIENCE_HEADER],
+        None => &["authorization"],
+    };
+    let covers_exactly = input.items.len() == expected.len()
+        && input.items.iter().zip(expected).all(|(item, want)| {
+            item.params.is_empty() && item.bare_item.as_string().map(|s| s.as_str()) == Some(*want)
+        });
+    if !covers_exactly {
+        return Err(SignatureError(format!(
+            "signature must cover exactly {expected:?}, in order"
+        )));
+    }
+    if let Some(alg) = input.params.get("alg")
+        && alg.as_string().map(|s| s.as_str()) != Some(SIGNATURE_ALG)
+    {
+        return Err(SignatureError(format!(
+            "signature algorithm must be {SIGNATURE_ALG}"
+        )));
+    }
+    let keyid = input
+        .params
+        .get("keyid")
+        .map(|k| k.as_string().map(|s| s.as_str().to_string()));
+    let signing_key = match (bound_key, keyid) {
+        (Some(bound), None) => bound.to_string(),
+        (Some(bound), Some(keyid)) => {
+            if keyid.as_deref() != Some(bound) {
+                return Err(SignatureError(
+                    "signature keyid does not match the credential key".into(),
+                ));
+            }
+            bound.to_string()
+        }
+        (None, Some(Some(keyid))) => keyid,
+        (None, _) => return Err(not_p256()),
+    };
+    let verifying_key = parse_did_key(&signing_key)?;
+
+    use sfv::FieldType;
+    let params = vec![sfv::ListEntry::InnerList(input)]
+        .serialize()
+        .ok_or_else(malformed)?;
+    let mut base = vec![format!("\"authorization\": {}", authorization.trim())];
+    if let Some(audience) = audience {
+        base.push(format!("\"{AUDIENCE_HEADER}\": {}", audience.trim()));
+    }
+    base.push(format!("\"@signature-params\": {params}"));
+    let base = base.join("\n");
+
+    if signature.len() != 64 {
+        return Err(invalid());
+    }
+    let signature = Signature::from_slice(&signature).map_err(|_| invalid())?;
+    use p256::ecdsa::signature::Verifier;
+    verifying_key
+        .verify(base.as_bytes(), &signature)
+        .map_err(|_| invalid())?;
+    Ok(signing_key)
+}
+
+/// Sign as a simplespace syncer would: over `Authorization` alone, naming the
+/// key in `keyid`, to exchange a delegation token; or, with `audience`, over
+/// `Authorization` and the audience, to present a credential.
+pub fn sign_legacy(key: &SigningKey, authorization: &str, audience: Option<&str>) -> HeaderMap {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+
+    let params = match audience {
+        Some(_) => format!("(\"authorization\" \"{AUDIENCE_HEADER}\")"),
+        None => format!(
+            "(\"authorization\");keyid=\"{}\"",
+            did_key(key.verifying_key())
+        ),
+    };
+    let mut base = vec![format!("\"authorization\": {authorization}")];
+    if let Some(audience) = audience {
+        base.push(format!("\"{AUDIENCE_HEADER}\": {audience}"));
+    }
+    base.push(format!("\"@signature-params\": {params}"));
+    let signature: Signature = key.sign(base.join("\n").as_bytes());
+
+    let mut headers = HeaderMap::new();
+    let mut set = |name: &'static str, value: String| {
+        headers.insert(
+            name,
+            value
+                .parse()
+                .expect("signature fields are valid header values"),
+        );
+    };
+    set("authorization", authorization.to_string());
+    if let Some(audience) = audience {
+        set(AUDIENCE_HEADER, audience.to_string());
+    }
+    set(
+        "signature-input",
+        format!("{LEGACY_SIGNATURE_LABEL}={params}"),
+    );
+    set(
+        "signature",
+        format!(
+            "{LEGACY_SIGNATURE_LABEL}=:{}:",
+            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+        ),
+    );
+    headers
+}
+
 /// Whether `did` is a P-256 `did:key`, the only key a credential can be bound
 /// to.
 pub fn is_p256_did_key(did: &str) -> bool {
@@ -500,6 +645,75 @@ mod tests {
         }
         let err = verify(&doubled, &did).unwrap_err();
         assert!(err.0.contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn a_simplespace_exchange_signature_names_its_key() {
+        let key = key();
+        let headers = sign_legacy(&key, "Bearer token", None);
+        assert_eq!(
+            verify_legacy(&headers, None).unwrap(),
+            did_key(key.verifying_key())
+        );
+        // A credential presentation signature does not pass as an exchange.
+        let presented = sign_legacy(&key, "Atproto-Space cred", Some(AUDIENCE));
+        assert!(verify_legacy(&presented, None).is_err());
+    }
+
+    #[test]
+    fn a_simplespace_presentation_is_verified_against_the_bound_key() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        let headers = sign_legacy(&key, "Atproto-Space cred", Some(AUDIENCE));
+        assert_eq!(verify_legacy(&headers, Some(&did)).unwrap(), did);
+        let other = did_key(self::key().verifying_key());
+        assert!(verify_legacy(&headers, Some(&other)).is_err());
+        // Nor is a current-revision signature read as a simplespace one.
+        assert!(verify_legacy(&credential_headers(&key), Some(&did)).is_err());
+    }
+
+    /// A simplespace presentation over `Authorization` and the audience,
+    /// signed by `key`, whose parameters name `keyid`.
+    fn legacy_presentation_naming(key: &SigningKey, keyid: &str) -> HeaderMap {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        let authorization = "Atproto-Space cred";
+        let params = format!("(\"authorization\" \"{AUDIENCE_HEADER}\");keyid=\"{keyid}\"");
+        let base = format!(
+            "\"authorization\": {authorization}\n\"{AUDIENCE_HEADER}\": {AUDIENCE}\n\"@signature-params\": {params}"
+        );
+        let signature: Signature = key.sign(base.as_bytes());
+        let mut headers = HeaderMap::new();
+        set(&mut headers, "authorization", authorization);
+        set(&mut headers, AUDIENCE_HEADER, AUDIENCE);
+        set(
+            &mut headers,
+            "signature-input",
+            &format!("{LEGACY_SIGNATURE_LABEL}={params}"),
+        );
+        set(
+            &mut headers,
+            "signature",
+            &format!(
+                "{LEGACY_SIGNATURE_LABEL}=:{}:",
+                base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_simplespace_presentation_naming_another_key_is_refused() {
+        let key = key();
+        let did = did_key(key.verifying_key());
+        // Naming the bound key is fine.
+        let named = legacy_presentation_naming(&key, &did);
+        assert_eq!(verify_legacy(&named, Some(&did)).unwrap(), did);
+        // A valid signature by the bound key, whose keyid names another key.
+        let other = did_key(self::key().verifying_key());
+        let mismatched = legacy_presentation_naming(&key, &other);
+        let err = verify_legacy(&mismatched, Some(&did)).unwrap_err();
+        assert!(err.0.contains("keyid"), "{err}");
     }
 
     #[test]

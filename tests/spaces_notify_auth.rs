@@ -208,6 +208,24 @@ async fn notify_write_with(
     rev_field: &str,
     rev: &str,
 ) -> (StatusCode, serde_json::Value) {
+    notify_write_bound_to(
+        signer,
+        repo,
+        rev_field,
+        rev,
+        Some("com.atproto.space.notifyWrite"),
+    )
+    .await
+}
+
+/// `notify_write_with`, with service auth bound to `lxm`.
+async fn notify_write_bound_to(
+    signer: &str,
+    repo: &str,
+    rev_field: &str,
+    rev: &str,
+    lxm: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance_did = app.setup_did_web().await;
@@ -220,7 +238,7 @@ async fn notify_write_with(
             signer,
             &instance_did,
             "#atproto_space_host",
-            Some("com.atproto.space.notifyWrite"),
+            lxm,
         )
         .await;
 
@@ -286,6 +304,39 @@ async fn notify_write_accepts_the_writers_repo_host() {
     common::require_db!();
     let status = notify_write_as("did:plc:writer", "did:plc:writer").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The space host entry HappyView creates with a space lists notifyWrite, so a
+/// repo host's notification is still accepted once the entry exists.
+#[tokio::test]
+#[serial]
+async fn notify_write_is_accepted_with_the_space_host_entry() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    happyview::service_entries::ensure_space_host_entry(&app.state.db, app.state.db_backend)
+        .await
+        .expect("create the space host entry");
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// The space tracks only writers its write policy admits.
@@ -728,6 +779,17 @@ async fn create_space_on_its_own_did_with(
 /// `aud_fragment` of that DID, on an instance that exposes no identity of its
 /// own.
 async fn notify_space_did(aud_fragment: &str) -> StatusCode {
+    notify_space_did_bound_to(aud_fragment, Some("com.atproto.space.notifyWrite"))
+        .await
+        .0
+}
+
+/// `notify_space_did`, with service auth bound to `lxm`, returning the status
+/// and body.
+async fn notify_space_did_bound_to(
+    aud_fragment: &str,
+    lxm: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     enable_spaces(&app).await;
@@ -736,13 +798,7 @@ async fn notify_space_did(aud_fragment: &str) -> StatusCode {
     let space_did = space.trim_start_matches("at://").split('/').next().unwrap();
 
     let auth = app
-        .service_auth_jwt_for(
-            &plc_store,
-            &writer,
-            space_did,
-            aud_fragment,
-            Some("com.atproto.space.notifyWrite"),
-        )
+        .service_auth_jwt_for(&plc_store, &writer, space_did, aud_fragment, lxm)
         .await;
     let req = Request::builder()
         .method("POST")
@@ -759,7 +815,51 @@ async fn notify_space_did(aud_fragment: &str) -> StatusCode {
             .to_string(),
         ))
         .unwrap();
-    app.router.clone().oneshot(req).await.unwrap().status()
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// A space route refuses service auth that names no method, or another one,
+/// whether the token is addressed to this instance's space host or to the
+/// space's own DID.
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_a_token_not_bound_to_it() {
+    common::require_db!();
+    for (lxm, message) in [
+        (
+            None,
+            "missing jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+        (
+            Some("com.atproto.space.notifySpaceDeleted"),
+            "bad jwt lexicon method (\"lxm\"). must match: com.atproto.space.notifyWrite",
+        ),
+    ] {
+        let (status, body) = notify_write_bound_to(
+            "did:plc:writer",
+            "did:plc:writer",
+            "repoRev",
+            "3lzq2b3k4c22a",
+            lxm,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+        assert_eq!(body["error"], json!("BadJwtLexiconMethod"), "{lxm:?}");
+        assert_eq!(body["message"], json!(message), "{lxm:?}");
+
+        let (status, body) = notify_space_did_bound_to("#atproto_pds", lxm).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{lxm:?}: {body}");
+        assert_eq!(body["error"], json!("BadJwtLexiconMethod"), "{lxm:?}");
+        assert_eq!(body["message"], json!(message), "{lxm:?}");
+    }
 }
 
 /// Proposal 0016 addresses a space host as its authority's `#atproto_pds`. A
@@ -1548,4 +1648,152 @@ async fn notify_write_accepts_the_reference_pds_on_a_space_of_its_own() {
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+/// A managing app's answer is asked for before the credential is stored, and
+/// can't be asked again under the space's row lock. The credential is stored
+/// only if the space still names the app that answered: a space that names
+/// another app by then refuses it, as if it did not exist.
+#[tokio::test]
+#[serial]
+async fn a_managed_space_issues_only_on_the_answer_of_the_app_it_still_names() {
+    common::require_db!();
+    let (status, body) = mint_while_the_space_changes(|row| {
+        row.read_policy = Policy::ManagingApp {
+            managing_app: "did:plc:otherapp#forum".into(),
+        };
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+}
+
+/// The app access rules are checked again when the credential is stored, so
+/// rules that change while the managing app is asked apply to it.
+#[tokio::test]
+#[serial]
+async fn a_managed_space_applies_the_app_rules_it_has_when_it_issues() {
+    common::require_db!();
+    let (status, body) = mint_while_the_space_changes(|row| {
+        row.app_access = AppAccess::AllowList {
+            allowed: vec!["https://allowed.example/client-metadata.json".into()],
+        };
+    })
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("AppNotAuthorized"));
+}
+
+/// Ask a managed space for a credential with no user, and change the space
+/// with `change` while its managing app (which allows the read) is answering.
+/// Returns the answer, having checked no credential was stored.
+async fn mint_while_the_space_changes(
+    change: impl FnOnce(&mut Space),
+) -> (StatusCode, serde_json::Value) {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    enable_spaces(&app).await;
+
+    // The app allows the read, slowly enough for the space to change first.
+    let managing_app = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": true, "write": false }))
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&managing_app)
+        .await;
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+        }),
+    );
+    let creator = format!("did:plc:creator{}", Uuid::new_v4().simple());
+    let space = create_space_on_its_own_did_with(
+        &app,
+        &creator,
+        json!({ "policy": {
+            "$type": "com.atproto.managedspace.policy",
+            "managingApp": "did:plc:forumapp#forum",
+        }}),
+    )
+    .await;
+    let space_did = space_did_of(&space);
+    let mut row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &space_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let key = {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.getSpaceCredential")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "credentialKey": happyview::spaces::http_signature::did_key(key.verifying_key()),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let router = app.router.clone();
+    let mint = tokio::spawn(async move {
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+        )
+    });
+
+    // Once the app has been asked, the space moves to another app.
+    for _ in 0..100 {
+        if !managing_app
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    change(&mut row);
+    spaces_db::update_space(&app.state.db, app.state.db_backend, &row)
+        .await
+        .unwrap();
+
+    let (status, body) = mint.await.unwrap();
+    let issued: i64 = happyview::db::query_scalar(&happyview::db::adapt_sql(
+        "SELECT count(*) FROM happyview_space_credentials WHERE space_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(&row.id)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(issued, 0);
+    (status, body)
 }

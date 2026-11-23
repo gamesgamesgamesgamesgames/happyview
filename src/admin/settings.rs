@@ -31,6 +31,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
         "backfill_concurrent_resolution",
         "BACKFILL_CONCURRENT_RESOLUTION",
     ),
+    ("backfill_rate_limit_domains", "BACKFILL_RATE_LIMIT_DOMAINS"),
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
@@ -464,6 +465,26 @@ pub(super) async fn list(
     Ok(Json(entries))
 }
 
+/// The retention settings are a whole number of days to keep something, up
+/// to 100 years, `0` meaning forever. Their sweeps read anything else as their
+/// default (or, past the maximum, overflow their date arithmetic), so a value
+/// that isn't one is refused here. Padding is refused too: the value is
+/// stored as sent, and not every reader trims it.
+pub fn validate_retention(key: &str, value: &str) -> Result<(), String> {
+    use happyview_source_jetstream::backfill::MAX_RETENTION_DAYS;
+    let is_retention = crate::limits::CEILED_RETENTION_SETTINGS.contains(&key)
+        || key == crate::event_log::SPACE_ACCESS_RETENTION_SETTING;
+    if !is_retention {
+        return Ok(());
+    }
+    match value.parse::<u32>() {
+        Ok(days) if days <= MAX_RETENTION_DAYS => Ok(()),
+        _ => Err(format!(
+            "{key} must be a whole number of days up to {MAX_RETENTION_DAYS}, or 0 to keep forever"
+        )),
+    }
+}
+
 /// PUT /admin/settings/{key} — create or update a setting.
 pub(super) async fn upsert(
     State(state): State<AppState>,
@@ -479,6 +500,9 @@ pub(super) async fn upsert(
     }
     script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
     crate::metrics::validate(&key, &body.value).map_err(AppError::BadRequest)?;
+    // A retention value has to be a number of days before the ceiling can
+    // judge it: the ceiling check passes anything that doesn't parse.
+    validate_retention(&key, &body.value).map_err(AppError::BadRequest)?;
     // The log_retention_days ceiling (HAP-227): an owner can keep logs for
     // less, never for longer.
     crate::limits::check_retention_setting(&state.limits.limits(), &key, &body.value)?;

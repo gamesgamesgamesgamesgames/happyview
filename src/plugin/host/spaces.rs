@@ -433,7 +433,8 @@ pub async fn remove_member(
     spec: SpaceMemberRemove,
 ) -> Result<(), SpacesError> {
     require_enabled(state).await?;
-    service::remove_member(state, caller_did, &spec.uri, &spec.did).await?;
+    // A space named as a member may be nested rather than listed.
+    crate::spaces::nested::remove_space_member(state, caller_did, &spec.uri, &spec.did).await?;
     Ok(())
 }
 
@@ -880,6 +881,73 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SpacesError::NotAuthorized(_)), "{err}");
         assert_eq!(err.code(), "NOT_AUTHORIZED");
+    }
+
+    /// A script removes a space nested in its space by naming it, as
+    /// `simplespace` `removeMember` does, by address or `ats://` form.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn remove_member_naming_a_nested_space_removes_it() {
+        for state in each_backend().await {
+            let (outer_uri, admin_did) = seed_space_in(&state).await;
+            let (inner_uri, _) = seed_space_in(&state).await;
+            let resolve = |uri: &str| {
+                let uri = crate::spaces::SpaceUri::parse(uri).unwrap();
+                let state = state.clone();
+                async move {
+                    crate::spaces::db::get_space_by_address(
+                        &state.db,
+                        state.db_backend,
+                        &uri.did,
+                        &uri.type_nsid,
+                        &uri.skey,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                }
+            };
+            let outer = resolve(&outer_uri).await;
+            let inner = resolve(&inner_uri).await;
+            let ats = inner_uri
+                .replacen("at://", "ats://", 1)
+                .replacen("/space/", "/", 1);
+            for name in [inner_uri.clone(), ats] {
+                crate::spaces::db::upsert_nested(
+                    &state.db,
+                    state.db_backend,
+                    &outer.id,
+                    &inner.id,
+                    &crate::spaces::db::NestedRef {
+                        target_space_uri: inner_uri.clone(),
+                        read: true,
+                        write: false,
+                        added_by: None,
+                        created_at: crate::db::now_rfc3339(),
+                    },
+                )
+                .await
+                .unwrap();
+                remove_member(
+                    &state,
+                    &admin_did,
+                    SpaceMemberRemove {
+                        uri: outer_uri.clone(),
+                        did: name.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}: {name}: {e:?}", backend_name(&state)));
+                let left = crate::spaces::db::list_nested(&state.db, state.db_backend, &outer.id)
+                    .await
+                    .unwrap();
+                assert!(
+                    left.is_empty(),
+                    "{}: {name}: {left:?}",
+                    backend_name(&state)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1528,6 +1596,157 @@ mod tests {
                     .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"))
                     .unwrap_or_else(|| panic!("the member exists on {on}"));
             assert!(row.is_delegation, "is_delegation did change on {on}");
+        }
+    }
+
+    /// A script run by the delegating space's administrator alone may lower
+    /// a consented space-as-member entry, which caps the named space's
+    /// members at once and revokes the credentials it no longer allows, as
+    /// `putMember` does. Raising either flag needs the named space's
+    /// administrator, even alongside lowering the other.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_script_may_lower_an_entry_but_not_raise_it() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (x_uri, admin) = seed_space_in(&state).await;
+            let (y_uri, y_admin) = seed_space_in(&state).await;
+            let x = service::resolve_space(&state, &x_uri).await.unwrap();
+            let y = service::resolve_space(&state, &y_uri).await.unwrap();
+            let member = format!("did:plc:m{}", uuid::Uuid::new_v4().simple());
+            service::put_member(
+                &state,
+                &y_admin,
+                &y_uri,
+                &member,
+                Some(MemberAccess::WRITE),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("member of Y on {on}: {e}"));
+            // Consented as Y's administrator would.
+            assert!(
+                crate::spaces::db::insert_delegation_if_allowed(
+                    &state.db,
+                    state.db_backend,
+                    &crate::spaces::types::SpaceMember {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        space_id: x.id.clone(),
+                        did: y_uri.clone(),
+                        access: MemberAccess::WRITE,
+                        is_delegation: true,
+                        granted_by: Some(y_admin.clone()),
+                        created_at: crate::db::now_rfc3339(),
+                    },
+                    crate::spaces::db::DelegationConsent::Granted(&y.id),
+                )
+                .await
+                .unwrap()
+            );
+            let jti = uuid::Uuid::new_v4().to_string();
+            crate::db::query(&crate::db::adapt_sql(
+                "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                state.db_backend,
+            ))
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&x.id)
+            .bind(&member)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&jti)
+            .bind((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339())
+            .bind(crate::db::now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+            let entry = |read: bool, write: bool| SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: Some(read),
+                write: Some(write),
+                is_delegation: Some(true),
+            };
+            let access = || async {
+                crate::spaces::members::is_member(&state.db, state.db_backend, &x.id, &member)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("still a member on {on}"))
+            };
+            let outstanding = || async {
+                crate::spaces::db::outstanding_credential_jtis(
+                    &state.db,
+                    state.db_backend,
+                    &x.id,
+                    &member,
+                )
+                .await
+                .unwrap()
+            };
+
+            // Withdrawing write keeps the credential.
+            set_member(&state, &admin, entry(true, false))
+                .await
+                .unwrap_or_else(|e| panic!("lower write on {on}: {e}"));
+            assert_eq!(access().await, MemberAccess::READ, "on {on}");
+            assert_eq!(outstanding().await, vec![jti.clone()], "on {on}");
+
+            for (read, write) in [(false, true), (true, true)] {
+                assert!(
+                    set_member(&state, &admin, entry(read, write))
+                        .await
+                        .is_err(),
+                    "raise to {read}/{write} on {on}"
+                );
+                assert_eq!(access().await, MemberAccess::READ, "on {on}");
+            }
+
+            // Withdrawing read revokes it.
+            set_member(&state, &admin, entry(false, false))
+                .await
+                .unwrap_or_else(|e| panic!("lower read on {on}: {e}"));
+            let now = access().await;
+            assert!(!now.read && !now.write, "{now:?} on {on}");
+            assert!(outstanding().await.is_empty(), "on {on}");
+            assert!(
+                crate::spaces::db::consented_delegations(&state.db, state.db_backend, &x.id)
+                    .await
+                    .unwrap()
+                    .contains_key(&y_uri),
+                "consent kept on {on}"
+            );
+        }
+    }
+
+    /// A script delegating to a space goes through the same check as the
+    /// XRPC methods: the caller must administer the named space too.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_script_delegating_to_a_space_must_administer_it() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (x_uri, x_admin) = seed_space_in(&state).await;
+            let (y_uri, _) = seed_space_in(&state).await;
+            let x = service::resolve_space(&state, &x_uri).await.unwrap();
+            let spec = || SpaceMemberAdd {
+                uri: x_uri.clone(),
+                did: y_uri.clone(),
+                access: None,
+                read: None,
+                write: None,
+                is_delegation: Some(true),
+            };
+            assert!(
+                add_member(&state, &x_admin, spec()).await.is_err(),
+                "add_member on {on}"
+            );
+            assert!(
+                set_member(&state, &x_admin, spec()).await.is_err(),
+                "set_member on {on}"
+            );
+            let row = crate::spaces::db::get_member(&state.db, state.db_backend, &x.id, &y_uri)
+                .await
+                .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"));
+            assert!(row.is_none(), "nothing stored on {on}");
         }
     }
 }

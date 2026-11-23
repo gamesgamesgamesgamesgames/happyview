@@ -105,8 +105,7 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet. Variables defined here are readable
-                    by scripts as ctx.env.
+                    No script variables yet.
                   </TableCell>
                 </TableRow>
               )}
@@ -238,7 +237,7 @@ function UpsertVariableDialog({
           <ResponsiveDialogDescription>
             {isEdit
               ? "Update the value for this script variable."
-              : "Add a new script variable accessible via env.KEY in Lua scripts."}
+              : "Add a new script variable."}
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
@@ -260,7 +259,6 @@ function UpsertVariableDialog({
               id="var-value"
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder="Enter value..."
               rows={3}
             />
           </div>

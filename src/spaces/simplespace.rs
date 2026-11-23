@@ -525,15 +525,29 @@ async fn put_member(
         read_self: false,
     };
     let space = canonical_ref(&state, &input.space).await?;
-    let member = service::put_member(
-        &state,
-        claims.did(),
-        &space,
-        &input.did,
-        Some(access),
-        input.is_delegation,
-    )
-    .await?;
+    // A space named as a member is a nested space (HAP-388 H5).
+    let member = if names_space(input.is_delegation, &input.did) {
+        crate::spaces::nested::put_space_member(
+            &state,
+            claims.did(),
+            &space,
+            &input.did,
+            Some(access),
+            input.is_delegation,
+            false,
+        )
+        .await?
+    } else {
+        service::put_member(
+            &state,
+            claims.did(),
+            &space,
+            &input.did,
+            Some(access),
+            input.is_delegation,
+        )
+        .await?
+    };
     let mut response = Json(serde_json::json!({ "member": member })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -566,15 +580,28 @@ async fn add_member(
         });
     }
     let space = canonical_ref(&state, &input.space).await?;
-    let member = service::add_member(
-        &state,
-        claims.did(),
-        &space,
-        &input.did,
-        access,
-        input.is_delegation,
-    )
-    .await?;
+    let member = if names_space(input.is_delegation, &input.did) {
+        crate::spaces::nested::put_space_member(
+            &state,
+            claims.did(),
+            &space,
+            &input.did,
+            access,
+            input.is_delegation,
+            true,
+        )
+        .await?
+    } else {
+        service::add_member(
+            &state,
+            claims.did(),
+            &space,
+            &input.did,
+            access,
+            input.is_delegation,
+        )
+        .await?
+    };
     let mut response = Json(serde_json::json!({ "member": member })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -587,6 +614,11 @@ async fn remove_member(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let space = canonical_ref(&state, &input.space).await?;
-    service::remove_member(&state, claims.did(), &space, &input.did).await?;
+    crate::spaces::nested::remove_space_member(&state, claims.did(), &space, &input.did).await?;
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// Whether a member entry names a space rather than an account.
+fn names_space(is_delegation: Option<bool>, member: &str) -> bool {
+    is_delegation == Some(true) || member.starts_with("at://") || member.starts_with("ats://")
 }

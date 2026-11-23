@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::spaces::host_mode::HostMode;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
+use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog, publish};
 use crate::tid::generate_tid;
 use sha2::{Digest, Sha256};
 
@@ -587,6 +587,7 @@ pub(crate) async fn create_record(
     collection: &str,
     record: serde_json::Value,
 ) -> Result<(String, String), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
 
@@ -681,6 +682,7 @@ pub(crate) async fn put_record(
     record: serde_json::Value,
     swap_cid: Option<String>,
 ) -> Result<(String, String), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
 
@@ -792,6 +794,7 @@ pub(crate) async fn delete_record(
     rkey: &str,
     swap_cid: Option<String>,
 ) -> Result<(), AppError> {
+    publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, None).await?;
 
@@ -950,30 +953,228 @@ pub(crate) async fn create_space(
         created_at: now_rfc3339(),
     };
     db::add_member(&state.db, state.db_backend, &member).await?;
+    // A policy that asks for publishing has its records from the start.
+    publish::sync(state, &space.id, publish::Scope::All).await?;
     Ok(space)
 }
 
-/// Add a member, or replace their read and write access if they already exist.
-///
-/// `putMember` semantics: a repeat call updates the member rather than
-/// conflicting. The upsert preserves `read_self` instead of resetting it.
-/// `read_self` is HappyView-local and never sent over the wire, so a caller
-/// replacing read/write access has not asked to lift an own-records-only
-/// restriction.
-/// Revoke a member's credentials, and tell the hosts that verify them.
+/// Revoke a member's credentials in the caller's transaction, the one that
+/// changes their membership, so the two commit together. Returns the `jti`s
+/// of the credentials that were outstanding, for [`announce_revoked`] to send
+/// once the transaction commits.
 async fn revoke_member_credentials(
-    state: &AppState,
-    space: &Space,
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
     member_did: &str,
-) -> Result<(), AppError> {
-    let jtis =
-        db::outstanding_credential_jtis(&state.db, state.db_backend, &space.id, member_did).await?;
-    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
-        .await?;
+) -> Result<Vec<String>, AppError> {
+    let jtis = db::outstanding_credential_jtis(&mut *conn, backend, space_id, member_did).await?;
+    db::revoke_space_credentials_for_member(&mut *conn, backend, space_id, member_did).await?;
+    Ok(jtis)
+}
+
+/// Tell the hosts that verify a space's credentials which were revoked, once
+/// the revocation has committed.
+fn announce_revoked(state: &AppState, space: &Space, jtis: Vec<String>) {
+    #[cfg(test)]
+    tests::ANNOUNCED_REVOKED.with(|a| a.borrow_mut().push((space.id.clone(), jtis.clone())));
     if !jtis.is_empty() {
         notifications::announce_revoked_credentials(state, space, jtis);
     }
-    Ok(())
+}
+
+/// Who read a space through its member list before a change to its members,
+/// and which spaces take its members through delegation entries or nested
+/// references, as read in the change's transaction, under the space's row
+/// lock, before the change. [`revoke_lost_readers`] takes it once the change
+/// is made.
+pub(crate) struct Readers {
+    space_id: String,
+    readers: std::collections::HashSet<String>,
+    delegating: Vec<String>,
+}
+
+/// The DIDs a space's member list admits to a credential, resolved through
+/// its delegation entries.
+async fn member_list_readers(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    Ok(members::resolve_members_on(conn, backend, space_id)
+        .await?
+        .into_iter()
+        .filter(|m| crate::spaces::auth::member_list_admits(Some(m.access)))
+        .map(|m| m.did)
+        .collect())
+}
+
+impl Readers {
+    /// The spaces that took the space's members before the change.
+    pub(crate) fn delegating(&self) -> &[String] {
+        &self.delegating
+    }
+}
+
+pub(crate) async fn readers_before(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Readers, AppError> {
+    let delegating = members::delegating_spaces(conn, backend, space_id).await?;
+    let readers = match member_list_readers(conn, backend, space_id).await {
+        Ok(readers) => readers,
+        // A space past the resolution bound admits no one now, but anyone
+        // holding one of its credentials was admitted before it grew, so
+        // they count as its readers. Otherwise a change that brings the
+        // space back within the bound couldn't be made. A space that takes
+        // its members may still resolve, reading less of it than the bound
+        // stops at, so its readers count too.
+        Err(e) if members::is_too_large(&e) => {
+            let mut readers: std::collections::HashSet<String> =
+                db::outstanding_credential_subjects(&mut *conn, backend, space_id)
+                    .await?
+                    .into_iter()
+                    .collect();
+            for id in &delegating {
+                match member_list_readers(conn, backend, id).await {
+                    Ok(theirs) => readers.extend(theirs),
+                    Err(e) if members::is_too_large(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            readers
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Readers {
+        space_id: space_id.to_string(),
+        readers,
+        delegating,
+    })
+}
+
+/// Credentials revoked in a space, for [`announce_all_revoked`] once the
+/// transaction commits.
+pub(crate) type Revoked = Vec<(Space, Vec<String>)>;
+
+/// After a change to a space's members, revoke, in the caller's transaction,
+/// the credentials of every DID the space no longer admits, in the space and
+/// in every space that takes its members through delegation entries or
+/// nested references, directly or through others. A credential for one of
+/// those spaces may have been issued because its subject was a member here.
+///
+/// Only the DIDs that read the space before the change and no longer do are
+/// looked at, and each keeps its credentials for a space that still admits
+/// it some other way. A space's creator, and a space whose read policy is not
+/// a member list, are left alone, as issuing a credential treats them.
+///
+/// The delegating spaces are locked for update in id order and their members
+/// resolved again under the locks, so a change to one of them waits for this
+/// one, and the lookup is repeated until it finds no space not yet locked.
+///
+/// A space past the resolution bound admits no one, so every DID in question
+/// loses its credentials there, as an access check would refuse them.
+///
+/// Issuing a credential locks top-down (the space, then the spaces it
+/// delegates to) and this locks bottom-up, so the two can deadlock on
+/// Postgres. Postgres then fails one of them, and `retry_on_busy` runs it
+/// again.
+pub(crate) async fn revoke_lost_readers(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    before: Readers,
+) -> Result<Result<Revoked, AppError>, sqlx::Error> {
+    // Errors other than the database's own (a lock wait it gives up on,
+    // which the caller's retry takes) are the request's.
+    macro_rules! app {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => return Ok(Err(e)),
+            }
+        };
+    }
+    let now = app!(db::get_space(&mut *conn, backend, &before.space_id).await);
+    let after = match &now {
+        Some(_) => app!(readers_or_none(conn, backend, &before.space_id).await),
+        None => Default::default(),
+    };
+    let mut lost: Vec<String> = before.readers.difference(&after).cloned().collect();
+    if lost.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    lost.sort();
+
+    let mut locked: Vec<String> = Vec::new();
+    let mut pending = before.delegating;
+    loop {
+        pending.retain(|id| !locked.contains(id));
+        if pending.is_empty() {
+            break;
+        }
+        pending.sort();
+        for id in pending.drain(..) {
+            db::lock_space_for_members(&mut *conn, backend, &id).await?;
+            locked.push(id);
+        }
+        if now.is_some() {
+            pending = app!(members::delegating_spaces(conn, backend, &before.space_id).await);
+        }
+    }
+
+    let mut targets: Vec<(Space, Option<std::collections::HashSet<String>>)> = Vec::new();
+    if let Some(space) = now {
+        targets.push((space, Some(after)));
+    }
+    for id in &locked {
+        if let Some(space) = app!(db::get_space(&mut *conn, backend, id).await) {
+            targets.push((space, None));
+        }
+    }
+    let mut revoked = Vec::new();
+    for (space, readers) in targets {
+        if space.read_policy != Policy::MemberList {
+            continue;
+        }
+        let readers = match readers {
+            Some(readers) => readers,
+            None => app!(readers_or_none(conn, backend, &space.id).await),
+        };
+        let mut jtis = Vec::new();
+        for did in &lost {
+            if *did == space.creator_did || readers.contains(did) {
+                continue;
+            }
+            jtis.extend(app!(
+                revoke_member_credentials(conn, backend, &space.id, did).await
+            ));
+        }
+        if !jtis.is_empty() {
+            revoked.push((space, jtis));
+        }
+    }
+    Ok(Ok(revoked))
+}
+
+/// [`member_list_readers`], with none for a space past the resolution bound:
+/// its access checks refuse everyone.
+async fn readers_or_none(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    match member_list_readers(conn, backend, space_id).await {
+        Err(e) if members::is_too_large(&e) => Ok(Default::default()),
+        result => result,
+    }
+}
+
+/// [`announce_revoked`] for each space in `revoked`.
+pub(crate) fn announce_all_revoked(state: &AppState, revoked: Revoked) {
+    for (space, jtis) in revoked {
+        announce_revoked(state, &space, jtis);
+    }
 }
 
 /// A managedspace has no member list: its managing app decides who reads and
@@ -987,13 +1188,101 @@ fn no_members_on_managedspace() -> AppError {
     }
 }
 
-/// Insert or update a member, refusing a space that takes none
-/// ([`db::insert_member_if_allowed`]).
-async fn insert_member(state: &AppState, member: &SpaceMember) -> Result<(), AppError> {
-    if !db::insert_member_if_allowed(&state.db, state.db_backend, member).await? {
-        return Err(no_members_on_managedspace());
+/// The space, read under its row lock as [`db::lock_space_for_members`]
+/// takes it, or `None` when it takes no members: a managedspace, or a space
+/// that is gone.
+async fn lock_member_space(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Option<Space>, sqlx::Error> {
+    Ok(db::lock_space(&mut *conn, backend, space_id)
+        .await?
+        .filter(|space| {
+            !matches!(
+                crate::spaces::policy::SpacePolicy::of(space),
+                Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+            )
+        }))
+}
+
+/// The consent `put_member` and `add_member` store a member with. A
+/// space-as-member entry (`is_delegation`) brings in the named space's
+/// members, so adding one that names a space on this host requires
+/// administering that space too. An entry naming a space that isn't here is
+/// stored as it always was, and brings in no members.
+///
+/// Putting an entry that already brings in members again, naming the same
+/// space with the same access or less, keeps its consent without asking
+/// again: a client re-sending a space's whole member list goes on working,
+/// and this space's administrator can lower what the entry grants (to no
+/// access at all), as they can remove it. Raising either flag needs the
+/// named space's administrator, as a new entry does.
+async fn delegation_consent(
+    state: &AppState,
+    actor_did: &str,
+    member: &SpaceMember,
+) -> Result<Consent, AppError> {
+    if !member.is_delegation {
+        return Ok(Consent::None);
     }
-    Ok(())
+    let target =
+        crate::spaces::members::delegation_target(&state.db, state.db_backend, &member.did).await?;
+    let Some(target) = target else {
+        return Ok(Consent::None);
+    };
+    match require_space_admin(state, &target, actor_did).await {
+        Ok(()) => Ok(Consent::Granted(target.id)),
+        Err(AppError::Forbidden(_))
+            if consented_delegation_not_raised(state, member, &target.id).await? =>
+        {
+            Ok(Consent::Kept)
+        }
+        Err(AppError::Forbidden(_)) => Err(AppError::Forbidden(
+            "delegating to a space requires administering it".into(),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`db::DelegationConsent`], owning the id of the space consented to.
+enum Consent {
+    None,
+    Granted(String),
+    Kept,
+}
+
+impl Consent {
+    fn as_db(&self) -> db::DelegationConsent<'_> {
+        match self {
+            Consent::None => db::DelegationConsent::None,
+            Consent::Granted(id) => db::DelegationConsent::Granted(id),
+            Consent::Kept => db::DelegationConsent::Kept,
+        }
+    }
+}
+
+/// Whether `member` is already stored as an entry that brings in the
+/// members of the space `target_id`, granting at least the read and write
+/// `member` asks for.
+async fn consented_delegation_not_raised(
+    state: &AppState,
+    member: &SpaceMember,
+    target_id: &str,
+) -> Result<bool, AppError> {
+    let stored = db::get_member(&state.db, state.db_backend, &member.space_id, &member.did).await?;
+    let not_raised = |stored: MemberAccess| {
+        (stored.read || !member.access.read) && (stored.write || !member.access.write)
+    };
+    if !stored.is_some_and(|m| m.is_delegation && not_raised(m.access)) {
+        return Ok(false);
+    }
+    Ok(
+        db::consented_delegations(&state.db, state.db_backend, &member.space_id)
+            .await?
+            .get(&member.did)
+            .is_some_and(|id| id == target_id),
+    )
 }
 
 /// Upsert a member. `access` of `None` leaves an existing member's read and
@@ -1032,11 +1321,51 @@ pub(crate) async fn put_member(
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
-    // A credential is the member's read access, so it goes when that does.
-    if !member.access.read {
-        revoke_member_credentials(state, &space, member_did).await?;
-    }
+    let consent = delegation_consent(state, actor_did, &member).await?;
+    // The member, their credentials when read access goes, and the published
+    // member record change in one transaction under the space's row lock, as
+    // `putMembers` does.
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, published, jtis, delegated) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let Some(locked) = lock_member_space(&mut tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(no_members_on_managedspace()));
+        };
+        let before = match readers_before(&mut tx, state.db_backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        db::upsert_member(&mut *tx, state.db_backend, &member, consent.as_db()).await?;
+        // A credential is the member's read access, so it goes when that does.
+        let jtis = if member.access.read {
+            Vec::new()
+        } else {
+            match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did).await
+            {
+                Ok(jtis) => jtis,
+                Err(e) => return Ok(Err(e)),
+            }
+        };
+        let delegated = match revoke_lost_readers(&mut tx, state.db_backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        // A failure here drops the transaction, and the change with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((locked, published, jtis, delegated)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
+    announce_revoked(state, &space, jtis);
+    announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(member)
 }
 
@@ -1060,14 +1389,36 @@ pub(crate) async fn add_member(
     }
     let member = SpaceMember {
         id: uuid::Uuid::new_v4().to_string(),
-        space_id: space.id,
+        space_id: space.id.clone(),
         did: member_did.to_string(),
         access: access.unwrap_or(MemberAccess::READ),
         is_delegation: is_delegation.unwrap_or(false),
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
     };
-    insert_member(state, &member).await?;
+    let consent = delegation_consent(state, actor_did, &member).await?;
+    // The member and its published record commit together, as in
+    // `put_member`.
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, published) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let Some(locked) = lock_member_space(&mut tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(no_members_on_managedspace()));
+        };
+        db::upsert_member(&mut *tx, state.db_backend, &member, consent.as_db()).await?;
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((locked, published)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to add member: {e}")))??;
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     Ok(member)
 }
 
@@ -1115,10 +1466,16 @@ pub(crate) async fn update_space(
 }
 
 /// Store a space's fields and, with `discard_members`, discard its member
-/// list and its invites, all in one transaction, so a failure cannot leave a
-/// managedspace with the member list of the space it replaced.
+/// list, the credentials issued from it and its invites, all in one
+/// transaction, so a failure cannot leave a managedspace with the member list
+/// of the space it replaced, or that list's credentials. A space that read by
+/// its member list until now loses every credential but its creator's, those
+/// issued through its delegation entries included, and the spaces that take
+/// its members through theirs lose its members' credentials as
+/// [`revoke_lost_readers`] decides. The hosts that verify the revoked
+/// credentials are told once it commits.
 ///
-/// The `UPDATE` takes the space's row first, as every member insert does
+/// The space's row is locked first, as every member insert does
 /// (`db::lock_space_for_members`), so an insert racing this one either lands
 /// before the list is discarded or sees the new policy.
 pub(crate) async fn store_space(
@@ -1126,20 +1483,127 @@ pub(crate) async fn store_space(
     space: &Space,
     discard_members: bool,
 ) -> Result<(), AppError> {
-    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
-    db::update_space(&mut *tx, state.db_backend, space).await?;
-    if discard_members {
-        db::remove_all_members(&mut *tx, state.db_backend, &space.id).await?;
-        // An outstanding invite would add a member once accepted.
-        db::delete_invites(&mut *tx, state.db_backend, &space.id).await?;
-    }
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to commit space update: {e}")))
+    let backend = state.db_backend;
+    let scope = publish::Scope::All;
+    let signing_key = publish_key(state, space, scope).await?;
+    let (jtis, delegated, published) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, backend).await?;
+        db::lock_space_for_members(&mut *tx, backend, &space.id).await?;
+        let mut jtis = Vec::new();
+        let mut delegated = Vec::new();
+        if discard_members {
+            let stored = match db::get_space(&mut *tx, backend, &space.id).await {
+                Ok(stored) => stored,
+                Err(e) => return Ok(Err(e)),
+            };
+            let before = match readers_before(&mut tx, backend, &space.id).await {
+                Ok(before) => before,
+                Err(e) => return Ok(Err(e)),
+            };
+            if let Err(e) = db::update_space(&mut *tx, backend, space).await {
+                return Ok(Err(e));
+            }
+            // The credentials go with the list they were issued from.
+            let revoked = if stored.is_some_and(|s| s.read_policy == Policy::MemberList) {
+                db::revoke_space_credentials_except(&mut tx, backend, &space.id, &space.creator_did)
+                    .await
+            } else {
+                db::revoke_member_list_credentials(&mut tx, backend, &space.id).await
+            };
+            match revoked {
+                Ok(revoked) => jtis = revoked,
+                Err(e) => return Ok(Err(e)),
+            }
+            if let Err(e) = db::remove_all_members(&mut *tx, backend, &space.id).await {
+                return Ok(Err(e));
+            }
+            // Nested spaces are part of the list too.
+            if let Err(e) = db::delete_all_nested(&mut *tx, backend, &space.id).await {
+                return Ok(Err(e));
+            }
+            // An outstanding invite would add a member once accepted.
+            if let Err(e) = db::delete_invites(&mut *tx, backend, &space.id).await {
+                return Ok(Err(e));
+            }
+            match revoke_lost_readers(&mut tx, backend, before).await? {
+                Ok(revoked) => delegated = revoked,
+                Err(e) => return Ok(Err(e)),
+            }
+        } else if let Err(e) = db::update_space(&mut *tx, backend, space).await {
+            return Ok(Err(e));
+        }
+        // The published policy and member list follow the stored ones in the
+        // same commit.
+        let published = match publish_in(&mut tx, state, space, scope, signing_key.as_ref()).await {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((jtis, delegated, published)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to store space: {e}")))??;
+    announce_revoked(state, space, jtis);
+    announce_all_revoked(state, delegated);
+    after_publish(state, space, scope, signing_key.is_some(), published).await?;
+    Ok(())
 }
 
+/// The signing key a write needs to bring `space`'s published records into
+/// step, or `None` when it cannot touch them. Fetched before the write's
+/// transaction opens; see [`service_signing_key`].
+async fn publish_key(
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+) -> Result<Option<p256::ecdsa::SigningKey>, AppError> {
+    if publish::may_touch(state, space, scope).await? {
+        Ok(Some(service_signing_key(state).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// [`publish::sync_in`] inside a member transaction, when the write fetched a
+/// key for it.
+async fn publish_in(
+    conn: &mut sqlx::AnyConnection,
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+    signing_key: Option<&p256::ecdsa::SigningKey>,
+) -> Result<Option<publish::Published>, AppError> {
+    match signing_key {
+        Some(key) => publish::sync_in(conn, state.db_backend, space, scope, key).await,
+        None => Ok(None),
+    }
+}
+
+/// Announce what a write published. A write that fetched no key, because
+/// the space published nothing when it began, catches up afterwards in case
+/// a policy change raced it.
+async fn after_publish(
+    state: &AppState,
+    space: &Space,
+    scope: publish::Scope<'_>,
+    had_key: bool,
+    published: Option<publish::Published>,
+) -> Result<(), AppError> {
+    if let Some(published) = published {
+        published.announce(state, space).await;
+    } else if !had_key {
+        #[cfg(test)]
+        if tests::FAIL_CATCH_UP.with(std::cell::Cell::get) {
+            return Err(AppError::Internal("catch-up failed".into()));
+        }
+        publish::sync(state, &space.id, scope).await?;
+    }
+    Ok(())
+}
+
+/// Delete a space. The spaces that took its members through delegation
+/// entries lose its members' credentials in the same transaction, as
+/// [`revoke_lost_readers`] decides.
 pub(crate) async fn delete_space(
     state: &AppState,
     actor_did: &str,
@@ -1149,9 +1613,273 @@ pub(crate) async fn delete_space(
     require_space_admin(state, &space, actor_did).await?;
     let registrations =
         db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
-    db::delete_space(&state.db, state.db_backend, &space.id).await?;
+    let backend = state.db_backend;
+    let delegated = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, backend).await?;
+        db::lock_space_for_members(&mut *tx, backend, &space.id).await?;
+        let before = match readers_before(&mut tx, backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        if let Err(e) = db::delete_space(&mut tx, backend, &space.id).await {
+            return Ok(Err(e));
+        }
+        // Spaces that nested this one stop naming it.
+        let address = format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        );
+        if let Err(e) = db::delete_nested_naming(&mut *tx, backend, &space.id, &address).await {
+            return Ok(Err(e));
+        }
+        let delegated = match revoke_lost_readers(&mut tx, backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok(delegated))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to delete space: {e}")))??;
     notifications::announce_space_deleted(state, &space, registrations);
+    announce_all_revoked(state, delegated);
     Ok(())
+}
+
+/// A member list entry as the protocol shapes it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct MemberEntry {
+    pub did: String,
+    pub read: bool,
+    pub write: bool,
+}
+
+/// The error for a member method on a space whose policy keeps no member list.
+pub(crate) fn policy_mismatch() -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        code: "PolicyMismatch",
+        message: "the space does not have a memberspace policy".into(),
+    }
+}
+
+fn require_memberspace(space: &Space) -> Result<(), AppError> {
+    match crate::spaces::policy::SpacePolicy::of(space) {
+        Ok(crate::spaces::policy::SpacePolicy::Member(_)) => Ok(()),
+        _ => Err(policy_mismatch()),
+    }
+}
+
+fn require_dids<'a>(dids: impl IntoIterator<Item = &'a str>) -> Result<(), AppError> {
+    for did in dids {
+        if !did.starts_with("did:") || did.len() < 7 {
+            return Err(AppError::XrpcError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "InvalidRequest",
+                message: format!("{did:?} is not a DID"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Add members or replace their access, all in one transaction under the
+/// space's row lock, as `memberspace.putMembers` does. A DID listed twice
+/// takes its last entry. A member whose write access is withdrawn leaves the
+/// writer set, and one whose read access is withdrawn loses its credentials.
+///
+/// The caller has checked that `actor_did` may manage `space`.
+pub(crate) async fn put_members(
+    state: &AppState,
+    actor_did: &str,
+    space: &Space,
+    entries: Vec<MemberEntry>,
+) -> Result<(), AppError> {
+    require_memberspace(space)?;
+    require_dids(entries.iter().map(|e| e.did.as_str()))?;
+    // The last entry for a DID wins, in the order the DIDs first appeared.
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: std::collections::HashMap<String, MemberEntry> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if !latest.contains_key(&entry.did) {
+            order.push(entry.did.clone());
+        }
+        latest.insert(entry.did.clone(), entry);
+    }
+    let entries: Vec<MemberEntry> = order
+        .into_iter()
+        .filter_map(|did| latest.remove(&did))
+        .collect();
+
+    // As in `remove_members`, withdrawing read access and revoking the
+    // credentials that go with it commit together; only telling the
+    // verifying hosts waits for the commit.
+    let dids: Vec<String> = entries.iter().map(|e| e.did.clone()).collect();
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, space, scope).await?;
+    let stored = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Ok(None));
+        };
+        if matches!(
+            crate::spaces::policy::SpacePolicy::of(&locked),
+            Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+        ) {
+            return Ok(Ok(None));
+        }
+        let before = match readers_before(&mut tx, state.db_backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        let mut jtis = Vec::new();
+        for entry in &entries {
+            let member = SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: space.id.clone(),
+                did: entry.did.clone(),
+                access: MemberAccess {
+                    read: entry.read,
+                    write: entry.write,
+                    read_self: false,
+                },
+                is_delegation: false,
+                granted_by: Some(actor_did.to_string()),
+                created_at: now_rfc3339(),
+            };
+            db::upsert_member(
+                &mut *tx,
+                state.db_backend,
+                &member,
+                db::DelegationConsent::None,
+            )
+            .await?;
+            if !entry.write {
+                db::remove_writer(&mut *tx, state.db_backend, &space.id, &entry.did).await?;
+            }
+            if !entry.read {
+                match revoke_member_credentials(&mut tx, state.db_backend, &space.id, &entry.did)
+                    .await
+                {
+                    Ok(outstanding) => jtis.extend(outstanding),
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+        }
+        let delegated = match revoke_lost_readers(&mut tx, state.db_backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        // A failure here drops the transaction, and the members with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok(Some((locked, published, jtis, delegated))))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to put members: {e}")))??;
+    let Some((locked, published, jtis, delegated)) = stored else {
+        return Err(policy_mismatch());
+    };
+    announce_revoked(state, space, jtis);
+    announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
+    Ok(())
+}
+
+/// Remove members, all in one transaction, as `memberspace.removeMembers`
+/// does. DIDs that are not members are ignored and keep any place they have
+/// in the writer set; each removed member leaves it, and loses its
+/// credentials. Returns the DIDs removed.
+///
+/// The caller has checked that `actor_did` may manage `space`.
+pub(crate) async fn remove_members(
+    state: &AppState,
+    space: &Space,
+    dids: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    require_memberspace(space)?;
+    require_dids(dids.iter().map(String::as_str))?;
+    // A DID that is a member only through a nested space can't be removed
+    // here: the whole batch fails, naming where it comes from.
+    let effective = {
+        let mut conn = state
+            .db
+            .acquire()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+        members::resolve_on(&mut conn, state.db_backend, &space.id).await?
+    };
+    for did in &dids {
+        if let Some(entry) = effective.get(did)
+            && !entry.direct
+        {
+            return Err(AppError::XrpcError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "InvalidRequest",
+                message: format!(
+                    "{did} is a member through the nested space {}; remove it there, or \
+                     remove the nested space",
+                    entry.via.as_deref().unwrap_or("it nests")
+                ),
+            });
+        }
+    }
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, space, scope).await?;
+    // The removals and their credential revocations commit together, so a
+    // request that fails after them can't leave a removed member's credentials
+    // standing for a retry to miss. Only telling the verifying hosts waits for
+    // the commit.
+    let (locked, removed, published, jtis, delegated) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        // A space deleted since it was resolved has nothing left to remove
+        // or publish.
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(AppError::NotFound("Space not found".into())));
+        };
+        let before = match readers_before(&mut tx, state.db_backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        let mut removed = Vec::new();
+        let mut jtis = Vec::new();
+        for did in &dids {
+            if removed.contains(did) {
+                continue;
+            }
+            if db::remove_direct_member(&mut *tx, state.db_backend, &space.id, did).await? {
+                db::remove_writer(&mut *tx, state.db_backend, &space.id, did).await?;
+                match revoke_member_credentials(&mut tx, state.db_backend, &space.id, did).await {
+                    Ok(outstanding) => jtis.extend(outstanding),
+                    Err(e) => return Ok(Err(e)),
+                }
+                removed.push(did.clone());
+            }
+        }
+        let delegated = match revoke_lost_readers(&mut tx, state.db_backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        // A failure here drops the transaction, and the removals with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((locked, removed, published, jtis, delegated)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove members: {e}")))??;
+    announce_revoked(state, space, jtis);
+    announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
+    Ok(removed)
 }
 
 pub(crate) async fn remove_member(
@@ -1162,12 +1890,69 @@ pub(crate) async fn remove_member(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    revoke_member_credentials(state, &space, member_did).await?;
-    let removed = db::remove_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    // The removal and the revocation of the member's credentials commit
+    // together, under the space's row lock, as in `remove_members`. The
+    // credentials are revoked even when no member row is found, as they
+    // always were. A managedspace has no member list to remove from, as
+    // `put_member` refuses to add to one.
+    let dids = [member_did.to_string()];
+    let scope = publish::Scope::Members(&dids);
+    let signing_key = publish_key(state, &space, scope).await?;
+    let (locked, removed, published, jtis, delegated) = crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend).await?;
+        let Some(locked) = db::lock_space(&mut *tx, state.db_backend, &space.id).await? else {
+            return Ok(Err(AppError::NotFound("Space not found".into())));
+        };
+        if matches!(
+            crate::spaces::policy::SpacePolicy::of(&locked),
+            Ok(crate::spaces::policy::SpacePolicy::Managed(_))
+        ) {
+            return Ok(Err(no_members_on_managedspace()));
+        }
+        let before = match readers_before(&mut tx, state.db_backend, &space.id).await {
+            Ok(before) => before,
+            Err(e) => return Ok(Err(e)),
+        };
+        let jtis = match revoke_member_credentials(&mut tx, state.db_backend, &space.id, member_did)
+            .await
+        {
+            Ok(jtis) => jtis,
+            Err(e) => return Ok(Err(e)),
+        };
+        let removed =
+            match db::remove_member(&mut *tx, state.db_backend, &space.id, member_did).await {
+                Ok(removed) => removed,
+                Err(e) => return Ok(Err(e)),
+            };
+        let delegated = match revoke_lost_readers(&mut tx, state.db_backend, before).await? {
+            Ok(revoked) => revoked,
+            Err(e) => return Ok(Err(e)),
+        };
+        // A failure here drops the transaction, and the removal with it.
+        let published = match publish_in(&mut tx, state, &locked, scope, signing_key.as_ref()).await
+        {
+            Ok(published) => published,
+            Err(e) => return Ok(Err(e)),
+        };
+        tx.commit().await?;
+        Ok(Ok((locked, removed, published, jtis, delegated)))
+    })
+    .await
+    .map_err(|e: sqlx::Error| AppError::Internal(format!("failed to remove member: {e}")))??;
+    announce_revoked(state, &space, jtis);
+    announce_all_revoked(state, delegated);
+    after_publish(state, &locked, scope, signing_key.is_some(), published).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
     }
     Ok(())
+}
+
+/// Bring one member's published record into step after a single-member
+/// method changed their entry.
+async fn publish_member(state: &AppState, space_id: &str, did: &str) -> Result<(), AppError> {
+    let dids = [did.to_string()];
+    publish::sync(state, space_id, publish::Scope::Members(&dids)).await
 }
 
 /// An invite's `expiresAt` as given at creation, as the UTC timestamp it is
@@ -1297,6 +2082,9 @@ pub(crate) async fn accept_invite(
         }
         db::InviteClaim::NoMembers => return Err(no_members_on_managedspace()),
     }
+    // Published after the claim commits: accepting only adds a member, so a
+    // failed publish under-reports the list until the next sync corrects it.
+    publish_member(state, &invite.space_id, did).await?;
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
     let space_uri = space
         .map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey))
@@ -1308,6 +2096,15 @@ pub(crate) async fn accept_invite(
 mod tests {
     use super::*;
     use crate::db::DatabaseBackend;
+
+    thread_local! {
+        /// Every [`announce_revoked`] call on this thread, as (space id,
+        /// `jti`s).
+        pub(super) static ANNOUNCED_REVOKED: std::cell::RefCell<Vec<(String, Vec<String>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// Makes [`after_publish`]'s catch-up fail on this thread.
+        pub(super) static FAIL_CATCH_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     macro_rules! require_test_db {
         () => {
@@ -1398,6 +2195,304 @@ mod tests {
             ),
         );
         config
+    }
+
+    /// A write that began while the space published nothing fetched no key
+    /// and published nothing; if the policy turned publishing on meanwhile,
+    /// `after_publish` catches the published list up. A write that had a key
+    /// published in its own transaction and has nothing to catch up.
+    #[tokio::test]
+    async fn after_publish_catches_up_a_write_that_began_with_nothing_to_publish() {
+        require_test_db!();
+        let (state, space_uri, member_did) = service_test_db().await;
+        let stale = resolve_space(&state, &space_uri).await.unwrap();
+        let mut current = stale.clone();
+        current
+            .config
+            .extra
+            .insert("publishMembers".into(), serde_json::Value::Bool(true));
+        db::update_space(&state.db, state.db_backend, &current)
+            .await
+            .unwrap();
+        let records = || async {
+            db::repo_collection_records(
+                &state.db,
+                state.db_backend,
+                &stale.id,
+                &stale.authority_did,
+                publish::MEMBER_COLLECTION,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+        let dids = [member_did.clone()];
+        let scope = publish::Scope::Members(&dids);
+
+        after_publish(&state, &stale, scope, true, None)
+            .await
+            .unwrap();
+        assert!(
+            records().await.is_empty(),
+            "a write with a key catches nothing up"
+        );
+
+        after_publish(&state, &stale, scope, false, None)
+            .await
+            .unwrap();
+        let published = records().await;
+        assert_eq!(published.len(), 1, "{published:?}");
+    }
+
+    /// A member change that revokes credentials in a space delegating to the
+    /// one changed still announces those revocations when catching the
+    /// published list up fails afterwards.
+    #[tokio::test]
+    async fn a_failed_catch_up_still_announces_revocations_in_delegating_spaces() {
+        require_test_db!();
+        type Change = fn(
+            &AppState,
+            String,
+            String,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), AppError>> + '_>,
+        >;
+        let changes: [(&str, Change); 3] = [
+            ("put_member", |state, admin, space, did| {
+                Box::pin(async move {
+                    put_member(
+                        state,
+                        &admin,
+                        &space,
+                        &did,
+                        Some(MemberAccess {
+                            read: false,
+                            write: true,
+                            read_self: false,
+                        }),
+                        None,
+                    )
+                    .await
+                    .map(drop)
+                })
+            }),
+            ("remove_member", |state, admin, space, did| {
+                Box::pin(async move { remove_member(state, &admin, &space, &did).await })
+            }),
+            ("remove_members", |state, _admin, space, did| {
+                Box::pin(async move {
+                    let space = resolve_space(state, &space).await?;
+                    remove_members(state, &space, vec![did]).await.map(drop)
+                })
+            }),
+        ];
+        for (name, change) in changes {
+            let (state, inner_uri, admin) = service_test_db().await;
+            let inner = resolve_space(&state, &inner_uri).await.unwrap();
+            let reader = format!("did:plc:reader{}", uuid::Uuid::new_v4().simple());
+            db::add_member(
+                &state.db,
+                state.db_backend,
+                &SpaceMember {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    space_id: inner.id.clone(),
+                    did: reader.clone(),
+                    access: MemberAccess::READ,
+                    is_delegation: false,
+                    granted_by: None,
+                    created_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+
+            // A space that takes the inner space's members through a
+            // delegation entry, and a credential for it issued to the reader.
+            let unique = uuid::Uuid::new_v4().simple().to_string();
+            let outer = Space {
+                id: uuid::Uuid::new_v4().to_string(),
+                did: format!("did:plc:outer{unique}"),
+                authority_did: format!("did:plc:outer{unique}"),
+                creator_did: format!("did:plc:outer{unique}"),
+                skey: format!("outer{unique}"),
+                ..inner.clone()
+            };
+            db::create_space(&state.db, state.db_backend, &outer)
+                .await
+                .unwrap();
+            // An entry added by the inner space's administrator.
+            assert!(
+                db::insert_delegation_if_allowed(
+                    &state.db,
+                    state.db_backend,
+                    &SpaceMember {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        space_id: outer.id.clone(),
+                        did: inner.id.clone(),
+                        access: MemberAccess::READ,
+                        is_delegation: true,
+                        granted_by: Some(admin.clone()),
+                        created_at: now_rfc3339(),
+                    },
+                    db::DelegationConsent::Granted(&inner.id),
+                )
+                .await
+                .unwrap()
+            );
+            let jti = format!("jti{unique}");
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                state.db_backend,
+            ))
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&outer.id)
+            .bind(&reader)
+            .bind(format!("hash{unique}"))
+            .bind(&jti)
+            .bind("9999-12-31T00:00:00+00:00")
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+            ANNOUNCED_REVOKED.with(|a| a.borrow_mut().clear());
+            FAIL_CATCH_UP.with(|f| f.set(true));
+            let result = change(&state, admin, inner_uri, reader).await;
+            FAIL_CATCH_UP.with(|f| f.set(false));
+            assert!(result.is_err(), "{name}: the catch-up failure is returned");
+            let announced = ANNOUNCED_REVOKED.with(|a| a.borrow().clone());
+            assert!(
+                announced.contains(&(outer.id.clone(), vec![jti])),
+                "{name}: {announced:?}"
+            );
+        }
+    }
+
+    /// Removing a nested space announces the credentials it revokes in the
+    /// nesting space, once the removal commits.
+    #[tokio::test]
+    async fn removing_a_nested_space_announces_its_revocations() {
+        require_test_db!();
+        let (state, inner_uri, _admin) = service_test_db().await;
+        let inner = resolve_space(&state, &inner_uri).await.unwrap();
+        let reader = format!("did:plc:reader{}", uuid::Uuid::new_v4().simple());
+        db::add_member(
+            &state.db,
+            state.db_backend,
+            &SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: inner.id.clone(),
+                did: reader.clone(),
+                access: MemberAccess::READ,
+                is_delegation: false,
+                granted_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let outer = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: format!("did:plc:outer{unique}"),
+            authority_did: format!("did:plc:outer{unique}"),
+            creator_did: format!("did:plc:outer{unique}"),
+            skey: format!("outer{unique}"),
+            ..inner.clone()
+        };
+        db::create_space(&state.db, state.db_backend, &outer)
+            .await
+            .unwrap();
+        db::upsert_nested(
+            &state.db,
+            state.db_backend,
+            &outer.id,
+            &inner.id,
+            &db::NestedRef {
+                target_space_uri: inner_uri.clone(),
+                read: true,
+                write: false,
+                added_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let jti = format!("jti{unique}");
+        crate::db::query(&adapt_sql(
+            "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&outer.id)
+        .bind(&reader)
+        .bind(format!("hash{unique}"))
+        .bind(&jti)
+        .bind("9999-12-31T00:00:00+00:00")
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        ANNOUNCED_REVOKED.with(|a| a.borrow_mut().clear());
+        crate::spaces::nested::remove_nested(&state, &outer, &inner_uri)
+            .await
+            .unwrap();
+        let announced = ANNOUNCED_REVOKED.with(|a| a.borrow().clone());
+        assert_eq!(announced, vec![(outer.id.clone(), vec![jti])]);
+    }
+
+    /// Nesting checks the nesting space's policy as it stands under its row
+    /// lock, not as it was read before.
+    #[tokio::test]
+    async fn nesting_follows_a_policy_change_that_commits_first() {
+        require_test_db!();
+        let (state, inner_uri, admin) = service_test_db().await;
+        let inner = resolve_space(&state, &inner_uri).await.unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let outer = Space {
+            id: uuid::Uuid::new_v4().to_string(),
+            did: format!("did:plc:outer{unique}"),
+            skey: format!("outer{unique}"),
+            ..inner.clone()
+        };
+        db::create_space(&state.db, state.db_backend, &outer)
+            .await
+            .unwrap();
+        let managed = Space {
+            read_policy: Policy::ManagingApp {
+                managing_app: "did:plc:app".into(),
+            },
+            write_policy: Policy::ManagingApp {
+                managing_app: "did:plc:app".into(),
+            },
+            ..outer.clone()
+        };
+        db::update_space(&state.db, state.db_backend, &managed)
+            .await
+            .unwrap();
+
+        // `outer` as read before the change.
+        let result =
+            crate::spaces::nested::put_nested(&state, &admin, &outer, &inner_uri, true, false)
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(AppError::XrpcError {
+                    code: "PolicyMismatch",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            db::list_nested(&state.db, state.db_backend, &outer.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2181,12 +3276,70 @@ mod tests {
         let entries = crate::service_entries::list_entries(&state.db, state.db_backend)
             .await
             .unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.fragment_id == "#atproto_space_host"),
-            "no #atproto_space_host service entry: {entries:?}"
-        );
+        let entry = entries
+            .iter()
+            .find(|e| e.fragment_id == "#atproto_space_host")
+            .unwrap_or_else(|| panic!("no #atproto_space_host service entry: {entries:?}"));
+        assert_eq!(entry.access_mode, "specific");
+        let xrpcs = crate::service_entries::list_entry_xrpcs(&state.db, state.db_backend, entry.id)
+            .await
+            .unwrap();
+        let mut expected: Vec<String> = crate::service_entries::SPACE_HOST_XRPCS
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(xrpcs, expected);
+    }
+
+    #[tokio::test]
+    async fn the_space_host_entry_opens_only_space_host_methods() {
+        let (state, _plc) = memory_state_with_plc().await;
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+
+        for method in crate::service_entries::SPACE_HOST_XRPCS {
+            assert!(
+                crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+        for method in [
+            "com.example.listThings",
+            "dev.happyview.createApiClient",
+            "com.atproto.space.createRecord",
+        ] {
+            assert!(
+                !crate::service_entries::check_access(
+                    &state.db,
+                    state.db_backend,
+                    "#atproto_space_host",
+                    method
+                )
+                .await
+                .unwrap(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_space_host_method_is_served() {
+        let served: Vec<String> = crate::spaces::routes::protocol_method_table()
+            .into_iter()
+            .map(|(nsid, _)| nsid)
+            .collect();
+        for method in crate::service_entries::SPACE_HOST_XRPCS {
+            assert!(served.iter().any(|s| s == method), "{method} is not routed");
+        }
     }
 
     const INSTANCE_DID: &str = "did:plc:happyviewinstance";

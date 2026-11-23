@@ -180,7 +180,7 @@ export default function XrpcProxySettingsPage() {
           <div className="flex flex-col gap-2">
             <Label>NSID Patterns</Label>
             <p className="text-muted-foreground text-xs">
-              Enter NSID patterns. Use{" "}
+              Use{" "}
               <code className="text-[11px] bg-muted px-1 py-0.5 rounded">
                 com.example.*
               </code>{" "}

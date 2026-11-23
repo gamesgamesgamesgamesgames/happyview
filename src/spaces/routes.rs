@@ -225,10 +225,18 @@ struct GetSpaceCredentialInput {
     credential_key: Option<String>,
     /// The same key under its Oct 29 name.
     credential_kid: Option<String>,
+    /// A DPoP key thumbprint, which some simplespace hosts bind credentials
+    /// to instead. This host doesn't, and says so (see
+    /// [`exchange_generation`]).
+    dpop_jkt: Option<String>,
     /// Establishes the user being acted for, for spaces that gate on users.
     delegation_token: Option<String>,
     /// Identifies the app, for spaces that gate on it.
     client_attestation: Option<String>,
+    /// A notification registration, which `authorizeSpaceSync` can carry in
+    /// the merged Nov 12 text. HappyView doesn't take registrations this way
+    /// yet, so a request carrying one is refused rather than half-served.
+    notify: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +365,7 @@ const LEGACY_NS: &str = "dev.happyview";
 /// protocol methods and must not be advertised.
 pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
     let mut table = crate::spaces::lifecycle::lifecycle_method_table();
+    table.extend(crate::spaces::memberspace::memberspace_method_table());
     table.extend(vec![
         (format!("{PROTO_NS}.space.listSpaces"), get(list_spaces)),
         (format!("{PROTO_NS}.space.getRecord"), get(get_record)),
@@ -380,6 +389,11 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         ),
         (
             format!("{PROTO_NS}.space.getSpaceCredential"),
+            post(get_space_credential),
+        ),
+        // The merged Nov 12 name of the same exchange.
+        (
+            format!("{PROTO_NS}.space.authorizeSpaceSync"),
             post(get_space_credential),
         ),
         (
@@ -418,6 +432,10 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
 pub fn space_routes() -> Router<AppState> {
     let mut router = Router::new();
     for (nsid, handler) in protocol_method_table() {
+        router = router.route(&format!("/xrpc/{nsid}"), handler);
+    }
+    // Nested spaces: a HappyView extension, served but not advertised.
+    for (nsid, handler) in crate::spaces::nested::nested_method_table() {
         router = router.route(&format!("/xrpc/{nsid}"), handler);
     }
 
@@ -786,6 +804,12 @@ async fn apply_writes(
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
+    for write in &input.writes {
+        let (WriteOp::Create { collection, .. }
+        | WriteOp::Update { collection, .. }
+        | WriteOp::Delete { collection, .. }) = write;
+        crate::spaces::publish::refuse_direct_write(collection)?;
+    }
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_membership(
         &state,
@@ -2068,6 +2092,7 @@ async fn notify_credential_revoked(
 /// against the request.
 async fn get_space_credential(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(input): Json<GetSpaceCredentialInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let refused = |code: &'static str, message: String| AppError::XrpcError {
@@ -2094,7 +2119,16 @@ async fn get_space_credential(
             reset,
         });
     }
-    let (generation, credential_key) = exchange_generation(&input)?;
+    if input.notify.is_some() {
+        return Err(refused(
+            "InvalidRequest",
+            "this host does not take notification registrations through \
+             authorizeSpaceSync yet; omit notify"
+                .into(),
+        ));
+    }
+    let (generation, credential_key) = exchange_generation(&input, &headers)?;
+    let credential_key = credential_key.as_str();
     if !crate::spaces::http_signature::is_p256_did_key(credential_key) {
         return Err(refused(
             "InvalidRequest",
@@ -2115,13 +2149,27 @@ async fn get_space_credential(
         address.did, address.type_nsid, address.skey
     );
     // Proposal 0016 addresses both assertions to the space host, the
-    // authority's `#atproto_pds`.
+    // authority's `#atproto_pds`. Simplespace addressed a delegation token to
+    // `#atproto_space_host`, and a client attestation to the bare DID.
     let host_aud = format!("{}#atproto_pds", address.did);
+    let legacy_host_aud = format!("{}#atproto_space_host", address.did);
+    let (delegation_auds, attestation_aud): (Vec<&str>, &str) = match generation {
+        ExchangeGeneration::G0 => (
+            vec![legacy_host_aud.as_str(), host_aud.as_str()],
+            address.did.as_str(),
+        ),
+        _ => (vec![host_aud.as_str()], host_aud.as_str()),
+    };
 
-    let subject = match &input.delegation_token {
-        Some(token) => {
-            Some(verify_delegation(&state, encryption_key, token, &space_uri, &host_aud).await?)
-        }
+    // Simplespace sent the delegation token as the request's bearer token.
+    let delegation_token = match generation {
+        ExchangeGeneration::G0 => bearer_token(&headers),
+        _ => input.delegation_token.clone(),
+    };
+    let subject = match &delegation_token {
+        Some(token) => Some(
+            verify_delegation(&state, encryption_key, token, &space_uri, &delegation_auds).await?,
+        ),
         None => None,
     };
 
@@ -2129,7 +2177,7 @@ async fn get_space_credential(
         Some(attestation) => {
             let verified = crate::spaces::client_attestation::verify_client_attestation(
                 attestation,
-                &host_aud,
+                attestation_aud,
                 &state.http,
             )
             .await
@@ -2184,7 +2232,7 @@ async fn get_space_credential(
         }
     };
 
-    let issued = crate::spaces::auth::issue_credential(
+    let issued = crate::spaces::auth::issue_credential_as(
         &state.db,
         state.db_backend,
         &state.http,
@@ -2196,6 +2244,7 @@ async fn get_space_credential(
         client_id.as_deref(),
         &space.authority_did,
         Some(credential_key),
+        generation.signing_kid(),
     )
     .await
     .map_err(|e| match e {
@@ -2203,16 +2252,28 @@ async fn get_space_credential(
         e => e,
     })?;
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "credential": issued.token,
         "expiresAt": issued.expires_at,
-    })))
+    });
+    // The space's current revision, which the merged Nov 12 text returns
+    // beside the credential. Omitted before the space's first update.
+    if let Some(space_rev) =
+        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
+    {
+        body["spaceRev"] = space_rev.into();
+    }
+    Ok(Json(body))
 }
 
 /// Which revision of Proposal 0016 a `getSpaceCredential` request follows,
 /// told by the field naming the key to bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeGeneration {
+    /// Simplespace: no key field. The delegation token is the bearer token,
+    /// and the key to bind is the `keyid` of an `atproto-space` signature
+    /// over the request.
+    G0,
     /// Oct 29: `credentialKid`.
     G1,
     /// Nov 12 (proposals #143): `credentialKey`.
@@ -2222,16 +2283,27 @@ enum ExchangeGeneration {
 impl ExchangeGeneration {
     fn key_field(self) -> &'static str {
         match self {
+            Self::G0 => "the signature's keyid",
             Self::G1 => "credentialKid",
             Self::G2 => "credentialKey",
         }
     }
 
-    /// The error for a user the space does not admit: `SpaceNotFound`, so a
-    /// refusal discloses nothing about the space. The Nov 12 text says so; the
-    /// Oct 29 text named the user (`UserNotAuthorized`), and HappyView answers
-    /// every generation the Nov 12 way (HAP-388 H4). `SpaceNotFound` is in the
-    /// Oct 29 lexicon too, so an Oct 29 client stays within it.
+    /// The `kid` a credential for this request is signed under, where the
+    /// space is on a DID of its own. Simplespace verifiers look the key up as
+    /// `#atproto_space`, which a space DID publishes beside `#atproto`.
+    fn signing_kid(self) -> &'static str {
+        match self {
+            Self::G0 => crate::spaces::authority::LEGACY_SIGNING_KID,
+            Self::G1 | Self::G2 => crate::spaces::authority::SIGNING_KID,
+        }
+    }
+
+    /// The error for a user the space does not admit: `SpaceNotFound`, as the
+    /// Nov 12 text specifies. The Oct 29 text named the user
+    /// (`UserNotAuthorized`), and HappyView answers every generation the Nov 12
+    /// way (HAP-388 H4). `SpaceNotFound` is in the Oct 29 lexicon too, so an
+    /// Oct 29 client stays within it.
     fn refused_user(self) -> AppError {
         AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,
@@ -2241,30 +2313,51 @@ impl ExchangeGeneration {
     }
 }
 
-/// The request's generation and the key it names. A request naming neither
-/// field is the simplespace exchange, which binds the key by a signature over
-/// the request and is issued under the authority's `#atproto_space` key. It
-/// needs that key published on each space DID (HAP-388 H1–H3, a follow-up
-/// PR), so until then it is refused by name; supporting it slots in here.
+/// The request's generation and the key it names: `credentialKey` (Nov 12),
+/// `credentialKid` (Oct 29), or, when it names neither, the simplespace
+/// exchange, which binds the key named by an `atproto-space` signature over
+/// the request.
+///
+/// A body that names a did:key with `credentialKey` or `credentialKid` and
+/// also carries `dpopJkt` is taken as the Nov 12 or Oct 29 exchange, binding
+/// the did:key, and `dpopJkt` is ignored. The `dpopJkt` refusal is only for a
+/// simplespace exchange that names no did:key.
 fn exchange_generation(
     input: &GetSpaceCredentialInput,
-) -> Result<(ExchangeGeneration, &str), AppError> {
+    headers: &axum::http::HeaderMap,
+) -> Result<(ExchangeGeneration, String), AppError> {
     match (&input.credential_key, &input.credential_kid) {
         (Some(key), Some(kid)) if key != kid => Err(AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,
             code: "InvalidRequest",
             message: "credentialKey and credentialKid name different keys".into(),
         }),
-        (Some(key), _) => Ok((ExchangeGeneration::G2, key)),
-        (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid)),
-        (None, None) => Err(AppError::XrpcError {
+        (Some(key), _) => Ok((ExchangeGeneration::G2, key.clone())),
+        (None, Some(kid)) => Ok((ExchangeGeneration::G1, kid.clone())),
+        // A simplespace exchange asking for a DPoP-bound credential is told
+        // which binding this host offers, rather than failing on a signature
+        // it was never going to carry.
+        (None, None) if input.dpop_jkt.is_some() => Err(AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,
             code: "InvalidRequest",
-            message: "credentialKey is required. The simplespace credential exchange, which \
-                      names no key, is not supported by this host yet"
-                .into(),
+            message: "this host binds credentials to a did:key; dpopJkt is not supported".into(),
         }),
+        (None, None) => {
+            let key = crate::spaces::http_signature::verify_legacy(headers, None)?;
+            Ok((ExchangeGeneration::G0, key))
+        }
     }
+}
+
+/// The token in a `Bearer` authorization, as simplespace sent a delegation
+/// token.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
 /// Verify a delegation token for `space_uri` and record it as used, returning
@@ -2274,14 +2367,13 @@ async fn verify_delegation(
     encryption_key: &crate::plugin::encryption::Keyring,
     token: &str,
     space_uri: &str,
-    host_aud: &str,
+    accepted_aud: &[&str],
 ) -> Result<String, AppError> {
     let invalid = |message: String| AppError::XrpcError {
         status: StatusCode::BAD_REQUEST,
         code: "InvalidDelegationToken",
         message,
     };
-    let accepted_aud = [host_aud];
 
     // A PDS that serves spaces mints delegation tokens with the account's own
     // key. For accounts on one that does not, HappyView mints them with its own
@@ -2296,11 +2388,7 @@ async fn verify_delegation(
                 None
             });
     let local_claims = local_key.as_ref().map(|key| {
-        crate::spaces::credential::verify_delegation_token(
-            token,
-            key.verifying_key(),
-            &accepted_aud,
-        )
+        crate::spaces::credential::verify_delegation_token(token, key.verifying_key(), accepted_aud)
     });
     let claims = match local_claims {
         Some(Ok(claims)) => claims,
@@ -2308,7 +2396,7 @@ async fn verify_delegation(
             token,
             &state.http,
             &state.config.plc_url,
-            &accepted_aud,
+            accepted_aud,
         )
         .await
         .map_err(|e| invalid(e.to_string()))?,

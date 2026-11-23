@@ -179,7 +179,7 @@ export function VacuumPromptProvider({ children }: { children: ReactNode }) {
         duration: Infinity,
         closeButton: true,
         description:
-          "If disk usage keeps climbing even as you delete records, a one-time cleanup will reclaim it. This only needs doing once.",
+          "If disk usage keeps climbing even as you delete records, a one-time cleanup will reclaim it.",
         onDismiss: () => markSeen(SEEN_PROMPT, "1"),
         action: {
           label: "Review",

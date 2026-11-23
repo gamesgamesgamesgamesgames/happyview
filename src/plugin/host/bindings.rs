@@ -1150,6 +1150,28 @@ pub(crate) fn define_host_functions(
     })?;
 
     imports.define(
+        "host_caller_assertion",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                let session = caller.data().caller.clone();
+                host_script_impl(
+                    caller,
+                    "host_caller_assertion",
+                    req_ptr,
+                    req_len,
+                    |state,
+                     run,
+                     spec: happyview_plugin_sdk::wire::CallerAssertionRequest| async move {
+                        super::script::caller_assertion(&state, &run, session.as_deref(), spec)
+                            .await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
         "host_module_resolve",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {

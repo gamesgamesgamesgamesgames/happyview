@@ -23,6 +23,36 @@ pub(crate) fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
     msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
 }
 
+/// The result of a call whose lexicon has no output, read as success when the
+/// PDS answered 2xx with a body anyway.
+///
+/// atrium decodes a 2xx `application/json` body against the method's output.
+/// With no output declared, `{}` or an empty body fails to decode, and a body
+/// that decodes is reported as an unexpected type. Both happen only after a
+/// 2xx, so the call succeeded. Errors the PDS returned are kept. Encoding the
+/// request fails with the same JSON error, so callers check it first with
+/// [`encode_input`].
+pub(crate) fn ignore_unexpected_output<E: std::fmt::Debug>(
+    result: Result<(), atrium_xrpc::Error<E>>,
+) -> Result<(), atrium_xrpc::Error<E>> {
+    match result {
+        Err(atrium_xrpc::Error::SerdeJson(_)) | Err(atrium_xrpc::Error::UnexpectedResponseType) => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Encode a request body as atrium will, so an encoding failure is reported
+/// before the call. atrium raises it as the same JSON error as a response it
+/// can't decode, which [`ignore_unexpected_output`] reads as success: checked
+/// here first, that can only be a response.
+pub(crate) fn encode_input<T: serde::Serialize>(input: &T) -> Result<(), AppError> {
+    serde_json::to_vec(input)
+        .map(|_| ())
+        .map_err(|e| AppError::Internal(format!("failed to encode the request: {e}")))
+}
+
 fn pds_reauth_error() -> AppError {
     AppError::Auth(
         "Your PDS session has expired or been revoked. \
@@ -46,6 +76,7 @@ pub fn routes() -> Router<AppState> {
         .route("/plc/register", post(plc_register))
         .route("/plc/request", post(plc_request))
         .route("/plc/submit", post(plc_submit))
+        .route("/plc/check", post(plc_check))
         .route("/complete", post(complete))
         .route("/rotation-key", get(export_rotation_key))
         .route("/resolve", get(resolve_identity))
@@ -423,26 +454,86 @@ async fn plc_submit(
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
-    agent
+    let input: submit_plc_operation::Input = submit_plc_operation::InputData {
+        operation: sign_result.operation.clone(),
+    }
+    .into();
+    encode_input(&input)?;
+    let submitted = agent
         .api
         .com
         .atproto
         .identity
-        .submit_plc_operation(
-            submit_plc_operation::InputData {
-                operation: sign_result.operation.clone(),
-            }
-            .into(),
-        )
-        .await
-        .map_err(|e| {
-            if is_pds_session_expired(&e) {
-                return pds_reauth_error();
-            }
-            AppError::Internal(format!("submitPlcOperation failed: {e}"))
-        })?;
+        .submit_plc_operation(input)
+        .await;
+    ignore_unexpected_output(submitted).map_err(|e| {
+        if is_pds_session_expired(&e) {
+            return pds_reauth_error();
+        }
+        AppError::Internal(format!("submitPlcOperation failed: {e}"))
+    })?;
 
     // Update service_identity with the account's DID
+    service_identity::upsert_identity(
+        &state.db,
+        state.db_backend,
+        &IdentityMode::AttachAccount,
+        Some(&account_did),
+        None,
+        None,
+        Some(&account_did),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether `services`, from a DID's current PLC operation, lists every service
+/// entry at `public_url`.
+fn lists_every_entry(
+    services: &serde_json::Value,
+    entries: &[crate::service_entries::ServiceEntry],
+    public_url: &str,
+) -> bool {
+    entries.iter().all(|entry| {
+        let service = &services[entry.fragment_id.trim_start_matches('#')];
+        service["type"] == entry.service_type.as_str() && service["endpoint"] == public_url
+    })
+}
+
+/// POST /api/setup/plc/check: finish an attached account's PLC step when its
+/// DID document already lists this instance.
+///
+/// A submit can fail after the PDS has applied the operation, for instance
+/// when its answer is lost. The DID document is the record of what applied:
+/// when it lists every service entry at this instance, the step is done, and
+/// setup continues as it would after a submit. With no service entries there
+/// is nothing for it to list, so the step is done too. Otherwise it answers
+/// 409, and the operator submits again.
+async fn plc_check(_auth: UserAuth, State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
+    let identity = service_identity::get_identity(&state.db, state.db_backend)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
+    if identity.mode != IdentityMode::AttachAccount {
+        return Err(AppError::BadRequest(
+            "PLC flow only supported for attach_account mode".into(),
+        ));
+    }
+    let account_did = identity
+        .attached_account_did
+        .ok_or_else(|| AppError::BadRequest("no attached account DID configured".into()))?;
+
+    let plc_url = state.config.plc_url.trim_end_matches('/');
+    let last_op = crate::plc::fetch_last_operation(&state.http, plc_url, &account_did).await?;
+    let entries = crate::service_entries::list_entries(&state.db, state.db_backend).await?;
+    if !lists_every_entry(&last_op["services"], &entries, &state.config.public_url) {
+        return Err(AppError::Conflict(
+            "The DID document doesn't list this instance yet. Submit the confirmation code again."
+                .into(),
+        ));
+    }
+
     service_identity::upsert_identity(
         &state.db,
         state.db_backend,
@@ -653,5 +744,42 @@ async fn resolve_identity(
             display_name: None,
             avatar: None,
         }])),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unencodable;
+
+    impl serde::Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("no"))
+        }
+    }
+
+    #[test]
+    fn an_input_that_cannot_be_encoded_is_an_error_before_the_call() {
+        assert!(encode_input(&Unencodable).is_err());
+        assert!(encode_input(&serde_json::json!({ "operation": {} })).is_ok());
+    }
+
+    #[test]
+    fn only_a_decode_error_after_a_response_reads_as_success() {
+        let decode: Result<(), atrium_xrpc::Error<()>> = Err(atrium_xrpc::Error::SerdeJson(
+            serde_json::from_str::<()>("{}").unwrap_err(),
+        ));
+        assert!(ignore_unexpected_output(decode).is_ok());
+        let unexpected: Result<(), atrium_xrpc::Error<()>> =
+            Err(atrium_xrpc::Error::UnexpectedResponseType);
+        assert!(ignore_unexpected_output(unexpected).is_ok());
+        let refused: Result<(), atrium_xrpc::Error<()>> = Err(atrium_xrpc::Error::XrpcResponse(
+            atrium_xrpc::error::XrpcError {
+                status: atrium_xrpc::http::StatusCode::BAD_REQUEST,
+                error: None,
+            },
+        ));
+        assert!(ignore_unexpected_output(refused).is_err());
     }
 }

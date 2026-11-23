@@ -228,6 +228,22 @@ pub async fn mark_needs_reauth(state: &AppState, id: &str, error: &str) -> Resul
     Ok(())
 }
 
+/// Record a failure that leaves the grant active, such as an outage at its
+/// authorization server.
+pub async fn record_error(state: &AppState, id: &str, error: &str) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_linked_repos SET last_error = ? WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::query(&sql)
+        .bind(error)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to record linked repo error: {e}")))?;
+    Ok(())
+}
+
 pub async fn touch_refreshed(state: &AppState, id: &str) -> Result<(), AppError> {
     let sql = adapt_sql(
         "UPDATE happyview_linked_repos SET last_refreshed_at = ?, last_error = NULL WHERE id = ?",

@@ -1947,6 +1947,11 @@ export function plcSubmit(token: string) {
   });
 }
 
+/** Finish the attached account's PLC step if its DID document already lists this instance. */
+export function plcCheck() {
+  return apiFetch("/api/setup/plc/check", { method: "POST" });
+}
+
 export function plcRegister() {
   return apiFetch<{ did: string }>("/api/setup/plc/register", {
     method: "POST",

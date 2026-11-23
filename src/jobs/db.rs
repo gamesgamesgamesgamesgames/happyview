@@ -108,6 +108,19 @@ pub async fn create_job(
     api_client_id: Option<&str>,
     dpop_key_id: Option<&str>,
 ) -> Result<String, AppError> {
+    // A job that inherits auth runs with its creator's stored session. A
+    // management ticket authenticates a user without one of their own, so
+    // nothing handling a ticket request may create such a job.
+    if inherit_auth && let Some(ticket) = crate::auth::ticket::current() {
+        tracing::error!(
+            job_type,
+            ticket_jti = %ticket.ticket_jti,
+            "refused to create a job inheriting auth during a management-ticket request"
+        );
+        return Err(AppError::Forbidden(
+            "a management ticket cannot create a job that acts with a stored session".into(),
+        ));
+    }
     let id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let input_str = serde_json::to_string(input)
@@ -589,6 +602,39 @@ mod lease_tests {
                 db.finish().await;
             }
         }
+    }
+
+    /// Whatever calls it, job creation while handling a management-ticket
+    /// request refuses a job that would inherit auth.
+    #[tokio::test]
+    async fn a_ticket_request_cannot_create_a_job_that_inherits_auth() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            return;
+        };
+        let ticket = crate::auth::ticket::Verified {
+            did: "did:plc:ticket".into(),
+            jkt: "jkt".into(),
+            ticket_jti: "ticket".into(),
+            issuer: "https://issuer.example".into(),
+            htu_origin: "https://instance.example".into(),
+        };
+        let input = serde_json::json!({});
+        let job = |inherit| {
+            create_job(
+                &state,
+                "test.ticket",
+                &input,
+                "did:plc:ticket",
+                inherit,
+                None,
+                None,
+            )
+        };
+        let (inheriting, plain) =
+            crate::auth::ticket::scope(ticket, async { (job(true).await, job(false).await) }).await;
+        assert!(matches!(inheriting, Err(AppError::Forbidden(_))));
+        assert!(plain.is_ok());
+        assert!(job(true).await.is_ok(), "allowed outside a ticket request");
     }
 
     async fn new_job(state: &AppState) -> String {

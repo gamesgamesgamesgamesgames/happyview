@@ -226,6 +226,64 @@ async fn settings_crud() {
 
 #[tokio::test]
 #[serial]
+async fn a_retention_must_be_a_whole_number_of_days() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    for key in [
+        "event_log_retention_days",
+        "backfill_retention_days",
+        "space_access_log_retention_days",
+    ] {
+        for good in ["0", "90", "36500", "7"] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": good }),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_success(),
+                "{key}={good:?}: {}",
+                resp.status()
+            );
+        }
+        for bad in ["-1", "a month", "1.5", "", " 7", "36501", "100000000"] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+        }
+        // A refused value leaves the last accepted one stored.
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        let entry = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == key)
+            .unwrap_or_else(|| panic!("{key} not listed"));
+        assert_eq!(entry["value"], "7", "{key}");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn a_script_budget_must_be_an_integer_inside_its_range() {
     common::require_db!();
     let app = TestApp::new().await;
