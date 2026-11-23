@@ -78,13 +78,16 @@ impl MemberAccess {
     /// Merge memberships reached via multiple paths (direct + delegation).
     ///
     /// The most permissive value wins on each axis independently, and a single
-    /// unrestricted grant lifts `read_self`. Otherwise a delegated whole-space
-    /// read would stay clamped to the member's own repo.
+    /// unrestricted read lifts `read_self`. Otherwise a delegated whole-space
+    /// read would stay clamped to the member's own repo. A path that grants
+    /// no read lifts nothing: its `read_self` says nothing about reads.
     pub fn union(self, other: Self) -> Self {
+        let read = self.read || other.read;
+        let whole = (self.read && !self.read_self) || (other.read && !other.read_self);
         Self {
-            read: self.read || other.read,
+            read,
             write: self.write || other.write,
-            read_self: self.read_self && other.read_self,
+            read_self: read && !whole,
         }
     }
 }
