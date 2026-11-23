@@ -1247,20 +1247,33 @@ async fn clear_records(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    if let Some(forwarded) = service::forward_write_if_native(
-        &state,
-        &space,
-        &did,
-        "com.atproto.space.clearRecords",
-        serde_json::json!({ "space": space_uri, "repo": did }),
-    )
-    .await?
+    // Forwarded only when the check above was the one for a repo on the PDS.
+    if on_pds
+        && let Some(forwarded) = service::forward_write_if_native(
+            &state,
+            &space,
+            &did,
+            "com.atproto.space.clearRecords",
+            serde_json::json!({ "space": space_uri, "repo": did }),
+        )
+        .await?
     {
         return Ok(Json(forwarded));
     }
 
     let signing_key = service::service_signing_key(&state).await?;
     let mut tx = service::begin_space_write(&state, &space.id).await?;
+    // A repo that moved to its PDS since it was read above is cleared there,
+    // after the check for that.
+    if !on_pds
+        && db::read_repo_state(&mut tx, state.db_backend, &space.id, &did)
+            .await?
+            .is_some_and(|s| !s.host_mode.is_authoritative_here())
+    {
+        return Err(AppError::Conflict(
+            "the repo moved to its PDS while it was being cleared; try again".into(),
+        ));
+    }
     let records: Vec<_> = db::list_space_record_keys(&mut tx, state.db_backend, &space.id, &did)
         .await?
         .into_iter()
@@ -1271,7 +1284,9 @@ async fn clear_records(
     }
     // A write that landed since the grant check may have added a collection
     // the check didn't cover.
-    if let Some((_, collection, _, _)) = records.iter().find(|r| !held.contains(&r.1)) {
+    if xrpc_claims.identity.is_some()
+        && let Some((_, collection, _, _)) = records.iter().find(|r| !held.contains(&r.1))
+    {
         return Err(AppError::Conflict(format!(
             "the repo gained a {collection} record while it was being cleared; try again"
         )));

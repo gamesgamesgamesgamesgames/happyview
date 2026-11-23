@@ -9,7 +9,7 @@
 # Format: https://github.com/happyproto/spaces-conformance/blob/main/docs/catalogue.md#deviations
 # Check: node cli/validate.ts --deviations <this file>   (in the suite repo)
 #
-# Recorded against the feat/spaces-sync-read-params build on 2026-11-23, graded
+# Recorded against the feat/spaces-sync-read-params build on 2026-11-22, graded
 # at both 2026-10-29 and 2026-11-12. An entry's `revisions` says which.
 
 
@@ -19,7 +19,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-10-29", "2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -28,7 +28,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-10-29", "2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -37,7 +37,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-10-29", "2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -46,7 +46,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-10-29", "2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -55,7 +55,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -64,7 +64,7 @@
   reason: "Reads with a space credential come back without a MAC: this release verifies MACs as a syncer but doesn't add them as a host."
   spec: "#commit-authenticity"
   tracking: HAP-507
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-11-12"]
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
@@ -132,7 +132,7 @@
   reason: "After deleteSpace, authorizeSpaceSync answers SpaceNotFound rather than the SpaceDeleted error 0016 asks for."
   spec: "#space-deletion"
   tracking: HAP-388 (PR 7)
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-11-12"]
   expect:
     message: "authorizeSpaceSync for a deleted space answered SpaceNotFound, not SpaceDeleted"
@@ -152,7 +152,7 @@
   reason: "authorizeSpaceSync refuses a `notify` registration by name: this release doesn't take registrations that way yet."
   spec: "#registering-for-notifications"
   tracking: HAP-388 (PR 6)
-  since: "2026-11-23"
+  since: "2026-11-22"
   revisions: ["2026-11-12"]
   expect:
     message: 'authorizeSpaceSync with notify answered 400 \{"error":"InvalidRequest","message":"this host does not take notification registrations through authorizeSpaceSync yet; omit notify"\}, though it issues credentials without one'
