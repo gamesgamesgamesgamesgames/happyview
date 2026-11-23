@@ -12,6 +12,26 @@ const PDS_URL = "http://localhost:3100";
 const SCHEMA = "com.atproto.lexicon.schema";
 const SCHEMA_SCOPE = `repo:${SCHEMA}?action=create&action=update&action=delete`;
 
+/** The repo actions a granted scope string allows on `collection`. A PDS may
+ * give back a scope in another, equivalent form: `repo:<nsid>` with no
+ * `action` means every action, so a PDS can drop the defaults it was asked
+ * for (Tranquil 0.9 does). */
+function grantedRepoActions(scope: string, collection: string): Set<string> {
+  const actions = new Set<string>();
+  for (const token of scope.split(" ")) {
+    if (!token.startsWith("repo:")) continue;
+    const [resource, query = ""] = token.slice("repo:".length).split("?");
+    if (resource !== collection && resource !== "*") continue;
+    const named = new URLSearchParams(query).getAll("action");
+    for (const action of named.length
+      ? named
+      : ["create", "update", "delete"]) {
+      actions.add(action);
+    }
+  }
+  return actions;
+}
+
 async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   const suffix = Date.now().toString(36);
   const handle = `testuser-${suffix}.test`;
@@ -189,7 +209,11 @@ test.describe("Setup - Attach Account", () => {
     // What the PDS granted, which is what it read from its copy of the client
     // metadata: a copy cached without the schema scope would leave it out.
     const { scope } = await getOauthSessionTokenState(account.did);
-    expect(scope?.split(" ")).toContain(SCHEMA_SCOPE);
+    expect([...grantedRepoActions(scope ?? "", SCHEMA)].sort()).toEqual([
+      "create",
+      "delete",
+      "update",
+    ]);
   });
 
   test("a lexicon publishes to the attached account and unpublishes from it", async ({
